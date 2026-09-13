@@ -38,7 +38,7 @@ pub enum Status {
     /// loading is not serving.
     ///
     /// Whether the card can LOAD the kernels is a separate question - read
-    /// `in_pack`, not this. The two used to be the same thing, back when the
+    /// `pack`, not this. The two used to be the same thing, back when the
     /// pack was the dev `.so` with every arch in it; a release now welds an
     /// elected subset into the binary, and the fatbin carries no PTX, so most
     /// `Built` dies cannot load anything from a shipped build.
@@ -80,25 +80,53 @@ pub struct Arch {
     /// reading before `optimized` goes true, and the thing to open when
     /// somebody asks "compared to what".
     pub board: Option<&'static str>,
-    /// Whether the SHIPPED kernel pack carries SASS for this die - a BUILD
-    /// fact, deliberately separate from `status`, which is a serving promise.
+    /// Which release's kernel pack carries SASS for this die - a BUILD fact,
+    /// deliberately separate from `status`, which is a serving promise.
     ///
-    /// Every `Supported` die must have it (a card we promise to serve and then
-    /// cannot load kernels for is the worst of both, and the test below
-    /// enforces it). It is also true for dies we have not validated, and that
+    /// Every `Supported` die must be in one (a card we promise to serve and
+    /// then cannot load kernels for is the worst of both, and the test below
+    /// enforces it). It is also set for dies we have not validated, and that
     /// is the whole point: the fatbin carries no PTX, so without SASS on
     /// board an unvalidated card - which serves under the UNVALIDATED
     /// warning, and that is how a bring-up campaign STARTS - has nothing to
     /// run. Found when the release began welding a validated-only pack into
     /// the binary: the (then) escape hatch still opened, onto a drop.
     ///
+    /// A HOST, not a bool, since the DGX Spark: GB10 only ever sits beside a
+    /// Grace CPU, so it belongs in the aarch64 pack and nowhere else, while
+    /// every discrete card belongs in the x86_64 one. One flag for both would
+    /// either weld sm_121 into packs no GB10 can reach, or leave the Spark's
+    /// own release with nothing to load.
+    ///
     /// Not serialized: this describes how we build, not what a user's card is,
     /// and the manager's supported-GPU sheet has no business rendering it.
     #[serde(skip)]
-    pub in_pack: bool,
+    pub pack: Pack,
     pub datacenter: &'static [&'static str],
     pub workstation: &'static [&'static str],
     pub jetson: &'static [&'static str],
+}
+
+/// The release host whose kernel pack carries a die. See [`Arch::pack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pack {
+    /// No shipped pack carries it.
+    None,
+    /// The x86_64 releases, Windows and Linux alike.
+    X86_64,
+    /// The aarch64 Linux release - the DGX Spark's.
+    Aarch64,
+}
+
+impl Pack {
+    /// The pack this build belongs to, decided by what it was compiled for.
+    pub const fn host() -> Pack {
+        if cfg!(target_arch = "aarch64") {
+            Pack::Aarch64
+        } else {
+            Pack::X86_64
+        }
+    }
 }
 
 impl Arch {
@@ -128,7 +156,7 @@ const fn arch(
         campaign: None,
         optimized: false,
         board: None,
-        in_pack: false,
+        pack: Pack::None,
         datacenter,
         workstation,
         jetson,
@@ -142,18 +170,24 @@ const fn arch(
 /// boards sets it - the right default for a claim we would have to defend.
 pub static ALL: &[Arch] = &[
     Arch {
+        campaign: Some(
+            "DGX Spark (GB10) - kernels tuned on the die, its sm_121a tensor-core image \
+             matched exactly rather than borrowed from sm_120, perplexity and logprob \
+             parity held there, and the full model catalog smoke-tested on it",
+        ),
+        pack: Pack::Aarch64,
         ..arch(
             (12, 1),
-            Status::Built,
-            "Blackwell (Jetson)",
-            &[],
+            Status::Supported,
+            "Grace Blackwell",
             &[],
             &["NVIDIA GB10 (DGX Spark)"],
+            &[],
         )
     },
     Arch {
         campaign: Some("RTX PRO 6000 - kernels tuned and parity-gated on the die"),
-        in_pack: true,
+        pack: Pack::X86_64,
         ..arch(
             (12, 0),
             Status::Supported,
@@ -207,7 +241,7 @@ pub static ALL: &[Arch] = &[
              f8t perplexity gate, the cold-prefill profile, and a batch-9 decode cliff \
              found and fixed",
         ),
-        in_pack: true,
+        pack: Pack::X86_64,
         ..arch(
             (10, 0),
             Status::Supported,
@@ -238,7 +272,7 @@ pub static ALL: &[Arch] = &[
         // It is still `Built`: the engine stamps it, no board exists, and
         // nothing here is a claim that Ada is fast. Carrying the kernels is a
         // build decision; supporting is a measurement.
-        in_pack: true,
+        pack: Pack::X86_64,
         ..arch(
             (8, 9),
             Status::Built,
@@ -274,7 +308,7 @@ pub static ALL: &[Arch] = &[
     },
     Arch {
         campaign: Some("A6000 - original bring-up plus the heavy parity suites"),
-        in_pack: true,
+        pack: Pack::X86_64,
         ..arch(
             (8, 6),
             Status::Supported,
@@ -403,27 +437,34 @@ pub fn fp8_kv_blocked(cc: (u32, u32)) -> Option<&'static str> {
     (!fp8_kv(cc)).then_some("this GPU cannot store an fp8 KV cache")
 }
 
-/// The generations the SHIPPED kernel pack compiles SASS for - a superset of
-/// `supported()`, and the list both release lanes build against
-/// (the release script on Windows, the Linux build script in the container).
+/// The generations THIS build's shipped kernel pack compiles SASS for - the
+/// supported dies of its host plus any unvalidated die we carry kernels for.
 ///
 /// Read, never restated: a second copy of this in a build script is how the
-/// Windows pack once sat three GPU generations behind its Linux twin.
+/// Windows pack once sat three GPU generations behind its Linux twin. The
+/// release lanes read the per-host literals the test below pins.
 pub fn in_pack() -> impl Iterator<Item = &'static Arch> {
-    ALL.iter().filter(|a| a.in_pack)
+    in_pack_for(Pack::host())
+}
+
+/// The same, for a named release host - what the tests check both packs with,
+/// whatever machine they happen to run on.
+pub fn in_pack_for(host: Pack) -> impl Iterator<Item = &'static Arch> {
+    ALL.iter().filter(move |a| a.pack == host)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The three closed campaigns, by capability - if one of these stops being
-    /// true it is a product decision, not an edit.
+    /// The closed campaigns, by capability - if one of these stops being true
+    /// it is a product decision, not an edit. GB10 joined on 2026-09-13, when
+    /// the DGX Spark became a release target.
     #[test]
-    fn the_supported_set_is_the_three_closed_campaigns() {
+    fn the_supported_set_is_the_closed_campaigns() {
         let mut ccs: Vec<_> = supported().map(|a| a.cc).collect();
         ccs.sort_unstable();
-        assert_eq!(ccs, [(8, 6), (10, 0), (12, 0)]);
+        assert_eq!(ccs, [(8, 6), (10, 0), (12, 0), (12, 1)]);
         for a in supported() {
             assert!(
                 a.campaign.is_some(),
@@ -433,25 +474,46 @@ mod tests {
         }
     }
 
-    /// What the shipped kernel pack carries SASS for. Both release lanes parse
-    /// this literal - the release script and the Linux build script - so
-    /// editing it moves the actual builds, which is the point: the fatbin has
-    /// no PTX, so this list is the set of dies that can load paddock's kernels
-    /// at all.
+    /// What each release's kernel pack carries SASS for, one literal per host.
+    /// The release lanes parse these - release.ps1 reads SHIPPED_X86_64, the
+    /// Linux build script reads the one matching the machine it runs on - so
+    /// editing one moves the actual build, which is the point: the fatbin has
+    /// no PTX, so a host's list is the set of dies that can load its kernels
+    /// at all. Keep each on one line; the scripts read it with a regex.
+    const SHIPPED_X86_64: [(u32, u32); 4] = [(8, 6), (8, 9), (10, 0), (12, 0)];
+    const SHIPPED_AARCH64: [(u32, u32); 1] = [(12, 1)];
+
+    /// Both packs are checked on every machine, not only the one the test
+    /// happens to run on - a table property, not a property of the host.
     #[test]
-    fn the_shipped_pack_covers_every_supported_die_plus_ada() {
-        let mut shipped: Vec<_> = in_pack().map(|a| a.cc).collect();
-        shipped.sort_unstable();
-        assert_eq!(shipped, [(8, 6), (8, 9), (10, 0), (12, 0)]);
+    fn each_shipped_pack_covers_its_hosts_supported_dies() {
+        for (host, want) in [
+            (Pack::X86_64, &SHIPPED_X86_64[..]),
+            (Pack::Aarch64, &SHIPPED_AARCH64[..]),
+        ] {
+            let mut shipped: Vec<_> = in_pack_for(host).map(|a| a.cc).collect();
+            shipped.sort_unstable();
+            assert_eq!(shipped, want, "{host:?} pack");
+        }
         // A card we promise to serve and then cannot load kernels for is the
         // worst of both, so this direction is not optional.
         for a in supported() {
             assert!(
-                a.in_pack,
-                "{:?} is served but the shipped pack has no SASS for it",
+                a.pack != Pack::None,
+                "{:?} is served but no shipped pack has SASS for it",
                 a.cc
             );
         }
+    }
+
+    /// `in_pack()` is this build's pack and nothing else: an x86_64 binary
+    /// must not claim sm_121, and the Spark's binary must not claim the
+    /// discrete cards its host can never hold.
+    #[test]
+    fn in_pack_is_this_builds_own_host() {
+        assert!(in_pack().all(|a| a.pack == Pack::host()));
+        let has_gb10 = in_pack().any(|a| a.cc == (12, 1));
+        assert_eq!(has_gb10, cfg!(target_arch = "aarch64"));
     }
 
     /// A card a person owns resolves to a verdict, which is the whole reason

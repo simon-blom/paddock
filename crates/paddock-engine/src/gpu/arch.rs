@@ -18,25 +18,27 @@
 //! catches it - the fatbin has no PTX, so there is no limp mode to fall
 //! into).
 //!
-//! The case the refusal covered better is the same-major minor (GB10 / DGX
-//! Spark, sm_121): the trial launch passes on the fatbin's sm_121 image, and
-//! an `sm_120a`-only tensor-core family reached through a host election that
-//! tests only the MAJOR does not fail at all - it launches the stub body the
-//! sm_121 pass compiled (measured 2026-09-07: the lin kt3 election did
-//! exactly that, untouched output planes, garbage from the first token). The
-//! pack's rule since then is one host function, `pd_dev_bs_sass` (abi.cuh),
-//! matched exactly. The warning says the die is unmeasured; a Spark campaign
-//! (an sm_121a target with its own probes) is the fix, not a gate.
+//! The case the refusal covered better is the same-major minor. GB10 (DGX
+//! Spark, sm_121) was the one that showed it: the trial launch passed on the
+//! fatbin's sm_121 image, and an `sm_120a`-only tensor-core family reached
+//! through a host election that tested only the MAJOR did not fail at all -
+//! it launched the stub body the sm_121 pass compiled (measured 2026-09-07:
+//! the lin kt3 election did exactly that, untouched output planes, garbage
+//! from the first token). The pack's rule since then is one host function,
+//! `pd_dev_bs_sass` (abi.cuh), matched exactly. A campaign rather than a gate
+//! was the fix, and it closed: the Spark got its own sm_121a image, kernels
+//! tuned on the die and the catalog smoke-tested there, and GB10 is validated
+//! (2026-09-13). The exact match still matters for the next same-major minor.
 //!
 //! Lifecycle per generation: unknown -> serves with the warning; in bring-up
 //! -> the same, with the campaign named; validated -> listed below, with the
 //! campaign that closed it.
 
-// The lists themselves are DATA, not code: `gpu-support.toml` at the repo
-// root, parsed once by paddock-models and read here and by the manager alike.
-// They used to be consts in this file, which meant the same fact also lived
-// in the manager and in the Studio's prose - and all three managed to
-// disagree at once. One file, several readers.
+// The lists themselves live in ONE place: the `ALL` table in
+// paddock-models' gpu_support.rs, read here and by the manager alike. They
+// used to be consts in this file, which meant the same fact also lived in the
+// manager and in the Studio's prose - and all three managed to disagree at
+// once. One table, several readers.
 use paddock_models::gpu_support::{self, Status};
 
 /// Capabilities whose bring-up campaign has closed, as `(major, minor, why)`.
@@ -115,18 +117,21 @@ mod tests {
         // sm_100 joined when its campaign closed - before that it sat in
         // bring-up, serving under the stamp.
         assert!(matches!(gate((10, 0), "B200"), Gate::Validated));
+        // sm_121 joined the same way, when the DGX Spark's campaign closed.
+        assert!(matches!(gate((12, 1), "GB10"), Gate::Validated));
     }
 
-    /// The GB10 / DGX Spark case: same major as the validated consumer die,
-    /// different minor - exact matching must NOT read it as validated (plain
-    /// sm_120 SASS forward-loads onto it, which is precisely what made it
-    /// half-serve unannounced before this gate). It serves, stamped.
+    /// Same major as a validated die, different minor - exact matching must
+    /// NOT read it as validated. GB10 was this case until its own campaign
+    /// closed: plain sm_120 SASS forward-loads onto it, which is precisely
+    /// what made it half-serve unannounced before this gate. GB300 (sm_103,
+    /// beside the validated B200) holds the same shape now. It serves, stamped.
     #[test]
     fn same_major_different_minor_serves_with_the_stamp() {
-        let Gate::Unvalidated(warn) = gate((12, 1), "GB10") else {
-            panic!("sm_121 must not pass as validated");
+        let Gate::Unvalidated(warn) = gate((10, 3), "GB300") else {
+            panic!("sm_103 must not pass as validated");
         };
-        assert!(warn.contains("sm_121"), "{warn}");
+        assert!(warn.contains("sm_103"), "{warn}");
         assert!(warn.contains("UNVALIDATED"), "{warn}");
         assert!(warn.contains("first launch"), "{warn}");
     }
