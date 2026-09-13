@@ -399,7 +399,7 @@ static int pd_f8bs_moe_launch(bool dn, const void* wdata, const void* wsc,
     // FALSIFIED the S=3/NT=2 geometry: pf8 -6.3% (589.4 ->
     // 552.4), c32/c8 ~-1%. The smem doubling (99 -> 148KB) halves CTAs/SM
     // and the occupancy loss beats the Y-traffic savings (~1/3 of gu
-    // bytes). Output-IDENTICAL to NT=1, so the kernel stays for an S=2
+    // bytes). Output-identical to NT=1, so the kernel stays for an S=2
     // retune (98KB keeps 2 CTA/SM) - measure before any default flip.
     static const bool wide_ok = pd_env("PADDOCK_MOE_TC5W") != nullptr;
     const uint32_t tiles = rows_per_e >> 7;
@@ -1603,7 +1603,7 @@ __global__ void pd_moe_head_kernel(const float* __restrict__ x,
 
 PD_EXPORT
 // P1-2 producer twin (hibatch path 1): identical dual-weight head, but the
-// pn->q8 quantize uses PER-128 scale groups (measured 1.27-1.35x the per-32
+// pn->q8 quantize uses per-128 scale groups (measured 1.27-1.35x the per-32
 // error on real serving rows; per-row FAILED). Two passes over xb - the
 // second re-read is L2-hot (first-touch law). qs is written at n/128 stride.
 // Fixed 512 threads: uniform groups-per-iter; s_inv tree differs from the

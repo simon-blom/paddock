@@ -279,7 +279,7 @@ pub async fn handle(
     // Free VRAM, not total: the engine sizes against what is actually
     // available, and so must anything claiming to predict it. Multi-GPU:
     // the caller picks the device (`gpu` = NVML index, default 0) and both
-    // the free figure and the reclaimable fleet VRAM are per-THAT-device.
+    // the free figure and the reclaimable fleet VRAM are per-that-device.
     let snap = state.gpu.latest();
     let sel = q.gpu.unwrap_or(0);
     let gpu = snap.gpus.iter().find(|g| g.index == sel);

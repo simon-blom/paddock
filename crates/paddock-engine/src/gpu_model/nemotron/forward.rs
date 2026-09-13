@@ -72,13 +72,49 @@ pub(crate) struct SendGraph(pub(crate) crate::gpu::CapturedGraph);
 // never touched from two threads at once (same argument as every family).
 unsafe impl Send for SendGraph {}
 
-/// Bulk-prefill chunk width. The scan kernel walks the chunk sequentially
-/// in one launch (state register-resident), so a wider chunk amortizes the
-/// per-chunk launch train; scratch cost is ~60 MB at 512.
-pub(crate) const PREFILL_CHUNK: usize = 512;
+/// Bulk-prefill chunk width on dies of 128 SMs and up: the scan kernel walks
+/// the chunk sequentially in one launch (state register-resident), so a wider
+/// chunk amortizes the per-chunk launch train; scratch cost is ~60 MB at 512.
+/// This is the width every big-die number was measured at.
+const PREFILL_CHUNK_BIG: usize = 512;
+/// Small dies (under 128 SMs) size the row scratch for 8192 rows - the
+/// service's own tick budget - and take ticks by the WHOLE-PROMPT rule in
+/// `plan_chunk` (`PREFILL_TICK_BASE` rows, or the first queued prompt's
+/// remaining rows if that is more). Every mixed tick re-streams the touched
+/// experts' weights (~0.7 GB per MoE layer once the tick is a few hundred
+/// rows wide, 16 GB per pass over the 23 MoE layers), and on GB10's ~240
+/// GB/s that pass is ~70 ms - so a 1k prompt chunked at 512 paid two passes
+/// (280 ms TTFT vs vLLM's 202 in one pass), an 8x1k cohort sixteen, and a
+/// 4k / 8k prompt at the 2048 cap two / four where vLLM's 8192-token step
+/// pays one. Scratch is ~embd*4 B/row over a handful of planes (~2.4 GB at
+/// 8192; the reserve is charged before the KV pool is sized).
+const PREFILL_CHUNK_SMALL: usize = 8192;
+/// The per-tick take on small dies when no single queued prompt needs more:
+/// a cohort of short prompts ramps through 2048-row ticks (measured on the
+/// 8x1k cohort: 2048 gives the best median TTFT, 4096 / 8192 make every
+/// request wait one fat tick - 1252 vs 1921 / 2205 ms), while a single long
+/// prompt takes one tick of its own size up to the scratch cap.
+pub(crate) const PREFILL_TICK_BASE: usize = 2048;
+
+/// Row-scratch cap (and the whole-prompt chunk loop's width), read once at
+/// load: explicit `PADDOCK_PREFILL_CHUNK` (the gpt-oss lane's switch,
+/// 256..=8192) wins, else the die class picks. Stored on the model
+/// (`prefill_chunk`) so every consumer - scratch sizing, the admission
+/// floor, chunk loops, the tick's clamp - reads the same value.
+pub(crate) fn prefill_chunk_rows(sm_count: usize) -> usize {
+    paddock_models::dev_var!("PADDOCK_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| (256..=8192).contains(&n))
+        .unwrap_or(if sm_count < 128 {
+            PREFILL_CHUNK_SMALL
+        } else {
+            PREFILL_CHUNK_BIG
+        })
+}
 
 /// Chunk-wide scratch for the bulk serial prefill (rung): every
-/// buffer is the serial `Scratch` twin at [PREFILL_CHUNK, dim]. The mamba
+/// buffer is the serial `Scratch` twin at [prefill_chunk, dim]. The mamba
 /// in/out projections ride the W8A8 f8row GEMM here (dynamic per-token
 /// activation e4m3 - the checkpoint's own W8A8 class; decode stays W8A16
 /// GEMV), hence the activation-quant image buffers.
@@ -310,7 +346,7 @@ impl GpuNemotron {
         }
         let e = &self.exec;
         let hp = &self.hp;
-        let c = PREFILL_CHUNK;
+        let c = self.prefill_chunk;
         let kv_dim = hp.n_kv_heads * hp.head_dim;
         let q_dim = hp.n_heads * hp.head_dim;
         let qmax = hp.hidden.max(hp.d_inner());
@@ -402,14 +438,14 @@ impl GpuNemotron {
         let n = tokens.len();
         let mut done = 0usize;
         let mut logits = None;
-        for chunk in tokens.chunks(PREFILL_CHUNK) {
+        for chunk in tokens.chunks(self.prefill_chunk) {
             done += chunk.len();
             logits = self.prefill_chunk(chunk, done == n)?;
         }
         Ok(logits.expect("non-empty prompt"))
     }
 
-    /// One chunk (T <= PREFILL_CHUNK tokens) through the whole stack.
+    /// One chunk (T <= prefill_chunk tokens) through the whole stack.
     fn prefill_chunk(
         &mut self,
         tokens: &[u32],

@@ -10,6 +10,18 @@
 
 mod common;
 
+/// The expert lane under test. These tests were written for the host-mapped
+/// expert lane (`PADDOCK_MOE_HOST=1`: the 76 GiB file does not fit a 96 GB
+/// card beside its KV), which is also the slower load - pinning ~50 GB of
+/// host memory takes the better part of an hour on a unified-memory box
+/// (GB10, 2026-09-12) whose serve puts every expert in device memory. Set
+/// `QWEN38FN_MOE_DEVICE=1` there to test the lane that actually serves.
+fn moe_lane() {
+    if std::env::var_os("QWEN38FN_MOE_DEVICE").is_none() {
+        unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    }
+}
+
 use std::time::Instant;
 
 use paddock_engine::gpu_model::qwen4exp::Qwen4ExpGpu;
@@ -32,7 +44,7 @@ fn gguf_greedy_continuation() {
         return;
     };
     // host-mapped experts + the slot cache are what this lane exists for
-    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    moe_lane();
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
@@ -126,7 +138,7 @@ fn gguf_incremental_matches_prefill() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
-    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    moe_lane();
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
@@ -269,7 +281,7 @@ fn gguf_dump_prefill() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
-    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    moe_lane();
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
@@ -463,7 +475,7 @@ fn gguf_teacher_forced_agreement() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
-    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    moe_lane();
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
@@ -640,4 +652,147 @@ fn gguf_kq_dense_tile_matches_dp4a() {
             "{name}: the chunked walk differs from the one-shot tile"
         );
     }
+}
+
+/// The prefix cache (prefix.rs): a re-prefill of a cached prompt resumes at
+/// the prompt's deepest checkpoint bit-exact (same chunk geometry, restored
+/// state, copied KV pages), and the multi-turn shape - the prompt plus a
+/// decoded reply plus a new message - resumes at the prompt's last cut and
+/// stays greedy-identical to a cold walk of the same turn (loose L2: the
+/// walk is chunked at the cuts where the cold reference walked whole, so the
+/// GDN chunked-scan grouping differs, the qwen35 gate's class).
+///
+/// The cold reference comes from a first instance loaded with the cache
+/// off (`PADDOCK_NO_PREFIX_CACHE` is read at load), dropped before the
+/// cached instance loads.
+#[test]
+fn gguf_prefix_cache_resumes_and_matches_cold() {
+    use paddock_engine::generator::Generator;
+    if !common::heavy() {
+        return;
+    }
+    let Some(path) = common::model("QWEN38FN_GGUF", &[]) else {
+        common::missing("QWEN38FN_GGUF");
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    moe_lane();
+    let map = MappedGguf::open(&path).expect("open gguf");
+    let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
+    drop(map);
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold(0usize, |b, (i, &x)| if x > v[b] { i } else { b })
+    };
+    let rel = |x: &[f32], y: &[f32]| {
+        let num: f64 = x.iter().zip(y).map(|(p, q)| ((p - q) as f64).powi(2)).sum();
+        let den: f64 = y.iter().map(|p| (*p as f64).powi(2)).sum();
+        (num.sqrt() / den.sqrt().max(1e-12)) as f32
+    };
+    // ~200 tokens of varied text, deliberately not page-aligned
+    let base = tok
+        .encode(
+            "The reference manual describes a distributed consensus protocol in which \
+             every participant maintains a monotonically increasing term counter and \
+             exchanges signed heartbeat messages over authenticated channels. ",
+        )
+        .expect("enc");
+    let a: Vec<u32> = base.iter().copied().cycle().take(203).collect();
+    let tail = tok
+        .encode(" The committee then turned to the question of quorum, and")
+        .expect("enc");
+    let n_reply = 45usize;
+
+    // --- instance A, cache off: the reply the prompt greedily continues into,
+    // and the cold reference for the multi-turn prompt
+    unsafe { std::env::set_var("PADDOCK_NO_PREFIX_CACHE", "1") };
+    let (reply, reference, c) = {
+        let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 2).expect("load gguf");
+        let headroom = exec.vram_headroom().unwrap_or(0);
+        m.enable_moe_cache(headroom.saturating_sub(512 << 20))
+            .expect("cache");
+        let l = m.prefill_slot(0, &a).expect("prefill A");
+        let mut reply = vec![argmax(&l) as u32];
+        for _ in 1..n_reply {
+            let l = m
+                .decode_step_batch(&[(0, *reply.last().unwrap())])
+                .expect("decode");
+            reply.push(argmax(&l[0]) as u32);
+        }
+        let mut c = a.clone();
+        c.extend_from_slice(&reply);
+        c.extend_from_slice(&tail);
+        let reference = m.prefill_slot(0, &c).expect("cold prefill of the turn");
+        assert_eq!(m.take_prefill_reused(0), 0, "the cache is off");
+        (reply, reference, c)
+    };
+    unsafe { std::env::remove_var("PADDOCK_NO_PREFIX_CACHE") };
+
+    // --- instance B, cache on
+    let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 2).expect("load gguf");
+    let headroom = exec.vram_headroom().unwrap_or(0);
+    m.enable_moe_cache(headroom.saturating_sub(512 << 20))
+        .expect("cache");
+    let cold = m.prefill_slot(0, &a).expect("cold prefill");
+    assert_eq!(m.take_prefill_reused(0), 0, "a cold run must not reuse");
+    let warm = m.prefill_slot(1, &a).expect("warm prefill");
+    let reused = m.take_prefill_reused(1);
+    let b1 = (a.len() - 1) / 16 * 16;
+    eprintln!(
+        "PREFIX CACHE: reused {reused} of {} (deepest cut {b1})",
+        a.len()
+    );
+    assert_eq!(reused, b1, "must resume at the deepest checkpoint");
+    let n_diff = cold.iter().zip(&warm).filter(|(x, y)| x != y).count();
+    assert_eq!(
+        n_diff,
+        0,
+        "a resume of the same prompt must be BIT-EXACT; {n_diff} of {} logits differ (rel {:.2e})",
+        cold.len(),
+        rel(&warm, &cold)
+    );
+    // the same reply must come out of the cached instance (the greedy stream
+    // is the test's own witness that instance B walks the same math)
+    let l = m.prefill_slot(1, &a).expect("prefill A again");
+    let mut reply_b = vec![argmax(&l) as u32];
+    for _ in 1..n_reply {
+        let l = m
+            .decode_step_batch(&[(1, *reply_b.last().unwrap())])
+            .expect("decode");
+        reply_b.push(argmax(&l[0]) as u32);
+    }
+    assert_eq!(
+        reply_b, reply,
+        "instance B's greedy reply differs from instance A's"
+    );
+    // the multi-turn prompt: the reply checkpoint (stage F) filed the reply's
+    // pages as the decode ticks closed them, so the turn resumes at the
+    // reply's last page boundary - past the prompt's last cut - and walks
+    // only the reply's tail and the new message
+    let got = m.prefill_slot(0, &c).expect("prefill the turn");
+    let reused = m.take_prefill_reused(0);
+    let reply_cut = (a.len() + n_reply) / 16 * 16;
+    let r = rel(&got, &reference);
+    eprintln!(
+        "PREFIX CACHE multi-turn: reused {reused} of {} (prompt {} + reply {} + tail {}; prompt cut {b1}, reply cut {reply_cut}); rel {r:.2e}; greedy {} vs {}",
+        c.len(),
+        a.len(),
+        reply.len(),
+        tail.len(),
+        argmax(&got),
+        argmax(&reference)
+    );
+    assert!(
+        reply_cut > b1,
+        "the test's reply must cross a page boundary"
+    );
+    assert_eq!(
+        reused, reply_cut,
+        "the turn must resume at the reply's last page"
+    );
+    assert_eq!(argmax(&got), argmax(&reference), "greedy token flipped");
+    assert!(r < 3e-1, "diverged: rel {r}");
 }

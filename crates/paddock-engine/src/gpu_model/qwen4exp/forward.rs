@@ -35,6 +35,7 @@ use cudarc::driver::sys::CUstreamCaptureMode;
 
 use crate::gpu::{DeviceTensor, ExpertCache, GpuExecutor, KvDtype, QuantTensor};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use crate::gpu_model::st_load::bf16_bytes;
 use paddock_kernels::reference::qwen4exp as rq;
 use paddock_models::ggml_type::GgmlType;
@@ -70,7 +71,7 @@ fn KV() -> KvDtype {
 }
 
 /// PLE conv dilation - a k=4 kernel over a 9-token receptive ring.
-const PLE_DILATION: usize = 3;
+pub(super) const PLE_DILATION: usize = 3;
 
 /// Query-tile height of the prefill attention family (`PD_APF_TQ` in the
 /// pack): the batched entry takes one (row0, slot) per tile.
@@ -340,7 +341,7 @@ pub struct Qwen4ExpGpu {
     /// where the host-side PLE n-gram gather reads its rows
     /// Resident WEIGHT bytes, stamped once at load by `settled_mem_used()`
     /// before anything pool-sized allocates - the number `will-it-fit` prices
-    /// this model with. It excludes what this family deliberately keeps OFF
+    /// this model with. It excludes what this family deliberately keeps off
     /// the device: the n-gram table (51B of the parameter count, read from the
     /// GGUF mmap) and any host-mapped experts, which is why the honest figure
     /// is far under the download size.
@@ -396,6 +397,20 @@ pub struct Qwen4ExpGpu {
     /// `set_graph_capture` lets one process A/B the two paths, which is how
     /// the capture gate proves the graph and the eager walk agree.
     graph_capture: bool,
+    /// The prefix cache (prefix.rs): `None` when the model has nothing to
+    /// cache or the engine-wide switch is off.
+    prefix: Option<super::prefix::PrefixCache>,
+    /// The walk in flight CONTINUES a sequence: rows at positions
+    /// `walk_row0..` of a slot whose carried state was restored. The two
+    /// causal convs re-stage their windows in front of the span's first rows
+    /// (`resume_gdn_conv` / `resume_ple_conv`); 0 = a fresh sequence.
+    walk_row0: usize,
+    /// Stage F, the reply checkpoint (`reply_snapshot`): per slot the cut
+    /// and pool index of its live in-reply checkpoint, and whether the
+    /// slot's reply is tracked at all (a prompt admitted through the cache,
+    /// long enough to be worth a checkpoint).
+    reply_ckpt: Vec<Option<(usize, u32)>>,
+    reply_track: Vec<bool>,
 }
 
 /// Every device buffer the walk touches, allocated once at `max_tokens`.
@@ -472,7 +487,7 @@ struct Scratch {
     #[allow(dead_code)]
     d_lowm_warm: CudaSlice<f32>,
     /// The low-M cluster warm-up was refused on this card (sm_120 consumer
-    /// Blackwell answers cudaErrorNotSupported): the lane stays OFF, whatever
+    /// Blackwell answers cudaErrorNotSupported): the lane stays off, whatever
     /// the opt-in says - a refused warm-up used to only print and leave the
     /// decode gate to elect the lane anyway.
     lowm_refused: bool,
@@ -533,6 +548,12 @@ struct Scratch {
     d_ple_ids: CudaSlice<u32>,
     d_pkey: CudaSlice<f32>,
     d_pval: CudaSlice<f32>,
+    /// resumed-conv staging: `[window ; first rows]` in, the conv of it out
+    /// (GDN: 2(k-1) x qkv rows; PLE: 2 x ring rows x hc width)
+    d_gdn_ext_in: CudaSlice<f32>,
+    d_gdn_ext_out: CudaSlice<f32>,
+    d_ple_ext_in: CudaSlice<f32>,
+    d_ple_ext_out: CudaSlice<f32>,
     d_pkn: CudaSlice<f32>,
     d_pqn: CudaSlice<f32>,
     d_pgv: CudaSlice<f32>,
@@ -923,7 +944,7 @@ impl Qwen4ExpGpu {
             lowm_ok: false,
             f16_max: usize::MAX,
         };
-        Ok(Self {
+        let mut me = Self {
             exec: exec.clone(),
             cfg,
             weights_bytes,
@@ -948,7 +969,16 @@ impl Qwen4ExpGpu {
             stage,
             decode_graph: None,
             graph_capture: capture_wanted(),
-        })
+            prefix: None,
+            walk_row0: 0,
+            reply_ckpt: vec![None; slots],
+            reply_track: vec![false; slots],
+        };
+        if slots >= 1 && !super::prefix::prefix_disabled() {
+            me.prefix =
+                super::prefix::PrefixCache::new(exec, &me.cfg, slots, max_tokens, KV().bytes())?;
+        }
+        Ok(me)
     }
 
     pub fn config(&self) -> &Qwen4ExpConfig {
@@ -1023,6 +1053,8 @@ impl Qwen4ExpGpu {
 
     /// Zero just one slot's carried state, leaving every other slot alone.
     fn reset_slot(&mut self, slot: usize) -> Result<(), GpuModelError> {
+        self.reply_track[slot] = false;
+        self.reply_ckpt[slot] = None;
         let st = self.cfg.gdn_v_heads * self.cfg.gdn_k_dim * self.cfg.gdn_v_dim;
         for r in self.recur.iter_mut().flatten() {
             self.exec.zero_region(r, slot * st, st)?;
@@ -1040,14 +1072,23 @@ impl Qwen4ExpGpu {
         Ok(())
     }
 
-    /// Prefill walk for one slot: `n` tokens of one sequence at positions
-    /// `0..n`, all rows carrying that slot id.
-    fn walk_slot(&mut self, slot: usize, ids: &[u32]) -> Result<Vec<f32>, GpuModelError> {
-        let n = ids.len();
-        let pos: Vec<u32> = (0..n as u32).collect();
+    /// Prefill walk for one slot: `ids[from..to]` of one sequence at positions
+    /// `from..to`, all rows carrying that slot id. `from > 0` continues a
+    /// sequence whose carried state (KV rows, recurrence, conv windows) is
+    /// already the state after `from` tokens - a prefix-cache resume or the
+    /// chunk after a checkpoint cut; the stream must hold the whole prompt.
+    fn walk_span(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        from: usize,
+        to: usize,
+    ) -> Result<Vec<f32>, GpuModelError> {
+        let n = to - from;
+        let pos: Vec<u32> = (from as u32..to as u32).collect();
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
         let slots: Vec<u32> = vec![slot as u32; n];
-        self.exec.upload_u32(ids, &mut self.sc.d_tok)?;
+        self.exec.upload_u32(&ids[from..to], &mut self.sc.d_tok)?;
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&slots, &mut self.sc.d_slots)?;
@@ -1055,7 +1096,7 @@ impl Qwen4ExpGpu {
             if let Some(ple) = self.layers[li].ple.as_ref() {
                 match ple.table.as_ref() {
                     Some(tab) => {
-                        let ids = ple_row_ids(&self.cfg, ple, &self.stream[slot], 2, n)?;
+                        let ids = ple_row_ids(&self.cfg, ple, &self.stream[slot], 2 + from, n)?;
                         stage_ple_device(&self.exec, &self.cfg, ple, tab, &ids, &mut self.sc)?;
                     }
                     None => {
@@ -1065,7 +1106,7 @@ impl Qwen4ExpGpu {
                             ple,
                             li,
                             &self.stream[slot],
-                            2,
+                            2 + from,
                             n,
                         )?;
                         self.exec.upload_f32(&emb, &mut self.sc.d_emb)?;
@@ -1073,8 +1114,155 @@ impl Qwen4ExpGpu {
                 }
             }
         }
-        self.device_walk(n, Phase::Prefill)?;
+        self.cur_slots = vec![slot; n];
+        self.walk_row0 = from;
+        let walked = self.device_walk(n, Phase::Prefill);
+        self.walk_row0 = 0;
+        walked?;
         Ok(self.exec.to_host_len(&self.sc.d_out, self.cfg.vocab)?)
+    }
+
+    /// The prefix-cache consult for `slot`: the resume point with the slot's
+    /// carried state restored to it, or 0 (nothing touched).
+    fn prefix_resume(&mut self, slot: usize, ids: &[u32]) -> Result<usize, GpuModelError> {
+        let Some(pc) = self.prefix.as_mut() else {
+            return Ok(0);
+        };
+        pc.resume(
+            &self.exec,
+            slot,
+            ids,
+            self.max_tokens,
+            &mut self.kv_k,
+            &mut self.kv_v,
+            &mut self.recur,
+            &mut self.gdn_win,
+            self.ple_win.as_mut(),
+        )
+    }
+
+    fn prefix_publish(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        upto: usize,
+        snapshot: bool,
+    ) -> Result<Option<u32>, GpuModelError> {
+        let Some(pc) = self.prefix.as_mut() else {
+            return Ok(None);
+        };
+        pc.publish(
+            &self.exec,
+            slot,
+            ids,
+            upto,
+            snapshot,
+            self.max_tokens,
+            &mut self.kv_k,
+            &mut self.kv_v,
+            &mut self.recur,
+            &mut self.gdn_win,
+            self.ple_win.as_mut(),
+        )
+    }
+
+    // ---- stage F: the reply checkpoint (the qwen35 / nemotron design) ----
+    //
+    // A prompt's two cuts are filed during its prefill; without more, the
+    // next turn - the same history plus this reply plus a new message -
+    // resumes at the prompt's last cut and re-walks the whole reply. So a
+    // tracked slot checkpoints its reply too: every time a decode tick
+    // closes a 16-token page, the page is filed under the radix (the strip
+    // already holds its rows) and the carried state is snapshotted there,
+    // replacing the slot's previous reply checkpoint. One rolling
+    // checkpoint per reply; the next turn prefills <= 15 reply tokens plus
+    // its new message. Kill: PADDOCK_NO_REPLY_CKPT=1.
+
+    /// Admission: the prompt just landed in `slot`. Track its reply when the
+    /// cache is on and the sequence is long enough to be worth a checkpoint.
+    fn reply_track_admit(&mut self, slot: usize) {
+        self.reply_ckpt[slot] = None;
+        self.reply_track[slot] = self.prefix.is_some()
+            && !crate::gpu_model::prefix_cache::reply_ckpt_disabled()
+            && self.pos[slot] >= super::prefix::MIN_SNAPSHOT_LEN;
+    }
+
+    /// A decode tick advanced `rows` (its copies queue behind the walk on
+    /// the stream): every tracked slot whose new position closes a page gets
+    /// its reply checkpoint there.
+    fn reply_after_rows(&mut self, rows: &[(usize, u32)]) -> Result<(), GpuModelError> {
+        for &(sl, _) in rows {
+            if self.reply_track[sl] && self.pos[sl].is_multiple_of(BLOCK_TOKENS) {
+                self.reply_snapshot(sl)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// File the reply so far (the pages the prompt's publish did not already
+    /// hold) and snapshot the slot's carried state at its position; the
+    /// slot's previous reply checkpoint is dropped. The prompt's own cuts
+    /// stay - the prefill filed those, not this.
+    fn reply_snapshot(&mut self, slot: usize) -> Result<(), GpuModelError> {
+        let cut = self.pos[slot];
+        if self.stream[slot].len() != cut + 2 {
+            // the stream and the position parted (a reset the tracking did
+            // not see): stop rather than file a mismatched sequence
+            self.reply_track[slot] = false;
+            return Ok(());
+        }
+        let tokens: Vec<u32> = self.stream[slot][2..].iter().map(|&t| t as u32).collect();
+        let Some(idx) = self.prefix_publish(slot, &tokens, cut, true)? else {
+            return Ok(());
+        };
+        if let Some((old_cut, old_idx)) = self.reply_ckpt[slot].replace((cut, idx))
+            && let Some(pc) = self.prefix.as_mut()
+        {
+            pc.drop_ckpt(&tokens, old_cut, old_idx);
+        }
+        if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
+            tracing::info!("qwen4exp-reply-ckpt: slot {slot} cut {cut} idx {idx}");
+        }
+        Ok(())
+    }
+
+    /// Prefill `ids[start..]` into `slot` whose state is already the state
+    /// after `start` tokens (0 = fresh: reset first). Splits at the prompt's
+    /// checkpoint cuts so the state can be snapshotted there - the cold and
+    /// the resumed walks of one prompt then share the same chunk geometry,
+    /// which is what makes a resume bit-identical to the cold run.
+    fn prefill_from(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        start: usize,
+    ) -> Result<Vec<f32>, GpuModelError> {
+        let n = ids.len();
+        if start == 0 {
+            self.reset_slot(slot)?;
+        }
+        self.stream[slot] = vec![self.cfg.bos_id as i64; 2];
+        self.stream[slot].extend(ids.iter().map(|&i| i as i64));
+        let cuts = if self.prefix.is_some() {
+            super::prefix::ckpt_cuts(n)
+        } else {
+            [0, 0]
+        };
+        let mut pos = start;
+        for c in cuts {
+            if c <= pos || c >= n {
+                continue;
+            }
+            self.walk_span(slot, ids, pos, c)?;
+            self.pos[slot] = c;
+            self.prefix_publish(slot, ids, c, true)?;
+            pos = c;
+        }
+        let logits = self.walk_span(slot, ids, pos, n)?;
+        self.pos[slot] = n;
+        self.prefix_publish(slot, ids, n, false)?;
+        self.reply_track_admit(slot);
+        Ok(logits)
     }
 
     /// Advance `rows` INDEPENDENT slots by one token each, in one walk.
@@ -1168,6 +1356,7 @@ impl Qwen4ExpGpu {
         for &(sl, _) in rows {
             self.pos[sl] += 1;
         }
+        self.reply_after_rows(rows)?;
         Ok(all.chunks(self.cfg.vocab).map(|c| c.to_vec()).collect())
     }
 
@@ -1235,6 +1424,7 @@ impl Qwen4ExpGpu {
         for &(sl, _) in rows {
             self.pos[sl] += 1;
         }
+        self.reply_after_rows(rows)?;
         Ok(())
     }
 
@@ -1500,38 +1690,102 @@ impl Qwen4ExpGpu {
             }
         }
 
-        // fresh state per run: the runs walk's conv arms rely on the window
-        // being zero at their offset base, which is what makes the offset
-        // entry equal to a zero left-pad
-        let mut runs = Vec::with_capacity(items.len());
-        let mut off = 0usize;
+        // where every item starts: the prefix cache's resume point (its
+        // carried state restored), or 0 with the slot reset - a fresh run's
+        // conv arms rely on a zero window at their offset base, a resumed
+        // run's on the re-staged one (see the `row0` arms)
+        let mut starts = Vec::with_capacity(items.len());
         for (slot, toks) in items {
-            self.reset_slot(*slot)?;
+            let start = self.prefix_resume(*slot, toks)?;
+            if start == 0 {
+                self.reset_slot(*slot)?;
+            }
             self.stream[*slot] = vec![self.cfg.bos_id as i64; 2];
             self.stream[*slot].extend(toks.iter().map(|&i| i as i64));
-            runs.push(Run {
-                slot: *slot,
-                off,
-                len: toks.len(),
-            });
-            off += toks.len();
+            starts.push(start);
         }
-        self.cur_runs = runs.clone();
-        self.cur_slots = runs
+        // every item's stops: its checkpoint cuts past the start, then its end
+        // - the same chunk geometry the single-slot path walks, so a cold
+        // cohort leaves the checkpoints its next turn resumes from
+        let stops: Vec<Vec<usize>> = items
             .iter()
-            .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
+            .zip(&starts)
+            .map(|((_, toks), &start)| {
+                let n = toks.len();
+                let mut v: Vec<usize> = if self.prefix.is_some() {
+                    super::prefix::ckpt_cuts(n)
+                        .into_iter()
+                        .filter(|&c| c > start && c < n)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                v.push(n);
+                v
+            })
             .collect();
-        self.stage_inputs_runs(items, &runs)?;
-        let walked = self.device_walk(n, Phase::PrefillRuns);
-        self.cur_runs.clear();
-        walked?;
-        for (slot, toks) in items {
-            self.pos[*slot] = toks.len();
+        let mut cur = starts;
+        let mut done = vec![false; items.len()];
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; items.len()];
+        let mut stage = 0usize;
+        while done.iter().any(|d| !d) {
+            let mut runs = Vec::with_capacity(items.len());
+            let mut which = Vec::with_capacity(items.len());
+            let mut off = 0usize;
+            for (i, (slot, _)) in items.iter().enumerate() {
+                if done[i] {
+                    continue;
+                }
+                let to = stops[i][stage.min(stops[i].len() - 1)];
+                if to <= cur[i] {
+                    continue;
+                }
+                runs.push(Run {
+                    slot: *slot,
+                    off,
+                    len: to - cur[i],
+                    row0: cur[i],
+                });
+                which.push(i);
+                off += to - cur[i];
+            }
+            if runs.is_empty() {
+                break;
+            }
+            let rows = off;
+            self.cur_runs = runs.clone();
+            self.cur_slots = runs
+                .iter()
+                .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
+                .collect();
+            let prompts: Vec<(usize, Vec<u32>)> = which.iter().map(|&i| items[i].clone()).collect();
+            self.stage_inputs_runs(&prompts, &runs)?;
+            let walked = self.device_walk(rows, Phase::PrefillRuns);
+            self.cur_runs.clear();
+            walked?;
+            let all = self
+                .exec
+                .to_host_len(&self.sc.d_out, runs.len() * self.cfg.vocab)?;
+            for (k, (&i, r)) in which.iter().zip(&runs).enumerate() {
+                let (slot, toks) = &items[i];
+                let to = r.row0 + r.len;
+                self.pos[*slot] = to;
+                cur[i] = to;
+                if to == toks.len() {
+                    self.prefix_publish(*slot, toks, to, false)?;
+                    self.reply_track_admit(*slot);
+                    out[i] = Some(all[k * self.cfg.vocab..(k + 1) * self.cfg.vocab].to_vec());
+                    done[i] = true;
+                } else {
+                    self.prefix_publish(*slot, toks, to, true)?;
+                }
+            }
+            stage += 1;
         }
-        let all = self
-            .exec
-            .to_host_len(&self.sc.d_out, items.len() * self.cfg.vocab)?;
-        Ok(all.chunks(self.cfg.vocab).map(|c| c.to_vec()).collect())
+        Ok(out
+            .into_iter()
+            .map(|l| l.expect("every item walked"))
+            .collect())
     }
 
     /// Everything a `PrefillRuns` walk reads from the host: the fused token
@@ -1547,8 +1801,8 @@ impl Qwen4ExpGpu {
         let mut pos = Vec::with_capacity(n);
         let mut slots = Vec::with_capacity(n);
         for ((_, toks), r) in items.iter().zip(runs) {
-            ids.extend_from_slice(toks);
-            pos.extend(0..r.len as u32);
+            ids.extend_from_slice(&toks[r.row0..r.row0 + r.len]);
+            pos.extend(r.row0 as u32..(r.row0 + r.len) as u32);
             slots.extend(std::iter::repeat_n(r.slot as u32, r.len));
         }
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
@@ -1585,7 +1839,7 @@ impl Qwen4ExpGpu {
                                 &self.cfg,
                                 ple,
                                 &self.stream[r.slot],
-                                2,
+                                2 + r.row0,
                                 r.len,
                             )?);
                         }
@@ -1600,7 +1854,7 @@ impl Qwen4ExpGpu {
                                 ple,
                                 li,
                                 &self.stream[r.slot],
-                                2,
+                                2 + r.row0,
                                 r.len,
                             )?);
                         }
@@ -1628,14 +1882,8 @@ impl Qwen4ExpGpu {
                 self.max_tokens
             )));
         }
-        self.reset_slot(slot)?;
-        self.stream[slot] = vec![self.cfg.bos_id as i64; 2];
-        self.stream[slot].extend(ids.iter().map(|&i| i as i64));
-        // prefill walks one sequence; stage it against this slot
-        self.cur_slots = vec![slot; n];
-        let logits = self.walk_slot(slot, ids)?;
-        self.pos[slot] = n;
-        Ok(logits)
+        let start = self.prefix_resume(slot, ids)?;
+        self.prefill_from(slot, ids, start)
     }
 
     /// Record the decode tick as a CUDA graph. Capture RECORDS without
@@ -1841,8 +2089,10 @@ impl Qwen4ExpGpu {
             stage,
             cur_slots,
             cur_runs,
+            walk_row0,
             ..
         } = self;
+        let row0 = *walk_row0;
         let (h, hw, hc, lr, eps) = (c.hidden, c.hc_width(), c.hc_count, c.hc_lowrank, c.eps);
         // Fork eligibility. The two branches both call `DensePlane::matmul`,
         // and only the F8Row class stages activations through the shared
@@ -1956,6 +2206,7 @@ impl Qwen4ExpGpu {
                     ple_win.as_mut().expect("ple window"),
                     cur_slots,
                     cur_runs,
+                    row0,
                 )?;
                 pm.lap(e, "ple");
                 debug_assert!(
@@ -1998,6 +2249,7 @@ impl Qwen4ExpGpu {
                         cur_slots.first().copied().unwrap_or(0),
                         cur_runs,
                         fork_ok,
+                        row0,
                     )?;
                     pm.lap(e, "gdn");
                     if dump.on() {
@@ -2198,6 +2450,10 @@ pub(crate) struct Run {
     pub slot: usize,
     pub off: usize,
     pub len: usize,
+    /// the sequence position of the run's first row: 0 = a fresh prompt,
+    /// otherwise the run continues a slot whose carried state is the state
+    /// after `row0` tokens (a prefix-cache resume, or the span after a cut)
+    pub row0: usize,
 }
 
 /// Graph capture is on unless killed, and never while the triage dump is
@@ -2426,6 +2682,7 @@ fn ple_pass(
     win: &mut CudaSlice<f32>,
     slot_ids: &[usize],
     runs: &[Run],
+    row0: usize,
 ) -> Result<(), GpuModelError> {
     let (h, hw, hc, eps) = (c.hidden, c.hc_width(), c.hc_count, c.eps);
     let wrows = (c.ple_conv - 1) * PLE_DILATION;
@@ -2482,15 +2739,46 @@ fn ple_pass(
             // the zeros `reset` left - which under the ring's own indexing is
             // the tail, i.e. the zero left-pad the sequence form applies.
             let pbase = slot_ids.first().copied().unwrap_or(0) * wrows * hw;
-            if n >= wrows {
-                let r0 = n % wrows; // ring row of source row (n - wrows)
-                let head = wrows - r0; // rows before the wrap
-                e.copy_region(&sc.d_pkn, (n - wrows) * hw, win, pbase + r0 * hw, head * hw)?;
-                if r0 > 0 {
-                    e.copy_region(&sc.d_pkn, (n - r0) * hw, win, pbase, r0 * hw)?;
+            if row0 > 0 {
+                // a continued sequence: the ring holds the pre-conv rows of
+                // positions row0-wrows..row0 at index (pos % wrows); stage them
+                // in order in front of the span's first rows and recompute
+                // those rows' conv (the fresh conv above zero-padded them)
+                let m = n.min(wrows);
+                let s0 = row0 % wrows; // ring index of position row0 - wrows
+                let Scratch {
+                    d_pkn,
+                    d_pconv,
+                    d_ple_ext_in,
+                    d_ple_ext_out,
+                    ..
+                } = sc;
+                e.copy_region(win, pbase + s0 * hw, d_ple_ext_in, 0, (wrows - s0) * hw)?;
+                if s0 > 0 {
+                    e.copy_region(win, pbase, d_ple_ext_in, (wrows - s0) * hw, s0 * hw)?;
                 }
-            } else {
-                e.copy_region(&sc.d_pkn, 0, win, pbase, n * hw)?;
+                e.copy_region(d_pkn, 0, d_ple_ext_in, wrows * hw, m * hw)?;
+                e.q4x_conv_dil(
+                    d_ple_ext_in,
+                    &ple.conv.buf,
+                    d_ple_ext_out,
+                    wrows + m,
+                    hw,
+                    c.ple_conv,
+                    PLE_DILATION,
+                )?;
+                e.copy_region(d_ple_ext_out, wrows * hw, d_pconv, 0, m * hw)?;
+            }
+            // commit the span's last min(n, wrows) rows at their ring index
+            // (pos % wrows); for a fresh sequence this is the two-copy
+            // wrap-around commit above exactly
+            let m = n.min(wrows);
+            let q0 = row0 + n - m; // position of the first committed row
+            let r = q0 % wrows;
+            let len1 = m.min(wrows - r);
+            e.copy_region(&sc.d_pkn, (n - m) * hw, win, pbase + r * hw, len1 * hw)?;
+            if len1 < m {
+                e.copy_region(&sc.d_pkn, (n - m + len1) * hw, win, pbase, (m - len1) * hw)?;
             }
         }
         Phase::PrefillRuns => {
@@ -2509,21 +2797,55 @@ fn ple_pass(
                     PLE_DILATION,
                 )?;
                 let pbase = r.slot * wrows * hw;
-                if r.len >= wrows {
-                    let r0 = r.len % wrows;
-                    let head = wrows - r0;
+                if r.row0 > 0 {
+                    // a continuing run (see the Prefill arm): the ring's rows
+                    // in order in front of the run's first rows, recomputed
+                    let m = r.len.min(wrows);
+                    let s0 = r.row0 % wrows;
+                    let Scratch {
+                        d_pkn,
+                        d_pconv,
+                        d_ple_ext_in,
+                        d_ple_ext_out,
+                        ..
+                    } = sc;
+                    e.copy_region(win, pbase + s0 * hw, d_ple_ext_in, 0, (wrows - s0) * hw)?;
+                    if s0 > 0 {
+                        e.copy_region(win, pbase, d_ple_ext_in, (wrows - s0) * hw, s0 * hw)?;
+                    }
+                    e.copy_region(d_pkn, r.off * hw, d_ple_ext_in, wrows * hw, m * hw)?;
+                    e.q4x_conv_dil(
+                        d_ple_ext_in,
+                        &ple.conv.buf,
+                        d_ple_ext_out,
+                        wrows + m,
+                        hw,
+                        c.ple_conv,
+                        PLE_DILATION,
+                    )?;
+                    e.copy_region(d_ple_ext_out, wrows * hw, d_pconv, r.off * hw, m * hw)?;
+                }
+                // the run's last min(len, wrows) rows at their ring index
+                // (pos % wrows) - for a fresh run this is the old commit exactly
+                let m = r.len.min(wrows);
+                let q0 = r.row0 + r.len - m;
+                let ri = q0 % wrows;
+                let len1 = m.min(wrows - ri);
+                e.copy_region(
+                    &sc.d_pkn,
+                    (r.off + r.len - m) * hw,
+                    win,
+                    pbase + ri * hw,
+                    len1 * hw,
+                )?;
+                if len1 < m {
                     e.copy_region(
                         &sc.d_pkn,
-                        (r.off + r.len - wrows) * hw,
+                        (r.off + r.len - m + len1) * hw,
                         win,
-                        pbase + r0 * hw,
-                        head * hw,
+                        pbase,
+                        (m - len1) * hw,
                     )?;
-                    if r0 > 0 {
-                        e.copy_region(&sc.d_pkn, (r.off + r.len - r0) * hw, win, pbase, r0 * hw)?;
-                    }
-                } else {
-                    e.copy_region(&sc.d_pkn, r.off * hw, win, pbase, r.len * hw)?;
                 }
             }
         }
@@ -2811,6 +3133,9 @@ fn gdn_pass(
     // run table; non-empty only in `PrefillRuns`
     runs: &[Run],
     fork_ok: bool,
+    // the sequence position of the span's first row (`walk_row0`): a
+    // continued sequence re-stages its conv window in front of the span
+    row0: usize,
 ) -> Result<(), GpuModelError> {
     let (h, hv, kd, vd) = (c.hidden, c.gdn_v_heads, c.gdn_k_dim, c.gdn_v_dim);
     let (qkv_rows, km1) = (c.gdn_qkv_rows(), c.gdn_conv - 1);
@@ -2927,7 +3252,39 @@ fn gdn_pass(
             // window = the last k-1 PRE-conv rows, oldest first (conv_step's
             // contract); a short prompt lands at the tail over the reset zeros
             let wbase = slot * km1 * qkv_rows;
-            if n >= km1 {
+            if row0 > 0 {
+                // a continued sequence: the fresh conv above zero-padded the
+                // span's first k-1 rows; recompute them over [window ; rows]
+                // (the whole-sequence conv bit for bit), then the window
+                // SHIFTS - a span shorter than the window keeps its tail
+                let m = n.min(km1);
+                let Scratch {
+                    d_qkv,
+                    d_conv,
+                    d_gdn_ext_in,
+                    d_gdn_ext_out,
+                    ..
+                } = sc;
+                e.copy_region(win, wbase, d_gdn_ext_in, 0, km1 * qkv_rows)?;
+                e.copy_region(d_qkv, 0, d_gdn_ext_in, km1 * qkv_rows, m * qkv_rows)?;
+                e.causal_conv1d_silu(
+                    d_gdn_ext_in,
+                    &w.conv.buf,
+                    d_gdn_ext_out,
+                    km1 + m,
+                    qkv_rows,
+                    c.gdn_conv,
+                )?;
+                e.copy_region(d_gdn_ext_out, km1 * qkv_rows, d_conv, 0, m * qkv_rows)?;
+                if n >= km1 {
+                    e.copy_region(d_qkv, (n - km1) * qkv_rows, win, wbase, km1 * qkv_rows)?;
+                } else {
+                    let keep = km1 - n;
+                    e.copy_region(win, wbase + n * qkv_rows, d_gdn_ext_in, 0, keep * qkv_rows)?;
+                    e.copy_region(d_qkv, 0, d_gdn_ext_in, keep * qkv_rows, n * qkv_rows)?;
+                    e.copy_region(d_gdn_ext_in, 0, win, wbase, km1 * qkv_rows)?;
+                }
+            } else if n >= km1 {
                 e.copy_region(&sc.d_qkv, (n - km1) * qkv_rows, win, wbase, km1 * qkv_rows)?;
             } else {
                 e.copy_region(
@@ -2955,7 +3312,67 @@ fn gdn_pass(
                     c.gdn_conv,
                 )?;
                 let wbase = r.slot * km1 * qkv_rows;
-                if r.len >= km1 {
+                if r.row0 > 0 {
+                    // a continuing run (see the Prefill arm): recompute the
+                    // run's first k-1 rows over [window ; rows], then shift
+                    let m = r.len.min(km1);
+                    let Scratch {
+                        d_qkv,
+                        d_conv,
+                        d_gdn_ext_in,
+                        d_gdn_ext_out,
+                        ..
+                    } = sc;
+                    e.copy_region(win, wbase, d_gdn_ext_in, 0, km1 * qkv_rows)?;
+                    e.copy_region(
+                        d_qkv,
+                        r.off * qkv_rows,
+                        d_gdn_ext_in,
+                        km1 * qkv_rows,
+                        m * qkv_rows,
+                    )?;
+                    e.causal_conv1d_silu(
+                        d_gdn_ext_in,
+                        &w.conv.buf,
+                        d_gdn_ext_out,
+                        km1 + m,
+                        qkv_rows,
+                        c.gdn_conv,
+                    )?;
+                    e.copy_region(
+                        d_gdn_ext_out,
+                        km1 * qkv_rows,
+                        d_conv,
+                        r.off * qkv_rows,
+                        m * qkv_rows,
+                    )?;
+                    if r.len >= km1 {
+                        e.copy_region(
+                            d_qkv,
+                            (r.off + r.len - km1) * qkv_rows,
+                            win,
+                            wbase,
+                            km1 * qkv_rows,
+                        )?;
+                    } else {
+                        let keep = km1 - r.len;
+                        e.copy_region(
+                            win,
+                            wbase + r.len * qkv_rows,
+                            d_gdn_ext_in,
+                            0,
+                            keep * qkv_rows,
+                        )?;
+                        e.copy_region(
+                            d_qkv,
+                            r.off * qkv_rows,
+                            d_gdn_ext_in,
+                            keep * qkv_rows,
+                            r.len * qkv_rows,
+                        )?;
+                        e.copy_region(d_gdn_ext_in, 0, win, wbase, km1 * qkv_rows)?;
+                    }
+                } else if r.len >= km1 {
                     e.copy_region(
                         &sc.d_qkv,
                         (r.off + r.len - km1) * qkv_rows,
@@ -4282,7 +4699,7 @@ impl Scratch {
             //   - the arm consumes `DensePlane::Dual` (the safetensors
             //     lane's bf16+f16 twin); the GGUF lane's dense planes are
             //     k-quant, so there is nothing for it to serve there.
-            // A pack that HAS the entry and still refuses is the case worth
+            // A pack that has the entry and still refuses is the case worth
             // a warning: that is a real launch failure on a die the pack
             // claims to serve, and the lane goes off rather than the model.
             if !kq_lanes && e.has_lowm() {
@@ -4421,6 +4838,10 @@ impl Scratch {
             d_tile_slot: e.alloc_u32(t / PD_APF_TQ + slots.max(1) + 1)?,
             d_pkey: e.alloc(t * hw)?,
             d_pval: e.alloc(t * h)?,
+            d_gdn_ext_in: e.alloc(2 * (c.gdn_conv - 1) * c.gdn_qkv_rows())?,
+            d_gdn_ext_out: e.alloc(2 * (c.gdn_conv - 1) * c.gdn_qkv_rows())?,
+            d_ple_ext_in: e.alloc(2 * (c.ple_conv - 1) * PLE_DILATION * hw)?,
+            d_ple_ext_out: e.alloc(2 * (c.ple_conv - 1) * PLE_DILATION * hw)?,
             d_pkn: e.alloc(t * hw)?,
             d_pqn: e.alloc(t * hw)?,
             d_pgv: e.alloc(t * hw)?,
@@ -4588,6 +5009,9 @@ impl crate::generator::Generator for Qwen4ExpGpu {
     /// The service checks this before drawing per-row uniforms, so answering
     /// truthfully is what keeps a slot's seed stream from paying for a path
     /// that will not run.
+    fn take_prefill_reused(&mut self, slot: usize) -> usize {
+        self.prefix.as_mut().map_or(0, |p| p.take_reused(slot))
+    }
     fn supports_device_sampling(&self) -> bool {
         self.exec.has_sample_rows()
     }

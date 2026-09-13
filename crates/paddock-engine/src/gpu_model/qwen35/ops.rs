@@ -172,7 +172,7 @@ pub(crate) fn nvf4_ffn(
     )
 }
 
-/// `nvf4_ffn` with the activation ALREADY quantized: `xq_ready` says the
+/// `nvf4_ffn` with the activation already quantized: `xq_ready` says the
 /// caller's prenorm staged x's e2m1 bytes + scales in (`xq`, `xs`) itself
 /// (the fused add+rmsnorm+nvf4-quant prenorm on the unified prefill tick,
 /// 2026-09-08), so the W4A4 arms skip their own `quantize_nvf4` - one f32
@@ -262,7 +262,7 @@ pub(crate) fn nvf4_ffn_staged(
 ///     2ff] f32 landing, no swiglu-quant pass: on GB10 those were 2 x 71 MB
 ///     written and 144 MB read per layer at 1k rows, on a die whose fp4 GEMM
 ///     is bound by exactly that traffic (Spark session 5).
-///   2..127 rows (the W4A4 decode arms): ONE GEMM over the fused plane into
+///   2..127 rows (the W4A4 decode arms): One GEMM over the fused plane into
 ///     the interleaved landing, then `swiglu_fused_nvf4_il` (slot 534)
 ///     quantizes pairs in place of the two-plane pass.
 ///   the serial spine / below the W4A4 floor: `nvf4_mm` over the fused plane,
@@ -385,7 +385,7 @@ pub(crate) fn nvf4_gu_swiglu(
 ///
 /// The distinction matters and is easy to miss: for `QuantW::Q8` `gemv_any`
 /// already lands on the optimized repacked GEMV, but for `QuantW::Kq` it lands
-/// on `kquant_gemv`, which is the EXACT-f32 ORACLE. A family wired to
+/// on `kquant_gemv`, which is the exact-f32 ORACLE. A family wired to
 /// `gemv_any` for decode therefore runs a tuned kernel on Q8_0 files and the
 /// reference kernel on every k-quant file - silently, since both are correct.
 /// Measured on granite-30b Q4_K_M: per-node profiling put
@@ -514,7 +514,7 @@ pub(crate) fn mmq(
     }
 }
 
-/// k-quant `mmq` body for ALREADY-quantized strided activations. Rungs mirror
+/// k-quant `mmq` body for already-quantized strided activations. Rungs mirror
 /// `mmq_pre`'s r-independent structure: 5..64 takes the K-split W4A8 mma under
 /// the same uniform 64-row capacity envelope (never the actual r - the spec
 /// gates' r-class rule), everything else the batch-invariant dp4a z-tile.
@@ -636,6 +636,35 @@ pub(crate) fn mmq_q8(
 /// counted 3-4 identical quantize_q8 launches per layer). Same rungs, same
 /// numerics, bit-exact vs per-call quantize.
 #[allow(clippy::too_many_arguments)]
+/// Rows up to which the PLAIN int8 MMA (`pd_q8_0_gemm_mma`: one CTA per
+/// 64-row M tile, the whole K in one accumulator) is preferred over the
+/// K-split MMA in `mmq_pre` on wide planes. The K-split was elected for
+/// 5..=64 on the 188-SM GB202, where a plain tile's N/64 CTAs cannot fill
+/// the die; on the 48-SM GB10 the plain tile fills it from N >= 3072 and the
+/// K-split's partial-sum round trip costs it the wall - `q8nc_gb10_bench`,
+/// K = 5120, the 27B's four projection widths (10240, 12288, 6144, 5120):
+/// plain 196-206 GB/s at r = 9 and at r = 32, K-split 156-169, the 1..4-row
+/// gemv 250-258 (2026-09-12). Same int8 W8A8 class, a different summation
+/// order (relRMS 2.5e-7 between the two on the bench). The election is by
+/// rows and width only, never by which caller asks, so a single-slot spec
+/// round (r = K+1) and its batched twin (r = B*(K+1) <= 64) ride one
+/// kernel - the spec gate's identity rule. 0 = never (the GB202 election);
+/// PADDOCK_Q8_PLAIN_MAX overrides.
+pub(crate) fn q8_plain_max_rows(exec: &GpuExecutor) -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_Q8_PLAIN_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if exec.sm_count() < 128 { 64 } else { 0 })
+    })
+}
+
+/// Planes at least this wide fill a small die with the plain tile's N/64
+/// CTAs (48 CTAs at 3072); narrower ones keep the K-split, whose z-split is
+/// what fills the die there.
+const Q8_PLAIN_MIN_OUT: usize = 3072;
+
 pub(crate) fn mmq_pre(
     exec: &GpuExecutor,
     w: &RepackedQ8,
@@ -647,6 +676,10 @@ pub(crate) fn mmq_pre(
 ) -> Result<(), GpuModelError> {
     if r <= 4 {
         exec.q8_0_gemv_dp4a_nc(w, xq, xs, y, r)?;
+    } else if r <= q8_plain_max_rows(exec) && w.dims[1] >= Q8_PLAIN_MIN_OUT {
+        // small-die election (see q8_plain_max_rows): the plain tile holds
+        // the wall where the K-split below does not
+        exec.q8_0_gemm_mma(w, xq, xs, y, r)?;
     } else if r <= 64 && part.len() >= 8 * 64 * w.dims[1] {
         // K-split mma: one weight pass for any r <= 64 (the mt tile pays a
         // full re-read per 16/24 rows) - this is what lifts the spec ceiling
@@ -2361,7 +2394,7 @@ pub(crate) fn prefill_ffn_down_any(
     match w {
         QuantW::Q8(q) => prefill_ffn_down(exec, q, xq, xs, yq, skfix, gate, up, y, ff, batch),
         QuantW::Kq(k) => {
-            // the fused swiglu+quantize writes ONLY the mmq tiles; a down
+            // the fused swiglu+quantize writes only the mmq tiles; a down
             // plane the pack cannot tile reads the row-major pair (kq_mm_pre),
             // so it takes the two-step form at every width - this was the
             // site that fed stale xq to a 110-token prompt and decoded

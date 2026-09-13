@@ -857,7 +857,7 @@ impl GpuGemma4 {
             graphs: HashMap::new(),
         });
         // `topk_rows` gates per row on the host sampler's mode byte, so the
-        // drafter publishes a table that says "mode 4, every row" ONCE. It is
+        // drafter publishes a table that says "mode 4, every row" once. It is
         // constant for the life of the state, which is also what keeps it
         // inside the captured draft graph.
         if sel_k > 0 {

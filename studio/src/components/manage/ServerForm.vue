@@ -441,6 +441,7 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       { key: 'mcp_servers', kind: 'json', hint: '[{"server_label": "github", "server_url": "https://.../mcp"}]' },
       { key: 'pdf_max_pages', kind: 'num', int: true, hint: 'pages rendered per PDF · 20' },
       { key: 'pdf_page_long_edge', kind: 'num', int: true, hint: 'target long edge, px · 1568' },
+      { key: 'max_image_tokens', kind: 'num', int: true, hint: "soft tokens one image may cost · the model's own budget when empty" },
       // The first config key that is a TOML TABLE rather than a scalar, so it
       // rides the json kind the way mcp_servers does: the round trip is
       // table -> pretty JSON in the box -> table, which is what keeps the

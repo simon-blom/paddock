@@ -416,7 +416,7 @@ kv_default = "fp8_e4m3"
     sha256 = "6326fb9f5e487aa8dcdd313a091e3c67724cb2a666ec3b7d2895b5b26d93ed1b"
     size = 461766816
 
-# Qwen3.5/3.6 sourcing: official + unsloth ONLY.
+# Qwen3.5/3.6 sourcing: official + unsloth only.
 # Elected line = the unsloth *-MTP-GGUF repos - the MTP/nextn tensors are
 # IN-FILE (built-in speculative decoding, no drafter artifact needed) and the
 # mmproj tower is one artifact per model, shared by every weights choice.
@@ -888,13 +888,13 @@ revision = "2026-08-15"
   # model, not a second model (the muse DFlash1/2 rule).
   # Upstream: incoai/Qwen3.8-27B-DFlash2-GGUF (z-lab mirrors it), file
   # Qwen3.8-27B-DFlash2-Q4_K_M.gguf. Verified identical to what we mirror,
-  # not assumed: HF's x-linked-etag (the LFS sha256) WAS
+  # not assumed: HF's x-linked-etag (the LFS sha256) was
   # 18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594 and its
   # x-linked-size 1143006752 - both match the bytes below exactly. The name
   # differs because this tree's drafters are named by role (muse precedent).
   # Upstream moved on 2026-08-29 ("Add dflash.rope.dimension_sections to
   # GGUFs (mrope fix)": +64 bytes, sha256 1a25c568...131ebd, both HF repos).
-  # The mirror keeps the 2026-08-18 bytes on purpose: paddock's drafter
+  # The mirror keeps the 2026-08-18 bytes deliberately: paddock's drafter
   # loader (qwen35/dflash.rs) reads no such key, so the two files draft
   # identically here; re-verified on the DGX Spark 2026-09-07. Re-pin when
   # the loader learns the key, not before.

@@ -339,13 +339,13 @@ __global__ __launch_bounds__(D) void pd_gated_delta_recurrent_kernel_t(
 //    column needs only its own rows plus the head's (q, k) - so the split
 //    costs nothing across blocks, just a P-lane butterfly for the two dots.
 //    The unsplit walk held a whole column in registers: ncu measured 255
-//    registers a thread, a block limit of TWO an SM, 12.57% occupancy, with
+//    registers a thread, a block limit of two an SM, 12.57% occupancy, with
 //    n_heads = 48 blocks on a 148-SM die.
 //  * the norms come PRE-COMPUTED in `rn` (the companion pass below), where
 //    the shipped walk ran two shared trees a token - ~15 barriers.
 //  * with only D/P rows to serve, a thread reads its own q and k straight
 //    from global instead of staging the head's vectors in shared, so the
-//    token loop has NO barrier at all. A warp's lanes cover one column's
+//    token loop has no barrier at all. A warp's lanes cover one column's
 //    rows contiguously, so those reads coalesce.
 //
 // Measured on Flash-Next IQ3_XXS at a 2114-row prefill, ms a layer: 3.85
@@ -472,7 +472,7 @@ __global__ __launch_bounds__(D) void pd_gdn_qk_rnorm_kernel(
 // (q, k) vectors - so the split needs no cross-block anything, just a P-lane
 // butterfly for the two dots. It exists because the unsplit walk holds the
 // whole column in registers: ncu says 255 registers a thread, a block limit
-// of TWO an SM and 12.57% achieved occupancy, with 48 blocks on a 148-SM die
+// of two an SM and 12.57% achieved occupancy, with 48 blocks on a 148-SM die
 // and nothing resident to hide the serial chain. At P=4 the state costs D/4
 // registers, the grid is 4x the blocks, and the per-token chain is a quarter
 // as long.

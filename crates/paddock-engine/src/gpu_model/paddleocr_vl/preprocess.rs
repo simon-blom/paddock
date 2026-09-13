@@ -4,7 +4,7 @@
 //!
 //! 1. `smart_resize`: both edges to multiples of 28 (patch 14 × merge 2),
 //!    area clamped to [min_pixels, max_pixels]. Python `round()` is
-//!    round-half-EVEN, so the port uses `round_ties_even` - 350px rounds to
+//!    round-half-even, so the port uses `round_ties_even` - 350px rounds to
 //!    336 (12.5 -> 12) where a naive round would give 364.
 //! 2. PIL bicubic resize on u8 (`resample: 3`) - `pillow::resize_rgb8`, the
 //!    same int32 fixed-point + u8 mid-pass path the deepseek_ocr lane gates

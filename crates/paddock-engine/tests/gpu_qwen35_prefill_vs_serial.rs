@@ -10,7 +10,7 @@
 //! 0.0001). Heavy: `QWEN35_ORACLE_GGUF` names the file; defaults to the
 //! dense i-quant demo file, and the elected 9B UD-Q4_K_XL is the control.
 //!
-//! Two prompt lengths on purpose: 23 tokens stays on the <= 64-row GEMM
+//! Two prompt lengths deliberately: 23 tokens stays on the <= 64-row GEMM
 //! class, ~110 tokens crosses into the > 64-row class (the pipe GEMMs for
 //! k-quant, the dp4a lane for i-quant), so a lane that is only wrong on
 //! one side of that boundary still shows.

@@ -246,7 +246,7 @@ __global__ void __launch_bounds__(256, 2) pd_mxfp4_gemm_bs_kernel(
 // K-128 pairs per fetch, so W streams half the bytes of the e4m3 kernel at
 // the same proven box geometry. W stage ring [2][16KB], fetched on even
 // pairs; the even pair's mbarrier counts W+Y tx (32KB), odd pairs Y only
-// (16KB). W overwrite needs no extra barrier: the producer's Y-EMPTY(b)
+// (16KB). W overwrite needs no extra barrier: the producer's Y-empty(b)
 // wait (pair sp-2 done) already implies the W stage's last reader (pair
 // sp-3) finished. Consumer fragments ride the MoE mxfp4 pattern: ldmatrix
 // raw over packed bytes + nibble expand (e2m1 at bits 5:2, split order),

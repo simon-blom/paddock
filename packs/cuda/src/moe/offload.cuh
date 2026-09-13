@@ -1,7 +1,7 @@
 // moe/offload.cuh - MoE expert offload: a device-managed LRU cache of routed
 // experts in VRAM, fed from a host-mapped mirror of the full expert planes.
 //
-// Everything here runs INSIDE the decode/prefill graphs: routing -> resolve
+// Everything here runs inside the decode/prefill graphs: routing -> resolve
 // (expert id -> cache slot, LRU victim on a miss) -> fill (copy the missing
 // experts' repacked bytes from the pinned host mirror into their slots) ->
 // the unchanged MoE kernels over the slot planes with the remapped ids. No
@@ -10,14 +10,14 @@
 //
 // Slot planes carry the same repacked k-quant layout as a resident plane
 // (moe/kquant.cuh addressing `(slot*ff + o) * n_super * bytes`), which is
-// what lets the consumer kernels stay untouched: a slot IS an expert index
+// what lets the consumer kernels stay untouched: a slot is an expert index
 // into a plane that happens to hold S experts instead of n_expert.
 //
 // resolve: one block, thread 0 walks the rows in order. Rows are at most a
 // few hundred on the token-batched class this serves (decode: B x top-k), so
 // a serial walk is microseconds and keeps the LRU bookkeeping trivially
 // race-free. A row whose expert is resident takes its slot; a miss takes the
-// least-recently-used slot that no row of THIS tick pinned (so a tick never
+// least-recently-used slot that no row of this tick pinned (so a tick never
 // evicts what it is about to read - the caller guarantees rows <= S). Empty
 // slots have last_use 0 and are taken first.
 //
@@ -110,12 +110,12 @@ __global__ void __launch_bounds__(256) pd_moe_cache_fill_kernel(
 //
 // Expert-major instead, the discipline every offloaded-MoE serving system
 // converges on (llama.cpp's CPU experts, ktransformers, fiddler): the
-// bytes a prompt moves are bounded by ONE pass over the experts it touches,
+// bytes a prompt moves are bounded by one pass over the experts it touches,
 // never by its rows. Per layer: plan = mark the experts present in the
 // launch, enumerate them, assign wave w = ordinal / S. Then per wave:
-// resolve its <= S ids through the SAME LRU (so the cache ends the prefill
+// resolve its <= S ids through the same LRU (so the cache ends the prefill
 // warm with the last wave), fill the misses once, and run the token-batched
-// pair over ALL rows with every out-of-wave pair marked ABSENT
+// pair over all rows with every out-of-wave pair marked ABSENT
 // (PD_MOE_CACHE_NONE in the routing): the gate/up block and the down warp
 // of an absent pair return at once, so a wave costs its own pairs, and the
 // engine sums the waves' down partials. (A first cut pointed absent pairs
@@ -125,7 +125,7 @@ __global__ void __launch_bounds__(256) pd_moe_cache_fill_kernel(
 // graph keeps its shape; an empty wave resolves nothing, fills nothing and
 // its pair kernels exit block by block.
 //
-// plan: one block. wave_of[e] = wave of expert e (NONE if absent) - the
+// plan: one block. wave_of[e] = wave of expert e (none if absent) - the
 // mask kernel's whole input; wave_ids[w*S + i] = the wave's ids, wave_cnt[w].
 __global__ void pd_moe_wave_plan_kernel(
     const unsigned int* __restrict__ idx, uint32_t rows, uint32_t n_expert,
@@ -156,7 +156,7 @@ __global__ void pd_moe_wave_plan_kernel(
     }
 }
 
-// resolve with a DEVICE-side id count: the wave's ids are a device list the
+// resolve with a device-side id count: the wave's ids are a device list the
 // plan kernel filled, so the count cannot be a host argument on a captured
 // path. Same LRU walk as pd_moe_cache_resolve_kernel over `*n_ids` ids;
 // max_ids bounds the scratch (<= n_slots by construction).
@@ -283,7 +283,7 @@ int pd_moe_cache_resolve(const void* idx, uint32_t rows, uint32_t n_slots,
     return pd_launch_status();
 }
 
-// src/dst/bytes: HOST arrays of 6 u64 each, copied into the launch by value.
+// src/dst/bytes: Host arrays of 6 u64 each, copied into the launch by value.
 PD_EXPORT
 int pd_moe_cache_fill(const void* jobs, const void* n_jobs, uint32_t max_jobs,
                       const void* src, const void* dst, const void* bytes,

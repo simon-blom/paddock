@@ -7,7 +7,7 @@
 //! 1. **Image slots are ZEROED**, not left holding the `<image>` placeholder
 //!    embedding. Since the first thing written is stream 0, "zero then add" and
 //!    "replace" are the same operation - `apply_embed` replaces.
-//! 2. **`embedding_scale` (12.0) is for token embeddings ONLY.** Vision rows
+//! 2. **`embedding_scale` (12.0) is for token embeddings only.** Vision rows
 //!    enter unscaled. `apply_embed` therefore runs after the whole-buffer
 //!    scale in `embed_rows`, overwriting it. llama.cpp gates the same way:
 //!    `if (f_embedding_scale != 0 && (ubatch.token || n_deepstack_layers == 0))`
@@ -392,7 +392,7 @@ impl crate::gpu_model::granite::GpuGranite {
         Ok(self.place_feats(slot, pos, feats))
     }
 
-    /// Register ALREADY-encoded features at `pos` in `slot`'s prompt - the
+    /// Register already-encoded features at `pos` in `slot`'s prompt - the
     /// hand-off from a batched wave encode, where the pixels were turned into
     /// streams before any slot's prefill started.
     pub(crate) fn place_feats(

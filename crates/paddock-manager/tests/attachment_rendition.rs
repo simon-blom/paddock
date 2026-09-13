@@ -81,7 +81,7 @@ async fn an_avif_becomes_a_jpeg_anything_can_show() {
     assert_eq!(r.mime, "image/jpeg");
     let img = r.image();
     // Smaller than the default max, so it comes back at its own size - the
-    // endpoint only ever scales DOWN.
+    // endpoint only ever scales down.
     assert_eq!((img.width(), img.height()), (32, 32));
 }
 

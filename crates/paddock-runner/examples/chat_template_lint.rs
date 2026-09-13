@@ -4,7 +4,7 @@
 //! Every new family arrives with an HF Jinja template written against Python's
 //! Jinja2, and the ones that use constructs minijinja lacks fail at request
 //! time with a one-line "parse error ... (in chat:1)" - templates ship as a
-//! single line, so that says nothing about WHERE. This bisects to the offending
+//! single line, so that says nothing about where. This bisects to the offending
 //! span and prints the source around it.
 //!
 //! Usage: chat_template_lint <model.gguf> [--render]

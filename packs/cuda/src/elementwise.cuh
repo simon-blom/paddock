@@ -2814,7 +2814,7 @@ int pd_spec_toks(const void* meta, const void* drafts, void* dst, uint32_t n,
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -2;
 }
 
-// Rung B1: DEVICE-side accept for the async spec round. Runs
+// Rung B1: Device-side accept for the async spec round. Runs
 // right after the verify tick on the same stream and emits one compact
 // per-slot strip - the host then reads the strip instead of picks +
 // drafts and replays nothing (the accept-while-match walk happens here,

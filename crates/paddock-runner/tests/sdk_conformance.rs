@@ -275,7 +275,7 @@ fn load_qwen36_vision() -> Option<ServingModel> {
     .ok()
 }
 
-/// granite-speech-4.1-2b-PLUS, the one generative lane that times words: ask
+/// granite-speech-4.1-2b-plus, the one generative lane that times words: ask
 /// it to and it writes `[T:N]` tags into its transcript. Its base
 /// sibling deliberately cannot, which is why the gate names the -plus file
 /// rather than either granite-speech that happens to be on the box.

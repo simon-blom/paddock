@@ -1049,7 +1049,7 @@ impl Engine {
                 // c8: a 303 ms first prefill span against 155 ms warm, and the
                 // first width-8 decode graph captured under the clients. This
                 // is what vLLM's and SGLang's startup graph capture buys them:
-                // one synthetic cohort of `cap` prompts through the REAL
+                // one synthetic cohort of `cap` prompts through the real
                 // scheduler (admission, chunked prefill, mixed ticks, the
                 // decode graph at every width the cohort passes through on its
                 // way out), on a private channel whose sender is dropped so
@@ -1916,7 +1916,7 @@ fn finish_prefill(
     }
 }
 
-/// `finish_prefill` for a finisher the generator DEVICE-sampled (fin_plans):
+/// `finish_prefill` for a finisher the generator device-sampled (fin_plans):
 /// same bookkeeping, no logits and no host pick - the plan's peeked uniform
 /// is committed here, in `pick_next`'s position (after the recompute check,
 /// which never fires for device-planned finishers but stays for safety).
@@ -2194,6 +2194,33 @@ const POOL_WATERMARK_BLOCKS: usize = 32;
 fn cohort_fuse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_COHORT_FUSE").is_none())
+}
+
+/// Live-REQUEST floor (slots holding a request, chunking or decoding) for
+/// the two side-stream decode paths - the OVERLAP block (span-only prefill
+/// ticks on the main lane, decoders pumped on the pipe lane) and the
+/// classic pure-decode pipe. Below it the decode rows ride the unified
+/// prefill pass and ticks run one at a time. 0 = the paths engage at any
+/// width (the 188-SM die, where both were measured to win). The qwen35
+/// default stack sets 9 on dies under 128 SMs: on GB10 (LPDDR5X, 48 SMs) a
+/// decode tick is ~100 ms of weight streaming, so at 8 slots the two lanes
+/// just time-slice the same bandwidth - 1024x1024 c8 TTFT p50 2698 -> 2124
+/// ms and 128x128 c1 223 -> 136 ms with the paths off, throughput flat or
+/// up - while from 16 concurrent up the overlap wins the long cohort
+/// (1024x1024 c16 128.9 vs 126 tok/s, TTFT p50 7.3 vs 10 s; c32 205 vs
+/// 199-202, 12.4 vs 14-16 s). It is counted in requests, not decoders: the
+/// cohort's loss is in its EARLY ticks, so gating on decoders (a floor of
+/// 9 or 16 decoders) still lost c16/c32 - the overlap has to own the cohort
+/// from its first decoder, which a request count gives. PADDOCK_PIPE_MIN_LIVE
+/// overrides.
+fn pipe_min_live() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_PIPE_MIN_LIVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 fn overlap_admit_max() -> usize {
@@ -3107,7 +3134,7 @@ fn run_batched(
                     })
                     .map(|(k, _)| k);
                 let Some(k) = next_pending else { break };
-                // Checkpoint hints for this leader: where every OTHER pending
+                // Checkpoint hints for this leader: where every other pending
                 // prompt that will wait on it diverges (page-floored by the
                 // backend). Followers then resume exactly there.
                 let hints: Vec<usize> = match share_floor {
@@ -3427,10 +3454,13 @@ fn run_batched(
                         && s.constraint.is_none()
                         && s.logprobs.is_none()
                 });
+            // requests in flight (chunking + decoding) - the pipe_min_live floor
+            let live_slots = slots.iter().filter(|s| s.is_some()).count();
             let overlap_ok = unified_ok
                 && !spec_mixed_first
                 && generator.supports_overlap()
                 && !dec.is_empty()
+                && live_slots >= pipe_min_live()
                 && dec.iter().all(|&(k, _, _)| {
                     let s = slots[k].as_ref().expect("live decode row");
                     s.constraint.is_none()
@@ -4324,7 +4354,7 @@ fn run_batched(
                             }
                         }
                         // The backend still holds the failed chunked prefills
-                        // in its own queue; clearing only OUR set left every
+                        // in its own queue; clearing only our set left every
                         // later prefill_begin on those slots refusing with
                         // "slot already has a chunked prefill in flight" -
                         // one bad prompt poisoned the slot for the server's
@@ -5452,7 +5482,11 @@ fn run_batched(
                 g.pool_free_blocks()
                     .is_none_or(|f| f > high_water + POOL_WATERMARK_BLOCKS)
             };
+            // requests in flight - the pipe_min_live floor (pure-decode phase:
+            // every live slot is a decoder)
+            let live_slots = slots.iter().filter(|s| s.is_some()).count();
             let pipe_begun = pipe_supported
+                && live_slots >= pipe_min_live()
                 && ticks_since_admit >= pipe_min_quiet.saturating_add(pipe_backoff)
                 // host-head TruncCat cannot ride the zero-host pipe;
                 // full-device (mode 5) TruncCat can

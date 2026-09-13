@@ -4,7 +4,7 @@
 //
 // These are the 1-4 bpw formats of the Unsloth UD files: codebook-indexed
 // 8-weight groups (a grid entry per group, a sign byte per group, a scale per
-// 16 or 32 weights) rather than packed nibbles. They ride the SAME repacked
+// 16 or 32 weights) rather than packed nibbles. They ride the same repacked
 // stream pair the k-quant family uses - a data stream of 16-byte-aligned
 // per-super-block payloads and a 24-byte scale record - so the token-batched
 // MoE pair (moe/kquant.cuh) serves them through pd_kq_win_unpack with no
@@ -14,7 +14,7 @@
 // f32: a power-of-two rescale), so no mu term is needed.
 //
 // Layouts are ggml's (ggml-common.h): the block byte order and the codebooks
-// ARE the format. The decoders are ours, written from those layouts - one
+// are the format. The decoders are ours, written from those layouts - one
 // window unpack serves every lane, and the load-time dequant goes through
 // it too (repack, unpack, widen), so there is exactly one place the bits
 // are read. Every product in the family is exact in f32 (an f16 d times a
@@ -195,7 +195,7 @@ __device__ __forceinline__ void pd_iq_repack_super(uint32_t dt, const uint8_t* _
             for (uint32_t i = 0; i < 8u; ++i) rec[2u + i] = s[66u + i];
             break;
         case PD_KQ_IQ2S:
-            // ggml's qs[64] is 32 grid-index bytes THEN 32 sign bytes; qh follows
+            // ggml's qs[64] is 32 grid-index bytes then 32 sign bytes; qh follows
             for (uint32_t i = 0; i < 32u; ++i) d[i] = s[2u + i];          // qs (indices)
             for (uint32_t i = 0; i < 8u; ++i) d[32u + i] = s[66u + i];    // qh
             for (uint32_t i = 0; i < 32u; ++i) d[40u + i] = s[34u + i];   // signs
@@ -329,7 +329,7 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_grid_bytes(uint32_t dt) {
 // smem bytes a block needs for its table copy. (A nibble-coded copy - every
 // grid draws its bytes from an alphabet of <= 8 values, so an entry fits a
 // 32-bit word and a lookup is a one-bank load + two byte-permutes - was
-// measured 10% SLOWER on IQ2_XXS: the lanes are issue-bound, not
+// measured 10% slower on IQ2_XXS: the lanes are issue-bound, not
 // bank-conflict-bound, and the permutes cost more than the wider gather.)
 __host__ __device__ __forceinline__ uint32_t pd_iq_tabs_bytes(uint32_t dt) {
     return pd_iq_grid_bytes(dt);

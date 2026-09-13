@@ -15,7 +15,7 @@
 //! checkpoints store raw w), rms_norm/swiglu/rope (`reference::ops`).
 
 /// Grouped Gemma RMSNorm, (1+w) affine: each of `groups` equal slices of `x`
-/// is normalized by its own RMS, then the FULL-width weight applies as
+/// is normalized by its own RMS, then the full-width weight applies as
 /// `y = xn + xn*w` (the FMA form vLLM's kernel uses). In-place.
 pub fn group_rms_norm_1p(x: &mut [f32], w: &[f32], groups: usize, eps: f32) {
     assert_eq!(x.len(), w.len());

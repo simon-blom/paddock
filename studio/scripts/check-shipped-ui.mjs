@@ -119,7 +119,7 @@ function deepSpans(css) {
 }
 
 /** Every selector list in the sheet, at any nesting depth (at-rule preludes
- *  skipped). The check is PER BLOCK: a class shared between plain elements and
+ *  skipped). The check is per block: a class shared between plain elements and
  *  a Reka item legitimately needs both `.cls` and `:deep(.cls)` - but they must
  *  live in the same block, or one of the two renderings goes unstyled. */
 function selectorLists(css) {
@@ -146,7 +146,7 @@ for (const file of vueFiles(SRC)) {
   const block = templateOf(source)
   if (!block) continue
   const rel = relative(SRC, file).replaceAll('\\', '/')
-  // ui/ IS the place these roles are allowed - that is where the wrappers are
+  // ui/ is the place these roles are allowed - that is where the wrappers are
   const isWrapper = rel.startsWith('components/ui/')
 
   for (const match of block.text.matchAll(TAG)) {

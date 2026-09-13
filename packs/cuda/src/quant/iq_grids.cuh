@@ -1,10 +1,10 @@
 // Transcribed by NodeNestor (github.com/Nodenester) for truespar/paddock PR #17.
 // quant/iq_grids.cuh - codebooks of the ggml i-quant family (IQ1/IQ2/IQ3,
-// IQ4_NL), transcribed from llama.cpp ggml-common.h (MIT). The values ARE
+// IQ4_NL), transcribed from llama.cpp ggml-common.h (MIT). The values are
 // the format definition, not a tuning choice: a differing entry is a
 // different format. Generated; do not hand-edit.
 //
-// Global memory on purpose, not __constant__: every lane indexes these with
+// Global memory deliberately, not __constant__: every lane indexes these with
 // its own codebook entry, and the constant cache serializes divergent
 // reads 32 ways. As plain read-only globals they ride L1/L2 (~40 KB total).
 

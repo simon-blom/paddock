@@ -11,7 +11,7 @@
 //! card: `rope_parameters` is a nested dict, `text_config.model_type` is
 //! `qwen4_exp_text` (top-level `qwen4_exp`), `mtp` is a nested dict, and
 //! `ple_embedding_dtype` = `float8_e4m3fn` is present (the sglang PR#40
-//! knob). `ple_layer_ids` is ONE-indexed (id 2 = decoder layer index 1 -
+//! knob). `ple_layer_ids` is one-indexed (id 2 = decoder layer index 1 -
 //! proven by the shard audit: the ple.* tensors live under
 //! `model.language_model.layers.1.`).
 
@@ -71,7 +71,7 @@ pub struct Qwen4ExpConfig {
     pub hc_count: usize,   // 4
     pub hc_lowrank: usize, // 320
 
-    // PLE n-gram layer(s), ZERO-indexed decoder layer indices
+    // PLE n-gram layer(s), zero-indexed decoder layer indices
     pub ple_layers: Vec<usize>, // [1]
     pub ple_embed: usize,       // 2560 (16 heads x 160)
     pub ple_conv: usize,        // 4 (dilation 3 -> 9-token ring)
@@ -198,7 +198,7 @@ impl Qwen4ExpConfig {
             )));
         }
 
-        // ple_layer_ids is ONE-indexed (id 2 = decoder layer index 1; the
+        // ple_layer_ids is one-indexed (id 2 = decoder layer index 1; the
         // ple.* tensors sit under layers.1 in the shard headers).
         let ple_layers = tc
             .get("ple_layer_ids")

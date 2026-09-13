@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { uuid } from '@/lib/uuid'
-import { computed, ref } from 'vue'
+import { computed, ref, toRaw } from 'vue'
 import type { AudioPart, Conversation, Message, SamplingParams } from '@/types/chat'
 import { DEFAULT_PARAMS, messageText } from '@/types/chat'
 import { activeMessages, deleteSubtree, migrate, stepSibling, tipId } from '@/lib/tree'
@@ -17,6 +17,12 @@ export const useChatStore = defineStore('chat', () => {
   const activeId = ref<string | null>(null)
   const loaded = ref(false)
   const loadedIds = ref<Set<string>>(new Set())
+  // Documents that were asked for and did not arrive. Kept apart from "not
+  // loaded yet" so the view can offer a retry instead of an endless spinner.
+  const failedIds = ref<Set<string>>(new Set())
+  // One fetch per document however many callers ask at once - hydrate and the
+  // route sync both open the resumed chat.
+  const inflight = new Map<string, Promise<void>>()
 
   // The start page's conversation-in-waiting. It is deliberately not in
   // `conversations` and not on the server: the sidebar lists committed chats
@@ -34,6 +40,21 @@ export const useChatStore = defineStore('chat', () => {
   function isDraft(c: Conversation): boolean {
     return draft.value?.id === c.id
   }
+
+  /** The chat in view is a committed one whose document has not arrived: the
+   *  list row is only a stub with no messages, and drawing it would show an
+   *  empty conversation that is not. The list used to take long enough on a
+   *  cold disk that the document was cached by the time anyone opened it;
+   *  with the list answered from an index the document is now the slow read,
+   *  so this state is real and visible for seconds. */
+  const activeLoading = computed(() => {
+    const c = active.value
+    return !!c && !isDraft(c) && !loadedIds.value.has(c.id) && !failedIds.value.has(c.id)
+  })
+  const activeLoadFailed = computed(() => {
+    const c = active.value
+    return !!c && !isDraft(c) && failedIds.value.has(c.id)
+  })
 
   // Both the shell (for the nav's chat count) and ChatView hydrate; share the
   // in-flight fetch so concurrent callers don't both list + both set activeId.
@@ -76,6 +97,15 @@ export const useChatStore = defineStore('chat', () => {
   /** Fetch a conversation's full document (messages) the first time it opens. */
   async function ensureLoaded(id: string): Promise<void> {
     if (loadedIds.value.has(id)) return
+    const pending = inflight.get(id)
+    if (pending) return pending
+    const run = fetchDocument(id).finally(() => inflight.delete(id))
+    inflight.set(id, run)
+    return run
+  }
+
+  async function fetchDocument(id: string): Promise<void> {
+    failedIds.value.delete(id)
     try {
       const full = await store.getConversation(id)
       // Pre-popover chats carry the old hard-coded sampling the user never
@@ -106,7 +136,30 @@ export const useChatStore = defineStore('chat', () => {
       loadedIds.value.add(id)
     } catch (e) {
       console.error('failed to load conversation', id, e)
+      failedIds.value.add(id)
     }
+  }
+
+  /** Change a conversation that may not be loaded yet - a sidebar rename or
+   *  pin on a chat nobody has opened, or a model picked while the document is
+   *  still on its way. The change shows at once on whatever object is there,
+   *  then is applied again to the real document once it lands, and only that
+   *  is saved: the stub is thrown away by the load, so an edit made only to
+   *  it would silently vanish, and saving the stub itself would replace the
+   *  stored conversation with an empty one. */
+  async function edit(id: string, apply: (c: Conversation) => void): Promise<void> {
+    const now = conversations.value.find((x) => x.id === id) ?? (draft.value?.id === id ? draft.value : null)
+    if (!now) return
+    apply(now)
+    if (isDraft(now)) return persist(now)
+    await ensureLoaded(id)
+    const live = conversations.value.find((x) => x.id === id)
+    if (!live || !loadedIds.value.has(id)) return
+    // re-apply only when the load swapped the object; an already-loaded chat
+    // got the change above, and `apply` need not be idempotent
+    if (toRaw(live) !== toRaw(now)) apply(live)
+    // awaited, so a caller's `await rename(...)` means the rename is stored
+    await persistNow(live)
   }
 
   function makeConversation(model: string, params?: Partial<SamplingParams>): Conversation {
@@ -188,17 +241,34 @@ export const useChatStore = defineStore('chat', () => {
     )
   }
 
-  function persistNow(c: Conversation): void {
-    if (isDraft(c)) return // see persist(): drafts are in-memory until sent
+  /** Save now, cancelling any pending debounced save. The promise settles
+   *  when the write has landed - fire-and-forget callers can ignore it. */
+  function persistNow(c: Conversation): Promise<void> {
+    if (isDraft(c)) return Promise.resolve() // see persist(): drafts are in-memory until sent
     const prev = timers.get(c.id)
     if (prev) {
       clearTimeout(prev)
       timers.delete(c.id)
     }
-    void save(c)
+    return save(c)
   }
 
   async function save(c: Conversation): Promise<void> {
+    // The server REPLACES the stored document with whatever is sent. A list
+    // stub has no messages, so saving one wipes the conversation's history -
+    // and roughly thirty call sites persist whatever conversation they hold.
+    // So the choke point refuses two things: a document that has not loaded,
+    // and an object that is no longer the live one (a caller still holding
+    // the stub after the load replaced it would otherwise pass an id check and
+    // write the stub back). A pending save for a chat deleted meanwhile lands
+    // here too, and must not bring it back.
+    if (!isDraft(c)) {
+      const live = conversations.value.find((x) => x.id === c.id)
+      if (!live || !loadedIds.value.has(c.id) || toRaw(live) !== toRaw(c)) {
+        console.warn('not saving conversation', c.id, '- its document is not the loaded one')
+        return
+      }
+    }
     try {
       await store.putConversation(c)
     } catch (e) {
@@ -208,11 +278,11 @@ export const useChatStore = defineStore('chat', () => {
 
   // Rename is metadata, not activity: don't bump updatedAt or re-sort (renaming
   // used to yank the chat to the top of the list - jarring). Persist in place.
-  function rename(id: string, title: string): void {
-    const c = conversations.value.find((x) => x.id === id)
-    if (!c) return
-    c.title = title.trim() || 'Untitled'
-    persistNow(c)
+  function rename(id: string, title: string): Promise<void> {
+    const t = title.trim() || 'Untitled'
+    return edit(id, (c) => {
+      c.title = t
+    })
   }
 
   /** Re-point activeId after the current chat is gone; keeps URL/localStorage in
@@ -261,11 +331,15 @@ export const useChatStore = defineStore('chat', () => {
 
   // Pinning is metadata too - persist without a reorder/updatedAt bump; the
   // sidebar floats pinned chats to the top via its sort.
-  function togglePin(id: string): void {
+  function togglePin(id: string): Promise<void> {
     const c = conversations.value.find((x) => x.id === id)
-    if (!c) return
-    c.pinned = !c.pinned
-    persistNow(c)
+    if (!c) return Promise.resolve()
+    // decided once, from what the user saw - re-reading it off the loaded
+    // document would flip it back
+    const pinned = !c.pinned
+    return edit(id, (x) => {
+      x.pinned = pinned
+    })
   }
 
   /** Set the title from the first user message, once, if still default.
@@ -392,6 +466,9 @@ export const useChatStore = defineStore('chat', () => {
     active,
     isDraft,
     loaded,
+    activeLoading,
+    activeLoadFailed,
+    edit,
     showDocument,
     setDocPane,
     setArtifactsPane,

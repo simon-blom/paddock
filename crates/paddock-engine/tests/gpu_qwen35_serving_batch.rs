@@ -41,9 +41,10 @@ fn serving_batch_isolation_and_throughput() {
     // single-sequence reference stream
     let single = m.generate_greedy(&prompt, n_new, None).expect("single");
 
-    // batch: 8 slots, same prompt in each
-    let b = 64usize;
-    m.enable_batch(b).expect("enable_batch");
+    // batch: the same prompt in every slot, at the width the plan grants
+    // (enable_batch returns the seated count - on a box where 64 slots of
+    // a 27B's DeltaNet state do not fit, that is fewer than asked)
+    let b = m.enable_batch(64).expect("enable_batch");
     let vocab = m.vocab;
     let mut last_tok = vec![0u32; b];
     for (s, lt) in last_tok.iter_mut().enumerate() {

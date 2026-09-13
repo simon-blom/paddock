@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     uint32_t gdt, uint32_t udt, const unsigned int* __restrict__ list,
     const unsigned int* __restrict__ n_list) {
     PD_PDL_ARM();
-    // PLAIN grid is (batch, n_active, ff): the out row is the SLOW axis, so a
+    // PLAIN grid is (batch, n_active, ff): the out row is the slow axis, so a
     // row's whole pair set dispatches together. What the grouped kernel below
     // left this one is the DECODE band (routed rows <= n_expert), and that is
     // where the order pays - measured on Flash-Next IQ3_XXS 2026-09-07, same
@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     // read. Leave `out` alone - the down kernel skips the same pair - and
     // skip before anything block-collective; e is block-uniform so the
     // skip is too. Measured reason: without it a wave's cost scaled with
-    // EVERY routed pair (10 ms a launch on a 435-token prompt), not its own.
+    // every routed pair (10 ms a launch on a 435-token prompt), not its own.
     if (e == 0xFFFFFFFFu) continue;
     const uint32_t gdb = pd_kq_datab(gdt), udb = pd_kq_datab(udt);
     const uint32_t gscb = pd_kq_scb(gdt), uscb = pd_kq_scb(udt);
@@ -163,7 +163,7 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
     const bool mu = pd_kq_has_mu(gdt) ||
                     pd_kq_has_mu(udt);
     if (mu && xsums == nullptr) return cudaErrorInvalidValue;
-    dim3 grid(batch, n_active, ff);   // out row SLOW - see the kernel note
+    dim3 grid(batch, n_active, ff);   // out row slow - see the kernel note
     // Block width = one thread per 16-weight window, warp-rounded, capped at
     // 256. BIT-EXACT against the old flat-256 launch: a thread's window is
     // tid*16 either way, so the surviving threads hold the same partial in the
@@ -224,7 +224,7 @@ int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
 // kernel: SM 52% of peak against DRAM 23% - i-quant UNPACK, not bandwidth, is
 // what a prefill spends its MoE time on, and a grid transpose (L2 reuse) moved
 // it 0%. Here a block owns (expert group, out row) from the moe_align layout:
-// each thread unpacks its 16-weight window ONCE and walks the group's up-to-T
+// each thread unpacks its 16-weight window once and walks the group's up-to-T
 // routed rows against it. T=8 covers a whole expert at this density (one block
 // per expert), so the unpack cost falls by the rows-per-expert factor while the
 // dp4a work - which is per row either way - is unchanged.
@@ -325,7 +325,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_grp_kernel(
 }
 
 // slot 586: the grouped form. `sorted_row`/`sorted_slot`/`block_expert` are a
-// pd_moe_align_bm(bm = group) layout over the SAME idx the pair kernel reads;
+// pd_moe_align_bm(bm = group) layout over the same idx the pair kernel reads;
 // `group` is 8, 16 or 32 (the caller elects it from rows/n_expert - a whole
 // expert per block is the point). Output layout is the pair kernel's, so the
 // down kernel and the quantize between them are unchanged.
@@ -460,7 +460,7 @@ int pd_kquant_moe_down(const void* down_data, const void* down_scales,
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if ((pd_kq_has_mu(ddt)) && fsums == nullptr)
         return cudaErrorInvalidValue;
-    dim3 grid(batch, embd);   // column SLOW - see the kernel note
+    dim3 grid(batch, embd);   // column slow - see the kernel note
     pd_pdl_go(pd_kquant_moe_down_kernel<false>, grid, 32u * n_active, 0u, (cudaStream_t)stream,
         (const uint8_t*)down_data, (const uint8_t*)down_scales,
         (const unsigned int*)idx, (const float*)topk_w, (const int8_t*)fq,
@@ -470,12 +470,12 @@ int pd_kquant_moe_down(const void* down_data, const void* down_scales,
 }
 
 // ---- column-tiled down (the prefill class, slot 587) -----------------------
-// The plain down kernel above computes ONE output float per block: 10 warps
+// The plain down kernel above computes one output float per block: 10 warps
 // each walk their slot's 640-weight row with 1.25 windows per lane, then the
 // block folds and writes. ncu: SM 32% of peak, DRAM 21%, 57% warps active -
 // nothing is saturated, the block is waiting on its own dependent loads with
 // no other work to hide them. Here a block owns COLS columns instead of one:
-// the activation window is loaded ONCE and reused across the COLS weight rows,
+// the activation window is loaded once and reused across the COLS weight rows,
 // so each lane carries COLS independent dot chains and the row loads overlap.
 //
 // BIT-IDENTICAL to the plain kernel: per (token, column, slot) the same
@@ -583,15 +583,15 @@ int pd_kquant_moe_down_cols(const void* down_data, const void* down_scales,
 }
 
 // ---- REGISTER-TILED grouped gate+up (the wave-prefill class, slot 592) ----
-// The grouped pair kernel above pays one block per (expert group, OUT ROW), so
+// The grouped pair kernel above pays one block per (expert group, out ROW), so
 // it re-reads the group's activations for every one of the ff output rows: 47
 // GB a layer at a 2114-row wave with in_dim 2560 and a 16-row group, which is
 // what it was actually waiting on. (The evidence that it is TRAFFIC and not
 // unpack: a 32-row group unpacks 237M windows against a 16-row group's 369M
-// and is SLOWER - 10.80 vs 8.97 ms a layer - because it moves 60 GB instead
+// and is slower - 10.80 vs 8.97 ms a layer - because it moves 60 GB instead
 // of 47.)
 //
-// Here a block owns BM routed rows x BN output columns and stages BOTH sides
+// Here a block owns BM routed rows x BN output columns and stages both sides
 // of a BK slice once: the activations land in shared, and the weight windows
 // are UNPACKED into shared as int8 with their per-window scales. Every thread
 // then owns TN whole columns of one row, so its dots need no cross-thread
@@ -743,7 +743,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_tile_kernel(
     }
 }
 
-// The register-tiled DOWN twin (slot 593). Same tile as the gate+up pair
+// The register-tiled down twin (slot 593). Same tile as the gate+up pair
 // above - BM routed rows x BN output columns, both operands staged per BK
 // slice, a thread owning whole dots - but its activations are the SORTED
 // pairs' swiglu rows (`fq`, pair-major) and its output is the per-(pair,
@@ -945,11 +945,11 @@ int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
 // per output column: a 2114-row wave walk is 2114 x 2560 x 400 window unpacks
 // a layer, and down owned 42% of it. Here a block owns (expert group, column
 // tile) off the same moe_align CSR the grouped gate_up reads: the group's
-// activation rows are staged ONCE into shared, and each column's weight row is
-// unpacked ONCE and walked against all of them. Unpack falls by the rows per
+// activation rows are staged once into shared, and each column's weight row is
+// unpacked once and walked against all of them. Unpack falls by the rows per
 // group, the fq re-reads by the columns per block.
 //
-// A grouped block holds pairs of DIFFERENT tokens, so it cannot fold the slots
+// A grouped block holds pairs of different tokens, so it cannot fold the slots
 // itself - it writes one partial per (pair, column) and `pd_moe_part_fold_at`
 // sums them in ascending slot order, which is the fold order the ungrouped
 // kernel used inside its block. Per (pair, column) the dot keeps the plain
@@ -999,7 +999,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_down_grp_kernel(
 
     const uint32_t ddb = pd_kq_datab(ddt), dscb = pd_kq_scb(ddt);
     const bool mu = pd_kq_has_mu(ddt);
-    // One column at a time per warp, and the row loop is NOT unrolled: with
+    // One column at a time per warp, and the row loop is not unrolled: with
     // the group's rows unrolled (or held as a register tile of columns) the
     // kernel compiled to 128 registers, which is 2 blocks an SM and 33% of
     // warps - and ncu then put it at 39% of L1 throughput with DRAM at 3.5%,
@@ -1125,7 +1125,7 @@ int pd_moe_part_fold_at(const void* part, void* out, uint32_t embd, uint32_t o0,
 // seven waves nearly every token holds an in-wave pair in every wave, so a
 // per-(column, token) block ran once per wave with nine of its ten warps
 // skipping - 18 ms a launch at 435 tokens, 57% of the prefill (nsys).
-// Here a block owns ONE token from the wave's token list and walks that
+// Here a block owns one token from the wave's token list and walks that
 // token's in-wave pairs in order (1-3 of them): the pair's fq row + scales
 // are staged to smem once, every thread computes a strided set of output
 // columns over the whole 640-deep row, and the topk-weighted sum lands in

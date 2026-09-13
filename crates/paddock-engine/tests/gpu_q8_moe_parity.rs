@@ -814,7 +814,7 @@ fn f8row_case(
         let mut d_fs = exec.alloc(max_blocks * bm * ff / 32).expect("fs");
         exec.stream.memset_zeros(&mut d_fq).expect("zero fq");
         exec.stream.memset_zeros(&mut d_fs).expect("zero fs");
-        // e4m3-OUT epilogue: this is the arm the flat-scale down half needs,
+        // e4m3-out epilogue: this is the arm the flat-scale down half needs,
         // and it is the one the serve path runs when both halves are on, so it
         // is the one worth gating. The int8-out twin is the same GEMM.
         exec.f8row_moe_gate_up_mma_geglu_f8(

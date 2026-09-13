@@ -1463,7 +1463,7 @@ mod tests {
         m.observe(&o);
         let s = m.render(Format::OpenMetrics, 0);
         assert!(s.ends_with("# EOF\n"));
-        // Counter family named without _total, sample WITH.
+        // Counter family named without _total, sample with.
         assert!(s.contains("# TYPE paddock_prompt_tokens counter"));
         assert!(s.contains("paddock_prompt_tokens_total{"));
         assert!(!s.contains("# TYPE paddock_prompt_tokens_total"));

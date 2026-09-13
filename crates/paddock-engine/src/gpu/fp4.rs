@@ -963,7 +963,7 @@ impl GpuExecutor {
     // ---- modelopt NVFP4 checkpoint planes  ----------------------
 
     /// Whether the checkpoint-NVFP4 consumers (dequant oracle + W4A16 GEMV)
-    /// can actually run HERE.
+    /// can actually run here.
     ///
     /// The symbol test alone is not an answer, and used to be the whole test.
     /// `pd_nvf4_gemv` is exported unconditionally; its real body is compiled
@@ -1072,7 +1072,7 @@ impl GpuExecutor {
     /// `_tm` kernel twins read: `[row_tile 128][k_stage 128][row]`, weights
     /// (64 B/row/stage) and e4m3 scale records (8 B/row/stage) each
     /// contiguous per (tile, stage) block, rows padded to 128 and
-    /// ZERO-filled (a pad row decodes as 0 x scale-byte-0 = 0.0, and every
+    /// zero-filled (a pad row decodes as 0 x scale-byte-0 = 0.0, and every
     /// consumer guards its stores at `out_dim`). Same bytes per logical
     /// element as [`Self::nvf4_upload`] - the twins are bit-exact per class
     /// - but the tensor-core head's per-stage cp.async becomes one
@@ -1803,6 +1803,80 @@ impl GpuExecutor {
                     self.stream_ptr(),
                 )
             });
+        }
+        // Decode-width f4t (GB10 2026-09-10, rival-gap audit): on dies under
+        // 128 SMs the fp4 FFN decode GEMM is the whole c8 gap to vLLM - the
+        // cp.async decode arms (f4cn / f4cd) stream the qwen3.8 planes at
+        // 168-181 GB/s where CUTLASS streams the same bytes at 222/207 and
+        // this die's D2D memcpy at ~236. The TMA-fed f4t tile, batch padded
+        // to its 128-row tile, streams them at 206/186 (B=8, cold:
+        // gate_up 486 vs 554-598 us, down 270 vs 300-307;
+        // bench/nv4_dec_f4t_probe.cu) - the binder is the per-thread 16 B
+        // load path, not the die. Serving: c8 70.0 -> 74.8 tok/s, 128-c8
+        // 70.2 -> 75.0. Stores are masked to `batch` and the activation
+        // tensor map is sized to `batch` rows (OOB zero-fill), so the
+        // batch-row y is safe; same per-acc K order as f4c: bit-exact
+        // (probe diffs 0 at B=8/16/32). Elected at batch <= 32 (the f4cn
+        // band) on sm_count < 128; the 188-SM die keeps its measured arms
+        // until f4t is measured there. PADDOCK_NVF4_F4T_DECODE=1 forces it
+        // anywhere, =0 kills it.
+        static F4T_DEC: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        let f4t_dec_pin = *F4T_DEC.get_or_init(|| {
+            paddock_models::dev_var!("PADDOCK_NVF4_F4T_DECODE")
+                .ok()
+                .map(|v| v != "0")
+        });
+        let f4t_dec = f4t_dec_pin.unwrap_or(self.sm_count() < 128);
+        if f4t_dec && f4t_on && batch <= 32 && w.in_dim.is_multiple_of(256) {
+            // f4tn (slot 597, GB10 2026-09-10): f4t's loader and fragment plan
+            // over a 32-column batch tile - no phantom rows, 2 CTA/SM. Same
+            // per-acc K order as f4t / f4c: bit-exact (bench/nv4_dec_f4t_probe.cu).
+            // Elected first wherever the pack carries it; f4t stays the
+            // fallback (older packs, PADDOCK_NVF4_F4TN=0).
+            static F4TN_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let f4tn_on = *F4TN_ON.get_or_init(|| {
+                paddock_models::dev_var!("PADDOCK_NVF4_F4TN")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+            });
+            if f4tn_on && let Some(ftn) = self.kernels.nvf4_gemm_f4tn {
+                // SAFETY: ABI contract; geometry validated above; f4tn masks
+                // its stores to `batch` rows
+                return check(unsafe {
+                    ftn(
+                        dp as *const _,
+                        sp as *const _,
+                        bp,
+                        xqp as *const _,
+                        xsp as *const _,
+                        yp as *mut _,
+                        w.scale2,
+                        w.in_dim as u32,
+                        w.out_dim as u32,
+                        batch as u32,
+                        self.stream_ptr(),
+                    )
+                });
+            }
+            if let Some(ft) = self.kernels.nvf4_gemm_f4t {
+                // SAFETY: ABI contract; geometry validated above; f4t masks its
+                // stores to `batch` rows
+                return check(unsafe {
+                    ft(
+                        dp as *const _,
+                        sp as *const _,
+                        bp,
+                        xqp as *const _,
+                        xsp as *const _,
+                        yp as *mut _,
+                        w.scale2,
+                        w.in_dim as u32,
+                        w.out_dim as u32,
+                        batch as u32,
+                        self.stream_ptr(),
+                    )
+                });
+            }
         }
         // Decode narrow-tile arm: the BN=32 / WR=144 twin at
         // launch_bounds(256,2) => 2 CTA/SM. The wide f4c tile (88 KB smem,

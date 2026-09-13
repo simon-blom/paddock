@@ -10,6 +10,7 @@ import { useReadinessStore } from '@/stores/readiness'
 import { useFleetStore } from '@/stores/fleet'
 import { useUpdatesStore } from '@/stores/updates'
 import { friendlyModelName, isVisionModel } from '@/lib/model-caps'
+import { fleetLabel, fleetVendor } from '@/lib/model-name'
 import { effectiveModelId, selectStudioModel } from '@/lib/select-model'
 import { fmtBytes, fmtEta, fmtRate } from '@/lib/format'
 import Icon from '@/components/Icon.vue'
@@ -147,9 +148,12 @@ const pickerOptions = computed(() => {
   return [
     {
       value: id,
-      label: m?.display ?? friendlyModelName(id),
+      // fleet first, then the catalog: a stopped model is by definition not
+      // in the running list, so asking the fleet alone dropped the maker's
+      // mark and the proper name exactly on the older chats this row is for
+      label: fleetLabel(id),
       hint: m?.cloud ? m.cloud.endpointName : 'not running',
-      vendor: m?.vendor,
+      vendor: fleetVendor(id),
       title: `${id} - not running`,
     },
     ...opts,
@@ -164,7 +168,9 @@ const modelSel = computed<string | number>({
 const compareLanes = computed(() =>
   (chat.active?.compareModels ?? []).map((id) => {
     const m = models.models.find((x) => x.id === id)
-    return { id, label: m?.display ?? friendlyModelName(id), vendor: m?.vendor, spec: m?.spec }
+    // same fallback as the not-running picker row: a compare lane can name a
+    // model that has since stopped
+    return { id, label: fleetLabel(id), vendor: fleetVendor(id), spec: m?.spec }
   }),
 )
 /** The lane's speculation mechanism, worn beside the name like the vision

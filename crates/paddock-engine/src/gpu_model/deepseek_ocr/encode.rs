@@ -19,7 +19,7 @@
 //! Faithfulness notes, each one a silent-wrong if missed:
 //!  * the two halves run different activations (SAM erf-GELU, CLIP quick-GELU)
 //!    and different LayerNorm eps (1e-6 / 1e-5) - module doc in `vision.rs`.
-//!  * window padding is ZERO-padding of the NORMED stream, and the pad rows go
+//!  * window padding is zero-padding of the NORMED stream, and the pad rows go
 //!    through the QKV GEMM (their k/v become pure bias) exactly as the
 //!    reference's `F.pad` -> `qkv` does. They are dropped at unpartition; out
 //!    proj runs on the unpartitioned (real) rows only, which is legal because

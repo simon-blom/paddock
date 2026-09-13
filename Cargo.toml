@@ -207,7 +207,7 @@ lto = "thin"
 # and the CUDA kernels ship as disassemblable SASS regardless), just declining
 # to publish the function names.
 #
-# `panic` stays at the default `unwind` DELIBERATELY. Under `abort` a single
+# `panic` stays at the default `unwind` deliberately. Under `abort` a single
 # panicking request would take the engine thread and every other in-flight
 # request with it, which is the opposite of the crash-isolation the runner
 # split exists for.

@@ -515,7 +515,7 @@ fn render_heif(bytes: &[u8], max: u32) -> Result<Vec<u8>, paddock_heif::Error> {
     let img = image::RgbImage::from_raw(r.width, r.height, r.rgb)
         .ok_or_else(|| paddock_heif::Error::Decode("decoded plane is the wrong size".into()))?;
 
-    // Only ever DOWN. A 400px photo asked for at max=1600 stays 400px rather
+    // Only ever down. A 400px photo asked for at max=1600 stays 400px rather
     // than becoming a blurry 1600, which is what a naive `resize` would do.
     let long = img.width().max(img.height());
     let img = if long > max {

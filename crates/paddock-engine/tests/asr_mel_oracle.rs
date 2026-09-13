@@ -1,6 +1,6 @@
 //! Numeric gate for the ASR mel frontend: the Rust pipeline
 //! must reproduce transformers' Qwen3ASRFeatureExtractor - the checkpoint's
-//! declared extractor and the TRUE-correctness oracle - on the committed
+//! declared extractor and the true-correctness oracle - on the committed
 //! battery in tests/data/asr-mel (regenerate with
 //! Our ASR oracle tool; see that script for the pinned
 //! semantics). Host-only, no GPU.

@@ -1250,7 +1250,7 @@ int pd_q8_0_moe_down_mma(const void* down_data, const void* down_scale,
 // scales at +64 -- the exact layouts the mma body reads). All guards
 // zero-fill (cp.async src-size 0), reproducing the shipped stages' exact
 // zeros. One commit_group per call, at the call site.
-// FS64 (P1 dn64): Y scales are PER-64 groups (xs at in_dim/64 stride); each
+// FS64 (P1 dn64): Y scales are per-64 groups (xs at in_dim/64 stride); each
 // per-32 slot pair gets the group value DUPLICATED (L2-hot dup reads), so
 // the tile layout - and any non-restructured fold - stays verbatim.
 template <bool FS64 = false>
@@ -1547,7 +1547,7 @@ __global__ void __launch_bounds__(256, PD_QMMA2_OCC_GU) pd_q8_0_moe_gate_up_mma2
         }
     }
     } else {
-    // Y64 (P1 dn64): PER-64 scale groups. Column c's 64-span [row_base,
+    // Y64 (P1 dn64): Per-64 scale groups. Column c's 64-span [row_base,
     // row_base+64) is split across the two warps sharing joff (i0 = 0/32);
     // pair abs-max via a 32x2 smem plane (the ring is dead post-loop), then
     // each warp quantizes its own 32-span with the shared scale. All warps
@@ -2517,7 +2517,7 @@ int pd_q8_0_moe_down_mma2_pbf16(const void* down_data, const void* down_scale,
     return pd_launch_status();
 }
 
-// P1 dn64 producer: mma2g twin quantizing the GEGLU output with PER-64
+// P1 dn64 producer: mma2g twin quantizing the GEGLU output with per-64
 // scale groups (fs at ff/64 stride). Same signature as the mma2g launcher;
 // ff % 64 required (full 64-row windows; gemma4-A4B's 704 qualifies).
 PD_EXPORT
@@ -2547,7 +2547,7 @@ int pd_q8_0_moe_gate_up_mma2g_y64_geglu(const void* gate_data, const void* gate_
     return pd_launch_status();
 }
 
-// P1 dn64 consumer: v2 down consuming PER-64 Y scales (fs at ff/64 stride,
+// P1 dn64 consumer: v2 down consuming per-64 Y scales (fs at ff/64 stride,
 // pair-grouped fold); trailing pbf16 flag selects the bf16 partials store
 // (P1-1 composition). Plain-ring LDM form only - table entry is nullptr on
 // NT/YSYNC/no-LDM builds so the lane gates itself off.

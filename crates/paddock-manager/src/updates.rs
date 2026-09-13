@@ -349,7 +349,7 @@ pub async fn download(latest: &LatestVersion, dl: Arc<Download>) {
         return dl.fail(format!("cannot create {}: {e}", dir.display()));
     }
 
-    // Name it after what it IS. The Content-Disposition filename is the
+    // Name it after what it is. The Content-Disposition filename is the
     // publisher's, and two releases could share it; version + platform cannot
     // collide with another release of ours.
     let name = format!("paddock-{}-{}.zip", latest.version, release_platform());
@@ -542,7 +542,7 @@ mod tests {
     ///
     /// Worth having despite the network, because it is the only check that the
     /// URL and platform string are right end to end - and getting those wrong
-    /// fails SILENTLY. traverse shipped exactly that: its 0.8.2 notes read "the
+    /// fails silently. traverse shipped exactly that: its 0.8.2 notes read "the
     /// version check previously queried with the wrong platform identifier and
     /// never found new releases", i.e. every user was told they were current,
     /// forever, and no error was ever raised. A fixture cannot catch it.

@@ -1,4 +1,4 @@
-# Stage OUR prebuilt pdfium without building it. Windows twin of fetch.sh.
+# Stage our prebuilt pdfium without building it. Windows twin of fetch.sh.
 #
 #   powershell -File packs\pdfium\fetch.ps1                    # win-x64, the host
 #   powershell -File packs\pdfium\fetch.ps1 -Platform linux-x64

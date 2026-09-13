@@ -148,18 +148,26 @@ pub(super) fn host_top64(row: &[f32]) -> Vec<(u32, f32)> {
 /// Varlen chunked-GDN route gate - the same env chain the unified tick's
 /// `vl_route` static checks (GDN formulation band); kept in
 /// sync by hand because that one is fn-local. Kill: PADDOCK_NO_DNC_VL.
-/// DeltaNet state checkpoints the prefix cache holds PER SEATED SLOT.
+/// DeltaNet state checkpoints the prefix cache holds per seated slot.
 ///
 /// Sized by demand, not by the card. Each checkpoint is a whole recurrent-state
 /// snapshot (~150 MiB f32 on the 27B: 48 GDN layers of state + conv window),
-/// and the working set a slot generates is its own conversation at the two
-/// `ckpt_cuts` per prompt that multi-turn needs - so two per slot covers every
-/// seated session's latest turn with one to spare. Until 2026-09-06 the pool
-/// was a fifth of the grant regardless of width: 11.5 GiB of snapshots on a
-/// 96 GB card for a single-slot server that could use a handful, measured
-/// against vLLM's on-demand state pages and SGLang's int8 idle store as the
-/// largest single policy term in paddock's one-slot 262k floor.
-pub(super) const STATE_CKPTS_PER_SLOT: u64 = 2;
+/// and the working set a slot generates is its own conversation: the two
+/// `ckpt_cuts` per prompt plus the reply checkpoint (prefix.rs stage F) -
+/// three per turn. But the pool is a plain LRU and an agentic cohort's turns
+/// arrive as a WAVE: every slot's new cuts land before the later slots have
+/// touched theirs, so one wave of demand (three per slot) is not enough -
+/// the wave steals its own not-yet-used cuts and every session past the
+/// second falls back to the shared prefix (GB10 2026-09-12: eight sessions,
+/// every c8 turn resumed at the system-prompt cut with two per slot). Two
+/// waves is the floor at which every session's latest cut survives the
+/// cohort's next wave; the plan still shrinks the pool into what the grant
+/// has left (`state_ckpt_count`). Until 2026-09-06 the pool was a fifth of
+/// the grant regardless of width: 11.5 GiB of snapshots on a 96 GB card for
+/// a single-slot server that could use a handful, measured against vLLM's
+/// on-demand state pages and SGLang's int8 idle store as the largest single
+/// policy term in paddock's one-slot 262k floor.
+pub(super) const STATE_CKPTS_PER_SLOT: u64 = 6;
 /// Floor: keeps prefix reuse alive at width 1 and on small cards - a 16-turn
 /// restore window for one conversation. Mandatory: below it the plan refuses
 /// rather than serve without a prefix cache.
@@ -178,7 +186,7 @@ pub(super) const STATE_CKPTS_MAX: u64 = 256;
 /// the widest spread of its ladder (30.8%, one leg at 1743) rather than the
 /// win its slot count promised.
 ///
-/// `leftover` is what the grant has left once every OTHER term is charged: the
+/// `leftover` is what the grant has left once every other term is charged: the
 /// other reserves, the seated slots' state, and a full-context KV pool. The
 /// pool takes its demand out of that and never out of the KV a slot was
 /// promised, so a card that can seat the configuration but not the whole
@@ -274,7 +282,7 @@ impl GpuQwen35 {
 
     fn enable_batch_sized(&mut self, requested: usize) -> Result<usize, GpuModelError> {
         // Profile the serving scratch at load. The widest prefill pass the
-        // scheduler can issue is allocated HERE, before the grant is read, so
+        // scheduler can issue is allocated here, before the grant is read, so
         // the plan meets its true cost in the ledger instead of a constant: it
         // was charged 3 GiB and measured 6.17 GB on the 27B at 8192 rows, the
         // difference riding on the 40% hedge this replaced. When the plan
@@ -747,6 +755,8 @@ impl GpuQwen35 {
             tier,
             mtp_cover: std::collections::HashSet::new(),
             dflash_cover: std::collections::HashSet::new(),
+            seq: vec![Vec::new(); max_batch],
+            reply_ckpt: vec![None; max_batch],
             kv_k,
             kv_v,
             recur,
@@ -1325,6 +1335,12 @@ impl GpuQwen35 {
     /// A freed slot's device block-table entries go stale but are never read (an
     /// inactive slot is re-cleared and regrown at its next prefill).
     pub fn release_inactive_slots(&mut self, occupied: &[bool]) {
+        let n_slots = self.batch.as_ref().map_or(0, |b| b.tables.len());
+        for slot in 0..n_slots {
+            if occupied.get(slot).copied() != Some(true) {
+                self.reply_release(slot);
+            }
+        }
         let Some(bs) = self.batch.as_mut() else {
             return;
         };
@@ -1382,7 +1398,7 @@ impl GpuQwen35 {
         self.last_reused.get_mut(slot).map_or(0, std::mem::take)
     }
 
-    /// Lever 1: batched WHOLE-prompt prefill - fuse the admitted cohort into one
+    /// Lever 1: batched whole-prompt prefill - fuse the admitted cohort into one
     /// weight-amortized forward per cap-sized group, instead of the serial
     /// per-prompt default that re-reads the 256-expert MoE once per prompt (the
     /// c32 TTFT stall). Every
@@ -4647,6 +4663,9 @@ impl GpuQwen35 {
             };
             self.dflash_append_features(tokens, positions, slots_v, None)?;
         }
+        // stage F: the rows' states advanced in this pass (stream-ordered
+        // behind it, ahead of the ids readback below)
+        self.reply_after_rows(tokens, positions, slots)?;
         let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
         // folded launches: this site writes mode 5 for every trunc row (no
         // mode 6 exists here), so the p chain was 11 launches of nothing
@@ -4833,6 +4852,7 @@ impl GpuQwen35 {
         // match+restore the cached prefix (sets mrope_delta, last_reused, seeds the
         // slot's KV table + DeltaNet state). `done` = resume position: the fused
         // tick covers only tokens[done..], attending the adopted prefix in KV.
+        self.reply_track_admit(slot, &tokens);
         let done = self.prefix_resume_begin(slot, &tokens)?;
         self.chunked.push(ChunkedPrefill {
             slot,
@@ -5225,6 +5245,13 @@ impl GpuQwen35 {
         // scheduler can pump decode-lane ticks between the two halves).
         self.unified_launch_core(decodes, budget, plans, fin_plans)?;
         self.dflash_flush_pending_append()?;
+        // stage F: the decode rows' states advanced in the span
+        {
+            let toks: Vec<u32> = decodes.iter().map(|&(_, t, _)| t).collect();
+            let pos: Vec<u32> = decodes.iter().map(|&(_, _, p)| p).collect();
+            let sl: Vec<u32> = decodes.iter().map(|&(k, _, _)| k as u32).collect();
+            self.reply_after_rows(&toks, &pos, Some(&sl))?;
+        }
         self.unified_finish_core()
     }
 
@@ -5372,6 +5399,28 @@ impl GpuQwen35 {
         let mut shares: Vec<(usize, usize, usize, usize, bool, Vec<u32>)> = Vec::new();
         let mut room = cap;
         let mut fuse_stages = 0usize;
+        // FINISHING-SHARE OVERDRAW (GB10 2026-09-10, rival-gap audit §3): a
+        // prompt whose checkpoint-tail walk is cut short by `room` hitting
+        // the cap used to leave its last <= TAIL_SLOP rows to a tick of
+        // their own - a full weight pass (~120 ms on this die) for eight
+        // rows: the 1032-row class prompt against the 1024-row cap ran
+        // 1008 + 16 in one tick and 8 in the next (chunk-start -> prefilled
+        // 513 ms where the single pass is ~400). The fuse walk may now
+        // overdraw the cap by up to TAIL_SLOP rows for the share that
+        // FINISHES the prompt (never for a body share, never for the next
+        // prompt's head - the cap-1100 A/B showed a head riding early costs
+        // the cohort a tick per prompt). Same bound the absorb branch above
+        // keeps: a tick is at most cap + TAIL_SLOP rows and only one prompt
+        // can extend (room is 0 afterwards, so the outer loop stops).
+        // PADDOCK_NO_CKPT_OVERDRAW reverts.
+        static NO_OVERDRAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut overdraw = if *NO_OVERDRAW
+            .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_CKPT_OVERDRAW").is_some())
+        {
+            0
+        } else {
+            TAIL_SLOP
+        };
         for (idx, ch) in self.chunked.iter().enumerate() {
             if room == 0 {
                 break;
@@ -5399,14 +5448,14 @@ impl GpuQwen35 {
             // 2026-09-07): the fused-tail budget below is the two stage blobs,
             // so in a cold cohort only the first prompt (or two) gets its
             // checkpoint tails fused into this tick; every other prompt's
-            // <=16-row tails ride LATER ticks, one full weight pass each. On
+            // <=16-row tails ride later ticks, one full weight pass each. On
             // a 273 GB/s die a pass is ~350 ms regardless of rows (launch +
             // stream fixed cost), so an 8-prompt 143-row cohort took three
             // ticks (1.37 s to the median first token) where one 1144-row
             // tick is 0.53 s; `PADDOCK_CKPT_ABSORB=1` measured 615 ms at
             // 128x128 c8 and 3257 vs 3717 ms at 1024x1024 c8, c1 unchanged.
             // So once the stage budget is spent, the remaining prompts of the
-            // tick run WHOLE (no cut) - they trade their resumable prefix
+            // tick run whole (no cut) - they trade their resumable prefix
             // checkpoint for finishing in this tick; the prompts that got
             // the blobs keep theirs. On 188-SM dies a tail tick is ~30 ms
             // and the cut stays (unmeasured there in this shape).
@@ -5488,13 +5537,26 @@ impl GpuQwen35 {
             // finish-side takes the live snapshot for an unfused landing).
             if fuse && cut_at_ckpt {
                 let mut from = ch.done + take;
-                while room > 0 && fuse_stages < CKPT_STAGE_BLOBS && from < ch.tokens.len() {
+                while (room > 0 || overdraw > 0)
+                    && fuse_stages < CKPT_STAGE_BLOBS
+                    && from < ch.tokens.len()
+                {
                     let next_stop = cuts
                         .iter()
                         .copied()
                         .find(|&b| b > from)
                         .unwrap_or(ch.tokens.len());
-                    let t2 = (next_stop - from).min(room);
+                    let need = next_stop - from;
+                    // the finishing share may overdraw the cap by the slop
+                    // (bounded once per tick); body shares stay under it
+                    let t2 = if need <= room {
+                        need
+                    } else if next_stop == ch.tokens.len() && need <= room + overdraw {
+                        overdraw -= need - room;
+                        need
+                    } else {
+                        room
+                    };
                     if t2 == 0 {
                         break;
                     }
@@ -7274,7 +7336,7 @@ impl GpuQwen35 {
                     // bit-identical to the norm + standalone-quantize pair.
                     // f8t out_w arm excluded: it needs the f32 d_core + the
                     // row-quant seam, not the linear e4m3 planes. Without this
-                    // guard, an f8t in_qkv tick that ALSO has lw8 (the arms
+                    // guard, an f8t in_qkv tick that also has lw8 (the arms
                     // overlap once w8_min < r, e.g. the shipped w8_min=0) runs
                     // the fused norm, skips the d_core store, and the f8t out
                     // arm below then row-quants a stale d_core -> corrupt out
@@ -8655,7 +8717,7 @@ impl GpuQwen35 {
     /// ever receives them when the pack ships slot 435 (the service gates
     /// on supports_device_trunc), so full-device is the only pipe form.
     /// Launch fold for the sampler chains (nemotron's (any5,any6)
-    /// fold ported): launch only the chains this tick's rows NEED. The
+    /// fold ported): launch only the chains this tick's rows need. The
     /// elected qwen truncation (top_k 20) is pure mode 5, so without this
     /// every tick also paid the 11-launch mode-6 nucleus chain (and the
     /// base modes-1/2 kernel) for zero rows. PADDOCK_NO_SAMP_FOLD=1
@@ -8792,7 +8854,7 @@ impl GpuQwen35 {
                 exec.stream.memcpy_htod(&tpar, &mut t).map_err(drv)?;
             }
         }
-        // advance the DEVICE-dependent inputs from the previous ring's out plane
+        // advance the device-dependent inputs from the previous ring's out plane
         if advance {
             let prev = ((tick + 1) % 2) as usize;
             let bs = self.batch.as_mut().expect("batch enabled");

@@ -582,7 +582,7 @@ enum AttachPlan {
     /// open bucket, fold this scrape normally.
     Fold,
     /// A fresh persisted full state: seed the loop with it and fold this
-    /// scrape as a normal delta - a quick manager restart loses NOTHING.
+    /// scrape as a normal delta - a quick manager restart loses nothing.
     Seed(Snapshot),
     /// Totals read failed: fold nothing, re-attach on the next scrape.
     Skip,

@@ -38,7 +38,7 @@
 // TK*HD halves, V region TK*row_e halves; the strip needs TK*HD bytes) so
 // the port costs zero extra smem. Register-staged per region - the half
 // writes cover the strip bytes they read - K wave then V wave so one wave's
-// chunks are live across a barrier at a time. Rows >= nkeys ZERO-fill here,
+// chunks are live across a barrier at a time. Rows >= nkeys zero-fill here,
 // not at stage time: the f16 path's swizzled zero stores would overlap the
 // strip byte range and race the strip cp.asyncs. (Zero-fill also kills the
 // stale-e4m3 NaN hazard: 0x7f/0xff decode to NaN and would poison the PV
@@ -1918,7 +1918,7 @@ pd_attn_prefill_pf6g_kernel(
             }
             // V rank slice STRAIGHT into the swizzled e4m3 B image (2
             // column tiles of [TK x 128B]): local 16B unit u of band t <->
-            // global unit t*16 + crank*8 + u. Tail rows ZERO-fill - stale
+            // global unit t*16 + crank*8 + u. Tail rows zero-fill - stale
             // e4m3 bytes can decode NaN and 0 x NaN poisons the accumulate.
             for (uint32_t i = tid; i < TK * (HDH / 16u); i += 256u) {
                 const uint32_t kr = i / (HDH / 16u), l = i - kr * (HDH / 16u);

@@ -568,7 +568,7 @@ pub async fn run(
                 cfg.mtp.as_deref()
             };
             let id = cfg.served_model_name.clone().unwrap_or(id);
-            let m = serving::load(
+            let m = serving::load_with(
                 id,
                 path,
                 &cfg.device,
@@ -581,6 +581,7 @@ pub async fn run(
                 cfg.fp8_native.as_deref(),
                 // config carries MiB (nvidia-smi units); the engine takes bytes
                 cfg.vram_budget.map(|mib| mib << 20),
+                cfg.max_image_tokens,
             )?;
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;

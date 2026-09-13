@@ -2532,7 +2532,7 @@ mod tests {
     }
 
     /// Was `openai_list_keeps_only_chat_models_and_stamps_reasoning`, and it
-    /// used to assert whisper-1 and gpt-4o-transcribe were kept OUT. They are
+    /// used to assert whisper-1 and gpt-4o-transcribe were kept out. They are
     /// offered now: the rule was never "chat only", it was "only
     /// what we can serve", and a transcriber became something we can serve.
     /// `openai_native_speech_models_are_offered_and_marked` owns that side.

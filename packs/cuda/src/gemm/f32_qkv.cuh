@@ -737,6 +737,169 @@ pd_gemm_tf32_nt_kernel(const float* __restrict__ w, const float* __restrict__ x,
         }
 }
 
+// The WIDE 3xTF32 tile (GB10, 2026-09-11): the
+// 32x32 tile above is staging-bound at ~10 TF/s useful on the 48-SM die -
+// PREC 1 and PREC 3 time the same there too (bench/tf32_gb10_bench.cu: q
+// 2688->4096 at 1024 rows 2313 vs 2340 us), so the three mma per k8 are
+// free and what binds is the per-fragment work around them: each converted
+// A fragment feeds two n8 tiles and each B fragment one m16 tile, so every
+// mma pays ~4 cvt/fsub plus a scalar smem load. This tile is 128 x 128 per
+// CTA, 8 warps as 2 (m) x 4 (n), a 64 x 32 warp tile (4 m16 x 4 n8): a
+// converted A fragment serves four n8 tiles and a B fragment four m16
+// tiles, ~1.5 conversions per mma. BIT-EXACT vs the tile above by
+// construction - the per-element k sequence is unchanged: the same
+// cvt.rna split of A and B, the same three mma per k8 in the same order
+// (big.big, big.small, small.big), k8 ascending within the BK = 32 tile,
+// the same drain of the tile's mma chain into the RN accumulator (fac +=
+// acc; acc = 0) per BK tile, tiles ascending. Only the ownership of the
+// (m, n) pairs moves. Same smem geometry per row (stride SK = 36 floats,
+// conflict-free scalar fragment loads), 2 slots of 128 + 128 rows = 72 KB
+// dynamic smem, one CTA per SM. Elected for planes whose grid fills the
+// die (see pd_gemm_f32); k/v (out 256) stay on the 32x32 tile.
+template <uint32_t PREC>
+__global__ void __launch_bounds__(256, 1)
+pd_gemm_tf32_nt_wide_kernel(const float* __restrict__ w, const float* __restrict__ x,
+                            float* __restrict__ out, uint32_t in_dim,
+                            uint32_t out_dim, uint32_t batch) {
+    constexpr uint32_t BM = 128u, BN = 128u, BK = PD_RGEMM_BK, SK = BK + 4u;
+    constexpr uint32_t MT = 4u, NT = 4u;   // m16 tiles x n8 tiles per warp
+    extern __shared__ float pd_tfw_sh[];
+    float* xs = pd_tfw_sh;                      // [2][BM][SK]
+    float* ws = pd_tfw_sh + 2u * BM * SK;       // [2][BN][SK]
+    // Grouped raster (bit-exact: only which CTA owns which tile changes).
+    // The grid is 1-D; consecutive CTAs walk the n tiles of a GROUP of 8 m
+    // tiles before the next group, so a group's 8 x tiles (8 x 128 rows x
+    // K x 4 B = 11 MB at K 2688) stay in L2 while the w plane streams once
+    // per group. With the plain (m fastest) raster the x panel was
+    // re-streamed once per n tile - 32 x 81 MB at 7556 rows on the q plane,
+    // 14.5 ms against 3.0 at 2048 rows where the panel still fit (GB10
+    // 2026-09-11). The last group is the ragged tail.
+    const uint32_t mtiles = (batch + BM - 1u) / BM, ntiles = out_dim / BN;
+    constexpr uint32_t GROUP = 8u;
+    const uint32_t bid = blockIdx.x;
+    const uint32_t grp = bid / (GROUP * ntiles);
+    const uint32_t gm0 = grp * GROUP;
+    const uint32_t gsz = (gm0 + GROUP <= mtiles) ? GROUP : (mtiles - gm0);
+    const uint32_t rem = bid - grp * (GROUP * ntiles);
+    const uint32_t m0 = (gm0 + rem % gsz) * BM, n0 = (rem / gsz) * BN;
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+    const uint32_t gr = lane >> 2, t4 = lane & 3u;
+    const uint32_t wm = warp >> 2, wn = warp & 3u;   // warp tile origin: (wm*64, wn*32)
+    const uint32_t xr = tid >> 3, xk = (tid & 7u) * 4u;   // staging: row xr + 32j, 16 B at xk
+    float acc[MT][NT][4] = {};
+    float fac[MT][NT][4] = {};
+    auto cp16 = [](float* dst, const float* src, uint32_t bytes) {
+        const unsigned sm = (unsigned)__cvta_generic_to_shared(dst);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(sm),
+                     "l"(src), "r"(bytes));
+    };
+    auto stage = [&](uint32_t slot, uint32_t k0) {
+        float* xsl = xs + slot * BM * SK;
+        float* wsl = ws + slot * BN * SK;
+        #pragma unroll
+        for (uint32_t j = 0; j < BM / 32u; ++j) {
+            const uint32_t r = xr + 32u * j;
+            cp16(xsl + r * SK + xk, x + (size_t)(m0 + r) * in_dim + k0 + xk,
+                 m0 + r < batch ? 16u : 0u);
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < BN / 32u; ++j) {
+            const uint32_t r = xr + 32u * j;
+            cp16(wsl + r * SK + xk, w + (size_t)(n0 + r) * in_dim + k0 + xk, 16u);
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    stage(0u, 0u);
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += BK) {
+        const uint32_t slot = (k0 / BK) & 1u;
+        const bool more = k0 + BK < in_dim;
+        if (more) stage(slot ^ 1u, k0 + BK);
+        if (more) asm volatile("cp.async.wait_group 1;" ::: "memory");
+        else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        const float* xsl = xs + slot * BM * SK;
+        const float* wsl = ws + slot * BN * SK;
+        #pragma unroll
+        for (uint32_t k8 = 0; k8 < BK; k8 += 8u) {
+            uint32_t ab[MT][4], as[MT][4];
+            #pragma unroll
+            for (uint32_t mt = 0; mt < MT; ++mt) {
+                const float* ar = xsl + (wm * 64u + mt * 16u + gr) * SK + k8 + t4;
+                const float a0 = ar[0];
+                const float a1 = ar[8u * SK];
+                const float a2 = ar[4u];
+                const float a3 = ar[8u * SK + 4u];
+                ab[mt][0] = pd_bnt_tf32(a0); ab[mt][1] = pd_bnt_tf32(a1);
+                ab[mt][2] = pd_bnt_tf32(a2); ab[mt][3] = pd_bnt_tf32(a3);
+                if (PREC == 3u) {
+                    as[mt][0] = pd_bnt_tf32(a0 - __uint_as_float(ab[mt][0]));
+                    as[mt][1] = pd_bnt_tf32(a1 - __uint_as_float(ab[mt][1]));
+                    as[mt][2] = pd_bnt_tf32(a2 - __uint_as_float(ab[mt][2]));
+                    as[mt][3] = pd_bnt_tf32(a3 - __uint_as_float(ab[mt][3]));
+                }
+            }
+            #pragma unroll
+            for (uint32_t nt = 0; nt < NT; ++nt) {
+                const float* br = wsl + (wn * 32u + nt * 8u + gr) * SK + k8 + t4;
+                const float b0 = br[0];
+                const float b1 = br[4u];
+                uint32_t bb[2] = {pd_bnt_tf32(b0), pd_bnt_tf32(b1)};
+                uint32_t bs[2] = {0u, 0u};
+                if (PREC == 3u) {
+                    bs[0] = pd_bnt_tf32(b0 - __uint_as_float(bb[0]));
+                    bs[1] = pd_bnt_tf32(b1 - __uint_as_float(bb[1]));
+                }
+                #pragma unroll
+                for (uint32_t mt = 0; mt < MT; ++mt) {
+                    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]),
+                          "+f"(acc[mt][nt][2]), "+f"(acc[mt][nt][3])
+                        : "r"(ab[mt][0]), "r"(ab[mt][1]), "r"(ab[mt][2]), "r"(ab[mt][3]),
+                          "r"(bb[0]), "r"(bb[1]));
+                    if (PREC == 3u) {
+                        asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]),
+                              "+f"(acc[mt][nt][2]), "+f"(acc[mt][nt][3])
+                            : "r"(ab[mt][0]), "r"(ab[mt][1]), "r"(ab[mt][2]), "r"(ab[mt][3]),
+                              "r"(bs[0]), "r"(bs[1]));
+                        asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+f"(acc[mt][nt][0]), "+f"(acc[mt][nt][1]),
+                              "+f"(acc[mt][nt][2]), "+f"(acc[mt][nt][3])
+                            : "r"(as[mt][0]), "r"(as[mt][1]), "r"(as[mt][2]), "r"(as[mt][3]),
+                              "r"(bb[0]), "r"(bb[1]));
+                    }
+                }
+            }
+        }
+        // drain the tile's mma chain into the RN accumulator (the 32x32
+        // tile's two-level accumulation, per BK tile, verbatim)
+        #pragma unroll
+        for (uint32_t mt = 0; mt < MT; ++mt)
+            #pragma unroll
+            for (uint32_t nt = 0; nt < NT; ++nt)
+                #pragma unroll
+                for (uint32_t e = 0; e < 4u; ++e) {
+                    fac[mt][nt][e] += acc[mt][nt][e];
+                    acc[mt][nt][e] = 0.f;
+                }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint32_t mt = 0; mt < MT; ++mt)
+        #pragma unroll
+        for (uint32_t nt = 0; nt < NT; ++nt)
+            #pragma unroll
+            for (uint32_t e = 0; e < 4u; ++e) {
+                const uint32_t m = m0 + wm * 64u + mt * 16u + gr + (e >= 2u ? 8u : 0u);
+                const uint32_t n = n0 + wn * 32u + nt * 8u + 2u * t4 + (e & 1u);
+                if (m < batch) out[(size_t)m * out_dim + n] = fac[mt][nt][e];
+            }
+}
+#define PD_TFW_SMEM (2u * 2u * 128u * (PD_RGEMM_BK + 4u) * 4u)
+
 // row x TT tokens, lanes stride K by 32. The block-per-(o, tile) shape
 // re-read every x row once per OUTPUT (47 MB of L2 per 128x32 launch - the
 // 18.5 us/layer line in the c32 ledger); tiling outputs 8-wide cuts x
@@ -1053,7 +1216,17 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
         (in_dim % PD_RGEMM_BK) == 0u) {
         const uint32_t base = ((batch + 63u) / 64u) * (out_dim / 32u);
         const uint32_t S = base >= 376u ? 1u : (376u + base - 1u) / base > 16u ? 16u : (376u + base - 1u) / base;
-        if (S >= 2u)
+        // S == 1 (the grid already fills, from ~6k rows on 48 SMs) takes the
+        // same tiled kernel as one K window rather than falling through to
+        // the tile matvec, whose per-output x re-reads fall off L2 at that
+        // width (router 128 x 2688 at 7556 rows: 45 ms per 23-layer request
+        // against ~4 on the tile; GB10 2026-09-11). Same regroup class as
+        // the S >= 2 windows the band already ships.
+        // PADDOCK_NO_F32NT_KS1 pins the S == 1 case alone to the tile matvec
+        // (the pre-2026-09-11 route at >= 6k rows) - the narrow A/B; the
+        // broad PADDOCK_NO_F32NT_KS also pins the S >= 2 windows.
+        static const bool no_ks1 = pd_env("PADDOCK_NO_F32NT_KS1") != nullptr;
+        if (S >= 2u || (ks_small && !no_ks1))
             return pd_f32nt_ks_go((const float*)w, (const float*)x, (float*)out,
                                   in_dim, out_dim, batch, S, (cudaStream_t)stream);
     }
@@ -1204,7 +1377,7 @@ int pd_gemm_f32(const void* w, const void* x, void* out, uint32_t in_dim,
     // probe arm. PREC=3 is elected over PREC=1 because on these shapes the
     // kernel is STAGING-bound, not compute-bound -- 3 mma passes vs 1 measured
     // 1.00x/0.99x on q_proj/o_proj (342.1 vs 340.7 us, 348.5 vs 350.6), so the
-    // finer numerics are FREE. Both arms measured closer to the parity-pinned
+    // finer numerics are free. Both arms measured closer to the parity-pinned
     // serial reference than the f32 they replace (bulk-vs-serial mean |d|
     // 0.18814 -> 0.16544; resume 0.215193 -> 0.165267), because the SIMT
     // tile's accumulation ORDER was a bigger error source than tf32's mantissa.
@@ -1216,6 +1389,44 @@ int pd_gemm_f32(const void* w, const void* x, void* out, uint32_t in_dim,
         const char* e = pd_env("PADDOCK_GEMMF32_TF32");
         return e ? (e[0] == 'p' ? 1 : (atoi(e) != 0 ? 3 : 0)) : 3;
     }();
+    // The wide 128x128 tile (kernel above) where its grid fills the die
+    // three times over: out_dim a multiple of 128 and >= 3 CTAs per SM (one
+    // CTA per SM resident, so the wave tail must be small). Bit-exact vs the
+    // 32x32 tile (same k sequence), so the election is shape-only like the
+    // rest of this launcher; PADDOCK_GEMMF32_WIDE=0 pins the 32x32 tile (dev
+    // A/B). Measured on GB10 (bench/tf32_gb10_bench.cu, 0 differing bytes
+    // at every shape): q 2688->4096 at 1022 rows 2407 -> 1616 us (1.49x,
+    // 13.9 TF/s useful = the 3xTF32 mma roof of the die, ~43 TF/s issued),
+    // 2048 rows 4806 -> 2979 (1.61x); o 4096->2688 at 1022 rows 2185 ->
+    // 1647 (1.33x), 2048 rows 6044 -> 2906 (2.08x). With the grouped raster
+    // (below) the tile also wins at 512 rows (q 1.34x on 128 CTAs, o 1.27x
+    // on 84) and stays at the mma roof to 7556 rows (11.5 ms, 5.3x the
+    // 32x32 tile, whose x panel re-reads fall off L2 there), so the floor
+    // is 1.5 CTAs per SM: k/v (out 256) stay on the 32x32 tile below 2k
+    // rows, where the wide grid is 8-16 CTAs. On the 32x32 tile
+    // PREC 1 and PREC 3 time the same on this die as on the big one (it is
+    // staging-bound at ~10 TF/s useful); on this tile the three mma are the
+    // wall, so PREC 1 would be ~3x again - a precision-class decision;
+    // the shipped default stays PREC 3.
+    static const bool wide_off = pd_env("PADDOCK_GEMMF32_WIDE") &&
+                                 pd_env("PADDOCK_GEMMF32_WIDE")[0] == '0';
+    static int nsm_w = 0;
+    if (nsm_w == 0) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm_w, cudaDevAttrMultiProcessorCount, d); if (nsm_w <= 0) nsm_w = 148; }
+    if (gf_tf32 && !wide_off && (out_dim % 128u) == 0u && (in_dim % PD_RGEMM_BK) == 0u &&
+        2u * ((batch + 127u) / 128u) * (out_dim / 128u) >= 3u * (uint32_t)nsm_w) {
+        static bool attr1 = false, attr3 = false;
+        dim3 grid(((batch + 127u) / 128u) * (out_dim / 128u));   // grouped raster inside
+        if (gf_tf32 == 1) {
+            if (!attr1) { cudaFuncSetAttribute(pd_gemm_tf32_nt_wide_kernel<1u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_TFW_SMEM); attr1 = true; }
+            pd_gemm_tf32_nt_wide_kernel<1u><<<grid, 256, PD_TFW_SMEM, (cudaStream_t)stream>>>(
+                (const float*)w, (const float*)x, (float*)out, in_dim, out_dim, batch);
+        } else {
+            if (!attr3) { cudaFuncSetAttribute(pd_gemm_tf32_nt_wide_kernel<3u>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_TFW_SMEM); attr3 = true; }
+            pd_gemm_tf32_nt_wide_kernel<3u><<<grid, 256, PD_TFW_SMEM, (cudaStream_t)stream>>>(
+                (const float*)w, (const float*)x, (float*)out, in_dim, out_dim, batch);
+        }
+        return pd_launch_status();
+    }
     if (gf_tf32 && (out_dim % 32u) == 0u && (in_dim % PD_RGEMM_BK) == 0u) {
         dim3 grid((batch + 31u) / 32u, out_dim / 32u);
         if (gf_tf32 == 1)
@@ -3772,10 +3983,18 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
     // stands - arm + launcher are one change. The engine mirrors this
     // election in its split budget (n_kv-based, not nh-based).
     // Kill: PADDOCK_NO_ATTN_HP16 (falls back to vec8 / the GQA walk).
+    // batch >= 1 since GB10 2026-09-11 (was >= 2, the width the arm was
+    // built for): at one row the head-packed walk is faster at every context
+    // on the small die - bench/nemo_dec_attn_bench.cu B=1: ctx 128 5.7 vs
+    // vec8's 6.2 us, 1024 9.9 vs 15.5, 4096 28.3 vs 54.1, 7680 52.9 vs 147.6
+    // - and the long-prompt board had lost the c1 cell at 7.5k tokens on the
+    // vec8 walk's 327 us per layer (GB10, 2026-09-11). The r = 1
+    // lane thereby joins the r >= 2 class (the NXQ2/NXP3 split-f16 walk);
+    // its gates are the class gates, not bit-identity.
     static int no_hp16 = -1;
     if (no_hp16 < 0) no_hp16 = pd_env("PADDOCK_NO_ATTN_HP16") ? 1 : 0;
     if (!no_hp16 && kv_dtype == PD_KV_FP8_E4M3 && head_dim == 128u
-        && group >= 8u && group <= 16u && batch >= 2u
+        && group >= 8u && group <= 16u && batch >= 1u
         && n_heads == n_kv_heads * group) {
         static uint32_t hp16_set_p = 0;
         if (hp16_set_p == 0) {
@@ -5158,7 +5377,7 @@ static int pd_attn_spec_batch_paged_impl(const void* q, const void* pool_k, cons
                 swa_window, n_splits | fin_bit, rows, k1, scale);
         }
         // smem-constrained fallback (sm_120 global layers): PT=16 with a
-        // SINGLE-buffered KV ring - the 32KB double-buffer was exactly the
+        // single-buffered KV ring - the 32KB double-buffer was exactly the
         // overflow. Fits hd512 to M<=48 (~87KB; M=64/k1 7-8 still overflows
         // by 3.8KB and keeps the walk). One cp.async stall per tile instead
         // of overlap; still far ahead of the 1.76ms/launch per-row walk.

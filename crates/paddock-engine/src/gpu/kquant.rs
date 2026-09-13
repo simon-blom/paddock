@@ -1053,7 +1053,7 @@ impl GpuExecutor {
     /// The ladder stops at 16 on measurement, not on principle: a 32-row
     /// group holds more of a wide prefill's rows per block but costs the
     /// accumulators to do it, and at a 2114-row wave that traded 9.31 ms a
-    /// layer for 10.80 (2026-09-08). It is also what the grouped DOWN can
+    /// layer for 10.80 (2026-09-08). It is also what the grouped down can
     /// stage in shared at ff = 640.
     pub fn kq_moe_group_for(rows: usize, n_expert: usize) -> usize {
         let avg = rows / n_expert.max(1);
@@ -1421,7 +1421,7 @@ impl GpuExecutor {
 
     /// Column-tiled routed k-quant down (slot 587): one block per (token,
     /// `cols` columns), which is the prefill shape - the plain kernel writes
-    /// ONE float per block and spends the launch waiting on its own weight
+    /// one float per block and spends the launch waiting on its own weight
     /// loads. Bit-identical to `kquant_moe_down`; the caller keeps narrow
     /// widths on that one, where cols-fewer blocks would leave the die idle.
     #[allow(clippy::too_many_arguments)]

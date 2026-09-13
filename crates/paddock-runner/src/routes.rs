@@ -816,7 +816,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // timestamp vocabulary, and an empty list is how they say so instead of
         // a UI discovering it from a 400 (or, worse, offering a control that
         // returns an empty `segments`).
-        // Whisper answers both; granite-speech-PLUS answers `word` only - it
+        // Whisper answers both; granite-speech-plus answers `word` only - it
         // writes word end times into its transcript when instructed to, but
         // that mode emits no punctuation, so there are no sentence boundaries
         // to cut segments on. Whisper first, because the handler picks the
@@ -1078,7 +1078,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             // base granite-speech emit a bare transcript with no timestamp
             // vocabulary at all, so there is no granularity they can answer,
             // and saying so beats a caller finding out from a 400.
-            // granite-speech-PLUS is the exception - asking it to time words
+            // granite-speech-plus is the exception - asking it to time words
             // makes it write the times into its transcript  - but
             // `segment` stays out of reach even there: that mode emits no
             // punctuation, so there are no sentences to cut cues on.
@@ -1371,7 +1371,7 @@ pub(crate) fn peer_is_local(req: &axum::extract::Request, trusted_proxy: bool) -
 /// exactly one (doc §5.1: the manager issues it at spawn and sends it on its
 /// own relay calls; inference keys never grant admin ops, which live on the
 /// local admin surface, not TCP). Behind a reverse proxy on the same host
-/// every caller IS loopback, which is why the exemption switches off the
+/// every caller is loopback, which is why the exemption switches off the
 /// moment anything says a proxy is there.
 async fn auth_mw(
     State(state): State<Arc<AppState>>,

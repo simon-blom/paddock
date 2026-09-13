@@ -29,7 +29,7 @@ fn main() {
 
     let exec = Arc::new(GpuExecutor::new(0, pack.as_ref()).expect("executor"));
     let map = MappedGguf::open(mmproj.as_ref()).expect("open mmproj");
-    let vm = VisionModel::load(exec.clone(), &map).expect("load tower");
+    let vm = VisionModel::load(exec.clone(), &map, None).expect("load tower");
 
     let t0 = std::time::Instant::now();
     let (patches, gw, gh) = vm.preprocess_rgb(img.as_raw(), w, h);

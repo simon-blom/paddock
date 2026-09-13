@@ -6,7 +6,7 @@
 //! subtle ways and it is tested against hand-worked cases, while this file is
 //! plumbing that either runs or does not.
 //!
-//! Why A SECOND pass at ALL. The decode already computed exactly this
+//! Why A SECOND pass at all. The decode already computed exactly this
 //! attention, once per token, and threw it away. Keeping it would mean every
 //! transcription materialising an attention row per alignment head per step -
 //! and a second captured graph variant to write it - to serve a feature most

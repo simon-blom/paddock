@@ -1369,7 +1369,7 @@ mod tests {
         let parts = out[0]["content"].as_array().expect("array");
         assert_eq!(parts[0], json!({"type": "text", "text": "what is this?"}));
         assert_eq!(parts[1], json!({"type": "image"}));
-        // an ALL-text array flattens to the plain string - the spec's own
+        // an all-text array flattens to the plain string - the spec's own
         // semantics for the array form, and what lets string-concatenating
         // templates (gpt-oss's Harmony) take the multi-part spelling at all
         let msgs = [json!({"role": "user", "content": [

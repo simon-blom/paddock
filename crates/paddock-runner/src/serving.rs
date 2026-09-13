@@ -911,6 +911,40 @@ pub fn load(
     fp8_native: Option<&Path>,
     vram_budget: Option<u64>,
 ) -> Result<ServingModel, ServeError> {
+    load_with(
+        id,
+        path,
+        device,
+        gpu,
+        pack,
+        max_ctx,
+        max_batch,
+        mmproj,
+        mtp,
+        fp8_native,
+        vram_budget,
+        None,
+    )
+}
+
+/// `load` plus the endpoint options that only some families read.
+/// `max_image_tokens` is the per-image soft-token ceiling from
+/// `servers/<port>.toml` (None = the checkpoint's published budget).
+#[allow(clippy::too_many_arguments)]
+pub fn load_with(
+    id: String,
+    path: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    max_ctx: usize,
+    max_batch: usize,
+    mmproj: Option<&Path>,
+    mtp: Option<&Path>,
+    fp8_native: Option<&Path>,
+    vram_budget: Option<u64>,
+    max_image_tokens: Option<u32>,
+) -> Result<ServingModel, ServeError> {
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
     // HF-native lane - no GGUF exists in it, so everything (arch, tokenizer,
     // template, weights) comes from the checkpoint's own files. First family:
@@ -1083,6 +1117,7 @@ pub fn load(
         mtp.map(Path::to_path_buf),
         fp8_native.map(Path::to_path_buf),
         vram_budget,
+        max_image_tokens,
     )?;
 
     Ok(ServingModel {
@@ -1248,6 +1283,9 @@ fn load_hf_dir(
         None,
         None,
         vram_budget,
+        // safetensors-directory lane: no mmproj is attached here, so the
+        // image budget has nothing to apply to
+        None,
     )?;
 
     Ok(ServingModel {
@@ -1293,6 +1331,7 @@ fn build_engine(
     mtp: Option<PathBuf>,
     fp8_native: Option<PathBuf>,
     vram_budget: Option<u64>,
+    max_image_tokens: Option<u32>,
 ) -> Result<Engine, ServeError> {
     let arch = arch.to_owned();
     let device = device.to_owned();
@@ -1316,6 +1355,7 @@ fn build_engine(
             mtp.as_deref(),
             fp8_native.as_deref(),
             vram_budget,
+            max_image_tokens,
         )
     })
     .map_err(ServeError::Engine)
@@ -1337,7 +1377,25 @@ fn build_generator(
     mtp: Option<&Path>,
     fp8_native: Option<&Path>,
     vram_budget: Option<u64>,
+    max_image_tokens: Option<u32>,
 ) -> Result<Box<dyn Generator>, String> {
+    // Say so when the field cannot bite, rather than letting it read as
+    // effective: only the gemma4 tower takes an image budget today (the
+    // others size from their own checkpoint), and none of them take one
+    // without an mmproj to attach it to.
+    if max_image_tokens.is_some() {
+        if mmproj.is_none() {
+            tracing::warn!(
+                arch,
+                "max_image_tokens is set but this endpoint has no mmproj - it serves no images"
+            );
+        } else if arch != "gemma4" {
+            tracing::warn!(
+                arch,
+                "max_image_tokens is set but only the gemma4 tower reads it - this endpoint                  keeps its checkpoint's own image budget"
+            );
+        }
+    }
     // one constructor applies the config'd VRAM budget so a new family arm
     // can't forget it - the executor's headroom seam does the enforcing
     let make_exec = |pack: Option<&Path>| -> Result<Arc<paddock_engine::gpu::GpuExecutor>, String> {
@@ -1533,7 +1591,9 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
                 apply_kv_dtype(|d| model.set_kv_dtype(d));
                 if let Some(mp) = mmproj {
                     let mmap = MappedGguf::open(mp).map_err(|e| e.to_string())?;
-                    model.attach_vision(&mmap).map_err(|e| e.to_string())?;
+                    model
+                        .attach_vision_with(&mmap, max_image_tokens.map(|t| t as usize))
+                        .map_err(|e| e.to_string())?;
                 }
                 // Two drafter classes share the `mtp` sideload key, and the
                 // FILE says which: gemma-4 ships `gemma4-assistant` (an

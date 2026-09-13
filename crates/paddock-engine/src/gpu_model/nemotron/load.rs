@@ -21,6 +21,47 @@ use super::*;
 
 use crate::gpu_model::st_load::{bf16_bytes, f32_tensor};
 
+/// Small-die (under 128 SMs) serve defaults for this family, installed as
+/// process env at load exactly like the qwen35 default stack: the pack and
+/// service launchers latch getenv, a paddock process serves one model, and
+/// an explicit env value always wins (only unset vars are filled).
+///
+/// `PADDOCK_PIPE_MIN_LIVE=9`: the side-stream decode paths (the overlap
+/// scheduler and the classic decode pipe) engage only from 9 requests in
+/// flight. On GB10 (48 SMs, LPDDR5X) a decode tick is weight streaming and
+/// the two lanes time-slice the same ~240 GB/s; measured on the nemotron
+/// NVFP4 lane at 8 slots (2026-09-11): 1024x1024 c1 TTFT
+/// 265 -> 240 ms, 128x128 c1 98 -> 90, c8 decode +2..3%, same finding as
+/// the qwen35 lane's 2026-09-10 audit. The 188-SM die keeps 0 (both paths
+/// measured to win there).
+fn small_die_defaults(exec: &GpuExecutor) {
+    if exec.sm_count() >= 128 {
+        return;
+    }
+    // The batched decode pipe's live-slot floor. 9 (= never at 8 slots) was
+    // measured before the whole-prompt/prompt-aligned ticks and the reply
+    // checkpoint reshaped the c8 tick; re-measured after them (the pipe
+    // floor), 8 buys 1024x1024 c8 +2.5% and the
+    // agentic c8 turn -45 ms TTFT with every other cell unchanged.
+    if std::env::var_os("PADDOCK_PIPE_MIN_LIVE").is_none() {
+        crate::envset::set_env("PADDOCK_PIPE_MIN_LIVE", "8");
+    }
+    // Speculation off by default on the small die (measured on agentic
+    // turns). A spec-capable serve routes every decode tick
+    // through the spec-round path (`spec_capable()` wins the single-user
+    // election over the decode pipe, and the batched loop's rounds are the
+    // eager tick-at-a-time path), so with the n-gram drafter at 37%
+    // acceptance on agentic prose the c1 tick was 17.0 ms/token against the
+    // pipe's 11.6, and `adaptive` (K = 0 rounds included) paid the same -
+    // a K = 0 round is still an eager tick. The operator's explicit choice
+    // wins: `--spec on|adaptive|<K>` (PADDOCK_SPEC) or PADDOCK_NO_SPEC as
+    // written. The door that keeps spec available is a K = 0 round that
+    // runs on the pipe.
+    if std::env::var_os("PADDOCK_SPEC").is_none() && std::env::var_os("PADDOCK_NO_SPEC").is_none() {
+        crate::envset::set_env("PADDOCK_NO_SPEC", "1");
+    }
+}
+
 impl GpuNemotron {
     /// Load the checkpoint directory onto the device. `max_ctx` bounds the
     /// serial lane's KV allocation (attention layers only - 6 of 52).
@@ -501,6 +542,8 @@ impl GpuNemotron {
              duplicate residency, included in weights_gib)"
         );
 
+        let prefill_chunk = super::forward::prefill_chunk_rows(exec.sm_count());
+        small_die_defaults(&exec);
         Ok(Self {
             exec,
             hp,
@@ -510,6 +553,7 @@ impl GpuNemotron {
             lm_head,
             kv_dtype: KvDtype::Fp16,
             ssm_dtype,
+            prefill_chunk,
             max_ctx,
             weights_bytes,
             content_id: (
@@ -862,6 +906,8 @@ impl GpuNemotron {
             "nemotron Q8_0 gguf loaded"
         );
 
+        let prefill_chunk = super::forward::prefill_chunk_rows(exec.sm_count());
+        small_die_defaults(&exec);
         Ok(Self {
             exec,
             hp,
@@ -871,6 +917,7 @@ impl GpuNemotron {
             lm_head,
             kv_dtype: KvDtype::Fp16,
             ssm_dtype,
+            prefill_chunk,
             max_ctx,
             weights_bytes,
             content_id: (

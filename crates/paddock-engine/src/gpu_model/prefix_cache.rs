@@ -13,6 +13,14 @@
 /// partial page (< this) is never cached, and re-prefilled (cheap).
 pub const BLOCK_TOKENS: usize = 16;
 
+/// Stage F (the reply checkpoint) off switch, shared by every family that
+/// snapshots its recurrent state during decode (nemotron, qwen35): with it
+/// set the next turn resumes at the previous PROMPT's last boundary and
+/// re-prefills the whole reply.
+pub fn reply_ckpt_disabled() -> bool {
+    paddock_models::dev_var_os!("PADDOCK_NO_REPLY_CKPT").is_some()
+}
+
 /// The radix key for row `j` of an image whose content hashes to `h`.
 ///
 /// Every image row of every prompt carries the same `<image>` placeholder id, so

@@ -504,7 +504,7 @@ export function useMicTranscribe() {
       finish(lanes.value)
       return
     }
-    // Nobody ASKED FOR THIS. Every lane is gone while the microphone is still
+    // Nobody asked for this. Every lane is gone while the microphone is still
     // open - a runner died, or the session hit a limit and the socket closed.
     // Tearing down here would stop the recorder and drop its chunks, leaving
     // the caller with a turn it can never finish, so close the recording

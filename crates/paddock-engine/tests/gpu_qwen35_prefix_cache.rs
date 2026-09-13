@@ -6,7 +6,7 @@
 //! Gate 1 (bit-exact): re-prefilling the same prompt resumes from its own
 //! checkpoint - the resumed chunk replays the cold run's final chunk with a
 //! bit-exact restored state over byte-identical KV pages, so the logits must
-//! match EXACTLY.
+//! match exactly.
 //!
 //! Gate 2 (multi-turn shape): a prompt sharing all but its trailing tokens
 //! with a cached one (the re-rendered-history case) must reuse a checkpoint
@@ -14,6 +14,14 @@
 //! single-chunk path. The resume geometry differs from the cold run's, so the
 //! DeltaNet chunked-scan grouping differs - greedy + loose L2 is the honest
 //! bar (the S2/G2 gate lesson), on a clear-winner prompt.
+//!
+//! Gate 3 (the reply checkpoint, stage F): a turn that DECODES past a page
+//! boundary leaves a checkpoint at the reply's last boundary, so the next
+//! turn (prompt + reply + a new message) resumes there - past the prompt's
+//! own cuts - and stays greedy-identical to the pinned-off path. Decode
+//! advances the state one token at a time where the pinned prefill scans
+//! the reply in chunks, so this is the multi-turn gate's class (greedy +
+//! loose L2), not gate 1's.
 //!
 //! Heavy GPU test: PADDOCK_HEAVY_TESTS=1, --release, --test-threads=1.
 
@@ -161,4 +169,83 @@ fn multi_turn_shape_reuses_and_matches_pinned_reference() {
         );
         assert!(r < LOOSE_REL, "diverged: rel {r} (tail {i})");
     }
+}
+
+/// Greedy decode `n` tokens on `slot` through the sampled batch tick (the
+/// serving decode path), returning the reply.
+fn decode_greedy(m: &mut GpuQwen35, slot: usize, first: u32, pos0: usize, n: usize) -> Vec<u32> {
+    use paddock_engine::generator::RowSample;
+    use paddock_engine::sampler::DevicePlan;
+    let mut reply = vec![first];
+    let mut tok = first;
+    for j in 0..n {
+        let mut tokens = vec![0u32; slot + 1];
+        let mut positions = vec![0u32; slot + 1];
+        tokens[slot] = tok;
+        positions[slot] = (pos0 + j) as u32;
+        let mut plans = vec![RowSample::Hole; slot + 1];
+        plans[slot] = RowSample::Device(DevicePlan::Greedy);
+        let step = m
+            .forward_batch_sampled(&tokens, &positions, &plans)
+            .expect("decode tick");
+        tok = step.ids[slot];
+        reply.push(tok);
+    }
+    reply.pop();
+    reply
+}
+
+#[test]
+fn reply_checkpoint_resumes_the_next_turn_at_the_reply() {
+    let Some((mut m, tok)) = setup() else { return };
+    let a = long_prompt(&tok, 199);
+    let tail = tok
+        .encode(" The committee then turned to the question of quorum, and")
+        .expect("enc");
+
+    // turn 1 on the cached engine: prefill A, decode a reply that crosses
+    // at least two page boundaries (the tracked state snapshots at each)
+    m.enable_batch(4).expect("enable_batch cached");
+    let logits = m.forward_prefill_slot(0, &a).expect("prefill A");
+    let reply = decode_greedy(&mut m, 0, amax(&logits) as u32, a.len(), 45);
+    let mut b: Vec<u32> = a.clone();
+    b.extend_from_slice(&reply);
+    b.extend_from_slice(&tail);
+    let reply_cut = (a.len() + reply.len()) / 16 * 16;
+    assert!(
+        reply_cut > (a.len() - 1) / 16 * 16,
+        "the reply must cross a boundary"
+    );
+
+    // turn 2: resumes at the reply's last boundary, past the prompt's cuts
+    m.release_inactive_slots(&[false, false, false, false]);
+    let got = m.forward_prefill_slot(1, &b).expect("prefill B");
+    let reused = m.take_prefill_reused(1);
+    eprintln!(
+        "REPLY CKPT: reused {reused} of {} (prompt {} + reply {} + tail {}); reply cut {reply_cut}",
+        b.len(),
+        a.len(),
+        reply.len(),
+        tail.len()
+    );
+    assert_eq!(
+        reused, reply_cut,
+        "must resume at the reply's last page boundary"
+    );
+
+    // the pinned-off reference for the same turn-2 prompt
+    unsafe { std::env::set_var("PADDOCK_NO_PREFIX_CACHE", "1") };
+    m.enable_batch(4).expect("enable_batch pinned");
+    let reference = m.forward_prefill_slot(2, &b).expect("pinned prefill");
+    assert_eq!(m.take_prefill_reused(2), 0, "pinned path must not reuse");
+    unsafe { std::env::remove_var("PADDOCK_NO_PREFIX_CACHE") };
+
+    let r = rel(&got, &reference);
+    eprintln!(
+        "REPLY CKPT: rel {r:.2e}; greedy {} vs {}",
+        amax(&got),
+        amax(&reference)
+    );
+    assert_eq!(amax(&got), amax(&reference), "greedy token flipped");
+    assert!(r < LOOSE_REL, "diverged: rel {r}");
 }

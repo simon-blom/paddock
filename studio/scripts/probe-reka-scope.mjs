@@ -7,7 +7,7 @@
 // silently matches nothing. That once shipped the Manager and Studio
 // with unstyled native buttons.
 //
-// Run this after any reka-ui upgrade - the answer is a property of THEIR
+// Run this after any reka-ui upgrade - the answer is a property of their
 // internals, so it can change under us:  node scripts/probe-reka-scope.mjs
 import { h, defineComponent, createSSRApp } from 'vue'
 import { renderToString } from '@vue/server-renderer'

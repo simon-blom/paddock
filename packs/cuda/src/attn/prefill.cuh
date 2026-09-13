@@ -1725,7 +1725,7 @@ pd_attn_prefill_f16_v3_kernel(
 // the q-group, register S/O, FA-2 online softmax) but hd512 doubles both the
 // pinned Q (128 u32) and the O accumulator (256 f32) past the 255-reg cap -
 // so each block takes half the q-group and each head splits across two
-// D-HALF warps: 256 threads = 8 warps = 4 heads x 2 halves,
+// D-half warps: 256 threads = 8 warps = 4 heads x 2 halves,
 // grid (n_kv, rows/NR, 2 head-pairs). Per warp: Q-half 64 regs + O-half 128.
 // The halves' partial S exchange through one smem pane per head (the only
 // cross-warp traffic; +1 barrier vs v3), softmax then runs REDUNDANTLY in
@@ -1797,7 +1797,7 @@ pd_attn_prefill_f16_v3w_kernel(
         posr[e] = liver[e] ? positions[b] : 0u;
     }
 
-    // Q-HALF pinned in registers, pre-scaled
+    // Q-half pinned in registers, pre-scaled
     uint32_t qa[DH / 16u][4];
     #pragma unroll
     for (uint32_t d0 = 0; d0 < DH / 16u; ++d0) {

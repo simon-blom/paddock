@@ -1,4 +1,4 @@
-//! The kv-offload tier's DEVICE-side geometry, in the one crate both the
+//! The kv-offload tier's device-side geometry, in the one crate both the
 //! engine and the estimator can see.
 //!
 //! The engine reserves these bytes out of the KV pool the moment a tier is

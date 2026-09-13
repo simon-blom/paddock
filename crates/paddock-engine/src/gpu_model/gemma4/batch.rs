@@ -234,7 +234,7 @@ fn r1_gu_off() -> bool {
 /// The PF_RUNS arm htod's a run table inside prefill_layers, which a capture
 /// cannot bake by pointer - but that arm only engages when `spans.len() > 1`
 /// (see `pf_runs_batched` in forward.rs), while this capture only engages on
-/// SINGLE-run chunks, so the two are near-disjoint at runtime. The old global
+/// single-run chunks, so the two are near-disjoint at runtime. The old global
 /// `PADDOCK_PF_RUNS` refusal here was therefore far too coarse: it disabled the
 /// capture on every tick just because the env was set, including the
 /// single-prompt steady-state ticks where PF_RUNS does nothing. P55 measured
@@ -779,6 +779,30 @@ impl GpuGemma4 {
         self.kv_dtype_pref = Some(dtype);
     }
 
+    /// Re-allocate the prefill scratch for `rows`-row chunks, and make that
+    /// the width every prefill lane splits at.
+    ///
+    /// The two must never diverge: the planes are `[pf_rows, dim]`, so a chunk
+    /// wider than the allocation is an out-of-bounds write rather than a slow
+    /// path. Callers come from `enable_batch_impl`'s ladder only, and never
+    /// below [`super::forward::pf_rows_floor`].
+    fn set_pf_rows(&mut self, rows: usize) -> Result<(), GpuError> {
+        if self.pf_rows == rows {
+            return Ok(());
+        }
+        // Free the current planes before asking for the new ones. At ~0.62
+        // MiB/row on the 31B, holding both shapes at once is a multi-GiB
+        // transient on exactly the card that made us step down - so hand the
+        // old set to a one-row stub first, let the frees land, and only then
+        // build at the new width. The stub still pays for the few planes that
+        // are not row-scaled (pf_skfix, pf_fin, pf_xq/xs), ~120 MB.
+        self.scratch = super::scratch::build(&self.exec, &self.scratch_dims, 1)?;
+        self.exec.trim_mem_pool();
+        self.scratch = super::scratch::build(&self.exec, &self.scratch_dims, rows)?;
+        self.pf_rows = rows;
+        Ok(())
+    }
+
     /// return the capacity actually enabled. Existing cache contents drop -
     /// the engine only enables batching before admitting sequences.
     pub(crate) fn enable_batch_impl(&mut self, max_batch: usize) -> Result<usize, GpuError> {
@@ -786,6 +810,21 @@ impl GpuGemma4 {
         // below sees their memory as free (both rebuild at the end)
         self.prefix = None;
         self.gpool = None;
+        // Every captured graph bakes the device pointers it was recorded with,
+        // and this function re-allocates both the KV planes and (since the
+        // chunk ladder below) the prefill scratch. Today the caches happen to
+        // be empty here - enable_batch only runs before any sequence is
+        // admitted - but `service.rs`'s width-by-VRAM backstop calls this in a
+        // loop, halving on failure, so "empty" is a property of the call site
+        // rather than of this function. Dropping them makes it a property of
+        // this function: a graph that outlived its buffers is the phantom
+        // CUDA-error class, and it costs nothing to be certain at startup.
+        self.decode_graphs.clear();
+        self.graph_seen.clear();
+        self.prefill_graphs.clear();
+        self.prefill_graph_seen.clear();
+        self.mtp_graphs.clear();
+        self.attn_scratch = None;
         // Global budget pool (G4a shape): requires the paged kernels (SWA
         // paging on implies they exist) - PADDOCK_NO_GLOBAL_POOL pins the
         // dense escape hatch for A/B.
@@ -855,7 +894,7 @@ impl GpuGemma4 {
         let pool_floor_blocks = 1536usize;
         // read the dtype off the CURRENT planes, before they are freed
         let ckpt_reserve = if pooled {
-            self.prefix_vram_estimate()
+            self.prefix_vram_estimate(max_batch)
         } else {
             0
         };
@@ -867,32 +906,43 @@ impl GpuGemma4 {
         // dropped. Free-then-measure needs no correction term and cannot
         // drift from what the allocator really did.
         self.kv = Vec::new();
-        self.exec
-            .stream
-            .synchronize()
-            .map_err(|e| GpuError::Driver(e.to_string()))?;
-        self.exec.trim_mem_pool();
-        // budget-aware headroom (device free clamped to vram_budget - ledger):
-        // slots + the global pool must size inside this runner's granted slice
-        let grant = self
-            .exec
-            .vram_headroom()
-            .ok_or_else(|| GpuError::Driver("cuMemGetInfo gave no free-VRAM reading".into()))?;
+
+        // Per-slot ring cost for every span this server may elect, resolved
+        // before the chunk ladder below - that loop needs `&mut self` to
+        // re-allocate the scratch, so nothing inside it may still be holding a
+        // borrow of the weights.
+        let span_cost: Vec<(usize, usize)> = {
+            let mut v: Vec<usize> = super::forward::SWA_SPAN_LADDER
+                .iter()
+                .copied()
+                .filter(|&s| s <= self.swa_span)
+                .collect();
+            if !v.contains(&self.swa_span) {
+                v.insert(0, self.swa_span);
+            }
+            v.into_iter().map(|s| (s, per_slot_for(s))).collect()
+        };
+        let start_cost = per_slot_for(self.swa_span);
+        let max_ctx = self.max_ctx;
+        let paged = self.paging.is_some();
+        let span_pinned = super::forward::swa_span_pin().is_some();
+        let start_span = self.swa_span;
+
         // One arbiter sizes the KV store: crate::kv_plan. gemma4's own
         // arithmetic was already budget-correct - this is the same solve, moved
         // somewhere a new family cannot forget to do it. The SWA-span LADDER stays
         // here because which sub-span to prefill in is a gemma4 question; the
         // planner only answers "does that rung still seat the whole ask".
-        let demand_for = |span: usize, slots: usize| kv_plan::Demand {
+        let demand_for = |per_slot: usize, slots: usize| kv_plan::Demand {
             family: "gemma4",
-            max_ctx: self.max_ctx,
+            max_ctx,
             slots,
             // Dense mode has no shared pool at all: every layer's plane is
             // per-slot and already priced into per_slot_bytes, so the pool's
             // addressable ceiling is zero.
             blocks_per_slot: if pooled { bps } else { 0 },
             block_bytes: block_bytes as u64,
-            per_slot_bytes: per_slot_for(span) as u64,
+            per_slot_bytes: per_slot as u64,
             // Admission slack for radix retention (nodes hold blocks after
             // their sequence ends), sized by DEMAND: one retained context per
             // seated slot, capped at the eight every pool got before
@@ -930,58 +980,103 @@ impl GpuGemma4 {
             },
             ..Default::default()
         };
-        // Elect the widest span rung that still seats the whole ask. An operator
-        // pin, or a dense (unpaged) setup where the span buys nothing, skips the
-        // election entirely.
-        if self.paging.is_some() && super::forward::swa_span_pin().is_none() {
-            let ladder: Vec<usize> = super::forward::SWA_SPAN_LADDER
-                .iter()
-                .copied()
-                .filter(|&s| s <= self.swa_span)
-                .collect();
-            let narrowest = ladder.last().copied().unwrap_or(self.swa_span);
-            let elected = ladder
-                .iter()
-                .copied()
-                .find(|&s| {
-                    // seats the whole ask: a rung the planner has to narrow to
-                    // fit has not seated it
-                    demand_for(s, max_batch)
-                        .plan(grant)
-                        .is_ok_and(|p| p.slots == max_batch)
-                })
-                .unwrap_or(narrowest);
-            // Only narrow when narrowing actually buys per-slot bytes. A family
-            // with no SWA layers prices every rung the same, and cutting its
-            // prefill into shorter sub-spans then costs churn (~9% measured) for
-            // nothing.
-            if elected != self.swa_span && per_slot_for(elected) < per_slot_for(self.swa_span) {
-                tracing::info!(
-                    "gemma4 SWA sub-span {} -> {} rows: the wider ring does not leave room to \
-                     batch {max_batch} slots at ctx {} ({:.2} vs {:.2} GiB/slot)",
-                    self.swa_span,
-                    elected,
-                    self.max_ctx,
-                    per_slot_for(self.swa_span) as f64 / (1u64 << 30) as f64,
-                    per_slot_for(elected) as f64 / (1u64 << 30) as f64,
-                );
-                self.swa_span = elected;
-            }
-        }
-        let demand = demand_for(self.swa_span, max_batch);
-        // Say the arithmetic out loud whenever the answer is narrower than asked
-        // - Plan::report does, at WARN. A silent drop to 1 slot is a serving MODE
-        // change (the service falls back to the serial engine), and the duel
-        // board's biggest loss was exactly that with nothing on-screen to
-        // attribute it to.
+
+        // The prefill chunk ladder. The scratch is the other large non-weight
+        // tenant and it is allocated before the grant is read, so until now it
+        // outbid the KV: sized by max_ctx alone, gemma-4-31B at ctx 16384 took
+        // 4.99 GiB of chunk width off a 40000 MiB budget and the planner then
+        // refused the very context the operator had configured - and
+        // plan_or_minimum allocated anyway, landing 40.74 GiB resident. Step
+        // the chunk down instead until the plan fits beside it. A narrower
+        // chunk is slower bulk prefill; a refused plan is a server on the
+        // serial engine. Same shape as qwen35's enable_batch_sized.
         //
-        // plan_or_minimum, not plan: the load-time serial planes are already gone
-        // (freed above so the measurement needs no correction term), so an Err
-        // here would hand the caller a model with no key-value cache at all. Take
-        // the smallest runnable shape and let alloc_kv refuse honestly instead -
-        // its restore path below puts the 1-slot serial planes back.
-        let plan = demand.plan_or_minimum(grant);
-        plan.report(&demand, grant);
+        // Start from the ceiling, not from `self.pf_rows`: enable_batch runs
+        // again on a width change, and a rung we stepped down to for 32 slots
+        // must not become the permanent ceiling for a later 1-slot server that
+        // has room to spare.
+        let mut chunk = super::forward::pf_rows(self.max_ctx);
+        let chunk_floor = super::forward::pf_rows_floor();
+        let (plan, elected, elected_cost) = loop {
+            self.set_pf_rows(chunk)?;
+            self.exec
+                .stream
+                .synchronize()
+                .map_err(|e| GpuError::Driver(e.to_string()))?;
+            self.exec.trim_mem_pool();
+            // budget-aware headroom (device free clamped to vram_budget -
+            // ledger): slots + the global pool must size inside this runner's
+            // granted slice, and the scratch we just sized is already in it
+            let grant = self
+                .exec
+                .vram_headroom()
+                .ok_or_else(|| GpuError::Driver("cuMemGetInfo gave no free-VRAM reading".into()))?;
+
+            // Elect the widest span rung that still seats the whole ask. An
+            // operator pin, or a dense (unpaged) setup where the span buys
+            // nothing, skips the election entirely. Re-run per rung: a
+            // narrower chunk frees VRAM, which can afford a WIDER ring.
+            let (elected, cost) = if paged && !span_pinned {
+                span_cost
+                    .iter()
+                    .find(|&&(_, cost)| {
+                        // seats the whole ask: a rung the planner has to narrow
+                        // to fit has not seated it
+                        demand_for(cost, max_batch)
+                            .plan(grant)
+                            .is_ok_and(|p| p.slots == max_batch)
+                    })
+                    .or_else(|| span_cost.last())
+                    .map_or((start_span, start_cost), |&(s, c)| (s, c))
+            } else {
+                (start_span, start_cost)
+            };
+
+            let demand = demand_for(cost, max_batch);
+            match demand.plan(grant) {
+                Ok(p) => {
+                    p.report(&demand, grant);
+                    break (p, elected, cost);
+                }
+                Err(refusal) if chunk > chunk_floor => {
+                    let next = (chunk / 2).max(chunk_floor);
+                    tracing::warn!(
+                        chunk_rows = chunk,
+                        next,
+                        "gemma4: {refusal} - stepping the prefill chunk down so its scratch \
+                         stops eating the KV the configuration needs"
+                    );
+                    chunk = next;
+                }
+                Err(_) => {
+                    // At the floor the chunk cannot shrink further: one tick
+                    // has to fit or the planes are an out-of-bounds write. Take
+                    // the smallest runnable KV shape and let alloc_kv refuse
+                    // honestly - plan_or_minimum clamps it to the grant, so
+                    // this can no longer walk past the configured budget.
+                    let p = demand.plan_or_minimum(grant);
+                    p.report(&demand, grant);
+                    break (p, elected, cost);
+                }
+            }
+        };
+
+        // Only narrow when narrowing actually buys per-slot bytes. A family
+        // with no SWA layers prices every rung the same, and cutting its
+        // prefill into shorter sub-spans then costs churn (~9% measured) for
+        // nothing.
+        if elected != self.swa_span && elected_cost < start_cost {
+            tracing::info!(
+                "gemma4 SWA sub-span {} -> {} rows: the wider ring does not leave room to \
+                 batch {max_batch} slots at ctx {} ({:.2} vs {:.2} GiB/slot)",
+                self.swa_span,
+                elected,
+                self.max_ctx,
+                start_cost as f64 / (1u64 << 30) as f64,
+                elected_cost as f64 / (1u64 << 30) as f64,
+            );
+            self.swa_span = elected;
+        }
         let slots = plan.slots;
 
         if self.paging.is_some() {
@@ -1467,7 +1562,7 @@ impl GpuGemma4 {
             {
                 // token ids -> pf_toks. Host admission: stays outside any
                 // capture so the embed node reads fresh ids by pointer on
-                // every replay (the ONE-kernel gather itself moved into
+                // every replay (the one-kernel gather itself moved into
                 // pf_embed_layers, the capturable core).
                 let toks: Vec<u32> = chunk.iter().map(|x| x.2).collect();
                 let sc = &mut self.scratch;
@@ -5382,7 +5477,7 @@ impl GpuGemma4 {
                     .map_err(e)?;
             }
             {
-                // ONE-kernel embed gather (the per-row dequant+copy loop was
+                // One-kernel embed gather (the per-row dequant+copy loop was
                 // 2 host launches/row - the c32 mixed-tick launch wall)
                 let toks: Vec<u32> = chunk.iter().map(|x| x.2).collect();
                 let sc = &mut self.scratch;
@@ -5757,7 +5852,7 @@ impl GpuGemma4 {
                 }
             }
         }
-        // One batched dtoh for the HOST-planned staged finishers (device-planned
+        // One batched dtoh for the host-planned staged finishers (device-planned
         // rows read a 4-byte id from the fin_samp strip instead of their
         // [1, vocab] logits row - on the all-device round the 1-8MB pageable
         // copy disappears entirely)
@@ -5965,7 +6060,7 @@ impl GpuGemma4 {
                     .map_err(e)?;
             }
             {
-                // ONE-kernel embed gather (the per-row dequant+copy loop was
+                // One-kernel embed gather (the per-row dequant+copy loop was
                 // 2 host launches/row - the c32 mixed-tick launch wall)
                 let toks: Vec<u32> = chunk.iter().map(|x| x.2).collect();
                 let sc = &mut self.scratch;
@@ -6009,7 +6104,7 @@ impl GpuGemma4 {
             }
             base += r;
         }
-        // MTP h bootstrap: on SINGLE-chunk streams the decode rows'
+        // MTP h bootstrap: on single-chunk streams the decode rows'
         // post-output-norm hiddens are still in pf_normed[0..nd)
         // (unified_decode_head wrote them; no later chunk overwrote). Record
         // the h map so the next tick's draft chain can engage - without
@@ -7264,10 +7359,10 @@ pub(super) fn g4_moe_tail(
         .unwrap_or(false)
         && paddock_models::dev_var_os!("PADDOCK_MOE_DEC2").is_some()
     {
-        // decode-band intensity twins - NOW OPT-IN (PADDOCK_MOE_DEC2=1).
+        // decode-band intensity twins - now OPT-IN (PADDOCK_MOE_DEC2=1).
         // GREEDY-REFUTED 2026-09-04 on gemma-4-26b-A4B: the gu_dec2 + dn_dec2
         // PAIR produces token-repetition garbage ("CAPITAL.- Ezil, own-own..."
-        // deterministic), while EITHER twin paired with its original
+        // deterministic), while either twin paired with its original
         // counterpart is correct (bisected: gu_dec2 + original down = OK;
         // original gate_up + dn_dec2 = OK; both dec2 = garbage). So neither
         // kernel is wrong alone - the defect is an interaction between the

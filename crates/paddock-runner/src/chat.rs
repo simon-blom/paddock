@@ -999,7 +999,7 @@ pub(crate) fn build_mm_chunks(
     if n_pads != n_media {
         // The one case with a known cause gets a message that says what to
         // change: granite-vision's template rebuilds a task-tagged turn as
-        // IBM's canned prompt around ONE image slot, so a multi-page document
+        // IBM's canned prompt around one image slot, so a multi-page document
         // (one image per page) sent with `<tables_json>` and friends renders
         // one slot for N pages. The tasks are single-image by design - IBM's
         // own document pipeline drives the model one page per request - and

@@ -31,9 +31,21 @@ fn argmax(l: &[f32]) -> u32 {
     bi as u32
 }
 
+/// Prompt ids: `NEMOTRON_ORACLE`, else the battery's oracle dump, else the
+/// wikitext ids checked in next to the battery scripts (1200 ids of
+/// wiki.test.raw through the checkpoint's own tokenizer) - the two
+/// batch-vs-serial tests SKIPPED on every box without the dump (GB10
+/// 2026-09-12: "4 passed" was two skips).
 fn oracle_prompt(n: usize) -> Option<Vec<u32>> {
     let path = std::env::var("NEMOTRON_ORACLE").unwrap_or_else(|_| ORACLE.into());
-    let raw = std::fs::read(&path).ok()?;
+    let raw = std::fs::read(&path)
+        .or_else(|_| {
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/nemotron/oracle-wikitext-ids.json"
+            ))
+        })
+        .ok()?;
     let oracle: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     let seed: Vec<u32> = oracle["prompt_ids"]
         .as_array()?
@@ -140,26 +152,55 @@ fn batch_lane_c1_matches_serial() {
         logits_s = model.forward(t).expect("serial forward");
     }
     let mut ids_s = Vec::with_capacity(GREEDY_STEPS);
+    let mut ser_steps = vec![logits_s.clone()];
     let mut l = logits_s.clone();
     for _ in 0..GREEDY_STEPS {
         let tok = argmax(&l);
         ids_s.push(tok);
         l = model.forward(tok).expect("serial decode");
+        ser_steps.push(l.clone());
     }
 
     // ---- batch lane: slot prefill + r=1 decode graph ----------------------
     let slots = model.batch_enable_probe(4).expect("enable_batch");
     assert_eq!(slots, 4);
     let logits_b = model.forward_prefill(0, &prompt).expect("batch prefill");
+    // teacher-forced on the serial lane's greedy ids: the batched lane's
+    // per-step logits against the serial lane's at the same position. The
+    // old form asserted 24 identical greedy picks, which a near-tie fork
+    // fails at the accepted class (GB10 2026-09-12: a flip at step 10 with
+    // the boundary at 4.8% of rms) - the per-step distance is the yardstick.
     let mut ids_b = Vec::with_capacity(GREEDY_STEPS);
     let mut l = logits_b.clone();
+    let (mut tf_sum, mut tf_worst, mut tf_top1) = (0f64, 0f64, 0usize);
     for i in 0..GREEDY_STEPS {
-        let tok = argmax(&l);
-        ids_b.push(tok);
+        ids_b.push(argmax(&l));
         l = model
-            .forward_batch(&[tok], &[(PROMPT_LEN + i) as u32])
+            .forward_batch(&[ids_s[i]], &[(PROMPT_LEN + i) as u32])
             .expect("batch decode");
+        let refl = &ser_steps[i + 1];
+        let rms = (refl.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / refl.len() as f64)
+            .sqrt();
+        let d = l
+            .iter()
+            .zip(refl)
+            .map(|(a, b)| (*a as f64 - *b as f64).abs())
+            .sum::<f64>()
+            / refl.len() as f64
+            / rms.max(1e-3);
+        tf_sum += d;
+        if d > tf_worst {
+            tf_worst = d;
+        }
+        if argmax(&l) == argmax(refl) {
+            tf_top1 += 1;
+        }
     }
+    println!(
+        "teacher-forced c1: mean |d|/rms {:.5}, worst {:.5}, top-1 agree {tf_top1}/{GREEDY_STEPS}",
+        tf_sum / GREEDY_STEPS as f64,
+        tf_worst
+    );
 
     let rms = (logits_s
         .iter()
@@ -187,7 +228,11 @@ fn batch_lane_c1_matches_serial() {
         mean_abs / rms.max(1e-3) < 0.10,
         "boundary logits drifted structurally: mean |delta| {mean_abs:.4} vs rms {rms:.3}"
     );
-    assert_eq!(ids_s, ids_b, "greedy continuation diverged");
+    assert!(
+        (tf_sum / GREEDY_STEPS as f64) < 0.10 && tf_top1 * 10 >= GREEDY_STEPS * 9,
+        "batched decode drifted from the serial lane: mean |d|/rms {:.4}, top-1 {tf_top1}/{GREEDY_STEPS}",
+        tf_sum / GREEDY_STEPS as f64
+    );
 
     // ---- coalesced wave (c3): same prompt in slot 1 + two different ------
     let p_short: Vec<u32> = prompt[..97].to_vec();
@@ -481,5 +526,97 @@ fn fp8_kv_batch_lane_smoke() {
     assert!(
         kv8 < kv16,
         "fp8 KV accounting did not shrink: {kv8} vs {kv16}"
+    );
+}
+
+/// The c8 yardstick at the engine level, timing-free: eight slots holding
+/// the same prompt (the prefix cache off, so every slot is a real prefill),
+/// then GREEDY_STEPS decode ticks at r=8 teacher-forced with the serial
+/// lane's greedy ids; every row's logits against the serial lane's at the
+/// same position. Run it with and without PADDOCK_NO_NEMO_SH_FOLD8 to see
+/// what the BM=8 shared-expert fold does to a pure-decode tick.
+#[test]
+fn batch_lane_c8_matches_serial() {
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    if !exec.has_paged_kv()
+        || !exec.has_mamba2_batch()
+        || !exec.has_nvf4_gemv_batch()
+        || !exec.has_nvf4_ckpt()
+        || !exec.has_nemotron_prefill_f8()
+    {
+        common::missing("pack lacks the nemotron batch kernel set (cc != 12.0?)");
+        return;
+    }
+    let Some(dir) = common::model_dir(CKPT_ENV, &[CKPT_DIR]) else {
+        return;
+    };
+    let Some(prompt) = oracle_prompt(PROMPT_LEN) else {
+        common::missing("no oracle dump for prompt ids");
+        return;
+    };
+    let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    model.reset();
+    let mut l = Vec::new();
+    for &t in &prompt {
+        l = model.forward(t).expect("serial forward");
+    }
+    let mut ids = Vec::with_capacity(GREEDY_STEPS);
+    let mut ser = vec![l.clone()];
+    for _ in 0..GREEDY_STEPS {
+        let tok = argmax(&l);
+        ids.push(tok);
+        l = model.forward(tok).expect("serial decode");
+        ser.push(l.clone());
+    }
+    let slots = model.batch_enable_probe(8).expect("enable_batch");
+    assert_eq!(slots, 8);
+    let vocab = ser[0].len();
+    for s in 0..8usize {
+        let lg = model.forward_prefill(s, &prompt).expect("batch prefill");
+        assert_eq!(lg.len(), vocab);
+    }
+    let (mut sum, mut worst, mut n, mut top1) = (0f64, 0f64, 0usize, 0usize);
+    for i in 0..GREEDY_STEPS {
+        let toks = vec![ids[i]; 8];
+        let pos = vec![(PROMPT_LEN + i) as u32; 8];
+        let lg = model.forward_batch(&toks, &pos).expect("r=8 decode");
+        assert_eq!(lg.len(), 8 * vocab);
+        let refl = &ser[i + 1];
+        let rms =
+            (refl.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / vocab as f64).sqrt();
+        for r in 0..8 {
+            let row = &lg[r * vocab..(r + 1) * vocab];
+            let d = row
+                .iter()
+                .zip(refl)
+                .map(|(a, b)| (*a as f64 - *b as f64).abs())
+                .sum::<f64>()
+                / vocab as f64
+                / rms.max(1e-3);
+            sum += d;
+            n += 1;
+            if d > worst {
+                worst = d;
+            }
+            if argmax(row) == argmax(refl) {
+                top1 += 1;
+            }
+        }
+    }
+    let fold = if std::env::var_os("PADDOCK_NO_NEMO_SH_FOLD8").is_some() {
+        "off"
+    } else {
+        "on"
+    };
+    println!(
+        "[c8-vs-serial] fold8 {fold}: rows x steps {n}, mean |d|/rms {:.5}, worst {:.5}, top-1 agree {top1}/{n}",
+        sum / n as f64,
+        worst
+    );
+    assert!(
+        (sum / n as f64) < 0.10,
+        "r=8 decode drifted structurally from the serial lane"
     );
 }

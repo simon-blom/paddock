@@ -862,7 +862,7 @@ impl GpuExecutor {
         })
     }
 
-    /// TWO-segment twin of [`Self::bf16_qkv_gemm`] - one launch over a plane
+    /// Two-segment twin of [`Self::bf16_qkv_gemm`] - one launch over a plane
     /// that folds exactly two projections, storing rows `[0, oq)` to `ya` and
     /// `[oq, oq + ob)` to `yb`.
     ///

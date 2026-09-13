@@ -34,11 +34,13 @@ export function selectStudioModel(id: string): void {
   const chat = useChatStore()
   models.currentId = id
   const c = chat.active
-  if (c) {
-    c.model = id
-    c.compareModels = undefined
-    chat.persist(c)
-  }
+  // through `edit`: picking a model while the chat's document is still
+  // loading must land on the document, not on the stub the load replaces
+  if (c)
+    void chat.edit(c.id, (x) => {
+      x.model = id
+      x.compareModels = undefined
+    })
   // the ctx window / reasoning style / vision flags are per-runner - refresh
   void models.fetchLimits()
 }

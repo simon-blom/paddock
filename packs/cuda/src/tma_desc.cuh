@@ -43,7 +43,7 @@
 // decode-attention staging needs it on every build - while PD_BS_HOST is set
 // only when the arch list contains 120 or 100 (build.sh). Keeping the gate here
 // is what forced f32_qkv to carry its own byte-identical copy.
-// The tensor map MUST be a 64-byte-aligned type, at the type level, before any
+// The tensor map must be a 64-byte-aligned type, at the type level, before any
 // kernel takes one by value. cuda.h spells CUtensorMap's alignment as
 // `#if __cplusplus >= 201103L alignas(128)`, and MSVC reports __cplusplus as
 // 199711L unless /Zc:__cplusplus is passed - nvcc mirrors the host value into
@@ -56,7 +56,7 @@
 // f8row, the w8 kt family) works by accident. Probed on an RTX 5060 Ti
 // (2026-09-06): the same kernel, same bytes, .param .align 8 -> misaligned
 // address, .param .align 128 -> clean. build.ps1 passes the flag; this makes a
-// build that loses it fail HERE instead of on a user's first request.
+// build that loses it fail here instead of on a user's first request.
 static_assert(alignof(CUtensorMap) >= 64,
               "CUtensorMap is under-aligned: the host compiler reports __cplusplus < 201103L "
               "(MSVC without /Zc:__cplusplus), so cuda.h dropped alignas(128) and every "
@@ -64,9 +64,9 @@ static_assert(alignof(CUtensorMap) >= 64,
               "Build with -Xcompiler /Zc:__cplusplus (packs/cuda/build.ps1 does).");
 
 // The kernel-parameter carrier for a tensor map. Same 128 bytes as CUtensorMap;
-// aligned 128 in the DEVICE pass, so the kernel's .param slot is .align 128 and
+// aligned 128 in the device pass, so the kernel's .param slot is .align 128 and
 // cp.async.bulk.tensor / prefetch.tensormap see a 64-byte-aligned map - and only
-// 8 in the HOST pass, because MSVC refuses an over-aligned struct passed BY VALUE
+// 8 in the host pass, because MSVC refuses an over-aligned struct passed by value
 // (C2719, "formal parameter with requested alignment of 128 won't be aligned"),
 // and nvcc's launch stub hands every kernel parameter over by value. With
 // /Zc:__cplusplus in place a raw `const __grid_constant__ PdTmap` parameter
@@ -91,7 +91,7 @@ typedef CUresult (*pd_tmap_encode_fn)(
     const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
     CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
 
-// Resolved BY VERSION, pinned at 12000, not through cudaGetDriverEntryPoint.
+// Resolved by version, pinned at 12000, not through cudaGetDriverEntryPoint.
 // The unversioned call asks the driver for the entry point at CUDART_VERSION -
 // the toolkit the pack was COMPILED with - and a driver older than that
 // toolkit refuses outright (cudaErrorInvalidValue, no status, no pointer),

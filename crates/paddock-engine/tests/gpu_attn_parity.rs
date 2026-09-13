@@ -1304,19 +1304,19 @@ fn attn_partial_batch_paged_bitwise_matches_dense_body() {
 }
 
 /// The v9q fp8 decode arm (fp8 KV, hd128, G4, batch >= 2 - granite) against
-/// a reference of ITS class: Q*scale cast to e4m3, f32 scores, online softmax
+/// a reference of its class: Q*scale cast to e4m3, f32 scores, online softmax
 /// over 32-key supertiles aligned to 16-token blocks from the split's first
 /// block, P = exp(x - m) ROUNDED to e4m3 for the PV product, l accumulated
 /// from the unrounded weights, splits merged like the combine. Measured on
 /// the GB10 that surfaced it: 1.5e-8..6e-8 at every split count and length
 /// (accumulation order), where the exact-f32 reference sits 1.6e-3..5.9e-3
-/// away - that gap IS the class, the same P.to(fp8) the industry fp8 paths
+/// away - that gap is the class, the same P.to(fp8) the industry fp8 paths
 /// ship, and the number a reviewer should expect from this arm.
 ///
 /// Two contracts, both covered: n_splits >= 2 writes partials + ml for the
 /// combine (the engine clamps this arm to 2..4 splits), and n_splits == 1 is
 /// the in-kernel FINALIZE - [b][head][hd] rows straight into the final
-/// buffer, out_ml untouched, no sink (granite has none) and NO combine after
+/// buffer, out_ml untouched, no sink (granite has none) and no combine after
 /// it (granite's `v9q_ns1` branch). Combining a finalized buffer reads
 /// garbage ml and was exactly the harness mistake that first made this arm
 /// look 0.4 wrong.

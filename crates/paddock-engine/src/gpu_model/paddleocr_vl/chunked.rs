@@ -22,7 +22,7 @@
 //! reports `Queued` (or on the admission fast path, whose verdict puts the
 //! slot into the scheduler's chunking set before its next decode section).
 //! While a slot is `Encoding`, dense ticks feed it HOLE rows whose KV append
-//! still runs - an early adoption turns those into writes on radix-SHARED
+//! still runs - an early adoption turns those into writes on radix-shared
 //! blocks. So: admission PROBES (read-only) to decide prep/encode work; the
 //! real admit+resume happens at completion (`enc_finish`), and a completion
 //! resume SHORTER than the probe basis (eviction in between) re-enters the
@@ -556,7 +556,7 @@ impl GpuPaddleOcrVl {
 
         if !had_stale && (0..n_img).all(|k| plan.img_start[k] + plan.img_tokens[k] <= start) {
             // every image sits inside the cached prefix: no tower, no prep -
-            // adopt and queue NOW. Adopting here is safe (unlike in the
+            // adopt and queue now. Adopting here is safe (unlike in the
             // Encoding state) because the Queued verdict puts this slot into
             // the scheduler's chunking set before its next decode section.
             self.admit(slot, plan.n_rows)?;

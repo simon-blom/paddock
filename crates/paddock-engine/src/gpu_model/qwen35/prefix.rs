@@ -172,6 +172,7 @@ impl GpuQwen35 {
         // match+restore the cached prefix (DeltaNet state + KV pages), then prefill
         // only the divergent tail [start, t_len). One match/restore implementation,
         // shared with the chunked prefill_begin / advance_chunks paths.
+        self.reply_track_admit(slot, tokens);
         let start = self.prefix_resume_begin(slot, tokens)?;
         self.prefill_slot_tail(slot, tokens, start)
     }
@@ -2929,5 +2930,190 @@ impl GpuQwen35 {
             }
         }
         Ok(logits)
+    }
+}
+
+// ── stage F: the reply checkpoint ──────────────────────────────────────────
+//
+// The DeltaNet checkpoints of the prefix cache landed only at a PROMPT's last
+// two page boundaries (`ckpt_cuts`), so an agentic turn N+1 resumed at turn
+// N's prompt and re-prefilled turn N's whole reply plus the new message -
+// ~230 rows of a full weight pass per turn on the 27B, eight of them in one
+// wave at c8. Now every 16-token boundary a reply crosses snapshots the
+// slot's live state (states + conv windows) straight into the checkpoint
+// pool and files the reply's pages under the radix at that cut, with the
+// drafters' coverage recorded so the next turn resumes warm; one live reply
+// checkpoint per slot (the previous one is detached and its index recycled),
+// so the next turn resumes at the END of the reply.
+//
+// The sequence is tracked per slot: the prompt's keys at admission, then
+// every decode token a tick FEEDS (the tracked length always equals the
+// next position; any gap - a pipe run, a recompute - ends tracking for the
+// slot until its next admission). Under speculation the state only exists at
+// round ENDS (the verify holds, the commit walk lands at pos + committed),
+// so a reply checkpoint there is taken when a round's end closes a page.
+// The nemotron design (its prefix.rs stage F), with the pipe path dropped:
+// the pipe is off on every lane this family serves at width <= 8.
+impl GpuQwen35 {
+    /// Admission: start tracking `slot`'s sequence at the prompt's keys.
+    pub(super) fn reply_track_admit(&mut self, slot: usize, tokens: &[u32]) {
+        self.reply_release(slot);
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if crate::gpu_model::prefix_cache::reply_ckpt_disabled()
+            || bs.paged_prefix.is_none()
+            || bs.d_state_pool.is_none()
+            || slot >= bs.seq.len()
+        {
+            return;
+        }
+        bs.seq[slot] = tokens.to_vec();
+    }
+
+    /// A tick fed `tok` at `pos` for `slot`.
+    fn reply_feed(&mut self, slot: usize, pos: u32, tok: u32) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let Some(seq) = bs.seq.get_mut(slot) else {
+            return;
+        };
+        if seq.is_empty() {
+            return;
+        }
+        if seq.len() != pos as usize {
+            seq.clear();
+            return;
+        }
+        seq.push(tok);
+    }
+
+    fn reply_any_tracking(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|bs| bs.seq.iter().any(|s| !s.is_empty()))
+    }
+
+    /// A decode pass over these rows has been launched (the caller keeps
+    /// the copy stream-ordered behind it): feed the rows' tokens, then
+    /// snapshot every slot whose new position closes a page.
+    pub(super) fn reply_after_rows(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        slots: Option<&[u32]>,
+    ) -> Result<(), GpuModelError> {
+        if !self.reply_any_tracking() {
+            return Ok(());
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            let slot = slots.map_or(i, |s| s[i] as usize);
+            self.reply_feed(slot, positions[i], tok);
+            let cut = positions[i] as usize + 1;
+            if cut.is_multiple_of(BLOCK_TOKENS) {
+                self.reply_snapshot(slot, cut)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A spec round committed `committed[i]` rows of block `i` (rows
+    /// `padded[i*k1..]`, positions from `rows[i].1`): the state now sits at
+    /// the round's end, which is where a reply checkpoint can be taken.
+    pub(super) fn reply_after_spec_round(
+        &mut self,
+        rows: &[(usize, usize)],
+        padded: &[u32],
+        committed: &[u32],
+        k1: usize,
+    ) -> Result<(), GpuModelError> {
+        if !self.reply_any_tracking() {
+            return Ok(());
+        }
+        for (i, &(slot, pos0)) in rows.iter().enumerate() {
+            let c = committed[i] as usize;
+            for j in 0..c {
+                self.reply_feed(slot, (pos0 + j) as u32, padded[i * k1 + j]);
+            }
+            let cut = pos0 + c;
+            if cut.is_multiple_of(BLOCK_TOKENS) {
+                self.reply_snapshot(slot, cut)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `slot`'s live state into a reserved pool index (the prompt-cut
+    /// snapshot's own copy) and file it: the reply's pages up to the cut go
+    /// under the radix, the state attaches at the cut, the drafters'
+    /// coverage is recorded, the slot's previous reply checkpoint is
+    /// detached and its index recycled.
+    fn reply_snapshot(&mut self, slot: usize, cut: usize) -> Result<(), GpuModelError> {
+        let idx = {
+            let Some(bs) = self.batch.as_mut() else {
+                return Ok(());
+            };
+            if bs.seq.get(slot).is_none_or(|s| s.len() < cut)
+                || bs.tables[slot].blocks().len() < cut / BLOCK_TOKENS
+                || bs.d_state_pool.is_none()
+            {
+                return Ok(());
+            }
+            let Some(radix) = bs.paged_prefix.as_mut() else {
+                return Ok(());
+            };
+            let Some(idx) = radix.reserve_state_slot() else {
+                return Ok(()); // pool full of proven cuts - skip this one
+            };
+            idx
+        };
+        self.snapshot_paged_state(slot, idx)?;
+        let seq = {
+            let bs = self.batch.as_mut().expect("batch checked above");
+            let seq = std::mem::take(&mut bs.seq[slot]);
+            let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
+            let pool = bs.pool.as_mut().expect("prefix requires the pool");
+            let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
+            radix.insert(&seq[..cut], &blocks, pool);
+            if !radix.attach_state_at(&seq, cut, idx) {
+                radix.recycle_state(idx);
+                bs.seq[slot] = seq;
+                return Ok(());
+            }
+            seq
+        };
+        self.record_mtp_cover(idx, slot, cut, &seq);
+        self.record_dflash_cover(idx, slot, cut, &seq);
+        let bs = self.batch.as_mut().expect("batch checked above");
+        if let Some((old_cut, old_idx)) = bs.reply_ckpt[slot].replace((cut, idx))
+            && let Some(radix) = bs.paged_prefix.as_mut()
+            && radix.detach_state_at(&seq, old_cut) == Some(old_idx)
+        {
+            radix.recycle_state(old_idx);
+        }
+        if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
+            tracing::info!(
+                "qwen35-reply-ckpt: slot {slot} cut {cut} idx {idx} mtp_cover {} dflash_cover {}",
+                bs.mtp_cover.contains(&idx),
+                bs.dflash_cover.contains(&idx)
+            );
+        }
+        bs.seq[slot] = seq;
+        Ok(())
+    }
+
+    /// The slot went idle (or is being re-admitted): stop tracking. Its last
+    /// reply checkpoint STAYS in the radix for the next turn - the pool's
+    /// LRU owns it now.
+    pub(super) fn reply_release(&mut self, slot: usize) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if slot >= bs.seq.len() {
+            return;
+        }
+        bs.seq[slot].clear();
+        bs.reply_ckpt[slot] = None;
     }
 }

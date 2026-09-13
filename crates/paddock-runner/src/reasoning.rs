@@ -39,7 +39,7 @@ use crate::parsers::Dialect;
 /// gemma4, laguna, granite) and must come back with no ladder at all.
 const KWARGS: [&str; 2] = ["reasoning_effort", "reasoning_strength"];
 
-/// Candidate rungs, LOWEST FIRST. This is the OpenAI `reasoning_effort`
+/// Candidate rungs, lowest first. This is the OpenAI `reasoning_effort`
 /// vocabulary minus `none`, which is the request to stop reasoning rather than
 /// a level to reason at - see `ReasoningCaps::off`.
 const CANDIDATES: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -81,7 +81,7 @@ pub struct ReasoningCaps {
     /// through the variable.
     pub default_level: Option<String>,
     /// `enable_thinking` measurably changes what this template renders, so
-    /// reasoning can be turned OFF. Measured, which is the point: the old
+    /// reasoning can be turned off. Measured, which is the point: the old
     /// dialect list had already been wrong twice (gemma4 and laguna both read
     /// the flag while `has_thinking_toggle` said they did not).
     pub off: bool,

@@ -2278,7 +2278,25 @@ int pd_mxfp4_gemm_bs_gu(const void* gate_data, const void* gate_scale,
 // amax order-free -- writing the down GEMM's q/scale planes directly.
 // Bit-identical to {f4t -> pd_swiglu_fused_nvf4} by construction
 // (bench/nv4_swq_cmp.cu). SWQ=false is the original kernel.
-template <bool SWQ>
+//
+// EPI: the epilogue's SHAPE (2026-09-11, GB10 session 20; the values and
+// their order are the same in every mode).
+//   0 = the fragment epilogue below: each lane stores its own mma fragments -
+//       32-byte f32 segments on the plain landing, and on SWQ the silu and
+//       the e2m1 quant computed per lane on both lanes of a gate/up pair with
+//       ~30 shuffles per column tile. Latency-bound at 1 CTA/SM: on GB10 the
+//       fused gate|up plane at 1k rows spends ~700 us of its 1680 in it.
+//   1 = PARKED: the consumers park scale2 (and bias) applied accumulators in
+//       the idle TMA ring as [col][row] f32 (f4t4's park), then all twelve
+//       warps - the producers join instead of exiting - finish the tile
+//       from smem: SWQ quantizes one 16-pair block per THREAD (32 rows of a
+//       column read as eight float4: sixteen independent silu chains, the
+//       amax and the codes in registers, no shuffles, one 8-byte store), the
+//       plain landing streams 512-byte row runs. Same expression per
+//       element, fmaxf (exact) for the amax, pd_nvf4_scale / pd_e2m1_rn as
+//       before: byte-identical by construction (bench/nv4_f4t_epi_probe.cu).
+//   2 = bench-only (PD_F4T_PROBE): no epilogue - the mainloop's own time.
+template <bool SWQ, int EPI>
 __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
     const __grid_constant__ PdTmap wdm, const __grid_constant__ PdTmap wsm,
     const __grid_constant__ PdTmap ydm, const __grid_constant__ PdTmap ysm,
@@ -2309,6 +2327,12 @@ __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
     asm volatile("bar.sync 0, 384;");
+
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    float acc[16][4] = {};
 
     if (tid >= 256u) {
         // ---------------- producer warps 8-11 ----------------
@@ -2346,16 +2370,9 @@ __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
                 asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(m));
             }
         }
-        return;
-    }
-
+        if constexpr (EPI != 1) return;
+    } else {
     // ---------------- consumer warps 0-7 (v3 fragment plan) ----------------
-    const uint32_t lane = tid & 31u, warp = tid >> 5;
-    const uint32_t g = lane >> 2, tq = lane & 3u;
-    const uint32_t i0 = (warp >> 1) * 32u;
-    const uint32_t joff = (warp & 1u) * 8u;
-
-    float acc[16][4] = {};
     uint32_t ph0 = 0u, ph1 = 0u;
 
     for (uint32_t kt = 0; kt < nk; ++kt) {
@@ -2411,6 +2428,7 @@ __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
         asm volatile("bar.arrive %0, 384;" ::"r"(1u + b));
     }
 
+    if constexpr (EPI == 0) {
     if constexpr (!SWQ) {
     // v3's exact epilogue: scale2, conditional bias, f32 y
     #pragma unroll
@@ -2499,6 +2517,105 @@ __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
             }
         }
     }
+    }   // SWQ
+    }   // EPI == 0
+    if constexpr (EPI == 2) {
+        // bench-only: one store per lane keeps the mainloop live, nothing else
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < 16u; ++i) sum += acc[i][0] + acc[i][1] + acc[i][2] + acc[i][3];
+        float* sink = SWQ ? (float*)qo : y;
+        sink[(size_t)blockIdx.x * 256u + tid] = sum;
+    }
+    }   // consumers
+
+    if constexpr (EPI == 1) {
+        // ---------------- parked epilogue, all twelve warps ----------------
+        // Every consumer is past its last ring read and every TMA load has
+        // landed (the consumers waited on each stage's mbarrier), so the ring
+        // is free: [128 cols][132 f32] with 4 pad floats per column keeps the
+        // fragment writes bank-conflict-free (f4t4's park), 67.6 KB of the
+        // 72 KB ring, below the mbarriers.
+        asm volatile("bar.sync 7, 384;" ::: "memory");
+        float* otile = (float*)pd_f4t_sh;
+        if (tid < 256u) {
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+                const uint32_t cl = j0 + joff + 2u * tq;      // local batch column
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    const uint32_t rl = i0 + n * 16u + g;     // local out row
+                    float v00 = acc[(j0 >> 3) + n][0], v01 = acc[(j0 >> 3) + n][1];
+                    float v10 = acc[(j0 >> 3) + n][2], v11 = acc[(j0 >> 3) + n][3];
+                    v00 *= scale2; v01 *= scale2; v10 *= scale2; v11 *= scale2;
+                    if constexpr (!SWQ) {
+                        if (bias) {
+                            const uint32_t r0 = row_base + rl, r8 = r0 + 8u;
+                            if (r0 < out_dim) { const float bv = bias[r0]; v00 += bv; v01 += bv; }
+                            if (r8 < out_dim) { const float bv = bias[r8]; v10 += bv; v11 += bv; }
+                        }
+                    }
+                    otile[cl * 132u + rl] = v00;
+                    otile[(cl + 1u) * 132u + rl] = v01;
+                    otile[cl * 132u + rl + 8u] = v10;
+                    otile[(cl + 1u) * 132u + rl + 8u] = v11;
+                }
+            }
+        }
+        asm volatile("bar.sync 7, 384;" ::: "memory");
+        if constexpr (SWQ) {
+            // One 16-pair block (32 consecutive rows of one batch column: gate
+            // row 2p, up row 2p+1) per thread - 512 blocks per tile over 384
+            // threads. Consecutive lanes take consecutive columns (the 528-byte
+            // column pitch lands each lane's float4 in its own bank group).
+            const uint32_t ff = out_dim >> 1;
+            for (uint32_t it = tid; it < 512u; it += 384u) {
+                const uint32_t cl = it & 127u, blk = it >> 7;
+                const uint32_t c = col_base + cl;
+                const uint32_t pb = (row_base + blk * 32u) >> 1;   // block's first pair (multiple of 16)
+                if (c >= batch || pb >= ff) continue;
+                const float* src = otile + cl * 132u + blk * 32u;
+                float v[16];
+                #pragma unroll
+                for (uint32_t h = 0; h < 8u; ++h) {
+                    const float4 p = *(const float4*)(src + h * 4u);   // g, u, g, u
+                    v[2u * h] = (p.x / (1.0f + expf(-p.x))) * p.y;
+                    v[2u * h + 1u] = (p.z / (1.0f + expf(-p.z))) * p.w;
+                }
+                float amax = fabsf(v[0]);
+                #pragma unroll
+                for (uint32_t k = 1; k < 16u; ++k) amax = fmaxf(amax, fabsf(v[k]));
+                float inv;
+                const unsigned sbyte = pd_nvf4_scale(amax, &inv);
+                uint32_t lo = 0u, hi = 0u;   // byte k = pair 2k | pair 2k+1 << 4, pairs in row order
+                #pragma unroll
+                for (uint32_t k = 0; k < 8u; ++k) {
+                    lo |= pd_e2m1_rn(v[k] * inv) << (4u * k);
+                    hi |= pd_e2m1_rn(v[8u + k] * inv) << (4u * k);
+                }
+                *(uint2*)(qo + (size_t)c * (ff >> 1) + (pb >> 1)) = make_uint2(lo, hi);
+                qs[(size_t)c * (ff >> 4) + (pb >> 4)] = (unsigned char)sbyte;
+            }
+        } else {
+            // 12 warps stream 128 columns x 128 rows as 512-byte row runs, 16 B per lane
+            const uint32_t rows_ok = (out_dim > row_base) ? (out_dim - row_base) : 0u;
+            const bool al16 = (out_dim & 3u) == 0u;   // every row start 16-B aligned
+            for (uint32_t it = warp; it < 128u; it += 12u) {
+                const uint32_t c = col_base + it;
+                if (c >= batch) continue;
+                const uint32_t rl = lane * 4u;
+                float* dst = y + (size_t)c * out_dim + row_base + rl;
+                const float4 v = *(const float4*)(otile + it * 132u + rl);
+                if (al16 && rl + 3u < rows_ok) {
+                    *(float4*)dst = v;
+                } else {
+                    if (rl < rows_ok) dst[0] = v.x;
+                    if (rl + 1u < rows_ok) dst[1] = v.y;
+                    if (rl + 2u < rows_ok) dst[2] = v.z;
+                    if (rl + 3u < rows_ok) dst[3] = v.w;
+                }
+            }
+        }
     }
 #else
     (void)wdm; (void)wsm; (void)ydm; (void)ysm; (void)y; (void)qo; (void)qs; (void)scale2;
@@ -2587,11 +2704,11 @@ static inline bool pd_f4t_maps(const void* data, const void* scale, const void* 
 #endif
 
 
-// ---- f4t4: the f4t ring at FOUR 128-K stages (2026-09-07, GB10) ------------
+// ---- f4t4: the f4t ring at four 128-K stages (2026-09-07, GB10) ------------
 // Same tile (128 out x 128 batch), same fragment plan, same per-acc K order
 // (stage kt = K rows [kt*128, kt*128+128), k64 ascending) - so bit-exact vs
 // f4t/f4c by construction - but each stage carries 64 bytes of K per row
-// under the 64B TMA swizzle, and the ring is four deep in the SAME 72 KB
+// under the 64B TMA swizzle, and the ring is four deep in the same 72 KB
 // (4 x (8 KB W + 8 KB Y) data + 2 x (2 KB + 2 KB) scale pairs). Why: on a
 // 48-SM die at 2.4 GHz a 128x128x256 stage is ~0.85 us of tensor work and
 // its 36 KB load is ~2 us of latency+transfer, so the two-buffer ring runs
@@ -2775,19 +2892,21 @@ __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t4_kernel(
     asm volatile("bar.sync 7, 256;");
     // 256 threads stream 128 columns x 128 rows: a warp per column-run, 16 B per lane
     const uint32_t rows_ok = (out_dim > row_base) ? (out_dim - row_base) : 0u;   // rows in this tile
-    const uint32_t full16 = (rows_ok >= 128u) && ((out_dim & 3u) == 0u);   // float4 stores need 16 B rows
+    const bool al16 = (out_dim & 3u) == 0u;   // float4 stores need every row start 16-B aligned (2026-09-11: was
+                                              // `full16 || rl + 3 < rows_ok`, a fault on an out_dim % 4 != 0 plane)
     for (uint32_t it = warp; it < 128u; it += 8u) {          // column it, lane covers rows lane*4..+3
         const uint32_t c = col_base + it;
         if (c >= batch) continue;
         const uint32_t rl = lane * 4u;
         float* dst = y + (size_t)c * out_dim + row_base + rl;
         const float4 v = *(const float4*)(otile + it * 132u + rl);
-        if (full16 || rl + 3u < rows_ok) {
+        if (al16 && rl + 3u < rows_ok) {
             *(float4*)dst = v;
         } else {
             if (rl < rows_ok) dst[0] = v.x;
             if (rl + 1u < rows_ok) dst[1] = v.y;
             if (rl + 2u < rows_ok) dst[2] = v.z;
+            if (rl + 3u < rows_ok) dst[3] = v.w;
         }
     }
 #else
@@ -2858,6 +2977,64 @@ int pd_nvf4_gemm_f4t4(const void* data, const void* scale, const void* bias,
 #endif
 }
 
+#ifdef PD_BS_HOST
+template <bool SWQ, int EPI>
+static int pd_f4t_run(const CUtensorMap* wdm, const CUtensorMap* wsm, const CUtensorMap* ydm,
+                      const CUtensorMap* ysm, float* y, unsigned char* q, unsigned char* qs,
+                      float scale2, const float* bias, uint32_t in_dim, uint32_t out_dim,
+                      uint32_t batch, uint32_t ntiles, cudaStream_t stream) {
+    static int smem_set = 0;   // one per instantiation
+    if (!smem_set) {
+        cudaFuncSetAttribute(pd_nvf4_gemm_f4t_kernel<SWQ, EPI>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_F4T_SMEM);
+        smem_set = 1;
+    }
+    pd_nvf4_gemm_f4t_kernel<SWQ, EPI><<<ntiles, 384, PD_F4T_SMEM, stream>>>(
+        *wdm, *wsm, *ydm, *ysm, y, q, qs, scale2, bias, in_dim, out_dim, batch);
+    return pd_launch_status();
+}
+
+// The f4t launch by (epilogue kind, epilogue shape): the two exported
+// launchers below and bench/nv4_f4t_epi_probe.cu (which also asks for the
+// bench-only EPI 2, compiled under PD_F4T_PROBE). Geometry gates: in_dim %
+// 256; SWQ also out_dim % 256 (a warp's 32 rows = one whole 16-pair block).
+static int pd_f4t_variant(bool swq, int epi, const void* data, const void* scale,
+                          const void* bias, const void* xq, const void* xs, void* y, void* q,
+                          void* qs, float scale2, uint32_t in_dim, uint32_t out_dim,
+                          uint32_t batch, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    if ((in_dim & 255u) != 0 || (swq && (out_dim & 255u) != 0)) return cudaErrorInvalidValue;
+    CUtensorMap *wdm, *wsm, *ydm, *ysm;
+    if (!pd_f4t_maps(data, scale, xq, xs, in_dim, out_dim, batch, &wdm, &wsm, &ydm, &ysm))
+        return cudaErrorNotSupported;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t ntiles = ((out_dim + 127u) / 128u) * (batch_pad >> 7);
+    float* yp = swq ? nullptr : (float*)y;
+    unsigned char* qp = swq ? (unsigned char*)q : nullptr;
+    unsigned char* sp = swq ? (unsigned char*)qs : nullptr;
+    const float* bp = swq ? nullptr : (const float*)bias;
+    cudaStream_t st = (cudaStream_t)stream;
+    switch (epi * 2 + (swq ? 1 : 0)) {
+        case 0: return pd_f4t_run<false, 0>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+        case 1: return pd_f4t_run<true, 0>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+        case 2: return pd_f4t_run<false, 1>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+        case 3: return pd_f4t_run<true, 1>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+#ifdef PD_F4T_PROBE
+        case 4: return pd_f4t_run<false, 2>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+        case 5: return pd_f4t_run<true, 2>(wdm, wsm, ydm, ysm, yp, qp, sp, scale2, bp, in_dim, out_dim, batch, ntiles, st);
+#endif
+        default: return cudaErrorInvalidValue;
+    }
+}
+
+// The parked epilogue (EPI 1) is the default for both landings;
+// PADDOCK_NO_NVF4_F4T_PARK=1 pins the fragment epilogue (EPI 0) for A/B.
+static inline int pd_f4t_epi_default(void) {
+    static const int epi = pd_env("PADDOCK_NO_NVF4_F4T_PARK") ? 0 : 1;
+    return epi;
+}
+#endif
+
 PD_EXPORT
 int pd_nvf4_gemm_f4t(const void* data, const void* scale, const void* bias,
                      const void* xq, const void* xs, void* y, float scale2,
@@ -2868,26 +3045,851 @@ int pd_nvf4_gemm_f4t(const void* data, const void* scale, const void* bias,
     (void)scale2; (void)in_dim; (void)out_dim; (void)batch; (void)stream;
     return cudaErrorNotSupported;
 #else
+    return pd_f4t_variant(false, pd_f4t_epi_default(), data, scale, bias, xq, xs, y, nullptr,
+                          nullptr, scale2, in_dim, out_dim, batch, stream);
+#endif
+}
+
+// ---- f4tn: the f4t TMA tile at DECODE width (2026-09-10, GB10) -------------
+// The rival-gap audit put the whole c8 decode gap on the fp4 FFN decode GEMM:
+// the cp.async decode arms (f4cn / f4cd) stream the qwen3.8 planes at 163-181
+// GB/s where CUTLASS streams the same bytes at 222/207 and a D2D memcpy at
+// ~236 - and f4t itself, the prefill tile with the batch padded to 128,
+// already does 205/195 at B=8 (session 15 elected it at batch <= 32). What f4t
+// pays at decode width is phantom work: 16 batch-column fragments of MMA per
+// K-step for 8 real rows, a 16 KB activation box per stage, acc[16][4]
+// pinning it at 1 CTA/SM. This twin keeps f4t's loader (TMA + mbarrier ring,
+// 4 producer warps, KC=256 stages, 128B swizzle) and f4t's exact fragment /
+// mma plan and per-acc K order (kt, kh, k64, n - bit-exact vs f4t / f4c) over
+// a 32-column batch tile: 32-row activation boxes (4 KB + 512 B per stage),
+// acc[4][4], 2 CTAs/SM under 46 KB of smem, four MMAs per warp per K-step
+// instead of sixteen. Measured, that alone is not the lever (202 vs f4t's 204
+// GB/s at B=8): at decode width the binder is the DRAM stream itself, and
+// what moves it is the producer asking the TMA unit to PREFETCH the weight
+// boxes two stages ahead into L2 (cp.async.bulk.prefetch.tensor) - the
+// stream runs ahead of the smem ring without the smem: 220 / 213 GB/s on
+// gate_up / down, CUTLASS's rate on the same bytes. batch <= 32, in_dim %
+// 256 == 0, out_dim in 128-row tiles (masked). y is [batch, out_dim] f32;
+// only rows < batch are written.
+#define PD_F4TN_YROWS 32u
+#define PD_F4TN_STAGE \
+    (128u * 128u + 128u * 16u + PD_F4TN_YROWS * 128u + PD_F4TN_YROWS * 16u)  // 23040
+// ST-stage ring: all weight data boxes first (ST x 16 KB, 1024-aligned), then
+// the weight scales (ST x 2 KB), the activation boxes (ST x 4 KB, 1024-aligned
+// for ST = 2/3/4: 36864 / 55296 / 73728) and their scales (ST x 512 B, 128-
+// aligned), then ST mbarriers.
+#define PD_F4TN_SMEM(ST) ((ST) * PD_F4TN_STAGE + 64u)
+
+// ST = ring depth (2 = f4t's, 3 fits 1 CTA/SM), PF = stages of L2 prefetch
+// issued ahead of the ring for the weight boxes (0 = none): the producer
+// asks the TMA unit to pull stage kt+PF into L2 while stage kt lands in smem,
+// so the DRAM stream runs PF stages ahead of the smem ring without the smem.
+template <uint32_t ST, uint32_t PF>
+__global__ void __launch_bounds__(384, (ST <= 2u) ? 2 : 1) pd_nvf4_gemm_f4tn_kernel(
+    const __grid_constant__ PdTmap wdm, const __grid_constant__ PdTmap wsm,
+    const __grid_constant__ PdTmap ydm, const __grid_constant__ PdTmap ysm,
+    float* __restrict__ y, float scale2, const float* __restrict__ bias,
+    uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
+#if PD_BS_OK
+    extern __shared__ __align__(1024) unsigned char pd_f4tn_sh[];
+    unsigned char* wdat = pd_f4tn_sh;                                  // ST x 16384
+    unsigned char* wsc = pd_f4tn_sh + ST * 16384u;                     // ST x 2048
+    unsigned char* ydat = pd_f4tn_sh + ST * 18432u;                    // ST x 4096
+    unsigned char* ysc = pd_f4tn_sh + ST * 22528u;                     // ST x 512
+    unsigned long long* mb = (unsigned long long*)(pd_f4tn_sh + ST * 23040u);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nk = in_dim >> 8;  // KC=256 chunks (launcher gates %256)
+    const uint32_t row_base = blockIdx.x * 128u;
+
+    if (tid == 0u) {
+        const uint32_t m0 = (uint32_t)__cvta_generic_to_shared(mb);
+        #pragma unroll
+        for (uint32_t s = 0; s < ST; ++s)
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 128;" ::"r"(m0 + s * 8u));
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    asm volatile("bar.sync 0, 384;");
+
+    if (tid >= 256u) {
+        // ---------------- producer warps 8-11 (f4t's, narrow y boxes) -------
+        const uint32_t ptid = tid - 256u;
+        for (uint32_t kt = 0; kt < nk; ++kt) {
+            const uint32_t b = kt % ST;
+            if (kt >= ST) asm volatile("bar.sync %0, 384;" ::"r"(1u + b));
+            const uint32_t m = (uint32_t)__cvta_generic_to_shared(mb) + b * 8u;
+            if (ptid == 0u) {
+                asm volatile(
+                    "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(m),
+                    "r"(PD_F4TN_STAGE));
+                const uint32_t wd = (uint32_t)__cvta_generic_to_shared(wdat + b * 16384u);
+                const uint32_t ws = (uint32_t)__cvta_generic_to_shared(wsc + b * 2048u);
+                const uint32_t yd = (uint32_t)__cvta_generic_to_shared(ydat + b * 4096u);
+                const uint32_t ys = (uint32_t)__cvta_generic_to_shared(ysc + b * 512u);
+                const int ck = (int)(kt * 128u), sk16 = (int)(kt * 16u);
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3}], [%4];" ::"r"(wd), "l"(&wdm), "r"(ck),
+                    "r"((int)row_base), "r"(m) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3}], [%4];" ::"r"(ws), "l"(&wsm), "r"(sk16),
+                    "r"((int)row_base), "r"(m) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3}], [%4];" ::"r"(yd), "l"(&ydm), "r"(ck),
+                    "r"(0), "r"(m) : "memory");
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                    " [%0], [%1, {%2, %3}], [%4];" ::"r"(ys), "l"(&ysm), "r"(sk16),
+                    "r"(0), "r"(m) : "memory");
+                if (PF > 0u && kt + PF < nk) {
+                    const int pck = (int)((kt + PF) * 128u), psk = (int)((kt + PF) * 16u);
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+                                 ::"l"(&wdm), "r"(pck), "r"((int)row_base) : "memory");
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+                                 ::"l"(&wsm), "r"(psk), "r"((int)row_base) : "memory");
+                }
+            } else {
+                asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(m));
+            }
+        }
+        return;
+    }
+
+    // ---------------- consumer warps 0-7 (f4t's fragment plan, 32 cols) -----
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+
+    float acc[4][4] = {};
+    uint32_t phbits = 0u;
+
+    for (uint32_t kt = 0; kt < nk; ++kt) {
+        const uint32_t b = kt % ST;
+        const uint32_t m = (uint32_t)__cvta_generic_to_shared(mb) + b * 8u;
+        const uint32_t ph = (phbits >> b) & 1u;
+        asm volatile(
+            "{\n\t.reg .pred P;\n"
+            "PD_F4TN_WAIT_%=:\n\t"
+            "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
+            "@!P bra PD_F4TN_WAIT_%=;\n\t}" ::"r"(m), "r"(ph) : "memory");
+        phbits ^= 1u << b;
+
+        const unsigned char* tw = wdat + b * 16384u;
+        const unsigned char* tws = wsc + b * 2048u;
+        const unsigned char* ty = ydat + b * 4096u;
+        const unsigned char* tys = ysc + b * 512u;
+
+        #pragma unroll
+        for (uint32_t kh = 0; kh < 2u; ++kh) {
+            const uint32_t sb8 = kh * 8u;
+            uint32_t am[2][2][4], sa[2][2];
+            #pragma unroll
+            for (uint32_t n = 0; n < 2u; ++n) {
+                const uint32_t r0 = i0 + n * 16u + g;
+                const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+                const uint32_t rr = i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u);
+                #pragma unroll
+                for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                    const uint32_t c = kh * 4u + k64 * 2u + (lane >> 4);
+                    pd_ldm_x4(am[n][k64], tw + rr * 128u + ((c ^ (rr & 7u)) * 16u));
+                    sa[n][k64] = *(const uint32_t*)(tws + rs * 16u + sb8 + k64 * 4u);
+                }
+            }
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < PD_F4TN_YROWS; j0 += 16u) {
+                const uint32_t col = j0 + joff + (lane & 7u);
+                const uint32_t cy = kh * 4u + (lane >> 3);
+                uint32_t bm[4];
+                pd_ldm_x4(bm, ty + col * 128u + ((cy ^ (col & 7u)) * 16u));
+                const unsigned char* ysr = tys + (j0 + joff + g) * 16u + sb8;
+                #pragma unroll
+                for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                    const uint32_t sbv = *(const uint32_t*)(ysr + k64 * 4u);
+                    #pragma unroll
+                    for (uint32_t n = 0; n < 2u; ++n)
+                        pd_nv4_mma(acc[(j0 >> 3) + n], am[n][k64][0], am[n][k64][1],
+                                   am[n][k64][2], am[n][k64][3], bm[k64 * 2u],
+                                   bm[k64 * 2u + 1u], sa[n][k64], sbv);
+                }
+            }
+        }
+        asm volatile("bar.arrive %0, 384;" ::"r"(1u + b));
+    }
+
+    // f4t's epilogue: scale2, conditional bias, f32 y, rows < batch only
+    #pragma unroll
+    for (uint32_t j0 = 0; j0 < PD_F4TN_YROWS; j0 += 16u) {
+        const uint32_t c0 = j0 + joff + 2u * tq;
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = row_base + i0 + n * 16u + g;
+            const uint32_t r8 = r0 + 8u;
+            float v00 = acc[(j0 >> 3) + n][0], v01 = acc[(j0 >> 3) + n][1];
+            float v10 = acc[(j0 >> 3) + n][2], v11 = acc[(j0 >> 3) + n][3];
+            v00 *= scale2; v01 *= scale2; v10 *= scale2; v11 *= scale2;
+            if (bias) {
+                if (r0 < out_dim) { const float bv = bias[r0]; v00 += bv; v01 += bv; }
+                if (r8 < out_dim) { const float bv = bias[r8]; v10 += bv; v11 += bv; }
+            }
+            if (r0 < out_dim) {
+                if (c0 < batch) y[(size_t)c0 * out_dim + r0] = v00;
+                if (c0 + 1u < batch) y[(size_t)(c0 + 1u) * out_dim + r0] = v01;
+            }
+            if (r8 < out_dim) {
+                if (c0 < batch) y[(size_t)c0 * out_dim + r8] = v10;
+                if (c0 + 1u < batch) y[(size_t)(c0 + 1u) * out_dim + r8] = v11;
+            }
+        }
+    }
+#else
+    (void)wdm; (void)wsm; (void)ydm; (void)ysm; (void)y; (void)scale2; (void)bias;
+    (void)in_dim; (void)out_dim; (void)batch;
+#endif
+}
+
+#ifdef PD_BS_HOST
+// narrow activation maps for f4tn: the f4t maps with 32-row boxes (data
+// 128B x 32 under the 128B swizzle, scales 16 B x 32 plain); gdim rows =
+// batch, so rows past it zero-fill. Cached on (ptr, scale ptr, rows, k) like
+// the f4t activation cache and for the same reason (see the corruption note).
+static bool pd_tmap_2d_rows(CUtensorMap* map, const void* base, uint64_t inner,
+                            uint64_t rows, uint32_t box_rows, bool swz) {
+    pd_tmap_encode_fn enc = pd_tmap_encode();
+    if (!enc || ((uintptr_t)base & 15u) || (inner & 15u)) return false;
+    const cuuint64_t gdim[2] = {inner, rows};
+    const cuuint64_t gstride[1] = {inner};
+    const cuuint32_t box[2] = {swz ? 128u : 16u, box_rows};
+    const cuuint32_t estride[2] = {1u, 1u};
+    return enc(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2u, (void*)base, gdim, gstride,
+               box, estride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+               swz ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+               CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+static inline bool pd_f4tn_ymaps(const void* xq, const void* xs, uint32_t in_dim, uint32_t batch,
+                                 CUtensorMap** ydm, CUtensorMap** ysm) {
+    static PdF4tYEnt yc[64]; static uint32_t yn = 0;
+    *ydm = nullptr; *ysm = nullptr;
+    for (uint32_t i = 0; i < yn; ++i)
+        if (yc[i].p == xq && yc[i].s == xs && yc[i].rows == batch && yc[i].k == in_dim) { *ydm = &yc[i].dm; *ysm = &yc[i].sm; return true; }
+    PdF4tYEnt& e = yc[yn % 64u];
+    if (!pd_tmap_2d_rows(&e.dm, xq, in_dim >> 1, batch, PD_F4TN_YROWS, true) ||
+        !pd_tmap_2d_rows(&e.sm, xs, in_dim >> 4, batch, PD_F4TN_YROWS, false))
+        return false;
+    e.p = xq; e.s = xs; e.rows = batch; e.k = in_dim; *ydm = &e.dm; *ysm = &e.sm;
+    yn = yn < 64u ? yn + 1u : yn;
+    return true;
+}
+#endif
+
+#ifdef PD_BS_HOST
+template <uint32_t ST, uint32_t PF>
+static inline int pd_f4tn_launch(const void* data, const void* scale, const void* bias,
+                                 const void* xq, const void* xs, void* y, float scale2,
+                                 uint32_t in_dim, uint32_t out_dim, uint32_t batch,
+                                 cudaStream_t stream) {
+    CUtensorMap *wdm, *wsm, *ydm128, *ysm128, *ydm, *ysm;
+    if (!pd_f4t_maps(data, scale, xq, xs, in_dim, out_dim, batch, &wdm, &wsm, &ydm128, &ysm128))
+        return cudaErrorNotSupported;
+    if (!pd_f4tn_ymaps(xq, xs, in_dim, batch, &ydm, &ysm)) return cudaErrorNotSupported;
+    const uint32_t ntiles = (out_dim + 127u) / 128u;
+    static int smem_set = 0;
+    if (!smem_set) {
+        cudaFuncSetAttribute(pd_nvf4_gemm_f4tn_kernel<ST, PF>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)PD_F4TN_SMEM(ST));
+        smem_set = 1;
+    }
+    pd_nvf4_gemm_f4tn_kernel<ST, PF><<<ntiles, 384, PD_F4TN_SMEM(ST), stream>>>(
+        *wdm, *wsm, *ydm, *ysm, (float*)y, scale2, (const float*)bias, in_dim, out_dim,
+        batch);
+    return pd_launch_status();
+}
+// (st, pf) probe twin for the bench: 2/3-deep ring x 0/2/4 stages of L2 prefetch
+static inline int pd_f4tn_variant(uint32_t st, uint32_t pf, const void* data, const void* scale,
+                                  const void* bias, const void* xq, const void* xs, void* y,
+                                  float scale2, uint32_t in_dim, uint32_t out_dim,
+                                  uint32_t batch, cudaStream_t stream) {
     if (out_dim == 0 || batch == 0) return 0;
-    if ((in_dim & 255u) != 0) return cudaErrorInvalidValue;
+    if ((in_dim & 255u) != 0 || batch > PD_F4TN_YROWS) return cudaErrorInvalidValue;
+    #define PD_F4TN_CASE(S, P) \
+        if (st == S && pf == P) return pd_f4tn_launch<S, P>(data, scale, bias, xq, xs, y, scale2, in_dim, out_dim, batch, stream);
+    PD_F4TN_CASE(2u, 0u) PD_F4TN_CASE(2u, 2u) PD_F4TN_CASE(2u, 4u)
+    PD_F4TN_CASE(3u, 0u) PD_F4TN_CASE(3u, 2u) PD_F4TN_CASE(3u, 4u)
+    #undef PD_F4TN_CASE
+    return cudaErrorInvalidValue;
+}
+#endif
+
+// The decode-width launcher: slot 597. Weight maps come from the f4t cache
+// (same plane, same boxes); the activation maps are the 32-row twins.
+// batch > 32 or in_dim % 256 != 0 is refused - the caller keeps f4t / f4cn.
+// The shipped (ST, PF) is the bench winner (nv4_dec_f4t_probe.cu).
+PD_EXPORT
+int pd_nvf4_gemm_f4tn(const void* data, const void* scale, const void* bias,
+                      const void* xq, const void* xs, void* y, float scale2,
+                      uint32_t in_dim, uint32_t out_dim, uint32_t batch,
+                      void* stream) {
+#ifndef PD_BS_HOST
+    (void)data; (void)scale; (void)bias; (void)xq; (void)xs; (void)y;
+    (void)scale2; (void)in_dim; (void)out_dim; (void)batch; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    // (2, 2): two-deep smem ring, two stages of L2 prefetch ahead - the bench
+    // winner on GB10 (gate_up 456 us / 220 GB/s, down 236 / 213 vs 491 / 261
+    // without the prefetch; CUTLASS 451 / 243). A 3-deep ring buys nothing
+    // over it (456 / 233) and costs the second CTA per SM.
+    return pd_f4tn_variant(2u, 2u, data, scale, bias, xq, xs, y, scale2, in_dim, out_dim,
+                           batch, (cudaStream_t)stream);
+#endif
+}
+
+// ---- f4tp: the PERSISTENT SWQ f4t (2026-09-11, GB10 session 21) - FALSIFIED,
+// kept as an opt-in (PADDOCK_NVF4_F4T_PERSIST=1) to re-test on the next die.
+// One CTA per SM walks tiles blockIdx.x + i*gridDim.x with f4t's ring (two
+// 256-K stages, laid out per stage: wdat | wsc | ydat | ysc, 36 KB each,
+// 1024-aligned), f4t's fragment plan and per-acc K order, and session 20's
+// parked epilogue (all twelve warps) between tiles. What persistence could
+// buy: the CTA launch and ramp amortized over ~45 tiles, and the producer
+// asking the TMA unit to PREFETCH the next tile's first two stages into L2
+// (cp.async.bulk.prefetch.tensor) before it joins the epilogue. Measured on
+// GB10: NEUTRAL (1468 vs 1473 us at 1k rows, bit-identical) - the block
+// scheduler already back-fills, and a tile's first stages are already
+// L2-warm (eight column-tile CTAs share each weight row block). The in-loop
+// prefetch (PF = 2) LOSES 12% at prefill width. The two cuts measured before
+// this one, both bit-identical, tried the real thing - a warp-specialized
+// epilogue overlapped under the next mainloop: (1) products parked in ring
+// region 1, three worker warps quantizing while the ring refills - the
+// producer must wait on the drain before refilling region 1 and the ring
+// stalls, +17% at 1k rows (+11% with prefetch); (2) raw accumulators parked
+// to a per-CTA L2-resident global scratch, the ring never touched, the
+// workers doing the whole silu+quant - +51%: three warps cannot drain 512
+// blocks under a 24 us mainloop, and 168 regs x 384 threads is the SM's
+// whole register file, so there are no more warps to give them. Ring + park
+// do not fit in this die's 99 KB either (72 + 64, or 72 + 32 for products).
+// Gates: in_dim % 256, out_dim % 256, batch any (masked at the store).
+#define PD_F4TP_REGION 36864u
+#define PD_F4TP_SMEM (2u * PD_F4TP_REGION + 32u)
+
+template <uint32_t PF>
+__global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4tp_kernel(
+    const __grid_constant__ PdTmap wdm, const __grid_constant__ PdTmap wsm,
+    const __grid_constant__ PdTmap ydm, const __grid_constant__ PdTmap ysm,
+    unsigned char* __restrict__ qo, unsigned char* __restrict__ qs, float scale2,
+    uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t ntiles) {
+#if PD_BS_OK
+    extern __shared__ __align__(1024) unsigned char pd_f4tp_sh[];
+    unsigned long long* mb = (unsigned long long*)(pd_f4tp_sh + 2u * PD_F4TP_REGION);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nk = in_dim >> 8;
+    const uint32_t nct = ((batch + 127u) & ~127u) >> 7;
+    const uint32_t ff = out_dim >> 1;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    float* otile = (float*)pd_f4tp_sh;   // the park: [128 cols][132 f32] across both regions
+
+    if (tid == 0u) {
+        const uint32_t m0 = (uint32_t)__cvta_generic_to_shared(mb);
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 32;" ::"r"(m0));
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 32;" ::"r"(m0 + 8u));
+        asm volatile("fence.mbarrier_init.release.cluster;");
+    }
+    asm volatile("bar.sync 0, 384;");
+
+    uint32_t ph = 0u, kt = 0u;
+    for (uint32_t tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const int row_base = (int)((tile / nct) * 128u), col_base = (int)((tile % nct) * 128u);
+        float acc[16][4] = {};
+        if (warp == 8u) {
+            // ---------------- producer: warp 8, lane 0 issues ----------------
+            for (uint32_t k = 0; k < nk; ++k, ++kt) {
+                const uint32_t b = kt & 1u;
+                if (kt >= 2u) asm volatile("bar.sync %0, 288;" ::"r"(1u + b) : "memory");   // region b released
+                const uint32_t m = (uint32_t)__cvta_generic_to_shared(mb) + b * 8u;
+                if (lane == 0u) {
+                    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(m),
+                                 "r"(2u * PD_F4T_STAGE));
+                    const uint32_t r0 = (uint32_t)__cvta_generic_to_shared(pd_f4tp_sh + b * PD_F4TP_REGION);
+                    const int ck = (int)(k * 128u), sk16 = (int)(k * 16u);
+                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                                 " [%0], [%1, {%2, %3}], [%4];" ::"r"(r0), "l"(&wdm), "r"(ck), "r"(row_base), "r"(m) : "memory");
+                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                                 " [%0], [%1, {%2, %3}], [%4];" ::"r"(r0 + 16384u), "l"(&wsm), "r"(sk16), "r"(row_base), "r"(m) : "memory");
+                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                                 " [%0], [%1, {%2, %3}], [%4];" ::"r"(r0 + 18432u), "l"(&ydm), "r"(ck), "r"(col_base), "r"(m) : "memory");
+                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                                 " [%0], [%1, {%2, %3}], [%4];" ::"r"(r0 + 34816u), "l"(&ysm), "r"(sk16), "r"(col_base), "r"(m) : "memory");
+                    if constexpr (PF > 0u) {
+                        // Unconditional: the stage index is CLAMPED to the last stage
+                        // instead of guarded. A guard here made ptxas emit a uniform-
+                        // predicated UTMAPF (`@!UP1 UTMAPF.L2.2D`) that this die
+                        // rejects with "illegal instruction" (sm_121a, CUDA 13.3;
+                        // compute-sanitizer, 2026-09-11) - the unpredicated form runs.
+                        const uint32_t kp = (k + PF < nk) ? k + PF : nk - 1u;
+                        const int pck = (int)(kp * 128u), psk = (int)(kp * 16u);
+                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+                                     ::"l"(&wdm), "r"(pck), "r"(row_base) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];"
+                                     ::"l"(&wsm), "r"(psk), "r"(row_base) : "memory");
+                    }
+                } else {
+                    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(m));
+                }
+            }
+            // the next tile's first two stages into L2 while this tile's
+            // epilogue runs (clamped coordinates: never predicated, see above)
+            const uint32_t nt = tile + gridDim.x;
+            const uint32_t ntc = nt < ntiles ? nt : tile;
+            const int nrb = (int)((ntc / nct) * 128u), ncb = (int)((ntc % nct) * 128u);
+            if (lane == 0u) {
+                #pragma unroll
+                for (uint32_t k = 0; k < 2u; ++k) {
+                    const int ck = (int)(k * 128u), sk16 = (int)(k * 16u);
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&wdm), "r"(ck), "r"(nrb) : "memory");
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&wsm), "r"(sk16), "r"(nrb) : "memory");
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&ydm), "r"(ck), "r"(ncb) : "memory");
+                    asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::"l"(&ysm), "r"(sk16), "r"(ncb) : "memory");
+                }
+            }
+        } else if (warp < 8u) {
+            // ---------------- consumers: warps 0-7 ----------------
+            for (uint32_t k = 0; k < nk; ++k, ++kt) {
+                const uint32_t b = kt & 1u;
+                const uint32_t m = (uint32_t)__cvta_generic_to_shared(mb) + b * 8u;
+                asm volatile(
+                    "{\n\t.reg .pred P;\n"
+                    "PD_F4TP_WAIT_%=:\n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
+                    "@!P bra PD_F4TP_WAIT_%=;\n\t}" ::"r"(m), "r"((ph >> b) & 1u) : "memory");
+                ph ^= 1u << b;
+                const unsigned char* tw = pd_f4tp_sh + b * PD_F4TP_REGION;
+                const unsigned char* tws = tw + 16384u;
+                const unsigned char* ty = tw + 18432u;
+                const unsigned char* tys = tw + 34816u;
+                #pragma unroll
+                for (uint32_t kh = 0; kh < 2u; ++kh) {
+                    const uint32_t sb8 = kh * 8u;
+                    uint32_t am[2][2][4], sa[2][2];
+                    #pragma unroll
+                    for (uint32_t n = 0; n < 2u; ++n) {
+                        const uint32_t r0 = i0 + n * 16u + g;
+                        const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+                        const uint32_t rr = i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u);
+                        #pragma unroll
+                        for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                            const uint32_t c = kh * 4u + k64 * 2u + (lane >> 4);
+                            pd_ldm_x4(am[n][k64], tw + rr * 128u + ((c ^ (rr & 7u)) * 16u));
+                            sa[n][k64] = *(const uint32_t*)(tws + rs * 16u + sb8 + k64 * 4u);
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+                        const uint32_t col = j0 + joff + (lane & 7u);
+                        const uint32_t cy = kh * 4u + (lane >> 3);
+                        uint32_t bm[4];
+                        pd_ldm_x4(bm, ty + col * 128u + ((cy ^ (col & 7u)) * 16u));
+                        const unsigned char* ysr = tys + (j0 + joff + g) * 16u + sb8;
+                        #pragma unroll
+                        for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                            const uint32_t sbv = *(const uint32_t*)(ysr + k64 * 4u);
+                            #pragma unroll
+                            for (uint32_t n = 0; n < 2u; ++n)
+                                pd_nv4_mma(acc[(j0 >> 3) + n], am[n][k64][0], am[n][k64][1],
+                                           am[n][k64][2], am[n][k64][3], bm[k64 * 2u],
+                                           bm[k64 * 2u + 1u], sa[n][k64], sbv);
+                        }
+                    }
+                }
+                asm volatile("bar.arrive %0, 288;" ::"r"(1u + b) : "memory");
+            }
+        }
+        // ---------------- session 20's parked epilogue, all twelve warps ----------------
+        asm volatile("bar.sync 7, 384;" ::: "memory");   // consumers past their last ring read; loads all landed
+        if (tid < 256u) {
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+                const uint32_t cl = j0 + joff + 2u * tq;
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    const uint32_t rl = i0 + n * 16u + g;
+                    otile[cl * 132u + rl] = acc[(j0 >> 3) + n][0] * scale2;
+                    otile[(cl + 1u) * 132u + rl] = acc[(j0 >> 3) + n][1] * scale2;
+                    otile[cl * 132u + rl + 8u] = acc[(j0 >> 3) + n][2] * scale2;
+                    otile[(cl + 1u) * 132u + rl + 8u] = acc[(j0 >> 3) + n][3] * scale2;
+                }
+            }
+        }
+        asm volatile("bar.sync 7, 384;" ::: "memory");
+        for (uint32_t it = tid; it < 512u; it += 384u) {
+            const uint32_t cl = it & 127u, blk = it >> 7;
+            const uint32_t c = (uint32_t)col_base + cl;
+            const uint32_t pb = ((uint32_t)row_base + blk * 32u) >> 1;
+            if (c >= batch || pb >= ff) continue;
+            const float* src = otile + cl * 132u + blk * 32u;
+            float v[16];
+            #pragma unroll
+            for (uint32_t h = 0; h < 8u; ++h) {
+                const float4 p = *(const float4*)(src + h * 4u);   // g, u, g, u
+                v[2u * h] = (p.x / (1.0f + expf(-p.x))) * p.y;
+                v[2u * h + 1u] = (p.z / (1.0f + expf(-p.z))) * p.w;
+            }
+            float amax = fabsf(v[0]);
+            #pragma unroll
+            for (uint32_t k = 1; k < 16u; ++k) amax = fmaxf(amax, fabsf(v[k]));
+            float inv;
+            const unsigned sbyte = pd_nvf4_scale(amax, &inv);
+            uint32_t lo = 0u, hi = 0u;
+            #pragma unroll
+            for (uint32_t k = 0; k < 8u; ++k) {
+                lo |= pd_e2m1_rn(v[k] * inv) << (4u * k);
+                hi |= pd_e2m1_rn(v[8u + k] * inv) << (4u * k);
+            }
+            *(uint2*)(qo + (size_t)c * (ff >> 1) + (pb >> 1)) = make_uint2(lo, hi);
+            qs[(size_t)c * (ff >> 4) + (pb >> 4)] = (unsigned char)sbyte;
+        }
+        asm volatile("bar.sync 7, 384;" ::: "memory");   // the park is read out before the ring refills
+    }
+#else
+    (void)wdm; (void)wsm; (void)ydm; (void)ysm; (void)qo; (void)qs; (void)scale2;
+    (void)in_dim; (void)out_dim; (void)batch; (void)ntiles;
+#endif
+}
+
+#ifdef PD_BS_HOST
+template <uint32_t PF>
+static int pd_f4tp_run(const CUtensorMap* wdm, const CUtensorMap* wsm, const CUtensorMap* ydm,
+                       const CUtensorMap* ysm, unsigned char* q, unsigned char* qs, float scale2,
+                       uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t grid,
+                       uint32_t ntiles, cudaStream_t stream) {
+    static int smem_set = 0;
+    if (!smem_set) {
+        cudaFuncSetAttribute(pd_nvf4_gemm_f4tp_kernel<PF>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_F4TP_SMEM);
+        smem_set = 1;
+    }
+    pd_nvf4_gemm_f4tp_kernel<PF><<<grid, 384, PD_F4TP_SMEM, stream>>>(
+        *wdm, *wsm, *ydm, *ysm, q, qs, scale2, in_dim, out_dim, batch, ntiles);
+    return pd_launch_status();
+}
+
+// The persistent SWQ launch by in-loop L2-prefetch depth (0 = none, 2 = two
+// stages ahead as f4tn; the next-tile prefetch is always on).
+static int pd_f4tp_variant(uint32_t pf, const void* data, const void* scale, const void* xq,
+                           const void* xs, void* q, void* qs, float scale2, uint32_t in_dim,
+                           uint32_t out_dim, uint32_t batch, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    if ((in_dim & 255u) != 0 || (out_dim & 255u) != 0) return cudaErrorInvalidValue;
+    static int sms = 0;
+    if (!sms) { cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0); if (sms <= 0) sms = 1; }
     CUtensorMap *wdm, *wsm, *ydm, *ysm;
     if (!pd_f4t_maps(data, scale, xq, xs, in_dim, out_dim, batch, &wdm, &wsm, &ydm, &ysm))
         return cudaErrorNotSupported;
     const uint32_t batch_pad = (batch + 127u) & ~127u;
     const uint32_t ntiles = ((out_dim + 127u) / 128u) * (batch_pad >> 7);
-    static int smem_set = 0;
-    if (!smem_set) {
-        cudaFuncSetAttribute(pd_nvf4_gemm_f4t_kernel<false>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)PD_F4T_SMEM);
-        smem_set = 1;
+    const uint32_t grid = ntiles < (uint32_t)sms ? ntiles : (uint32_t)sms;
+    cudaStream_t st = (cudaStream_t)stream;
+    switch (pf) {
+        case 0u: return pd_f4tp_run<0u>(wdm, wsm, ydm, ysm, (unsigned char*)q, (unsigned char*)qs, scale2, in_dim, out_dim, batch, grid, ntiles, st);
+        case 2u: return pd_f4tp_run<2u>(wdm, wsm, ydm, ysm, (unsigned char*)q, (unsigned char*)qs, scale2, in_dim, out_dim, batch, grid, ntiles, st);
+        default: return cudaErrorInvalidValue;
     }
-    pd_nvf4_gemm_f4t_kernel<false><<<ntiles, 384, PD_F4T_SMEM, (cudaStream_t)stream>>>(
-        *wdm, *wsm, *ydm, *ysm, (float*)y, nullptr, nullptr, scale2, (const float*)bias, in_dim,
-        out_dim, batch);
-    return pd_launch_status();
+}
+#define PD_F4TP_PF 0u
+#endif
+
+// ---- f4t2: the SWQ tile at two CTAs per SM (2026-09-11, GB10 session 22) -----
+// Session 21 priced why the SWQ epilogue cannot be overlapped inside one CTA
+// on this die: ring + park exceed the 99 KB block cap, and 168 registers x
+// 384 threads is the register file. The structure left was two CTAs per SM,
+// so that one CTA's epilogue runs while the other's mainloop streams. The
+// budget per CTA is then <= 49 KB of smem and <= 128 registers at 256
+// threads (launch_bounds(256, 2)):
+//   - 8 warps, all consumers, f4t's exact fragment plan and per-acc K order
+//     (bit-exact vs f4t / f4t4 / f4c); no producer warps - warp 0 lane 0
+//     issues the TMA ring and waits on "empty" mbarriers (one arrive per
+//     warp after its last read of a slot) before refilling;
+//   - f4t4's 128-K loader: 64-byte data boxes under the 64B swizzle, the
+//     e4m3 scales per PAIR of stages (a TMA box inner must be >= 16 B),
+//     two data slots (2 x 2 x 8 KB) and two scale pair-slots (2 x 2 x 2 KB)
+//     = 40 KB; the pair-slot WAR follows from the data-slot WAR;
+//   - session 20's parked SWQ epilogue in two 64-column halves (a half
+//     park is 33.8 KB, inside the 40 KB ring): park, quantize one 16-pair
+//     block per thread (256 blocks per half over 256 threads), repeat.
+// Per CTA the ring holds one 18 KB load in flight while one stage computes
+// - half f4t's bytes in flight - but the SM holds two such CTAs, so the
+// SM's stream is f4t's, and when one CTA parks and quantizes the other has
+// the tensor pipe and the TMA unit to itself. Measured on GB10 (cold, the
+// fused gate|up plane, bench/nv4_f4t_epi_probe.cu): 1157 us at 1024 rows
+// against the parked single-CTA kernel's 1504 (-23%, 316 TF/s with the
+// swiglu and the e2m1 quant in the epilogue), 2233 vs 2923 at 2048, 679 vs
+// 812 at 512. Its mainloop alone runs 1020 us (f4t's 1111: two CTAs with 18
+// KB in flight each beat one with 36 KB), and its epilogue exposes 137 us
+// of the 393 the parked kernel exposes; the same kernel forced to one CTA
+// per SM is 1614 us - the overlap made visible. Two traps on the way:
+// a dynamic half index into acc[] sent the
+// accumulators through local memory (the half loop is unrolled), and a
+// waiting issuer lane diverged from its warp (the last-arriver issue
+// below). 128 registers, 0 spills. Gates: in_dim % 256, out_dim % 256,
+// batch any (columns >= batch masked at the store).
+#define PD_F4T2_WD (128u * 64u)     // 8 KB data box per stage
+#define PD_F4T2_SC (128u * 16u)     // 2 KB scale box per pair
+#define PD_F4T2_SMEM (2u * 2u * PD_F4T2_WD + 2u * 2u * PD_F4T2_SC + 32u)   // 40992
+
+template <int EPI>   // 1 = the parked SWQ epilogue; 2 = none (bench-only, PD_F4T_PROBE: the mainloop's own time)
+__global__ void __launch_bounds__(256, 2) pd_nvf4_gemm_f4t2_kernel(
+    const __grid_constant__ PdTmap wdm, const __grid_constant__ PdTmap wsm,
+    const __grid_constant__ PdTmap ydm, const __grid_constant__ PdTmap ysm,
+    unsigned char* __restrict__ qo, unsigned char* __restrict__ qs, float scale2,
+    uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
+#if PD_BS_OK
+    extern __shared__ __align__(1024) unsigned char pd_f4t2_sh[];
+    unsigned char* wdat = pd_f4t2_sh;                              // 2 x 8 KB
+    unsigned char* ydat = pd_f4t2_sh + 2u * PD_F4T2_WD;            // 2 x 8 KB
+    unsigned char* wsc = pd_f4t2_sh + 4u * PD_F4T2_WD;             // 2 x 2 KB
+    unsigned char* ysc = wsc + 2u * PD_F4T2_SC;                    // 2 x 2 KB
+    unsigned long long* mb = (unsigned long long*)(ysc + 2u * PD_F4T2_SC);   // full[2]
+    uint32_t* rel = (uint32_t*)(mb + 2);                                     // release counters per slot
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nk = in_dim >> 7;   // 128-K stages (launcher gates in_dim % 256: nk even)
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t nct = batch_pad >> 7;
+    const uint32_t tile = blockIdx.x;
+    const uint32_t row_base = (tile / nct) * 128u;
+    const uint32_t col_base = (tile % nct) * 128u;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t m0 = (uint32_t)__cvta_generic_to_shared(mb);
+
+    if (tid == 0u) {
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(m0));          // full[0]
+        asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(m0 + 8u));     // full[1]
+        asm volatile("fence.mbarrier_init.release.cluster;");
+        rel[0] = 0u; rel[1] = 0u;
+    }
+    __syncthreads();
+
+    // the issue of stage kt into data slot kt & 1 (+ the pair's scales on even kt)
+    auto issue = [&](uint32_t kt) {
+        const uint32_t s = kt & 1u, p = (kt >> 1) & 1u;
+        const bool even = (kt & 1u) == 0u;
+        const uint32_t m = m0 + s * 8u;
+        const uint32_t tx = 2u * PD_F4T2_WD + (even ? 2u * PD_F4T2_SC : 0u);
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(m), "r"(tx));
+        const uint32_t wd = (uint32_t)__cvta_generic_to_shared(wdat + s * PD_F4T2_WD);
+        const uint32_t yd = (uint32_t)__cvta_generic_to_shared(ydat + s * PD_F4T2_WD);
+        const int ck = (int)(kt * 64u);
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                     " [%0], [%1, {%2, %3}], [%4];" ::"r"(wd), "l"(&wdm), "r"(ck), "r"((int)row_base), "r"(m) : "memory");
+        asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                     " [%0], [%1, {%2, %3}], [%4];" ::"r"(yd), "l"(&ydm), "r"(ck), "r"((int)col_base), "r"(m) : "memory");
+        if (even) {
+            const uint32_t ws = (uint32_t)__cvta_generic_to_shared(wsc + p * PD_F4T2_SC);
+            const uint32_t ys = (uint32_t)__cvta_generic_to_shared(ysc + p * PD_F4T2_SC);
+            const int sk16 = (int)((kt >> 1) * 16u);
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                         " [%0], [%1, {%2, %3}], [%4];" ::"r"(ws), "l"(&wsm), "r"(sk16), "r"((int)row_base), "r"(m) : "memory");
+            asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+                         " [%0], [%1, {%2, %3}], [%4];" ::"r"(ys), "l"(&ysm), "r"(sk16), "r"((int)col_base), "r"(m) : "memory");
+        }
+    };
+    if (tid == 0u) { issue(0u); if (nk > 1u) issue(1u); }
+    __syncwarp();   // warp 0 reconverges behind its issuing lane before the collective loads
+
+    float acc[16][4] = {};
+    uint32_t fph = 0u;   // full parities, bit s
+    for (uint32_t kt = 0; kt < nk; ++kt) {
+        const uint32_t s = kt & 1u, p = (kt >> 1) & 1u;
+        const uint32_t sb8 = (kt & 1u) * 8u;
+        const uint32_t m = m0 + s * 8u;
+        asm volatile(
+            "{\n\t.reg .pred P;\n"
+            "PD_F4T2_WAIT_%=:\n\t"
+            "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
+            "@!P bra PD_F4T2_WAIT_%=;\n\t}" ::"r"(m), "r"((fph >> s) & 1u) : "memory");
+        fph ^= 1u << s;
+
+        const unsigned char* tw = wdat + s * PD_F4T2_WD;
+        const unsigned char* ty = ydat + s * PD_F4T2_WD;
+        const unsigned char* tws = wsc + p * PD_F4T2_SC;
+        const unsigned char* tys = ysc + p * PD_F4T2_SC;
+
+        uint32_t am[2][2][4], sa[2][2];
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = i0 + n * 16u + g;
+            const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+            const uint32_t rr = i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u);
+            #pragma unroll
+            for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                const uint32_t c = k64 * 2u + (lane >> 4);                    // 16 B chunk 0..3
+                pd_ldm_x4(am[n][k64], tw + rr * 64u + ((c ^ ((rr >> 1) & 3u)) * 16u));
+                sa[n][k64] = *(const uint32_t*)(tws + rs * 16u + sb8 + k64 * 4u);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+            const uint32_t col = j0 + joff + (lane & 7u);
+            const uint32_t cy = (lane >> 3);                                  // 0..3
+            uint32_t bm[4];
+            pd_ldm_x4(bm, ty + col * 64u + ((cy ^ ((col >> 1) & 3u)) * 16u));
+            const unsigned char* ysr = tys + (j0 + joff + g) * 16u + sb8;
+            #pragma unroll
+            for (uint32_t k64 = 0; k64 < 2u; ++k64) {
+                const uint32_t sbv = *(const uint32_t*)(ysr + k64 * 4u);
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n)
+                    pd_nv4_mma(acc[(j0 >> 3) + n], am[n][k64][0], am[n][k64][1],
+                               am[n][k64][2], am[n][k64][3], bm[k64 * 2u],
+                               bm[k64 * 2u + 1u], sa[n][k64], sbv);
+            }
+        }
+        // Release slot s: each warp's lane 0 counts itself out after every
+        // lane's last read of the slot, and the last warp to release it issues
+        // the refill (stage kt + 2) - nobody waits. (The first cut had lane 0
+        // of warp 0 spin on an "empty" mbarrier: with independent thread
+        // scheduling its lanes 1-31 ran on into the next stage's ldmatrix /
+        // mma.sync while it spun - the bench never showed a byte, the PPL
+        // example gave three answers in three runs - and once reconverged
+        // with a __syncwarp the whole warp stalled behind the slowest warp
+        // every stage: 1257 us at 1k rows against 1132. The last-arriver
+        // issue keeps the divergence window to the issue itself.)
+        __syncwarp();
+        if (lane == 0u) {
+            const uint32_t old = atomicAdd(&rel[s], 1u);
+            if (((old + 1u) & 7u) == 0u && kt + 2u < nk) issue(kt + 2u);
+        }
+        __syncwarp();
+    }
+
+    if constexpr (EPI == 2) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < 16u; ++i) sum += acc[i][0] + acc[i][1] + acc[i][2] + acc[i][3];
+        ((float*)qo)[(size_t)blockIdx.x * 256u + tid] = sum;
+        return;
+    }
+    // ---------------- the parked SWQ epilogue, two 64-column halves ----------------
+    // (unrolled: a dynamic half index would send acc through local memory)
+    const uint32_t ff = out_dim >> 1;
+    float* otile = (float*)pd_f4t2_sh;   // [64 cols][132 f32] = 33.8 KB inside the 40 KB ring
+    #pragma unroll
+    for (uint32_t half = 0; half < 2u; ++half) {
+        __syncthreads();   // every warp is past its last ring read (half 0) / park read (half 1)
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < 64u; j0 += 16u) {
+            const uint32_t cl = j0 + joff + 2u * tq;           // local column within the half
+            const uint32_t ai = ((j0 + half * 64u) >> 3);
+            #pragma unroll
+            for (uint32_t n = 0; n < 2u; ++n) {
+                const uint32_t rl = i0 + n * 16u + g;
+                otile[cl * 132u + rl] = acc[ai + n][0] * scale2;
+                otile[(cl + 1u) * 132u + rl] = acc[ai + n][1] * scale2;
+                otile[cl * 132u + rl + 8u] = acc[ai + n][2] * scale2;
+                otile[(cl + 1u) * 132u + rl + 8u] = acc[ai + n][3] * scale2;
+            }
+        }
+        __syncthreads();
+        {
+            const uint32_t cl = tid & 63u, blk = tid >> 6;     // 256 blocks over 256 threads
+            const uint32_t c = col_base + half * 64u + cl;
+            const uint32_t pb = (row_base + blk * 32u) >> 1;   // block's first pair (multiple of 16)
+            if (c < batch && pb < ff) {
+                const float* src = otile + cl * 132u + blk * 32u;
+                float v[16];
+                #pragma unroll
+                for (uint32_t h = 0; h < 8u; ++h) {
+                    const float4 pr = *(const float4*)(src + h * 4u);   // g, u, g, u
+                    v[2u * h] = (pr.x / (1.0f + expf(-pr.x))) * pr.y;
+                    v[2u * h + 1u] = (pr.z / (1.0f + expf(-pr.z))) * pr.w;
+                }
+                float amax = fabsf(v[0]);
+                #pragma unroll
+                for (uint32_t k = 1; k < 16u; ++k) amax = fmaxf(amax, fabsf(v[k]));
+                float inv;
+                const unsigned sbyte = pd_nvf4_scale(amax, &inv);
+                uint32_t lo = 0u, hi = 0u;
+                #pragma unroll
+                for (uint32_t k = 0; k < 8u; ++k) {
+                    lo |= pd_e2m1_rn(v[k] * inv) << (4u * k);
+                    hi |= pd_e2m1_rn(v[8u + k] * inv) << (4u * k);
+                }
+                *(uint2*)(qo + (size_t)c * (ff >> 1) + (pb >> 1)) = make_uint2(lo, hi);
+                qs[(size_t)c * (ff >> 4) + (pb >> 4)] = (unsigned char)sbyte;
+            }
+        }
+    }
+#else
+    (void)wdm; (void)wsm; (void)ydm; (void)ysm; (void)qo; (void)qs; (void)scale2;
+    (void)in_dim; (void)out_dim; (void)batch;
 #endif
 }
+
+#ifdef PD_BS_HOST
+// CTAs per SM the driver grants the f4t2 kernel at PD_F4T2_SMEM (2 on GB10).
+static int pd_f4t2_occupancy(void) {
+    static int n = -1;
+    if (n < 0) {
+        cudaFuncSetAttribute(pd_nvf4_gemm_f4t2_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_F4T2_SMEM);
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, pd_nvf4_gemm_f4t2_kernel<1>, 256, PD_F4T2_SMEM) != cudaSuccess) n = 0;
+    }
+    return n;
+}
+
+// epi: 1 = shipped, 2 = bench-only no-epilogue; smem_pad: extra dynamic smem
+// requested (bench-only) to force one CTA per SM for the A/B.
+template <int EPI>
+static int pd_f4t2_run(const CUtensorMap* wdm, const CUtensorMap* wsm, const CUtensorMap* ydm,
+                       const CUtensorMap* ysm, unsigned char* q, unsigned char* qs, float scale2,
+                       uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t ntiles,
+                       uint32_t smem, cudaStream_t stream) {
+    static uint32_t smem_set = 0;
+    if (smem_set < smem) {
+        cudaFuncSetAttribute(pd_nvf4_gemm_f4t2_kernel<EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        smem_set = smem;
+    }
+    pd_nvf4_gemm_f4t2_kernel<EPI><<<ntiles, 256, smem, stream>>>(
+        *wdm, *wsm, *ydm, *ysm, q, qs, scale2, in_dim, out_dim, batch);
+    return pd_launch_status();
+}
+
+static int pd_f4t2_variant_probe(int epi, uint32_t smem_pad, const void* data, const void* scale,
+                                 const void* xq, const void* xs, void* q, void* qs, float scale2,
+                                 uint32_t in_dim, uint32_t out_dim, uint32_t batch, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    if ((in_dim & 255u) != 0 || (out_dim & 255u) != 0) return cudaErrorInvalidValue;
+    CUtensorMap *wdm, *wsm, *ydm, *ysm;
+    if (!pd_f4t4_maps(data, scale, xq, xs, in_dim, out_dim, batch, &wdm, &wsm, &ydm, &ysm))
+        return cudaErrorNotSupported;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t ntiles = ((out_dim + 127u) / 128u) * (batch_pad >> 7);
+    const uint32_t smem = PD_F4T2_SMEM + smem_pad;
+    cudaStream_t st = (cudaStream_t)stream;
+    switch (epi) {
+        case 1: return pd_f4t2_run<1>(wdm, wsm, ydm, ysm, (unsigned char*)q, (unsigned char*)qs, scale2, in_dim, out_dim, batch, ntiles, smem, st);
+#ifdef PD_F4T_PROBE
+        case 2: return pd_f4t2_run<2>(wdm, wsm, ydm, ysm, (unsigned char*)q, (unsigned char*)qs, scale2, in_dim, out_dim, batch, ntiles, smem, st);
+#endif
+        default: return cudaErrorInvalidValue;
+    }
+}
+
+static int pd_f4t2_variant(const void* data, const void* scale, const void* xq, const void* xs,
+                           void* q, void* qs, float scale2, uint32_t in_dim, uint32_t out_dim,
+                           uint32_t batch, void* stream) {
+    return pd_f4t2_variant_probe(1, 0u, data, scale, xq, xs, q, qs, scale2, in_dim, out_dim, batch, stream);
+}
+// Default election of f4t2 for the SWQ launcher on dies under 128 SMs (the
+// measured one); PADDOCK_NVF4_F4T2=1|0 pins it either way.
+#define PD_F4T2_SMALL_DIE_DEFAULT 1
+#endif
 
 // f4t with the swiglu + nvf4-quant epilogue over an INTERLEAVED gate|up plane
 // (out_dim = 2*ff, rows 2j/2j+1 = gate_j/up_j): writes the down GEMM's
@@ -2905,24 +3907,25 @@ int pd_nvf4_gemm_f4t_swq(const void* data, const void* scale, const void* xq,
     (void)scale2; (void)in_dim; (void)out_dim; (void)batch; (void)stream;
     return cudaErrorNotSupported;
 #else
-    if (out_dim == 0 || batch == 0) return 0;
-    if ((in_dim & 255u) != 0 || (out_dim & 255u) != 0) return cudaErrorInvalidValue;
-    CUtensorMap *wdm, *wsm, *ydm, *ysm;
-    if (!pd_f4t_maps(data, scale, xq, xs, in_dim, out_dim, batch, &wdm, &wsm, &ydm, &ysm))
-        return cudaErrorNotSupported;
-    const uint32_t batch_pad = (batch + 127u) & ~127u;
-    const uint32_t ntiles = ((out_dim + 127u) / 128u) * (batch_pad >> 7);
-    static int smem_set = 0;
-    if (!smem_set) {
-        cudaFuncSetAttribute(pd_nvf4_gemm_f4t_kernel<true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)PD_F4T_SMEM);
-        smem_set = 1;
+    // The persistent twin (session 21) is OPT-IN: measured neutral on GB10
+    // (its comment has the ledger); PADDOCK_NVF4_F4T_PERSIST=1 elects it
+    // where its geometry holds, PADDOCK_NO_NVF4_F4T_PARK=1 pins the fragment
+    // epilogue of the single-tile kernel.
+    static const bool persist = pd_env("PADDOCK_NVF4_F4T_PERSIST") != nullptr;
+    if (persist && (in_dim & 255u) == 0 && (out_dim & 255u) == 0 && batch != 0 && out_dim != 0) {
+        return pd_f4tp_variant(PD_F4TP_PF, data, scale, xq, xs, q, qs, scale2, in_dim, out_dim, batch, stream);
     }
-    pd_nvf4_gemm_f4t_kernel<true><<<ntiles, 384, PD_F4T_SMEM, (cudaStream_t)stream>>>(
-        *wdm, *wsm, *ydm, *ysm, nullptr, (unsigned char*)q, (unsigned char*)qs, scale2,
-        nullptr, in_dim, out_dim, batch);
-    return pd_launch_status();
+    // f4t2 (session 22): two CTAs per SM, the epilogue of one under the
+    // mainloop of the other - the default on dies under 128 SMs where it
+    // was measured, when the driver grants the second CTA.
+    static const int f4t2_pin = pd_env("PADDOCK_NVF4_F4T2") ? (pd_env("PADDOCK_NVF4_F4T2")[0] != '0') : -1;
+    static int sms = 0;
+    if (!sms) { cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0); if (sms <= 0) sms = 1; }
+    const bool f4t2_on = f4t2_pin >= 0 ? (f4t2_pin != 0) : (PD_F4T2_SMALL_DIE_DEFAULT && sms < 128 && pd_f4t2_occupancy() >= 2);
+    if (f4t2_on && pd_f4t_epi_default() == 1 && (in_dim & 255u) == 0 && (out_dim & 255u) == 0 && batch != 0 && out_dim != 0)
+        return pd_f4t2_variant(data, scale, xq, xs, q, qs, scale2, in_dim, out_dim, batch, stream);
+    return pd_f4t_variant(true, pd_f4t_epi_default(), data, scale, nullptr, xq, xs, nullptr, q,
+                          qs, scale2, in_dim, out_dim, batch, stream);
 #endif
 }
 
@@ -3425,13 +4428,48 @@ int pd_nvf4_dequant(const void* data, const void* scale, float scale2, void* y,
         acc += s * ((float)eb[0] * xv.x + (float)eb[1] * xv.y              \
                   + (float)eb[2] * xv.z + (float)eb[3] * xv.w);            \
     }
+// L2 bulk prefetch of a contiguous byte range (sm_90+; 16 B aligned, size a
+// multiple of 16). A hint: no data dependency, no numerics. Used by the
+// gemv below to present the CTA's whole row block to DRAM as one request
+// ahead of the warps' 64-byte steps (GB10 2026-09-10, session 19).
+__device__ __forceinline__ void pd_l2_prefetch_bulk(const void* p, uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if ((bytes & 15u) == 0u && bytes != 0u && (((uintptr_t)p) & 15u) == 0u)
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+#else
+    (void)p; (void)bytes;
+#endif
+}
+
+// PF: L2 prefetch of the CTA's row block (weights + scales) by one thread
+// before the warps start walking it, plus the row block AHEAD CTAs later
+// in the grid (AHEAD = 0: own block only). Bit-exact: prefetch is a hint.
+#define PD_NV4G_AHEAD 0u
+template <bool PF, uint32_t AHEAD>
 __global__ void pd_nvf4_gemv_kernel(
     const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
     const float* __restrict__ bias, const float* __restrict__ x,
     float* __restrict__ y, float scale2, uint32_t in_dim, uint32_t out_dim) {
 #if PD_NV4_OK
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const uint32_t o = blockIdx.x * (blockDim.x >> 5) + warp;
+    const uint32_t rpc = blockDim.x >> 5;
+    if (PF && threadIdx.x == 0u) {
+        const uint32_t o0 = blockIdx.x * rpc;
+        if (o0 < out_dim) {
+            const uint32_t nr = (out_dim - o0 < rpc) ? (out_dim - o0) : rpc;
+            pd_l2_prefetch_bulk(data + (size_t)o0 * (in_dim >> 1), nr * (in_dim >> 1));
+            pd_l2_prefetch_bulk(scale + (size_t)o0 * (in_dim >> 4), nr * (in_dim >> 4));
+        }
+        if (AHEAD > 0u) {
+            const uint32_t oa = (blockIdx.x + AHEAD) * rpc;
+            if (oa < out_dim) {
+                const uint32_t nr = (out_dim - oa < rpc) ? (out_dim - oa) : rpc;
+                pd_l2_prefetch_bulk(data + (size_t)oa * (in_dim >> 1), nr * (in_dim >> 1));
+                pd_l2_prefetch_bulk(scale + (size_t)oa * (in_dim >> 4), nr * (in_dim >> 4));
+            }
+        }
+    }
+    const uint32_t o = blockIdx.x * rpc + warp;
     if (o >= out_dim) return;
     const uint8_t* row = data + (size_t)o * (in_dim >> 1);
     const uint8_t* srow = scale + (size_t)o * (in_dim >> 4);
@@ -3736,9 +4774,17 @@ int pd_nvf4_gemv(const void* data, const void* scale, const void* bias,
     // derives rows-per-CTA from blockDim, so this is launch config only.
     const uint32_t rows_per_cta = out_dim >= 4096u ? 2u : 8u;
     const uint32_t grid = (out_dim + rows_per_cta - 1u) / rows_per_cta;
-    pd_nvf4_gemv_kernel<<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
-        (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
-        (const float*)x, (float*)y, scale2, in_dim, out_dim);
+    // L2 prefetch of each CTA's row block (session 19, GB10): the bench
+    // winner; PADDOCK_NO_NVF4_GEMV_PF pins the plain walk.
+    static const bool no_pf = pd_env("PADDOCK_NO_NVF4_GEMV_PF") != nullptr;
+    if (no_pf)
+        pd_nvf4_gemv_kernel<false, 0u><<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
+            (const float*)x, (float*)y, scale2, in_dim, out_dim);
+    else
+        pd_nvf4_gemv_kernel<true, PD_NV4G_AHEAD><<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
+            (const float*)x, (float*)y, scale2, in_dim, out_dim);
     return pd_launch_status();
 #endif
 }

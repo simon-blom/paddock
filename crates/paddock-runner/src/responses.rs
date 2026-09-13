@@ -2417,7 +2417,7 @@ struct Gathered {
 /// Without this a server's guidance is collected at initialize and discarded,
 /// which is exactly how "put pages in an artifact, not in your reply" failed
 /// to reach a model that had the tool declared and connected.
-/// Tool guidance first, the user's prompt LAST.
+/// Tool guidance first, the user's prompt last.
 ///
 /// Order is not cosmetic. With the user's line leading and ~200 words of tool
 /// procedure trailing it, a short instruction ("begin every reply with ZORK:")

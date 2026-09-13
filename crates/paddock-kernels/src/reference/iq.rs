@@ -8,8 +8,8 @@
 //! anyone's decoder, and structured around what the codebook formats share:
 //!
 //!   a 256-weight super-block is 8 blocks of 32, each 4 groups of 8;
-//!   a group is ONE codebook entry (8 bytes, one weight each), ONE 8-bit sign
-//!   field and ONE scale (shared by 8, 16 or 32 weights).
+//!   a group is one codebook entry (8 bytes, one weight each), one 8-bit sign
+//!   field and one scale (shared by 8, 16 or 32 weights).
 //!
 //! Every codebook format is therefore a small extractor that yields that
 //! triple per group ([`Group`]), and a single loop widens it. IQ1 differs only

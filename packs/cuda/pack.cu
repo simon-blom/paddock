@@ -41,6 +41,7 @@
 #include "src/gemm/dense_tc5.cuh"       // tcgen05 dense GEMM families (split from dense_fp4_w8); needs its mma/tmap helpers
 #include "src/gemm/dense_f8_decode.cuh" // e4m3 decode/GEMV lane, mma_ks twins, rowwise prefill; must follow dense_tc5 (uses pd_rowq_*/pd_tc5{p,q}_* from it)
 #include "src/gemm/f8_lin.cuh"      // tile-linear f8 weight lane (needs int8_mma ldm helpers + dense_fp4_w8's mma helpers; tmap builders now from tma_desc)
+#include "src/gemm/f8_lin_tall.cuh" // kt3t: the kt3 frame on a 256x128 tile (f8_lin forward-declares its try-launch)
 #include"src/attn/decode_tc5.cuh"  // tcgen05 decode attention (needs tma_desc's pd_tc5_sdesc + f32_qkv's pd_attn_tmap_kv_f8s - no longer tied to dense_fp4_w8)
 #include "src/quant/nvf4.cuh"
 #include "src/moe/nvf4_expert.cuh"   // NVFP4 MoE expert consumers + persistent raw-ring + TM/TF plane twins (split from quant/nvf4.cuh); needs its quantizers/mma helpers

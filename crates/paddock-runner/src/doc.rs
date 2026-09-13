@@ -962,9 +962,9 @@ fn pdf_page_count(bytes: &[u8]) -> Option<usize> {
 /// a strong model answer this exact photo twice - once blind, once with the
 /// metadata - showed which fields change an answer rather than lengthen it:
 ///
-/// * WHEN. Blind, it read the brown foliage as late-summer drought. The date
+/// * when. Blind, it read the brown foliage as late-summer drought. The date
 ///   made it late October. Nothing in the pixels settles that.
-/// * WHERE. Blind, it said Catalonia - masia, umbrella pines, the lot. See
+/// * where. Blind, it said Catalonia - masia, umbrella pines, the lot. See
 ///   the GPS block below for why the place is now resolved here.
 /// * How BIG. It called 640x480 "a downsized copy", and it is right, and it
 ///   could not otherwise know: the vision tower is handed a RESIZED image, so

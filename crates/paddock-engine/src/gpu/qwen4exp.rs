@@ -243,7 +243,7 @@ impl GpuExecutor {
         Ok(true)
     }
 
-    /// Does this pack carry the low-M cluster arm (slots 543/544) for THIS
+    /// Does this pack carry the low-M cluster arm (slots 543/544) for this
     /// die? The pack nulls both on anything but sm_100 (the kernel is
     /// tcgen05/TMEM), so presence is the honest per-device answer and the
     /// load-time warm-up keys off it instead of discovering absence by

@@ -378,7 +378,7 @@ impl GpuExecutor {
         })
     }
 
-    /// `causal_conv1d_silu_qkv_vl_qkc` on ONE fresh span at a row offset
+    /// `causal_conv1d_silu_qkv_vl_qkc` on one fresh span at a row offset
     /// (the unified tick's per-span conv form, GB10 2026-09-08): the kernel
     /// indexes rows relative to the pointers it gets and reads `row0s[row]`
     /// for the zero-pad edge, so a fresh span is the same launch at offset

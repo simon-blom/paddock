@@ -186,7 +186,7 @@ struct ChunkedPrefill {
 
 /// The checkpoint boundaries a chunked prefill lands spans on: `ckpt_cuts`'s
 /// two trailing page boundaries plus every scheduler hint. Ascending, deduped,
-/// each strictly inside the prompt (a cut AT the prompt length is just the
+/// each strictly inside the prompt (a cut at the prompt length is just the
 /// finishing span).
 fn chunk_cuts(ch: &ChunkedPrefill, step: usize) -> Vec<usize> {
     let len = ch.tokens.len();
@@ -1400,7 +1400,7 @@ enum Ffn {
 }
 
 /// The checkpoint-NVFP4 FFN's gate and up planes: either the two planes the
-/// checkpoint ships, or ONE interleaved plane (row 2j = gate_j, row 2j+1 =
+/// checkpoint ships, or one interleaved plane (row 2j = gate_j, row 2j+1 =
 /// up_j, `Nvf4Plane::gu_pairs`) built at load when both share a global scale
 /// and the pack carries the consumers of an interleaved landing (slots
 /// 533-536). Fused, the wide prefill runs `nvf4_gemm_f4t_swq`: silu(gate)
@@ -1666,7 +1666,7 @@ pub struct GpuQwen35 {
     /// Open sampled-spec round (forward_spec_verify_mtp -> spec_commit_mtp):
     /// (padded slot-major chunk, pos_before per live slot).
     /// Open sampled-spec round: (padded chunk rows, per-BLOCK pos_before,
-    /// block->TRUE-slot map) - the map restores round_slots/bs.d_slots at
+    /// block->true-slot map) - the map restores round_slots/bs.d_slots at
     /// commit in case a tick between the split phases re-pointed them.
     spec_pending: Option<(Vec<u32>, Vec<usize>, Vec<u32>)>,
     /// ARMED async draft chain: the draft
@@ -2139,6 +2139,13 @@ struct BatchState {
     /// position 0). Checked at prefix resume; every attach must insert OR
     /// remove (recycled idx slots must never bless garbage feature rows).
     dflash_cover: std::collections::HashSet<u32>,
+    /// Stage F (the reply checkpoint, prefix.rs): per-slot tracked
+    /// sequence - the prompt's keys at admission, then every decode token a
+    /// tick FEEDS, so its length is always the slot's next position; empty =
+    /// not tracking.
+    seq: Vec<Vec<u32>>,
+    /// Stage F: the slot's live reply checkpoint (cut, pool index).
+    reply_ckpt: Vec<Option<(usize, u32)>>,
     /// P5 budget pool: a shared free-list of physical blocks + a per-slot block
     /// table that grows from it on demand, so total full-attn KV follows a block
     /// budget (`PADDOCK_KV_POOL_BLOCKS`) rather than `max_batch × max_ctx`. `None`
@@ -2645,7 +2652,7 @@ struct SpecBatchState {
     chain_depth: usize,
     /// per-slot committed position (host mirror of the sequence lengths)
     pos: Vec<usize>,
-    /// block->TRUE-slot map of the CURRENT round (block i = row block i of
+    /// block->true-slot map of the CURRENT round (block i = row block i of
     /// the round buffers; round_slots[i] = the serving slot it belongs to).
     /// Set by every round driver before staging. The round machinery used to
     /// require reqs[i].slot == i (contiguous-from-0), and any
@@ -2654,7 +2661,7 @@ struct SpecBatchState {
     /// 2-6-row EAGER 65-layer pass on 64x64-tile Q8 kernels (~40 ms/round,
     /// ~95% tile padding: the whole c4-c32 spec loss). The kernels were
     /// always map-driven (staged d_slots_rows / bs.d_slots); this map fixes
-    /// the HOST-side block-vs-slot indexing so the graphed round serves
+    /// the host-side block-vs-slot indexing so the graphed round serves
     /// arbitrary slot sets. Identity (0..alloc) at rest, so the contiguous
     /// paths (bench drivers, c1) behave bit-identically.
     round_slots: Vec<u32>,
@@ -2663,7 +2670,7 @@ struct SpecBatchState {
     round_k1: usize,
     /// [alloc_batch, embd] block-gathered pending_h staging: the draft
     /// graph's step-0 h read is a CONTIGUOUS [0, b*embd) copy baked at
-    /// capture, while pending_h is TRUE-slot-strided - mtp_draft_b gathers
+    /// capture, while pending_h is true-slot-strided - mtp_draft_b gathers
     /// round_slots' rows in here (b small D2D copies, eager) before launch.
     d_pending_hb: CudaSlice<f32>,
     /// per-slot MTP warm flag: KV + pending_h cover positions 0..pos[slot].
@@ -2861,7 +2868,7 @@ fn attn_splits(n_heads: usize, batch: usize, sm_count: usize) -> usize {
     // gates' pair (r=K+1 vs r=B*(K+1)) straddled it - one side split, the
     // other walked. Small dies take the 188-SM boundary (1128 CTAs at 24
     // heads) so they make the RTX PRO's decisions; big dies are unchanged.
-    // The partial scratch (forward.rs) is sized from the SAME boundary.
+    // The partial scratch (forward.rs) is sized from the same boundary.
     if n_heads * batch >= 2 * attn_fill_blocks(attn_boundary_sms(sm_count)) {
         return 1;
     }

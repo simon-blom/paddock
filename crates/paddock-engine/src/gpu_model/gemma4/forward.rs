@@ -125,11 +125,23 @@ pub(crate) const PF_ROWS: usize = 8192;
 /// Two things bound a chunk, and the wider wins:
 ///  - a single-sequence bulk prefill, at most `max_ctx` rows;
 ///  - one serving tick - the mixed prefill budget plus every live slot's
-///    spec-verify rows. `tick_floor` covers the budget plus 1024 rows of
+///    spec-verify rows. [`pf_rows_floor`] covers the budget plus 1024 rows of
 ///    verify, i.e. any width up to ~113 slots.
+///
+/// This is where a server STARTS. `enable_batch` steps it down the halving
+/// ladder when the KV plan cannot seat the configured context beside it, so
+/// `GpuGemma4::pf_rows` - not this - is the width every lane must read.
 pub(crate) fn pf_rows(max_ctx: usize) -> usize {
-    let tick_floor = super::batch::mixed_tick_rows() + 1024;
-    PF_ROWS.min(max_ctx.max(tick_floor).next_multiple_of(128))
+    PF_ROWS.min(max_ctx.next_multiple_of(128).max(pf_rows_floor()))
+}
+
+/// The narrowest chunk this server may run: one serving tick - the mixed
+/// prefill budget plus 1024 rows of spec verify.
+///
+/// Below it a tick overruns the planes, which is an out-of-bounds write and
+/// not a slow path, so this is where `batch::set_pf_rows`'s ladder stops.
+pub(crate) fn pf_rows_floor() -> usize {
+    (super::batch::mixed_tick_rows() + 1024).next_multiple_of(128)
 }
 
 /// SWA append+attend sub-span rows. The WindowRing only has to absorb one
@@ -4121,6 +4133,27 @@ mod tests {
                 "ctx {ctx}: {r} cannot hold one {}-row tick",
                 super::super::batch::mixed_tick_rows()
             );
+        }
+    }
+
+    /// `enable_batch`'s chunk ladder halves toward the floor when the KV plan
+    /// cannot seat the configuration beside the scratch. It must reach the
+    /// floor exactly and never step under it: the planes are `[pf_rows, dim]`,
+    /// so a tick wider than the allocation is an out-of-bounds write.
+    #[test]
+    fn the_chunk_ladder_lands_on_one_tick_and_stops() {
+        let floor = pf_rows_floor();
+        for ctx in [4096usize, 16384, 262144] {
+            let mut chunk = pf_rows(ctx);
+            assert!(chunk >= floor, "ctx {ctx}: starts under the floor");
+            let mut steps = 0;
+            while chunk > floor {
+                chunk = (chunk / 2).max(floor);
+                assert!(chunk >= floor, "ctx {ctx}: stepped under one tick");
+                steps += 1;
+                assert!(steps < 32, "ctx {ctx}: ladder does not terminate");
+            }
+            assert_eq!(chunk, floor);
         }
     }
 

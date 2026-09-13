@@ -885,7 +885,7 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     } else {
         // Deliberately the FLOOR, not the self-sized pool: this gates the
         // "tight" verdict, and the question it asks is whether the endpoint
-        // can cache prefixes at ALL. The pool being able to grow past its
+        // can cache prefixes at all. The pool being able to grow past its
         // minimum is not what makes an endpoint workable.
         shape.recurrent.as_ref().map_or(0, |r| {
             PREFIX_CKPT_FLOOR * r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes

@@ -1929,7 +1929,7 @@ impl GpuQwen35 {
                 let sb = self.spec_batch.as_mut().expect("spec batch");
                 if i == 0 {
                     // d_hin <- the block-gathered pending_h staging (see
-                    // d_pending_hb: pending_h itself is TRUE-slot-strided,
+                    // d_pending_hb: pending_h itself is true-slot-strided,
                     // this copy is contiguous and baked at capture)
                     exec.copy_region(&sb.d_pending_hb, 0, &mut sb.d_hin, 0, b * embd)?;
                 } else {
@@ -3387,7 +3387,7 @@ impl GpuQwen35 {
                 .memcpy_htod(&toks, &mut sb.d_mtp_tok)
                 .map_err(drv)?;
             // h inputs, shifted right within each block; pending_h is
-            // TRUE-slot-strided, the chunk h/logits buffers are block-strided
+            // true-slot-strided, the chunk h/logits buffers are block-strided
             let mut row = 0usize;
             for (i, &ci) in committed[..b].iter().enumerate() {
                 let c = ci as usize;
@@ -4155,7 +4155,7 @@ impl GpuQwen35 {
         if k_use == 0 {
             return Ok(None);
         }
-        // ALL-or-nothing eligibility (the MTP begin's shape): one cold ring
+        // All-or-nothing eligibility (the MTP begin's shape): one cold ring
         // sends the whole round to the MTP chain arm, whose warm seam
         // re-warms - partial dflash rounds keep the synchronous path.
         let mut reqs: Vec<(usize, usize, u32)> = Vec::with_capacity(n);
@@ -4723,6 +4723,14 @@ impl GpuQwen35 {
                 self.dflash_spec_commit(reqs, &padded, &committed, k1)?;
             }
         }
+        {
+            let rows: Vec<(usize, usize)> = reqs
+                .iter()
+                .zip(&pos_before)
+                .map(|(r, &p)| (r.0, p))
+                .collect();
+            self.reply_after_spec_round(&rows, &padded, &committed, k1)?;
+        }
         if dbg2 {
             tracing::info!(
                 "[spec-round-t] verify+readback={t_verify}us commit={t_commit}us catchup={}us",
@@ -4990,6 +4998,14 @@ impl GpuQwen35 {
                 self.dflash_spec_commit(reqs, &padded, &committed, k1)?;
             }
         }
+        {
+            let rows: Vec<(usize, usize)> = reqs
+                .iter()
+                .zip(&pos_before)
+                .map(|(r, &p)| (r.0, p))
+                .collect();
+            self.reply_after_spec_round(&rows, &padded, &committed, k1)?;
+        }
         if dbg {
             let acc: u32 = committed.iter().sum();
             let c0 = &reqs[0].2;
@@ -5116,6 +5132,15 @@ impl GpuQwen35 {
                 .map(|(&s, &p)| (s as usize, p, Vec::new()))
                 .collect();
             self.dflash_spec_commit(&reqs, &padded, committed, k1)?;
+        }
+        {
+            let k1 = padded.len() / slots.len().max(1);
+            let rows: Vec<(usize, usize)> = slots
+                .iter()
+                .zip(&pos_before)
+                .map(|(&s, &p)| (s as usize, p))
+                .collect();
+            self.reply_after_spec_round(&rows, &padded, committed, k1)?;
         }
         Ok(())
     }

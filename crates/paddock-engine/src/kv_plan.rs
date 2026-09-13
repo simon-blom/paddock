@@ -323,11 +323,26 @@ impl Demand {
     /// worth more than a server that starts and then cannot serve.
     pub fn plan_or_minimum(&self, grant: u64) -> Plan {
         self.plan(grant).unwrap_or_else(|e| {
+            // Clamped to the GRANT, not just to the floor. The reserves are
+            // allocations this caller makes later (checkpoint blobs, graph
+            // slack), so a minimum shape may fairly eat into them - but the
+            // grant itself is the budget the operator set, and walking past it
+            // is how a 40000 MiB gemma4 server ended up 40.74 GiB resident:
+            // the refusal was printed and then ignored, identically at 40000
+            // and at 43000, because the fallback never looked at `grant` at
+            // all. If even one block will not fit, say so and let alloc_kv
+            // fail honestly rather than quietly overcommitting the card.
+            let per_block = self.block_bytes.max(1);
+            let affordable = grant.saturating_sub(self.per_slot_bytes) / per_block;
+            let blocks = self.floor(1).min(affordable);
             tracing::warn!(
                 family = self.family,
-                "{e} - trying one slot and letting the allocator have the last word"
+                floor_blocks = self.floor(1),
+                taken_blocks = blocks,
+                grant_gib = gib(grant),
+                "{e} - taking the smallest shape the grant affords and letting the \
+                 allocator have the last word"
             );
-            let blocks = self.floor(1);
             Plan {
                 slots: 1,
                 pool_blocks: blocks as usize,
@@ -496,6 +511,45 @@ mod tests {
             reserves: vec![Reserve::new("slack", GIB), Reserve::new("scratch", GIB)],
             ..Default::default()
         }
+    }
+
+    /// The fallback must not walk past the grant.
+    ///
+    /// It used to take `floor(1)` outright, with no reference to `grant` at
+    /// all, so the refusal was printed and then ignored. Measured on
+    /// gemma-4-31B at ctx 16384: a 40000 MiB budget and a 43000 MiB budget
+    /// produced the same 1536-block pool and the same 40.74 GiB resident,
+    /// which is the tell - the number the operator set changed nothing.
+    #[test]
+    fn the_minimum_shape_never_exceeds_the_grant() {
+        let d = pooled();
+        // floor(1) is 256 blocks = 1 GiB here; give it half that
+        let grant = GIB / 2;
+        assert!(d.plan(grant).is_err(), "this grant must not plan");
+        let p = d.plan_or_minimum(grant);
+        assert!(
+            p.pool_bytes + p.slot_bytes <= grant,
+            "took {} bytes of a {grant}-byte grant",
+            p.pool_bytes + p.slot_bytes
+        );
+        assert_eq!(
+            p.pool_blocks, 128,
+            "the grant affords 128 of the 256-block floor"
+        );
+    }
+
+    /// Per-slot state is charged before the pool gets what is left, so a grant
+    /// that barely covers one slot's state buys no blocks rather than
+    /// overcommitting the card by a pool's worth.
+    #[test]
+    fn the_minimum_shape_charges_per_slot_state_first() {
+        let d = Demand {
+            per_slot_bytes: GIB,
+            ..pooled()
+        };
+        let p = d.plan_or_minimum(GIB + GIB / 8);
+        assert!(p.pool_bytes + p.slot_bytes <= GIB + GIB / 8);
+        assert_eq!(p.pool_blocks, 32, "(1.125 - 1.0) GiB / 4 MiB");
     }
 
     #[test]

@@ -414,12 +414,13 @@ __global__ void __launch_bounds__(256, 1) pd_ssd_y_kernel(
 // caller's base pointers, already offset (the serial walk's contract).
 // Returns a NEGATIVE value if the stream-ordered alloc fails, so the
 // launcher can fall back to the serial walk.
-static int pd_mamba2_ssd_run(void* state, int state_f16, const void* xbc,
-                             const void* dt_raw, uint32_t dt_stride,
-                             const void* A, const void* D,
-                             const void* dt_bias, void* y, uint32_t n_tokens,
-                             uint32_t n_heads, uint32_t n_groups,
-                             void* stream) {
+#include "ssd_mma.cuh"   // K2/K3/K5 on the tf32 tensor pipe (3xTF32), elected below
+static int pd_mamba2_ssd_run_impl(void* state, int state_f16, const void* xbc,
+                                  const void* dt_raw, uint32_t dt_stride,
+                                  const void* A, const void* D,
+                                  const void* dt_bias, void* y,
+                                  uint32_t n_tokens, uint32_t n_heads,
+                                  uint32_t n_groups, void* stream, int mma) {
     const cudaStream_t st = (cudaStream_t)stream;
     const uint32_t d_inner = n_heads * 64u;
     const uint32_t conv_dim = d_inner + 2u * n_groups * 128u;
@@ -452,19 +453,49 @@ static int pd_mamba2_ssd_run(void* state, int state_f16, const void* xbc,
         pd_ssd_prep_kernel<<<dim3(n_heads, nc), PD_SSD_L, 0, st>>>(
             (const float*)dt_raw, dt_stride, t0, (const float*)A,
             (const float*)dt_bias, n_heads, ptok, cum, dtv);
-        pd_ssd_gram_kernel<128u><<<dim3(4u, nc * n_groups), 128u, 0, st>>>(
-            (const float*)xbc, t0, conv_dim, d_inner, n_groups, ptok, m);
-        pd_ssd_dstate_kernel<128u, 64u>
-            <<<dim3(n_heads, nc), 256u, 0, st>>>(
-                (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
-                ptok, cum, dtv, ds);
+        if (mma)
+            pd_ssd_gram_mma_kernel<128u>
+                <<<dim3(4u, nc * n_groups), 128u, 0, st>>>(
+                    (const float*)xbc, t0, conv_dim, d_inner, n_groups, ptok, m);
+        else
+            pd_ssd_gram_kernel<128u><<<dim3(4u, nc * n_groups), 128u, 0, st>>>(
+                (const float*)xbc, t0, conv_dim, d_inner, n_groups, ptok, m);
+        if (mma)
+            pd_ssd_dstate_mma_kernel<128u, 64u>
+                <<<dim3(n_heads, nc), 256u, 0, st>>>(
+                    (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
+                    ptok, cum, dtv, ds);
+        else
+            pd_ssd_dstate_kernel<128u, 64u>
+                <<<dim3(n_heads, nc), 256u, 0, st>>>(
+                    (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
+                    ptok, cum, dtv, ds);
         pd_ssd_chain_kernel<<<dim3(n_heads, 4u), 256u, 0, st>>>(
             state, state_f16, nc, n_heads, p == 0, p + 1u == n_pass, cum, ds,
             run);
-        pd_ssd_y_kernel<128u, 64u><<<dim3(n_heads, nc, 2u), 256u, 0, st>>>(
-            (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
-            (const float*)D, (float*)y, ptok, cum, dtv, m, ds);
+        if (mma)
+            pd_ssd_y_mma_kernel<128u, 64u>
+                <<<dim3(n_heads, nc), 256u, 0, st>>>(
+                    (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
+                    (const float*)D, (float*)y, ptok, cum, dtv, m, ds);
+        else
+            pd_ssd_y_kernel<128u, 64u><<<dim3(n_heads, nc, 2u), 256u, 0, st>>>(
+                (const float*)xbc, t0, conv_dim, d_inner, n_groups, n_heads,
+                (const float*)D, (float*)y, ptok, cum, dtv, m, ds);
     }
     cudaFreeAsync(blob, st);
     return pd_launch_status();
+}
+// The shipped entry: the tensor-pipe pieces unless PADDOCK_NO_SSD_MMA pins
+// the scalar twins (GB10 2026-09-11; both are the SSD numerics class).
+static int pd_mamba2_ssd_run(void* state, int state_f16, const void* xbc,
+                             const void* dt_raw, uint32_t dt_stride,
+                             const void* A, const void* D,
+                             const void* dt_bias, void* y, uint32_t n_tokens,
+                             uint32_t n_heads, uint32_t n_groups,
+                             void* stream) {
+    static const bool no_mma = pd_env("PADDOCK_NO_SSD_MMA") != nullptr;
+    return pd_mamba2_ssd_run_impl(state, state_f16, xbc, dt_raw, dt_stride, A,
+                                  D, dt_bias, y, n_tokens, n_heads, n_groups,
+                                  stream, no_mma ? 0 : 1);
 }

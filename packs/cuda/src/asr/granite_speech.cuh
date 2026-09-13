@@ -5,7 +5,7 @@
 //
 // The granite-speech mmproj is a CONFORMER, not a whisper-shaped
 // encoder, so four of its pieces have no counterpart anywhere else in the
-// pack: a macaron FFN with a HALF-weighted residual, a sigmoid-GLU on a
+// pack: a macaron FFN with a half-weighted residual, a sigmoid-GLU on a
 // channel-split landing, a CENTERED depthwise conv over time (deltanet's
 // `pd_causal_conv1d_silu` is causal - the whole point here is that the
 // conformer looks both ways), and blockwise attention carrying **Shaw

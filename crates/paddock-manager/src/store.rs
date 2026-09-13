@@ -317,7 +317,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     kind       TEXT NOT NULL DEFAULT '',
     doc        TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS conversations_updated ON conversations(updated_at DESC);
+-- The list index is NOT here: it covers `kind`, which arrives by ALTER in
+-- `open` (see `conversations_list` there).
 
 CREATE TABLE IF NOT EXISTS prompts (
     id         TEXT PRIMARY KEY,
@@ -858,6 +859,32 @@ impl Store {
                 );
             }
         }
+        // The conversation list is a COVERING index, and that is the whole
+        // point: every column `list_conversations` selects lives in the index,
+        // so the query never touches the table. It has to be here rather than
+        // in SCHEMA because `kind` is one of those columns and it arrives by
+        // the ALTER just above.
+        //
+        // Why it matters (measured 2026-09-09, staged install on a spinning
+        // RAID array, 324 conversations in a 234 MB file): ordering alone -
+        // the old `conversations_updated` - still fetched each row FROM THE
+        // TABLE, and rows are far apart because each one carries its whole
+        // conversation as a ~240 KB `doc` (78 MB across the table). That is
+        // 324 scattered reads at ~92 ms of seek each, and the first load of
+        // the Studio after a boot spent 38.7 s inside this one query while
+        // every other endpoint answered in ~200 ms. A covering scan reads a
+        // few contiguous index pages instead. Warm it never showed, which is
+        // why it survived this long: only a cold cache and a slow disk bill
+        // for row fetches.
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS conversations_list
+             ON conversations(updated_at DESC, id, title, model, pinned, created_at, kind)",
+            [],
+        );
+        // Redundant once the above exists: same leading column, so it can
+        // serve every ordering the old one did, and a second index is only
+        // more write cost per conversation.
+        let _ = conn.execute("DROP INDEX IF EXISTS conversations_updated", []);
         // activity rekeyed on instance_id. A PK
         // change is a table REBUILD in SQLite, not an ALTER: detect the old
         // shape by the missing column and copy rows across, stamping each old
@@ -2979,6 +3006,42 @@ mod tests {
     fn conv(id: &str, messages: Value) -> Value {
         json!({"id": id, "title": "t", "model": "m", "createdAt": 1, "updatedAt": 1,
                "messages": messages})
+    }
+
+    /// The list query must never touch the conversations TABLE: every column
+    /// it selects is in `conversations_list`, and the row it would otherwise
+    /// fetch carries the whole conversation document with it. On a slow disk
+    /// with a cold cache that difference was 38.7 s against ~0. A column added
+    /// to the SELECT without being added to the index brings the row fetches
+    /// back, silently and only on someone else's hardware - so assert the
+    /// plan, not the timing.
+    #[test]
+    fn the_conversation_list_is_answered_by_a_covering_index() {
+        let s = mem_store();
+        let conn = s.lock();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, title, model, pinned, updated_at, created_at, kind
+                 FROM conversations ORDER BY updated_at DESC",
+                [],
+                |r| r.get(3),
+            )
+            .expect("plan");
+        assert!(
+            plan.contains("COVERING INDEX conversations_list"),
+            "the list query fell back to row fetches: {plan}"
+        );
+        // and the index it replaced is gone, not carried along as write cost
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'conversations_updated'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(leftover, 0, "the superseded index is still there");
     }
 
     /// The whole point: the LIST answers the kind, so an unopened row does not

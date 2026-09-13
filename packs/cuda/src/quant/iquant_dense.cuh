@@ -160,7 +160,7 @@ __global__ void __launch_bounds__(256) pd_iqd_glu_kernel(
 // each lane one 64-weight chunk (four 16-weight windows) per step - so a
 // lane's weight bytes are contiguous (one superblock region) and a warp's
 // step covers 2048 weights. The activations and the format's codebook are
-// staged in shared ONCE per block, and the block then walks rows grid-stride
+// staged in shared once per block, and the block then walks rows grid-stride
 // (the grid is capped at the resident-block count); a warp per row needs no
 // cross-warp fold, so rows finish with a shuffle and one store.
 //

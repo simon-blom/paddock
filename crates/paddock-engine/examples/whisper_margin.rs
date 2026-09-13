@@ -2,7 +2,7 @@
 //!
 //!   cargo run --release --example whisper_margin -- <model.gguf> <clip.wav> [lang]
 //!
-//! WHY. When two engines running the same weights disagree on a word, the
+//! why. When two engines running the same weights disagree on a word, the
 //! question that decides whether it is a defect or not is how close the two
 //! candidates were. A flip at a 1e-3 relative margin is the model being
 //! undecided and the two engines rounding differently; a flip at a wide

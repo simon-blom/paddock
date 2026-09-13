@@ -82,7 +82,7 @@ pub struct ExpertCache {
     /// out-of-wave pair ABSENT (`MOE_CACHE_NONE` in the routing, which the
     /// pair kernels skip). See `pd_moe_wave_plan` in the pack.
     pub n_waves: usize,
-    /// `wave_of[n_expert]`: the wave each present expert landed in (NONE
+    /// `wave_of[n_expert]`: the wave each present expert landed in (none
     /// when absent from the launch), written by the plan.
     wave_of: CudaSlice<u32>,
     /// `wave_ids[n_waves * slots]`, `wave_cnt[n_waves]`: the plan's lists.

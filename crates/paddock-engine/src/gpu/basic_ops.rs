@@ -9,7 +9,7 @@ use paddock_models::ggml_type::GgmlType;
 /// Shape census for the in-house GEMM helpers (born as, kept
 /// after the phase-C cuBLAS deletion - new models' shapes still need
 /// enumerating against gauntlet coverage). Behind PADDOCK_LOG_GEMM_SHAPES
-/// (off by default), logs each unique (kind, in, out, batch) ONCE. kind:
+/// (off by default), logs each unique (kind, in, out, batch) once. kind:
 /// "A-f32" (router matvec class) / "B-gemmEx-f16" (f16xf16->f32, slot 383).
 /// Cost when off is one cached OnceLock bool load.
 pub(crate) fn gemm_census(kind: &'static str, in_dim: usize, out_dim: usize, batch: usize) {

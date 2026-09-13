@@ -15,7 +15,7 @@
 //!   (~50 MB/slot on this geometry), and it makes admission a two-part act:
 //!   back the prompt's blocks AND zero the slot's arenas.
 //!
-//! Scratch is sized once at enable for `cap = PREFILL_CHUNK + n_slots` rows
+//! Scratch is sized once at enable for `cap = prefill_chunk + n_slots` rows
 //! (granite's law: a fused mixed tick carries the decode band on TOP of a
 //! full chunk, so sizing at the chunk alone would make the band steal chunk
 //! rows). Decode graphs will bake these addresses in stage C - allocated
@@ -32,7 +32,6 @@ use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::kv_plan;
 use crate::kv_pool::{BlockTable, KvPool};
 
-use super::forward::PREFILL_CHUNK;
 use super::*;
 use crate::gpu_model::qwen35::{gemv_any, mmq_pre, mmq_pre_any, prefill_mm_pre_any, prefill_quant};
 use paddock_models::nemotron::NemotronBlock;
@@ -186,7 +185,7 @@ pub(crate) struct BatchQ8 {
 #[allow(dead_code)]
 pub(crate) struct NemoBatch {
     pub n_slots: usize,
-    /// Row capacity of every scratch plane = PREFILL_CHUNK + one row per slot.
+    /// Row capacity of every scratch plane = prefill_chunk + one row per slot.
     pub cap: usize,
     /// logical blocks per slot (max_ctx/16) - the block table's slot stride
     pub bps: usize,
@@ -224,6 +223,14 @@ pub(crate) struct NemoBatch {
     pub d_ckpt_stage: Vec<CudaSlice<f32>>,
     /// spec verify planes  - lazily allocated at first spec use
     pub verify: Option<super::spec::VerifyPlanes>,
+    /// Stage F: per-slot tracked sequence (prompt keys, then every fed
+    /// decode token); empty = not tracking.
+    pub seq: Vec<Vec<u32>>,
+    /// Stage F: the slot's live reply checkpoint (cut, pool index).
+    pub reply_ckpt: Vec<Option<(usize, u32)>>,
+    /// Stage F: snapshots copied on the device whose ids the host has not
+    /// seen yet (slot, cut, pool index).
+    pub reply_pending: Vec<(usize, usize, u32)>,
 }
 
 /// A prompt queued for stall-free chunked prefill. `keys` mirrors `tokens`
@@ -260,7 +267,7 @@ fn drv(e: cudarc::driver::DriverError) -> GpuError {
 /// `quantize_q8` between them.
 ///
 /// `bs.nb_r` / `bs.nb_s` are ARENA capacities, sized once for the widest row
-/// stream a tick can carry (`cap = PREFILL_CHUNK + max_batch` - 520 rows on a
+/// stream a tick can carry (`cap = prefill_chunk + max_batch` - 520 rows on a
 /// max-batch-8 server, so nb_r = 260). Handing that to the kernels launched
 /// 260 blocks for a 4-row decode that fills about 24 of them. The GEMM tiles
 /// early-out on PD_MOE_PAD so the pad blocks only cost a CTA slot, but the
@@ -292,7 +299,16 @@ fn moe_live_blocks(rows: usize, picks: usize, experts: usize, cap: usize) -> usi
     if *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_MOE_NBLIVE").is_some()) {
         return cap;
     }
-    (experts.min(rows.saturating_mul(picks)) * rows.div_ceil(32)).min(cap)
+    // sum_e ceil(c_e / 32) <= sum_e (c_e / 32 + 1) = pairs / 32 + distinct,
+    // and distinct <= min(experts, pairs): the same distribution-free bound
+    // the BM=8 twin uses. The old `distinct * ceil(rows/32)` is exact only
+    // at rows <= 32 and grows with rows x experts (4224 at 1036 rows), so a
+    // wide scratch cap turned it into launches of mostly PAD CTAs (GB10
+    // 2026-09-11: +9 ms on the 1k request at an 8192-row cap).
+    let pairs = rows.saturating_mul(picks);
+    let tight = experts.min(pairs) + pairs / 32;
+    let old = experts.min(pairs) * rows.div_ceil(32);
+    tight.min(old).min(cap)
 }
 
 /// Dense-projection dispatch for the GGUF lane above r = 1.
@@ -346,6 +362,13 @@ const MOE_DEC2_MAX_ROWS: usize = 64;
 /// family's capability gate: a pack without it serves fine on the sorted
 /// tile, just slower, and folding it into the gate is the over-broad-bundle
 /// shape is auditing for.
+/// Lever 14: the BM=8 shared-expert fold on the skinny decode path
+/// (`PADDOCK_NO_NEMO_SH_FOLD8=1` keeps the separate wide pair).
+fn sh_fold8_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NEMO_SH_FOLD8").is_none())
+}
+
 fn moe_dec2_ok(exec: &GpuExecutor) -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
@@ -480,7 +503,7 @@ impl GpuNemotron {
         let ssm_dt = self.ssm_dtype;
         let arena_bytes = max_batch * n_mamba * (state_elems * ssm_dt.bytes() + win_elems * 4);
 
-        let cap = PREFILL_CHUNK + max_batch;
+        let cap = self.prefill_chunk + max_batch;
         let qmax = embd.max(d_inner);
         // shared fold-: the r>1 path serves the shared expert
         // as ns_sh pseudo-experts inside the routed launch, so the align
@@ -536,14 +559,26 @@ impl GpuNemotron {
         // adds the plan's charges to it.
         let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
         // Mamba state checkpoints for the prefix cache, sized by DEMAND and
-        // charged as a reserve (the qwen35 rule, 2026-09-06): two per
+        // charged as a reserve (the qwen35 rule, 2026-09-06): eight per
         // requested slot, clamped 16..256, then capped by what the grant has
         // left once every other term - including a full-context pool for
-        // every slot - is charged. It used to be computed AFTER the plan as a
+        // every slot - is charged. It used to be computed after the plan as a
         // fifth of whatever was still free, clamped to 256, with no reserve:
         // 256 f32 snapshots (~6 GiB) for a one-slot server on a 96 GB card.
+        // Two per slot (16 at 8 slots) was the working set of one wave: an
+        // agentic session keeps two live cuts and its previous turn's two
+        // until the next commit, so eight sessions cycled the pool every
+        // turn and resumed from the shared system prompt instead of their
+        // own boundary (GB10 2026-09-11; 64 held every session's cut).
+        // The staging blobs (one pass's cuts) are charged the same way.
         let state_ckpt_f32 = n_mamba * (state_elems + win_elems);
         let per_ckpt = (state_ckpt_f32 * 4) as u64;
+        let n_stages = if px_on {
+            super::prefix::ckpt_stages(max_batch)
+        } else {
+            0
+        };
+        let staging_bytes = n_stages as u64 * per_ckpt;
         let tier_staging: u64 = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
             crate::kv_tier::ram_transport::device_staging_bytes()
         } else {
@@ -555,6 +590,7 @@ impl GpuNemotron {
         let charged_without_pool = VRAM_HEADROOM as u64
             + scratch_est as u64
             + tier_staging
+            + staging_bytes
             + max_batch as u64 * per_slot_bytes
             + (max_batch * bps * block_bytes) as u64;
         let n_ckpt: u32 = if !px_on || per_ckpt == 0 {
@@ -566,7 +602,7 @@ impl GpuNemotron {
         {
             n
         } else {
-            let want = (max_batch as u64 * 2).clamp(16, 256);
+            let want = (max_batch as u64 * 8).clamp(16, 256);
             let leftover = grant.saturating_sub(charged_without_pool);
             want.min(leftover / per_ckpt).max(16) as u32
         };
@@ -581,14 +617,22 @@ impl GpuNemotron {
             // explicit radix retention (blocks the tree may hold after their
             // sequence ends - cheap here at 96 KiB/block-set, ~48 MB default).
             retention_blocks: retain,
-            // every slot must at least hold a full chunk's worth of prompt, or
-            // admission deadlocks on its own first chunk
-            floor_blocks_per_slot: PREFILL_CHUNK.div_ceil(16),
+            // every slot must at least hold a base tick's worth of prompt, or
+            // admission deadlocks on its own first chunk. The BASE tick, not
+            // the scratch cap: with the cap at 8192 rows on small dies the
+            // cap-derived floor (512 blocks x 8 slots) was the whole pool
+            // and the prefix cache stopped retaining (GB10 2026-09-11 -
+            // serving logprobs moved, PPL did not; the resumes had vanished)
+            floor_blocks_per_slot: self
+                .prefill_chunk
+                .min(super::forward::PREFILL_TICK_BASE)
+                .div_ceil(16),
             floor_blocks_min: 256,
             reserves: vec![
                 kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
                 kv_plan::Reserve::new("prefill scratch", scratch_est as u64),
                 kv_plan::Reserve::new("prefix state pool", n_ckpt as u64 * per_ckpt),
+                kv_plan::Reserve::new("prefix state staging", staging_bytes),
                 kv_plan::Reserve::new("kv-tier staging", tier_staging),
             ],
             ..Default::default()
@@ -733,7 +777,7 @@ impl GpuNemotron {
             let mut pr = crate::paged_radix::PagedRadix::new();
             pr.set_state_capacity(n_ckpt);
             let pool_f32 = self.exec.alloc(n_ckpt as usize * state_ckpt_f32)?;
-            let stages = (0..super::prefix::CKPT_STAGES)
+            let stages = (0..n_stages)
                 .map(|_| self.exec.alloc(state_ckpt_f32))
                 .collect::<Result<Vec<_>, _>>()?;
             (Some(pr), Some(pool_f32), stages, n_ckpt)
@@ -824,6 +868,9 @@ impl GpuNemotron {
             state_ckpt_f32,
             d_ckpt_stage,
             verify: None,
+            seq: vec![Vec::new(); slots],
+            reply_ckpt: vec![None; slots],
+            reply_pending: Vec::new(),
         });
         self.last_reused = vec![0; slots];
         self.dflash_ensure_state()?;
@@ -835,7 +882,7 @@ impl GpuNemotron {
             (pool_blocks * block_bytes) as f64 / (1u64 << 30) as f64,
             pool_blocks * 16,
             arena_bytes as f64 / (1u64 << 30) as f64,
-            PREFILL_CHUNK,
+            self.prefill_chunk,
             grant.saturating_sub(plan_reserved) as f64 / (1u64 << 30) as f64,
             grant as f64 / (1u64 << 30) as f64,
         );
@@ -973,6 +1020,7 @@ impl GpuNemotron {
     pub(crate) fn release_inactive_slots_impl(&mut self, occupied: &[bool]) {
         for (s, &occ) in occupied.iter().enumerate() {
             if !occ {
+                self.reply_release(s);
                 self.dflash_clear_slot(s);
                 // release is not a data path - a clear-copy failure here
                 // can't corrupt anything the next admit won't re-clear
@@ -1180,11 +1228,14 @@ impl GpuNemotron {
         // (ctx/8 chunks keep the 32-token tiles full at serve contexts).
         // The kill env is the same one the pack's election reads, so an
         // off-arm A/B leg gets vec8's budget too.
+        // r >= 1 since GB10 2026-09-11 (the pack's gate widened with it): the
+        // head-packed arm wins at one row at every context, and the c1 cell
+        // at 7.5k tokens was lost on vec8's walk (GB10, 2026-09-11).
         let hp16 = matches!(kv_dtype, KvDtype::Fp8E4m3)
             && hd == 128
             && n_kv > 0
             && nh == n_kv * 16
-            && r >= 2
+            && r >= 1
             && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_HP16").is_none();
         let ns = if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
             1
@@ -1987,7 +2038,16 @@ impl GpuNemotron {
                     // The tiny shared grid rides the routed grid's PDL tail
                     // (the rung-17 law working for us, not against).
                     let skinny = moe_tiled && !pf && !dec1;
-                    if ns_sh > 0 && !dec1 && !skinny {
+                    // BM=8 fold of the shared expert (lever 14, GB10 c8):
+                    // at r <= 8 every pseudo-expert is one block, so the
+                    // strip re-read the comment above fears does not
+                    // happen, and the separate wide pair - 28.6 + 26.1 us
+                    // per layer PDL-accounted, 2.5x its 7.5 MB byte floor,
+                    // 1.26 ms of a 25.4 ms c8 tick - becomes two more
+                    // blocks of a launch that streams at ~93% of the roof.
+                    // PADDOCK_NO_NEMO_SH_FOLD8=1 keeps the separate pair.
+                    let fold8 = skinny && ns_sh > 0 && r <= 8 && sh_fold8_on();
+                    if ns_sh > 0 && !dec1 && (!skinny || fold8) {
                         exec.moe_topk_sigmoid_batch_sh(
                             &sc.d_logits_r,
                             &w.bias.buf,
@@ -2023,7 +2083,7 @@ impl GpuNemotron {
                     // is measured; launch-only, so captured decode graphs
                     // bake it in and it keeps counting on replays.
                     if sc.moe_uniq_dev != 0 {
-                        let kw = if ns_sh > 0 && !dec1 && !skinny {
+                        let kw = if ns_sh > 0 && !dec1 && (!skinny || fold8) {
                             hp.n_active + ns_sh
                         } else {
                             hp.n_active
@@ -2326,13 +2386,16 @@ impl GpuNemotron {
                     // sums the down K halves (the sanctioned split-K
                     // regroup, same class as the slot fold itself).
                     if skinny {
-                        // routed experts: plain topk rows, BM=8 blocks
-                        let kw = hp.n_active;
-                        let np = hp.n_active + 1;
+                        // routed experts: plain topk rows, BM=8 blocks; with
+                        // the fold the shared pseudo-experts ride along as
+                        // picks n_active.. (one block each at r <= 8)
+                        let ns_f = if fold8 { ns_sh } else { 0 };
+                        let kw = hp.n_active + ns_f;
+                        let np = if fold8 { kw } else { hp.n_active + 1 };
                         if !pro_done {
                             exec.quantize_nvf4(&sc.d_xn, &mut sc.d_xq4, &mut sc.d_xs4, r * embd)?;
                         }
-                        let nbr = moe_live_blocks_bm8(r, kw, hp.n_expert, sc.nb_r);
+                        let nbr = moe_live_blocks_bm8(r, kw, hp.n_expert + ns_f, sc.nb_r);
                         exec.moe_align_bm(
                             &sc.d_idx,
                             &mut sc.d_srow,
@@ -2340,7 +2403,7 @@ impl GpuNemotron {
                             &mut sc.d_bexp,
                             r,
                             kw,
-                            hp.n_expert,
+                            hp.n_expert + ns_f,
                             8,
                             nbr,
                         )?;
@@ -2370,46 +2433,48 @@ impl GpuNemotron {
                             nbr,
                             8,
                         )?;
-                        // shared expert: resident sh planes, WIDE tiled pair
-                        // (full 32-blocks; the 1-block grid overlaps the
-                        // routed grid's drain under PDL)
-                        let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
-                        exec.moe_align(
-                            &sc.d_sh_idx,
-                            &mut sc.d_srow_s,
-                            &mut sc.d_sslot_s,
-                            &mut sc.d_bexp_s,
-                            r,
-                            1,
-                            1,
-                            nbs,
-                        )?;
-                        exec.nvf4_moe_up_relu2_st(
-                            sh_up,
-                            &sc.d_srow_s,
-                            &sc.d_bexp_s,
-                            &sc.d_xq4,
-                            &sc.d_xs4,
-                            &mut sc.d_fq_s,
-                            &mut sc.d_fs_s,
-                            nbs,
-                            32,
-                        )?;
-                        exec.nvf4_moe_down_st(
-                            sh_down,
-                            &sc.d_srow_s,
-                            &sc.d_sslot_s,
-                            &sc.d_bexp_s,
-                            None,
-                            &sc.d_fq_s,
-                            &sc.d_fs_s,
-                            &mut sc.d_part,
-                            1,
-                            np,
-                            hp.n_active,
-                            nbs,
-                            32,
-                        )?;
+                        if !fold8 {
+                            // shared expert: resident sh planes, WIDE tiled
+                            // pair (full 32-blocks; the 1-block grid
+                            // overlaps the routed grid's drain under PDL)
+                            let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
+                            exec.moe_align(
+                                &sc.d_sh_idx,
+                                &mut sc.d_srow_s,
+                                &mut sc.d_sslot_s,
+                                &mut sc.d_bexp_s,
+                                r,
+                                1,
+                                1,
+                                nbs,
+                            )?;
+                            exec.nvf4_moe_up_relu2_st(
+                                sh_up,
+                                &sc.d_srow_s,
+                                &sc.d_bexp_s,
+                                &sc.d_xq4,
+                                &sc.d_xs4,
+                                &mut sc.d_fq_s,
+                                &mut sc.d_fs_s,
+                                nbs,
+                                32,
+                            )?;
+                            exec.nvf4_moe_down_st(
+                                sh_down,
+                                &sc.d_srow_s,
+                                &sc.d_sslot_s,
+                                &sc.d_bexp_s,
+                                None,
+                                &sc.d_fq_s,
+                                &sc.d_fs_s,
+                                &mut sc.d_part,
+                                1,
+                                np,
+                                hp.n_active,
+                                nbs,
+                                32,
+                            )?;
+                        }
                         exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, np, r)?;
                         continue;
                     }
@@ -2778,7 +2843,11 @@ impl GpuNemotron {
         assert!(r <= n_slots, "rows {r} > enabled {n_slots}");
         self.ensure_rows(slots, positions)?;
         self.upload_rows(tokens, positions, slots)?;
+        for i in 0..r {
+            self.reply_feed(slots[i] as usize, positions[i], tokens[i]);
+        }
         self.step_replay(r)?;
+        self.reply_after_rows(slots, positions)?;
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
             for i in 0..r {
                 let p = positions[i] as usize;
@@ -2814,11 +2883,12 @@ impl GpuNemotron {
         row0: usize,
         stage0: &mut usize,
         step: usize,
+        max_stages: usize,
     ) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
         let mut breaks = Vec::new();
         let mut after = Vec::new();
         for cut in super::prefix::ckpt_cuts(t_len, step) {
-            if cut > start.max(base) && cut <= base + len && *stage0 < super::prefix::CKPT_STAGES {
+            if cut > start.max(base) && cut <= base + len && *stage0 < max_stages {
                 breaks.push((row0 + (cut - base), *stage0));
                 after.push((*stage0, cut));
                 *stage0 += 1;
@@ -2827,7 +2897,7 @@ impl GpuNemotron {
         (breaks, after)
     }
 
-    /// Prefill a whole prompt into `slot` (chunked at PREFILL_CHUNK) and
+    /// Prefill a whole prompt into `slot` (chunked at `prefill_chunk`) and
     /// return the last token's logits. Trailing-boundary checkpoints stage
     /// during the passes and commit between chunks (stage D).
     pub(crate) fn forward_prefill_impl(
@@ -2837,24 +2907,30 @@ impl GpuNemotron {
     ) -> Result<Vec<f32>, GpuModelError> {
         self.admit_rows(slot, tokens.len())?;
         let start = self.prefix_resume_rows(slot, tokens, tokens.len())?;
+        self.reply_track_admit(slot, tokens);
         let mut base = start;
         let mut last_len = 0usize;
-        for chunk in tokens[base..].chunks(PREFILL_CHUNK) {
+        for chunk in tokens[base..].chunks(self.prefill_chunk) {
             let rows: Vec<(u32, u32, u32)> = chunk
                 .iter()
                 .enumerate()
                 .map(|(j, &t)| (slot as u32, (base + j) as u32, t))
                 .collect();
             let mut stage = 0usize;
-            let (breaks, after) = Self::stage_plan(
-                tokens.len(),
-                start,
-                base,
-                chunk.len(),
-                0,
-                &mut stage,
-                self.tier_ckpt_step(),
-            );
+            let (breaks, after) = if !self.has_ckpt_stages() {
+                (Vec::new(), Vec::new())
+            } else {
+                Self::stage_plan(
+                    tokens.len(),
+                    start,
+                    base,
+                    chunk.len(),
+                    0,
+                    &mut stage,
+                    self.tier_ckpt_step(),
+                    self.ckpt_stage_count(),
+                )
+            };
             self.rows_pass_body(&rows, 0, breaks)?;
             for (st, cut) in after {
                 self.commit_stage(st, slot, tokens, cut);
@@ -2885,6 +2961,7 @@ impl GpuNemotron {
         for (it, (slot, tokens)) in items.iter().enumerate() {
             self.admit_rows(*slot, tokens.len())?;
             starts[it] = self.prefix_resume_rows(*slot, tokens, tokens.len())?;
+            self.reply_track_admit(*slot, tokens);
         }
         let mut rows: Vec<(u32, u32, u32)> = Vec::new();
         let mut last_row = vec![0usize; items.len()];
@@ -2906,7 +2983,7 @@ impl GpuNemotron {
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
         let step = self.tier_ckpt_step();
         let mut base = 0usize;
-        for chunk in rows.chunks(PREFILL_CHUNK) {
+        for chunk in rows.chunks(self.prefill_chunk) {
             let r = chunk.len();
             // finishers whose last row landed in this chunk read inside the
             // pass - the next chunk's embed overwrites d_x. Ascending by row
@@ -2923,9 +3000,10 @@ impl GpuNemotron {
             let mut breaks: Vec<(usize, usize)> = Vec::new();
             let mut after: Vec<(usize, usize, usize)> = Vec::new();
             let mut stage = 0usize;
+            let max_stages = self.ckpt_stage_count();
             for (it, (_, toks)) in items.iter().enumerate() {
                 for cut in super::prefix::ckpt_cuts(toks.len(), step) {
-                    if cut <= starts[it] || stage >= super::prefix::CKPT_STAGES {
+                    if cut <= starts[it] || stage >= max_stages {
                         continue;
                     }
                     let grow = item_base[it] + (cut - starts[it]);
@@ -2969,6 +3047,7 @@ impl GpuNemotron {
         if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG_IDS").is_some() {
             tracing::info!("[spec2a-ids] admit slot={slot} cursor={cursor} prompt={tokens:?}");
         }
+        self.reply_track_admit(slot, &tokens);
         self.chunked.push(ChunkedPrefill {
             slot,
             keys: tokens.clone(),
@@ -2986,20 +3065,53 @@ impl GpuNemotron {
     }
 
     /// Pick this tick's chunk rows: FIFO over the queue, up to `budget`
-    /// rows, splitting the last prompt if it does not fit.
+    /// rows, splitting the last prompt if it does not fit. The tick's width
+    /// is the WHOLE-PROMPT rule: `PREFILL_TICK_BASE` rows, or the first
+    /// queued prompt's remaining rows when that is more, never past the
+    /// scratch cap - a cohort of short prompts ramps through base-width
+    /// ticks (the median first token comes earlier that way), a long prompt
+    /// streams the experts once instead of once per base width (GB10
+    /// 2026-09-11: 2048 / 4096 / 8192 rows per tick measured on the 8x1k
+    /// cohort and on 4k / 8k prompts).
     fn plan_chunk(&self, budget: usize) -> (Vec<(u32, u32, u32)>, Vec<(usize, usize, bool)>) {
         let mut rows: Vec<(u32, u32, u32)> = Vec::new();
         let mut take: Vec<(usize, usize, bool)> = Vec::new();
         if self.chunked.is_empty() {
             return (rows, take);
         }
-        let cap = budget.clamp(1, PREFILL_CHUNK);
+        let first_rem = self.chunked[0].tokens.len() - self.chunked[0].cursor;
+        let width = super::forward::PREFILL_TICK_BASE.max(first_rem);
+        let cap = budget.clamp(1, self.prefill_chunk).min(width.max(1));
+        // Prompt-aligned ticks (GB10, 2026-09-11):
+        // a prompt after the first joins the tick only whole - within the
+        // cap, or within a quarter-base overshoot the scratch can take - and
+        // the tick ends at the previous prompt's boundary otherwise. A prompt
+        // cut at the tick edge costs its owner a whole extra tick of
+        // first-token latency and one more mamba segment split: the 8 x 1k
+        // cohort ran as 2048-row cuts (five ticks, the 4th and 5th first
+        // tokens on the 3rd tick) and now runs as 2-prompt ticks (four). The
+        // first prompt keeps the whole-prompt rule above; on the big die the
+        // scratch cap binds first and nothing changes.
+        // PADDOCK_NO_PROMPT_ALIGN=1 restores the row-exact cut.
+        let align = paddock_models::dev_var_os!("PADDOCK_NO_PROMPT_ALIGN").is_none();
+        let slack_cap = if align {
+            (cap + super::forward::PREFILL_TICK_BASE / 4)
+                .min(budget.max(1))
+                .min(self.prefill_chunk)
+                .max(cap)
+        } else {
+            cap
+        };
         for (qi, c) in self.chunked.iter().enumerate() {
             if rows.len() >= cap {
                 break;
             }
             let remaining = c.tokens.len() - c.cursor;
-            let n = remaining.min(cap - rows.len()).max(1);
+            let limit = if qi == 0 { cap } else { slack_cap };
+            if align && qi > 0 && rows.len() + remaining > limit {
+                break;
+            }
+            let n = remaining.min(limit - rows.len()).max(1);
             for j in 0..n {
                 let p = c.cursor + j;
                 rows.push((c.slot as u32, p as u32, c.tokens[p]));
@@ -3032,6 +3144,18 @@ impl GpuNemotron {
 
     /// Build the fused tick's row stream: decode rows first (one band), then
     /// as much of the prefill queue as scratch capacity allows.
+    /// Whether checkpoint staging buffers exist (prefix cache armed with a
+    /// state pool); the checkpoint planners emit no cuts without them.
+    fn has_ckpt_stages(&self) -> bool {
+        self.ckpt_stage_count() > 0
+    }
+
+    /// Staging blobs this serve allocated (`prefix::ckpt_stages` at enable;
+    /// 0 with the cache off) - the per-pass cap every stage plan honours.
+    fn ckpt_stage_count(&self) -> usize {
+        self.batch.as_ref().map_or(0, |b| b.d_ckpt_stage.len())
+    }
+
     fn fuse_rows(
         &self,
         decodes: &[(usize, u32, u32)],
@@ -3078,13 +3202,21 @@ impl GpuNemotron {
     ) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize)>) {
         let mut breaks = Vec::new();
         let mut after = Vec::new();
+        // No staging buffers (prefix cache off, or no checkpoint pool fit):
+        // nothing to stage into, so no cuts. Without this the walk indexed
+        // `d_ckpt_stage[stg]` on an empty vec (PADDOCK_NO_PREFIX_CACHE=1
+        // panicked on the first prompt past a page boundary, GB10 2026-09-11).
+        if !self.has_ckpt_stages() {
+            return (breaks, after);
+        }
         let mut stage = 0usize;
         let mut row_base = dec_n;
         let step = self.tier_ckpt_step();
+        let max_stages = self.ckpt_stage_count();
         for &(qi, n, _) in take {
             let c = &self.chunked[qi];
             for cut in super::prefix::ckpt_cuts(c.tokens.len(), step) {
-                if cut > c.cursor && cut <= c.cursor + n && stage < super::prefix::CKPT_STAGES {
+                if cut > c.cursor && cut <= c.cursor + n && stage < max_stages {
                     breaks.push((row_base + (cut - c.cursor), stage));
                     after.push((stage, qi, cut));
                     stage += 1;
@@ -3142,8 +3274,16 @@ impl GpuNemotron {
             self.ensure_rows(&slots, &pos)?;
         }
         let (breaks, after) = self.mixed_stage_plan(&take, dec_n);
+        for &(slot, tok, pos) in decodes {
+            self.reply_feed(slot, pos, tok);
+        }
         self.rows_pass_body(&rows, dec_n, breaks)?;
         self.mixed_stage_commit(after);
+        {
+            let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
+            let dpos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
+            self.reply_after_rows(&dslots, &dpos)?;
+        }
         // Decode rows first: one bulk head over rows 0..dec_n, then device
         // sampling - it must precede the finisher heads because head_row
         // bounces through x[0] and rewrites head_logits[0..vocab].
@@ -3197,8 +3337,16 @@ impl GpuNemotron {
             self.ensure_rows(&slots, &pos)?;
         }
         let (breaks, after) = self.mixed_stage_plan(&take, dec_n);
+        for &(slot, tok, pos) in decodes {
+            self.reply_feed(slot, pos, tok);
+        }
         self.rows_pass_body(&rows, dec_n, breaks)?;
         self.mixed_stage_commit(after);
+        {
+            let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
+            let dpos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
+            self.reply_after_rows(&dslots, &dpos)?;
+        }
         let mut dec_logits = Vec::new();
         if dec_n > 0 {
             self.head_rows(dec_n)?;
@@ -3389,7 +3537,11 @@ impl GpuNemotron {
         assert_eq!(ident.len(), r, "one slot per row");
         self.ensure_rows(ident, positions)?;
         self.upload_rows(tokens, positions, ident)?;
+        for i in 0..r {
+            self.reply_feed(ident[i] as usize, positions[i], tokens[i]);
+        }
         self.step_replay(r)?;
+        self.reply_after_rows(ident, positions)?;
         let step = self.sample_head_rows(r, plans)?;
         self.mtp_append_ticks(ident, positions)?;
         Ok(step)
@@ -3419,9 +3571,9 @@ impl GpuNemotron {
             let p = self.pipe_b.as_ref().expect("pipe active");
             (p.b, p.tick)
         };
-        // back every row's THIS-tick write position before anything mutates -
+        // back every row's this-tick write position before anything mutates -
         // a growth error leaves the rings/inputs untouched
-        {
+        let (slots_v, pos_v) = {
             let (pos0, slot_map) = {
                 let p = self.pipe_b.as_ref().expect("pipe active");
                 (p.pos0.clone(), p.slots.clone())
@@ -3431,7 +3583,8 @@ impl GpuNemotron {
                 .collect();
             let pos_v: Vec<u32> = pos0.iter().map(|&p0| p0 + tick as u32).collect();
             self.ensure_rows(&slots_v, &pos_v)?;
-        }
+            (slots_v, pos_v)
+        };
         let ring = tick % 2;
         let (par, tpar, any5, any6) = Self::pack_samp_par(plans);
         let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
@@ -3459,6 +3612,9 @@ impl GpuNemotron {
             exec.pipe_advance(out, prev * n_slots, tok, pos, b)?;
         }
         self.step_replay(b)?;
+        // stage F: the snapshot copies ride the stream behind this tick; the
+        // ids that complete their pages arrive with the next host read
+        self.reply_after_rows(&slots_v, &pos_v)?;
         {
             let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
             exec.sample_rows_at(
@@ -3538,6 +3694,10 @@ impl GpuNemotron {
         // them); ensure_rows runs inside pipe_launch_tick_b at tick 0
         let ident: Vec<u32> = (0..b as u32).collect();
         self.upload_rows(tokens, positions, slots.unwrap_or(&ident))?;
+        for i in 0..b {
+            let slot = slots.map_or(i, |s| s[i] as usize);
+            self.reply_feed(slot, positions[i], tokens[i]);
+        }
         self.pipe_b = Some(PipeB {
             b,
             tick: 0,
@@ -3582,7 +3742,14 @@ impl GpuNemotron {
             exec.to_host_u32_after(ev, &sc.d_pipe_out, ring * n_slots, b)
         };
         match r {
-            Ok(ids) => Ok(ids),
+            Ok(ids) => {
+                let (pos0, slots) = {
+                    let p = self.pipe_b.as_ref().expect("pipe active");
+                    (p.pos0.clone(), p.slots.clone())
+                };
+                self.reply_pipe_ids(&ids, &pos0, slots.as_deref(), j + 1);
+                Ok(ids)
+            }
             Err(e) => {
                 self.pipe_b_abort();
                 Err(e.into())
@@ -3605,9 +3772,15 @@ impl GpuNemotron {
             .ok_or(GpuModelError::BatchDisabled)?
             .n_slots;
         let ev = st.ev[ring].as_ref().expect("in-flight event");
-        let sc = &self.batch.as_ref().expect("batch enabled").sc;
-        match exec.to_host_u32_after(ev, &sc.d_pipe_out, ring * n_slots, st.b) {
-            Ok(ids) => Ok(ids),
+        let r = {
+            let sc = &self.batch.as_ref().expect("batch enabled").sc;
+            exec.to_host_u32_after(ev, &sc.d_pipe_out, ring * n_slots, st.b)
+        };
+        match r {
+            Ok(ids) => {
+                self.reply_pipe_ids(&ids, &st.pos0, st.slots.as_deref(), st.tick + 1);
+                Ok(ids)
+            }
             Err(e) => {
                 let _ = exec.synchronize(); // state gone - quiesce ring readers
                 Err(e.into())

@@ -41,6 +41,22 @@
 # Env: PADDOCK_MMPROJ   CLI: --mmproj
 # mmproj = "~/paddock/models/Qwen3-VL-mmproj-f16.gguf"
 
+# Soft tokens one image may cost. Unset = the checkpoint's own published
+# budget, which is what you want unless you are reading dense documents.
+#
+# It buys resolution: the budget decides what the image is resized to before
+# the encoder sees it. Gemma 4 publishes 280, which renders an A4 page at
+# 672x912 and loses small print - measured on a page of 6 pt figures, 280
+# read 1 of 12 amounts correctly where 1120 read 12 of 12. You pay for it in
+# prompt tokens (~1100 per page instead of ~270) and in encode time, so it is
+# a deliberate choice per endpoint rather than a default.
+#
+# Clamped to what the tower's position tables can address. Read by the gemma4
+# family today; other models keep their checkpoint's budget and say so at
+# startup if this is set.
+# Env: PADDOCK_MAX_IMAGE_TOKENS
+# max_image_tokens = 1120
+
 # --- Server-side sampling defaults (llama.cpp-style) -----------------------
 # Used only when a request omits the field - the request always wins. The
 # commented values are the built-in OpenAI-compat defaults.

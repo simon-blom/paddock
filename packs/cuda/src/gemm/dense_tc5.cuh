@@ -2200,7 +2200,7 @@ static uint32_t* pd_tc5q_ctr(bool make = false) {
 //
 // Even widened this stays two kernels with a global barrier between them,
 // and that is STRUCTURAL rather than a tuning miss. Quantizing against a
-// PER-128-GROUP scale instead (DeepGEMM's "1d1d" - 1D scales on both
+// per-128-GROUP scale instead (DeepGEMM's "1d1d" - 1D scales on both
 // operands, which is what SGLang's per_token_group_quant_flat does) lets
 // every block reduce its own group locally, so the whole thing is one pass
 // with no cross-block dependency. Our f8t plane carries a PER-ROW

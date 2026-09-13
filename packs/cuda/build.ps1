@@ -113,6 +113,17 @@ foreach ($a in $Arches) {
     }
 }
 if ($bsHost) { $defines += "-DPD_BS_HOST=1" }
+else {
+    # No block-scale arch in the list, so paddock_pack_kernels_v1 is compiled
+    # without its per-device resolution and hands out the raw table. Fine for
+    # a quick compile check; not fine for a test gate - the block-scale
+    # entries then look loadable on a die whose SASS for them is empty, and
+    # suites that ask `has_*` before running launch them anyway and fail with
+    # CUDA_ERROR_NOT_SUPPORTED instead of skipping. Cost a false "pre-existing
+    # failure" reading on an A6000 (2026-09-12).
+    Write-Warning ("no block-scale arch (100/120/121) in -Arches: this pack exports the UNRESOLVED " +
+                   "kernel table. Use it to check the build, not to gate GPU tests.")
+}
 # No trailing PTX: JIT-limping onto a GPU generation we
 # never validated is exactly the unknown-performance serve the engine's
 # validated-arch allowlist exists to refuse. A new generation gets a proper
@@ -135,7 +146,7 @@ if ($gencode.Count -eq 0) { throw "no supported arches to build" }
 # diagnostic and keeps the non-conforming preprocessor CCCL is warning about.
 # /Zc:__cplusplus is not optional either, and it is a CORRECTNESS flag, not a
 # dialect nicety: without it MSVC reports __cplusplus as 199711L, nvcc mirrors
-# that value into the DEVICE pass, and cuda.h's CUtensorMap - which spells its
+# that value into the device pass, and cuda.h's CUtensorMap - which spells its
 # 128-byte alignment as `#if __cplusplus >= 201103L alignas(128)` - silently
 # degrades to an 8-byte-aligned struct. Every kernel that takes a tensor map
 # by value (`const __grid_constant__ CUtensorMap`) then gets it at whatever
@@ -143,7 +154,7 @@ if ($gencode.Count -eq 0) { throw "no supported arches to build" }
 # 64-byte-aligned tensor map: on the RTX 5060 Ti that is
 # CUDA_ERROR_MISALIGNED_ADDRESS on the first f8 lm_head call (the map sits at
 # offset 8, behind the weight pointer). The attention and f8row families
-# survived only because their maps are the FIRST parameters. NVIDIA's own
+# survived only because their maps are the first parameters. NVIDIA's own
 # guidance for MSVC-hosted nvcc is this exact flag; tma_desc.cuh static_asserts
 # the alignment so a build that loses it fails at compile time, not on a
 # user's first request.

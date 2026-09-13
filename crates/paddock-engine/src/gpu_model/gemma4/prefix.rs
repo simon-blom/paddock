@@ -51,11 +51,33 @@ const MIN_CACHE_PREFIX: usize = 64;
 /// Don't checkpoint prompts shorter than this.
 const MIN_SNAPSHOT_LEN: usize = 4 * BLOCK_TOKENS;
 
-fn ckpt_slots() -> usize {
-    paddock_models::dev_var!("PADDOCK_GEMMA4_PREFIX_CKPTS")
+/// SWA-window checkpoints the pool holds, per served slot. The flat 2 this
+/// replaced was LRU across the whole radix, so a cohort of agentic sessions
+/// (each caching its own growing conversation) never kept more than two
+/// checkpoints total - at 8 sessions no seat found its checkpoint on the
+/// next turn and re-prefilled the entire history (c8 cached_tokens=0 every
+/// turn, measured on GB10). One per active session is the bare minimum;
+/// four leaves the LRU a few turns of slack as sessions interleave.
+const PREFIX_CKPTS_PER_SLOT: usize = 4;
+
+/// Checkpoint pool size: `PADDOCK_GEMMA4_PREFIX_CKPTS` wins outright (0 drops
+/// the pool); else `PREFIX_CKPTS_PER_SLOT` per slot, capped by the
+/// `PADDOCK_GEMMA4_PREFIX_STATE_MB` byte budget (8192) and never below 2.
+/// One 31B window checkpoint at fp8 KV is ~210 MB, so 8 slots reserve
+/// ~6.7 GB here; Muse's is ~41 MB, the 26B-A4B's ~105 MB.
+fn ckpt_slots_for(slots: usize, state_bytes: usize) -> usize {
+    if let Some(n) = paddock_models::dev_var!("PADDOCK_GEMMA4_PREFIX_CKPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n;
+    }
+    let budget_mb: usize = paddock_models::dev_var!("PADDOCK_GEMMA4_PREFIX_STATE_MB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
+        .unwrap_or(8192);
+    let by_budget = (budget_mb << 20) / state_bytes.max(1);
+    (slots * PREFIX_CKPTS_PER_SLOT).min(by_budget).max(2)
 }
 
 /// Free-margin the pool keeps under retention (compaction): with
@@ -114,11 +136,12 @@ impl GpuGemma4 {
 
     /// VRAM `build_prefix` will claim (the checkpoint pool) - the reserve
     /// enable_batch carves out of the slot-fit budget.
-    pub(crate) fn prefix_vram_estimate(&self) -> usize {
+    pub(crate) fn prefix_vram_estimate(&self, slots: usize) -> usize {
         if paddock_models::dev_var_os!("PADDOCK_NO_PREFIX_CACHE").is_some() {
             return 0;
         }
-        ckpt_slots() * self.prefix_state_bytes()
+        let state_bytes = self.prefix_state_bytes();
+        ckpt_slots_for(slots, state_bytes) * state_bytes
     }
 
     /// Build the prefix cache (called from enable_batch; POOL mode only -
@@ -136,7 +159,7 @@ impl GpuGemma4 {
             return Ok(());
         }
         let win_blocks = self.hp.swa_window / BLOCK_TOKENS;
-        let n_states = ckpt_slots();
+        let n_states = ckpt_slots_for(slots, state_bytes);
         let mut radix = PagedRadix::new();
         radix.set_state_capacity(n_states as u32);
         let d_ckpt = self

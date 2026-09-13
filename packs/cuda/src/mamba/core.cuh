@@ -83,6 +83,60 @@ __global__ void pd_mamba_conv_seq_kernel(
     for (uint32_t j = 0; j < km1; ++j) win[(size_t)j * conv_dim + c] = vals[j];
 }
 
+// The same conv over a span cut into TCH-token chunks along T (grid.y): a
+// chunk's k-1 deep halo is the previous chunk's last k-1 inputs, which are
+// plain rows of xbc (chunk 0 takes them from `win`), and only the last chunk
+// writes the window back. Every output token runs the serial kernel's FMA
+// sequence verbatim (same wc[j] * vals[j] order, same bias seed), so
+// chunked-vs-serial is bit-exact - the halo is data the serial walk would
+// have shifted through `vals` anyway. Why: the serial kernel is 24 CTAs of
+// 256 threads on a 6144-channel plane (grid = conv_dim / 256), each thread
+// walking the whole span - on GB10's 48 SMs a 1022-row span cost 75-190 us
+// per launch and 172 launches per 1k prefill request (12.9 ms, vLLM's
+// triton conv 2.2), half the die idle and every thread latency-bound on
+// its own dependent load chain. TCH = 64 puts 16 chunks x 24 = 384 CTAs on
+// the span.
+template <uint32_t TCH>
+__global__ void pd_mamba_conv_seq_chunked_kernel(
+        float* __restrict__ win, const float* __restrict__ xbc,
+        uint32_t x_off, uint32_t x_stride, const float* __restrict__ w,
+        const float* __restrict__ b, float* __restrict__ out,
+        uint32_t conv_dim, uint32_t k, uint32_t n_tokens) {
+    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const uint32_t km1 = k - 1u;
+    const uint32_t t0 = blockIdx.y * TCH;
+    if (t0 >= n_tokens) return;
+    const uint32_t t1 = (t0 + TCH < n_tokens) ? t0 + TCH : n_tokens;
+    float vals[PD_CONV_K_MAX];
+    // halo: input rows t0-km1 .. t0-1; rows before the span come from the
+    // carried window (win[j] is the j-th oldest of the km1 inputs before
+    // row 0, exactly what the serial kernel loads)
+    for (uint32_t j = 0; j < km1; ++j) {
+        const int32_t tr = (int32_t)t0 - (int32_t)km1 + (int32_t)j;
+        vals[j] = tr >= 0 ? xbc[(size_t)tr * x_stride + x_off + c]
+                          : win[(size_t)(tr + (int32_t)km1) * conv_dim + c];
+    }
+    float wc[PD_CONV_K_MAX];
+    for (uint32_t j = 0; j < k; ++j) wc[j] = w[(size_t)c * k + j];
+    const float bc = b[c];
+    for (uint32_t t = t0; t < t1; ++t) {
+        vals[km1] = xbc[(size_t)t * x_stride + x_off + c];
+        float acc = bc;
+        for (uint32_t j = 0; j < k; ++j) acc += wc[j] * vals[j];
+        out[(size_t)t * conv_dim + c] = acc / (1.0f + expf(-acc));
+        for (uint32_t j = 0; j < km1; ++j) vals[j] = vals[j + 1];
+    }
+    if (t1 == n_tokens)
+        for (uint32_t j = 0; j < km1; ++j) win[(size_t)j * conv_dim + c] = vals[j];
+}
+
+// Chunk width and the election floor for the chunked conv: spans of at
+// least 2 x PD_CONV_TCH tokens chunk (a one-chunk launch is the serial
+// kernel with an extra halo read); PADDOCK_NO_CONV_CHUNK pins the serial
+// walk for the A/B.
+#define PD_CONV_TCH 64u
+
 PD_EXPORT
 int pd_mamba_conv_seq(void* win, const void* xbc, uint32_t x_off,
                       uint32_t x_stride, const void* w, const void* b,
@@ -92,6 +146,15 @@ int pd_mamba_conv_seq(void* win, const void* xbc, uint32_t x_off,
     if (k > PD_CONV_K_MAX || k == 0) return cudaErrorInvalidValue;
     uint32_t threads = 256;
     uint32_t blocks = (conv_dim + threads - 1) / threads;
+    static const bool no_chunk = pd_env("PADDOCK_NO_CONV_CHUNK") != nullptr;
+    if (!no_chunk && n_tokens >= 2u * PD_CONV_TCH) {
+        dim3 grid(blocks, (n_tokens + PD_CONV_TCH - 1u) / PD_CONV_TCH);
+        pd_mamba_conv_seq_chunked_kernel<PD_CONV_TCH>
+            <<<grid, threads, 0, (cudaStream_t)stream>>>(
+                (float*)win, (const float*)xbc, x_off, x_stride, (const float*)w,
+                (const float*)b, (float*)out, conv_dim, k, n_tokens);
+        return pd_launch_status();
+    }
     pd_mamba_conv_seq_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
         (float*)win, (const float*)xbc, x_off, x_stride, (const float*)w,
         (const float*)b, (float*)out, conv_dim, k, n_tokens);

@@ -21,7 +21,7 @@
 //! ## Why the radix prefix cache stays on
 //!
 //! The safety argument:
-//! - adoption and insertion are both FULL-16-row-block granular
+//! - adoption and insertion are both full-16-row-block granular
 //!   (`paged_radix::insert` takes `tokens.len()/16` blocks; a match covering
 //!   the block that contains `prefill_len` would need more rows than the
 //!   prompt has), so the boundary block is always slot-private;
@@ -44,7 +44,7 @@
 //!
 //! FlashDecoding splits are in, and the bring-up note above was wrong to park
 //! them as "decode is launch-bound -> graphs first". The serial
-//! `pd_attn_decode_batch_paged` walk is WORK-bound: a
+//! `pd_attn_decode_batch_paged` walk is work-bound: a
 //! (10 heads × ≤8 rows) = ≤80-block grid cannot fill a 188-SM die, and it
 //! runs at ~23% of the DRAM roof.
 

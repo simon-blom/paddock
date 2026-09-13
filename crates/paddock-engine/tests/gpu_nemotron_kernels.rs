@@ -109,79 +109,91 @@ fn mamba_conv_seq_matches_serial_steps() {
     // token by token (same FMA order per token), including the final window
     // state - the bulk-prefill path's state handoff to decode depends on it.
     let Some(exec) = common::gpu() else { return };
-    if !exec.has_mamba2() || !exec.has_nemotron_prefill_f8() {
+    // The GGUF lane's gate, not the fp8 one: conv_seq runs in both lanes'
+    // bulk prefill, but the fp8 pair is nulled below sm_89 - so asking the
+    // fp8 question here skipped this test on exactly the Ampere cards whose
+    // Q8_0 prefill runs this kernel (the same wrong-lane mistake
+    // has_nemotron_prefill_gguf's comment records for the engine).
+    if !exec.has_mamba2() || !exec.has_nemotron_prefill_gguf() {
         common::missing("pack has no mamba conv_seq kernel");
         return;
     }
-    const T: usize = 13;
     const X_OFF: usize = 33;
     const STRIDE: usize = CONV_DIM + 77; // fused-row layout: junk around the span
-    let win0 = det(3 * CONV_DIM, 11);
-    let xbc = det(T * STRIDE, 12);
-    let w = det(CONV_DIM * K_CONV, 13);
-    let b = det(CONV_DIM, 14);
-    let d_xbc = exec.to_device(&xbc).expect("xbc");
-    let d_w = exec.to_device(&w).expect("w");
-    let d_b = exec.to_device(&b).expect("b");
+    // 13 rows = the serial kernel; 200 and 1022 = the T-chunked twin the
+    // launcher elects from 128 rows (64-row chunks, a ragged last chunk, a
+    // halo read from xbc for every chunk but the first, the window written
+    // back by the last chunk only) - GB10 2026-09-11.
+    for t_len in [13usize, 200, 1022] {
+        #[allow(non_snake_case)]
+        let T = t_len;
+        let win0 = det(3 * CONV_DIM, 11);
+        let xbc = det(T * STRIDE, 12);
+        let w = det(CONV_DIM * K_CONV, 13);
+        let b = det(CONV_DIM, 14);
+        let d_xbc = exec.to_device(&xbc).expect("xbc");
+        let d_w = exec.to_device(&w).expect("w");
+        let d_b = exec.to_device(&b).expect("b");
 
-    // serial reference: T conv steps, each fed the token's span slice
-    let mut d_win_s = exec.to_device(&win0).expect("win serial");
-    let mut d_step = exec.alloc(CONV_DIM).expect("step out");
-    let mut serial_out = Vec::with_capacity(T * CONV_DIM);
-    for t in 0..T {
-        exec.mamba_conv_step(
-            &mut d_win_s,
+        // serial reference: T conv steps, each fed the token's span slice
+        let mut d_win_s = exec.to_device(&win0).expect("win serial");
+        let mut d_step = exec.alloc(CONV_DIM).expect("step out");
+        let mut serial_out = Vec::with_capacity(T * CONV_DIM);
+        for t in 0..T {
+            exec.mamba_conv_step(
+                &mut d_win_s,
+                &d_xbc,
+                t * STRIDE + X_OFF,
+                &d_w,
+                &d_b,
+                &mut d_step,
+                CONV_DIM,
+                K_CONV,
+            )
+            .expect("conv step");
+            serial_out.extend(exec.to_host(&d_step).expect("step host"));
+        }
+        let win_serial = exec.to_host(&d_win_s).expect("win serial host");
+
+        // bulk: one launch over the span
+        let mut d_win_b = exec.to_device(&win0).expect("win bulk");
+        let mut d_out = exec.alloc(T * CONV_DIM).expect("bulk out");
+        exec.mamba_conv_seq(
+            &mut d_win_b,
             &d_xbc,
-            t * STRIDE + X_OFF,
+            X_OFF,
+            STRIDE,
             &d_w,
             &d_b,
-            &mut d_step,
+            &mut d_out,
             CONV_DIM,
             K_CONV,
+            T,
         )
-        .expect("conv step");
-        serial_out.extend(exec.to_host(&d_step).expect("step host"));
-    }
-    let win_serial = exec.to_host(&d_win_s).expect("win serial host");
+        .expect("conv seq");
+        let bulk_out = exec.to_host(&d_out).expect("bulk host");
+        let win_bulk = exec.to_host(&d_win_b).expect("win bulk host");
 
-    // bulk: one launch over the span
-    let mut d_win_b = exec.to_device(&win0).expect("win bulk");
-    let mut d_out = exec.alloc(T * CONV_DIM).expect("bulk out");
-    exec.mamba_conv_seq(
-        &mut d_win_b,
-        &d_xbc,
-        X_OFF,
-        STRIDE,
-        &d_w,
-        &d_b,
-        &mut d_out,
-        CONV_DIM,
-        K_CONV,
-        T,
-    )
-    .expect("conv seq");
-    let bulk_out = exec.to_host(&d_out).expect("bulk host");
-    let win_bulk = exec.to_host(&d_win_b).expect("win bulk host");
-
-    for i in 0..T * CONV_DIM {
-        assert_eq!(
-            bulk_out[i].to_bits(),
-            serial_out[i].to_bits(),
-            "out[{i}] (t {}, c {}): bulk {} vs serial {}",
-            i / CONV_DIM,
-            i % CONV_DIM,
-            bulk_out[i],
-            serial_out[i]
-        );
+        for i in 0..T * CONV_DIM {
+            assert_eq!(
+                bulk_out[i].to_bits(),
+                serial_out[i].to_bits(),
+                "out[{i}] (t {}, c {}): bulk {} vs serial {}",
+                i / CONV_DIM,
+                i % CONV_DIM,
+                bulk_out[i],
+                serial_out[i]
+            );
+        }
+        for c in 0..2 * CONV_DIM {
+            assert_eq!(
+                win_bulk[c].to_bits(),
+                win_serial[c].to_bits(),
+                "window[{c}]"
+            );
+        }
+        println!("conv seq: {T} tokens bit-exact vs serial steps (incl. final window)");
     }
-    for c in 0..2 * CONV_DIM {
-        assert_eq!(
-            win_bulk[c].to_bits(),
-            win_serial[c].to_bits(),
-            "window[{c}]"
-        );
-    }
-    println!("conv seq: {T} tokens bit-exact vs serial steps (incl. final window)");
 }
 
 #[test]
@@ -1268,6 +1280,323 @@ fn nvf4_moe_st_skinny_chain_matches_bs_bitexact() {
         );
     }
     println!("[nvf4-st] skinny+wide tiled chains: t={t} k={k} (fill>8, blocks split), bit-exact");
+}
+
+/// Lever 14's door: the shared expert served as ns_sh = 2 pseudo-experts
+/// inside the routed launch (the loader's fold-in: up = a row split, down =
+/// a K split, one combine slot each) against the separate chain (routed
+/// pair + the standalone shared plane into its own slot). Three chains on
+/// the real shared expert of layer 1: A = separate (BM=8 routed + BM=32
+/// standalone shared), B = fold at BM=8 (the skinny decode shape), C = fold
+/// at BM=32 (the mixed/prefill shape the PPL lane ships). B and C must be
+/// bit-exact (same per-token K order); B vs A is the split-K regroup of the
+/// shared down (two f32 halves summed in the combine instead of one chain)
+/// and must sit at f32 reassociation, not at a logprob-visible distance.
+#[test]
+fn nvf4_moe_sh_fold8_matches_separate_chain() {
+    let Some(exec) = common::gpu() else { return };
+    let Some(st) = checkpoint() else {
+        common::missing("no nemotron checkpoint");
+        return;
+    };
+    if !exec.has_nvf4_moe_st() {
+        common::missing("pack has no tiled nvf4 moe kernels (cc != 12.0?)");
+        return;
+    }
+    let n_e = 4usize;
+    let mut views = Vec::new();
+    for e in 0..n_e {
+        let u = nvfp4_view(&st, &format!("backbone.layers.1.mixer.experts.{e}.up_proj"))
+            .expect("up view");
+        let d = nvfp4_view(
+            &st,
+            &format!("backbone.layers.1.mixer.experts.{e}.down_proj"),
+        )
+        .expect("down view");
+        views.push((u, d));
+    }
+    let shu = nvfp4_view(&st, "backbone.layers.1.mixer.shared_experts.up_proj").expect("sh up");
+    let shd = nvfp4_view(&st, "backbone.layers.1.mixer.shared_experts.down_proj").expect("sh down");
+    let (ff, in_dim, embd) = (views[0].0.n, views[0].0.k, views[0].1.n);
+    assert_eq!(
+        (shu.n, shu.k),
+        (2 * ff, in_dim),
+        "shared up = 2 x moe_ff rows"
+    );
+    assert_eq!(
+        (shd.n, shd.k),
+        (embd, 2 * ff),
+        "shared down = 2 x moe_ff cols"
+    );
+    let ns = 2usize;
+    // routed planes
+    let (mut up_p, mut up_s, mut up_s2) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut dn_p, mut dn_s, mut dn_s2) = (Vec::new(), Vec::new(), Vec::new());
+    for (u, d) in &views {
+        up_p.extend_from_slice(u.packed);
+        up_s.extend_from_slice(u.scales);
+        up_s2.push(u.scale2);
+        dn_p.extend_from_slice(d.packed);
+        dn_s.extend_from_slice(d.scales);
+        dn_s2.push(d.scale2);
+    }
+    let up_r = exec
+        .nvf4_moe_upload_tiled(&up_p, &up_s, &up_s2, n_e, ff, in_dim)
+        .expect("up r");
+    let dn_r = exec
+        .nvf4_moe_upload_tiled(&dn_p, &dn_s, &dn_s2, n_e, embd, ff)
+        .expect("dn r");
+    // standalone shared plane (one expert, ff = 2 x moe_ff)
+    let shu_t = exec
+        .nvf4_moe_upload_tiled(shu.packed, shu.scales, &[shu.scale2], 1, 2 * ff, in_dim)
+        .expect("shu t");
+    let shd_t = exec
+        .nvf4_moe_upload_tiled(shd.packed, shd.scales, &[shd.scale2], 1, embd, 2 * ff)
+        .expect("shd t");
+    // fold-in planes: routed + the two halves, exactly as load.rs builds them
+    let (mut fu_p, mut fu_s, mut fu_s2) = (up_p.clone(), up_s.clone(), up_s2.clone());
+    fu_p.extend_from_slice(shu.packed); // row split: consecutive spans
+    fu_s.extend_from_slice(shu.scales);
+    for _ in 0..ns {
+        fu_s2.push(shu.scale2);
+    }
+    let (mut fd_p, mut fd_s, mut fd_s2) = (dn_p.clone(), dn_s.clone(), dn_s2.clone());
+    {
+        // K split: pseudo-expert h takes columns [h*ff, (h+1)*ff) of every row
+        let rb = ff / 2;
+        let sb = ff / 16;
+        let vrb = shd.k / 2;
+        let vsb = shd.k / 16;
+        for h in 0..ns {
+            for r in 0..embd {
+                fd_p.extend_from_slice(&shd.packed[r * vrb + h * rb..r * vrb + (h + 1) * rb]);
+                fd_s.extend_from_slice(&shd.scales[r * vsb + h * sb..r * vsb + (h + 1) * sb]);
+            }
+        }
+        for _ in 0..ns {
+            fd_s2.push(shd.scale2);
+        }
+    }
+    let up_f = exec
+        .nvf4_moe_upload_tiled(&fu_p, &fu_s, &fu_s2, n_e + ns, ff, in_dim)
+        .expect("up f");
+    let dn_f = exec
+        .nvf4_moe_upload_tiled(&fd_p, &fd_s, &fd_s2, n_e + ns, embd, ff)
+        .expect("dn f");
+
+    for &t in &[8usize, 32usize] {
+        let k = 3usize;
+        let kw = k + ns;
+        // routed picks over the 4 experts, weights positive; shared picks 4, 5 at 1.0
+        let idx_r: Vec<u32> = (0..t * k).map(|p| ((p * 7 + p / k) % n_e) as u32).collect();
+        let w_r: Vec<f32> = det(t * k, 55).iter().map(|v| 0.05 + v.abs()).collect();
+        let mut idx_f = Vec::with_capacity(t * kw);
+        let mut w_f = Vec::with_capacity(t * kw);
+        for tok in 0..t {
+            idx_f.extend_from_slice(&idx_r[tok * k..(tok + 1) * k]);
+            w_f.extend_from_slice(&w_r[tok * k..(tok + 1) * k]);
+            for h in 0..ns {
+                idx_f.push((n_e + h) as u32);
+                w_f.push(1.0);
+            }
+        }
+        let x = det(t * in_dim, 77);
+        let d_x = exec.to_device(&x).expect("x");
+        let mut d_xq4 = exec.alloc_i8(t * in_dim / 2).expect("xq4");
+        let mut d_xs4 = exec.alloc_u8(t * in_dim / 16).expect("xs4");
+        exec.quantize_nvf4(&d_x, &mut d_xq4, &mut d_xs4, t * in_dim)
+            .expect("quant x");
+        let d_idx_r = exec.to_device_u32(&idx_r).expect("idx r");
+        let d_w_r = exec.to_device(&w_r).expect("w r");
+        let d_idx_f = exec.to_device_u32(&idx_f).expect("idx f");
+        let d_w_f = exec.to_device(&w_f).expect("w f");
+        let d_sh_idx = exec.to_device_u32(&vec![0u32; t]).expect("sh idx");
+        let zeros = |np: usize| exec.to_device(&vec![0.0f32; t * np * embd]).expect("part");
+
+        // A: separate - routed BM=8 into slots 0..k, standalone shared BM=32 into slot k
+        let y_a = {
+            let np = k + 1;
+            let rows_cap = t * k + 8 * n_e;
+            let nb = rows_cap / 8;
+            let mut d_srow = exec.alloc_u32(rows_cap.max(32)).expect("srow");
+            let mut d_sslot = exec.alloc_u32(rows_cap.max(32)).expect("sslot");
+            let mut d_bexp = exec.alloc_u32(nb).expect("bexp");
+            let mut d_fq = exec.alloc_u8(rows_cap * ff / 2).expect("fq");
+            let mut d_fs = exec.alloc_u8(rows_cap * ff / 16).expect("fs");
+            let mut d_part = zeros(np);
+            exec.moe_align_bm(
+                &d_idx_r,
+                &mut d_srow,
+                &mut d_sslot,
+                &mut d_bexp,
+                t,
+                k,
+                n_e,
+                8,
+                nb,
+            )
+            .expect("align r");
+            exec.nvf4_moe_up_relu2_st(
+                &up_r, &d_srow, &d_bexp, &d_xq4, &d_xs4, &mut d_fq, &mut d_fs, nb, 8,
+            )
+            .expect("up r");
+            exec.nvf4_moe_down_st(
+                &dn_r,
+                &d_srow,
+                &d_sslot,
+                &d_bexp,
+                Some(&d_w_r),
+                &d_fq,
+                &d_fs,
+                &mut d_part,
+                k,
+                np,
+                0,
+                nb,
+                8,
+            )
+            .expect("down r");
+            let nb_s = t / 32 + 1;
+            let mut d_srow_s = exec.alloc_u32(nb_s * 32).expect("srow s");
+            let mut d_sslot_s = exec.alloc_u32(nb_s * 32).expect("sslot s");
+            let mut d_bexp_s = exec.alloc_u32(nb_s).expect("bexp s");
+            exec.moe_align(
+                &d_sh_idx,
+                &mut d_srow_s,
+                &mut d_sslot_s,
+                &mut d_bexp_s,
+                t,
+                1,
+                1,
+                nb_s,
+            )
+            .expect("sh align");
+            let mut d_fq_s = exec.alloc_u8(nb_s * 32 * (2 * ff) / 2).expect("fq s");
+            let mut d_fs_s = exec.alloc_u8(nb_s * 32 * (2 * ff) / 16).expect("fs s");
+            exec.nvf4_moe_up_relu2_st(
+                &shu_t,
+                &d_srow_s,
+                &d_bexp_s,
+                &d_xq4,
+                &d_xs4,
+                &mut d_fq_s,
+                &mut d_fs_s,
+                nb_s,
+                32,
+            )
+            .expect("sh up");
+            exec.nvf4_moe_down_st(
+                &shd_t,
+                &d_srow_s,
+                &d_sslot_s,
+                &d_bexp_s,
+                None,
+                &d_fq_s,
+                &d_fs_s,
+                &mut d_part,
+                1,
+                np,
+                k,
+                nb_s,
+                32,
+            )
+            .expect("sh down");
+            let mut d_y = exec.to_device(&vec![0.0f32; t * embd]).expect("y");
+            exec.moe_slot_combine(&d_part, &mut d_y, embd, np, t)
+                .expect("combine a");
+            exec.to_host(&d_y).expect("y a")
+        };
+        // B / C: the fold at BM=8 and at BM=32
+        let fold = |bm: usize| -> Vec<f32> {
+            let np = kw;
+            let rows_cap = t * kw + bm * (n_e + ns);
+            let nb = rows_cap / bm;
+            let mut d_srow = exec.alloc_u32(rows_cap.max(32)).expect("srow");
+            let mut d_sslot = exec.alloc_u32(rows_cap.max(32)).expect("sslot");
+            let mut d_bexp = exec.alloc_u32(nb).expect("bexp");
+            let mut d_fq = exec.alloc_u8(rows_cap * ff / 2).expect("fq");
+            let mut d_fs = exec.alloc_u8(rows_cap * ff / 16).expect("fs");
+            let mut d_part = zeros(np);
+            if bm == 32 {
+                exec.moe_align(
+                    &d_idx_f,
+                    &mut d_srow,
+                    &mut d_sslot,
+                    &mut d_bexp,
+                    t,
+                    kw,
+                    n_e + ns,
+                    nb,
+                )
+                .expect("align f32");
+            } else {
+                exec.moe_align_bm(
+                    &d_idx_f,
+                    &mut d_srow,
+                    &mut d_sslot,
+                    &mut d_bexp,
+                    t,
+                    kw,
+                    n_e + ns,
+                    bm,
+                    nb,
+                )
+                .expect("align f8");
+            }
+            exec.nvf4_moe_up_relu2_st(
+                &up_f, &d_srow, &d_bexp, &d_xq4, &d_xs4, &mut d_fq, &mut d_fs, nb, bm,
+            )
+            .expect("up f");
+            exec.nvf4_moe_down_st(
+                &dn_f,
+                &d_srow,
+                &d_sslot,
+                &d_bexp,
+                Some(&d_w_f),
+                &d_fq,
+                &d_fs,
+                &mut d_part,
+                kw,
+                np,
+                0,
+                nb,
+                bm,
+            )
+            .expect("down f");
+            let mut d_y = exec.to_device(&vec![0.0f32; t * embd]).expect("y");
+            exec.moe_slot_combine(&d_part, &mut d_y, embd, np, t)
+                .expect("combine f");
+            exec.to_host(&d_y).expect("y f")
+        };
+        let y_b = fold(8);
+        let y_c = fold(32);
+        let bc = y_b
+            .iter()
+            .zip(&y_c)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let amax = y_a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (mut dmax, mut dsum) = (0f32, 0f64);
+        for (a, b) in y_a.iter().zip(&y_b) {
+            let d = (a - b).abs();
+            dmax = dmax.max(d);
+            dsum += d as f64;
+        }
+        println!(
+            "[nvf4-fold8] t={t}: fold BM=8 vs BM=32 differing values {bc}/{}; fold vs separate max|d| {dmax:.3e} (max|y| {amax:.3e}, rel {:.2e}) mean|d| {:.3e}",
+            y_b.len(),
+            dmax / amax.max(1e-30),
+            dsum / y_a.len() as f64
+        );
+        assert_eq!(
+            bc, 0,
+            "the fold at BM=8 and at BM=32 must be bit-exact (same per-token K order)"
+        );
+        assert!(
+            dmax <= 1e-3 * amax.max(1e-30),
+            "the fold moved the output beyond f32 reassociation: max|d| {dmax:.3e} vs max|y| {amax:.3e}"
+        );
+    }
 }
 
 // ---- tiled r=1 twins gate: the mt class rules (rel-to-rms + determinism) ---
@@ -2482,13 +2811,26 @@ fn nvf4_tm_plane_matches_rowmajor() {
 }
 
 /// Thin-k/v rung: the fused q|k|v decode GEMM must be
-/// BIT-identical, per out-row, to the plain batched GEMM on the matching
-/// segment - the segmented store only reroutes the epilogue, and mma
-/// configs never reorder the per-element k-walk. Real checkpoint planes
-/// (layer 5), all three launcher bands + the ragged gridY edge. The 2..=8
-/// band compares against the multi-row GEMV class instead (f32 products on
-/// host-bf16-cast x - same products, warp-reduce order) with the plane
-/// test's tolerance.
+/// BIT-identical, per out-row, to the plain batched GEMM over the same
+/// concatenated [q;k;v] plane - the segmented store only reroutes the
+/// epilogue, and mma configs never reorder the per-element k-walk. Real
+/// checkpoint planes (layer 5), all three launcher bands + the ragged gridY
+/// edge. The 2..=8 band compares against the multi-row GEMV class instead
+/// (f32 products on host-bf16-cast x - same products, warp-reduce order)
+/// with the plane test's tolerance.
+///
+/// The reference is the plain GEMM over the fused plane, not the three
+/// per-segment GEMMs: the K-split election (`pd_bf16ks_nz`) decides "split
+/// or not" from the launch's own grid against the die's SM count, so the
+/// 4608-row fused plane and a 256-row k/v segment can land on opposite sides
+/// of that early-out. They do on GB10 (48 SMs): the fused plane's 144 CTAs
+/// fill the die and stay unsplit while the k segment's 8 CTAs split into 6
+/// slabs - a different f32 regroup, 1 ulp apart (fused -1.0522887 vs segment
+/// -1.0522894 at bt 9). On 148/188-SM dies both split and the per-segment
+/// identity held by coincidence of shape. The per-segment comparison stays
+/// as the regroup-class check (rel-to-rms 5e-5) so a thin-plane routing or
+/// layout bug still shows as O(1); the plain-over-fused reference is
+/// bit-exact through bt 32 and regroup class above (tiers diverge there).
 #[test]
 fn bf16_qkv_fused_matches_segment_gemms() {
     let _scr = bf16ks_lock();
@@ -2552,21 +2894,78 @@ fn bf16_qkv_fused_matches_segment_gemms() {
             );
         }
         if bt > 8 {
-            // same mma class on both sides -> bit-exact
+            // same mma class, same plane, same grid -> same K-split election
+            // -> bit-exact: the plain GEMM over the concatenated plane,
+            // sliced per segment. Same grid holds through bt 32 (both
+            // launchers tier at BM=32 to 16 rows and BM=64/BN=32 to 32); at
+            // bt 33 the plain launcher's fat tier (BN=64, gridY 1) and the
+            // fused BN=32 tier (gridY 2) put the fused plane on opposite
+            // sides of the fill early-out on a 48-SM die (72 vs 144 CTAs
+            // against 96), so past 32 the plain reference is the regroup
+            // class too.
+            let fdim = q_dim + 2 * kv_dim;
+            let mut d_f = exec.alloc(bt * fdim).expect("fused y");
+            exec.bf16_gemm(&fused, None, &d_x, &mut d_f, bt)
+                .expect("plain over fused");
+            let full = exec.to_host(&d_f).expect("fused y host");
+            let frms = (full.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
+                / full.len() as f64)
+                .sqrt()
+                .max(1e-20);
+            let same_grid = bt <= 32;
+            for (p, (off, out)) in [(0, q_dim), (q_dim, kv_dim), (q_dim + kv_dim, kv_dim)]
+                .into_iter()
+                .enumerate()
+            {
+                for c in 0..bt {
+                    for r in 0..out {
+                        let want = full[c * fdim + off + r];
+                        let have = got[p][c * out + r];
+                        if same_grid {
+                            assert_eq!(
+                                have.to_bits(),
+                                want.to_bits(),
+                                "bt {bt} plane {p} row {c} col {r}: fused {have} vs plain-over-fused {want}"
+                            );
+                        } else {
+                            let rel = (have as f64 - want as f64).abs() / frms;
+                            assert!(
+                                rel < 5e-5,
+                                "bt {bt} plane {p} row {c} col {r}: fused {have} vs plain-over-fused {want} (rel-to-rms {rel:.3e})"
+                            );
+                        }
+                    }
+                }
+            }
+            // per-segment GEMMs: the same values up to the K-split regroup
+            // (the segment's grid may elect a different nz than the fused
+            // plane's on a small die - see the doc comment).
             for (p, (plane, out)) in planes.iter().zip([q_dim, kv_dim, kv_dim]).enumerate() {
                 let mut d_y = exec.alloc(bt * out).expect("y");
                 exec.bf16_gemm(plane, None, &d_x, &mut d_y, bt)
                     .expect("segment");
                 let want = exec.to_host(&d_y).expect("y host");
+                let rms = (want.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
+                    / want.len() as f64)
+                    .sqrt()
+                    .max(1e-20);
+                let mut exact = 0usize;
                 for i in 0..bt * out {
-                    assert_eq!(
-                        got[p][i].to_bits(),
-                        want[i].to_bits(),
-                        "bt {bt} plane {p} elem {i}: fused {} vs segment {}",
+                    if got[p][i].to_bits() == want[i].to_bits() {
+                        exact += 1;
+                    }
+                    let rel = (got[p][i] as f64 - want[i] as f64).abs() / rms;
+                    assert!(
+                        rel < 5e-5,
+                        "bt {bt} plane {p} elem {i}: fused {} vs segment {} (rel-to-rms {rel:.3e})",
                         got[p][i],
                         want[i]
                     );
                 }
+                println!(
+                    "bf16_qkv bt {bt} plane {p}: {exact}/{} bit-exact vs the segment GEMM",
+                    bt * out
+                );
             }
         } else {
             // 2..=8: the segment path is the multi-row GEMV (f32 products).
@@ -2607,7 +3006,8 @@ fn bf16_qkv_fused_matches_segment_gemms() {
         }
     }
     println!(
-        "bf16_qkv fused: bit-exact vs segment mma (bt>8), 1e-5 vs mr class (bt<=8), deterministic"
+        "bf16_qkv fused: bit-exact vs the plain GEMM over the fused plane (bt>8), \
+         regroup class vs the segment GEMMs, 1e-5 vs mr class (bt<=8), deterministic"
     );
 }
 

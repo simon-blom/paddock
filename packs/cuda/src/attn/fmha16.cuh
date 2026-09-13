@@ -1,11 +1,11 @@
 // fmha16: trtllm-gen-class tensor-core decode attention for the muse-glimmer
 // geometry (hd128, G=16, fp8-e4m3 paged KV).
 //
-// WHY. Attributing a c32 tick by DIE-TIME (duration x min(1, CTAs/148)) put
+// Why. Attributing a c32 tick by DIE-TIME (duration x min(1, CTAs/148)) put
 // muse's whole decode deficit in attention - the GEMM band and the packing
 // were already fine, so attention was the entire cell.
 //
-// HOW. NVIDIA's own kernel name states the formulation:
+// How. NVIDIA's own kernel name states the formulation:
 //   fmhaSm100fKernel_...H128PagedKvSlidingOrChunkedCausalP16MultiCtasKvCga
 //     VarSeqQ16Kv128StaticSwapsAbForGen
 // **Q16 x Kv128** + **SwapsAbForGen**: at G=16 the sixteen q-heads sharing a

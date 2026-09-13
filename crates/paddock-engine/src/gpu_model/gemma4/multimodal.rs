@@ -55,6 +55,14 @@ impl VisionTower {
         }
     }
 
+    /// Device bytes the tower's own weight planes hold.
+    pub(crate) fn weight_bytes(&self) -> usize {
+        match self {
+            VisionTower::Gemma4(v) => v.weight_bytes(),
+            VisionTower::Muse(v) => v.weight_bytes(),
+        }
+    }
+
     /// Preprocess + encode one RGB8 image -> (device rows, row count).
     /// Preprocessing is part of the tower, not of the caller: the two disagree
     /// on the resize filter (bilinear vs LANCZOS), on whether the image is
@@ -127,6 +135,19 @@ impl GpuGemma4 {
         &mut self,
         map: &paddock_models::mapped::MappedGguf,
     ) -> Result<(), GpuError> {
+        self.attach_vision_with(map, None)
+    }
+
+    /// `attach_vision` plus the endpoint's resolved options. `max_image_tokens`
+    /// is the per-image soft-token ceiling from `servers/<port>.toml`; None
+    /// keeps the checkpoint's published budget. Only the gemma4 tower reads
+    /// it - muse-glimmer sizes from its own grid - and the runner says so
+    /// rather than letting the field look effective when it is not.
+    pub fn attach_vision_with(
+        &mut self,
+        map: &paddock_models::mapped::MappedGguf,
+        max_image_tokens: Option<usize>,
+    ) -> Result<(), GpuError> {
         // The tower is elected by the TEXT model's arch, not by the mmproj's
         // projector string: they must agree, and the text side is what already
         // decided every other constant.
@@ -134,6 +155,7 @@ impl GpuGemma4 {
             Arch::Gemma4 => VisionTower::Gemma4(Box::new(super::vision::VisionModel::load(
                 self.exec.clone(),
                 map,
+                max_image_tokens,
             )?)),
             Arch::MuseGlimmer => VisionTower::Muse(Box::new(
                 super::muse_vision::VisionModel::load(self.exec.clone(), map)?,
@@ -153,6 +175,12 @@ impl GpuGemma4 {
                 self.hp.arch.key()
             )));
         }
+        // The tower is WEIGHTS, and it loads after the loader snapshotted the
+        // weights line - so without this its ~1 GiB was reported as
+        // `scratch_mem` (model_mem - weights - kv, a derived remainder), which
+        // is how a gemma4 memory ledger came to show "7.33 GiB of scratch" and
+        // read as impossible. Same correction the DFlash drafter makes.
+        self.weights_bytes = Some(self.weights_bytes.unwrap_or(0) + vm.weight_bytes() as u64);
         self.vision = Some(vm);
         Ok(())
     }

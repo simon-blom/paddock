@@ -1486,7 +1486,7 @@ export function useChatStream() {
             else if (ev.item?.type === 'file_metadata') persistFileMetadata(conv, ev.item)
             else if (ev.item) {
               applyMcpItem(assistant, ev.item, true)
-              // An artifact tool completed: show it NOW. The list refresh
+              // An artifact tool completed: show it now. The list refresh
               // used to wait for isStreaming to flip false, which in compare
               // means all lanes - the fast lane's finished graph stayed
               // invisible until the slowest lane was done.
@@ -1760,7 +1760,7 @@ export function useChatStream() {
     // Two kinds of model take this path. A document PARSER always does. A
     // chat vision model with task tags (granite-vision) does for a TASK turn
     // over a document with several pages: its template rebuilds a tagged turn
-    // as IBM's canned prompt around ONE image slot, so a multi-page document
+    // as IBM's canned prompt around one image slot, so a multi-page document
     // in one request renders one slot for N pages and the runner refuses it
     // (rightly - dropping N-1 pages would be worse). The tasks are single-page
     // by design, and one page per request is how IBM's own document pipeline

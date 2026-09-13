@@ -15,7 +15,7 @@
 //     y += dj * dB * sum(q' * xq)  +  mu * (dB * sum(xq))
 //     The second term rides per-block ACTIVATION SUMS S = dB*sum(xq)
 //     (pd_mmq_sums below) - the q8_1 trick, weights never see it.
-//   Q6_K: w = d*sc16*(q-32), q-32 already s8, but scales are PER-16: the k32
+//   Q6_K: w = d*sc16*(q-32), q-32 already s8, but scales are per-16: the k32
 //     mma can't scale halves apart, so Q6 runs two m16n8k16 mmas per 32-block
 //     with per-16 f32 scales. No mu.
 //   IQ4_XS: w = d*(ls-32)*LUT[q]; LUT values fit s8 -> pure Q8-shaped arm
@@ -30,7 +30,7 @@
 
 // ---- per-32-block activation sums off the mmq layout --------------------------
 // S[chunk][col][b] = scl_b * sum(int8 block b) - the min-term operand for
-// Q4_K/Q5_K. Reads the ALREADY-quantized yq so no existing quantize kernel
+// Q4_K/Q5_K. Reads the already-quantized yq so no existing quantize kernel
 // (incl. the fused add-norm/swiglu variants) needs to change; the extra yq
 // read is noise next to the GEMM. Pad columns quantized zero -> S = 0.
 __global__ void pd_mmq_sums_kernel(const uint8_t* __restrict__ yq,
@@ -979,7 +979,7 @@ __device__ __forceinline__ void pd_kq_win_unpack_t(
 // multi-segment sibling (pd_kquant_gemv_w4a8_multi_kernel): one row
 // accumulates over its ns_row super-blocks, TPR threads striding chunks.
 // Extracted verbatim from the single kernel so the merge
-// sibling runs the exact same unpack math - an edit here changes BOTH.
+// sibling runs the exact same unpack math - an edit here changes both.
 template <uint32_t TPR>
 __device__ __forceinline__ float pd_kq_w4a8_row_acc(
         const uint8_t* __restrict__ rowd, const uint8_t* __restrict__ rows,
@@ -2392,7 +2392,7 @@ int pd_kquant_gemm_mma_ks(const void* data, const void* scales, const void* xq,
 // from (a prefetched shared buffer instead of global `data`/`scales`) moves.
 // A dead row's buffer bytes zero-fill (cp.async's ok=false path) and unpack
 // to a nonzero-but-deterministic s8 value (e.g. -8 for Q4_K); its
-// ALSO-zero-filled scale record makes that row's contribution 0 regardless -
+// also-zero-filled scale record makes that row's contribution 0 regardless -
 // the same invariant pd_kquant_mma_ks_kernel already relies on, so v1's
 // explicit `live` guards are kept here rather than relied upon (belt and
 // suspenders, not a numerics dependency).
@@ -2842,7 +2842,7 @@ int pd_kquant_gemm_w4a8_pipe(const void* data, const void* scales, const void* y
 // 2-deep buffer removes that ordering constraint - issue kt+1's load the
 // MOMENT kt's own load lands, not when kt's consumer frees the buffer -
 // extending the overlap window to the full build+compute phase. That
-// wasn't affordable with the FULL-width tile_x (84 int32/row); the
+// wasn't affordable with the full-width tile_x (84 int32/row); the
 // half-width tile_x from the reverted "hi" kernel above (already bit-exact
 // verified) frees enough room for two raw copies AND stays under sm_120's
 // 101,376 B single-block cap for all four types:
@@ -3005,7 +3005,7 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
         }
     };
 
-    // Build the HALF-width tile_x for super `kt`'s `half` (0 or 1) out of
+    // Build the half-width tile_x for super `kt`'s `half` (0 or 1) out of
     // raw buffer `buf` - same per-DT unpack math as v1/pipe's build_tilex,
     // restricted to ci in [half*4, half*4+4) and rebased so the write lands
     // in [0,32) either way (obase_rebased = obase - half*32; verified true

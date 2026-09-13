@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "paddock-models"
 description = "Model store: plain GGUF files in user-visible directories. Import in place, no hashed blobs."
 version.workspace = true

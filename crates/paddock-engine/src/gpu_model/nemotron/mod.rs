@@ -258,6 +258,10 @@ pub struct GpuNemotron {
     /// (NLL-gated quality-neutral); PADDOCK_SSM_DTYPE=f32 (dev builds only) selects the
     /// checkpoint-conservative reference class (arithmetic is f32 in both).
     pub(crate) ssm_dtype: ssm_arena::SsmDtype,
+    /// Bulk-prefill chunk width = the row-scratch cap and the mixed tick's
+    /// prompt-row clamp; die-keyed with an env override, fixed at load
+    /// (`forward::prefill_chunk_rows`).
+    pub(crate) prefill_chunk: usize,
     pub(crate) max_ctx: usize,
     pub(crate) weights_bytes: u64,
     /// Content identity of the loaded weights and tokenizer, captured at

@@ -153,7 +153,7 @@ static __device__ __forceinline__ void pd_dnrs_cb16(const float (&fr)[4],
 // S = ring depth in items, MINB = the launch-bounds block floor: the
 // co-residency shape. Shipped big-die shape <4, 1> (41 KB, ~168 registers,
 // 1-2 CTAs/SM); small dies (< 128 SMs) take <2, 4> - a 20 KB ring under a
-// 128-register cap puts 4 CTAs on each SM, so the 192-CTA grid is ONE wave
+// 128-register cap puts 4 CTAs on each SM, so the 192-CTA grid is one wave
 // on 48 SMs instead of two (GB10 2026-09-08: the pair 812 -> 752 us at
 // 1024 rows, byte-identical; the shallower ring is hidden by the three
 // co-resident CTAs where the deep ring hid it within one).

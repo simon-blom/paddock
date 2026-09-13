@@ -47,7 +47,7 @@
 //! maps there. Granite survives that because it admits KV only at encode
 //! completion, so a hole lands in a scratch block the admission then
 //! clears. An early adoption turned the same hole into a write on the
-//! radix-SHARED block 0: every encode tick overwrote the cached page's
+//! radix-shared block 0: every encode tick overwrote the cached page's
 //! first K/V row, and the resumed transcript flipped a det coordinate
 //! (385->383) against its own cold pass. The wave path passed the same probe
 //! on the same binary, which is what indicted the chunked lane.
@@ -545,7 +545,7 @@ impl GpuDeepseekOcr {
 
         if !had_stale && (0..n_img).all(|k| plan.img_start[k] + plan.img_tokens[k] <= start) {
             // every image sits inside the cached prefix: no tower, no prep -
-            // adopt and queue NOW. Adopting here is safe (unlike in the
+            // adopt and queue now. Adopting here is safe (unlike in the
             // Encoding state) because the Queued verdict puts this slot into
             // the scheduler's chunking set before its next decode section.
             self.admit(slot, plan.n_rows)?;

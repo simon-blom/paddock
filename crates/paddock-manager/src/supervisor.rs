@@ -356,7 +356,7 @@ impl Resolution {
 
 /// A config buffer as the Start/Edit page's Simple tab reads it - the answer to
 /// `POST /api/servers/project`. Serialized straight to the browser, which then
-/// binds these to its controls and derives NOTHING.
+/// binds these to its controls and derives nothing.
 #[derive(Serialize)]
 pub struct ConfigProjection {
     /// Catalog model id when the text can name one (its `[catalog]` block, or a

@@ -39,6 +39,7 @@ pub(crate) use load::g4_moe_uniq_arm;
 mod multimodal;
 pub mod muse_vision;
 mod prefix;
+mod scratch;
 mod spec;
 pub mod vision;
 
@@ -526,7 +527,7 @@ impl Hparams {
     /// gemma4 multiplies by sqrt(n_embd) (ggml: `inpL = get_rows(...) *
     /// sqrtf(n_embd)`). muse-glimmer does no scale at all - it RMS-normalizes
     /// the rows instead (`build_norm(inpL, nullptr, nullptr, LLM_NORM_RMS,
-    /// -1)`, i.e. NO weight, at `f_norm_rms_eps`). Two different preambles
+    /// -1)`, i.e. No weight, at `f_norm_rms_eps`). Two different preambles
     /// with the same shape, so one number plus one flag covers both and no
     /// call site has to know which arch it is serving.
     pub fn embd_scale(&self) -> f32 {
@@ -791,7 +792,7 @@ pub(crate) struct Scratch {
     pub pf_up: CudaSlice<f32>,
     pub pf_row: CudaSlice<f32>, // [n_embd] single-token dequant staging
     pub pf_pos: CudaSlice<u32>, // [PF_ROWS] chunk positions
-    /// [PF_ROWS] chunk token ids - feeds the ONE-kernel embed gather (the
+    /// [PF_ROWS] chunk token ids - feeds the one-kernel embed gather (the
     /// per-row dequant_slice+copy_region loop was 2 host launches per row:
     /// up to 4096 cudaLaunchKernel/tick, ~8s of host launch time per c32
     /// window)
@@ -958,11 +959,17 @@ pub struct GpuGemma4 {
     /// store that survives restarts (see `kv_tier::fingerprint`).
     pub(crate) content_id: ([u8; 32], [u8; 32]),
     pub(crate) scratch: Scratch,
+    /// What `scratch` is sized from, kept so `enable_batch` can rebuild the
+    /// planes at a narrower chunk without re-deriving them off the weights.
+    pub(crate) scratch_dims: scratch::ScratchDims,
     pub(crate) max_ctx: usize,
     /// Rows the prefill scratch was allocated for, and therefore the chunk
     /// size every prefill lane splits at (see `forward::pf_rows`). Read it
     /// rather than `PF_ROWS` at any site that bounds rows - the constant is
     /// the ceiling, this is the allocation.
+    ///
+    /// Not fixed at load any more: `batch::set_pf_rows` re-allocates the
+    /// scratch when the KV plan cannot seat the configured server beside it.
     pub(crate) pf_rows: usize,
     /// The SWA sub-span this server prefills in, and the span the WindowRing
     /// was sized to absorb. One value for both or the ring aliases blocks the
@@ -1471,7 +1478,7 @@ impl Generator for GpuGemma4 {
         self.forward_prefill_impl(slot, tokens).map_err(gen_err)
     }
 
-    // Chunked prefill (mixed ticks): default-ON - gemma4 is dense, so the
+    // Chunked prefill (mixed ticks): default-on - gemma4 is dense, so the
     // mixed tick's extra weight walk is cheap (the qwen35 MoE re-read
     // economics that kept it opt-in there don't apply). The scheduler's
     // PADDOCK_NO_CHUNKED_PREFILL kill pins the classic blocking pass for A/B.

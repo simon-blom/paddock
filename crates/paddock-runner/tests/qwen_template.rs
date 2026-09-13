@@ -43,7 +43,7 @@ fn plain_chat_defaults_to_thinking() {
     // think by default; official Qwen3-line templates agree), so a plain
     // chat ends inside an open think block. The fixture alone would default
     // non-thinking (`is defined and ... true`), but the pipeline default is
-    // the served contract, and this test pins THAT. It once went stale the
+    // the served contract, and this test pins that. It once went stale the
     // other way - pinned to the pre-gemma4 non-thinking default - and stayed
     // red for days, so keep it aimed at the pipeline, not the fixture.
     assert!(

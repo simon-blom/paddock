@@ -1001,7 +1001,7 @@ impl GpuGranite {
                 .collect();
         }
         // Admit, then resume each item off the radix. Items inside one wave
-        // cannot reuse each OTHER's prefixes - the insert below needs written
+        // cannot reuse each other's prefixes - the insert below needs written
         // blocks - which is the known cost of coalescing, not a bug.
         let mut starts = vec![0usize; items.len()];
         for (it, (slot, tokens)) in items.iter().enumerate() {
@@ -2983,7 +2983,7 @@ impl GpuGranite {
                             )?;
                         }
                         _ => {
-                            // Not merged, and this has now been measured TWICE.
+                            // Not merged, and this has now been measured twice.
                             // First leg: the merge lost, blamed on it buying no
                             // occupancy since gate/up already fill the die.
                             // Second leg, after the geometry sweep found the multi
@@ -3788,7 +3788,7 @@ impl GpuGranite {
             let p = self.pipe.as_ref().expect("pipe active");
             (p.b, p.tick)
         };
-        // back every row's THIS-tick write position before anything mutates -
+        // back every row's this-tick write position before anything mutates -
         // a growth error leaves the rings/inputs untouched
         {
             let (pos0, slot_map) = {

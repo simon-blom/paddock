@@ -66,7 +66,7 @@ __global__ void pd_kv_scatter_blocks_kernel(
 }
 
 // Shared launch shape: 256 threads/CTA; x-chunks from the widest plane so
-// small planes just exit their loop early. max_plane_bytes is a HOST-side
+// small planes just exit their loop early. max_plane_bytes is a host-side
 // value (the planes array lives on device and cannot shape the grid), the
 // engine computes it alongside the descriptor upload.
 static inline dim3 pd_kv_xfer_grid(unsigned long long max_plane_bytes,

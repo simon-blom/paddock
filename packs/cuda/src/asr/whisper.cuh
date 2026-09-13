@@ -752,7 +752,7 @@ int pd_whisper_bias_gelu_f16(const void* x, const void* bias, void* out, uint32_
 //
 // Whisper's ApplyTimestampRules, on device.
 //
-// Why this is not OPTIONAL. Whisper emits timestamps as vocabulary tokens, and
+// Why this is not optional. Whisper emits timestamps as vocabulary tokens, and
 // the prompt only OFFERS the mode: dropping `<|notimestamps|>` from the prompt
 // lets the model emit times, it does not make it. Measured on KB-Whisper
 // (examples/whisper_margin with PADDOCK_MARGIN_TIMESTAMPS=1): at the first

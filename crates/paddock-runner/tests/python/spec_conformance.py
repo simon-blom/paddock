@@ -2,7 +2,7 @@
 """Spec-driven conformance gate.
 
 Three mechanical checks against the PINNED SDK spec encodings - the installed
-pip versions ARE the spec revision, the way a pinned llama.cpp build pins
+pip versions are the spec revision, the way a pinned llama.cpp build pins
 numerics:
 
 0. VERSION CURRENCY: the installed SDKs must match `_pinned` in
@@ -459,10 +459,10 @@ def sec_sampling_ranges(client, model):
 
 
 def sec_version_currency(matrix):
-    """The installed SDKs ARE the spec revision - so they must be the ones the
+    """The installed SDKs are the spec revision - so they must be the ones the
     matrix was written against.
 
-    This runs FIRST and hard-fails, because every other check in this file is
+    This runs first and hard-fails, because every other check in this file is
     only as current as the pip packages behind it. The failure it exists to
     prevent is silent: a box with an older SDK validates fine against an older
     spec and reports a clean pass, which is how this suite spent months
@@ -765,7 +765,7 @@ def sec_strict_anthropic(client, model):
 
 def sec_audio_matrix(matrix):
     """Completeness of the audio matrix + a usable probe for every disposition
-    that claims a refusal. Static on purpose - see the block comment above."""
+    that claims a refusal. Static deliberately - see the block comment above."""
     spec = sdk_params("audio_transcriptions")
     listed = set(matrix["audio_transcriptions"].keys())
     missing = spec - listed
@@ -837,7 +837,7 @@ def sec_audio_surface(client, matrix, wav, model):
             assert body.get("error", {}).get("message"), body
             assert body["error"].get("type"), body
             # "unsupported parameter" tells a caller nothing about whether to
-            # wait for it or work around it - the refusal must say WHAT. For a
+            # wait for it or work around it - the refusal must say what. For a
             # param whose values split that is the VALUE, because the field is
             # served and only this value is not. `languages` splits only on a
             # lane that has detection to bias: one without refuses the whole
@@ -977,7 +977,7 @@ AUDIO_STREAM_EXTENSION_CHECKS = {"paddock_verbose": check_paddock_verbose}
 
 
 def check_paddock_guards(body, duration):
-"""`paddock_guards` - the decode-guard notices.
+    """`paddock_guards` - the decode-guard notices.
 
     Returns how many rode along. ABSENT is the normal answer and the one the
     clean-clip leg asserts; this validates the shape wherever one does appear,
@@ -1005,7 +1005,7 @@ def check_paddock_guards(body, duration):
 
 
 def check_paddock_guard_stats(body, duration, lane_has_no_speech):
-"""`paddock_guard_stats` - every guard signal, fired or not.
+    """`paddock_guard_stats` - every guard signal, fired or not.
 
     The one extension asked for by a request field, and the one that has to be
     PRESENT rather than conditionally absent: a tuning surface that vanishes on
@@ -1093,7 +1093,7 @@ AUDIO_GUARD_EXTENSION_CHECKS = {
 def speechless_wav(name, sample, seconds=6.0, rate=16000):
     """A clip with ENERGY and no speech in it. `sample(i) -> float in [-1, 1]`.
 
-    Digital silence is the WRONG probe: whisper usually answers it with an
+    Digital silence is the wrong probe: whisper usually answers it with an
     immediate `<|endoftext|>`, which is correct and exercises nothing. Energy
     without speech is where the hallucination actually lives."""
     import struct  # noqa: PLC0415
@@ -1140,10 +1140,10 @@ def speechless_clips():
 
 
 def sec_audio_guards(client, wav, model):
-"""Decode guards: the transcript says when it stopped being
+    """Decode guards: the transcript says when it stopped being
     about the audio.
 
-    TWO legs, and the FIRST is the one that must never go red. Guards that fire
+    Two legs, and the first is the one that must never go red. Guards that fire
     on ordinary speech would move every WER number on the board silently, so
     the clean clip is asserted to carry no notice at all - not an empty array,
     no key.
@@ -1151,8 +1151,8 @@ def sec_audio_guards(client, wav, model):
     The speechless legs are deliberately not equalities. Whether a given
     checkpoint hallucinates over room tone is the model's business, not the
     API's, so demanding a notice here would pin a gate to a model's mood. What
-    IS asserted is the invariant, which holds either way: a span reported as
-    dropped leaves NO text behind. A checkpoint that stays quiet passes it
+    is asserted is the invariant, which holds either way: a span reported as
+    dropped leaves no text behind. A checkpoint that stays quiet passes it
     trivially, and that is the right outcome - there was nothing to guard."""
     fields = [("model", model), ("response_format", "verbose_json")]
     r = audio_post(client, wav, [*fields, ("paddock_guard_stats", "true")])
@@ -1213,7 +1213,7 @@ def audio_sse_events(client, wav, fields):
     NAMED APART from `sse_events` (the JSON-lane one) deliberately. It was
     called `sse_events` too, and since a module has one
     namespace the later definition silently won: every `sec_strict_chat`
-    streaming assertion had been calling THIS with a URL path since the audio
+    streaming assertion had been calling this with a URL path since the audio
     surface landed, and dying on `name, blob = wav`. Two gates were red for it.
     A multipart poster and a JSON poster do not share a name."""
     name, blob = wav
@@ -1242,7 +1242,7 @@ def audio_sse_events(client, wav, fields):
 
 
 def sec_audio_stream(client, matrix, wav, model, base_url):
-"""`stream=true`.
+    """`stream=true`.
 
     The invariant under test is the one a client actually depends on: the
     deltas CONCATENATE to the final text, byte for byte. A live transcript that
@@ -1347,7 +1347,7 @@ def ext(model, key):
 
     The OpenAI SDK's models keep unknown keys (`extra="allow"`), which is the
     whole reason our extensions are namespaced rather than shipped through a
-    forked client - but WHERE they surface has moved between versions, so read
+    forked client - but where they surface has moved between versions, so read
     both places rather than pin a behaviour."""
     v = getattr(model, key, None)
     if v is None:
@@ -1368,7 +1368,7 @@ def sec_audio_realtime_vad(base_url, model, wav, enriched):
     had text and nothing else, and the Studio re-transcribed the whole
     recording through the file endpoint to get times it could have had here.
 
-    `enriched` is whether THIS lane can serve that at all. The generative
+    `enriched` is whether this lane can serve that at all. The generative
     families have no timestamp vocabulary, so there is no enriched
     pass for them to run - and this leg asserts they say so BY NAME rather than
     accepting the opt-in and answering with a plain item, which is the same
@@ -1540,7 +1540,7 @@ def sec_audio_realtime_vad(base_url, model, wav, enriched):
 
 
 def sec_audio_realtime(base_url, model, wav, clip_s):
-"""`/v1/realtime?intent=transcription` - the microphone half.
+    """`/v1/realtime?intent=transcription` - the microphone half.
 
     Driven through the SDK's own realtime client, for the same reason the file
     lane is: the SDK decides the URL, the event names and the payload shapes, so
@@ -1723,7 +1723,7 @@ def audio_caps(client):
 
 
 def language_caps(client):
-"""What the SERVER says it can do about language, read the same
+    """What the SERVER says it can do about language, read the same
     way the granularities are and for the same reason: which lane is loaded
     decides what the assertions below may demand, and reading the list pins the
     advertisement itself."""
@@ -1741,7 +1741,7 @@ def language_caps(client):
 
 
 def sec_audio_language(client, wav, model):
-"""LANGUAGE: the soft candidate set, the checkpoint's own map,
+    """LANGUAGE: the soft candidate set, the checkpoint's own map,
     and the contradiction check.
 
     Every assertion is derived from `language_detection` rather than from which
@@ -1936,7 +1936,7 @@ def sec_strict_audio_segments(client, matrix, wav, model):
 
 
 def sec_strict_audio_words(client, wav, model, caps):
-"""WORD TIMES  - the other granularity, and never the same
+    """Word times  - the other granularity, and never the same
     mechanism as the segment times. On whisper they come from cross-attention
     over a second, teacher-forced pass and the transcript is untouched; on
     granite-speech-plus the model is asked for them and writes `[T:N]` tags
@@ -2005,10 +2005,10 @@ def sec_strict_audio_words(client, wav, model, caps):
 
 
 def sec_strict_audio_subtitles(client, wav, model, segments):
-    """Subtitles: a subtitle file IS timestamps, so neither asks for the
+    """Subtitles: a subtitle file is timestamps, so neither asks for the
     granularity. Escaping and the rolling-stamp cases are pinned by
     subtitles.rs's own tests; what only a live clip can show is that the cues
-    ARE the segments."""
+    are the segments."""
     for fmt, sep, numbered in (("srt", ",", True), ("vtt", ".", False)):
         r = audio_post(client, wav, [("model", model), ("response_format", fmt)])
         assert r.status_code == 200, r.text[:200]

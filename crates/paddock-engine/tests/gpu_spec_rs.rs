@@ -3,7 +3,7 @@
 //! `spec_rs_resolve` (accept w.p. min(1, p/q) + residual recovery).
 //!
 //! Oracle strategy: the TOKEN contracts are replayed on host over the
-//! DEVICE'S own stored q values (read back), with the kernel's exact chunk
+//! device's own stored q values (read back), with the kernel's exact chunk
 //! structure (256 contiguous chunks, per-chunk partials summed in chunk
 //! order) - so fp16 rounding never enters the oracle. Light (no model load).
 

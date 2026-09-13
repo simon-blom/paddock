@@ -18,6 +18,7 @@
 mod forward;
 mod load;
 mod load_gguf;
+mod prefix;
 
 pub use forward::Qwen4ExpGpu;
 pub use load::{load_layer, load_ple_projections, load_ple_table};
@@ -1364,7 +1365,7 @@ pub struct GdnW {
     pub qkv: DensePlane,
     /// in_proj_z [6144, hidden] (output gate; bypasses the conv)
     pub z: DensePlane,
-    /// z|qkv fused at load (rows: z then qkv) for the ONE-launch 2-segment
+    /// z|qkv fused at load (rows: z then qkv) for the one-launch 2-segment
     /// decode arm -- None unless PADDOCK_Q38FN_FUSE_ZQ armed the loader.
     pub zqkv: Option<QuantTensor>,
     /// in_proj_a and in_proj_b CONCATENATED: [2*v_heads, hidden] f32, rows

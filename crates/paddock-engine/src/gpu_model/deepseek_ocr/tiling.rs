@@ -169,7 +169,7 @@ fn view_tokens(nq: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Block {
     /// The stitched crop grid, `rows` token-rows each of `cols` tokens plus a
-    /// trailing `image_newline`. Gundam mode only, and it comes FIRST.
+    /// trailing `image_newline`. Gundam mode only, and it comes first.
     Local { rows: usize, cols: usize },
     /// The whole-page view, `side` rows of `side` tokens each plus a trailing
     /// `image_newline`.

@@ -246,7 +246,7 @@ pub struct CallLedger {
     /// Catalog searches this turn - see [`Self::search_budget_spent`].
     searches: usize,
     /// Calls refused before dispatch, and how often - see [`Self::note_refused`].
-    /// Kept apart from `seen`, which is about calls that RAN.
+    /// Kept apart from `seen`, which is about calls that ran.
     refused: HashMap<Signature, usize>,
 }
 

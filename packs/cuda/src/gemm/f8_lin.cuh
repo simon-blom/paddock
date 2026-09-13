@@ -1390,18 +1390,24 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
                 }
             }
             asm volatile("bar.sync 5, 256;");
+#if PD_KT3_PROBE == 7
+            // landing into an L2-resident window (bench twin of kt3t's probe 7)
+            const uint32_t row_base_st = 0u, col_base_st = 0u;
+#else
+            const uint32_t row_base_st = row_base, col_base_st = col_base;
+#endif
             for (uint32_t it = warp; it < 128u; it += 8u) {
-                const uint32_t c = col_base + it;
+                const uint32_t c = col_base_st + it;
                 if (c >= batch) continue;
                 const float4 v = *(const float4*)(otile + it * 132u + lane * 4u);
                 if (O16) {
-                    __nv_bfloat16* yh = (__nv_bfloat16*)y + (size_t)c * out_dim + row_base + lane * 4u;
+                    __nv_bfloat16* yh = (__nv_bfloat16*)y + (size_t)c * out_dim + row_base_st + lane * 4u;
                     __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y);
                     __nv_bfloat162 hi = __floats2bfloat162_rn(v.z, v.w);
                     uint2 pk; pk.x = *(const uint32_t*)&lo; pk.y = *(const uint32_t*)&hi;
                     *(uint2*)yh = pk;
                 } else {
-                    *(float4*)(ysp + (size_t)c * sp_dim + (row_base - sp_base) + lane * 4u) = v;
+                    *(float4*)(ysp + (size_t)c * sp_dim + (row_base_st - sp_base) + lane * 4u) = v;
                 }
             }
             return;
@@ -2825,7 +2831,7 @@ __global__ void __launch_bounds__(544, 1) pd_f8_gemm_lin_ktw(
 // barrier 3.66 of 14.7 cycles/inst; long_scoreboard 0.87 - DRAM hidden).
 // Geometry: 64 rows x 128 cols. The first cut (64x64) went 2x on both
 // staging streams and the extra W restages came from DRAM - measured 1.5x
-// SLOWER. 64x128 restages only Y (X is L2-resident, ~10 MB << L2): W bytes
+// slower. 64x128 restages only Y (X is L2-resident, ~10 MB << L2): W bytes
 // stay 1x. smem: Y ring [2][16 KB] + single W half-box 8448 B + scales =
 // 42.3 KB -> 2 CTAs/SM, 20 resident warps. The single W buffer serializes
 // its 8.4 KB stage against the previous pair's consumers (one bar wait);
@@ -3534,6 +3540,14 @@ __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_kt2(
 // come as a lin plane (row_off pre-applied by the caller as whole boxes) and
 // `o16` selects the bf16 epilogue at runtime. cudaErrorNotSupported when the
 // TMA route is off - the engine only builds lin planes after probing this.
+// kt3t (gemm/f8_lin_tall.cuh, follows this segment in pack.cu): the kt3
+// frame on a 256x128 tile for the prefill band - elected inside the kt3
+// branch below; false = shape outside the tile's contract, kt3 keeps it.
+static bool pd_f8_lin_kt3t_try(const void* wlin, const CUtensorMap& ym, const void* xs,
+                               void* y, uint32_t in_dim, uint32_t out_dim,
+                               uint32_t batch, uint32_t o16, cudaStream_t stream,
+                               int* status);
+
 PD_EXPORT
 int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
                       void* y, uint32_t in_dim, uint32_t out_dim,
@@ -3764,7 +3778,7 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
                 (float*)y, in_dim, out_dim, batch);
         return pd_launch_status();
     }
-    // kt3 (DEFAULT on for sm_120 - cc 12.0 EXACTLY, its bodies are
+    // kt3 (DEFAULT on for sm_120 - cc 12.0 exactly, its bodies are
     // PD_BS_OK SASS and a 12.1 GB10 would launch stubs; PADDOCK_LIN_KT3=0
     // reverts): 3-deep ring stage-period cut - ysc staging moved out of smem
     // (consumers read x-scales from L2 directly), producer collapsed to one
@@ -3789,6 +3803,18 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
             pd_prefer_max_shared(pd_f8_gemm_lin_kt3<true>);
             pd_prefer_max_shared(pd_f8_gemm_lin_kt3<false>);
             alin3 = true;
+        }
+        // kt3t tall tile (256x128), OPT-IN (PADDOCK_LIN_KT3T=1), default
+        // off: a quarter less L2-to-smem stream per FLOP, but the win only
+        // shows at B>=2048 on the wide-out planes and GB10 serving prefill
+        // caps its tick near 1024 rows, so the shipped election keeps kt3.
+        // Bit-exact vs kt3 per element; the try returns false when off.
+        // (GB10 - the tile itself is in f8_lin_tall.cuh.)
+        {
+            int st = 0;
+            if (pd_f8_lin_kt3t_try(wlin, ym, xs, y, in_dim, out_dim, batch, o16,
+                                   (cudaStream_t)stream, &st))
+                return st;
         }
         // ktd (OPT-IN, PADDOCK_LIN_KTD=1): decoupled dual-ring mainloop -
         // W 4-deep / Y 2-deep, producer two iterations ahead (see the
@@ -5031,7 +5057,7 @@ int pd_f8lin_gemv(const void* wlin, const void* x, void* part, void* y,
     // tuning parameter.
     //
     // The three rules above were ranked on 188 SMs, where 544 gate|up CTAs
-    // are 2.9 per SM in ONE wave. On 48 SMs (GB10, 2026-09-07) the same
+    // are 2.9 per SM in one wave. On 48 SMs (GB10, 2026-09-07) the same
     // launch is 11 CTAs per SM against a 9-per-SM smem ceiling (24 KB of x
     // window each) - a 1.26-wave tail - and the down plane's nz=2 is 160
     // CTAs, 3.3 per SM: both ran at 42-43% of that die's roof while the

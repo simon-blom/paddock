@@ -272,6 +272,31 @@ impl PagedRadix {
     /// boundary `pos`. False - and the caller recycles the index - if the
     /// node is missing (evicted between publication and now) or already
     /// checkpointed.
+    /// Detach the checkpoint at boundary `pos` of `tokens` (the reverse of
+    /// `attach_state_at`) and return its pool index for the caller to
+    /// recycle. `None` if the node does not exist or holds no checkpoint.
+    /// The node and its KV page stay.
+    pub fn detach_state_at(&mut self, tokens: &[u32], pos: usize) -> Option<u32> {
+        let want = pos / BLOCK_TOKENS;
+        if want == 0 || !pos.is_multiple_of(BLOCK_TOKENS) || tokens.len() < pos {
+            return None;
+        }
+        let mut node = 0u32;
+        for bi in 0..want {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let h = hash_block(chunk);
+            let child = *self.nodes[node as usize].children.get(&h)?;
+            if self.nodes[child as usize].tokens != chunk {
+                return None;
+            }
+            node = child;
+        }
+        if node == 0 {
+            return None;
+        }
+        self.nodes[node as usize].state_blk.take()
+    }
+
     pub fn attach_state_at(&mut self, tokens: &[u32], pos: usize, idx: u32) -> bool {
         let want = pos / BLOCK_TOKENS;
         if want == 0 || !pos.is_multiple_of(BLOCK_TOKENS) {
@@ -345,12 +370,19 @@ impl PagedRadix {
             self.st_writes += 1;
             return Some(b);
         }
+        // Plain LRU unless `protect_proven`: the never-recurred-first order
+        // is the opt-in policy's ("hold the proven set"), and applied by
+        // default it steals the NEWEST useful checkpoint - an agentic
+        // session's just-committed cut has not recurred yet, its previous
+        // turn's stale cut has - so a full pool cycled every session back
+        // to the shared prefix (GB10 2026-09-11).
+        let protect = self.protect_proven;
         let victim = self
             .nodes
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some())
-            .min_by_key(|(_, n)| (n.recurred, n.last_used))
+            .min_by_key(|(_, n)| (protect && n.recurred, n.last_used))
             .map(|(i, _)| i)?;
         if self.protect_proven && self.nodes[victim].recurred {
             // Every resident checkpoint belongs to a prefix that came back, so
@@ -782,6 +814,31 @@ mod tests {
         let _ = r.match_prefix(&a);
         let evicted = r.evict_lru(&mut pool).unwrap();
         assert_eq!(evicted, t2.blocks()[0], "LRU (B) evicted, not A");
+    }
+
+    #[test]
+    fn detach_state_at_frees_the_index_and_the_match_loses_the_checkpoint() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        r.set_state_capacity(1);
+        let table = prefill(&mut pool, 3);
+        let toks: Vec<u32> = [block_toks(1), block_toks(2), block_toks(3), vec![9]].concat();
+        r.insert(&toks, table.blocks(), &mut pool);
+        let idx = r.reserve_state_slot().expect("one index");
+        assert!(r.attach_state_at(&toks, 2 * BLOCK_TOKENS, idx));
+        assert_eq!(r.match_full(&toks).ckpt, Some((2 * BLOCK_TOKENS, idx)));
+        // not a boundary / not a node: None, nothing changes
+        assert_eq!(r.detach_state_at(&toks, 2 * BLOCK_TOKENS + 1), None);
+        assert_eq!(r.detach_state_at(&[1, 2, 3], BLOCK_TOKENS), None);
+        assert_eq!(r.detach_state_at(&toks, 2 * BLOCK_TOKENS), Some(idx));
+        assert!(
+            r.match_full(&toks).ckpt.is_none(),
+            "checkpoint gone, page stays"
+        );
+        assert_eq!(r.match_full(&toks).blocks, table.blocks());
+        // the pool was exhausted (capacity 1); recycling makes the index reusable
+        r.recycle_state(idx);
+        assert_eq!(r.reserve_state_slot(), Some(idx));
     }
 
     #[test]

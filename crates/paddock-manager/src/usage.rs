@@ -440,7 +440,7 @@ pub fn lost_between(prev: &Snapshot, cur: &Snapshot) -> (i64, i64, i64) {
 /// anchor's value - deltaing to exactly zero, never a fabricated number.
 /// A series the totals never saw was born inside the blind window: its
 /// baseline is fully zero so its whole content folds. The `anchor` is the
-/// first snapshot the head will fold TO.
+/// first snapshot the head will fold to.
 pub fn totals_pseudo_baseline(rows: &[TotalRow], anchor: &Snapshot) -> Snapshot {
     let mut base = anchor.clone();
     base.spec_drafted = 0;

@@ -311,7 +311,7 @@ impl GpuQwen35 {
                 "qwen35 MoE expert offload: routed-expert planes will be host-mapped (PADDOCK_MOE_HOST)"
             );
         }
-        // The slot cache is sized AFTER the KV plan (enable_batch), from
+        // The slot cache is sized after the KV plan (enable_batch), from
         // what the plan leaves - it is not charged here.
         exec.vram_load_gate(map.total_len().saturating_sub(host_bytes), "qwen3.5/3.6")
             .map_err(GpuModelError::WontFit)?;
@@ -352,6 +352,28 @@ impl GpuQwen35 {
         // Explicit env wins.
         if exec.sm_count() >= 128 && std::env::var_os("PADDOCK_UNIFIED_PREFILL_ROWS").is_none() {
             crate::envset::set_env("PADDOCK_UNIFIED_PREFILL_ROWS", "4096");
+        }
+        // Small dies keep the side-stream decode paths (the overlap
+        // scheduler and the classic decode pipe) for WIDE batches only
+        // (GB10 2026-09-10, rival-gap audit; service.rs pipe_min_live). The
+        // pipe's depth-2 issue-ahead hides ~1 ms of host work behind a
+        // ~13 ms tick on a 188-SM die; on a 48-SM LPDDR5X die a decode tick
+        // is ~100 ms of weight streaming and the two lanes time-slice the
+        // same bandwidth. With both paths off at 8 slots the decode rows
+        // ride the unified prefill pass (`[ushape] b>0`) and a request no
+        // longer waits for an in-flight pipe tick to be admitted: 1024x1024
+        // c8 TTFT p50 2754 -> 2123 ms (vLLM 2025) at flat-or-better tok/s,
+        // 128x128 c1 223 -> 136 ms (vLLM 130), 1024x1024 c1 622 -> 520,
+        // DFlash spec-auto 128x128 c8 137.6 -> 144.0 tok/s / 791 -> 519 ms.
+        // From 16 concurrent requests up the overlap wins the long-prompt
+        // cohort (1024x1024 c16 128.9 vs 126 tok/s, TTFT 7.3 vs 10 s; c32
+        // 205 vs 199-202, 12.4 vs 14-16 s), and it has to own the cohort
+        // from its first decoder (a floor counted in decoders, 9 or 16,
+        // still lost those cells), so the floor counts live REQUESTS and
+        // sits just above the 8-slot class: 9. Explicit env wins; the
+        // 188-SM die keeps 0 (both paths measured to win there).
+        if exec.sm_count() < 128 && std::env::var_os("PADDOCK_PIPE_MIN_LIVE").is_none() {
+            crate::envset::set_env("PADDOCK_PIPE_MIN_LIVE", "9");
         }
         // The PROVEN qwen35 performance stack is the DEFAULT: every lever
         // here passed its gate (bit-exact, 2e-5 oracle, or PPL) and has
@@ -950,7 +972,7 @@ impl GpuQwen35 {
                 if !exec.has_nvf4_ckpt()
                     || paddock_models::dev_var_os!("PADDOCK_NO_NVF4_FFN").is_some()
                 {
-                    // Say it, once, and say WHY. Falling back to the Q8-derived
+                    // Say it, once, and say why. Falling back to the Q8-derived
                     // planes is correct off sm_120a, but it is also a silent
                     // downgrade of a build the user picked and downloaded ~22 GB
                     // for: same answers as plain Q8_0, same memory as plain
@@ -980,7 +1002,7 @@ impl GpuQwen35 {
                 // quant run in the GEMM epilogue (slot 533) and the decode
                 // widths read one plane. Requires the W4A4 wide arm (the
                 // dies whose f4 family is live), the epilogue and the `_il`
-                // consumers, and ONE global scale for gate and up (the
+                // consumers, and one global scale for gate and up (the
                 // epilogue applies one scale2; this checkpoint has 56/56
                 // equal - a checkpoint that differs keeps the split planes,
                 // exactly as before). PADDOCK_NO_NVF4_GU_FUSE=1 keeps them too.
@@ -2375,7 +2397,7 @@ impl GpuQwen35 {
             // exact-bytes audit vs the free-VRAM ledger above. Two named
             // groups: the BASE planes (the checkpoint's own tensors) and the
             // DERIVED decode/batch-lane planes (f8-ffn, W8 projections, f8
-            // head, fused concats - default-ON elections living outside the
+            // head, fused concats - default-on elections living outside the
             // base struct fields). The derived group used to go unsummed,
             // and its ~25 GiB on the 27B printed as
             // "allocator slack", which sent a whole VRAM investigation

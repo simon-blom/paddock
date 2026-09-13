@@ -278,7 +278,7 @@ __global__ void __launch_bounds__(256, 1) pd_attn_spec_fa_kernel(
             // staged per region (the half writes cover the byte strip they
             // read), K wave then V wave so only one region's chunks are live
             // across a barrier (16 regs worst case, not 32). Rows >= n_t are
-            // ZERO-filled: stale e4m3 bytes can decode to NaN (0x7f/0xff)
+            // zero-filled: stale e4m3 bytes can decode to NaN (0x7f/0xff)
             // and the o-mma's 0-weight x stale-V product would poison the
             // accumulator - f16 staging never had this hazard (stale halves
             // are finite). Chunks are 16B and never cross a position row

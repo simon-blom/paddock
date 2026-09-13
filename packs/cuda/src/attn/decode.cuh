@@ -394,7 +394,7 @@ __device__ __forceinline__ void pd_attn_cpa_wait3() {
 //
 // The raw count is G*(hd+4) + 2*G*(T+1) floats. hd is a multiple of 4 on every
 // head we serve, so the first term is always 4-aligned; the second is 2*G*(T+1)
-// with T in {16, 32}, i.e. 2G*odd - 4-aligned only when G is EVEN. Every shape
+// with T in {16, 32}, i.e. 2G*odd - 4-aligned only when G is even. Every shape
 // served before granite-vision-4.1-4b had an even GQA group (4, 6, 8), so the
 // base happened to be aligned and nothing ever noticed. That model is 40 q / 8
 // kv = group 5, and it faulted on the first decode.

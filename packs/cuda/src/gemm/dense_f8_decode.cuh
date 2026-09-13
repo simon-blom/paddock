@@ -4005,7 +4005,24 @@ __global__ void __launch_bounds__(544) pd_f8row_gemm_tw5_kernel(
     // (measured: g32k M=384 226us). A 2-D launch keeps the legacy
     // order (PADDOCK_NO_F8R_RASTER). Per-tile math unchanged => bit-equal.
     uint32_t rt = blockIdx.x, ct = blockIdx.y;
-    if (gridDim.y == 1u) { const uint32_t ncol = (batch + BN - 1u) / BN; rt = blockIdx.x / ncol; ct = blockIdx.x % ncol; }
+    if (gridDim.y == 1u) {
+        // linearized raster, GROUPED (GB10, 2026-09-11): consecutive CTAs
+        // walk the batch columns of a group of 8 W row
+        // tiles, so the X panel streams once per GROUP and a group's W tiles
+        // (8 x 128 rows x K B) sit in L2. The plain column-fastest raster
+        // streamed the whole X panel once per W row tile - fine while the
+        // panel fit L2 (2048 rows x 2688 B = 5.5 MB) and 2.3x slower once it
+        // did not (7556 rows = 20 MB: in_proj 186 vs 79 ms per 1k-layer
+        // request). Bit-exact: ownership only. The last group is ragged.
+        const uint32_t ncol = (batch + BN - 1u) / BN, nrow = (out_dim + BM - 1u) / BM;
+        constexpr uint32_t GROUP = 8u;
+        const uint32_t grp = blockIdx.x / (GROUP * ncol);
+        const uint32_t r0 = grp * GROUP;
+        const uint32_t gsz = (r0 + GROUP <= nrow) ? GROUP : (nrow - r0);
+        const uint32_t rem = blockIdx.x - grp * (GROUP * ncol);
+        rt = r0 + rem % gsz;
+        ct = rem / gsz;
+    }
     const uint32_t row_base = rt * BM;
     const uint32_t col_base = ct * BN;
     const uint32_t mf0 = (uint32_t)__cvta_generic_to_shared(mbf);
@@ -4842,7 +4859,7 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
                 // wave rule (probed at M=160/192): the column-fastest
                 // linearized grid pays only when the grid spans several waves
                 // (the >L2 W plane is then re-read per column tile); on a
-                // SINGLE-wave grid (narrow-out at mixed-tick widths: 64 row
+                // single-wave grid (narrow-out at mixed-tick widths: 64 row
                 // tiles x 3 col tiles) it only scrambles intra-wave order and
                 // cost 25-30% (down M=160 84 vs 65us). Linearize iff tiles >
                 // blocks/SM x SMs (tw5: 1/SM, tw: 2/SM). PADDOCK_F8R_RASTER_ALL

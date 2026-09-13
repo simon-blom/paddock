@@ -8,7 +8,7 @@
 //!
 //! Geometry (whisper-large-v3 class, all stamped in metadata): 128-bin
 //! log-mel -> conv stem (k3/s1 then k3/s2, both +bias+GELU) -> sinusoid
-//! position table (stored, [1500, 1280]) -> 32-layer FULL-attention encoder
+//! position table (stored, [1500, 1280]) -> 32-layer full-attention encoder
 //! (d1280, 20 heads × hd64, erf-GELU 5120 MLP, pre-LN with biases) ->
 //! 32-layer decoder: causal self-attention over ≤448 LEARNED positions plus
 //! CROSS-ATTENTION over the encoder output - the one mechanism no served

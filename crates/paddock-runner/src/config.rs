@@ -138,6 +138,21 @@ pub struct Config {
     /// Target long-edge (px) for each rendered PDF page; per-page DPI is derived
     /// from it (capped at 300). 1568 matches the Qwen vision sweet spot.
     pub pdf_page_long_edge: u32,
+    /// Soft tokens one image may cost this endpoint, or None for the
+    /// checkpoint's published budget.
+    ///
+    /// It buys resolution: the budget is what the smart-resize fits the
+    /// picture into, so gemma4's published 280 x 48^2 px renders an A4 page
+    /// at 672x912 and loses small print - measured, on a generated page, at
+    /// 1 of 12 amounts and 0 of 12 references read correctly, against 12/12
+    /// at 1120. It is priced in prompt tokens and in encode
+    /// time (attention over patches is quadratic), so it is the endpoint
+    /// owner's call, not a default we move.
+    ///
+    /// Clamped by the tower to what its position tables can address, and
+    /// read today only by the gemma4 family - the log says so at load if it
+    /// is set for a model that does not use it.
+    pub max_image_tokens: Option<u32>,
 
     // --- Abuse controls for intentionally-exposed (public/demo) instances.
     // All off by default; a private Paddock is unaffected. See `ratelimit.rs`.
@@ -154,7 +169,7 @@ pub struct Config {
     /// rate limiter keys clients on the proxy's `X-Real-IP` (it overwrites any
     /// client value; `X-Forwarded-For` is never trusted, a client can prepend
     /// to it), and the API key is required from loopback peers too - behind a
-    /// proxy on the same host EVERY caller arrives from 127.0.0.1, so the
+    /// proxy on the same host every caller arrives from 127.0.0.1, so the
     /// loopback exemption would let the whole internet in. Off for a direct
     /// bind. nginx adds no forwarding headers unless told to, so set this
     /// rather than relying on the runner noticing the proxy.
@@ -339,6 +354,7 @@ impl Default for Config {
             web_search_api_key: None,
             pdf_max_pages: 20,
             pdf_page_long_edge: 1568,
+            max_image_tokens: None,
             max_output_ceiling: None,
             ratelimit_per_minute: None,
             ratelimit_per_day: None,
@@ -631,6 +647,12 @@ impl Config {
                 .parse()
                 .map_err(|_| bad_env("PADDOCK_PDF_PAGE_LONG_EDGE", &v))?;
         }
+        if let Some(v) = env_str("PADDOCK_MAX_IMAGE_TOKENS") {
+            self.max_image_tokens = Some(
+                v.parse()
+                    .map_err(|_| bad_env("PADDOCK_MAX_IMAGE_TOKENS", &v))?,
+            );
+        }
         if let Some(v) = env_str("PADDOCK_ALIASES") {
             self.aliases = v
                 .split(',')
@@ -692,6 +714,7 @@ pub const ENV_SURFACE: &[&str] = &[
     "PADDOCK_LOG_FILE",
     "PADDOCK_MAX_BATCH",
     "PADDOCK_MAX_CTX",
+    "PADDOCK_MAX_IMAGE_TOKENS",
     "PADDOCK_MAX_OUTPUT_CEILING",
     "PADDOCK_MAX_OUTPUT_TOKENS",
     "PADDOCK_MCP_SERVERS",

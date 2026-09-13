@@ -18,9 +18,9 @@
 //! used to cost) and the projections land on tensor cores instead of cuBLAS
 //! SGEMM. bf16->f16 is exact for every weight whose exponent fits - see
 //! `narrow_to_f16`, which refuses the ones that don't rather than shipping an
-//! `inf`. The pooler/std/rms tail runs host-side (≤280 rows - encode is once
-//! per image). Correctness gate: end-to-end token parity vs llama-mtmd-cli
-//! after the splice lands.
+//! `inf`. The pooler/std/rms tail runs host-side (one row per output token,
+//! 280 of them by default - encode is once per image). Correctness gate:
+//! end-to-end token parity vs llama-mtmd-cli after the splice lands.
 
 use std::sync::Arc;
 
@@ -39,7 +39,54 @@ const N_MERGE: usize = 3;
 /// `pooling_kernel_size: 3` - hence ALIGN 48 and 280 × 48² source pixels.
 /// llama.cpp's `set_limit_image_tokens(40, 280)` agrees on the ceiling.
 const MAX_TOKENS: usize = 280;
-const MAX_PIXELS: usize = MAX_TOKENS * ALIGN * ALIGN;
+/// Resolve the per-image soft-token ceiling for one served endpoint:
+/// `max_image_tokens` from its config, else Google's published 280.
+///
+/// Why it is settable at all: 280 tokens is 280 x 48^2 = 645 kpx, so an A4
+/// page arrives at 672x912 and small print is gone before the encoder sees
+/// it - measured on a generated page, where the published cap read 1 of 12
+/// amounts and 0 of 12 references correctly against 12/12 at 1120. Nothing
+/// in the tower is built around 280: every buffer in `encode` is sized from
+/// `n`, the host tail walks `n` rows, and the position tables carry
+/// `pos_size` entries per axis (10240 on gemma-4-31B-it's mmproj, about
+/// 163k px a side). The cap is a processor convention, not a capability.
+///
+/// It arrives as an explicit argument, never from the environment: this is
+/// product config, and the rule is the one `load_with` already states. The
+/// clamp is the model's own - a value the position tables cannot address is
+/// refused down to what they can, and said out loud.
+///
+/// Not free, which the endpoint's owner is choosing knowingly: attention
+/// over patches is quadratic, so 4x the tokens is 16x the tower's attention
+/// math (once per image), transient encode memory goes ~0.2 -> ~0.8 GB, and
+/// the page then occupies ~1100 prompt tokens instead of ~270.
+fn resolved_max_tokens(pos_size: usize, asked: Option<usize>) -> usize {
+    let Some(want) = asked else {
+        return MAX_TOKENS;
+    };
+    // what the file's own tables can address for a square image, in tokens
+    let axis_tokens = pos_size / N_MERGE;
+    let ceiling = axis_tokens.saturating_mul(axis_tokens).max(MAX_TOKENS);
+    let got = want.clamp(MIN_TOKENS, ceiling);
+    if got != want {
+        tracing::warn!(
+            asked = want,
+            using = got,
+            floor = MIN_TOKENS,
+            ceiling,
+            "max_image_tokens out of range for this tower - clamped"
+        );
+    }
+    if got != MAX_TOKENS {
+        tracing::info!(
+            tokens = got,
+            published = MAX_TOKENS,
+            pixels = got * ALIGN * ALIGN,
+            "gemma4 image budget set by config (the checkpoint publishes 280)"
+        );
+    }
+    got
+}
 /// The FLOOR is llama.cpp's, not Google's: its comment says "the model
 /// performs quite poor with small images, we need to bump minimum image
 /// tokens to 40". Google's config states no minimum. Kept because it only ever
@@ -86,6 +133,9 @@ pub struct VisionModel {
     /// factorized pos tables, host: [2][pos_size][embd] (x table then y)
     pos_tbl: Vec<f32>,
     pos_size: usize,
+    /// Output-token ceiling in force for this instance: `MAX_TOKENS` unless
+    /// the dev override raised it (see `resolved_max_tokens`).
+    max_tokens: usize,
     conv: HalfTensor, // [3*patch*patch, embd] flattened conv-as-GEMM
     blocks: Vec<VBlock>,
     std_bias: Vec<f32>,
@@ -126,7 +176,13 @@ fn host_f32(map: &MappedGguf, name: &str) -> Result<(Vec<f32>, Vec<usize>), GpuE
 }
 
 impl VisionModel {
-    pub fn load(exec: Arc<GpuExecutor>, map: &MappedGguf) -> Result<Self, GpuError> {
+    /// `max_image_tokens` is the endpoint's config value (None = the
+    /// checkpoint's published 280) - see [`resolved_max_tokens`].
+    pub fn load(
+        exec: Arc<GpuExecutor>,
+        map: &MappedGguf,
+        max_image_tokens: Option<usize>,
+    ) -> Result<Self, GpuError> {
         let n_layers = key_u32(map, "clip.vision.block_count")?;
         let embd = key_u32(map, "clip.vision.embedding_length")?;
         let n_heads = key_u32(map, "clip.vision.attention.head_count")?;
@@ -211,6 +267,7 @@ impl VisionModel {
             eps,
             pos_tbl,
             pos_size,
+            max_tokens: resolved_max_tokens(pos_size, max_image_tokens),
             conv,
             blocks,
             std_bias,
@@ -254,44 +311,49 @@ impl VisionModel {
     /// The largest image this tower can use. Gemma 4 is the tightest of our
     /// three families by a wide margin - 280 tokens per image whatever you send
     /// it - so a client that sizes to this budget is sending far less than for
-    /// qwen or granite, correctly.
+    /// qwen or granite, correctly. Reported from the instance, so a raised cap
+    /// reaches the API's detail levels and the Studio's picker by the one path
+    /// they already read.
     pub fn budget(&self) -> crate::generator::VisionBudget {
         crate::generator::VisionBudget {
-            max_pixels: MAX_PIXELS as u64,
+            max_pixels: self.max_pixels() as u64,
             min_pixels: MIN_PIXELS as u64,
+            // still None: the table bound is ~163k px per side, which no
+            // client can hit and every client would have to carry. It is
+            // enforced where it can actually bite, inside `resize_target`.
             max_edge: None,
             pixels_per_token: (ALIGN * ALIGN) as u64,
-            max_tokens: MAX_TOKENS as u32,
+            max_tokens: self.max_tokens as u32,
             min_tokens: MIN_TOKENS as u32,
         }
     }
 
+    /// Source pixels the cap allows.
+    fn max_pixels(&self) -> usize {
+        self.max_tokens * ALIGN * ALIGN
+    }
+
+    /// The longest edge the POSITION TABLES can address, in pixels, rounded
+    /// down to a whole output token. `encode` indexes `pos_tbl` by patch
+    /// column and row, so a picture wider than this in patches would read
+    /// past the x table and into the y one - silently, since the two are one
+    /// tensor. A 1:1 image can never reach it; a pathological 200:1 strip can.
+    fn max_edge(&self) -> usize {
+        (self.pos_size / N_MERGE) * ALIGN
+    }
+
     /// smart_resize (llama.cpp calc_size_preserved_ratio): align to 48, keep
-    /// pixels within [MIN, MAX] preserving aspect.
-    pub fn resize_target(w: usize, h: usize) -> (usize, usize) {
-        let f = ALIGN as f32;
-        let round_by = |x: f32| ((x / f).round() * f) as usize;
-        let ceil_by = |x: f32| ((x / f).ceil() * f) as usize;
-        let floor_by = |x: f32| ((x / f).floor() * f) as usize;
-        let mut wb = round_by(w as f32).max(ALIGN);
-        let mut hb = round_by(h as f32).max(ALIGN);
-        if wb * hb > MAX_PIXELS {
-            let beta = ((w * h) as f32 / MAX_PIXELS as f32).sqrt();
-            wb = floor_by(w as f32 / beta).max(ALIGN);
-            hb = floor_by(h as f32 / beta).max(ALIGN);
-        } else if wb * hb < MIN_PIXELS {
-            let beta = (MIN_PIXELS as f32 / (w * h) as f32).sqrt();
-            wb = ceil_by(w as f32 * beta);
-            hb = ceil_by(h as f32 * beta);
-        }
-        (wb, hb)
+    /// pixels within [MIN, MAX] preserving aspect, then hold every edge inside
+    /// what the position tables can address.
+    pub fn resize_target(&self, w: usize, h: usize) -> (usize, usize) {
+        resize_target_px(w, h, self.max_pixels(), self.max_edge())
     }
 
     /// Full preprocessing: bilinear resize to the smart target, then im2row
     /// patches with the graph's ×2-1 scaling folded in. Returns (patches
     /// [n_patches, 3·patch²], grid_w, grid_h).
     pub fn preprocess_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
-        let (tw, th) = Self::resize_target(w, h);
+        let (tw, th) = self.resize_target(w, h);
         let resized = resize_bilinear_u8(rgb, w, h, tw, th);
         let (gw, gh) = (tw / self.patch, th / self.patch);
         let pp = self.patch * self.patch;
@@ -480,4 +542,89 @@ fn resize_bilinear_u8(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) ->
         }
     }
     out
+}
+
+/// The resize itself, free of the tower so it can be checked without a GPU:
+/// align to whole output tokens, fit inside `max_pixels` preserving aspect,
+/// then hold every edge inside what the position tables address.
+fn resize_target_px(w: usize, h: usize, max_pixels: usize, edge_cap: usize) -> (usize, usize) {
+    let f = ALIGN as f32;
+    let round_by = |x: f32| ((x / f).round() * f) as usize;
+    let ceil_by = |x: f32| ((x / f).ceil() * f) as usize;
+    let floor_by = |x: f32| ((x / f).floor() * f) as usize;
+    let mut wb = round_by(w as f32).max(ALIGN);
+    let mut hb = round_by(h as f32).max(ALIGN);
+    if wb * hb > max_pixels {
+        let beta = ((w * h) as f32 / max_pixels as f32).sqrt();
+        wb = floor_by(w as f32 / beta).max(ALIGN);
+        hb = floor_by(h as f32 / beta).max(ALIGN);
+    } else if wb * hb < MIN_PIXELS {
+        let beta = (MIN_PIXELS as f32 / (w * h) as f32).sqrt();
+        wb = ceil_by(w as f32 * beta);
+        hb = ceil_by(h as f32 * beta);
+    }
+    // the table bound, applied last: clamping an edge only ever drops rows
+    // the tower could not have addressed anyway
+    (wb.min(edge_cap).max(ALIGN), hb.min(edge_cap).max(ALIGN))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The measured table width on gemma-4-31B-it's mmproj
+    /// (v.position_embd.weight = [1152, 10240, 2]): 10240 patch positions per
+    /// axis, so ~163k px per side. Nowhere near binding for a real picture.
+    const POS_SIZE: usize = 10240;
+    fn edge_cap() -> usize {
+        (POS_SIZE / N_MERGE) * ALIGN
+    }
+    fn tokens(t: (usize, usize)) -> usize {
+        (t.0 / ALIGN) * (t.1 / ALIGN)
+    }
+
+    /// What the published cap does to an A4 page scanned at 300 dpi - the
+    /// shape behind the digit errors on small print.
+    #[test]
+    fn the_published_cap_renders_an_a4_page_at_roughly_680x912() {
+        let (w, h) = (2480usize, 3508);
+        let t = resize_target_px(w, h, MAX_TOKENS * ALIGN * ALIGN, edge_cap());
+        assert_eq!(t, (672, 912), "A4 at 300 dpi under the 280-token cap");
+        assert!(tokens(t) <= MAX_TOKENS, "{} tokens", tokens(t));
+    }
+
+    /// ...and what raising it to 1120 buys: twice the linear resolution, for
+    /// four times the tokens. Same aspect, same alignment, still inside cap.
+    #[test]
+    fn a_1120_token_cap_doubles_the_linear_resolution() {
+        let (w, h) = (2480usize, 3508);
+        let lo = resize_target_px(w, h, MAX_TOKENS * ALIGN * ALIGN, edge_cap());
+        let hi = resize_target_px(w, h, 1120 * ALIGN * ALIGN, edge_cap());
+        assert!(tokens(hi) <= 1120, "{} tokens", tokens(hi));
+        assert!(
+            hi.0 >= 2 * lo.0 - ALIGN && hi.1 >= 2 * lo.1 - ALIGN,
+            "expected ~2x per edge, got {lo:?} -> {hi:?}"
+        );
+        // aspect preserved to within one output token
+        let (ar_src, ar_hi) = (w as f32 / h as f32, hi.0 as f32 / hi.1 as f32);
+        assert!((ar_src - ar_hi).abs() < 0.02, "aspect {ar_src} vs {ar_hi}");
+    }
+
+    /// A pathological strip: the area fits, but one edge would run past the
+    /// x table and read the y table's rows. The clamp is the only thing
+    /// between that and silently wrong position embeddings.
+    #[test]
+    fn a_long_strip_is_held_inside_the_position_tables() {
+        let cap = edge_cap();
+        let t = resize_target_px(cap * 4, ALIGN, 1120 * ALIGN * ALIGN, cap);
+        assert!(t.0 <= cap, "width {} over the table bound {cap}", t.0);
+        assert!(t.1 >= ALIGN);
+    }
+
+    /// The floor still upsamples a tiny image rather than starving the tower.
+    #[test]
+    fn a_tiny_image_is_still_brought_up_to_the_floor() {
+        let t = resize_target_px(64, 48, MAX_TOKENS * ALIGN * ALIGN, edge_cap());
+        assert!(tokens(t) >= MIN_TOKENS, "{} tokens from 64x48", tokens(t));
+    }
 }

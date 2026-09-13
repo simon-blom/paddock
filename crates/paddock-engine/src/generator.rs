@@ -121,7 +121,7 @@ pub trait Generator: Send {
     }
 
     /// True when this backend may receive `Device(Greedy)` plans for rows
-    /// whose sampler is greedy + no-repeat-ngram ONLY. The scheduler grants
+    /// whose sampler is greedy + no-repeat-ngram only. The scheduler grants
     /// the plan per tick, only after verifying the guard would ban nothing at
     /// the row's current history - a no-op mask leaves raw logits, so the
     /// device argmax is bit-exact; ban-live ticks fall back to the Host row.
@@ -622,7 +622,7 @@ pub trait Generator: Send {
     }
 
     /// `prefill_begin` with checkpoint hints: positions inside `tokens` where
-    /// the scheduler knows OTHER queued prompts diverge from this one. The
+    /// the scheduler knows other queued prompts diverge from this one. The
     /// backend snapshots resumable state as the prefill crosses each, so those
     /// prompts adopt the shared prefix instead of re-prefilling it beside this
     /// one. Backends without hint support ignore them. Returns the resume

@@ -1624,7 +1624,7 @@ __device__ __forceinline__ void pd_bs_gu_epilogue(
 #if PD_BS_OK
 // NF=1 (wide-consumer) epilogue: a warp owns 16 rows, so the 32-row fq/fs
 // scale block spans the warp PAIR (w, w+CW). Phase A computes the swiglu
-// values in registers and publishes each column's block-HALF amax to
+// values in registers and publishes each column's block-half amax to
 // shared; a consumers-only barrier (id 3 - id 1 is the down fold, id 2 the
 // gate_up producers); phase B folds both halves (max is order-free, so
 // fq/fs stay BIT-IDENTICAL to the NF=2 epilogue) and quantizes. The

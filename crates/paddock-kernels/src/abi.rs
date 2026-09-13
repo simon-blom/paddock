@@ -920,7 +920,7 @@ pub type SwigluF32Fn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Gather one embedding row selected by a DEVICE-resident token id:
+/// Gather one embedding row selected by a device-resident token id:
 /// `out[i] = table[token[0]*embd + i]`. The token id lives on device so the whole
 /// decode step is CUDA-graph-capturable (only device-buffer contents change per
 /// token, never a captured host address). `table` [vocab*embd] f32, `out` [embd].
@@ -4448,7 +4448,7 @@ pub struct KernelTableV1 {
     /// fp8-e4m3 paged KV, head_dim 128, group 16 only (rc -2 otherwise; rc
     /// -3 when the windowed context exceeds the shared-memory opt-in).
     /// Params = `AttnDecodeBatchPagedFn` + `pos_max: u32` after `batch` (max
-    /// position over the rows - a HOST-side hint that sizes shared memory;
+    /// position over the rows - a host-side hint that sizes shared memory;
     /// callers pass the kv_split_band ceiling so captured graphs stay valid
     /// across the band).
     pub attn_decode_fused_gqa16: Option<
@@ -5686,7 +5686,7 @@ pub struct KernelTableV1 {
     /// tokens. Precision-class vs the chain (lane gates arbitrate). Same
     /// signature as `moe_head_router`.
     pub moe_head_router_hb: Option<MoeHeadRouterFn>,
-    /// P1-2 (hibatch path 1): head twin emitting PER-128 activation scale
+    /// P1-2 (hibatch path 1): head twin emitting per-128 activation scale
     /// groups (qs at n/128 stride). Same signature as `moe_head`.
     pub moe_head_xg: Option<MoeHeadFn>,
     /// P1-2: mma2 ILV gate_up consumer for per-128 activation scales
@@ -6137,7 +6137,7 @@ pub struct KernelTableV1 {
     /// Slot 576: MoE expert-offload cache fill - copies the resolve's miss
     /// jobs from the host-mapped mirror into their slots over six streams
     /// (gate/up/down x data/scales). (jobs, n_jobs (device), max_jobs,
-    /// src[6], dst[6], bytes[6] (HOST u64 arrays), stream).
+    /// src[6], dst[6], bytes[6] (host u64 arrays), stream).
     pub moe_cache_fill: Option<MoeCacheFillFn>,
     /// Slot 577: capability marker - present iff the k-quant repack, dequant
     /// and token-batched MoE pair serve the ggml i-quant family (IQ1_S/M,
@@ -6159,7 +6159,7 @@ pub struct KernelTableV1 {
     /// (idx, rows, n_expert, n_slots, n_waves, wave_of[n_expert],
     /// wave_ids[n_waves*n_slots], wave_cnt[n_waves], stream).
     pub moe_wave_plan: Option<MoeWavePlanFn>,
-    /// 581: cache resolve over a DEVICE id list with a device count (one
+    /// 581: cache resolve over a device id list with a device count (one
     /// wave): (ids, n_ids, n_slots, slot_of, expert_in, last_use, tick, jobs,
     /// n_jobs, stats, stream). Same LRU as slot 575, writes no idx_slot.
     pub moe_cache_resolve_dev: Option<MoeCacheResolveDevFn>,
@@ -6238,7 +6238,7 @@ pub struct KernelTableV1 {
     /// `in_dim` must be a multiple of the kernel's BK (128). Its f32
     /// association is the tile's, not the pair kernel's.
     pub kquant_moe_gate_up_tile: Option<KquantMoeGateUpTileFn>,
-    /// 593: the register-tiled DOWN twin of 592, over one column chunk -
+    /// 593: the register-tiled down twin of 592, over one column chunk -
     /// (down_data, down_scales, sorted_row, sorted_slot, block_expert, topk_w,
     /// fq, fs, fsums, part, ff, embd, o0, ocols, n_active, max_blocks). Writes
     /// the partials slot 591 folds; `ff` must be a multiple of the tile's BK.
@@ -6254,6 +6254,25 @@ pub struct KernelTableV1 {
     /// column, so the walk stops being register-bound; the norms come from the
     /// companion pass, so its token loop carries no barrier.
     pub gated_delta_recurrent_pn: Option<GatedDeltaRecurrentPnFn>,
+    /// Slot 597: `pd_nvf4_gemm_f4tn` - the f4t TMA tile at DECODE width: a
+    /// 32-column batch tile with f4t's loader and fragment plan, 2 CTA/SM
+    /// (GB10 2026-09-10). Slot 430's contract with batch <= 32; NULL wherever
+    /// 430 is NULL.
+    pub nvf4_gemm_f4tn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            f32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
 }
 
 /// Pre-normed single-sequence GDN walk (see `KernelTableV1::gated_delta_recurrent_pn`).
@@ -6871,7 +6890,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 582;
+pub const KERNEL_TABLE_SLOTS: usize = 583;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -10375,7 +10394,7 @@ mod tests {
         // 446-447: f16 SSM state <-> f32 checkpoint blob.
         // 448-449: the QKC compact-bf16 q/k pair (conv emitter + vl
         // chunked-GDN reader; one caller-side latch drives both).
-        // 450: q8_0_moe_up_relu2_dec2 - the decode-band relu^2 expert UP.
+        // 450: q8_0_moe_up_relu2_dec2 - the decode-band relu^2 expert up.
         // 451: quantize_q8_relu2 - activation-fused quantize, the seam that
         // puts the shared expert on the dense ladder.
         // 452-454: tile-major NVFP4 plane twins (lm_head repack rung) -

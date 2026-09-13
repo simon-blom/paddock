@@ -3,7 +3,7 @@
 //! Two kinds of host memory with different jobs ("storage capacity
 //! ≠ pinned transport pool"), both elected by the host-memory probe.
 //!
-//! - **Capacity slabs** ([`HostStore`]): where demoted payload extents LIVE.
+//! - **Capacity slabs** ([`HostStore`]): where demoted payload extents live.
 //!   Allocated as ordinary pageable memory, touched, then registered once via
 //!   `cuMemHostRegister` - 5.9 ms/GiB vs 72-151 ms for
 //!   `cuMemHostAlloc`, and registered ≡ pinned ≡ 26.7 GB/s on the bus, so a
@@ -225,7 +225,7 @@ impl HostStore {
         }
     }
 
-    /// The transfer mode transfers should assume right NOW. Registered until
+    /// The transfer mode transfers should assume right now. Registered until
     /// a slab registration fails, then pageable for the rest of the process
     /// (mixed-mode transfers are not worth their complexity - one failure
     /// says the OS is short on lockable pages, stop asking).

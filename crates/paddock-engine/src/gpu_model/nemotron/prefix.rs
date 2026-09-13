@@ -30,10 +30,23 @@ use super::GpuNemotron;
 /// here also pays 23 state copies, so trivial prompts aren't worth churn).
 pub(super) const MIN_CACHE_PREFIX: usize = 32;
 
-/// Staging blobs available per pass. A pass stages one blob per checkpoint
-/// cut that lands inside it; cuts beyond this are skipped (reuse loss only,
-/// never an error). 4 covers a full admission wave's trailing cuts.
-pub(super) const CKPT_STAGES: usize = 4;
+/// Staging blobs per pass: two per slot (every prompt has two trailing cuts
+/// and a coalesced tick can carry every slot's prompt), clamped 4..=32. A
+/// pass stages one blob per checkpoint cut that lands inside it; cuts beyond
+/// the count are skipped (reuse loss only, never an error). It was a flat 4
+/// ("a full admission wave's trailing cuts"), which is two prompts: an
+/// 8-session agentic wave (its turns arrive together and share one tick)
+/// left six of the eight sessions without a checkpoint every turn, and
+/// each of them re-prefilled from the shared system prompt's cut on the
+/// next turn (GB10 2026-09-11, cached_tokens 1872 at every c8 turn).
+/// `PADDOCK_NEMO_CKPT_STAGES` pins a count (dev; 4 = the old flat value).
+pub(super) fn ckpt_stages(slots: usize) -> usize {
+    paddock_models::dev_var!("PADDOCK_NEMO_CKPT_STAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or((2 * slots).clamp(4, 32))
+}
 
 /// Blocks kept in reserve for radix retention when sizing the pool. Cheap
 /// here - a nemotron block-set is 96 KiB (6 attention layers), so the 512
@@ -52,6 +65,8 @@ pub(crate) fn retention_blocks() -> usize {
 pub(crate) fn prefix_disabled() -> bool {
     paddock_models::dev_var_os!("PADDOCK_NO_PREFIX_CACHE").is_some()
 }
+
+pub(crate) use crate::gpu_model::prefix_cache::reply_ckpt_disabled;
 
 /// The checkpoint boundaries for a prompt: its last two full page
 /// boundaries, ascending (0 entries collapse when the prompt is short).
@@ -162,6 +177,15 @@ impl GpuNemotron {
         };
         let blocks = bs.tables[slot].blocks().to_vec();
         radix.insert(keys, &blocks, &mut bs.pool);
+        self.prefix_press_margin();
+    }
+
+    /// Evict (or tier-demote) radix retention down to the admission margin.
+    fn prefix_press_margin(&mut self) {
+        let bs = self.batch.as_mut().expect("batch enabled");
+        if bs.prefix.is_none() {
+            return;
+        }
         let margin =
             crate::gpu_model::prefix_cache::evict_ahead_margin(256, bs.pool.capacity() as usize);
         if margin > 0 && bs.pool.free_blocks() < margin {
@@ -426,5 +450,212 @@ impl GpuNemotron {
             .as_ref()
             .and_then(|bs| bs.prefix.as_ref().map(|r| r.evictable_blocks(&bs.pool)))
             .unwrap_or(0)
+    }
+}
+
+// ── stage F: the reply checkpoint ──────────────────────────────────────────
+//
+// The prefix cache's mamba checkpoints landed only at a PROMPT's last two
+// page boundaries, so an agentic turn N+1 resumed at turn N's prompt and
+// re-prefilled turn N's whole reply plus the new message (~230 rows per
+// turn; 105 ms at one row on the GB10 against a ~65 ms floor for the new
+// message alone, and eight of them in one tick at c8). Now every 16-token
+// boundary a reply crosses snapshots the slot's live mamba state straight
+// from the arena into the pool and files the reply's pages under the radix,
+// one live reply checkpoint per slot (the previous one is detached and its
+// index recycled), so the next turn resumes at the END of the reply.
+//
+// The sequence is tracked per slot: the prompt's keys at admission, then
+// every decode token a tick FEEDS (so the tracked length always equals the
+// next position; any gap - a tier restore, a spec round, a recompute - ends
+// tracking for the slot until its next admission). The decode pipe enqueues
+// the copy the moment the tick is launched (stream-ordered behind it) and
+// files the pages when the ids reach the host.
+impl GpuNemotron {
+    /// Admission: start tracking `slot`'s sequence at the prompt's keys.
+    pub(super) fn reply_track_admit(&mut self, slot: usize, tokens: &[u32]) {
+        self.reply_release(slot);
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if reply_ckpt_disabled()
+            || bs.prefix.is_none()
+            || bs.d_state_pool.is_none()
+            || slot >= bs.seq.len()
+        {
+            return;
+        }
+        bs.seq[slot] = tokens.to_vec();
+    }
+
+    /// A tick fed `tok` at `pos` for `slot`.
+    pub(super) fn reply_feed(&mut self, slot: usize, pos: u32, tok: u32) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let Some(seq) = bs.seq.get_mut(slot) else {
+            return;
+        };
+        if seq.is_empty() {
+            return;
+        }
+        if seq.len() != pos as usize {
+            seq.clear();
+            return;
+        }
+        seq.push(tok);
+    }
+
+    /// After a decode pass over these rows: snapshot every row whose position
+    /// closes a page, then file whatever the host has the ids for.
+    pub(super) fn reply_after_rows(
+        &mut self,
+        slots: &[u32],
+        positions: &[u32],
+    ) -> Result<(), GpuModelError> {
+        for (i, &s) in slots.iter().enumerate() {
+            let cut = positions[i] as usize + 1;
+            if cut.is_multiple_of(BLOCK_TOKENS) {
+                self.reply_snapshot(s as usize, cut)?;
+            }
+        }
+        self.reply_resolve_pending();
+        Ok(())
+    }
+
+    /// The pipe's ids for tick `k - 1` arrived: they are the tokens fed at
+    /// `pos0 + k`. Feed them and file the snapshots they complete.
+    pub(super) fn reply_pipe_ids(
+        &mut self,
+        ids: &[u32],
+        pos0: &[u32],
+        slots: Option<&[u32]>,
+        k: usize,
+    ) {
+        for (i, &t) in ids.iter().enumerate() {
+            let slot = slots.map_or(i, |s| s[i] as usize);
+            self.reply_feed(slot, pos0[i] + k as u32, t);
+        }
+        self.reply_resolve_pending();
+    }
+
+    fn reply_tracking(&self, slot: usize) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|bs| bs.seq.get(slot).is_some_and(|s| !s.is_empty()))
+    }
+
+    /// Copy `slot`'s live state into a reserved pool index (the reverse of
+    /// `restore_state`) and queue it for filing.
+    fn reply_snapshot(&mut self, slot: usize, cut: usize) -> Result<(), GpuModelError> {
+        if !self.reply_tracking(slot) {
+            return Ok(());
+        }
+        let exec = self.exec.clone();
+        let hp = self.hp.clone();
+        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
+        let win_elems = (hp.d_conv - 1) * hp.conv_dim();
+        let n = self.state_ckpt_f32();
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let Some(radix) = bs.prefix.as_mut() else {
+            return Ok(());
+        };
+        let Some(idx) = radix.reserve_state_slot() else {
+            return Ok(());
+        };
+        let Some(sp) = bs.d_state_pool.as_mut() else {
+            radix.recycle_state(idx);
+            return Ok(());
+        };
+        let mut boff = idx as usize * n;
+        for li in 0..hp.n_layer {
+            let Some(s) = bs.ssm[li].as_ref() else {
+                continue;
+            };
+            s.save_to_blob(&exec, slot * state_elems, sp, boff, state_elems)?;
+            boff += state_elems;
+            let w = bs.conv_win[li].as_ref().expect("mamba layer has window");
+            exec.copy_region(w, slot * win_elems, sp, boff, win_elems)?;
+            boff += win_elems;
+        }
+        bs.reply_pending.push((slot, cut, idx));
+        Ok(())
+    }
+
+    /// File every pending snapshot whose ids have arrived: the reply's pages
+    /// up to the cut go under the radix, the state attaches at the cut, the
+    /// slot's previous reply checkpoint is detached and its index recycled.
+    pub(super) fn reply_resolve_pending(&mut self) {
+        let mut filed_any = false;
+        {
+            let Some(bs) = self.batch.as_mut() else {
+                return;
+            };
+            let Some(radix) = bs.prefix.as_mut() else {
+                return;
+            };
+            let mut i = 0;
+            while i < bs.reply_pending.len() {
+                let (slot, cut, idx) = bs.reply_pending[i];
+                let seq = &bs.seq[slot];
+                if seq.is_empty() {
+                    // tracking ended before the ids came - orphaned blob
+                    radix.recycle_state(idx);
+                    bs.reply_pending.swap_remove(i);
+                    continue;
+                }
+                if seq.len() < cut {
+                    i += 1;
+                    continue;
+                }
+                let filed = match bs.tables[slot].blocks().get(..cut / BLOCK_TOKENS) {
+                    Some(blocks) => {
+                        let blocks = blocks.to_vec();
+                        radix.insert(&seq[..cut], &blocks, &mut bs.pool);
+                        radix.attach_state_at(seq, cut, idx)
+                    }
+                    None => false,
+                };
+                if filed {
+                    filed_any = true;
+                    if let Some((old_cut, old_idx)) = bs.reply_ckpt[slot].replace((cut, idx))
+                        && radix.detach_state_at(seq, old_cut) == Some(old_idx)
+                    {
+                        radix.recycle_state(old_idx);
+                    }
+                } else {
+                    radix.recycle_state(idx);
+                }
+                bs.reply_pending.swap_remove(i);
+            }
+        }
+        if filed_any {
+            self.prefix_press_margin();
+        }
+    }
+
+    /// The slot went idle (or is being re-admitted): stop tracking. Its last
+    /// reply checkpoint STAYS in the radix for the next turn - the pool's
+    /// LRU owns it now; snapshots whose ids never arrived are given back.
+    pub(super) fn reply_release(&mut self, slot: usize) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if slot >= bs.seq.len() {
+            return;
+        }
+        bs.seq[slot].clear();
+        bs.reply_ckpt[slot] = None;
+        if let Some(radix) = bs.prefix.as_mut() {
+            let mut i = 0;
+            while i < bs.reply_pending.len() {
+                if bs.reply_pending[i].0 == slot {
+                    radix.recycle_state(bs.reply_pending[i].2);
+                    bs.reply_pending.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 }

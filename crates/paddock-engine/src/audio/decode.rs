@@ -2,7 +2,7 @@
 //! list (`flac mp3 mp4 mpeg mpga m4a ogg wav webm`) down to the mono f32 the
 //! ASR frontends eat.
 //!
-//! Why there is A DEPENDENCY here at ALL. `wav.rs` says it stays in-house
+//! Why there is A DEPENDENCY here at all. `wav.rs` says it stays in-house
 //! because "the parity requirement makes every sample-level transform part of
 //! the numeric contract". That argument covers the transforms we own - the
 //! resampler, the mel - not the codec: an MP3 frame has one defined meaning
@@ -15,7 +15,7 @@
 //! from-scratch decoder would put a difference of our own making inside the
 //! one comparison the ASR gates exist to run.
 //!
-//! WAV does not COME through HERE. RIFF still goes to `wav::decode_wav`: it
+//! WAV does not COME through here. RIFF still goes to `wav::decode_wav`: it
 //! is the format every parity gate and every board runs on, its numeric
 //! contract is pinned, and rerouting the one measured format through a new
 //! library to gain nothing is how a board silently moves.

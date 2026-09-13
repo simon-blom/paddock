@@ -178,7 +178,7 @@ fn bf16_plane_matches_host_reference() {
         assert!(err < 1e-5, "bf16 gemv_at: rel err {err:e} (want < 1e-5)");
     }
 
-    // ── 4/5: the row widen and gather. Both are EXACT.
+    // ── 4/5: the row widen and gather. Both are exact.
     //
     // `mm.2.weight` is [4096, 6656] - 6656 rows of 4096. These two kernels are
     // row gathers, so a projection plane stands in for an embedding table

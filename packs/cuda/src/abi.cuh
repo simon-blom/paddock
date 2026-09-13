@@ -77,7 +77,7 @@ static inline const char* pd_env(const char* name) { return getenv(name); }
 
 // Truthy election/kill read: set, non-empty, and not "0". The engine now
 // FILLS some of these as tuned defaults (envset::set_env), so "the env always
-// wins, FOO=0 reverts" needs a spelled opt-out - bare presence can't say OFF.
+// wins, FOO=0 reverts" needs a spelled opt-out - bare presence can't say off.
 // Rust-side twin: envset::env_on.
 static inline bool pd_env_on(const char* name) {
     const char* v = pd_env(name);
@@ -87,7 +87,7 @@ static inline bool pd_env_on(const char* name) {
 // Host half of PD_BS_OK: does the RUNNING device have the block-scale
 // (sm_120a feature-target) kernel bodies in this pack? The device gate is
 // `__CUDA_ARCH__ >= 1200 && __CUDA_ARCH_FEAT_SM120_ALL`, which only the
-// sm_120a pass satisfies - so the answer is an EXACT cc 12.0 match, never
+// sm_120a pass satisfies - so the answer is an exact cc 12.0 match, never
 // a major-only test. Every host election of a BS-bodied arm (the table
 // resolution in exports.cuh, the lin kt3/ktz family, the nv4 tile arm)
 // reads this one function, so the rule cannot drift per launcher again.
@@ -101,7 +101,7 @@ static inline bool pd_env_on(const char* name) {
 //
 // The widening (same day): build.sh adds the sm_121a feature target beside
 // plain sm_121 and defines PD_BS_SM121, PD_BS_OK accepts
-// __CUDA_ARCH_FEAT_SM121_ALL, and 12.1 answers true here ONLY under that
+// __CUDA_ARCH_FEAT_SM121_ALL, and 12.1 answers true here only under that
 // define - a pack built without 121a keeps GB10 on the portable arms. The
 // fatbin picks the most specific image (probed: sm_120a does not load on
 // 12.1 at all; sm_121a does, with its feature macro), so the bodies the
@@ -1805,7 +1805,7 @@ struct KernelTableV1 {
                     const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                     float, void*);
     // slot 381: DeepSeek-greedy MoE router epilogue  - top-k
-    // selection identical to moe_topk_batch, weights = FULL-softmax probs
+    // selection identical to moe_topk_batch, weights = full-softmax probs
     // (denominator over all n_expert, no renorm among the selected k).
     // -3 = shape not covered (n_expert > 256 or k > 16).
     // (logits [batch, n_expert], n_expert, k, out_idx, out_w, batch, stream)
@@ -2857,7 +2857,7 @@ struct KernelTableV1 {
     // wave_ids[n_waves*n_slots], wave_cnt[n_waves], stream).
     int (*moe_wave_plan)(const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*,
                          void*, void*, void*);
-    // 581: cache resolve over a DEVICE id list + device count (a wave):
+    // 581: cache resolve over a device id list + device count (a wave):
     // (ids, n_ids (device), n_slots, slot_of, expert_in, last_use, tick,
     // jobs, n_jobs, stats, stream). Same LRU as slot 575, no idx_slot.
     int (*moe_cache_resolve_dev)(const void*, const void*, uint32_t, void*, void*, void*,
@@ -2938,7 +2938,7 @@ struct KernelTableV1 {
                                    const void*, const void*, const void*, const void*,
                                    const void*, const void*, void*, uint32_t, uint32_t,
                                    uint32_t, uint32_t, uint32_t, uint32_t, void*);
-    // 593: the register-tiled DOWN twin of 592, over one column chunk:
+    // 593: the register-tiled down twin of 592, over one column chunk:
     // (down_data, down_scales, sorted_row, sorted_slot, block_expert, topk_w,
     // fq, fs, fsums, part, ff, embd, o0, ocols, n_active, max_blocks). Writes
     // slot 591's partials; `ff` must be a multiple of the tile's BK (128).
@@ -2961,6 +2961,12 @@ struct KernelTableV1 {
     int (*gated_delta_recurrent_pn)(const void*, const void*, const void*, const void*,
                                     const void*, void*, void*, uint32_t, uint32_t,
                                     uint32_t, void*, void*);
+    // 597: nvf4_gemm_f4tn - the f4t TMA tile at DECODE width (32-column batch
+    // tile, 2 CTA/SM; GB10 2026-09-10). Slot 430's contract with batch <= 32;
+    // NULL wherever 430 is NULL.
+    int (*nvf4_gemm_f4tn)(const void*, const void*, const void*, const void*,
+                          const void*, void*, float, uint32_t, uint32_t,
+                          uint32_t, void*);
 };
 
 } // extern "C"
@@ -3106,7 +3112,7 @@ static inline uint32_t pd_norm_decode_nth() {
 // lane), so 256 is the most accurate width. The throughput it buys ships
 // only with a numerics-preserving reduction (f64/Kahan accumulators - the
 // open route), not by regrouping f32 sums.
-// The auto arm is now THREE-band: the two-band form regressed the
+// The auto arm is now three-band: the two-band form regressed the
 // long-prefill case (512 thr loses to 256 at true
 // prefill widths where thousands of CTAs already fill the die):
 //   rows <= nsm      -> 1024  (1 CTA/SM latency-bound band: the 2.14x fix)

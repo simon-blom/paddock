@@ -454,6 +454,12 @@ function onListen(): void {
 
 // Resolve the route's :id to the active conversation. /chat RESUMES - it never
 // creates. A chat only comes into being when you send from a draft surface.
+/** The failed state's button: ask for the chat's document again. */
+function retryOpen(): void {
+  const id = chat.active?.id
+  if (id) void chat.ensureLoaded(id)
+}
+
 async function syncRoute(): Promise<void> {
   // Draft surfaces own no id: open a fresh draft, leave the sidebar with
   // nothing selected, and put the cursor where the user is headed anyway.
@@ -747,8 +753,16 @@ function newChat(): void {
       </Tooltip>
     </aside>
     <div ref="mainEl" class="chatview__main" :class="{ 'chatview__main--home': isHome }">
+      <div v-if="!isHome && chat.activeLoading" class="chatview__msg" role="status">
+        <Icon name="spinner" :size="20" class="chatview__spin" />
+        <span>Opening...</span>
+      </div>
+      <div v-else-if="!isHome && chat.activeLoadFailed" class="chatview__msg" role="alert">
+        <span>This conversation could not be opened.</span>
+        <button class="pk-btn pk-btn--sm" type="button" @click="retryOpen">Try again</button>
+      </div>
       <ChatThread
-        v-if="!isHome"
+        v-else-if="!isHome"
         @regenerate="regenerate"
         @continue-reply="continueLast"
         @edit="editAndResend"
@@ -779,6 +793,8 @@ function newChat(): void {
         v-model:files="files"
         :busy="isStreaming"
         :docked="!isHome"
+        :inert="!isHome && (chat.activeLoading || chat.activeLoadFailed)"
+        :class="{ 'chatview__composer--waiting': !isHome && (chat.activeLoading || chat.activeLoadFailed) }"
         @submit="onSubmit"
         @listen="onListen"
         @stop="stop"
@@ -840,6 +856,37 @@ function newChat(): void {
 </template>
 
 <style scoped>
+/* A chat whose document has not arrived yet (or did not): same recipe as the
+   document pane's "Opening...", centred where the thread will be. */
+.chatview__msg {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 24px;
+  text-align: center;
+  color: var(--pk-text-muted);
+  font-size: var(--pk-font-size-sm);
+}
+.chatview__spin {
+  animation: chatview-spin 0.8s linear infinite;
+}
+@keyframes chatview-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chatview__spin {
+    animation: none;
+  }
+}
+/* inert already takes the composer out of reach; this says so */
+.chatview__composer--waiting {
+  opacity: 0.55;
+}
 .chatview {
   position: relative;
   display: flex;

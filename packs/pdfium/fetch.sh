@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage OUR prebuilt pdfium without building it.
+# Stage our prebuilt pdfium without building it.
 #
 #   bash packs/pdfium/fetch.sh              # linux-x64, the host
 #   bash packs/pdfium/fetch.sh win-x64      # stage the Windows library instead

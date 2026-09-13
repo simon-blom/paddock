@@ -473,7 +473,7 @@ impl GpuExecutor {
     /// Discrete cards: cuMemGetInfo, unchanged. Integrated (unified-memory)
     /// dies - DGX Spark GB10, Jetson - answer differently: the driver reports
     /// total = the box's RAM and free = the kernel's MemFree, which counts the
-    /// page cache as USED and ignores the pages the driver itself parks in
+    /// page cache as used and ignores the pages the driver itself parks in
     /// its freed-allocation pools (open kernel module >= 590,
     /// NVreg_EnableSystemMemoryPools). Measured 2026-09-07 on a Spark: free
     /// read 0.9 GiB while 112 GiB of cudaMalloc succeeded, and the load gate

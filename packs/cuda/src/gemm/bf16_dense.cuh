@@ -1366,7 +1366,7 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_tma_kernel(
 // blocks on a 188-SM die and run at 24-37% of the DRAM roof, while cuBLASLt
 // split-K covers the same shapes at ~69%. Careful with the batch-scaling
 // "grid-fill ladder" reading that argues K-split off: that ladder scales
-// BATCH, and its GB/s-wt metric divides SINGLE-plane bytes by time, so a
+// BATCH, and its GB/s-wt metric divides single-plane bytes by time, so a
 // flat curve means time held constant while physical traffic doubled - CTA
 // starvation, exactly what a K-split cures at constant bytes.
 //
@@ -1415,6 +1415,15 @@ __global__ void pd_bf16_ks_combine_kernel(
 // not KT-runs). The fit clamp can, in principle, diverge nz for M*batch
 // beyond ~9k*64 - no shipped bit-compared pairing lives there; every
 // nemotron shape fits. 0 = stay unsplit. Kill: PADDOCK_NO_BF16_KSPLIT.
+// What the purity does not cover is the fill early-out just below: it is
+// decided per LAUNCH from that launch's own grid, so the 4608-row fused
+// q|k|v plane and its 256-row k/v segment can fall on opposite sides of it.
+// On GB10 (48 SMs) they do - the fused plane's 144 CTAs (>= 2*48) stay
+// unsplit while the k segment's 8 CTAs split into 6 slabs - so the fused
+// launch is bit-identical to the plain GEMM over the same concatenated
+// plane on every die, and to the per-segment GEMMs only where both sides
+// elect the same nz (the gate compares the former, and the latter at the
+// regroup class).
 static uint32_t pd_bf16ks_nz(uint32_t blocks2d, uint32_t in_dim,
                              uint32_t out_m, uint32_t batch) {
     static const bool off = pd_env("PADDOCK_NO_BF16_KSPLIT") != nullptr;
@@ -1477,7 +1486,7 @@ static uint32_t pd_bf16ks_nz(uint32_t blocks2d, uint32_t in_dim,
         return n >= 2u ? n : 0u;
     }();
     const uint32_t nb = (in_dim + slab - 1u) / slab;
-    // RAISE ONLY. A pure fill rule (cap = want) also LOWERS nz on shapes that
+    // Raise only. A pure fill rule (cap = want) also LOWERS nz on shapes that
     // are already well filled, and that regresses them -- measured, which is
     // why the sweep checks every decode cell and not just the two it targets:
     //   GDN qkv [2560->10240] blocks2d 160, nz 5 -> 2:  24.63 -> 28.82 us
@@ -1663,7 +1672,7 @@ static int pd_bf16_qkv_cfg(const __nv_bfloat16* w, const float* x, float* yq,
     return (int)cudaGetLastError();
 }
 
-// TWO-segment twin of pd_bf16_qkv_cfg. Identical kernel and identical row
+// Two-segment twin of pd_bf16_qkv_cfg. Identical kernel and identical row
 // routing; the only difference is the fused row count.
 //
 // This exists because reusing the q|k|v launcher for a 2-segment plane is a
@@ -1994,7 +2003,7 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
     // bit-neutral.
     // CORRECTION to that reading: the grid-fill ladder's "538 GB/s flat
     // across b32..b256" looked like saturation, but a GB/s-wt metric divides
-    // SINGLE-plane bytes by time while batch doubles the PHYSICAL weight
+    // single-plane bytes by time while batch doubles the PHYSICAL weight
     // traffic - flat GB/s-wt means time held constant as bytes doubled, i.e.
     // aggregate bandwidth scaled with CTA count. That is starvation, and the
     // K-split it argued against is exactly what pays: wo b32 40.9 -> 22.2 us
@@ -2048,7 +2057,9 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
 // Fused q|k|v decode-band entry (thin-k/v rung): one launch over
 // the load-time-concatenated [q;k;v] plane (in_dim x (oq + 2*okv)) against
 // the shared x, segmented store into yq/yk/yv ([batch, seg] each). Per
-// out-row bit-identical to pd_bf16_gemm_mma on the matching segment. The
+// out-row bit-identical to pd_bf16_gemm_mma over the same concatenated
+// plane (and to the matching segment's own launch wherever both elect the
+// same K-split - see pd_bf16ks_nz). The
 // probe's per-band picks: b8 20.8 us / b16 26.6 / b32 34.6 at the nemotron
 // fused shape (4608x2688) vs 131 us for the three separate launches at b32
 // - the thin k/v rows were latency-starved on their own grids. Declines

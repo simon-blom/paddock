@@ -6,7 +6,7 @@
 //!
 //! - 4 layers, embd 1024, GEGLU ffn 8192; SWA pattern [T,T,T,F] mirroring the
 //!   main model's two geometries (SWA hd256/32Q, global hd512/32Q).
-//! - Q-ONLY attention: the drafter has no K/V projections and no cache of its
+//! - Q-only attention: the drafter has no K/V projections and no cache of its
 //!   own - `shared_kv_layers=4` means every drafter layer reads a MAIN-model
 //!   plane: SWA layers share main layer n-2 (a SWA plane), the global layer
 //!   shares main layer n-1 (a global plane). Nothing is ever appended, so the

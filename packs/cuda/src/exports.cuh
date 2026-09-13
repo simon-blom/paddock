@@ -1522,6 +1522,9 @@ static const KernelTableV1 PD_KERNELS = {
     pd_add_rmsnorm_quant_e4m3_pf,
     pd_add_rmsnorm_quant_nvf4_pf,
     pd_gated_delta_recurrent_pn,
+    // 597: nvf4_gemm_f4tn - the f4t tile at decode width (block-scale SASS
+    // like 430; NULLed with it). Small-die decode election, see fp4.rs.
+    pd_nvf4_gemm_f4tn,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -1530,7 +1533,7 @@ PD_EXPORT const PackInfo* paddock_pack_info(void) {
 
 PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
 #ifdef PD_BS_HOST
-    // Honest per-DEVICE capability: a PD_BS_HOST fatbin can land
+    // Honest per-device capability: a PD_BS_HOST fatbin can land
     // on a device whose SASS pass compiled the block-scale bodies empty (the
     // multi-arch build always could; the sm_100 lane now builds
     // PD_BS_HOST for cc 10.x deliberately). A non-null entry backed by an
@@ -1554,7 +1557,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
         // reports cma==12, so a major-only test would advertise these entries
         // on a die whose SASS was compiled with PD_BS_OK=0 -- empty kernel
         // bodies, silently. Minor revisions must fall back, not no-op.
-        // pd_dev_bs_sass (abi.cuh) IS that rule; the in-launcher elections
+        // pd_dev_bs_sass (abi.cuh) is that rule; the in-launcher elections
         // read the same function, after the kt3 one drifted to major-only.
         if (!pd_dev_bs_sass()) {
             t.mxfp4_moe_gate_up_bs = NULL;
@@ -1574,6 +1577,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_gemm_f4c = NULL;
             t.nvf4_gemm_f4t = NULL;
             t.nvf4_gemm_f4t4 = NULL;
+            t.nvf4_gemm_f4tn = NULL;
             t.q8_0_to_nvf4_rot = NULL;
             t.mxfp4_gemm_bs_gu = NULL;
             t.q8_0_to_nvf4_smooth = NULL;
@@ -1659,10 +1663,10 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             //  decode-band f8 GEMMs ride the same sm_100a-only class
             t.f8bs_moe_gemm_gu_d32 = NULL;
             t.f8bs_moe_gemm_dn_d32 = NULL;
-            // slots 543/544: pd_lowm_gemm dispatches ONLY the tcgen05/TMEM
+            // slots 543/544: pd_lowm_gemm dispatches only the tcgen05/TMEM
             // form (pd_lowm5_kernel, body under PD_TC5_OK == sm_100a). On any
             // other die the entry was a lie in both pack flavours: a
-            // multi-arch pack launched an EMPTY kernel (warm-up "passed",
+            // multi-arch pack launched an empty kernel (warm-up "passed",
             // and PADDOCK_Q38FN_LOWM=1 would have returned zeros), an
             // sm_120-only pack answered 801 and the engine printed a
             // warm-up-refused warning on every Flash-Next load (5060 Ti,
@@ -1747,6 +1751,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.f8bs_moe_gemm_dn_d32 = NULL;
             t.nvf4_gemm_f4t = NULL;
             t.nvf4_gemm_f4t4 = NULL;
+            t.nvf4_gemm_f4tn = NULL;
             t.nvf4_gemm_f4t_swq = NULL;
             t.q8_0_moe_gate_up_g2_geglu = NULL;
             t.q8_0_moe_gate_up_mma2t_geglu = NULL;

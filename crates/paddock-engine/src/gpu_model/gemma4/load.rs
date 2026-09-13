@@ -15,7 +15,7 @@ use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::{GpuError, GpuExecutor};
 
-use super::{Arch, GpuGemma4, Hparams, LayerWeights, MoeWeights, Plane, Scratch};
+use super::{Arch, GpuGemma4, Hparams, LayerWeights, MoeWeights, Plane};
 use crate::gpu::RepackedQ8;
 use paddock_models::ggml_type::GgmlType;
 
@@ -532,7 +532,7 @@ impl GpuGemma4 {
         //  3. The FUSED KV APPEND ROPED NEOX. pd_kv_nra_rows had no pair-layout
         //     argument, so prefill roped K half-split while Q rode the
         //     interleaved layout the rope pass had just landed.
-        //  4. The BATCHED-DECODE EPILOGUE had no freq_scale at ALL.
+        //  4. The BATCHED-DECODE EPILOGUE had no freq_scale at all.
         //     pd_gemma_qkv_nra assumed 1.0, so this arch's NoPE full-attention
         //     layers were re-roped on every generated token while prefill
         //     correctly left them alone. That is why the symptom read as
@@ -1195,7 +1195,7 @@ impl GpuGemma4 {
         {
             crate::envset::set_env("PADDOCK_F8T_WMMA_BMAX", "8");
         }
-        // muse-glimmer: default-ON the LIN K-split. On B200 it cuts the
+        // muse-glimmer: default-on the LIN K-split. On B200 it cuts the
         // mid-M PREFILL - wide-batch TTFT and throughput both improve - with
         // zero regression at narrow widths, because the ktz dispatch gate
         // (nt <= 1.5*SMs && batch <= 1024)
@@ -2548,309 +2548,49 @@ impl GpuGemma4 {
         let kv = super::batch::alloc_kv(&exec, &layers, max_ctx, paging.as_ref(), None, 1, None)?;
         vram_mark("serial KV (1 slot)", &mut vram_prev);
 
-        // Prefill scratch rows: what a chunk on this server can actually be,
-        // not the 8192-row ceiling (see forward::pf_rows). Every prefill lane
-        // chunks at the same value, so the planes below are exactly wide
-        // enough by construction.
+        // Prefill scratch rows: the chunk width this server STARTS at.
+        // `enable_batch` may step it down - the planes are ~0.62 MiB/row on
+        // gemma-4-31B, so at ctx 16384 the full 8192-row set is 4.99 GiB taken
+        // off the budget before the KV planner is asked anything, and the plan
+        // then refuses beside it. Every prefill lane splits at
+        // `GpuGemma4::pf_rows` (the live value), never at this one.
         let pf_rows = super::forward::pf_rows(max_ctx);
 
-        let max_q = n_head * hd_global;
-        // muse-glimmer sigmoid output gate: sized only when the file actually
-        // carries the gate planes, so gemma4 pays nothing for it (max_q here
-        // is 4096 f32 serial + PF_ROWS x 4096 batched - not free)
-        let gate_q = if layers.iter().any(|l| l.attn_gate.is_some()) {
-            max_q
-        } else {
-            1
-        };
-        let max_kv = layers
-            .iter()
-            .map(|l| l.n_kv_heads * l.head_dim)
-            .max()
-            .expect("layers non-empty");
-        let alloc = |n: usize| -> Result<CudaSlice<f32>, LoadError> {
-            exec.stream
-                .alloc_zeros::<f32>(n)
-                .map_err(|e| LoadError::Tensor("scratch".into(), e.to_string()))
-        };
-        // sorted-MoE layout bounds (moe_align PAD padding): worst case over
-        // the block tiles - BM=32 has the most BLOCKS, BM=128 (the tc5 f8
-        // lane) the most padded ROWS.
-        let moe_pairs = pf_rows * n_expert_used.max(1);
-        let mb32 = (moe_pairs + n_expert * 31).div_ceil(32);
-        let mb64 = (moe_pairs + n_expert * 63).div_ceil(64);
-        let mb128 = (moe_pairs + n_expert * 127).div_ceil(128);
-        let (moe_srows, moe_blocks) = if n_expert != 0 {
-            (
-                (mb32 * 32).max(mb64 * 64).max(mb128 * 128),
-                mb32.max(mb64).max(mb128),
-            )
-        } else {
-            (0, 0)
-        };
-        // tc5 f8 expert-lane planes are sized on the BM=128 superset
-        let moe_f8_rows = if n_expert != 0 { mb128 * 128 } else { 0 };
-        let ff_pad = ff_exp.next_multiple_of(128).max(1);
-        let scratch = Scratch {
-            x: alloc(n_embd)?,
-            normed: alloc(n_embd)?,
-            q: alloc(max_q)?,
-            k: alloc(max_kv)?,
-            v: alloc(max_kv)?,
-            kn: alloc(max_kv)?,
-            vn: alloc(max_kv)?,
-            qn: alloc(max_q)?,
-            attn: alloc(max_q)?,
-            agate: alloc(gate_q)?,
-            proj: alloc(n_embd)?,
-            gate: alloc(n_ff)?,
-            up: alloc(n_ff)?,
-            logits: alloc(n_vocab)?,
-            stream_tmp: alloc(n_embd)?,
-            pos: exec
-                .alloc_u32(1)
-                .map_err(|e| LoadError::Tensor("scratch.pos".into(), e.to_string()))?,
-            ones: {
-                let host = vec![1.0f32; hd_global];
-                exec.stream
-                    .clone_htod(&host)
-                    .map_err(|e| LoadError::Tensor("scratch.ones".into(), e.to_string()))?
-            },
-            neg_inf_sinks: exec
-                .alloc_no_sinks(n_head)
-                .map_err(|e| LoadError::Tensor("scratch.sinks".into(), e.to_string()))?,
-            pf_x: alloc(pf_rows * n_embd)?,
-            pf_tmp: alloc(pf_rows * n_embd)?,
-            pf_normed: alloc(pf_rows * n_embd)?,
-            // sized for the widest per-row output: separate q (max_q) OR the
-            // fused qkv-concat row (q+2kv / q+kv on V-less global layers) -
-            // the Act-45 all-band concat arm writes r x concat at prefill
-            // chunks, which overflows a max_q-only buffer on global layers
-            pf_q: alloc(
-                pf_rows * {
-                    let max_qkv = layers
-                        .iter()
-                        .map(|l| {
-                            n_head * l.head_dim
-                                + l.n_kv_heads * l.head_dim * if l.wv.is_some() { 2 } else { 1 }
-                        })
-                        .max()
-                        .unwrap_or(max_q);
-                    max_q.max(max_qkv)
-                },
-            )?,
-            pf_qn: alloc(pf_rows * max_q)?,
-            pf_k: alloc(pf_rows * max_kv)?,
-            pf_v: alloc(pf_rows * max_kv)?,
-            pf_kn: alloc(pf_rows * max_kv)?,
-            pf_vn: alloc(pf_rows * max_kv)?,
-            pf_attn: alloc(pf_rows * max_q)?,
-            pf_agate: alloc(if gate_q > 1 { pf_rows * max_q } else { 1 })?,
-            pf_proj: alloc(pf_rows * n_embd)?,
-            pf_gate: alloc(pf_rows * 2 * n_ff)?, // fused gate|up rows
-            pf_up: alloc(pf_rows * n_ff)?,
-            pf_row: alloc(n_embd)?,
-            pf_pos: exec
-                .alloc_u32(pf_rows)
-                .map_err(|e| LoadError::Tensor("scratch.pf_pos".into(), e.to_string()))?,
-            pf_fin: alloc(64 * n_vocab)?,
-            pf_toks: exec
-                .alloc_u32(pf_rows)
-                .map_err(|e| LoadError::Tensor("scratch.pf_toks".into(), e.to_string()))?,
-            pf_runs: exec
-                .alloc_u32(65)
-                .map_err(|e| LoadError::Tensor("scratch.pf_runs".into(), e.to_string()))?,
-            pf_attn_pos: exec
-                .alloc_u32(pf_rows)
-                .map_err(|e| LoadError::Tensor("scratch.pf_attn_pos".into(), e.to_string()))?,
-            pf_slots: {
-                let zeros = vec![0u32; pf_rows];
-                exec.stream
-                    .clone_htod(&zeros)
-                    .map_err(|e| LoadError::Tensor("scratch.pf_slots".into(), e.to_string()))?
-            },
-            // widest mmq/mma quantize INPUT across the whole walk: ffn_down
-            // (n_ff), the pre-norm rows (n_embd), and the wo input
-            // (n_head*hd - 8192 on hd-512 layers). On the 31B the fat n_ff
-            // (21504) covered all of these by accident; the A4B's shared ff
-            // is only 2112 < n_embd 2816, and sizing by n_ff alone was an
-            // OOB write from the first attn quantize (all-NaN bring-up bug).
-            pf_yq: exec
-                .alloc_u8(
-                    n_ff.max(n_embd).max(max_q).div_ceil(128) * pf_rows.next_multiple_of(128) * 144,
-                )
-                .map_err(|e| LoadError::Tensor("scratch.pf_yq".into(), e.to_string()))?,
-            // skfix also holds the ks K-split partial planes: the M-col
-            // rung (wide-spec verify, <=192 rows) peaks at nz*out*rows =
-            // 2*21504*192 f32 (gate/up) - 9M covers every dense shape
-            pf_skfix: alloc(12 * 1024 * 1024)?, // fused gate|up twin at r=31
-            // needs 8*43008*31 = 10.67M f32 (the mma_ks partial contract)
-            // 192 rows: the mma_ks/M-col quantize class now serves the wide
-            // spec verify (was 64 - the mma_ks BN cap before the M-col rung)
-            // same widest-input rule as pf_yq (wo input outgrows n_ff on the A4B)
-            pf_xq: exec
-                .alloc_i8(192 * n_ff.max(n_embd).max(max_q))
-                .map_err(|e| LoadError::Tensor("scratch.pf_xq".into(), e.to_string()))?,
-            pf_xs: alloc(192 * n_ff.max(n_embd).max(max_q) / 32)?,
-            // f8a included: its attn arms quantize r*n_embd / r*(n_head*hd)
-            // into these planes - the old f8-only predicate left 32-byte
-            // stubs under a live F8A build whenever f8w/f8row were off (OOB
-            // writes; found via the same 26B NaN hunt). Widest-input rule as
-            // pf_yq.
-            pf_e4q: exec
-                .alloc_i8(if f8_on || f8row || f8w_pf || f8a {
-                    pf_rows * n_ff.max(n_embd).max(max_q)
-                } else {
-                    32
+        let scratch_dims = super::scratch::ScratchDims {
+            n_embd,
+            n_head,
+            hd_global,
+            n_vocab,
+            n_ff,
+            max_q: n_head * hd_global,
+            max_kv: layers
+                .iter()
+                .map(|l| l.n_kv_heads * l.head_dim)
+                .max()
+                .expect("layers non-empty"),
+            max_qkv: layers
+                .iter()
+                .map(|l| {
+                    n_head * l.head_dim
+                        + l.n_kv_heads * l.head_dim * if l.wv.is_some() { 2 } else { 1 }
                 })
-                .map_err(|e| LoadError::Tensor("scratch.pf_e4q".into(), e.to_string()))?,
-            pf_e4s: exec
-                .alloc_u8(if f8_on || f8w_pf || f8a {
-                    pf_rows * n_ff.max(n_embd).max(max_q) / 32
-                } else {
-                    32
-                })
-                .map_err(|e| LoadError::Tensor("scratch.pf_e4s".into(), e.to_string()))?,
-            // f8t decode arms row-quant up to 64 rows too - the 1-float
-            // stub was a live OOB write surviving on allocation padding
-            pf_e4rs: alloc(
-                if f8row || f8t_dec || paddock_models::dev_var_os!("PADDOCK_G4_PC").is_some() {
-                    pf_rows
-                } else {
-                    1
-                },
-            )?,
-            // P54: ones xrs for the fin-e4s static-store route - filled once
-            // here, read-only forever after (pf_e4rs is per-tick volatile)
-            pf_fae4rs: {
-                let n = if f8row || f8t_dec { pf_rows } else { 1 };
-                let mut b = alloc(n)?;
-                exec.stream
-                    .memcpy_htod(&vec![1.0f32; n], &mut b)
-                    .map_err(|e| LoadError::Tensor("scratch.pf_fae4rs".into(), e.to_string()))?;
-                b
-            },
-            // fused-gu landing planes (not pf_e4q: the fused GEMM reads
-            // pf_e4q via TMA while storing - same-buffer would race)
-            pf_ffq: exec
-                .alloc_i8(if f8_on || f8a { pf_rows * n_ff } else { 32 })
-                .map_err(|e| LoadError::Tensor("scratch.pf_ffq".into(), e.to_string()))?,
-            pf_ffs: exec
-                .alloc_u8(if f8_on || f8a {
-                    pf_rows * n_ff / 32
-                } else {
-                    32
-                })
-                .map_err(|e| LoadError::Tensor("scratch.pf_ffs".into(), e.to_string()))?,
-            // hybrid-MoE lane (26B-A4B): PF_ROWS-sized like the pf planes;
-            // 1-elem stubs on dense models. The token-batched dp4a route is
-            // the bring-up class - the sorted/mma port is the perf follow-up.
-            moe_xn: alloc(if n_expert != 0 { pf_rows * n_embd } else { 1 })?,
-            moe_out: alloc(if n_expert != 0 { pf_rows * n_embd } else { 1 })?,
-            moe_logits: alloc(if n_expert != 0 { pf_rows * n_expert } else { 1 })?,
-            moe_idx: exec
-                .alloc_u32(if n_expert != 0 {
-                    pf_rows * n_expert_used
-                } else {
-                    1
-                })
-                .map_err(|e| LoadError::Tensor("scratch.moe_idx".into(), e.to_string()))?,
-            moe_w: alloc(if n_expert != 0 {
-                pf_rows * n_expert_used
-            } else {
-                1
-            })?,
-            moe_xq: exec
-                .alloc_i8(if n_expert != 0 { pf_rows * n_embd } else { 1 })
-                .map_err(|e| LoadError::Tensor("scratch.moe_xq".into(), e.to_string()))?,
-            moe_xs: alloc(if n_expert != 0 {
-                pf_rows * n_embd / 32
-            } else {
-                1
-            })?,
-            // flat-scale e4m3 expert lane  - same shape as
-            // moe_xq/moe_xs, different encoding. Allocated unconditionally
-            // (101 KB) so the arm is a pure env flip with no load-path fork.
-            moe_x8q: exec
-                .alloc_u8(if n_expert != 0 { pf_rows * n_embd } else { 1 })
-                .map_err(|e| LoadError::Tensor("scratch.moe_x8q".into(), e.to_string()))?,
-            moe_x8s: alloc(if n_expert != 0 {
-                pf_rows * n_embd / 32
-            } else {
-                1
-            })?,
-            moe_fused: alloc(if n_expert != 0 {
-                pf_rows * n_expert_used * ff_exp
-            } else {
-                1
-            })?,
-            // fq/fs serve both expert classes: token-batched rows (= pairs)
-            // and the sorted layout's PAD-padded rows (BM=64 superset)
-            moe_fq: exec
-                .alloc_i8(if n_expert != 0 { moe_srows * ff_exp } else { 1 })
-                .map_err(|e| LoadError::Tensor("scratch.moe_fq".into(), e.to_string()))?,
-            moe_fs: alloc(if n_expert != 0 {
-                moe_srows * ff_exp / 32
-            } else {
-                1
-            })?,
-            moe_zbias: alloc(n_expert.max(1))?, // alloc_zeros - stays zero
-            moe_srow: exec
-                .alloc_u32(moe_srows.max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_srow".into(), e.to_string()))?,
-            moe_sslot: exec
-                .alloc_u32(moe_srows.max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_sslot".into(), e.to_string()))?,
-            moe_bexp: exec
-                .alloc_u32(moe_blocks.max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_bexp".into(), e.to_string()))?,
-            moe_srow2: exec
-                .alloc_u32(if n_expert != 0 { mb32 * 32 } else { 1 })
-                .map_err(|e| LoadError::Gpu(GpuError::Driver(e.to_string())))?,
-            moe_sslot2: exec
-                .alloc_u32(if n_expert != 0 { mb32 * 32 } else { 1 })
-                .map_err(|e| LoadError::Gpu(GpuError::Driver(e.to_string())))?,
-            moe_bexp2: exec
-                .alloc_u32(if n_expert != 0 { mb32 } else { 1 })
-                .map_err(|e| LoadError::Gpu(GpuError::Driver(e.to_string())))?,
-            moe_pairmap: alloc(if n_expert != 0 {
-                pf_rows * n_expert_used
-            } else {
-                1
-            })?,
-            moe_part: alloc(if n_expert != 0 {
-                pf_rows * n_expert_used * n_embd
-            } else {
-                1
-            })?,
-            moe_e4q: exec
-                .alloc_i8(if n_expert != 0 { pf_rows * n_embd } else { 1 })
-                .map_err(|e| LoadError::Tensor("scratch.moe_e4q".into(), e.to_string()))?,
-            moe_e4s: exec
-                .alloc_u8(if n_expert != 0 {
-                    pf_rows * n_embd / 32
-                } else {
-                    1
-                })
-                .map_err(|e| LoadError::Tensor("scratch.moe_e4s".into(), e.to_string()))?,
-            moe_xg: exec
-                .alloc_u8((moe_f8_rows * n_embd).max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_xg".into(), e.to_string()))?,
-            moe_sg: exec
-                .alloc_u8((moe_f8_rows * n_embd / 32).max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_sg".into(), e.to_string()))?,
-            moe_gu: alloc((moe_f8_rows * 2 * ff_exp).max(1))?,
-            // alloc_zeros: the K-tail [ff_exp, ff_pad) is a STANDING zero
-            // region (only geglu2_pad writes here, and only [0, ff_exp))
-            moe_fq8: exec
-                .alloc_u8((moe_f8_rows * ff_pad).max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_fq8".into(), e.to_string()))?,
-            moe_fs8: exec
-                .alloc_u8((moe_f8_rows * ff_pad / 32).max(1))
-                .map_err(|e| LoadError::Tensor("scratch.moe_fs8".into(), e.to_string()))?,
-            //  diagnostic (PADDOCK_MOE_UNIQ, MoE models only): raw
-            // non-pool accumulator + detached dumper thread - see the
-            // Scratch field comment for the two measured constraints
+                .max()
+                .unwrap_or(n_head * hd_global),
+            gated: layers.iter().any(|l| l.attn_gate.is_some()),
+            n_expert,
+            n_expert_used,
+            ff_exp,
+            f8_on,
+            f8row,
+            f8w_pf,
+            f8a,
+            f8t_dec,
+            // uniq-routing diagnostic (PADDOCK_MOE_UNIQ, MoE models only): raw
+            // non-pool accumulator + detached dumper thread - see the Scratch
+            // field comment for the two measured constraints. Armed once here
+            // rather than inside the builder: the buffer is leaked by design
+            // (process lifetime), so arming it per build would leak one per
+            // rung of enable_batch's chunk ladder.
             moe_uniq_dev: if n_expert != 0
                 && paddock_models::dev_var_os!("PADDOCK_MOE_UNIQ").is_some()
             {
@@ -2859,6 +2599,7 @@ impl GpuGemma4 {
                 0
             },
         };
+        let scratch = super::scratch::build(&exec, &scratch_dims, pf_rows)?;
 
         vram_mark(
             &format!("serial scratch ({pf_rows} pf rows)"),
@@ -2913,6 +2654,7 @@ impl GpuGemma4 {
                 crate::kv_tier::fingerprint::tokenizer(map),
             ),
             scratch,
+            scratch_dims,
             max_ctx,
             pf_rows,
             swa_span,

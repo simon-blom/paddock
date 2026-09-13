@@ -118,7 +118,7 @@ def sec_chat_basic(client, model):
 
 def sec_reasoning_effort(client, model, dialect):
     """`reasoning_effort` is the spec's own control over reasoning, and it has
-    to reach every model that HAS a reasoning mode - not just gpt-oss.
+    to reach every model that has a reasoning mode - not just gpt-oss.
 
     On a graded model (gpt-oss) the level passes through. On a toggle model
     (qwen3.5/3.6, gemma4, laguna) `none` means off and any other level means
@@ -687,7 +687,7 @@ def sec_prefix_cache(client, model, dialect):
     prefix cache serves - surfaced as usage.prompt_tokens_details.cached_tokens
     (the SDK types this field).
 
-    The system prompt is padded on purpose. Reuse is PAGE-granular and needs a
+    The system prompt is padded deliberately. Reuse is PAGE-granular and needs a
     resumable checkpoint under the shared prefix, so a short history has
     nothing to hand back - measured on qwen3.5-9B: a 41-token turn 2
     reuses 0, 65 reuses 32, 113 reuses 80, 282 reuses 256. The old fixture
@@ -874,7 +874,7 @@ def sec_mcp(client, model, mcp_url):
 
 
 def sec_context_management(client, model):
-"""Responses context management (openai 2.53.0 pins):
+    """Responses context management (openai 2.53.0 pins):
     `context_management: [{"type": "compaction", ...}]` compacts past the
     threshold and leads output with a typed compaction item (the plaintext
     summary rides `encrypted_content` - the SDK's one required field);

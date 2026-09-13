@@ -1708,7 +1708,7 @@ int pd_nvf4_gemm_tc(const void* data, const void* scale, const void* bias,
 // The loader repacks a plane to [row_tile 128][k_stage KT=128][row] with
 // weights (64 B/row/stage) and e4m3 scale records (8 B/row/stage) each
 // contiguous per (tile, stage) block, out_dim padded to 128 rows and
-// ZERO-filled (a pad row decodes 0 * scale-byte-0 = 0, and every consumer
+// zero-filled (a pad row decodes 0 * scale-byte-0 = 0, and every consumer
 // guards its stores at out_dim). That turns the tcp stage's 128 x 64 B
 // strided pulls into one sequential 10.25 KB block per (tile, stage) -
 // probe: tcpC 225 -> tcpR 205 us b32 / 180 us b8, +9-12%. These entries are

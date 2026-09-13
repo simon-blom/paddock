@@ -73,7 +73,7 @@
 //!     latency" comes from. It does not change the transcript at all: the pass
 //!     re-runs the tokens already decoded, under the canonical alignment
 //!     prompt.
-//!   * `word`, granite-speech-PLUS - the model is ASKED for the times and
+//!   * `word`, granite-speech-plus - the model is ASKED for the times and
 //!     writes them into its answer as `[T:N]` tags, which the runner parses back
 //!     out. So here the granularity does change the transcript, and visibly: a
 //!     different instruction is a different task on this family, and IBM's card
@@ -99,7 +99,7 @@
 const GRANITE_SPEECH_PROMPT: &str =
     "transcribe the speech with proper punctuation and capitalization.";
 
-/// granite-speech-PLUS's word-timestamp instruction, verbatim from IBM's model
+/// granite-speech-plus's word-timestamp instruction, verbatim from IBM's model
 /// card (`TS_PROMPT`) minus the `<|audio|>` marker our envelope supplies
 /// separately. Sent instead of the default when `word` granularity is asked
 /// for - on this family the instruction is the task selector, so this is not
@@ -3625,7 +3625,7 @@ mod tests {
         assert!(is_no_speech_marker("  <|nospeech|> "));
     }
 
-    /// The safety, and the reason the rule is WHOLE-text rather than
+    /// The safety, and the reason the rule is whole-text rather than
     /// substring: a transcript that merely mentions the marker is a
     /// transcript.
     #[test]

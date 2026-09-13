@@ -624,7 +624,7 @@ impl GpuExecutor {
         self.kernels.moe_head_router_hb.is_some()
     }
 
-    /// P1-2: head twin with PER-128 activation-scale quantize (lane).
+    /// P1-2: head twin with per-128 activation-scale quantize (lane).
     #[allow(clippy::too_many_arguments)]
     pub fn moe_head_xg(
         &self,

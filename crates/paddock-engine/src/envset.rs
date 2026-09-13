@@ -3,7 +3,7 @@
 //! The pack's launchers read election/kill envs with C `getenv`. On Windows,
 //! Rust's `std::env::set_var` writes the Win32 environment only - the UCRT
 //! keeps its own copy, snapshotted at process start, and the pack DLL's
-//! `getenv` reads THAT. So every default the engine elected at model load was
+//! `getenv` reads that. So every default the engine elected at model load was
 //! invisible to the pack on Windows: env-gated arms silently ran their
 //! fallbacks, and the first launcher that REFUSES instead of falling back
 //! (the DNC varlen rs route, engine gate true / pack gate false) surfaced it

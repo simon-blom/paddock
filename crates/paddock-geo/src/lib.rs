@@ -1,6 +1,6 @@
 //! Offline place lookup: two decimal degrees in, a name a person recognises out.
 //!
-//! WHY. A photo's EXIF carries coordinates and nothing else, and a model handed
+//! Why. A photo's EXIF carries coordinates and nothing else, and a model handed
 //! bare numbers does geography from memory. Measured on a real turn:
 //! Qwen3.5-9B read `43.467448, 11.885127` as "the Piedmont region of northern
 //! Italy" - it is Tuscany, 250 km away, and the nearest city is Arezzo at
@@ -22,7 +22,7 @@
 //! The tiers agree wherever a photo sits near a large town; rural points are
 //! where they part, and 77% of that sample got a different name.
 //!
-//! What it does not DO. This is nearest-populated-place, not point-in-polygon,
+//! What it does not do. This is nearest-populated-place, not point-in-polygon,
 //! so the REGION is the region of the city we matched, not a boundary test on
 //! the point itself. Near a border those differ. The phrasing everywhere
 //! therefore attributes the region to the city ("in Arezzo (Tuscany, Italy)")
