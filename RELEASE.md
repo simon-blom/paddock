@@ -1,42 +1,37 @@
-# Paddock 0.1.6
+# Paddock 0.1.7
 
-A feature release. Windows x64, Linux x64 and, new in this release, the NVIDIA
-DGX Spark. NVIDIA GPUs, driver 580 or newer.
+A feature release, mostly about Qwen 3.8 Flash-Next. Windows x64, Linux x64 and
+the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer.
 
 ## New
 
-- **The DGX Spark is supported.** The GB10 in NVIDIA's DGX Spark joins the
-  supported GPUs, with its own Linux build for the Spark (DGX OS 7 / Ubuntu
-  24.04 or newer). Its kernels were tuned on the Spark and the model catalog
-  was tested on it.
+- **Qwen 3.8 Flash-Next drafts its own tokens.** The model's companion drafter
+  is downloaded with it and proposes the next tokens, which the model then
+  verifies, so answers arrive faster with the same text. Measured on a DGX
+  Spark: 26-28 tokens a second without it, 35-40 with it. Speculation stays a
+  per-endpoint setting, off unless you turn it on.
 
-- **Gemma 4 reads small print.** A new endpoint setting, `max_image_tokens`,
-  sets how much detail an image carries. Gemma 4's default is too coarse for
-  fine print on a full page; raising it reads the figures correctly. More
-  detail costs prompt tokens and time per image, so the default is unchanged.
-
-- **Conversations resume from the last reply.** Qwen 3.5, 3.6 and 3.8,
-  Nemotron 3.5 Lightning and Qwen 3.8 Flash-Next pick the next turn up from the
-  end of the previous reply instead of reading the conversation again, and
-  many conversations running at once each keep their place.
-
-- **Qwen 3.8 Flash-Next caches repeated prompts.**
+- **Qwen 3.8 Flash-Next has a compact 4-bit build.** The catalog now offers the
+  UD-Q4_K_XL export beside the smaller default, for machines with the memory
+  to spare. It is not the default: it is 85 GB of weights.
 
 ## Improved
 
-- **Gemma 4 keeps to its memory budget.** With a tight `vram_budget` it now
-  makes room for the conversation instead of going past the budget.
+- **Qwen 3.8 Flash-Next reads prompts about twice as fast.** A 1024-token
+  prompt went from roughly 750 to 1450 tokens a second on a DGX Spark, from
+  the expert, attention and hyper-connection work now running on the tensor
+  cores and from fewer passes over the same data.
 
-- **Nemotron 3.5 Lightning and 4-bit NVFP4 models are faster on the DGX
-  Spark**, both reading prompts and generating text.
+- **A model keeps its full context after a restart on unified-memory machines.**
+  On a DGX Spark the memory a stopped model left behind was not counted as
+  free, so each restart planned a smaller conversation cache than the one
+  before. It is now measured and counted.
 
-- **The Studio opens quickly** even with a very large chat history, and a
-  stopped model keeps its logo and name.
-
-## Fixed
-
-- Opening a Studio chat before it had finished loading could save an empty
-  copy over its history.
+- **A stopped model no longer looks like it is still running.** Stopping a
+  model left a file behind that made its port read as occupied: the Studio
+  stopped showing the model and starting it again was refused. The file now
+  goes with the model, a leftover one is ignored, and a refusal says what is
+  holding the port.
 
 ## Known
 

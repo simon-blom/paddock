@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-admin"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "ciborium",
@@ -2822,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-api"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-bench"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clap",
  "libc",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-engine"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "blake3",
  "cudarc",
@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-estimator"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "paddock-models",
  "serde",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-filemeta"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "paddock-geo",
  "scriptor-crdt",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-forensics"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "cudarc",
  "image",
@@ -2908,14 +2908,14 @@ dependencies = [
 
 [[package]]
 name = "paddock-geo"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "zstd",
 ]
 
 [[package]]
 name = "paddock-heif"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "avif-parse",
  "rav1d",
@@ -2924,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-kernels"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "half",
  "libloading 0.9.0",
@@ -2933,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-manager"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-stream",
  "axum",
@@ -2977,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-mcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-models"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "memmap2",
  "serde",
@@ -3005,11 +3005,11 @@ dependencies = [
 
 [[package]]
 name = "paddock-pdfium"
-version = "0.1.6"
+version = "0.1.7"
 
 [[package]]
 name = "paddock-runner"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-stream",
  "axum",
@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-tls"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "axum",
  "hyper",
@@ -3081,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-tokenizer"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "paddock-models",
  "serde_json",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-websearch"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "reqwest",
  "serde_json",
