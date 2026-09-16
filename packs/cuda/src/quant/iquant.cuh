@@ -51,6 +51,18 @@
 // a 24-byte record, no codebook
 #define PD_KQ_Q2K_ID 10u
 #define PD_KQ_Q3K_ID 11u
+// Two 32-weight BLOCK formats that UD-Q4_K_XL exports put on routed expert
+// planes (Qwen3.8-Flash-Next: Q5_1 down on 43 layers, Q8_0 down on 5). Their
+// rows are laid flat like IQ4_NL - an expert down row of 640 weights is 2.5
+// super-blocks - so both streams are per-BLOCK contiguous:
+//   Q5_1 {f16 d, f16 m, u32 qh, u8 qs[16]} (24 B): data = qs (16 B / block),
+//        record = d | m | qh (8 B / block). weight = d*q + m, q = nib | hbit<<4,
+//        served as f*(q-16) + g with f = d, g = m + 16*d (the mu term).
+//   Q8_0 {f16 d, s8 qs[32]} (34 B): data = qs (32 B / block), record = d.
+// Exact repacks (every weight byte and scale kept), same resident bytes as
+// the file.
+#define PD_KQ_Q51_ID 7u
+#define PD_KQ_Q80_ID 8u
 
 #define PD_IQ1S_DELTA 0.125f
 
@@ -58,7 +70,14 @@ __host__ __device__ constexpr bool pd_kq_valid_iq(uint32_t dt) {
     return dt == PD_KQ_IQ2XXS || dt == PD_KQ_IQ2XS || dt == PD_KQ_IQ2S ||
            dt == PD_KQ_IQ3XXS || dt == PD_KQ_IQ3S || dt == PD_KQ_IQ1S ||
            dt == PD_KQ_IQ1M || dt == PD_KQ_IQ4NL_ID ||
-           dt == PD_KQ_Q2K_ID || dt == PD_KQ_Q3K_ID;
+           dt == PD_KQ_Q2K_ID || dt == PD_KQ_Q3K_ID ||
+           dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID;
+}
+
+// 32-weight block formats whose rows lie flat (no whole-super-block rule):
+// row r of in_dim weights starts at r * (in_dim/32) blocks in both streams.
+__host__ __device__ constexpr bool pd_kq_flat32(uint32_t dt) {
+    return dt == PD_KQ_IQ4NL_ID || dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID;
 }
 
 // raw (GGUF) bytes per 256-weight super-block
@@ -73,6 +92,8 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_srcb(uint32_t dt) {
         case PD_KQ_IQ1M: return 56u;
         case PD_KQ_Q2K_ID: return 84u;   // scales[16] qs[64] d dmin
         case PD_KQ_Q3K_ID: return 110u;  // hmask[32] qs[64] scales[12] d
+        case PD_KQ_Q51_ID: return 192u;  // 8 x 24
+        case PD_KQ_Q80_ID: return 272u;  // 8 x 34
         default: return 144u;  // IQ4_NL: 8 x 18
     }
 }
@@ -93,6 +114,8 @@ __host__ __device__ constexpr uint32_t pd_iq_scb(uint32_t dt) {
         case PD_KQ_IQ1M: return 12u;    // d (folded) + scales[8]
         case PD_KQ_Q2K_ID: return 24u;  // d, dmin + scales[16] (4|4-bit sc|m per 16)
         case PD_KQ_Q3K_ID: return 24u;  // d + 16 unpacked int8 scales (6-bit, -32 applied)
+        case PD_KQ_Q51_ID: return 64u;  // 8 x {f16 d, f16 m, u32 qh}
+        case PD_KQ_Q80_ID: return 16u;  // 8 x f16 d
         default: return 16u;            // IQ4_NL: 8 x f16 d
     }
 }
@@ -109,6 +132,8 @@ __host__ __device__ constexpr uint32_t pd_iq_datab(uint32_t dt) {
         case PD_KQ_IQ1M: return 48u;
         case PD_KQ_Q2K_ID: return 64u;   // qs
         case PD_KQ_Q3K_ID: return 96u;   // qs[64] + hmask[32]
+        case PD_KQ_Q51_ID: return 128u;  // 8 x qs[16]
+        case PD_KQ_Q80_ID: return 256u;  // 8 x qs[32]
         default: return 128u;
     }
 }
@@ -242,6 +267,21 @@ __device__ __forceinline__ void pd_iq_repack_super(uint32_t dt, const uint8_t* _
             for (uint32_t i = 0; i < 16u; ++i) rec[2u + i] = (uint8_t)scs[i];
             break;
         }
+        case PD_KQ_Q51_ID:
+            for (uint32_t j = 0; j < 8u; ++j) {
+                const uint32_t o = j * 24u;
+                for (uint32_t i = 0; i < 8u; ++i) rec[8u * j + i] = s[o + i];     // d | m | qh
+                for (uint32_t i = 0; i < 16u; ++i) d[16u * j + i] = s[o + 8u + i]; // qs
+            }
+            break;
+        case PD_KQ_Q80_ID:
+            for (uint32_t j = 0; j < 8u; ++j) {
+                const uint32_t o = j * 34u;
+                rec[2u * j] = s[o];
+                rec[2u * j + 1u] = s[o + 1u];
+                for (uint32_t i = 0; i < 32u; ++i) d[32u * j + i] = s[o + 2u + i];
+            }
+            break;
         default:  // IQ4_NL: 8 blocks of {f16 d, 16 qs}
             for (uint32_t j = 0; j < 8u; ++j) {
                 rec[2u * j] = s[j * 18u];
@@ -506,6 +546,36 @@ __device__ __forceinline__ void pd_iq_win_unpack_t(uint32_t dt, const uint8_t* _
             }
             break;
         }
+        case PD_KQ_Q51_ID: {
+            // block ib's lo (w even: weights 0-15) / hi (w odd: 16-31) half;
+            // the fifth bit of weight k is bit k of the block's qh
+            const uint8_t* br = rec + 8u * ib;
+            const float dd = pd_iq_f16a(br);
+            *f = dd;
+            *g = pd_iq_f16a(br + 2u) + 16.0f * dd;
+            const bool hi = (w & 1u) != 0u;
+            const uint32_t hb = hi ? (pd_iq_u32a(br + 4u) >> 16u) : pd_iq_u32a(br + 4u);
+            const uint4 qa = pd_iq_ld16((sb + ib * 16u));
+            const uint32_t qw[4] = {qa.x, qa.y, qa.z, qa.w};
+            #pragma unroll
+            for (uint32_t v = 0; v < 4u; ++v) {
+                const uint32_t nib = (hi ? qw[v] >> 4u : qw[v]) & 0x0F0F0F0Fu;
+                int out = 0;
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const int q = (int)(((nib >> (8u * j)) & 0xFu) | (((hb >> (4u * v + j)) & 1u) << 4u));
+                    out |= ((q - 16) & 0xFF) << (8u * j);
+                }
+                wq[v] = out;
+            }
+            break;
+        }
+        case PD_KQ_Q80_ID: {
+            *f = pd_iq_f16a(rec + 2u * ib);
+            const uint4 qa = pd_iq_ld16((sb + ib * 32u + (w & 1u) * 16u));
+            wq[0] = (int)qa.x; wq[1] = (int)qa.y; wq[2] = (int)qa.z; wq[3] = (int)qa.w;
+            break;
+        }
         default: {  // IQ4_NL: block ib's lo (w even) / hi (w odd) nibbles
             *f = pd_iq_f16a(rec + 2u * ib);
             const uint4 qa = pd_iq_ld16((sb + ib * 16u));
@@ -540,8 +610,8 @@ __device__ __forceinline__ void pd_iq_win_unpack(uint32_t dt, const uint8_t* __r
 // dp4a lanes multiply - one decoder to test, one to trust.
 __device__ __forceinline__ void pd_iq_dequant_super(uint32_t dt, const uint8_t* __restrict__ s,
                                                     float* __restrict__ y) {
-    __align__(16) uint8_t payload[128];  // pd_iq_datab max (IQ4_NL)
-    __align__(16) uint8_t rec[24];       // pd_iq_scb max (Q2_K / Q3_K)
+    __align__(16) uint8_t payload[256];  // pd_iq_datab max (Q8_0)
+    __align__(16) uint8_t rec[64];       // pd_iq_scb max (Q5_1)
     pd_iq_repack_super(dt, s, payload, rec);
     #pragma unroll 1
     for (uint32_t w = 0; w < 16u; ++w) {

@@ -588,6 +588,18 @@ extern "C" int pd_convert_bf16_f32(const void*, void*, uint64_t, void*);
 extern "C" int pd_convert_bf16_f32_rows(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_swiglu_mir(void*, const void*, void*, uint32_t, void*);
 extern "C" int pd_bf16_pad_rows(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q8_0_gemv_repacked_rows(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_flat32(void);
+extern "C" int pd_moe_q8_rows_unsort(const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_combine_norm_q8mmq(void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_kquant_moe_down_mma_e(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_gated_delta_recurrent_seg(const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*, void*);
+extern "C" int pd_q8_0_gemm_mmq_pipe_hcmix(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_combine_norm_q8mmq_ns(void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_q4x_hc_inject_rn(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q8_0_gemm_mmq_pipe_hcmix_rn(const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_combine_norm_q8mmq_nsi(void*, const void*, const void*, const void*, void*, void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_gated_delta_recurrent_runs_slots(const void*, const void*, const void*, const void*, const void*, void*, void*, const void*, const void*, const void*, const void*, const void*, float, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_bf16_hc_perm_pad(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_moe_gu_swiglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_combine_norm(void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, float, void*, void*);
@@ -1525,6 +1537,31 @@ static const KernelTableV1 PD_KERNELS = {
     // 597: nvf4_gemm_f4tn - the f4t tile at decode width (block-scale SASS
     // like 430; NULLed with it). Small-die decode election, see fp4.rs.
     pd_nvf4_gemm_f4tn,
+    // 598/599: row-exact verify twins (plain CUDA, no NULL rule): the
+    // batch-1 Q8_0 GEMV with a token axis, and slot 564's decode GDN body
+    // walked over a run's rows
+    pd_q8_0_gemv_repacked_rows,
+    pd_gated_delta_recurrent_runs_slots,
+    // 600: flat 32-weight block formats (Q5_1, Q8_0) on the i-quant lanes -
+    // capability marker, plain CUDA
+    pd_kquant_flat32,
+    // 601: sorted -> pair-major int8 activation rows (the fused mma gate/up
+    // tail feeding the grouped down), plain CUDA
+    pd_moe_q8_rows_unsort,
+    // 602: combine_norm + the next hc down's mmq activations, plain CUDA
+    pd_q4x_combine_norm_q8mmq,
+    // 603: expert-major tensor-core routed down over the sorted rows
+    pd_kquant_moe_down_mma_e,
+    // 604: segment-tiled single-sequence GDN walk (head_dim 128)
+    pd_gated_delta_recurrent_seg,
+    // 605: Q8_0 pipe tile with the hyper-connection mix in its epilogue
+    pd_q8_0_gemm_mmq_pipe_hcmix,
+    // 606-608: the combine without a stored normalized state, and its rebuild consumers
+    pd_q4x_combine_norm_q8mmq_ns,
+    pd_q4x_hc_inject_rn,
+    pd_q8_0_gemm_mmq_pipe_hcmix_rn,
+    // 609: slot 606 with the next mix's inject folded into its norm pass
+    pd_q4x_combine_norm_q8mmq_nsi,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

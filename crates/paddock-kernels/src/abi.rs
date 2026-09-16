@@ -6273,6 +6273,253 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
+    /// Slot 598: `pd_q8_0_gemv_repacked_rows` - the batch-1 Q8_0 GEMV
+    /// (`q8_0_gemv_repacked`) with a token axis, grid (out_dim, batch); each
+    /// (row, token) block is the batch-1 block verbatim, so every token's
+    /// output is the batch-1 call's bit for bit at one launch (row-exact spec
+    /// verify). (data, scale, bias|NULL, x [batch, in], y [batch, out],
+    /// in_dim, out_dim, batch, stream).
+    pub q8_0_gemv_repacked_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 599: `pd_gated_delta_recurrent_runs_slots` - slot 564's decode GDN
+    /// body (per-token state load/store, fused gated norm) walked over each
+    /// run's rows, grid (n_heads, n_runs): every row lands where the decode
+    /// tick lands on that token. `gn_w` NULL writes the plain recurrence output
+    /// (the rollback replay's form). -1 = declined (non-f32 state, runtime-D
+    /// geometry, generic pin, slot 564's kill switch) - keep the per-row calls.
+    /// (q, k, v, g, beta, states, out, run_off, run_len, run_slot, gn_z|NULL,
+    /// gn_w|NULL, gn_eps, n_runs, n_heads, head_dim, stream).
+    pub gated_delta_recurrent_runs_slots: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            f32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 600: capability marker - the i-quant lanes (repack, dequant, the
+    /// MoE pair/cols/grouped/tile/list kernels, dense) serve Q5_1 (GGUF raw id
+    /// 7) and Q8_0 (id 8) as flat 32-weight blocks, the routed expert types
+    /// UD-Q4_K_XL exports mix in. The dtypes ride existing entry points, so
+    /// their slot presence cannot answer; this one can.
+    pub kquant_flat32: Option<unsafe extern "C" fn() -> i32>,
+    /// Slot 601: `pd_moe_q8_rows_unsort` - moe_align SORTED int8 activation
+    /// rows (`[max_blocks][32][ff]` + per-32 scales, what the tensor-core
+    /// gate/up's fused quantize writes) to the PAIR-major layout
+    /// (`token * n_active + slot`) the expert-grouped down reads; PAD blocks
+    /// (`block_expert`) and PAD rows skipped. (sq, ss, sorted_row,
+    /// sorted_slot, block_expert, fq, fs, ff, n_active, max_blocks, stream).
+    pub moe_q8_rows_unsort: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 602: `pd_q4x_combine_norm_q8mmq` - `q4x_combine_norm` that also
+    /// emits the next hyper-connection down's mmq activations
+    /// (`pd_quantize_q8_mmq`'s layout and math, laid in `group_rows`-row
+    /// groups) from its norm pass. (h, block_out, inj, norm_w, xn, xn16|NULL,
+    /// yq, rows, hc, hidden, eps, group_rows, stream).
+    pub q4x_combine_norm_q8mmq: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 603: `pd_kquant_moe_down_mma_e` - the routed down on the tensor
+    /// cores, expert-major, straight off the tensor-core gate/up's moe_align
+    /// SORTED rows (bm = 32, no unsort); flat 32-weight downs. Writes the tiled
+    /// down's per-(pair, column) partials for chunk [o0, o0 + ocols); emap is
+    /// u32 [2 * n_expert] scratch. (down_data, down_scales, sorted_row,
+    /// sorted_slot, block_expert, topk_w, sfq, sfs, emap, part, ff, embd, o0,
+    /// ocols, n_active, n_expert, max_blocks, dtype, stream).
+    pub kquant_moe_down_mma_e: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 604: `pd_gated_delta_recurrent_seg` - slot 596's single-sequence
+    /// walk segment-tiled for head_dim 128 (8-lane segments of 2 state
+    /// columns, 32 state floats a lane, 4 blocks an SM) behind a pre-pass of
+    /// {exp(g), beta, q norm, k norm} a (token, head); `gp` is caller scratch
+    /// of n_tokens * n_heads * 4 f32. (q, k, v, g, beta, state, out, n_tokens,
+    /// n_heads, head_dim, gp, stream).
+    pub gated_delta_recurrent_seg: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 605: `pd_q8_0_gemm_mmq_pipe_hcmix` - the Q8_0 pipe tile over a
+    /// [in -> 4 * hidden] hyper-connection up plane with the gated mix folded
+    /// into its epilogue: out[rows][hidden] = (1/4) sum_s sigmoid(gate[s,d]) *
+    /// xn[s,d], byte-identical to pipe + q4x_hc_mix. (data, scale, yq, xn, out,
+    /// in_dim, hidden, batch, stream).
+    pub q8_0_gemm_mmq_pipe_hcmix: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 606: `pd_q4x_combine_norm_q8mmq_ns` - slot 602 without the stored
+    /// normalized state: h, the next hc down's mmq rows and the per-(row,
+    /// stream) 1/rms ([rows][hc]). (h, block_out, inj, norm_w, nscale, yq,
+    /// rows, hc, hidden, eps, group_rows, stream).
+    pub q4x_combine_norm_q8mmq_ns: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 607: `pd_q4x_hc_inject_rn` - the hc inject matvec over the
+    /// normalized state rebuilt from h and aux = [norm_w | 1/rms],
+    /// byte-identical to matvec_f32_batch over the stored state. (w, h, aux,
+    /// out, hidden, hc, out_dim, batch, stream).
+    pub q4x_hc_inject_rn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 608: `pd_q8_0_gemm_mmq_pipe_hcmix_rn` - slot 605 over the
+    /// normalized state rebuilt from h and aux = [norm_w | 1/rms],
+    /// byte-identical to slot 605 over the stored state. (data, scale, yq, h,
+    /// aux, out, in_dim, hidden, batch, stream).
+    pub q8_0_gemm_mmq_pipe_hcmix_rn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 609: `pd_q4x_combine_norm_q8mmq_nsi` - slot 606 that also folds
+    /// the NEXT mix's inject ([4][hc * hidden] f32) from its norm pass:
+    /// (row, stream) partials into ip [rows][hc][hc], summed over streams into
+    /// inj_out [rows][hc] (inj may alias inj_out). hc 4; a class change
+    /// against the matvec. (h, block_out, inj, norm_w, nscale, yq, w_inj, ip,
+    /// inj_out, rows, hc, hidden, eps, group_rows, stream).
+    pub q4x_combine_norm_q8mmq_nsi: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
 }
 
 /// Pre-normed single-sequence GDN walk (see `KernelTableV1::gated_delta_recurrent_pn`).
@@ -6890,7 +7137,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 583;
+pub const KERNEL_TABLE_SLOTS: usize = 595;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

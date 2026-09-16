@@ -45,6 +45,7 @@ mod qwen4exp;
 mod sampling;
 mod tier_xfer;
 mod transfer;
+mod unified_mem;
 mod upload;
 
 pub use error::GpuError;
@@ -149,6 +150,10 @@ pub struct GpuExecutor {
     /// batch-free antipattern one level down.
     conv_scratch:
         std::sync::Mutex<Option<(cudarc::driver::CudaSlice<u8>, cudarc::driver::CudaSlice<u8>)>>,
+    /// Unified-memory dies only: the driver-retained pool this process
+    /// measured as reusable, and our pool usage when it did (`unified_mem`).
+    /// Shared with forked lanes - one process, one mempool, one measurement.
+    retained: std::sync::Arc<std::sync::Mutex<Option<unified_mem::RetainedCredit>>>,
 }
 impl GpuExecutor {
     /// See the `dense_iq_seen` field.
@@ -320,6 +325,7 @@ impl GpuExecutor {
             vram_budget: std::sync::atomic::AtomicU64::new(0),
             staging: std::sync::Mutex::new(None),
             conv_scratch: std::sync::Mutex::new(None),
+            retained: Default::default(),
         };
         exec.preflight()?;
         Ok(exec)
@@ -490,8 +496,9 @@ impl GpuExecutor {
     /// Still pessimistic right after a large CUDA process exits: the pooled
     /// pages sit in no /proc/meminfo category, so MemAvailable does not see
     /// them until the kernel's shrinker runs (memory pressure, or
-    /// drop_caches=2). The gate's refusal says so; nothing here tries to be
-    /// clever about it.
+    /// drop_caches=2). This stays the plain OS reading on purpose - the load
+    /// gate proves its own case with a trial allocation, and `vram_headroom`
+    /// adds the measured pool (`unified_mem`), which is where the sizers read.
     pub fn device_mem_info(&self) -> Option<(u64, u64)> {
         let (free, total) = cudarc::driver::result::mem_get_info().ok()?;
         let (free, total) = (free as u64, total as u64);
@@ -499,7 +506,7 @@ impl GpuExecutor {
             return Some((free, total));
         }
         static SAID: std::sync::Once = std::sync::Once::new();
-        match unified_available_memory() {
+        match unified_mem::MemInfo::read().map(|m| (m.usable(), m.total)) {
             Some((avail, mem_total)) => {
                 let total = total.min(mem_total);
                 SAID.call_once(|| {
@@ -592,6 +599,16 @@ impl GpuExecutor {
             ),
         };
         let allowance = budget.saturating_sub(self.process_mem_used().unwrap_or(0));
+        // A unified-memory die's MemAvailable leaves out the pages the driver
+        // kept from the last CUDA process to exit - 76 GiB of grant on a
+        // Spark's first start became 37 GiB after one restart. Count the part
+        // of that pool this process has proven it can reuse, and only when the
+        // OS figure is what would bind.
+        let free = if self.integrated && free < allowance {
+            free.saturating_add(self.retained_headroom(allowance))
+        } else {
+            free
+        };
         // Say it once when the derived default is what binds - a pool quietly
         // smaller than the card is exactly the kind of thing the no-silent-
         // failures rule exists for, and the number is otherwise invisible.
@@ -864,6 +881,7 @@ impl GpuExecutor {
             // the forked lane does its own staging; nothing is shared
             staging: std::sync::Mutex::new(None),
             conv_scratch: std::sync::Mutex::new(None),
+            retained: self.retained.clone(),
         })
     }
 
@@ -908,46 +926,4 @@ impl GpuExecutor {
             }
         })
     }
-}
-
-/// `(MemAvailable, MemTotal)` in bytes for an integrated die, from
-/// /proc/meminfo - the reading NVIDIA publishes for the DGX Spark and the one
-/// llama.cpp, vLLM and SGLang all take. A box with hugetlb pages configured
-/// reports `HugePages_Free x Hugepagesize` instead, because that is the only
-/// memory CUDA can then use (same rule as NVIDIA's snippet). `None` where
-/// there is no /proc/meminfo, and on any other OS: no integrated NVIDIA die
-/// exists outside Linux today, and the caller keeps the driver's figure.
-fn unified_available_memory() -> Option<(u64, u64)> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = None;
-    let mut avail = None;
-    let mut huge_total = 0u64;
-    let mut huge_free = 0u64;
-    let mut huge_size = 0u64;
-    for line in text.lines() {
-        let Some((key, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let kb: u64 = rest
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        match key {
-            "MemTotal" => total = Some(kb * 1024),
-            "MemAvailable" => avail = Some(kb * 1024),
-            "HugePages_Total" => huge_total = kb, // a count, not kB
-            "HugePages_Free" => huge_free = kb,
-            "Hugepagesize" => huge_size = kb * 1024,
-            _ => {}
-        }
-    }
-    let (total, mut avail) = (total?, avail?);
-    if huge_total > 0 && huge_size > 0 {
-        avail = huge_free * huge_size;
-    }
-    Some((avail, total))
 }

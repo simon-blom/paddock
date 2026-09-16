@@ -136,15 +136,44 @@ pub fn socket_path(port: u16) -> PathBuf {
     runtime_dir().join(format!("runner-{port}.sock"))
 }
 
-/// Enumerate ports with a present admin endpoint on this host - the manager's
-/// startup reconciliation input. Presence ≠ liveness: a Unix socket can
-/// be stale (its runner died); `identify` is the liveness check. Windows pipes
-/// disappear with their process, so presence there is close to liveness.
+/// Where this port's admin endpoint lives, spelled for a person.
+///
+/// For refusals: "something is using this port" is only actionable if the
+/// operator can find the something. A DGX Spark user lost an evening to a
+/// leftover socket precisely because every message about it was silent on
+/// where it was.
+#[cfg(unix)]
+pub fn endpoint_display(port: u16) -> String {
+    socket_path(port).display().to_string()
+}
+
+/// Where this port's admin endpoint lives, spelled for a person. Windows pipes
+/// vanish with their process, so this is for symmetry of message, not rescue.
+#[cfg(windows)]
+pub fn endpoint_display(port: u16) -> String {
+    pipe_name(port)
+}
+
+/// Enumerate ports with an admin endpoint on this host - the manager's
+/// reconciliation input, and what it asks before calling a port taken.
+///
+/// Windows pipes disappear with their process, so presence there is close to
+/// liveness. A Unix socket file does not: it stays after its runner dies, and
+/// counting those files made a stopped endpoint look like it was still
+/// serving - the manager then refused to start it again. So on Unix a file
+/// only counts when something is listening on it (`has_listener`). That is
+/// still not a health check: a hung runner keeps its listener, and
+/// `identify` remains the liveness question for anything that needs one.
 pub fn enumerate() -> Vec<u16> {
-    let mut ports = Vec::new();
-    #[cfg(windows)]
+    #[cfg(unix)]
     {
+        enumerate_dir(&runtime_dir())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut ports = Vec::new();
         // The pipe namespace is enumerable as a directory listing.
+        #[cfg(windows)]
         if let Ok(entries) = std::fs::read_dir(r"\\.\pipe\") {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -155,23 +184,131 @@ pub fn enumerate() -> Vec<u16> {
                 }
             }
         }
+        ports.sort_unstable();
+        ports
     }
-    #[cfg(unix)]
-    {
-        if let Ok(entries) = std::fs::read_dir(runtime_dir()) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if let Some(rest) = name.strip_prefix("runner-")
-                    && let Some(p) = rest.strip_suffix(".sock")
-                    && let Ok(port) = p.parse::<u16>()
-                {
-                    ports.push(port);
-                }
+}
+
+/// The Unix half of `enumerate`, over any directory (tests point it at a
+/// temp dir rather than the real runtime dir).
+#[cfg(unix)]
+fn enumerate_dir(dir: &std::path::Path) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix("runner-")
+                && let Some(p) = rest.strip_suffix(".sock")
+                && let Ok(port) = p.parse::<u16>()
+                && has_listener(&e.path())
+            {
+                ports.push(port);
             }
         }
     }
     ports.sort_unstable();
     ports
+}
+
+/// Ask the kernel which unix sockets are actually listening, by path.
+///
+/// `/proc/net/unix` lists every bound unix socket in this network namespace as
+/// `Num RefCount Protocol Flags Type St Inode Path`, and a listening socket
+/// carries **SO_ACCEPTCON (0x10000)** in Flags. So the question "is anything
+/// listening on this path" is answerable by reading a file, with no connect()
+/// and therefore **no permission to the socket required** - which is the whole
+/// point. `connect()` alone cannot tell a live runner from a socket we merely
+/// may not open, and it used to answer "occupied" for both (see `has_listener`).
+///
+/// A corpse - a socket file whose runner is gone - does not appear here at all,
+/// because the file on disk and the kernel object are different things: unlink
+/// is what removes the file, close is what removes this entry. Verified on the
+/// GB10: a bound+listening socket shows one row with Flags `00010000`, a
+/// leftover file shows zero rows.
+///
+/// `None` means the question could not be asked (no procfs, unreadable, a path
+/// that is not valid UTF-8) and the caller should fall back.
+///
+/// This re-reads the file once per socket rather than building a set for the
+/// whole directory. That is deliberate: there is one caller, it looks at a
+/// handful of runner sockets, and the file is a few hundred lines - so the
+/// scan costs microseconds, and keeping it a pure path -> bool question is
+/// worth more than the saved reads on a path this load-bearing.
+#[cfg(target_os = "linux")]
+fn listening_per_procfs(path: &std::path::Path) -> Option<bool> {
+    const SO_ACCEPTCON: u32 = 0x0001_0000;
+    let want = path.to_str()?;
+    let txt = std::fs::read_to_string("/proc/net/unix").ok()?;
+    for line in txt.lines().skip(1) {
+        // Match the path by SUFFIX rather than by splitting into columns: the
+        // path is the last field and may itself contain spaces, so taking
+        // column 7 of a whitespace split would truncate such a path and miss.
+        // The preceding whitespace check stops "/a/b.sock" matching a line
+        // whose path is "/other/a/b.sock". An unbound socket has no path
+        // column at all and simply never matches.
+        let Some(head) = line.strip_suffix(want) else {
+            continue;
+        };
+        if !head.ends_with(char::is_whitespace) {
+            continue;
+        }
+        // Flags is the 4th column, hex, and everything before the path is
+        // space-free - so a plain whitespace split is safe for it.
+        if head
+            .split_whitespace()
+            .nth(3)
+            .and_then(|f| u32::from_str_radix(f, 16).ok())
+            .is_some_and(|v| v & SO_ACCEPTCON != 0)
+        {
+            return Some(true);
+        }
+    }
+    // Present but not listening, or absent entirely: either way nothing will
+    // accept on it.
+    Some(false)
+}
+
+/// Is anything listening on this socket file?
+///
+/// On Linux the kernel is asked directly (`listening_per_procfs`), because the
+/// probe below cannot distinguish "a live runner" from "a socket this process
+/// may not open". That mattered: a socket left by a runner once started under
+/// `sudo` is root-owned, `connect()` returns EACCES to the manager running as
+/// the user, the port read as occupied FOREVER, and the operator could neither
+/// start the endpoint nor remove its config (both gate on `enumerate`) without
+/// knowing to go delete a file nothing told them about.
+///
+/// Elsewhere, a non-blocking connect answers without talking to the runner:
+/// ECONNREFUSED means the file is a corpse, ENOENT that it went away while we
+/// looked. Everything else keeps the port - a connection (the listener accepts
+/// and sees us hang up, which it logs at trace), EAGAIN (a full backlog, so a
+/// listener certainly exists), EACCES (a socket we may not open is still
+/// somebody's, and without procfs we cannot do better than assume so).
+///
+/// Corpses are skipped, never deleted here: a runner between its bind() and
+/// listen() refuses too, and its own bind already clears a stale file for its
+/// port.
+#[cfg(unix)]
+fn has_listener(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(listening) = listening_per_procfs(path) {
+        return listening;
+    }
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::io::ErrorKind;
+    let Ok(addr) = SockAddr::unix(path) else {
+        return true;
+    };
+    let Ok(sock) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return true;
+    };
+    if sock.set_nonblocking(true).is_err() {
+        return true;
+    }
+    match sock.connect(&addr) {
+        Ok(()) => true,
+        Err(e) => !matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound),
+    }
 }
 
 /// Default `RUST_LOG` when the environment does not set one.
@@ -196,6 +333,109 @@ pub mod logging;
 
 pub const DEFAULT_LOG_FILTER: &str =
     "info,paddock=debug,rmcp=warn,hyper=warn,h2=warn,tower_http=warn";
+
+#[cfg(all(test, unix))]
+mod enumerate_tests {
+    use super::enumerate_dir;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pd-enum-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir for the enumerate test");
+        d
+    }
+
+    /// The DGX Spark failure, reduced: a runner's socket file left behind by
+    /// a stopped runner must not read as a serving port, while a live one
+    /// still does.
+    #[test]
+    fn a_socket_nobody_listens_on_is_not_a_serving_port() {
+        let dir = tmp("corpse");
+        let live = std::os::unix::net::UnixListener::bind(dir.join("runner-11540.sock")).unwrap();
+        // bound then dropped: the file stays, the listener is gone
+        drop(std::os::unix::net::UnixListener::bind(dir.join("runner-11541.sock")).unwrap());
+        assert!(dir.join("runner-11541.sock").exists());
+        // names that are not runner sockets never count
+        std::fs::write(dir.join("runner-11542.sock.bak"), b"").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"").unwrap();
+
+        assert_eq!(enumerate_dir(&dir), vec![11540]);
+        // skipped, not deleted - the runner that next binds 11541 clears it
+        assert!(dir.join("runner-11541.sock").exists());
+
+        drop(live);
+        assert_eq!(enumerate_dir(&dir), Vec::<u16>::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The procfs probe is the one that works on a socket we may not connect to,
+/// so it has to be right about paths as well as about liveness.
+#[cfg(all(test, target_os = "linux"))]
+mod procfs_listener_tests {
+    use super::listening_per_procfs;
+    use std::os::unix::net::UnixListener;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pd-procfs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir for the procfs test");
+        d
+    }
+
+    /// The distinction the whole fix rests on: the file on disk and the kernel
+    /// object are different things, and only the kernel knows which is which.
+    #[test]
+    fn a_listener_is_visible_and_a_corpse_file_is_not() {
+        let dir = tmp("live");
+        let path = dir.join("runner-11540.sock");
+        let live = UnixListener::bind(&path).unwrap();
+        assert_eq!(listening_per_procfs(&path), Some(true));
+
+        // Closing the listener leaves the file exactly where it was.
+        drop(live);
+        assert!(path.exists(), "the corpse file outlives its listener");
+        assert_eq!(listening_per_procfs(&path), Some(false));
+
+        // A path nothing ever bound.
+        assert_eq!(
+            listening_per_procfs(&dir.join("runner-9999.sock")),
+            Some(false)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The path is the last column and may contain spaces, so it is matched by
+    /// suffix rather than by splitting into columns - a column split would
+    /// truncate this path and report the live runner as a corpse.
+    #[test]
+    fn a_socket_path_containing_spaces_still_matches() {
+        let dir = tmp("spaced").join("a dir with spaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runner-11540.sock");
+        let live = UnixListener::bind(&path).unwrap();
+        assert_eq!(listening_per_procfs(&path), Some(true));
+        drop(live);
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// Suffix matching must not make one socket answer for another: a live
+    /// `/<tmp>/deep/runner-11540.sock` says nothing about `/runner-11540.sock`.
+    #[test]
+    fn a_suffix_of_a_live_path_is_not_that_path() {
+        let dir = tmp("suffix");
+        let deep = dir.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let live = UnixListener::bind(deep.join("runner-11540.sock")).unwrap();
+        assert_eq!(
+            listening_per_procfs(std::path::Path::new("/runner-11540.sock")),
+            Some(false),
+            "a bare suffix must not inherit a real socket's liveness"
+        );
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 
 #[cfg(test)]
 mod data_root_tests {

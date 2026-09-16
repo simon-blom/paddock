@@ -857,6 +857,11 @@ pub async fn run(
             );
         }
     }
+    // Off the host only after the free: a stop that waits for this port to
+    // leave `enumerate` must not start the next runner while we still hold
+    // the device. The file would otherwise outlive us and keep the port
+    // listed as serving.
+    paddock_admin::server::release();
     Ok(())
 }
 

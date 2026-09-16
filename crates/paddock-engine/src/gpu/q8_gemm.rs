@@ -46,6 +46,59 @@ impl GpuExecutor {
         })
     }
 
+    /// [`Self::q8_0_gemv_repacked`] over `batch` strided rows (slot 598): x
+    /// `[batch, in_dim]` -> y `[batch, out_dim]`, every row the batch-1 call's
+    /// output bit for bit at one launch - the row-exact spec verify's form of
+    /// this plane class. `Ok(false)` when the pack predates the slot, so the
+    /// caller keeps its per-row calls.
+    pub fn q8_0_gemv_repacked_rows(
+        &self,
+        w: &RepackedQ8,
+        bias: Option<&CudaSlice<f32>>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.q8_0_gemv_repacked_rows else {
+            return Ok(false);
+        };
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if x.len() < batch * in_dim || y.len() < batch * out_dim {
+            return Err(GpuError::Unsupported(format!(
+                "q8_0_gemv_repacked_rows: {batch} rows of [{in_dim} -> {out_dim}] past x {} / y {}",
+                x.len(),
+                y.len()
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let (xp, _g3) = x.device_ptr(&self.stream);
+        let (yp, _g4) = y.device_ptr_mut(&self.stream);
+        let (bias_ptr, _gb);
+        let bp: *const core::ffi::c_void = match bias {
+            Some(b) => {
+                (bias_ptr, _gb) = b.device_ptr(&self.stream);
+                bias_ptr as *const _
+            }
+            None => core::ptr::null(),
+        };
+        // SAFETY: ABI contract (slot 598); both planes bounds-checked above
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                bp,
+                xp as *const _,
+                yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })?;
+        Ok(true)
+    }
+
     /// True when the pack carries the multi-segment GEMV (entry 317).
     pub fn has_q8_0_gemv_repacked_multi(&self) -> bool {
         self.kernels.q8_0_gemv_repacked_multi.is_some()
@@ -1175,6 +1228,158 @@ impl GpuExecutor {
                 yp as *mut _,
                 in_dim as u32,
                 out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::q8_0_gemm_mmq_pipe`] over `batch` rows written from `y_row0`,
+    /// off a chunk-local `yq` - the `_rows` twin of [`Self::q8_0_gemm_mmq_rows`]
+    /// (the launcher takes no row offset, so the output pointer carries it).
+    pub fn q8_0_gemm_mmq_pipe_rows(
+        &self,
+        w: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        yq_off: usize,
+        y: &mut CudaSlice<f32>,
+        y_row0: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq_pipe
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq_pipe"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        debug_assert!(y.len() >= (y_row0 + batch) * out_dim);
+        debug_assert!(
+            yq.len() >= yq_off + in_dim.div_ceil(128) * batch.next_multiple_of(128) * 144
+        );
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let (yqp, _g3) = yq.device_ptr(&self.stream);
+        let (yp, _g4) = y.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI contract; the row offset stays inside `y` (asserted
+        // above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                (yqp + yq_off as u64) as *const _,
+                core::ptr::null(),
+                (yp + (y_row0 * out_dim * 4) as u64) as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the pipe tile with the hyper-connection mix
+    /// in its epilogue (slot 605).
+    pub fn has_q8_0_gemm_mmq_pipe_hcmix(&self) -> bool {
+        self.kernels.q8_0_gemm_mmq_pipe_hcmix.is_some()
+    }
+
+    /// Slot 605 over `batch` rows from `row0`: `w` is a [in -> 4 * hidden]
+    /// hyper-connection up plane, `yq` its chunk-local mmq rows, `xn` the
+    /// [rows][4 * hidden] normalized state and `out` the [rows][hidden] mixed
+    /// output - both row offsets ride the pointers. Byte-identical to
+    /// [`Self::q8_0_gemm_mmq_pipe_rows`] followed by `q4x_hc_mix`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_gemm_mmq_pipe_hcmix_rows(
+        &self,
+        w: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        xn: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        row0: usize,
+        batch: usize,
+        hidden: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq_pipe_hcmix
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq_pipe_hcmix"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if out_dim != 4 * hidden {
+            return Err(GpuError::Unsupported(format!(
+                "q8_0_gemm_mmq_pipe_hcmix: plane out {out_dim} is not 4 x hidden {hidden}"
+            )));
+        }
+        debug_assert!(xn.len() >= (row0 + batch) * out_dim);
+        debug_assert!(out.len() >= (row0 + batch) * hidden);
+        debug_assert!(yq.len() >= in_dim.div_ceil(128) * batch.next_multiple_of(128) * 144);
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let (yqp, _g3) = yq.device_ptr(&self.stream);
+        let (xp, _g4) = xn.device_ptr(&self.stream);
+        let (op, _g5) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI contract (slot 605); the row offsets stay inside
+        // `xn` / `out` (asserted above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                yqp as *const _,
+                (xp + (row0 * out_dim * 4) as u64) as *const _,
+                (op + (row0 * hidden * 4) as u64) as *mut _,
+                in_dim as u32,
+                hidden as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 608: [`Self::q8_0_gemm_mmq_pipe_hcmix_rows`] over the normalized
+    /// state rebuilt from the residual `h` and `aux` = [norm_w (4 * hidden) |
+    /// 1/rms (batch * 4)], as ONE launch over `batch` rows (the 1/rms tail is
+    /// indexed from row 0, so there is no row offset to carry).
+    /// Byte-identical to slot 605 over the stored state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_gemm_mmq_pipe_hcmix_rn(
+        &self,
+        w: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        h: &CudaSlice<f32>,
+        aux: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        batch: usize,
+        hidden: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq_pipe_hcmix_rn
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq_pipe_hcmix_rn"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if out_dim != 4 * hidden {
+            return Err(GpuError::Unsupported(format!(
+                "q8_0_gemm_mmq_pipe_hcmix_rn: plane out {out_dim} is not 4 x hidden {hidden}"
+            )));
+        }
+        debug_assert!(h.len() >= batch * out_dim && out.len() >= batch * hidden);
+        debug_assert!(aux.len() >= out_dim + batch * 4);
+        debug_assert!(yq.len() >= in_dim.div_ceil(128) * batch.next_multiple_of(128) * 144);
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let (yqp, _g3) = yq.device_ptr(&self.stream);
+        let (hp, _g4) = h.device_ptr(&self.stream);
+        let (ap, _g5) = aux.device_ptr(&self.stream);
+        let (op, _g6) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI contract (slot 608); planes sized as asserted,
+        // pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                yqp as *const _,
+                hp as *const _,
+                ap as *const _,
+                op as *mut _,
+                in_dim as u32,
+                hidden as u32,
                 batch as u32,
                 self.stream_ptr(),
             )

@@ -774,11 +774,11 @@ __host__ __device__ __forceinline__ uint32_t pd_kq_datab(uint32_t dt) {
 // (Qwen3.8-Flash-Next's expert down, 640 = 2.5) carries no padding at all -
 // the walk over the row is bounded by in_dim, never by the superblock count.
 __host__ __device__ __forceinline__ uint32_t pd_kq_row_datab(uint32_t dt, uint32_t in_dim) {
-    if (dt == PD_KQ_IQ4NL_ID) return (in_dim >> 5) * 16u;
+    if (pd_kq_flat32(dt)) return (in_dim >> 5) * (pd_kq_datab(dt) >> 3);
     return ((in_dim + 255u) >> 8) * pd_kq_datab(dt);
 }
 __host__ __device__ __forceinline__ uint32_t pd_kq_row_scb(uint32_t dt, uint32_t in_dim) {
-    if (dt == PD_KQ_IQ4NL_ID) return (in_dim >> 5) * 2u;
+    if (pd_kq_flat32(dt)) return (in_dim >> 5) * (pd_kq_scb(dt) >> 3);
     return ((in_dim + 255u) >> 8) * pd_kq_scb(dt);
 }
 

@@ -36,7 +36,7 @@ use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::MappedGguf;
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig, Qwen4ExpPleHash};
 
-use crate::gpu::{DeviceTensor, GpuExecutor, QuantTensor, RepackedKQ};
+use crate::gpu::{DeviceTensor, GpuExecutor, QuantTensor, QuantW, RepackedKQ};
 use crate::gpu_model::gpt_oss::GpuModelError;
 
 use super::{
@@ -96,6 +96,37 @@ fn f32_dt(
 ) -> Result<DeviceTensor, GpuModelError> {
     let n: usize = dims.iter().product();
     super::load::dt(exec, f32_vec(map, name, n)?, dims).map_err(GpuModelError::from)
+}
+
+/// An F32 plane that may also ship as Q8_0: the MTP head's `hc_*_inject`
+/// rows are Q8_0 where the trunk's are F32. The mix kernels read f32, so a
+/// Q8_0 copy is expanded on the host - that is the Q8_0 values themselves
+/// (scale x int8), not a requant, and the plane is 4 rows.
+fn f32_or_q8_dt(
+    exec: &GpuExecutor,
+    map: &MappedGguf,
+    name: &str,
+    dims: Vec<usize>,
+) -> Result<DeviceTensor, GpuModelError> {
+    let (info, bytes) = map
+        .tensor_bytes(name)
+        .map_err(|e| unsupported(format!("{name}: {e}")))?;
+    if info.ggml_type != GgmlType::Q8_0 {
+        return f32_dt(exec, map, name, dims);
+    }
+    let n: usize = dims.iter().product();
+    if !n.is_multiple_of(32) || bytes.len() != n / 32 * 34 {
+        return Err(unsupported(format!(
+            "{name}: {} Q8_0 bytes for {n} elements",
+            bytes.len()
+        )));
+    }
+    let mut v = Vec::with_capacity(n);
+    for blk in bytes.as_chunks::<34>().0 {
+        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        v.extend(blk[2..].iter().map(|&q| (q as i8) as f32 * d));
+    }
+    super::load::dt(exec, v, dims).map_err(GpuModelError::from)
 }
 
 /// A norm the converter stored as `(1+w)` for a kernel that applies the `+1`
@@ -190,6 +221,18 @@ fn kq_seat(
             "kernel pack has no k-quant MoE lanes - rebuild packs/cuda".into(),
         ));
     }
+    // Q5_1 / Q8_0 expert planes (UD-Q4_K_XL's routed down) ride the i-quant
+    // lanes as flat 32-weight blocks; an all-Q8_0 layer never reaches here
+    // (load_layer seats it on the Q8_0 expert kernels), so a Q8_0 plane here
+    // is one mixed with k-quant gate/up.
+    let flat = matches!(info.ggml_type, GgmlType::Q5_1 | GgmlType::Q8_0);
+    if flat && !exec.has_kquant_flat32() {
+        return Err(unsupported(format!(
+            "{name} is {:?} but the kernel pack does not serve flat 32-weight expert blocks \
+             (slot 600) - rebuild packs/cuda",
+            info.ggml_type
+        )));
+    }
     if crate::gpu::kq_is_iq(info.ggml_type) && !exec.has_kquant_iq() {
         return Err(unsupported(format!(
             "{name} is {:?} but the kernel pack has no i-quant seats (slot 539) - rebuild packs/cuda",
@@ -197,9 +240,21 @@ fn kq_seat(
         )));
     }
     let seat = if crate::gpu::moe_offload().enabled {
+        if info.ggml_type == GgmlType::Q8_0 {
+            return Err(unsupported(format!(
+                "{name}: a Q8_0 expert plane mixed with k-quant gate/up is not served under \
+                 [moe_offload] yet"
+            )));
+        }
         exec.try_repack_kquant_host_mapped(map, name)
             .map_err(|e| unsupported(format!("{name}: {e}")))?
             .map(KqSeat::Host)
+    } else if info.ggml_type == GgmlType::Q8_0 {
+        // asked for by name: `try_repack_kquant` keeps Q8_0 on its own lanes
+        Some(KqSeat::Dev(
+            exec.repack_kquant(map, name)
+                .map_err(|e| unsupported(format!("{name}: {e}")))?,
+        ))
     } else {
         exec.try_repack_kquant(map, name)
             .map_err(|e| unsupported(format!("{name}: {e}")))?
@@ -237,7 +292,7 @@ pub(super) fn hc_weights(
         down_p42: None,
         up_p42: None,
         inject: if inject {
-            Some(f32_dt(
+            Some(f32_or_q8_dt(
                 exec,
                 map,
                 &format!("{pfx}_inject.weight"),
@@ -381,32 +436,57 @@ pub(super) fn load_layer(
     want_dims(map, &format!("{p}.ffn_gate_inp.weight"), &[h, c.n_expert])?;
     let mut router_v = f32_vec(map, &format!("{p}.ffn_gate_inp.weight"), c.n_expert * h)?;
     router_v.extend(f32_vec(map, &format!("{p}.ffn_gate_inp_shexp.weight"), h)?);
-    let seats = ExpertSeats::Kq {
-        gate: kq_seat(
-            exec,
-            map,
-            &format!("{p}.ffn_gate_exps.weight"),
-            h,
-            c.moe_ff,
-            c.n_expert,
-        )?,
-        up: kq_seat(
-            exec,
-            map,
-            &format!("{p}.ffn_up_exps.weight"),
-            h,
-            c.moe_ff,
-            c.n_expert,
-        )?,
-        down: kq_seat(
-            exec,
-            map,
-            &format!("{p}.ffn_down_exps.weight"),
-            c.moe_ff,
-            h,
-            c.n_expert,
-        )?,
-        cache: None,
+    let exp_ty = |part: &str| -> Result<GgmlType, GpuModelError> {
+        let name = format!("{p}.ffn_{part}_exps.weight");
+        map.tensor_bytes(&name)
+            .map(|(info, _)| info.ggml_type)
+            .map_err(|e| unsupported(format!("{name}: {e}")))
+    };
+    let all_q8 = [exp_ty("gate")?, exp_ty("up")?, exp_ty("down")?]
+        .iter()
+        .all(|t| *t == GgmlType::Q8_0);
+    let seats = if all_q8 {
+        // the MTP head's block: every expert plane Q8_0 (a mixed Q8_0 /
+        // k-quant layer still refuses in kq_seat below)
+        let q8 = |part: &str, in_dim: usize, out_dim: usize| {
+            let name = format!("{p}.ffn_{part}_exps.weight");
+            want_dims(map, &name, &[in_dim, out_dim, c.n_expert])?;
+            exec.repack_q8(map, &name)
+                .map_err(|e| unsupported(format!("{name}: {e}")))
+        };
+        ExpertSeats::Q8 {
+            gate: q8("gate", h, c.moe_ff)?,
+            up: q8("up", h, c.moe_ff)?,
+            down: q8("down", c.moe_ff, h)?,
+        }
+    } else {
+        ExpertSeats::Kq {
+            gate: kq_seat(
+                exec,
+                map,
+                &format!("{p}.ffn_gate_exps.weight"),
+                h,
+                c.moe_ff,
+                c.n_expert,
+            )?,
+            up: kq_seat(
+                exec,
+                map,
+                &format!("{p}.ffn_up_exps.weight"),
+                h,
+                c.moe_ff,
+                c.n_expert,
+            )?,
+            down: kq_seat(
+                exec,
+                map,
+                &format!("{p}.ffn_down_exps.weight"),
+                c.moe_ff,
+                h,
+                c.n_expert,
+            )?,
+            cache: None,
+        }
     };
     let moe = MoeW {
         router: super::load::dt(exec, router_v, vec![c.n_expert + 1, h])?,
@@ -548,6 +628,13 @@ pub(super) fn load_embed(
             dims: vec![c.hidden, c.vocab],
         }));
     }
+    if info.ggml_type == GgmlType::Q8_0 {
+        return Ok(Embed::Q8(QuantTensor {
+            bytes: exec.to_device_u8(bytes).map_err(GpuModelError::from)?,
+            ty: GgmlType::Q8_0,
+            dims: vec![c.hidden, c.vocab],
+        }));
+    }
     let w: RepackedKQ = exec
         .try_repack_kquant(map, name)
         .map_err(|e| unsupported(format!("{name}: {e}")))?
@@ -566,4 +653,128 @@ pub(super) fn load_head(
     c: &Qwen4ExpConfig,
 ) -> Result<DensePlane, GpuModelError> {
     dense(exec, map, "output.weight", c.vocab, c.hidden)
+}
+
+/// The MTP head off its own GGUF (unsloth's `mtp-*-shared-Q8_0.gguf`, the
+/// file ds4 opens through `--mtp-model`): one ordinary full-attention qwen4exp
+/// block at index `n_layer`, the nextn input projections, and the head's own
+/// hyper-connection mixer. No `token_embd` / `output` in the file - the head
+/// borrows the target's (`qwen4exp.nextn_shared_target_tensors`).
+pub(super) struct MtpWeights {
+    pub layer: Qwen4ExpLayer,
+    /// `nextn.eh_proj` split at load into its two input halves. The plane is
+    /// `[fc_embedding ; fc_hidden]` side by side along the INPUT (the
+    /// embedding half is columns `[0, hidden)`), Q8_0 blocks are 32 wide and
+    /// hidden is a whole number of them, so each row's first hidden/32 blocks
+    /// are fc_embedding byte for byte. Split, the hidden half runs over the
+    /// four streams as plain rows and the embedding half once per token;
+    /// fused, every (token, stream) row would have to be packed `[e | h_s]`
+    /// first. Same weights, the f32 sum of the two halves reassociated.
+    pub eh_e: DensePlane,
+    pub eh_h: DensePlane,
+    pub enorm: DeviceTensor,
+    /// ONE rms statistic over the whole 4-stream row - ungrouped, unlike
+    /// every hyper-connection norm (ds4 reads it this way)
+    pub hnorm: DeviceTensor,
+    /// `nextn.hc_head_*`: the final mixer's shape, no inject
+    pub head_mix: HcW,
+}
+
+pub(super) fn load_mtp(
+    exec: &Arc<GpuExecutor>,
+    map: &MappedGguf,
+    target: &Qwen4ExpConfig,
+) -> Result<MtpWeights, GpuModelError> {
+    use paddock_models::gguf::Value;
+    let g = map.gguf();
+    let arch = g.architecture().unwrap_or("");
+    if arch != "qwen4exp" {
+        return Err(unsupported(format!(
+            "MTP head: general.architecture is {arch:?}, not qwen4exp"
+        )));
+    }
+    let num = |k: &str| g.arch_field(k).and_then(Value::as_u64).map(|v| v as usize);
+    if num("nextn_predict_layers") != Some(1) {
+        return Err(unsupported(format!(
+            "MTP head: nextn_predict_layers is {:?}; this lane serves exactly one head",
+            num("nextn_predict_layers")
+        )));
+    }
+    // the head writes the target's stream and reads the target's lm_head, so
+    // every width it shares with the target has to be the target's
+    for (k, want) in [
+        ("block_count", target.n_layer + 1),
+        ("embedding_length", target.hidden),
+        ("hyper_connection.count", target.hc_count),
+        ("hyper_connection.low_rank", target.hc_lowrank),
+        ("attention.head_count", target.n_heads),
+        ("attention.head_count_kv", target.n_kv_heads),
+        ("attention.key_length", target.head_dim),
+        ("expert_count", target.n_expert),
+        ("expert_used_count", target.n_active),
+        ("expert_feed_forward_length", target.moe_ff),
+    ] {
+        if num(k) != Some(want) {
+            return Err(unsupported(format!(
+                "MTP head: {k} is {:?}, the target has {want}",
+                num(k)
+            )));
+        }
+    }
+    let li = target.n_layer;
+    // The head's block is full attention whatever the file's compress_ratios
+    // says at this index (0, which from_gguf would read as a GDN layer).
+    let mut c = target.clone();
+    c.blocks.push(Qwen4ExpBlock::Attention);
+    c.n_layer += 1;
+    let layer = load_layer(exec, map, &c, li)?;
+    let h = c.hidden;
+    let name = format!("blk.{li}.nextn.eh_proj.weight");
+    want_dims(map, &name, &[2 * h, h])?;
+    let (info, bytes) = map
+        .tensor_bytes(&name)
+        .map_err(|e| unsupported(format!("{name}: {e}")))?;
+    let half_bytes = h / 32 * 34;
+    if info.ggml_type != GgmlType::Q8_0
+        || !h.is_multiple_of(32)
+        || bytes.len() != 2 * half_bytes * h
+    {
+        return Err(unsupported(format!(
+            "{name}: {:?} with {} bytes - want Q8_0 [{}, {h}]",
+            info.ggml_type,
+            bytes.len(),
+            2 * h
+        )));
+    }
+    let (mut be, mut bh) = (
+        Vec::with_capacity(half_bytes * h),
+        Vec::with_capacity(half_bytes * h),
+    );
+    for row in bytes.chunks_exact(2 * half_bytes) {
+        be.extend_from_slice(&row[..half_bytes]);
+        bh.extend_from_slice(&row[half_bytes..]);
+    }
+    let plane = |raw: &[u8]| -> Result<DensePlane, GpuModelError> {
+        let w = exec
+            .repack_q8_blocks(raw, vec![h, h])
+            .map_err(GpuModelError::from)?;
+        Ok(DensePlane::Kq {
+            w: QuantW::Q8(w),
+            in_dim: h,
+            out_dim: h,
+        })
+    };
+    Ok(MtpWeights {
+        layer,
+        eh_e: plane(&be)?,
+        eh_h: plane(&bh)?,
+        enorm: f32_dt(exec, map, &format!("blk.{li}.nextn.enorm.weight"), vec![h])?,
+        hnorm: f32_dt(
+            exec,
+            map,
+            &format!("blk.{li}.nextn.hnorm.weight"),
+            vec![c.hc_width()],
+        )?,
+        head_mix: hc_weights(exec, map, &c, &format!("blk.{li}.nextn.hc_head"), false)?,
+    })
 }

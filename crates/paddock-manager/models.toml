@@ -1008,27 +1008,52 @@ revision = "2026-08-15"
 
 # Qwen3.8-Flash-Next sourcing: the weights are unsloth's UD export of
 # Qwen/Qwen3.8-Flash-Next (quantiser repo huggingface.co/unsloth, recorded in
-# the file's own general.repo_url); the three shard sha256s here are the
-# upstream LFS oids, re-verified against the bytes at upload.
+# the file's own general.repo_url); every shard sha256 here is the upstream LFS
+# oid, re-verified against the bytes at upload.
 #
-# UD-IQ3_XXS is not a taste - it is the largest upstream file whose ROUTED
+# UD-IQ3_XXS is the DEFAULT lane, and it was not a taste: when this entry
+# landed it was the largest upstream file the engine could seat - its ROUTED
 # expert seats are all i-quant (IQ2_S gate/up, IQ4_NL down, IQ3_S on one
-# layer). The 4-bit UD files upcast some expert planes to Q8_0 and Q5_1, and
-# the engine has no seat for those in the routed path, so it refuses them.
-# NVFP4 is a separate lane and not published here: 84 GB resident before KV
+# layer), where the 4-bit UD files upcast some expert planes to Q8_0 and Q5_1
+# and the routed path had no seat for those.
+#
+# That last part is no longer true (2026-09-15): the flat 32-weight seats (pack
+# slot 600 `kquant_flat32`, the loader's per-tensor `kq_layout` dispatch) serve
+# Q5_1 / Q8_0 routed experts, UD-Q4_K_XL loads, and it is the file the Spark
+# prefill campaign measures on - 18/18 greedy parity against llama.cpp on the
+# same GGUF. So it is published here too (2026-09-16): 111.3 GB over four
+# shards, measured at 85.2 GB resident.
+#
+# That measurement is also why it is NOT the default. 85.2 GB of weights before
+# a single KV byte is the same arithmetic that rules NVFP4 out below, so a 96 GB
+# card does not serve this file either - it wants the 128 GB class the prefill
+# campaign runs on, and IQ3 (56.6 GB resident) is the lane that fits a 96 GB
+# card. Both shapes are published, so the picker prices that per box instead of
+# guessing from file size.
+#
+# NVFP4 is a separate lane and still not published: 84 GB resident before KV
 # does not fit a 96 GB card.
 #
 # The n-gram embedding is 51B of the parameter count and stays HOST-MAPPED -
-# the engine gathers 8 rows a token straight from the file's mmap - so the
-# resident figure below is far under the 76 GB of download, and a cold page
-# cache costs a disk seek per row on the first pass.
+# the engine gathers 8 rows a token straight from the file's mmap - so each
+# resident figure below sits ~24 GiB under its own download (76.3 -> 52.7 GiB
+# for IQ3, 103.7 -> 79.4 GiB for the 4-bit), and a cold page cache costs a disk
+# seek per row on the first pass.
+#
+# The drafter is unsloth's separate MTP head for the same model
+# (MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf: blk.48 full attention + nextn
+# glue, all Q8_0, borrowing the target's embedding and lm_head) - the UD export
+# strips the in-file MTP block, so this file is the only way to speculate.
+# sha256 re-verified through the public URL after upload (2026-09-14). The
+# engine's verify rows are decode-exact, so greedy text with it attached is
+# byte-identical to without - measured on a DGX Spark, 2026-09-14.
 
 [[model]]
 id = "qwen3.8-flash-next"
 vendor = "Alibaba"
 display = "Qwen 3.8 Flash Next"
 family = "qwen3.8"
-capability = ["chat", "tools", "reasoning"]
+capability = ["chat", "tools", "reasoning", "speculative"]
 license = "qwen-community-1.0"
 revision = "2026-09-08"
 
@@ -1041,19 +1066,20 @@ revision = "2026-09-08"
     "Only 10 of 512 experts run per token - flagship-scale weights at a fast token",
     "Hybrid Gated DeltaNet + sparse attention · 256K context",
     "Reasoning depth tunable per request (reasoning_effort)",
+    "Extra speed from a companion draft model",
   ]
   tradeoffs = [
     "The 51B n-gram embedding is read from the file per token - keep the weights on fast local storage, not a network mount",
     "This export is text-only: the vendor's vision encoder is not in the GGUF",
-    "No in-file MTP block, so speculative decoding has nothing to draft with here",
   ]
 
-  # The only quant this lane serves - see the seat note above.
+  # The default lane: the smallest export, and the one that leaves the most
+  # room for KV on a 96 GB card - see the seat note above.
   [[model.artifact]]
   id = "iq3"
   kind = "weights"
   format = "gguf"
-  label = "Compact"
+  label = "Compact (smaller)"
   quant = "UD-IQ3_XXS"
   default = true
 
@@ -1092,6 +1118,76 @@ revision = "2026-09-08"
     dest = "Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf"
     sha256 = "f1912ba34c79427d2295a58dcb2b732b5931af5bef7a373c60557a57d9ee7250"
     size = 32382955968
+
+  # The 4-bit UD export - four shards, and shard 1 is LISTED first for the same
+  # reason it is everywhere else here (the spawn path hands the runner
+  # `files.first()` and the engine walks the rest from that shard's own split
+  # metadata). Its routed experts upcast to Q5_1/Q8_0, which is what the flat
+  # 32-weight seats serve; see the sourcing note above for why that took until
+  # 2026-09-15.
+  [[model.artifact]]
+  id = "q4"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact"
+  quant = "UD-Q4_K_XL"
+
+  [model.artifact.shape]
+  weight_bytes = 85208451328
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, count = 12 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 36
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+    sha256 = "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"
+    size = 10946624
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
+    sha256 = "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9"
+    size = 49859583136
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf"
+    sha256 = "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"
+    size = 49376141504
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+    sha256 = "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"
+    size = 12087983520
+
+  # the separate MTP head (see the sourcing note above) - this export has no
+  # in-file one
+  [[model.artifact]]
+  id = "drafter"
+  kind = "drafter"
+  format = "gguf"
+  label = "Faster generation (2.6 GB drafter)"
+  default = true
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+    sha256 = "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+    size = 2786568256
 
 # Laguna sourcing: official
 # poolside repos only - the Q4_K_M below is poolside's own GGUF, the one

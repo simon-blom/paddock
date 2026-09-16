@@ -476,6 +476,8 @@ static inline uint32_t pd_iqd_grid(uint32_t rows_needed, uint32_t warps_per_bloc
         case PD_KQ_IQ4NL_ID: X(PD_KQ_IQ4NL_ID); break;    \
         case PD_KQ_Q2K_ID: X(PD_KQ_Q2K_ID); break;        \
         case PD_KQ_Q3K_ID: X(PD_KQ_Q3K_ID); break;        \
+        case PD_KQ_Q51_ID: X(PD_KQ_Q51_ID); break;        \
+        case PD_KQ_Q80_ID: X(PD_KQ_Q80_ID); break;        \
         default: return cudaErrorInvalidValue;            \
     }
 
@@ -483,7 +485,7 @@ static inline uint32_t pd_iqd_grid(uint32_t rows_needed, uint32_t warps_per_bloc
 // 256-block i-quant types need whole superblocks.
 static inline bool pd_iqd_in_dim_ok(uint32_t dtype, uint32_t in_dim) {
     if (in_dim == 0u) return false;
-    if (dtype == PD_KQ_IQ4NL_ID) return (in_dim & 31u) == 0u;
+    if (pd_kq_flat32(dtype)) return (in_dim & 31u) == 0u;
     return (in_dim & 255u) == 0u;
 }
 

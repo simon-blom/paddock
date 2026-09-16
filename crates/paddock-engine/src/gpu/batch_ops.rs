@@ -1588,6 +1588,11 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the wide-batch Q8_0 dp4a GEMM.
+    pub fn has_q8_0_gemm_mt_dp4a_wide(&self) -> bool {
+        self.kernels.q8_0_gemm_mt_dp4a_wide.is_some()
+    }
+
     /// Wide-batch (32 rows/weight-pass) dp4a GEMM - the B>=17 serving matmul.
     pub fn q8_0_gemm_mt_dp4a_wide(
         &self,

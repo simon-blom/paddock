@@ -51,6 +51,14 @@ impl GpuExecutor {
         self.kernels.kquant_q40.is_some()
     }
 
+    /// True when the pack's i-quant lanes serve the flat 32-weight block
+    /// formats Q5_1 and Q8_0 (slot 600) - the routed expert types UD-Q4_K_XL
+    /// exports mix in. Same reason as the Q4_0 marker: the dtypes ride the
+    /// existing entry points.
+    pub fn has_kquant_flat32(&self) -> bool {
+        self.kernels.kquant_flat32.is_some()
+    }
+
     /// True when the pack serves the i-quant family (IQ1/IQ2/IQ3, IQ4_NL)
     /// on the k-quant streams - repack, dequant and the token-batched MoE
     /// pair. Capability marker slot 577.
@@ -205,7 +213,7 @@ impl GpuExecutor {
         ty: GgmlType,
         what: &str,
     ) -> Result<RepackedKQ, GpuError> {
-        let (raw_id, raw_b, data_b) = kq_params(ty).ok_or(GpuError::NoKernel {
+        let (raw_id, raw_b, data_b) = kq_layout(ty).ok_or(GpuError::NoKernel {
             name: what.to_owned(),
             ty,
         })?;
@@ -227,9 +235,9 @@ impl GpuExecutor {
         let n_super = if in_dim.is_multiple_of(256) {
             dims.iter().product::<usize>() / 256
         } else {
-            if ty != GgmlType::Iq4Nl || !in_dim.is_multiple_of(32) {
+            if !kq_flat32(ty) || !in_dim.is_multiple_of(32) {
                 return Err(GpuError::Driver(format!(
-                    "kquant repack {what}: in_dim {in_dim} is not superblock-aligned and {ty:?} has no flat 32-block row layout (IQ4_NL only)"
+                    "kquant repack {what}: in_dim {in_dim} is not superblock-aligned and {ty:?} has no flat 32-block row layout (IQ4_NL / Q5_1 / Q8_0 only)"
                 )));
             }
             let per_row = in_dim / 32;
@@ -404,7 +412,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemv
             .ok_or(GpuError::MissingOp("kquant_gemv"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0] as u32, w.dims[1] as u32);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
         let (scp, _g2) = w.scales.device_ptr(&self.stream);
@@ -438,7 +446,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gather
             .ok_or(GpuError::MissingOp("kquant_gather"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (dp, _g1) = w.data.device_ptr(&self.stream);
         let (scp, _g2) = w.scales.device_ptr(&self.stream);
         let (tp, _g3) = tokens.device_ptr(&self.stream);
@@ -471,11 +479,11 @@ impl GpuExecutor {
             .kernels
             .kquant_dequant_rp
             .ok_or(GpuError::MissingOp("kquant_dequant_rp"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         // off the stream, not the dims: rows padded to whole superblocks
         // (partial-superblock in_dim, see `repack_kquant_raw`) carry more
         // superblocks than `dims.product() / 256`
-        let (_, _, data_b) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (_, _, data_b) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let n_super = w.data.len() / data_b;
         debug_assert!(dst.len() >= n_super * 256);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -543,7 +551,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_w4a8
             .ok_or(GpuError::MissingOp("kquant_gemm_w4a8"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * batch);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -592,7 +600,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_w4a8_pipe
             .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_pipe"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * batch);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -657,7 +665,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_w4a8_pipe2
             .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_pipe2"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * (y_row0 + batch));
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -735,7 +743,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_dp4a
             .ok_or(GpuError::MissingOp("kquant_gemm_dp4a"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * batch);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -788,7 +796,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_mma_ks
             .ok_or(GpuError::MissingOp("kquant_gemm_mma_ks"))?;
-        let (raw_id, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * batch);
         debug_assert!(part.len() >= 8 * out_dim * batch);
@@ -853,8 +861,8 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_gate_up
             .ok_or(GpuError::MissingOp("kquant_moe_gate_up"))?;
-        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
-        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
         debug_assert_eq!(up.dims[0], in_dim);
         debug_assert_eq!(up.dims[1], ff);
@@ -918,7 +926,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down
             .ok_or(GpuError::MissingOp("kquant_moe_down"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         debug_assert!(out.len() >= batch * embd);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
@@ -991,8 +999,8 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_gate_up_list
             .ok_or(GpuError::MissingOp("kquant_moe_gate_up_list"))?;
-        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
-        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
         debug_assert!(out.len() >= batch * n_active * ff);
         let (gdp, _g1) = gate.data.device_ptr(&self.stream);
@@ -1087,8 +1095,8 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_gate_up_grp
             .ok_or(GpuError::MissingOp("kquant_moe_gate_up_grp"))?;
-        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
-        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
         debug_assert_eq!(up.dims[0], in_dim);
         debug_assert_eq!(up.dims[1], ff);
@@ -1175,8 +1183,8 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_gate_up_tile
             .ok_or(GpuError::MissingOp("kquant_moe_gate_up_tile"))?;
-        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
-        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
         debug_assert!(out.len() >= batch * n_active * ff);
         debug_assert!(sorted_row.len() >= max_blocks * Self::KQ_MOE_TILE_BM);
@@ -1254,7 +1262,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_tile
             .ok_or(GpuError::MissingOp("kquant_moe_down_tile"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         debug_assert!(part.len() >= rows * n_active * ocols);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
@@ -1299,6 +1307,84 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the expert-major tensor-core down (slot 603)
+    /// and the slot fold its partials go through (slot 590).
+    pub fn has_kquant_moe_down_mma_e(&self) -> bool {
+        self.kernels.kquant_moe_down_mma_e.is_some() && self.kernels.moe_part_fold_at.is_some()
+    }
+
+    /// The routed down on the tensor cores over one column chunk (slot 603),
+    /// expert-major straight off the tensor-core gate/up's SORTED rows (`sfq`
+    /// / `sfs` over its bm = 32 moe_align layout): the per-(pair, column)
+    /// partials [`Self::kquant_moe_down_tile`] writes, for
+    /// [`Self::moe_part_fold_at`]. Flat 32-weight downs only; `emap` is
+    /// 2 x n_expert of scratch the pack fills from the layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_mma_e(
+        &self,
+        down: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        sfq: &CudaSlice<i8>,
+        sfs: &CudaSlice<f32>,
+        emap: &mut CudaSlice<u32>,
+        part: &mut CudaSlice<f32>,
+        o0: usize,
+        ocols: usize,
+        n_active: usize,
+        rows: usize,
+        n_expert: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_mma_e
+            .ok_or(GpuError::MissingOp("kquant_moe_down_mma_e"))?;
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (ff, embd) = (down.dims[0], down.dims[1]);
+        debug_assert!(part.len() >= rows * n_active * ocols);
+        debug_assert!(emap.len() >= 2 * n_expert);
+        debug_assert!(sorted_row.len() >= max_blocks * 32 && sorted_slot.len() >= max_blocks * 32);
+        debug_assert!(block_expert.len() >= max_blocks);
+        debug_assert!(sfq.len() >= max_blocks * 32 * ff && sfs.len() >= max_blocks * ff);
+        let (ddp, _g1) = down.data.device_ptr(&self.stream);
+        let (dsp, _g2) = down.scales.device_ptr(&self.stream);
+        let (srp, _g3) = sorted_row.device_ptr(&self.stream);
+        let (ssp, _g4) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g5) = block_expert.device_ptr(&self.stream);
+        let (twp, _g6) = topk_w.device_ptr(&self.stream);
+        let (fqp, _g7) = sfq.device_ptr(&self.stream);
+        let (fsp, _g8) = sfs.device_ptr(&self.stream);
+        let (emp, _g9) = emap.device_ptr_mut(&self.stream);
+        let (pp, _g10) = part.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 603); pointers + stream live across the call
+        check(unsafe {
+            f(
+                ddp as *const _,
+                dsp as *const _,
+                srp as *const _,
+                ssp as *const _,
+                bep as *const _,
+                twp as *const _,
+                fqp as *const _,
+                fsp as *const _,
+                emp as *mut _,
+                pp as *mut _,
+                ff as u32,
+                embd as u32,
+                o0 as u32,
+                ocols as u32,
+                n_active as u32,
+                n_expert as u32,
+                max_blocks as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// True when the pack carries the expert-grouped down + its slot fold
     /// (slots 589/590) - the prefill class for the routed down half.
     pub fn has_kquant_moe_down_grp(&self) -> bool {
@@ -1334,7 +1420,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_grp
             .ok_or(GpuError::MissingOp("kquant_moe_down_grp"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         debug_assert!(part.len() >= rows * n_active * ocols);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
@@ -1442,7 +1528,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_cols
             .ok_or(GpuError::MissingOp("kquant_moe_down_cols"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         debug_assert!(out.len() >= batch * embd);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
@@ -1503,7 +1589,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_list
             .ok_or(GpuError::MissingOp("kquant_moe_down_list"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         debug_assert!(out.len() >= batch * embd);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
@@ -1564,7 +1650,7 @@ impl GpuExecutor {
             .kquant_moe_gate_up_mma
             .ok_or(GpuError::MissingOp("kquant_moe_gate_up_mma"))?;
         assert_eq!(gate.ty, up.ty, "sorted kq pair shares one dtype");
-        let (did, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
         debug_assert_eq!(up.dims[0], in_dim);
         debug_assert_eq!(up.dims[1], ff);
@@ -1611,6 +1697,73 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the sorted -> pair-major int8 row move
+    /// (slot 601) the tensor-core gate/up needs to feed a grouped down.
+    pub fn has_moe_q8_rows_unsort(&self) -> bool {
+        self.kernels.moe_q8_rows_unsort.is_some()
+    }
+
+    /// Slot 601: move `moe_align`-SORTED int8 activation rows (`sq`:
+    /// `[max_blocks * 32][ff]`, `ss`: their per-32 scales) to the PAIR-major
+    /// layout (`token * n_active + slot`) in `fq` / `fs`; PAD blocks (by
+    /// `block_expert` - moe_align leaves the tail blocks' rows unfilled) and
+    /// PAD rows are skipped, and every live row has one writer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_q8_rows_unsort(
+        &self,
+        sq: &CudaSlice<i8>,
+        ss: &CudaSlice<f32>,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        fq: &mut CudaSlice<i8>,
+        fs: &mut CudaSlice<f32>,
+        ff: usize,
+        n_active: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_q8_rows_unsort
+            .ok_or(GpuError::MissingOp("moe_q8_rows_unsort"))?;
+        let rows = max_blocks * 32;
+        if sq.len() < rows * ff
+            || ss.len() < rows * (ff / 32)
+            || sorted_row.len() < rows
+            || sorted_slot.len() < rows
+            || block_expert.len() < max_blocks
+        {
+            return Err(GpuError::Unsupported(format!(
+                "moe_q8_rows_unsort: {max_blocks} sorted blocks of {ff} past the staged planes"
+            )));
+        }
+        let (sqp, _g1) = sq.device_ptr(&self.stream);
+        let (ssp, _g2) = ss.device_ptr(&self.stream);
+        let (srp, _g3) = sorted_row.device_ptr(&self.stream);
+        let (slp, _g4) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g7) = block_expert.device_ptr(&self.stream);
+        let (fqp, _g5) = fq.device_ptr_mut(&self.stream);
+        let (fsp, _g6) = fs.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 601); the sorted planes were bounds-checked
+        // above and the pair-major planes are sized by the caller for every
+        // (token, slot) the sorted rows name
+        check(unsafe {
+            f(
+                sqp as *const _,
+                ssp as *const _,
+                srp as *const _,
+                slp as *const _,
+                bep as *const _,
+                fqp as *mut _,
+                fsp as *mut _,
+                ff as u32,
+                n_active as u32,
+                max_blocks as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Sorted k-quant MoE down mma: consumes the gate_up pair's
     /// sorted-contiguous fq/fs, writes deterministic (token, slot) weighted
     /// partials for `moe_slot_combine`. `fsums` (per-16 sums off the sorted
@@ -1634,7 +1787,7 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_mma
             .ok_or(GpuError::MissingOp("kquant_moe_down_mma"))?;
-        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);
         let (dsp, _g2) = down.scales.device_ptr(&self.stream);
@@ -1731,7 +1884,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemv_w4a8
             .ok_or(GpuError::MissingOp("kquant_gemv_w4a8"))?;
-        let (did, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
@@ -1758,6 +1911,79 @@ impl GpuExecutor {
                 yp as *mut _,
                 in_dim as u32,
                 out_dim as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::kquant_gemv_w4a8`] over output rows `first_row .. first_row +
+    /// rows` of the plane, written to `y[y_off ..]`. A repacked k-quant plane
+    /// is output-row contiguous in both streams (`n_super * data_bytes` and
+    /// `n_super * 24` scale bytes per row), so a row range is the same kernel
+    /// launched at offset pointers: no copy, no second residency, and each
+    /// row's value is the full launch's bit for bit (the kernel's per-row
+    /// reduction does not see `out_dim`). The MTP draft head's shortlisted
+    /// lm_head reads its two id ranges this way. k-quant family only - the
+    /// i-quant dense path has its own layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_gemv_w4a8_rows(
+        &self,
+        w: &RepackedKQ,
+        first_row: usize,
+        rows: usize,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        y_off: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_gemv_w4a8
+            .ok_or(GpuError::MissingOp("kquant_gemv_w4a8"))?;
+        if kq_is_iq(w.ty) {
+            return Err(GpuError::Unsupported(
+                "kquant_gemv_w4a8_rows: i-quant planes have no row-offset form".into(),
+            ));
+        }
+        let (did, _, data_bytes) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        let n_super = in_dim / 256;
+        if first_row + rows > out_dim || y_off + rows > y.len() || rows == 0 {
+            return Err(GpuError::Unsupported(format!(
+                "kquant_gemv_w4a8_rows: rows {first_row}+{rows} of {out_dim} into {} at {y_off}",
+                y.len()
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp_, _g2) = w.scales.device_ptr(&self.stream);
+        let (xqp, _g3) = xq.device_ptr(&self.stream);
+        let (xsp, _g4) = xs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match xsums {
+            Some(s) => {
+                (sump, _gs) = s.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (yp, _g5) = y.device_ptr_mut(&self.stream);
+        let data_off = (first_row * n_super * data_bytes) as u64;
+        let scale_off = (first_row * n_super * 24) as u64;
+        let y_off_b = (y_off * std::mem::size_of::<f32>()) as u64;
+        // SAFETY: pack ABI v1 contract; the offsets stay inside both weight
+        // streams and `y` (checked above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                (dp + data_off) as *const _,
+                (sp_ + scale_off) as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                sp,
+                (yp + y_off_b) as *mut _,
+                in_dim as u32,
+                rows as u32,
                 did,
                 self.stream_ptr(),
             )
@@ -1797,7 +2023,7 @@ impl GpuExecutor {
         let mut guards = Vec::with_capacity(9);
         for (i, (w, y)) in segs.iter_mut().enumerate() {
             assert_eq!(w.dims[0], in_dim, "segments share in_dim");
-            let (did, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+            let (did, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
             debug_assert!(y.len() >= w.dims[1]);
             let (d, g1) = w.data.device_ptr(&self.stream);
             let (s, g2) = w.scales.device_ptr(&self.stream);
@@ -1876,8 +2102,8 @@ impl GpuExecutor {
         assert_eq!(up.dims[0], in_dim, "gate/up share in_dim");
         assert_eq!(up.dims[1], out_dim, "gate/up share out_dim");
         debug_assert!(y.len() >= out_dim);
-        let (dtg, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
-        let (dtu, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (dtg, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (dtu, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let needs = crate::gpu::kq_needs_sums(gate.ty) || crate::gpu::kq_needs_sums(up.ty);
         let (gd, _g1) = gate.data.device_ptr(&self.stream);
         let (gs, _g2) = gate.scales.device_ptr(&self.stream);
@@ -1955,7 +2181,7 @@ impl GpuExecutor {
             .kernels
             .kquant_gemv_w4a8_nc
             .ok_or(GpuError::MissingOp("kquant_gemv_w4a8_nc"))?;
-        let (did, _, _) = kq_params(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (did, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * ncols);
         // launcher contract only - fits() is dispatch POLICY (what wins),
@@ -1984,6 +2210,74 @@ impl GpuExecutor {
                 xsp as *const _,
                 sp,
                 yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                ncols as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::kquant_gemv_w4a8_nc`] over activation rows `row_off ..
+    /// row_off + ncols` of a strided `quantize_q8` plane, written to
+    /// `y[row_off * out_dim ..]`. The kernel reads its columns from its `xq` /
+    /// `xs` / `xsums` pointers and writes `ncols * out_dim` from `y`, so a
+    /// column group is the same launch at offset pointers - how a verify
+    /// chunk wider than the kernel's 5 columns splits into groups without a
+    /// copy. Each column's value does not see the grouping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_gemv_w4a8_nc_at(
+        &self,
+        w: &RepackedKQ,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        row_off: usize,
+        ncols: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_gemv_w4a8_nc
+            .ok_or(GpuError::MissingOp("kquant_gemv_w4a8_nc"))?;
+        let (did, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        let end = row_off + ncols;
+        if !(2..=5).contains(&ncols)
+            || xq.len() < end * in_dim
+            || xs.len() < end * (in_dim / 32)
+            || xsums.is_some_and(|s| s.len() < end * (in_dim / 16))
+            || y.len() < end * out_dim
+        {
+            return Err(GpuError::Unsupported(format!(
+                "kquant_gemv_w4a8_nc_at: columns {row_off}+{ncols} of [{in_dim} -> {out_dim}] \
+                 past the staged planes"
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp_, _g2) = w.scales.device_ptr(&self.stream);
+        let (xqp, _g3) = xq.device_ptr(&self.stream);
+        let (xsp, _g4) = xs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match xsums {
+            Some(s) => {
+                (sump, _gs) = s.device_ptr(&self.stream);
+                (sump + (row_off * (in_dim / 16) * 4) as u64) as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (yp, _g5) = y.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract; every offset plane was bounds-checked
+        // above, pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp_ as *const _,
+                (xqp + (row_off * in_dim) as u64) as *const _,
+                (xsp + (row_off * (in_dim / 32) * 4) as u64) as *const _,
+                sp,
+                (yp + (row_off * out_dim * 4) as u64) as *mut _,
                 in_dim as u32,
                 out_dim as u32,
                 ncols as u32,

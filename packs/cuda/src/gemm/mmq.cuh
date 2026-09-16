@@ -1087,6 +1087,397 @@ int pd_q8_0_gemm_mmq_pipe(const void* data, const void* scale, const void* yq,
     return pd_launch_status();
 }
 
+// ---------------------------------------- mmq_pipe + hyper-connection mix (slot 605)
+// The hyper-connection UP ([lowrank -> 4 * hidden] Q8_0) and its gated mix
+//   out[d] = (1/4) sum_s sigmoid(gate[s*hidden + d]) * xn[s*hidden + d]
+// in one launch. The weight staging puts plane row (d, s) at tile slot
+// 32*floor(d/8) + d%8 + 8s, which makes a thread's four accumulator rows
+// (i0 + g, +8, +16, +24) ONE d's four streams for both of its columns, so the
+// epilogue folds the mix and writes the hidden-wide output: the [rows][4 *
+// hidden] gate plane is never written or read back (at prefill the separate
+// mix read 84 MB a call, at the bandwidth wall). A lane loads the float4 line
+// of xn holding its d - four lanes of a warp share it - where scalar loads
+// left the epilogue latency-bound. Every gate is the pipe tile's bits (its
+// bias-free `acc + 0.0f`) and the fold is pd_q4x_hc_mix's order, so the output
+// is byte-identical to pipe + mix (bench/hcup_mix_gb10_bench.cu, 1024 rows:
+// 613 -> 415 us a call). hidden % 8 == 0.
+__device__ __forceinline__ uint32_t pd_mmqp_hcmix_src(uint32_t p, uint32_t hidden) {
+    return ((p % 32u) >> 3) * hidden + 8u * (p / 32u) + ((p % 32u) & 7u);
+}
+
+__device__ __forceinline__ void pd_mmqp_hcmix_issue_w(
+    int* __restrict__ wbuf, const int8_t* __restrict__ data, const __half* __restrict__ scale,
+    uint32_t row_base, uint32_t out_dim, uint32_t hidden, uint32_t n_k32, uint32_t n_blocks,
+    uint32_t in_dim, uint32_t kc, uint32_t tid) {
+#if PD_MMA_OK
+    #pragma unroll
+    for (uint32_t it = 0; it < 4u; ++it) {
+        const uint32_t i = it * 256u + tid;
+        const uint32_t row = i >> 3, seg = i & 7u, gk4 = kc * 32u + seg * 4u;
+        const uint32_t p = row_base + row;
+        const bool ok = gk4 < n_k32 && p < out_dim;
+        const uint32_t src = ok ? pd_mmqp_hcmix_src(p, hidden) : 0u;
+        pd_cpa16p(wbuf + row * PD_MMQ_PIPE_WK + seg * 4u,
+                  (const char*)data + (size_t)src * in_dim + (size_t)(kc * 128u + seg * 16u), ok);
+    }
+    if (tid < 128u) {
+        const uint32_t gb = kc * 4u;
+        const uint32_t p = row_base + tid;
+        const bool row_ok = p < out_dim;
+        const uint32_t src = row_ok ? pd_mmqp_hcmix_src(p, hidden) : 0u;
+        char* dst = (char*)(wbuf + tid * PD_MMQ_PIPE_WK + 32u);
+        const char* s = (const char*)(scale + (size_t)src * n_blocks + gb);
+        pd_cpa4p(dst, s, row_ok && (gb + 1u < n_blocks));
+        pd_cpa4p(dst + 4u, s + 4u, row_ok && (gb + 3u < n_blocks));
+    }
+#endif
+}
+
+__global__ void __launch_bounds__(256, 1) pd_q8_0_gemm_mmq_pipe_hcmix_kernel(
+        const int8_t* __restrict__ data, const __half* __restrict__ scale,
+        const uint8_t* __restrict__ yq, const float* __restrict__ xn,
+        float* __restrict__ out, uint32_t in_dim, uint32_t hidden, uint32_t batch) {
+#if PD_MMA_OK
+    constexpr uint32_t HC = 4u;
+    extern __shared__ int pd_mmqp_sh[];
+    int* wbuf0 = pd_mmqp_sh;
+    int* wbuf1 = wbuf0 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf0 = wbuf1 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf1 = ybuf0 + 128 * PD_MMQ_YK;
+
+    const uint32_t out_dim = HC * hidden;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, t = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t n_k32 = in_dim >> 2;
+    const uint32_t n_blocks = in_dim >> 5;
+    const uint32_t n_chunks = (in_dim + 127u) >> 7;
+    const uint32_t nct = batch_pad >> 7;
+
+    const uint32_t tile = blockIdx.x;
+    const uint32_t row_base = (tile / nct) * 128u;
+    const uint32_t col_base = (tile % nct) * 128u;
+
+    float acc[16][4] = {};
+    pd_mmqp_hcmix_issue_w(wbuf0, data, scale, row_base, out_dim, hidden, n_k32, n_blocks, in_dim, 0u, tid);
+    {
+        const int* by0 = (const int*)(yq + ((size_t)0u * batch_pad + col_base) * 144u);
+        #pragma unroll
+        for (uint32_t it = 0; it < 5u; ++it)
+            if (it * 256u + tid < 1152u)
+                pd_cpa16p(ybuf0 + (it * 256u + tid) * 4u,
+                          (const char*)by0 + (size_t)(it * 256u + tid) * 16u, true);
+    }
+    asm volatile("cp.async.commit_group;");
+
+    for (uint32_t kc = 0; kc < n_chunks; ++kc) {
+        int* tw = (kc & 1u) ? wbuf1 : wbuf0;
+        int* ty = (kc & 1u) ? ybuf1 : ybuf0;
+        if (kc + 1u < n_chunks) {
+            int* nw = (kc & 1u) ? wbuf0 : wbuf1;
+            int* ny = (kc & 1u) ? ybuf0 : ybuf1;
+            pd_mmqp_hcmix_issue_w(nw, data, scale, row_base, out_dim, hidden, n_k32, n_blocks, in_dim,
+                                  kc + 1u, tid);
+            const int* by1 = (const int*)(yq + ((size_t)(kc + 1u) * batch_pad + col_base) * 144u);
+            #pragma unroll
+            for (uint32_t it = 0; it < 5u; ++it)
+                if (it * 256u + tid < 1152u)
+                    pd_cpa16p(ny + (it * 256u + tid) * 4u,
+                              (const char*)by1 + (size_t)(it * 256u + tid) * 16u, true);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+
+        int A[2][4][4];
+        float dA[2][2][4];
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = (i0 + n * 16u + g) * PD_MMQ_PIPE_WK;
+            const uint32_t r8 = (i0 + n * 16u + 8u + g) * PD_MMQ_PIPE_WK;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                A[n][kk][0] = tw[r0 + ko + t];
+                A[n][kk][1] = tw[r8 + ko + t];
+                A[n][kk][2] = tw[r0 + ko + 4u + t];
+                A[n][kk][3] = tw[r8 + ko + 4u + t];
+                dA[n][0][kk] = __half2float(((const __half*)(tw + r0 + 32u))[kk]);
+                dA[n][1][kk] = __half2float(((const __half*)(tw + r8 + 32u))[kk]);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+            const uint32_t jc = j0 + joff;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                const int b0 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + t];
+                const int b1 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + 4u + t];
+                const float dB0 = ((const float*)ty)[(jc + 2u * t) * PD_MMQ_YK + kk];
+                const float dB1 = ((const float*)ty)[(jc + 2u * t + 1u) * PD_MMQ_YK + kk];
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                        : "r"(A[n][kk][0]), "r"(A[n][kk][1]), "r"(A[n][kk][2]),
+                          "r"(A[n][kk][3]), "r"(b0), "r"(b1));
+                    acc[(j0 >> 3) + n][0] += dA[n][0][kk] * dB0 * (float)d0;
+                    acc[(j0 >> 3) + n][1] += dA[n][0][kk] * dB1 * (float)d1;
+                    acc[(j0 >> 3) + n][2] += dA[n][1][kk] * dB0 * (float)d2;
+                    acc[(j0 >> 3) + n][3] += dA[n][1][kk] * dB1 * (float)d3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // epilogue: this thread's d, its four streams, its 16 columns
+    const uint32_t p0 = row_base + i0;
+    if (p0 >= out_dim) return;
+    const uint32_t d = 8u * (p0 / 32u) + g;
+    const uint32_t dl = d & ~3u, dk = d & 3u;
+    #pragma unroll
+    for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+        const uint32_t c0 = col_base + j0 + joff + 2u * t;
+        #pragma unroll
+        for (uint32_t cc = 0; cc < 2u; ++cc) {
+            const uint32_t c = c0 + cc;
+            if (c >= batch) continue;
+            const float gs[4] = {acc[(j0 >> 3)][cc] + 0.0f, acc[(j0 >> 3)][2u + cc] + 0.0f,
+                                 acc[(j0 >> 3) + 1u][cc] + 0.0f, acc[(j0 >> 3) + 1u][2u + cc] + 0.0f};
+            const size_t xr = (size_t)c * out_dim;
+            float xv[4];
+            #pragma unroll
+            for (uint32_t s = 0; s < HC; ++s) {
+                const float4 f = *reinterpret_cast<const float4*>(xn + xr + (size_t)s * hidden + dl);
+                xv[s] = dk == 0u ? f.x : dk == 1u ? f.y : dk == 2u ? f.z : f.w;
+            }
+            float m = 0.0f;
+            #pragma unroll
+            for (uint32_t s = 0; s < HC; ++s) m += pd_q4x_sig(gs[s]) * xv[s];
+            out[(size_t)c * hidden + d] = m / (float)HC;
+        }
+    }
+#else
+    (void)data; (void)scale; (void)yq; (void)xn; (void)out;
+    (void)in_dim; (void)hidden; (void)batch;
+#endif
+}
+
+PD_EXPORT
+int pd_q8_0_gemm_mmq_pipe_hcmix(const void* data, const void* scale, const void* yq,
+                                const void* xn, void* out, uint32_t in_dim, uint32_t hidden,
+                                uint32_t batch, void* stream) {
+    if (hidden == 0 || batch == 0) return 0;
+    if ((in_dim & 31u) || (hidden & 7u) || xn == nullptr) return cudaErrorInvalidValue;
+    static cudaError_t attr = cudaFuncSetAttribute(
+        (const void*)pd_q8_0_gemm_mmq_pipe_hcmix_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_MMQ_PIPE_SMEM);
+    if (attr != cudaSuccess) return attr;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t nct = batch_pad >> 7;
+    const uint32_t ntiles = ((4u * hidden + 127u) / 128u) * nct;
+    pd_q8_0_gemm_mmq_pipe_hcmix_kernel<<<ntiles, 256, PD_MMQ_PIPE_SMEM, (cudaStream_t)stream>>>(
+        (const int8_t*)data, (const __half*)scale, (const uint8_t*)yq, (const float*)xn,
+        (float*)out, in_dim, hidden, batch);
+    return pd_launch_status();
+}
+
+// ---------------------------------------- slot 605 over a REBUILT normalized state (slot 608)
+// pd_q8_0_gemm_mmq_pipe_hcmix with each normalized value rebuilt from the
+// residual `h` with the combine's own expression (v * inv + (v * inv) * w, off
+// `aux` = [norm_w (4 * hidden) | 1/rms (rows * 4)] that slot 606 publishes)
+// instead of read from a stored [rows][4 * hidden] state. The epilogue issues
+// all of its loads (the 16 columns' four h lines and their 1/rms rows) before
+// any arithmetic: loading and rebuilding per column measured 583 us a call
+// against 357 staged (bench/combine_rn_gb10_bench.cu, 1024 rows; slot 605 over
+// the stored state 414). EIGHT kernel arguments on purpose - the same tile at
+// ten measured 590 us with its rebuild reduced to a plain load, 383 at eight.
+// Byte-identical to slot 605 over the stored state. dims = in_dim | hidden << 16.
+template <uint32_t HC>
+__global__ void __launch_bounds__(256, 1) pd_q8_0_gemm_mmq_pipe_hcmix_rn_kernel(
+        const int8_t* __restrict__ data, const __half* __restrict__ scale,
+        const uint8_t* __restrict__ yq, const float* __restrict__ h,
+        const float* __restrict__ aux, float* __restrict__ out, uint32_t dims, uint32_t batch) {
+#if PD_MMA_OK
+    extern __shared__ int pd_mmqp_sh[];
+    int* wbuf0 = pd_mmqp_sh;
+    int* wbuf1 = wbuf0 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf0 = wbuf1 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf1 = ybuf0 + 128 * PD_MMQ_YK;
+
+    const uint32_t in_dim = dims & 0xFFFFu, hidden = dims >> 16u;
+    const uint32_t out_dim = HC * hidden;
+    const float* norm_w = aux;
+    const float* nscale = aux + out_dim;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, t = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t n_k32 = in_dim >> 2;
+    const uint32_t n_blocks = in_dim >> 5;
+    const uint32_t n_chunks = (in_dim + 127u) >> 7;
+    const uint32_t nct = batch_pad >> 7;
+
+    const uint32_t tile = blockIdx.x;
+    const uint32_t row_base = (tile / nct) * 128u;
+    const uint32_t col_base = (tile % nct) * 128u;
+
+    float acc[16][4] = {};
+    pd_mmqp_hcmix_issue_w(wbuf0, data, scale, row_base, out_dim, hidden, n_k32, n_blocks, in_dim, 0u, tid);
+    {
+        const int* by0 = (const int*)(yq + ((size_t)0u * batch_pad + col_base) * 144u);
+        #pragma unroll
+        for (uint32_t it = 0; it < 5u; ++it)
+            if (it * 256u + tid < 1152u)
+                pd_cpa16p(ybuf0 + (it * 256u + tid) * 4u,
+                          (const char*)by0 + (size_t)(it * 256u + tid) * 16u, true);
+    }
+    asm volatile("cp.async.commit_group;");
+
+    for (uint32_t kc = 0; kc < n_chunks; ++kc) {
+        int* tw = (kc & 1u) ? wbuf1 : wbuf0;
+        int* ty = (kc & 1u) ? ybuf1 : ybuf0;
+        if (kc + 1u < n_chunks) {
+            int* nw = (kc & 1u) ? wbuf0 : wbuf1;
+            int* ny = (kc & 1u) ? ybuf0 : ybuf1;
+            pd_mmqp_hcmix_issue_w(nw, data, scale, row_base, out_dim, hidden, n_k32, n_blocks, in_dim,
+                                  kc + 1u, tid);
+            const int* by1 = (const int*)(yq + ((size_t)(kc + 1u) * batch_pad + col_base) * 144u);
+            #pragma unroll
+            for (uint32_t it = 0; it < 5u; ++it)
+                if (it * 256u + tid < 1152u)
+                    pd_cpa16p(ny + (it * 256u + tid) * 4u,
+                              (const char*)by1 + (size_t)(it * 256u + tid) * 16u, true);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+
+        int A[2][4][4];
+        float dA[2][2][4];
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = (i0 + n * 16u + g) * PD_MMQ_PIPE_WK;
+            const uint32_t r8 = (i0 + n * 16u + 8u + g) * PD_MMQ_PIPE_WK;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                A[n][kk][0] = tw[r0 + ko + t];
+                A[n][kk][1] = tw[r8 + ko + t];
+                A[n][kk][2] = tw[r0 + ko + 4u + t];
+                A[n][kk][3] = tw[r8 + ko + 4u + t];
+                dA[n][0][kk] = __half2float(((const __half*)(tw + r0 + 32u))[kk]);
+                dA[n][1][kk] = __half2float(((const __half*)(tw + r8 + 32u))[kk]);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+            const uint32_t jc = j0 + joff;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                const int b0 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + t];
+                const int b1 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + 4u + t];
+                const float dB0 = ((const float*)ty)[(jc + 2u * t) * PD_MMQ_YK + kk];
+                const float dB1 = ((const float*)ty)[(jc + 2u * t + 1u) * PD_MMQ_YK + kk];
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                        : "r"(A[n][kk][0]), "r"(A[n][kk][1]), "r"(A[n][kk][2]),
+                          "r"(A[n][kk][3]), "r"(b0), "r"(b1));
+                    acc[(j0 >> 3) + n][0] += dA[n][0][kk] * dB0 * (float)d0;
+                    acc[(j0 >> 3) + n][1] += dA[n][0][kk] * dB1 * (float)d1;
+                    acc[(j0 >> 3) + n][2] += dA[n][1][kk] * dB0 * (float)d2;
+                    acc[(j0 >> 3) + n][3] += dA[n][1][kk] * dB1 * (float)d3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // epilogue: this thread's d, its HC streams, its 16 columns - loads first
+    const uint32_t p0 = row_base + i0;
+    if (p0 >= out_dim) return;
+    const uint32_t d = 8u * (p0 / 32u) + g;
+    const uint32_t dl = d & ~3u, dk = d & 3u;
+    float wk[HC];
+    #pragma unroll
+    for (uint32_t s = 0; s < HC; ++s) {
+        const float4 wl = *reinterpret_cast<const float4*>(norm_w + (size_t)s * hidden + dl);
+        wk[s] = dk == 0u ? wl.x : dk == 1u ? wl.y : dk == 2u ? wl.z : wl.w;
+    }
+    float hs[16][HC];
+    float ns[16][HC];
+    #pragma unroll
+    for (uint32_t j = 0; j < 16u; ++j) {
+        const uint32_t c = col_base + (j >> 1) * 16u + joff + 2u * t + (j & 1u);
+        const uint32_t cs = c < batch ? c : 0u;  // a padded column loads row 0, never stores
+        const float4 nv = *reinterpret_cast<const float4*>(nscale + (size_t)cs * HC);
+        ns[j][0] = nv.x; ns[j][1] = nv.y; ns[j][2] = nv.z; ns[j][3] = nv.w;
+        #pragma unroll
+        for (uint32_t s = 0; s < HC; ++s) {
+            const float4 v = *reinterpret_cast<const float4*>(h + (size_t)cs * out_dim + (size_t)s * hidden + dl);
+            hs[j][s] = dk == 0u ? v.x : dk == 1u ? v.y : dk == 2u ? v.z : v.w;
+        }
+    }
+    #pragma unroll
+    for (uint32_t j = 0; j < 16u; ++j) {
+        const uint32_t j0 = (j >> 1) * 16u, cc = j & 1u;
+        const uint32_t c = col_base + j0 + joff + 2u * t + cc;
+        if (c >= batch) continue;
+        const float gs[4] = {acc[(j0 >> 3)][cc] + 0.0f, acc[(j0 >> 3)][2u + cc] + 0.0f,
+                             acc[(j0 >> 3) + 1u][cc] + 0.0f, acc[(j0 >> 3) + 1u][2u + cc] + 0.0f};
+        float m = 0.0f;
+        #pragma unroll
+        for (uint32_t s = 0; s < HC; ++s) {
+            const float hv = hs[j][s], inv = ns[j][s], wvv = wk[s];
+            const float xv = hv * inv + (hv * inv) * wvv;
+            m += pd_q4x_sig(gs[s]) * xv;
+        }
+        out[(size_t)c * hidden + d] = m / (float)HC;
+    }
+#else
+    (void)data; (void)scale; (void)yq; (void)h; (void)aux; (void)out; (void)dims; (void)batch;
+#endif
+}
+
+PD_EXPORT
+int pd_q8_0_gemm_mmq_pipe_hcmix_rn(const void* data, const void* scale, const void* yq,
+                                   const void* h, const void* aux, void* out, uint32_t in_dim,
+                                   uint32_t hidden, uint32_t batch, void* stream) {
+    if (hidden == 0 || batch == 0) return 0;
+    if ((in_dim & 31u) || in_dim > 0xFFFFu || (hidden & 7u) || hidden > 0xFFFFu || h == nullptr ||
+        aux == nullptr)
+        return cudaErrorInvalidValue;
+    static cudaError_t attr = cudaFuncSetAttribute(
+        (const void*)pd_q8_0_gemm_mmq_pipe_hcmix_rn_kernel<4u>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PD_MMQ_PIPE_SMEM);
+    if (attr != cudaSuccess) return attr;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t nct = batch_pad >> 7;
+    const uint32_t ntiles = ((4u * hidden + 127u) / 128u) * nct;
+    pd_q8_0_gemm_mmq_pipe_hcmix_rn_kernel<4u><<<ntiles, 256, PD_MMQ_PIPE_SMEM, (cudaStream_t)stream>>>(
+        (const int8_t*)data, (const __half*)scale, (const uint8_t*)yq, (const float*)h,
+        (const float*)aux, (float*)out, in_dim | (hidden << 16), batch);
+    return pd_launch_status();
+}
+
 // ---------------------------------------- mmq_pipe64 (small-grid variant)
 // pd_q8_0_gemm_mmq_pipe with the K stage halved to 64: each buffer drops to
 // 128 rows x 20 int32, the four tiles fit 40 KB, and __launch_bounds__(256,2)

@@ -2074,6 +2074,138 @@ impl GpuExecutor {
         })
     }
 
+    /// [`Self::gated_delta_recurrent_pn_at`] over rows `row0..row0 + n_tokens`
+    /// of the walk's planes, the row offsets riding the pointers: a prefill
+    /// walk stops the recurrence at a prefix-cache checkpoint row, copies the
+    /// state out and goes on. The pn walk is a sequential token loop, so the
+    /// rows land as one call over the whole span would put them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrent_pn_rows(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        g: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        state_elem_off: usize,
+        out: &mut CudaSlice<f32>,
+        rn: &mut CudaSlice<f32>,
+        row0: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        v_dim: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .gated_delta_recurrent_pn
+            .ok_or(GpuError::MissingOp("gated_delta_recurrent_pn"))?;
+        let (kdim, vdim) = (n_heads * head_dim, n_heads * v_dim);
+        let end = row0 + n_tokens;
+        debug_assert!(state_elem_off + n_heads * head_dim * head_dim <= state.len());
+        debug_assert!(q.len() >= end * kdim && k.len() >= end * kdim && v.len() >= end * vdim);
+        debug_assert!(g.len() >= end * n_heads && beta.len() >= end * n_heads);
+        debug_assert!(out.len() >= end * vdim && rn.len() >= end * n_heads * 2);
+        let at = |p: u64, per_row: usize| p + (row0 * per_row * 4) as u64;
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (gp, _g4) = g.device_ptr(&self.stream);
+        let (bp, _g5) = beta.device_ptr(&self.stream);
+        let (sp, _g6) = state.device_ptr_mut(&self.stream);
+        let (op, _g7) = out.device_ptr_mut(&self.stream);
+        let (rp, _g8) = rn.device_ptr_mut(&self.stream);
+        let sp_off = sp + state_elem_off as u64 * Self::dn_state_esz();
+        // SAFETY: pack ABI v1 contract (slot 596); every offset row range is
+        // inside its plane (asserted above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                at(qp, kdim) as *const _,
+                at(kp, kdim) as *const _,
+                at(vp, vdim) as *const _,
+                at(gp, n_heads) as *const _,
+                at(bp, n_heads) as *const _,
+                sp_off as *mut _,
+                at(op, vdim) as *mut _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                at(rp, n_heads * 2) as *mut _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the segment-tiled single-sequence walk
+    /// (slot 604) - slot 596's class for a 128-wide head.
+    pub fn has_gated_delta_recurrent_seg(&self) -> bool {
+        self.kernels.gated_delta_recurrent_seg.is_some()
+    }
+
+    /// Slot 604 over rows `row0..row0 + n_tokens` of the walk's planes, the
+    /// row offsets riding the pointers as in
+    /// [`Self::gated_delta_recurrent_pn_rows`]. `gates` is caller scratch of
+    /// `n_tokens * n_heads * 4` floats a row ({exp(g), beta, q norm, k norm},
+    /// the pack's pre-pass fills it). 128-wide heads whose v columns are the
+    /// state's (`v_dim == head_dim`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrent_seg_rows(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        g: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        state_elem_off: usize,
+        out: &mut CudaSlice<f32>,
+        gates: &mut CudaSlice<f32>,
+        row0: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .gated_delta_recurrent_seg
+            .ok_or(GpuError::MissingOp("gated_delta_recurrent_seg"))?;
+        let kdim = n_heads * head_dim;
+        let end = row0 + n_tokens;
+        debug_assert!(state_elem_off + n_heads * head_dim * head_dim <= state.len());
+        debug_assert!(q.len() >= end * kdim && k.len() >= end * kdim && v.len() >= end * kdim);
+        debug_assert!(g.len() >= end * n_heads && beta.len() >= end * n_heads);
+        debug_assert!(out.len() >= end * kdim && gates.len() >= end * n_heads * 4);
+        let at = |p: u64, per_row: usize| p + (row0 * per_row * 4) as u64;
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (gp, _g4) = g.device_ptr(&self.stream);
+        let (bp, _g5) = beta.device_ptr(&self.stream);
+        let (sp, _g6) = state.device_ptr_mut(&self.stream);
+        let (op, _g7) = out.device_ptr_mut(&self.stream);
+        let (xp, _g8) = gates.device_ptr_mut(&self.stream);
+        let sp_off = sp + state_elem_off as u64 * Self::dn_state_esz();
+        // SAFETY: pack ABI v1 contract (slot 604); every offset row range is
+        // inside its plane (asserted above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                at(qp, kdim) as *const _,
+                at(kp, kdim) as *const _,
+                at(vp, kdim) as *const _,
+                at(gp, n_heads) as *const _,
+                at(bp, n_heads) as *const _,
+                sp_off as *mut _,
+                at(op, kdim) as *mut _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                at(xp, n_heads * 4) as *mut _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn gated_delta_recurrent_at(
         &self,
         q: &CudaSlice<f32>,
@@ -2227,6 +2359,90 @@ impl GpuExecutor {
                 mp,
                 gn_eps,
                 batch as u32,
+                n_heads as u32,
+                head_dim as u32,
+                self.stream_ptr(),
+            )
+        };
+        if rc == -1 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
+    }
+
+    /// Slot 599: the decode GDN body (slot 564's per-token state load/store
+    /// and, with `gn`, its fused gated norm) walked over each run's rows in
+    /// one launch - every row lands where the decode tick lands on that token,
+    /// which is the row-exact spec verify's contract. `gn = None` writes the
+    /// plain recurrence output (the rollback replay, where only the state
+    /// matters). Runs index the staged `[rows, ...]` planes by `run_off` /
+    /// `run_len` and the state arena by `run_slot`; runs must name distinct
+    /// slots. `Ok(false)` when the pack predates the slot or declines the
+    /// geometry (non-f32 state, runtime-D, the generic pin, slot 564's kill
+    /// switch) - the caller keeps its per-row calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrent_runs_slots(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        g: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        states: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        run_off: &CudaSlice<u32>,
+        run_len: &CudaSlice<u32>,
+        run_slot: &CudaSlice<u32>,
+        gn: Option<(&CudaSlice<f32>, &CudaSlice<f32>, f32)>,
+        n_runs: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.gated_delta_recurrent_runs_slots else {
+            return Ok(false);
+        };
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (gp, _g4) = g.device_ptr(&self.stream);
+        let (bp, _g5) = beta.device_ptr(&self.stream);
+        let (rop, _g6) = run_off.device_ptr(&self.stream);
+        let (rlp, _g7) = run_len.device_ptr(&self.stream);
+        let (rsp, _g8) = run_slot.device_ptr(&self.stream);
+        let (stp, _g9) = states.device_ptr_mut(&self.stream);
+        let (op, _g10) = out.device_ptr_mut(&self.stream);
+        let (zp, _gz, wp, _gw, eps);
+        let (zptr, wptr): (*const core::ffi::c_void, *const core::ffi::c_void) = match gn {
+            Some((z, w, e)) => {
+                (zp, _gz) = z.device_ptr(&self.stream);
+                (wp, _gw) = w.device_ptr(&self.stream);
+                eps = e;
+                (zp as *const _, wp as *const _)
+            }
+            None => {
+                eps = 0.0;
+                (core::ptr::null(), core::ptr::null())
+            }
+        };
+        // SAFETY: ABI contract (slot 599); the pack declines unsupported
+        // geometries with -1, carried back as Ok(false).
+        let rc = unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                gp as *const _,
+                bp as *const _,
+                stp as *mut _,
+                op as *mut _,
+                rop as *const _,
+                rlp as *const _,
+                rsp as *const _,
+                zptr,
+                wptr,
+                eps,
+                n_runs as u32,
                 n_heads as u32,
                 head_dim as u32,
                 self.stream_ptr(),

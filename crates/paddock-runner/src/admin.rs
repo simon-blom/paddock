@@ -136,6 +136,9 @@ async fn shutdown(
                 "drain timed out; exiting with requests still in flight"
             );
         }
+        // process::exit runs no destructors, so the socket file has to go by
+        // hand or the manager sees this port as serving after we are gone
+        paddock_admin::server::release();
         std::process::exit(0);
     });
     (

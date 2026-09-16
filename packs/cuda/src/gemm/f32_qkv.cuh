@@ -1164,7 +1164,16 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
     if (out_dim == 0 || batch == 0) return 0;
     // Large-batch (prefill-chunk) router: tiled GEMM instead of the matvec
     // tile - see pd_gemm_f32_nt_kernel. Alignment: BN|out_dim, 4|in_dim's
-    // float4 loads, BK|in_dim. Env-gated (accumulation-order change).
+    // float4 loads, BK|in_dim. It reassociates the K walk against the matvec
+    // tile, which is why it waited for a gate rather than defaulting.
+    //
+    // ELECTED on small dies from 2026-09-16 (GB10, 48 SMs): qwen4exp's router
+    // is [2560 -> 512] f32 at 1024 rows, and the matvec tile re-reads x per
+    // output tile - 0.996 ms a layer against a ~0.08 ms traffic floor, 47.8 ms
+    // of a 725 ms prefill walk. On this arm the same launch is 0.389 (18.7 a
+    // walk): -61%, walk 725.5 -> 694.1, prefill 749.5 -> 711.4 ms and 1366 ->
+    // 1440 tok/s, all 128 golden tokens and seed 6184 intact. `rg_min` still
+    // holds the row floor, so decode and small chunks keep the matvec tile.
     static const bool rgemm = pd_env("PADDOCK_ROUTER_GEMM") != nullptr;
     // skinny-out K-split rung (pd_gemm_f32_nt_ks_kernel above): exact-f32
     // FMA per window, deterministic combine; refills the wave the decay/ba
@@ -1230,7 +1239,8 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
             return pd_f32nt_ks_go((const float*)w, (const float*)x, (float*)out,
                                   in_dim, out_dim, batch, S, (cudaStream_t)stream);
     }
-    if (rgemm && batch >= rg_min && (out_dim % 32u) == 0u &&
+    const bool rgemm_small = nsm_sk < 128 && pd_env("PADDOCK_NO_ROUTER_GEMM") == nullptr;
+    if ((rgemm || rgemm_small) && batch >= rg_min && (out_dim % 32u) == 0u &&
         (in_dim % PD_RGEMM_BK) == 0u) {
         // Tile by GRID FILL. Per output element the K walk (k0 chunks, kk
         // ascending, one owning thread) is tile-size-invariant, so every

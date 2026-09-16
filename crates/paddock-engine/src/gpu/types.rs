@@ -301,8 +301,34 @@ pub(crate) fn kq_params(ty: GgmlType) -> Option<(u32, usize, usize)> {
         // the low-bit k-quants on the i-quant lanes: 16-weight scale windows
         GgmlType::Q2K => Some((10, 84, 64)),
         GgmlType::Q3K => Some((11, 110, 96)),
+        // Q5_1: a flat 32-weight block format on the i-quant lanes (routed
+        // expert down in UD-Q4_K_XL exports): 8 x 24 B raw per 256 weights,
+        // the nibbles as data and {d, m, qh} per block as the record. Gate on
+        // GpuExecutor::has_kquant_flat32.
+        GgmlType::Q5_1 => Some((7, 192, 128)),
         _ => None,
     }
+}
+
+/// The repack/kernel layout of a type that can sit in a `RepackedKQ` -
+/// `kq_params` plus Q8_0 as a flat 32-weight block format on the i-quant
+/// lanes (8 x 34 B raw, the int8 bytes as data, one f16 d per block as the
+/// record). Kept apart from `kq_params` on purpose: that function answers
+/// "is this a k-quant-lane type" for every loader's dispatch, and Q8_0 must
+/// keep taking its own repacked-Q8 lanes there. A Q8_0 `RepackedKQ` exists
+/// only where a caller asks for one by name (qwen4exp's mixed expert seat).
+pub(crate) fn kq_layout(ty: GgmlType) -> Option<(u32, usize, usize)> {
+    match ty {
+        GgmlType::Q8_0 => Some((8, 272, 256)),
+        _ => kq_params(ty),
+    }
+}
+
+/// 32-weight block formats whose rows lie flat in the repacked streams (a row
+/// need not be a whole number of 256-weight super-blocks): IQ4_NL, Q5_1, Q8_0.
+/// Mirrors the pack's `pd_kq_flat32`.
+pub(crate) fn kq_flat32(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::Iq4Nl | GgmlType::Q5_1 | GgmlType::Q8_0)
 }
 
 /// Repacked scale-record bytes per super-block (the pack's `pd_kq_scb`):
@@ -315,6 +341,9 @@ pub(crate) fn kq_scb(ty: GgmlType) -> usize {
         GgmlType::Iq3S => 8,
         GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq1M => 12,
         GgmlType::Iq4Nl => 16,
+        // flat 32-weight blocks: {f16 d, f16 m, u32 qh} / f16 d per block
+        GgmlType::Q5_1 => 64,
+        GgmlType::Q8_0 => 16,
         _ => 24,
     }
 }
@@ -334,6 +363,8 @@ pub(crate) fn kq_is_iq(ty: GgmlType) -> bool {
             | GgmlType::Iq4Nl
             | GgmlType::Q2K
             | GgmlType::Q3K
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
     )
 }
 
@@ -343,7 +374,7 @@ pub(crate) fn kq_is_iq(ty: GgmlType) -> bool {
 pub(crate) fn kq_needs_sums(ty: GgmlType) -> bool {
     matches!(
         ty,
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_0 | GgmlType::Q2K
+        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_0 | GgmlType::Q2K | GgmlType::Q5_1
     )
 }
 

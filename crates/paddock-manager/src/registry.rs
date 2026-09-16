@@ -2298,6 +2298,38 @@ mod tests {
         );
     }
 
+    /// `speculative` and the drafter artifact travel together.
+    ///
+    /// The resolver wires a default drafter as `--mtp` on its own, but a spawn
+    /// ASKED to speculate refuses unless the model claims `speculative` - so a
+    /// drafter catalogued without the capability is bytes nobody can turn on,
+    /// and the capability without in-file heads or a drafter is a promise the
+    /// runner cannot keep. Both are one-line catalog edits away (a drafter
+    /// added to an entry that predates it, as Flash-Next's was), so the pair
+    /// is checked here rather than remembered.
+    #[test]
+    fn speculative_capability_matches_a_drafter_or_in_file_heads() {
+        let reg = Registry::new(std::path::PathBuf::from("./models"));
+        let mut claims_without_means = Vec::new();
+        let mut drafter_without_claim = Vec::new();
+        for m in &reg.catalog().models {
+            let claims = m.capability.iter().any(|c| c == "speculative");
+            let drafter = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Drafter);
+            if claims && !drafter && !m.mtp_in_file {
+                claims_without_means.push(m.id.clone());
+            }
+            if drafter && !claims {
+                drafter_without_claim.push(m.id.clone());
+            }
+        }
+        assert!(
+            claims_without_means.is_empty() && drafter_without_claim.is_empty(),
+            "claim `speculative` with neither in-file heads nor a drafter: \
+             {claims_without_means:?}; catalogue a drafter without claiming \
+             `speculative`: {drafter_without_claim:?}"
+        );
+    }
+
     #[test]
     fn a_published_shape_round_trips_through_the_estimator() {
         let reg = Registry::new(std::path::PathBuf::from("./models"));

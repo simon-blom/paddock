@@ -329,11 +329,23 @@ export const useFleetStore = defineStore('fleet', () => {
   })
 
   /** Configured endpoints with nothing serving them and nothing in flight on
-   *  their port - the "ready to start again" rows. */
+   *  their port - the "ready to start again" rows.
+   *
+   *  Liveness comes from `rows` (the runners list) and NOTHING else. It used to
+   *  also require `!c.running`, which is the manager's own flag on
+   *  /api/servers - and the two are computed from different predicates:
+   *  /api/servers calls a port running if a record exists OR its admin socket
+   *  enumerates, while /api/runners only emits a row if `identify` answers or a
+   *  record exists. A port that enumerates but does not answer and has no
+   *  record therefore satisfied `c.running` while producing no row, so the
+   *  endpoint appeared in NEITHER list and simply vanished from the UI - with
+   *  its config still on disk the whole time. Trusting one source removes the
+   *  asymmetry: no row means not serving, whatever the other flag says, and the
+   *  worst case is a Start button on something already running (which the
+   *  manager refuses safely) instead of an endpoint the user cannot see. */
   const stopped = computed(() =>
     configured.value.filter(
       (c) =>
-        !c.running &&
         !rows.value.some((r) => r.port === c.port) &&
         !deploying.value.some((d) => d.port === c.port) &&
         !useDownloadsStore().active.some((j) => j.start?.port === c.port),

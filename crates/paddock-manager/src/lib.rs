@@ -193,6 +193,27 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Reconciliation is the SOLE owner of the record map, so it cannot be a
+    // boot-only pass. It used to be, and `list()` - a read path, called every
+    // 2s behind the SSE watcher - quietly did the job instead: adopting any
+    // port that answered, and never removing anything. That is what let a
+    // record outlive its runner (nothing pruned) and come back moments after
+    // `stop()` dropped it (the runner still answers while it drains). Read
+    // paths render the world now; this owns it.
+    //
+    // Sleep-then-run rather than an interval: a pass probes every enumerable
+    // port with a 2s identify timeout, so a slow one must not stack up behind
+    // itself. Drift is fine - nothing here is a deadline.
+    {
+        let sup = supervisor.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                sup.reconcile().await;
+            }
+        });
+    }
+
     // The collector: event-ring subscription (§8.1) + the usage-metrics
     // scrape, per the activity mode - `aggregates`
     // keeps the rollups while writing no per-request rows, and `off` runs

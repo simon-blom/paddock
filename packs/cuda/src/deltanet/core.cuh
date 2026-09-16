@@ -797,6 +797,188 @@ int pd_gated_delta_recurrent_pn(const void* q, const void* k, const void* v,
     return cudaErrorInvalidValue;
 }
 
+// ---- slot 604: the single-sequence walk, SEGMENT-TILED (head_dim 128) -------
+// Slot 596 holds D/P = 8 state rows a thread over 768 blocks (48 heads x 16):
+// with that little to carry per thread, its per-token loads, two 4-level lane
+// butterflies and block traffic are the walk. Here a thread carries 32 state
+// floats and a head is 4 blocks:
+//  * block (head, 32 state columns); warp w = 8 of them; an 8-lane SEGMENT s
+//    (lanes 8s..8s+7) = 2 columns; lane j of a segment = rows {4j + 32m},
+//    m = 0..3, of both columns - four float4 quads a column.
+//  * a column's dot is 32 quad dots: the tree's first two levels are local
+//    adds of a lane's 4 quads, the last three xor shuffles stay inside the
+//    segment, and the segment's 2 columns share each shuffle instruction.
+//  * the pre-pass takes {exp(g), beta, rn_q / sqrt(D), rn_k} a (token, head)
+//    once - the same 128-thread tree as pd_gdn_qk_rnorm_kernel for the norms -
+//    so a lane loads one float4 of scalars a token.
+//  * 192 blocks at a hint of 4 an SM is one wave on the GB10's 48 SMs; the
+//    hint is most of the win (bench/gdn_prefill_gb10_bench.cu, 1024 tokens,
+//    ms a layer: slot 596 2.76 (walk 2.51), this walk unhinted 1.67, hinted
+//    0.89, 8 an SM 8.5; the pre-pass 0.23). A two-token operand double buffer
+//    and pre-normalized q/k measured nothing worth their register sets /
+//    planes.
+// Numeric class: the norms and the gates are the pre-pass's bits; the two dots
+// re-associate (quad-local, then the segment tree) - slot 596's wave-prefill
+// class, max |d| ~1e-8 on the bench's out plane and carried state. Still a
+// sequential token loop, so a span split at a checkpoint row is exact.
+__global__ __launch_bounds__(128) void pd_gdn_prep4_kernel(
+        const float* __restrict__ q, const float* __restrict__ k,
+        const float* __restrict__ g, const float* __restrict__ beta,
+        float* __restrict__ gp, uint32_t n_heads) {
+    constexpr uint32_t D = 128u;
+    const uint32_t t = blockIdx.x, h = blockIdx.y, j = threadIdx.x;
+    extern __shared__ float smem[];
+    float* q_sh = smem;
+    float* k_sh = smem + D;
+    const size_t base = ((size_t)t * n_heads + h) * (size_t)D;
+    const float qj = q[base + j];
+    const float kj = k[base + j];
+    q_sh[j] = qj * qj;
+    k_sh[j] = kj * kj;
+    __syncthreads();
+    for (uint32_t s = D >> 1; s > 0; s >>= 1) {
+        if (j < s) { q_sh[j] += q_sh[j + s]; k_sh[j] += k_sh[j + s]; }
+        __syncthreads();
+    }
+    if (j == 0) {
+        const size_t th = (size_t)t * n_heads + h;
+        gp[th * 4u] = expf(g[th]);
+        gp[th * 4u + 1u] = beta[th];
+        gp[th * 4u + 2u] = rsqrtf(q_sh[0] + 1e-6f) * rsqrtf((float)D);
+        gp[th * 4u + 3u] = rsqrtf(k_sh[0] + 1e-6f);
+    }
+}
+
+__device__ __forceinline__ float pd_gdn_seg_dot4(float4 a, float4 b) {
+    float acc = __fmul_rn(a.y, b.y);
+    acc = __fmaf_rn(a.x, b.x, acc);
+    acc = __fmaf_rn(a.z, b.z, acc);
+    acc = __fmaf_rn(a.w, b.w, acc);
+    return acc;
+}
+
+// the segment tree's last three levels for the segment's two columns
+__device__ __forceinline__ void pd_gdn_seg_sum2(float& a, float& b) {
+    #pragma unroll
+    for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+        const float sa = __shfl_xor_sync(0xffffffffu, a, off);
+        const float sb = __shfl_xor_sync(0xffffffffu, b, off);
+        a = __fadd_rn(a, sa);
+        b = __fadd_rn(b, sb);
+    }
+}
+
+__global__ __launch_bounds__(128, 4) void pd_gated_delta_recurrent_seg_kernel(
+        const float* __restrict__ q, const float* __restrict__ k,
+        const float* __restrict__ v, const float* __restrict__ gp,
+        float* __restrict__ state, float* __restrict__ out,
+        uint32_t n_tokens, uint32_t n_heads) {
+    constexpr uint32_t D = 128u;
+    const uint32_t h = blockIdx.x;
+    if (h >= n_heads) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid >> 5u, lane = tid & 31u;
+    const uint32_t seg = lane >> 3u, jl = lane & 7u;
+    const uint32_t c0 = blockIdx.y * 32u + warp * 8u + seg * 2u;  // columns c0, c0 + 1
+    const uint32_t r0 = jl * 4u;                                  // rows r0 + 32m .. + 3
+    float* s_head = state + (size_t)h * D * D;
+
+    float4 hs[2][4];  // [column][quad]
+    #pragma unroll
+    for (uint32_t c = 0; c < 2u; ++c) {
+        #pragma unroll
+        for (uint32_t m = 0; m < 4u; ++m) {
+            const size_t rr = r0 + 32u * m;
+            hs[c][m] = make_float4(s_head[rr * D + c0 + c], s_head[(rr + 1u) * D + c0 + c],
+                                   s_head[(rr + 2u) * D + c0 + c], s_head[(rr + 3u) * D + c0 + c]);
+        }
+    }
+
+    size_t th = h, base = (size_t)h * D;
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const float4 gv = *reinterpret_cast<const float4*>(gp + th * 4u);
+        const float gt = gv.x, bt = gv.y, rq = gv.z, rk = gv.w;
+        float4 qn[4], kn[4];
+        #pragma unroll
+        for (uint32_t m = 0; m < 4u; ++m) {
+            const float4 qa = *reinterpret_cast<const float4*>(q + base + r0 + 32u * m);
+            const float4 ka = *reinterpret_cast<const float4*>(k + base + r0 + 32u * m);
+            qn[m] = make_float4(qa.x * rq, qa.y * rq, qa.z * rq, qa.w * rq);
+            kn[m] = make_float4(ka.x * rk, ka.y * rk, ka.z * rk, ka.w * rk);
+        }
+        const float2 vv = *reinterpret_cast<const float2*>(v + base + c0);
+        float u[2];
+        #pragma unroll
+        for (uint32_t c = 0; c < 2u; ++c) {
+            float p[4];
+            #pragma unroll
+            for (uint32_t m = 0; m < 4u; ++m) {
+                hs[c][m].x = __fmul_rn(hs[c][m].x, gt);
+                hs[c][m].y = __fmul_rn(hs[c][m].y, gt);
+                hs[c][m].z = __fmul_rn(hs[c][m].z, gt);
+                hs[c][m].w = __fmul_rn(hs[c][m].w, gt);
+                p[m] = pd_gdn_seg_dot4(hs[c][m], kn[m]);
+            }
+            u[c] = __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]));
+        }
+        pd_gdn_seg_sum2(u[0], u[1]);
+        const float dl[2] = {__fmul_rn(__fsub_rn(vv.x, u[0]), bt),
+                             __fmul_rn(__fsub_rn(vv.y, u[1]), bt)};
+        float o[2];
+        #pragma unroll
+        for (uint32_t c = 0; c < 2u; ++c) {
+            float p[4];
+            #pragma unroll
+            for (uint32_t m = 0; m < 4u; ++m) {
+                hs[c][m].x = __fmaf_rn(kn[m].x, dl[c], hs[c][m].x);
+                hs[c][m].y = __fmaf_rn(kn[m].y, dl[c], hs[c][m].y);
+                hs[c][m].z = __fmaf_rn(kn[m].z, dl[c], hs[c][m].z);
+                hs[c][m].w = __fmaf_rn(kn[m].w, dl[c], hs[c][m].w);
+                p[m] = pd_gdn_seg_dot4(hs[c][m], qn[m]);
+            }
+            o[c] = __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]));
+        }
+        pd_gdn_seg_sum2(o[0], o[1]);
+        if (jl == 0u) {
+            out[base + c0] = o[0];
+            out[base + c0 + 1u] = o[1];
+        }
+        th += n_heads;
+        base += (size_t)n_heads * D;
+    }
+
+    #pragma unroll
+    for (uint32_t c = 0; c < 2u; ++c) {
+        #pragma unroll
+        for (uint32_t m = 0; m < 4u; ++m) {
+            const size_t rr = r0 + 32u * m;
+            s_head[rr * D + c0 + c] = hs[c][m].x;
+            s_head[(rr + 1u) * D + c0 + c] = hs[c][m].y;
+            s_head[(rr + 2u) * D + c0 + c] = hs[c][m].z;
+            s_head[(rr + 3u) * D + c0 + c] = hs[c][m].w;
+        }
+    }
+}
+
+// Slot 596's arguments with `gp` in place of `rn`: caller scratch of
+// n_tokens * n_heads * 4 floats. head_dim 128 (the v columns are the state's).
+PD_EXPORT
+int pd_gated_delta_recurrent_seg(const void* q, const void* k, const void* v,
+                                 const void* g, const void* beta, void* state,
+                                 void* out, uint32_t n_tokens, uint32_t n_heads,
+                                 uint32_t head_dim, void* gp, void* stream) {
+    if (pd_dns_nonf32_env()) return cudaErrorInvalidValue;
+    if (n_tokens == 0 || n_heads == 0) return 0;
+    if (head_dim != 128u || gp == nullptr) return cudaErrorInvalidValue;
+    cudaStream_t st = (cudaStream_t)stream;
+    pd_gdn_prep4_kernel<<<dim3(n_tokens, n_heads), 128u, (size_t)2 * 128u * sizeof(float), st>>>(
+        (const float*)q, (const float*)k, (const float*)g, (const float*)beta, (float*)gp, n_heads);
+    pd_gated_delta_recurrent_seg_kernel<<<dim3(n_heads, 4u), 128u, 0u, st>>>(
+        (const float*)q, (const float*)k, (const float*)v, (const float*)gp, (float*)state,
+        (float*)out, n_tokens, n_heads);
+    return pd_launch_status();
+}
+
 // Depthwise causal conv1d (kernel k) + SiLU - DeltaNet input conv. One thread per
 // (t,c) output; zero left-padding. x [T,conv_dim], w [conv_dim,k] (w[c*k+kk]).
 __global__ void pd_causal_conv1d_silu_kernel(

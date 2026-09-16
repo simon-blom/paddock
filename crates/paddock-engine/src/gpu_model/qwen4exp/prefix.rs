@@ -101,6 +101,48 @@ pub(super) struct PrefixCache {
     max_descs: usize,
     last_reused: Vec<usize>,
     stats: bool,
+    /// per pool index: the (length, hash) of the prompt that took the
+    /// checkpoint INSIDE its own prefill walk - an exact re-send of that prompt
+    /// prefills cold (see `resume`). None for a checkpoint a walk boundary
+    /// took (cut walks, the reply checkpoint).
+    src: Vec<Option<(usize, u64)>>,
+}
+
+/// A checkpoint blob in the pool as a prefill walk writes it from inside
+/// itself - `copy_state`'s layout: per GDN layer, in layer order, the
+/// recurrence then its conv window, then the PLE ring.
+pub(super) struct CkptSink<'a> {
+    pub(super) pool: &'a mut CudaSlice<f32>,
+    pub(super) ckpt_f32: usize,
+    pub(super) st_elems: usize,
+    pub(super) win_elems: usize,
+}
+
+impl CkptSink<'_> {
+    /// Element offset of GDN layer `gdn_ord`'s recurrence in checkpoint `idx`.
+    pub(super) fn state_off(&self, idx: u32, gdn_ord: usize) -> usize {
+        idx as usize * self.ckpt_f32 + gdn_ord * (self.st_elems + self.win_elems)
+    }
+    /// Element offset of GDN layer `gdn_ord`'s conv window in checkpoint `idx`.
+    pub(super) fn win_off(&self, idx: u32, gdn_ord: usize) -> usize {
+        self.state_off(idx, gdn_ord) + self.st_elems
+    }
+    /// Element offset of the PLE ring in checkpoint `idx` (after all `n_gdn`).
+    pub(super) fn ple_off(&self, idx: u32, n_gdn: usize) -> usize {
+        idx as usize * self.ckpt_f32 + n_gdn * (self.st_elems + self.win_elems)
+    }
+}
+
+/// FNV-1a over a prompt's ids: which prompt took an in-walk checkpoint.
+fn prompt_hash(tokens: &[u32]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &t in tokens {
+        for b in t.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 impl PrefixCache {
@@ -187,6 +229,7 @@ impl PrefixCache {
             max_descs,
             last_reused: vec![0; slots],
             stats: paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some(),
+            src: vec![None; n_ckpt],
         }))
     }
 
@@ -217,6 +260,17 @@ impl PrefixCache {
         let Some((pos, idx)) = m.ckpt else {
             return Ok(0);
         };
+        // An exact re-send of the prompt that took this checkpoint inside its
+        // own walk prefills cold: resuming would replay rows the first run
+        // computed inside one walk through a shorter one, and the two agree
+        // only to the last ulp. Cold, the re-send is bit-identical to the
+        // first run (the in-walk checkpoint trade, chosen 2026-09-15).
+        if self.src.get(idx as usize).copied().flatten() == Some((t_len, prompt_hash(tokens))) {
+            if self.stats {
+                tracing::info!("qwen4exp-resume: t_len {t_len} is an exact re-send - cold");
+            }
+            return Ok(0);
+        }
         if pos < MIN_RESUME || pos >= t_len || m.blocks.len() * BLOCK_TOKENS < pos {
             if self.stats {
                 tracing::info!(
@@ -300,12 +354,55 @@ impl PrefixCache {
             && let Some(idx) = self.radix.attach_state(tokens, upto)
         {
             self.copy_state(exec, slot, idx, recur, gdn_win, ple_win, Dir::Store)?;
+            if let Some(s) = self.src.get_mut(idx as usize) {
+                *s = None;
+            }
             if self.stats {
                 tracing::info!("qwen4exp-ckpt: slot {slot} cut {upto} idx {idx}");
             }
             return Ok(Some(idx));
         }
         Ok(None)
+    }
+
+    /// The pool as a prefill walk writes in-walk checkpoints into it.
+    pub(super) fn ckpt_sink(&mut self) -> CkptSink<'_> {
+        CkptSink {
+            pool: &mut self.state_pool,
+            ckpt_f32: self.ckpt_f32,
+            st_elems: self.st_elems,
+            win_elems: self.win_elems,
+        }
+    }
+
+    /// A state-pool index for a checkpoint the next walk writes from inside
+    /// itself (attach it with [`Self::attach_reserved`] once the pages up to
+    /// its cut are filed, or give it back with [`Self::recycle_ckpt`]).
+    pub(super) fn reserve_ckpt(&mut self) -> Option<u32> {
+        self.radix.reserve_state_slot()
+    }
+
+    /// Attach reserved checkpoint `idx` at `cut` of `tokens`, recording the
+    /// prompt that took it; on a miss (the node is gone or already
+    /// checkpointed) the index goes back to the pool.
+    pub(super) fn attach_reserved(&mut self, tokens: &[u32], cut: usize, idx: u32) -> bool {
+        if self.radix.attach_state_at(tokens, cut, idx) {
+            if let Some(s) = self.src.get_mut(idx as usize) {
+                *s = Some((tokens.len(), prompt_hash(tokens)));
+            }
+            if self.stats {
+                tracing::info!("qwen4exp-ckpt: in-walk cut {cut} idx {idx}");
+            }
+            true
+        } else {
+            self.radix.recycle_state(idx);
+            false
+        }
+    }
+
+    /// Give back a reserved index that was never attached.
+    pub(super) fn recycle_ckpt(&mut self, idx: u32) {
+        self.radix.recycle_state(idx);
     }
 
     /// Drop the checkpoint at `cut` of `tokens` - but only if it is still

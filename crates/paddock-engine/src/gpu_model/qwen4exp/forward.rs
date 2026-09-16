@@ -106,7 +106,7 @@ thread_local! {
 
 /// Lap the armed walk timer, if any (inert when `PADDOCK_Q4X_PHASE_MS` is not
 /// set or the walk is a decode - see `PhaseMs::arm`).
-fn pm_lap(e: &GpuExecutor, tag: &'static str) {
+pub(crate) fn pm_lap(e: &GpuExecutor, tag: &'static str) {
     PHASE_MS.with(|p| {
         if let Some(pm) = p.borrow_mut().as_mut() {
             pm.lap(e, tag);
@@ -166,22 +166,49 @@ impl PhaseMs {
     }
 }
 
-struct Dump(Option<std::path::PathBuf>);
+/// `PADDOCK_Q38FN_DUMP_N=<rows>` arms the sink only on walks of that width
+/// (every later walk and decode tick writes the same file names, so a
+/// prefill's own tree is gone by the end of a run otherwise), and
+/// `PADDOCK_Q38FN_DUMP_TAGS=a,b,..` keeps just those tags - a whole 992-row
+/// Flash-Next walk is ~12 GB.
+struct Dump(Option<std::path::PathBuf>, Option<Vec<String>>);
 
 impl Dump {
-    fn arm() -> Self {
-        Self(std::env::var_os("PADDOCK_Q38FN_DUMP").map(|d| {
-            let p = std::path::PathBuf::from(d);
-            let _ = std::fs::create_dir_all(&p);
-            p
-        }))
+    fn arm(n: usize) -> Self {
+        let width_ok = std::env::var("PADDOCK_Q38FN_DUMP_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .is_none_or(|w| w == n);
+        let tags = std::env::var("PADDOCK_Q38FN_DUMP_TAGS")
+            .ok()
+            .map(|s| s.split(',').map(str::to_owned).collect());
+        Self(
+            std::env::var_os("PADDOCK_Q38FN_DUMP")
+                .filter(|_| width_ok)
+                .map(|d| {
+                    let p = std::path::PathBuf::from(d);
+                    let _ = std::fs::create_dir_all(&p);
+                    p
+                }),
+            tags,
+        )
     }
     fn on(&self) -> bool {
         self.0.is_some()
     }
+    /// The dump dir, when `tag` is one the sink keeps.
+    fn dir_for(&self, tag: &str) -> Option<&std::path::Path> {
+        let dir = self.0.as_deref()?;
+        self.1
+            .as_ref()
+            .is_none_or(|t| t.iter().any(|x| x == tag))
+            .then_some(dir)
+    }
     /// Write host-side values already read back.
     fn put_host(&self, li: usize, tag: &str, v: &[f32]) -> Result<(), GpuModelError> {
-        let Some(dir) = &self.0 else { return Ok(()) };
+        let Some(dir) = self.dir_for(tag) else {
+            return Ok(());
+        };
         let mut b = Vec::with_capacity(v.len() * 4);
         for x in v {
             b.extend_from_slice(&x.to_le_bytes());
@@ -200,7 +227,9 @@ impl Dump {
         buf: &CudaSlice<f32>,
         len: usize,
     ) -> Result<(), GpuModelError> {
-        let Some(dir) = &self.0 else { return Ok(()) };
+        let Some(dir) = self.dir_for(tag) else {
+            return Ok(());
+        };
         let v = e.to_host_len(buf, len)?;
         let mut b = Vec::with_capacity(len * 4);
         for x in &v {
@@ -405,12 +434,20 @@ pub struct Qwen4ExpGpu {
     /// causal convs re-stage their windows in front of the span's first rows
     /// (`resume_gdn_conv` / `resume_ple_conv`); 0 = a fresh sequence.
     walk_row0: usize,
+    /// in-walk prefix-cache checkpoints for the span `device_walk` runs next:
+    /// (row within the span, reserved pool index), ascending - the GDN and
+    /// PLE passes write each one's carried state as it stands at that row
+    walk_cuts: Vec<(usize, u32)>,
     /// Stage F, the reply checkpoint (`reply_snapshot`): per slot the cut
     /// and pool index of its live in-reply checkpoint, and whether the
     /// slot's reply is tracked at all (a prompt admitted through the cache,
     /// long enough to be worth a checkpoint).
     reply_ckpt: Vec<Option<(usize, u32)>>,
     reply_track: Vec<bool>,
+    /// The MTP drafter (forward/mtp.rs), once a head GGUF is attached.
+    mtp: Option<Box<mtp::Mtp>>,
+    /// The verify round's planes (forward/spec.rs), built at its first round.
+    verify: Option<Box<spec::Verify>>,
 }
 
 /// Every device buffer the walk touches, allocated once at `max_tokens`.
@@ -520,6 +557,28 @@ struct Scratch {
     /// CHUNK wide - a full [pairs, hidden] plane would be 419 MB at a 4096-row
     /// wave, and the fold consumes a chunk at a time anyway
     d_dpart: CudaSlice<f32>,
+    // the tensor-core gate/up's moe_align (bm = 32) CSR and its fused-quantize
+    // output in that SORTED layout: [blocks][32][moe_ff] int8 + per-32 scales
+    d_srow32: CudaSlice<u32>,
+    d_sslot32: CudaSlice<u32>,
+    d_bexp32: CudaSlice<u32>,
+    d_sfq: CudaSlice<i8>,
+    d_sfs: CudaSlice<f32>,
+    /// Per-expert (first, end) sorted positions the expert-major tensor-core
+    /// down (slot 603) derives from the bm = 32 layout: 2 x n_expert.
+    d_emap: CudaSlice<u32>,
+    /// One [norm_w (hc * hidden) | 1/rms (max_tokens * hc)] plane per
+    /// hyper-connection mix (attention mix of layer l at 2l, MLP mix at 2l +
+    /// 1): the norm prefix is copied once at load, and a combine that stores
+    /// no normalized state (slot 606) writes the 1/rms tail its next mix's
+    /// rebuild consumers read (slots 607 / 608). Empty without those slots.
+    d_hcaux: Vec<CudaSlice<f32>>,
+    /// Slot 609's (row, stream, output) inject partials, [max_tokens][hc][hc].
+    d_injp: CudaSlice<f32>,
+    /// the next hyper-connection down's mmq rows, emitted by the quantizing
+    /// combine (slot 602) as one group padded to 128 rows, for walks up to
+    /// `HC_PREQ_MAX_ROWS` (a stub without the slot)
+    d_hcq: CudaSlice<u8>,
     /// device-sampling scratch (slots 4-wide each): the packed per-row plan,
     /// the truncation params, and the sampled ids. Caller-owned and
     /// address-stable like everything else the decode graph can see.
@@ -854,7 +913,7 @@ impl Qwen4ExpGpu {
                 ExpertSeats::Kq { gate, up, down, .. } => {
                     gate.bytes().1 + up.bytes().1 + down.bytes().1
                 }
-                ExpertSeats::Nvf4 { .. } => 0,
+                ExpertSeats::Nvf4 { .. } | ExpertSeats::Q8 { .. } => 0,
             })
             .sum()
     }
@@ -894,9 +953,29 @@ impl Qwen4ExpGpu {
         // sized from leftover headroom, not weights, and is correctly outside
         // this number.
         let weights_bytes = exec.settled_mem_used();
-        let sc = Scratch::new(exec, &cfg, max_tokens, slots, kq_lanes)?;
+        let mut sc = Scratch::new(exec, &cfg, max_tokens, slots, kq_lanes)?;
+        // the rebuild planes' norm prefixes: each mix's (1+w) weight, once
+        if !sc.d_hcaux.is_empty() {
+            let hw = cfg.hc_width();
+            for (li, l) in layers.iter().enumerate() {
+                exec.copy_region(&l.attn_hc.norm.buf, 0, &mut sc.d_hcaux[2 * li], 0, hw)?;
+                exec.copy_region(&l.mlp_hc.norm.buf, 0, &mut sc.d_hcaux[2 * li + 1], 0, hw)?;
+            }
+        }
         // the widest activation any dense plane reads is the 4-stream state
         let stage = DenseStage {
+            row_exact: false,
+            prefill: false,
+            xrow: if kq_lanes {
+                Some(exec.alloc(cfg.hc_width())?)
+            } else {
+                None
+            },
+            yrow: if kq_lanes {
+                Some(exec.alloc(cfg.vocab.max(cfg.hc_width()))?)
+            } else {
+                None
+            },
             q: exec.alloc_i8(max_tokens * cfg.hc_width())?,
             rs: exec.alloc(max_tokens)?,
             xs: exec.alloc(if kq_lanes {
@@ -911,8 +990,10 @@ impl Qwen4ExpGpu {
             })?,
             // the > 64-row tile's mmq tiles for one KQ_TILE_ROWS-row chunk:
             // 144 B per (128-wide k chunk, row), and 4 per-32 sums per pair
+            // (two KQ_TILE_ROWS of the widest input: a 992-row walk then
+            // launches every other plane once - `q8_launch_rows`)
             yq: exec.alloc_u8(if kq_lanes {
-                cfg.hc_width().div_ceil(128) * super::KQ_TILE_ROWS * 144
+                cfg.hc_width().div_ceil(128) * 2 * super::KQ_TILE_ROWS * 144
             } else {
                 1
             })?,
@@ -971,8 +1052,11 @@ impl Qwen4ExpGpu {
             graph_capture: capture_wanted(),
             prefix: None,
             walk_row0: 0,
+            walk_cuts: Vec::new(),
             reply_ckpt: vec![None; slots],
             reply_track: vec![false; slots],
+            mtp: None,
+            verify: None,
         };
         if slots >= 1 && !super::prefix::prefix_disabled() {
             me.prefix =
@@ -1069,6 +1153,7 @@ impl Qwen4ExpGpu {
         }
         self.pos[slot] = 0;
         self.stream[slot].clear();
+        self.mtp_clear(slot);
         Ok(())
     }
 
@@ -1249,16 +1334,64 @@ impl Qwen4ExpGpu {
             [0, 0]
         };
         let mut pos = start;
+        self.mtp_begin(slot, start);
+        // The checkpoints taken INSIDE the one walk: a cut walk on this
+        // routed-expert family costs rows, not a weight pass (~290 ms of a
+        // 1024-token prompt as two 16-row walks). The pn recurrence is the
+        // one that can stop at a cut row, so its absence keeps the cut walks.
+        if self.prefix.is_some()
+            && super::inwalk_ckpt_enabled()
+            && self.exec.has_gated_delta_recurrent_pn()
+            && super::gdn_pn_enabled()
+        {
+            let mut reserved: Vec<(usize, u32)> = Vec::new();
+            if let Some(pc) = self.prefix.as_mut() {
+                for c in cuts {
+                    if c > pos
+                        && c < n
+                        && let Some(idx) = pc.reserve_ckpt()
+                    {
+                        reserved.push((c, idx));
+                    }
+                }
+            }
+            self.walk_cuts = reserved.iter().map(|&(c, idx)| (c - pos, idx)).collect();
+            let walked = self.walk_span(slot, ids, pos, n);
+            self.walk_cuts.clear();
+            let logits = match walked {
+                Ok(l) => l,
+                Err(err) => {
+                    if let Some(pc) = self.prefix.as_mut() {
+                        for &(_, idx) in &reserved {
+                            pc.recycle_ckpt(idx);
+                        }
+                    }
+                    return Err(err);
+                }
+            };
+            self.pos[slot] = n;
+            self.prefix_publish(slot, ids, n, false)?;
+            if let Some(pc) = self.prefix.as_mut() {
+                for (c, idx) in reserved {
+                    pc.attach_reserved(ids, c, idx);
+                }
+            }
+            self.mtp_seed(slot, 0, pos, n, ids)?;
+            self.reply_track_admit(slot);
+            return Ok(logits);
+        }
         for c in cuts {
             if c <= pos || c >= n {
                 continue;
             }
             self.walk_span(slot, ids, pos, c)?;
+            self.mtp_seed(slot, 0, pos, c, ids)?;
             self.pos[slot] = c;
             self.prefix_publish(slot, ids, c, true)?;
             pos = c;
         }
         let logits = self.walk_span(slot, ids, pos, n)?;
+        self.mtp_seed(slot, 0, pos, n, ids)?;
         self.pos[slot] = n;
         self.prefix_publish(slot, ids, n, false)?;
         self.reply_track_admit(slot);
@@ -1356,6 +1489,7 @@ impl Qwen4ExpGpu {
         for &(sl, _) in rows {
             self.pos[sl] += 1;
         }
+        self.mtp_note_rows(rows)?;
         self.reply_after_rows(rows)?;
         Ok(all.chunks(self.cfg.vocab).map(|c| c.to_vec()).collect())
     }
@@ -1424,6 +1558,7 @@ impl Qwen4ExpGpu {
         for &(sl, _) in rows {
             self.pos[sl] += 1;
         }
+        self.mtp_note_rows(rows)?;
         self.reply_after_rows(rows)?;
         Ok(())
     }
@@ -1700,6 +1835,7 @@ impl Qwen4ExpGpu {
             if start == 0 {
                 self.reset_slot(*slot)?;
             }
+            self.mtp_begin(*slot, start);
             self.stream[*slot] = vec![self.cfg.bos_id as i64; 2];
             self.stream[*slot].extend(toks.iter().map(|&i| i as i64));
             starts.push(start);
@@ -1766,6 +1902,10 @@ impl Qwen4ExpGpu {
             let all = self
                 .exec
                 .to_host_len(&self.sc.d_out, runs.len() * self.cfg.vocab)?;
+            // the head seeds off the wave's streams, run by run in row order
+            for (&i, r) in which.iter().zip(&runs) {
+                self.mtp_seed(r.slot, r.off, r.row0, r.row0 + r.len, &items[i].1)?;
+            }
             for (k, (&i, r)) in which.iter().zip(&runs).enumerate() {
                 let (slot, toks) = &items[i];
                 let to = r.row0 + r.len;
@@ -1798,15 +1938,26 @@ impl Qwen4ExpGpu {
     ) -> Result<(), GpuModelError> {
         let n: usize = runs.iter().map(|r| r.len).sum();
         let mut ids = Vec::with_capacity(n);
-        let mut pos = Vec::with_capacity(n);
-        let mut slots = Vec::with_capacity(n);
         for ((_, toks), r) in items.iter().zip(runs) {
             ids.extend_from_slice(&toks[r.row0..r.row0 + r.len]);
+        }
+        self.stage_inputs_runs_ids(&ids, runs)
+    }
+
+    /// [`Self::stage_inputs_runs`] over an already-assembled token plane (row
+    /// order = run order): the verify round stages its chunks without the
+    /// whole sequence in hand. The PLE hash still reads each slot's stream,
+    /// which must already hold the rows being staged.
+    fn stage_inputs_runs_ids(&mut self, ids: &[u32], runs: &[Run]) -> Result<(), GpuModelError> {
+        let n: usize = runs.iter().map(|r| r.len).sum();
+        let mut pos = Vec::with_capacity(n);
+        let mut slots = Vec::with_capacity(n);
+        for r in runs {
             pos.extend(r.row0 as u32..(r.row0 + r.len) as u32);
             slots.extend(std::iter::repeat_n(r.slot as u32, r.len));
         }
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
-        self.exec.upload_u32(&ids, &mut self.sc.d_tok)?;
+        self.exec.upload_u32(ids, &mut self.sc.d_tok)?;
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&slots, &mut self.sc.d_slots)?;
@@ -1949,6 +2100,11 @@ impl Qwen4ExpGpu {
         self.graph_capture = on;
         if !on {
             self.decode_graph = None;
+            // the batched ticks too: a width already captured would otherwise
+            // keep replaying, and an "eager" A/B would silently time the graph
+            for g in self.batch_graphs.iter_mut() {
+                *g = None;
+            }
         }
     }
 
@@ -2010,6 +2166,9 @@ impl Qwen4ExpGpu {
         }
         for st in self.stream.iter_mut() {
             st.clear();
+        }
+        for s in 0..self.slots {
+            self.mtp_clear(s);
         }
         // the captured tick survives: it names buffers, not values, and every
         // one of them is address-stable for the life of this model
@@ -2090,9 +2249,25 @@ impl Qwen4ExpGpu {
             cur_slots,
             cur_runs,
             walk_row0,
+            walk_cuts,
+            prefix,
+            verify,
             ..
         } = self;
         let row0 = *walk_row0;
+        // in-walk checkpoints: the pool the passes write them into, and each
+        // GDN layer's place among the GDN layers (the checkpoint layout)
+        let mut sink = if walk_cuts.is_empty() {
+            None
+        } else {
+            prefix.as_mut().map(|p| p.ckpt_sink())
+        };
+        let n_gdn = c
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Qwen4ExpBlock::Gdn))
+            .count();
+        let mut gdn_ord = 0usize;
         let (h, hw, hc, lr, eps) = (c.hidden, c.hc_width(), c.hc_count, c.hc_lowrank, c.eps);
         // Fork eligibility. The two branches both call `DensePlane::matmul`,
         // and only the F8Row class stages activations through the shared
@@ -2140,6 +2315,11 @@ impl Qwen4ExpGpu {
         // paths into different f32 orders - prefill_wave_matches_serial
         // FAILED exactly there in the round-4b battery.
         stage.lowm_ok = matches!(phase, Phase::Decode | Phase::DecodeBatch) && !sc.lowm_refused;
+        stage.prefill = matches!(phase, Phase::Prefill | Phase::PrefillRuns);
+        // A verify walk's dense planes run row-exact against the decode tick
+        // (see `DenseStage::row_exact`). `PADDOCK_Q38FN_VERIFY_EXACT=0` keeps
+        // them on the batched GEMMs (A/B).
+        stage.row_exact = verify.as_ref().is_some_and(|v| v.active) && spec::verify_exact_on();
         // MIRROR EXPIRY (walk-scoped). A bf16 mirror is valid only inside the
         // walk that wrote it. The buffers never move, so a pointer match alone
         // survives across walks: a mirror written on an n==1 walk was matched
@@ -2170,7 +2350,7 @@ impl Qwen4ExpGpu {
         } else {
             usize::MAX
         };
-        let dump = Dump::arm();
+        let dump = Dump::arm(n);
         let mut pm = PhaseMs::arm(phase);
         PHASE_MS.with(|p| *p.borrow_mut() = pm.on.then(|| PhaseMs::arm(phase)));
 
@@ -2178,12 +2358,14 @@ impl Qwen4ExpGpu {
         match embed {
             Embed::Bf16(t) => e.embed_gather_bf16(t, &sc.d_tok, &mut sc.d_x, h, n, 1.0)?,
             Embed::Kq(t) => e.kquant_gather(t, &sc.d_tok, &mut sc.d_x, h, n)?,
+            Embed::Q8(t) => e.embed_gather_q8(t, &sc.d_tok, &mut sc.d_x, h, n, 1.0)?,
         }
         for t in 0..n {
             for s in 0..hc {
                 e.copy_region(&sc.d_x, t * h, &mut sc.d_h, t * hw + s * h, h)?;
             }
         }
+        pm_lap(e, "embed");
         pm.lap(e, "embed");
         dump.put(e, usize::MAX, "h_embed", &sc.d_h, n * hw)?;
 
@@ -2191,6 +2373,21 @@ impl Qwen4ExpGpu {
         // normalized state in d_xn. False at entry: the first mix reads the
         // freshly broadcast embedding, which no combine produced.
         let mut pre_normed = false;
+        // ...and whether it also left the next hc down its mmq rows (slot 602)
+        let mut pre_preq = false;
+        // ...and, when it stored no state at all, the aux plane its 1/rms went to
+        let mut pre_rn: Option<(usize, bool)> = None;
+        // A verify walk's rows are few and each is its slot's next position, so
+        // the decode attention (per-row position and slot, KV appended before
+        // it reads) is exact for them. It is also the class a decode tick
+        // runs - which is what a verify row has to agree with - and at 2 rows
+        // it cost half of the prefill tile (phase census 2026-09-14: 3.4 ms
+        // decode, 7.4-8.3 ms tile at 2-8 rows). Prefill keeps its tile.
+        let attn_phase = if verify.as_ref().is_some_and(|v| v.active) && n <= 64 {
+            Phase::DecodeBatch
+        } else {
+            phase
+        };
         for li in 0..c.n_layer {
             let layer = &layers[li];
             if let Some(ple) = layer.ple.as_ref() {
@@ -2207,7 +2404,11 @@ impl Qwen4ExpGpu {
                     cur_slots,
                     cur_runs,
                     row0,
+                    walk_cuts,
+                    sink.as_mut(),
+                    n_gdn,
                 )?;
+                pm_lap(e, "ple");
                 pm.lap(e, "ple");
                 debug_assert!(
                     !pre_normed,
@@ -2220,7 +2421,17 @@ impl Qwen4ExpGpu {
                 }
             }
 
-            let attn_inj = hc_mix_pass(e, c, &layer.attn_hc, sc, stage, n, pre_normed)?;
+            let attn_inj = hc_mix_pass(
+                e,
+                c,
+                &layer.attn_hc,
+                sc,
+                stage,
+                n,
+                pre_normed,
+                pre_preq,
+                pre_rn,
+            )?;
             pm.lap(e, "hc_attn");
             dump.put(e, li, "hc_bi_attn", &sc.d_bi, n * h)?;
             dump.put(e, li, "hc_m_attn", &sc.d_m, n * c.hc_lowrank)?;
@@ -2250,7 +2461,20 @@ impl Qwen4ExpGpu {
                         cur_runs,
                         fork_ok,
                         row0,
+                        verify
+                            .as_mut()
+                            .filter(|v| v.active && spec::verify_exact_on())
+                            .map(|v| &mut v.rows),
+                        walk_cuts,
+                        sink.as_mut(),
+                        gdn_ord,
                     )?;
+                    gdn_ord += 1;
+                    if let Some(vf) = verify.as_mut().filter(|v| v.active) {
+                        // a verify round keeps what a rejecting commit replays
+                        vf.capture_gdn(e, c, sc, li, n)?;
+                    }
+                    pm_lap(e, "gdn-tail");
                     pm.lap(e, "gdn");
                     if dump.on() {
                         let (hv, vdim) = (c.gdn_v_heads, c.gdn_v_heads * c.gdn_v_dim);
@@ -2280,30 +2504,35 @@ impl Qwen4ExpGpu {
                         kv_v[li].as_mut().expect("kv v"),
                         *max_tokens,
                         n,
-                        phase,
+                        attn_phase,
                         cur_runs,
                         fork_ok,
                     )?;
+                    pm_lap(e, "attn");
                     pm.lap(e, "attn");
                 }
             }
             dump.put(e, li, "mix_out", &sc.d_mix, n * h)?;
             // the mlp mix always reads this combine's own output
-            let mlp_pre = combine(
+            let (mlp_pre, mlp_preq, mlp_rn) = combine(
                 e,
                 sc,
                 attn_inj,
                 Some(&layer.mlp_hc.norm),
+                Some(&layer.mlp_hc.down),
+                Some((&layer.mlp_hc, 2 * li + 1)),
                 n,
                 hc,
                 h,
                 eps,
                 stage,
             )?;
+            pm_lap(e, "combine");
             pm.lap(e, "combine");
             dump.put(e, li, "h_mid", &sc.d_h, n * hw)?;
 
-            let mlp_inj = hc_mix_pass(e, c, &layer.mlp_hc, sc, stage, n, mlp_pre)?;
+            let mlp_inj =
+                hc_mix_pass(e, c, &layer.mlp_hc, sc, stage, n, mlp_pre, mlp_preq, mlp_rn)?;
             pm.lap(e, "hc_mlp");
             dump.put(e, li, "hc_bi_mlp", &sc.d_bi, n * h)?;
             if dump.on() {
@@ -2325,6 +2554,15 @@ impl Qwen4ExpGpu {
             } else {
                 Some(&final_mix.norm)
             };
+            // the plane that reads that state's mmq rows when the combine may
+            // emit them: the next layer's attention hc down, never the final
+            // mixer (it projects d_xn on its own silu arm)
+            let next_down = (li + 1 < c.n_layer && layers[li + 1].ple.is_none())
+                .then(|| &layers[li + 1].attn_hc.down);
+            // ...and that mix itself with its aux plane, exactly where the down is
+            let next_rn = next_down
+                .is_some()
+                .then(|| (&layers[li + 1].attn_hc, 2 * (li + 1)));
             // ORDER: (.., fork_ok, decode). These two were swapped once, which
             // pinned `decode` false for the whole batch band - the folded
             // router, the fused shared gate|up and the low-M dense arms all
@@ -2338,10 +2576,15 @@ impl Qwen4ExpGpu {
                 n,
                 fork_ok,
                 matches!(phase, Phase::Decode | Phase::DecodeBatch),
+                None,
             )?;
+            pm_lap(e, "moe-tail");
             pm.lap(e, "moe");
             dump.put(e, li, "moe_out", &sc.d_mix, n * h)?;
-            pre_normed = combine(e, sc, mlp_inj, next_norm, n, hc, h, eps, stage)?;
+            (pre_normed, pre_preq, pre_rn) = combine(
+                e, sc, mlp_inj, next_norm, next_down, next_rn, n, hc, h, eps, stage,
+            )?;
+            pm_lap(e, "combine");
             pm.lap(e, "combine");
             dump.put(e, li, "h_out", &sc.d_h, n * hw)?;
         }
@@ -2396,6 +2639,10 @@ impl Qwen4ExpGpu {
         if matches!(phase, Phase::DecodeBatch) {
             // every row is a live sequence's next-token distribution
             lm_head.matmul(e, &sc.d_bi, &mut sc.d_out, n, stage)?;
+        } else if let Some(vf) = verify.as_mut().filter(|v| v.active) {
+            // a verify round: every row is a position the round compares
+            lm_head.matmul(e, &sc.d_bi, &mut vf.logits, n, stage)?;
+            dump.put(e, usize::MAX, "vlogits", &vf.logits, n * c.vocab)?;
         } else if matches!(phase, Phase::PrefillRuns) {
             // one row per RUN - its own last position - so the head runs once
             // over `runs.len()` rows instead of once per prompt
@@ -2485,12 +2732,39 @@ fn combine(
     sc: &mut Scratch,
     inj: Inj,
     next_norm: Option<&DeviceTensor>,
+    // the down plane that reads the normalized state next (None where nothing
+    // may take mmq rows): when it takes the pre-quantized pipe rung the norm
+    // pass emits them too (slot 602), and the second flag says it did
+    next_down: Option<&DensePlane>,
+    // the mix that reads the state next and its `d_hcaux` index: when its
+    // inject and up + mix both rebuild the state from h (slots 607 / 608) and
+    // the down takes the rows above, no state is stored at all (slot 606) and
+    // the third return names the aux plane the 1/rms went to
+    next_rn: Option<(&HcW, usize)>,
     n: usize,
     hc: usize,
     hidden: usize,
     eps: f32,
-    _stage: &mut DenseStage,
-) -> Result<bool, GpuModelError> {
+    stage: &mut DenseStage,
+) -> Result<(bool, bool, Option<(usize, bool)>), GpuModelError> {
+    let preq = next_norm.is_some()
+        && next_down.is_some_and(|p| p.takes_preq_mmq(e, n, stage))
+        && sc.d_hcq.len() >= super::hc_preq_bytes(hc * hidden, n);
+    // REBUILD (slots 606 - 608): with the down on the pre-quantized rows, the
+    // next mix's inject and up + mix are the state's only readers; when both
+    // rebuild it from h the combine stores none - a [rows][hc*hidden] write a
+    // call (bench/combine_rn_gb10_bench.cu, 1024 rows: the chain 1223 -> 1022
+    // us, every output byte-identical)
+    // ...and when the pack folds the next mix's inject into this pass (slot
+    // 609), the second field says the logits are already in `d_inj`
+    let rn = next_rn
+        .filter(|(w, idx)| {
+            preq && *idx < sc.d_hcaux.len() && hc_takes_rn(e, w, n, hc, hidden, stage)
+        })
+        .map(|(w, idx)| {
+            let fold = hc_inj_fold_ok(e, w, n, hc, hidden, sc.d_injp.len());
+            (idx, fold)
+        });
     // xn's bf16 MIRROR: this kernel is the only writer of d_xn on the decode
     // path, so mirroring at the store retires the per-consumer cast (the hc
     // down plane's TGV arm cast a [n, 10240] plane every layer). Any path
@@ -2499,44 +2773,150 @@ fn combine(
     // are all simultaneous without any shuffling.
     match (inj, next_norm) {
         (Inj::InM(off), Some(nw)) => {
-            e.q4x_combine_norm(
-                &mut sc.d_h,
-                &sc.d_mix,
-                &sc.d_m,
-                off,
-                &nw.buf,
-                &mut sc.d_xn,
-                None,
-                n,
-                hc,
-                hidden,
-                eps,
-            )?;
-            Ok(true)
+            if let (Some((idx, true)), Some((w, _))) = (rn, next_rn) {
+                let wi = w.inject.as_ref().expect("a folded inject has its weight");
+                e.q4x_combine_norm_q8mmq_nsi(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    Some((&sc.d_m, off)),
+                    &nw.buf,
+                    &mut sc.d_hcaux[idx],
+                    hc * hidden,
+                    &mut sc.d_hcq,
+                    &wi.buf,
+                    &mut sc.d_injp,
+                    &mut sc.d_inj,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else if let Some((idx, _)) = rn {
+                e.q4x_combine_norm_q8mmq_ns(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_m,
+                    off,
+                    &nw.buf,
+                    &mut sc.d_hcaux[idx],
+                    hc * hidden,
+                    &mut sc.d_hcq,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else if preq {
+                e.q4x_combine_norm_q8mmq(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_m,
+                    off,
+                    &nw.buf,
+                    &mut sc.d_xn,
+                    &mut sc.d_hcq,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else {
+                e.q4x_combine_norm(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_m,
+                    off,
+                    &nw.buf,
+                    &mut sc.d_xn,
+                    None,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                )?;
+            }
+            Ok((true, preq, rn))
         }
         (Inj::Separate, Some(nw)) => {
-            e.q4x_combine_norm(
-                &mut sc.d_h,
-                &sc.d_mix,
-                &sc.d_inj,
-                0,
-                &nw.buf,
-                &mut sc.d_xn,
-                None,
-                n,
-                hc,
-                hidden,
-                eps,
-            )?;
-            Ok(true)
+            if let (Some((idx, true)), Some((w, _))) = (rn, next_rn) {
+                // this combine's logits are read from d_inj before the fold
+                // writes the next mix's there (one buffer, stream order)
+                let wi = w.inject.as_ref().expect("a folded inject has its weight");
+                e.q4x_combine_norm_q8mmq_nsi(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    None,
+                    &nw.buf,
+                    &mut sc.d_hcaux[idx],
+                    hc * hidden,
+                    &mut sc.d_hcq,
+                    &wi.buf,
+                    &mut sc.d_injp,
+                    &mut sc.d_inj,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else if let Some((idx, _)) = rn {
+                e.q4x_combine_norm_q8mmq_ns(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_inj,
+                    0,
+                    &nw.buf,
+                    &mut sc.d_hcaux[idx],
+                    hc * hidden,
+                    &mut sc.d_hcq,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else if preq {
+                e.q4x_combine_norm_q8mmq(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_inj,
+                    0,
+                    &nw.buf,
+                    &mut sc.d_xn,
+                    &mut sc.d_hcq,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                    n.next_multiple_of(128),
+                )?;
+            } else {
+                e.q4x_combine_norm(
+                    &mut sc.d_h,
+                    &sc.d_mix,
+                    &sc.d_inj,
+                    0,
+                    &nw.buf,
+                    &mut sc.d_xn,
+                    None,
+                    n,
+                    hc,
+                    hidden,
+                    eps,
+                )?;
+            }
+            Ok((true, preq, rn))
         }
         (Inj::InM(off), None) => {
             e.q4x_hc_combine_at(&mut sc.d_h, &sc.d_mix, &sc.d_m, off, n, hc, hidden)?;
-            Ok(false)
+            Ok((false, false, None))
         }
         (Inj::Separate, None) => {
             e.q4x_hc_combine(&mut sc.d_h, &sc.d_mix, &sc.d_inj, n, hc, hidden)?;
-            Ok(false)
+            Ok((false, false, None))
         }
     }
 }
@@ -2574,6 +2954,13 @@ fn hc_mix_pass(
     stage: &mut DenseStage,
     n: usize,
     pre_normed: bool,
+    // the preceding combine also left this pass's down plane its mmq rows in
+    // `d_hcq` (slot 602) - consumed here, never kept
+    preq: bool,
+    // ...and stored no normalized state (slot 606): the inject and the up +
+    // mix rebuild it from h off `d_hcaux[rn.0]` (slots 607 / 608) - or, with
+    // rn.1, the combine already folded the inject into `d_inj` (slot 609)
+    rn: Option<(usize, bool)>,
 ) -> Result<Inj, GpuModelError> {
     let (h, hc, lr) = (c.hidden, c.hc_count, c.hc_lowrank);
     // `pre_normed`: the preceding combine already produced this mix's
@@ -2584,6 +2971,7 @@ fn hc_mix_pass(
         // would leave mir_xn aimed at this same buffer with stale bytes.
         e.q4x_group_norm_1p(&sc.d_h, &w.norm.buf, &mut sc.d_xn, None, n, hc, h, c.eps)?;
     }
+    pm_lap(e, "hc-norm");
     let mut silu_done = false;
     let inj = if w.inject_rows > 0 && n == 1 {
         // One launch for both projections: the inject logits come out as the
@@ -2601,6 +2989,7 @@ fn hc_mix_pass(
         if !silu_done {
             w.down.matmul(e, &sc.d_xn, &mut sc.d_m, 1, stage)?;
         }
+        pm_lap(e, "hc-down");
         Inj::InM(lr)
     } else if w.inject_rows > 0 {
         // One launch for both segments (the batch-1 arm above already fuses
@@ -2617,14 +3006,44 @@ fn hc_mix_pass(
             w.down
                 .matmul_rows(e, lr, hc, &sc.d_xn, &mut sc.d_inj, n, stage)?;
         }
+        pm_lap(e, "hc-down");
         Inj::Separate
     } else {
-        w.down.matmul(e, &sc.d_xn, &mut sc.d_m, n, stage)?;
+        let taken = preq
+            && w.down
+                .matmul_preq_mmq(e, &sc.d_hcq, &mut sc.d_m, n, stage)?;
+        debug_assert!(
+            taken || !preq,
+            "a combine emitted mmq rows the hc down did not take"
+        );
+        if !taken {
+            if rn.is_some() {
+                return Err(GpuModelError::Unsupported(
+                    "hc down declined the mmq rows of a combine that stored no normalized state"
+                        .into(),
+                ));
+            }
+            w.down.matmul(e, &sc.d_xn, &mut sc.d_m, n, stage)?;
+        }
+        pm_lap(e, "hc-down");
         let wi = w.inject.as_ref().expect("unfolded block hc carries inject");
-        e.matvec_f32_raw(&wi.buf, hc * h, hc, &sc.d_xn, &mut sc.d_inj, n)?;
+        match rn {
+            Some((_, true)) => {} // the combine folded it (slot 609)
+            Some((idx, false)) => e.q4x_hc_inject_rn(
+                &wi.buf,
+                &sc.d_h,
+                &sc.d_hcaux[idx],
+                &mut sc.d_inj,
+                h,
+                hc,
+                hc,
+                n,
+            )?,
+            None => e.matvec_f32_raw(&wi.buf, hc * h, hc, &sc.d_xn, &mut sc.d_inj, n)?,
+        }
+        pm_lap(e, "hc-inj");
         Inj::Separate
     };
-    pm_lap(e, "hc-down");
     if !silu_done {
         e.q4x_scale_silu(&mut sc.d_m, n * lr, 1.0 / hc as f32)?;
     }
@@ -2638,10 +3057,13 @@ fn hc_mix_pass(
     // 22 ms of the c8 prefill burst ran a 144 us bf16 tile where the f16 lane
     // does the same rows in ~20 us. Above the band the plain matmul below
     // takes the Dual election and the separate q4x_hc_mix launch is noise.
-    let fused = match (&w.up_hcmix, (2..=32).contains(&n)) {
-        (Some(wp), true) => e.bf16_hcmix_gemm(wp, &sc.d_m, &sc.d_xn, &mut sc.d_bi, lr, h, hc, n)?,
-        _ => false,
-    };
+    let fused = rn.is_none()
+        && match (&w.up_hcmix, (2..=32).contains(&n)) {
+            (Some(wp), true) => {
+                e.bf16_hcmix_gemm(wp, &sc.d_m, &sc.d_xn, &mut sc.d_bi, lr, h, hc, n)?
+            }
+            _ => false,
+        };
     if !fused {
         let upmix = n == 1
             && super::fuse_upmix_on()
@@ -2651,7 +3073,33 @@ fn hc_mix_pass(
                 }
                 None => false,
             };
-        if !upmix {
+        // prefill widths: the up GEMM with the gated mix in its epilogue (slot
+        // 605) - the [rows][hc*hidden] gate plane never lands, byte-identical
+        // to the two launches below (bench/hcup_mix_gb10_bench.cu, 1024 rows:
+        // 613 -> 415 us a call)
+        if let Some((idx, _)) = rn {
+            // the rung the combine elected on (`hc_takes_rn`); declining now
+            // would leave a state nobody stored
+            if !w.up.matmul_hcmix_rn(
+                e,
+                &sc.d_m,
+                &sc.d_h,
+                &sc.d_hcaux[idx],
+                &mut sc.d_bi,
+                n,
+                hc,
+                h,
+                stage,
+            )? {
+                return Err(GpuModelError::Unsupported(
+                    "hc up + mix declined the rebuild rung its combine elected".into(),
+                ));
+            }
+        } else if !upmix
+            && !w
+                .up
+                .matmul_hcmix(e, &sc.d_m, &sc.d_xn, &mut sc.d_bi, n, hc, h, stage)?
+        {
             w.up.matmul(e, &sc.d_m, &mut sc.d_gate, n, stage)?;
             e.q4x_hc_mix(&sc.d_xn, &sc.d_gate, &mut sc.d_bi, None, n, hc, h)?;
         }
@@ -2683,6 +3131,11 @@ fn ple_pass(
     slot_ids: &[usize],
     runs: &[Run],
     row0: usize,
+    // in-walk prefix-cache checkpoints (Prefill): (row in the span, pool
+    // index), where their blobs sit, and how many GDN layers precede the ring
+    cuts: &[(usize, u32)],
+    sink: Option<&mut super::prefix::CkptSink<'_>>,
+    n_gdn: usize,
 ) -> Result<(), GpuModelError> {
     let (h, hw, hc, eps) = (c.hidden, c.hc_width(), c.hc_count, c.eps);
     let wrows = (c.ple_conv - 1) * PLE_DILATION;
@@ -2779,6 +3232,33 @@ fn ple_pass(
             e.copy_region(&sc.d_pkn, (n - m) * hw, win, pbase + r * hw, len1 * hw)?;
             if len1 < m {
                 e.copy_region(&sc.d_pkn, (n - m + len1) * hw, win, pbase, (m - len1) * hw)?;
+            }
+            // in-walk checkpoints: the ring a walk ending at each cut row would
+            // have committed (a cut sits at least a page into the walk, so all
+            // `wrows` rows come from this span)
+            if let Some(sk) = sink {
+                for &(rc, idx) in cuts {
+                    debug_assert!(rc >= wrows && rc <= n, "cut row {rc} of a {n}-row walk");
+                    let base = sk.ple_off(idx, n_gdn);
+                    let r = (row0 + rc - wrows) % wrows;
+                    let len1 = wrows - r;
+                    e.copy_region(
+                        &sc.d_pkn,
+                        (rc - wrows) * hw,
+                        &mut *sk.pool,
+                        base + r * hw,
+                        len1 * hw,
+                    )?;
+                    if len1 < wrows {
+                        e.copy_region(
+                            &sc.d_pkn,
+                            (rc - wrows + len1) * hw,
+                            &mut *sk.pool,
+                            base,
+                            (wrows - len1) * hw,
+                        )?;
+                    }
+                }
             }
         }
         Phase::PrefillRuns => {
@@ -3136,6 +3616,14 @@ fn gdn_pass(
     // the sequence position of the span's first row (`walk_row0`): a
     // continued sequence re-stages its conv window in front of the span
     row0: usize,
+    // a decode-exact verify walk's one-row staging (see `verify_gdn_rows`)
+    vrows: Option<&mut spec::VerifyRows>,
+    // in-walk prefix-cache checkpoints (Prefill): (row in the span, pool
+    // index), where their blobs sit, and this layer's place among the GDN
+    // layers
+    cuts: &[(usize, u32)],
+    mut sink: Option<&mut super::prefix::CkptSink<'_>>,
+    gdn_ord: usize,
 ) -> Result<(), GpuModelError> {
     let (h, hv, kd, vd) = (c.hidden, c.gdn_v_heads, c.gdn_k_dim, c.gdn_v_dim);
     let (qkv_rows, km1) = (c.gdn_qkv_rows(), c.gdn_conv - 1);
@@ -3175,6 +3663,11 @@ fn gdn_pass(
         if !fused_zq {
             w.z.matmul(e, &sc.d_bi, &mut sc.d_zg, n, stage)?;
         }
+        // This is the branch prefill actually takes (the fork is decode-side),
+        // and the lap that follows covers the z matmul AND the ab matvec. Price
+        // them apart: if z is skipped (fused_zq) this reads ~0 and the whole
+        // lap is the ab pair.
+        pm_lap(e, "gdn-z");
         // one plane, one launch: rows [0,h) are alpha and [h,2h) beta, which is
         // delta_gate_ab's own layout
         {
@@ -3204,6 +3697,13 @@ fn gdn_pass(
         {
             // [in=2560, out=96] is 96 blocks on a 148-SM die under the
             // one-block-per-row matvec; split-K refills the wave.
+            //
+            // NOTE (2026-09-16): this is the FORKED branch, which prefill does
+            // not take - `forked` is decode-side. A fused ab+gate election
+            // (`matvec_ab_gate`, bit-identical) was tried here and measured
+            // nothing because it never ran. Elect it on the branch above if it
+            // is ever worth it; at 1024 rows the ab matvec is 0.094 ms a layer
+            // (47% of the bus), so it is not.
             let sp = sk_split();
             let done = n == 1
                 && sp >= 2
@@ -3234,6 +3734,10 @@ fn gdn_pass(
         )?;
         e.side_end()?;
     }
+    // Without this the qkv matmul's lap swallowed the z + ab work too, and
+    // "gdn-proj" read as one 1.109 ms kernel when it is three things. Measured
+    // a layer at 1024 rows: z 0.408, ab 0.094, qkv 0.653.
+    pm_lap(e, "gdn-ab");
     if !fused_zq {
         w.qkv.matmul(e, &sc.d_bi, &mut sc.d_qkv, n, stage)?;
     }
@@ -3294,6 +3798,21 @@ fn gdn_pass(
                     wbase + (km1 - n) * qkv_rows,
                     n * qkv_rows,
                 )?;
+            }
+            // in-walk checkpoints: the window a walk ending at each cut row
+            // would leave (the last k-1 pre-conv rows before it)
+            if let Some(sk) = sink.as_mut() {
+                for &(rc, idx) in cuts {
+                    debug_assert!(rc >= km1 && rc <= n, "cut row {rc} of a {n}-row walk");
+                    let off = sk.win_off(idx, gdn_ord);
+                    e.copy_region(
+                        &sc.d_qkv,
+                        (rc - km1) * qkv_rows,
+                        &mut *sk.pool,
+                        off,
+                        km1 * qkv_rows,
+                    )?;
+                }
             }
         }
         Phase::PrefillRuns => {
@@ -3496,7 +4015,10 @@ fn gdn_pass(
         )?;
     }
     let mut gn_done = false;
-    if matches!(phase, Phase::PrefillRuns) {
+    if let (Phase::PrefillRuns, Some(vr)) = (phase, vrows) {
+        verify_gdn_rows(e, c, w, sc, state, vr, runs)?;
+        gn_done = true;
+    } else if matches!(phase, Phase::PrefillRuns) {
         // Every run's whole sequence in one launch, grid (n_heads, n_runs).
         // The single-run entry grids 48 blocks at 255 registers - 32% of a
         // 148-SM die - and a serially-prefilled wave pays 195.9 us per layer
@@ -3584,21 +4106,40 @@ fn gdn_pass(
         // 2 blocks an SM, 12.57% occupancy on ncu) and runs two shared trees
         // a token. Prefill widths only - the decode tick is n == 1, where the
         // split has nothing to spread and the legacy order is kept.
-        if n > 1 && e.has_gated_delta_recurrent_pn() && super::gdn_pn_enabled() {
-            e.gated_delta_recurrent_pn_at(
-                &sc.d_dq,
-                &sc.d_dk,
-                &sc.d_dv,
-                &sc.d_g,
-                &sc.d_beta,
-                state,
-                slot * hv * kd * kd,
-                &mut sc.d_dattn,
-                &mut sc.d_dnrn,
-                n,
-                hv,
-                kd,
-            )?;
+        // SEGMENT-TILED walk (slot 604) for a 128-wide head: a thread carries
+        // 32 state floats instead of slot 596's 8, a head is 4 blocks at 4 an
+        // SM, and the gates and norms are one float4 a (token, head) from its
+        // pre-pass (bench/gdn_prefill_gb10_bench.cu, 1024 tokens: 2.76 -> 1.11
+        // ms a layer). Same class as slot 596 (the dots re-associate), and
+        // still a sequential token loop, so the checkpoint spans stay exact.
+        let seg = n > 1
+            && kd == 128
+            && vd == kd
+            && super::gdn_seg_enabled()
+            && e.has_gated_delta_recurrent_seg();
+        if seg || (n > 1 && e.has_gated_delta_recurrent_pn() && super::gdn_pn_enabled()) {
+            let st_off = slot * hv * kd * kd;
+            let ck = sink
+                .as_mut()
+                .filter(|_| matches!(phase, Phase::Prefill) && !cuts.is_empty());
+            match ck {
+                None => gdn_walk_rows(e, sc, state, st_off, 0, n, (hv, kd, vd), seg)?,
+                Some(sk) => {
+                    // in-walk checkpoints: stop at each cut row, copy the slot's
+                    // state into the checkpoint, go on - both walks are
+                    // sequential token loops, so the rows land as one call's
+                    let mut from = 0;
+                    for &(rc, idx) in cuts {
+                        gdn_walk_rows(e, sc, state, st_off, from, rc - from, (hv, kd, vd), seg)?;
+                        let (dst, len) = (sk.state_off(idx, gdn_ord), sk.st_elems);
+                        e.copy_region(&*state, st_off, &mut *sk.pool, dst, len)?;
+                        from = rc;
+                    }
+                    if from < n {
+                        gdn_walk_rows(e, sc, state, st_off, from, n - from, (hv, kd, vd), seg)?;
+                    }
+                }
+            }
         } else {
             e.gated_delta_recurrent_at(
                 &sc.d_dq,
@@ -3631,6 +4172,108 @@ fn gdn_pass(
     pm_lap(e, "gdn-norm");
     w.out.matmul(e, &sc.d_core, &mut sc.d_mix, n, stage)?;
     pm_lap(e, "gdn-out");
+    Ok(())
+}
+
+/// A verify walk's GDN rows through the decode tick's own recurrence entry,
+/// one row per call in run order, so each row's state update and gated norm
+/// land exactly where the tick that decodes that token lands. The runs walk
+/// plus the separate norm agree with it only to the last ulp (12 of 6144
+/// elements at 1.5e-8 on layer 0, exactness probe 2026-09-14), and a near-tie
+/// does not survive that. The conv, the split and the gates before it are
+/// already row-invariant. Interim form: 8 launches a row a layer; the SOTA
+/// shape is a runs entry carrying the slots kernel's per-token body verbatim,
+/// one launch for every row.
+#[allow(clippy::too_many_arguments)]
+fn verify_gdn_rows(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    w: &super::GdnW,
+    sc: &mut Scratch,
+    state: &mut CudaSlice<f32>,
+    vr: &mut spec::VerifyRows,
+    runs: &[Run],
+) -> Result<(), GpuModelError> {
+    let (hv, kd, vd) = (c.gdn_v_heads, c.gdn_k_dim, c.gdn_v_dim);
+    // One launch for every run's rows where the pack carries slot 599 - the
+    // DecodeBatch arm's slots_gn body token for token over the walk's own
+    // staged planes and run tables. It declines exactly where slots_gn does,
+    // and then the per-row calls below take the tick's fallback too.
+    if e.gated_delta_recurrent_runs_slots(
+        &sc.d_dq,
+        &sc.d_dk,
+        &sc.d_dv,
+        &sc.d_g,
+        &sc.d_beta,
+        state,
+        &mut sc.d_core,
+        &sc.d_run_off,
+        &sc.d_run_len,
+        &sc.d_run_slot,
+        Some((&sc.d_zg, &w.norm.buf, c.eps)),
+        runs.len(),
+        hv,
+        kd,
+    )? {
+        return Ok(());
+    }
+    let (kdim, vdim, zr) = (hv * kd, hv * vd, c.gdn_z_rows());
+    for r in runs {
+        e.upload_u32(&[r.slot as u32], &mut vr.slot)?;
+        for t in 0..r.len {
+            let row = r.off + t;
+            e.copy_region(&sc.d_dq, row * kdim, &mut vr.q, 0, kdim)?;
+            e.copy_region(&sc.d_dk, row * kdim, &mut vr.k, 0, kdim)?;
+            e.copy_region(&sc.d_dv, row * vdim, &mut vr.v, 0, vdim)?;
+            e.copy_region(&sc.d_g, row * hv, &mut vr.g, 0, hv)?;
+            e.copy_region(&sc.d_beta, row * hv, &mut vr.b, 0, hv)?;
+            e.copy_region(&sc.d_zg, row * zr, &mut vr.z, 0, zr)?;
+            // the DecodeBatch arm's calls at n = 1, fallback included
+            let done = e.gated_delta_recurrent_slots_gn(
+                &vr.q,
+                &vr.k,
+                &vr.v,
+                &vr.g,
+                &vr.b,
+                &vr.slot,
+                state,
+                &mut vr.core,
+                &vr.z,
+                &w.norm.buf,
+                None,
+                c.eps,
+                1,
+                hv,
+                kd,
+            )?;
+            if !done {
+                e.gated_delta_recurrent_slots(
+                    &vr.q,
+                    &vr.k,
+                    &vr.v,
+                    &vr.g,
+                    &vr.b,
+                    &vr.slot,
+                    state,
+                    &mut vr.attn,
+                    1,
+                    hv,
+                    kd,
+                )?;
+                e.q4x_gdn_gated_norm(
+                    &vr.attn,
+                    &vr.z,
+                    &w.norm.buf,
+                    &mut vr.core,
+                    None,
+                    hv,
+                    vd,
+                    c.eps,
+                )?;
+            }
+            e.copy_region(&vr.core, 0, &mut sc.d_core, row * vdim, vdim)?;
+        }
+    }
     Ok(())
 }
 
@@ -3738,14 +4381,32 @@ fn attn_pass(
         )?;
         e.side_join()?;
     } else {
+        // Close the window BEFORE the q matmul: attn-qmm opened at whatever
+        // lap last closed before this function, so it billed the layer's
+        // pre-attention work too. With this, attn-qmm is the q GEMM and the
+        // activation quantize `kq_matmul` runs inside it - and nothing else -
+        // which is what the bench's 353 us for this plane compares against.
+        pm_lap(e, "attn-pre");
         if !fused_qkv {
             w.q.matmul(e, &sc.d_bi, &mut sc.d_qg, n, stage)?;
         }
+        // The GEMM alone, then the split: split_qg is a full round trip of the
+        // 25 MB q+gate plane (~0.23 ms at this die's copy rate) that exists
+        // only to separate q from its gate - matmul_2seg could have the GEMM
+        // write both planes and skip it, but only if the split is the cost.
+        pm_lap(e, "attn-qmm");
         e.split_qg(&sc.d_qg, &mut sc.d_q, &mut sc.d_agate, n, nh, hd)?;
+        pm_lap(e, "attn-q");
         if !fused_qkv {
             w.k.matmul(e, &sc.d_bi, &mut sc.d_k, n, stage)?;
             w.v.matmul(e, &sc.d_bi, &mut sc.d_v, n, stage)?;
         }
+        // Split the projections from the passes that follow them: attn-qkv is
+        // 1.62 ms a layer and holds THREE narrow GEMMs plus six full-plane
+        // passes (split, 2 norms, 2 mrope, 2 append), and which half carries
+        // the cost decides whether the lever is a fused-QKV plane (concat_q8 +
+        // one wide GEMM) or a fused post-pass (the slot-309 shape).
+        pm_lap(e, "attn-proj");
         // q_norm/k_norm carry the +1 already (Gemma (1+w), folded at load)
         e.rmsnorm_batch(&sc.d_q, &w.q_norm.buf, &mut sc.d_qn, hd, c.eps, n * nh)?;
         e.rmsnorm_batch(&sc.d_k, &w.k_norm.buf, &mut sc.d_kn, hd, c.eps, n * nkv)?;
@@ -3790,6 +4451,7 @@ fn attn_pass(
             KV(),
         )?;
     }
+    pm_lap(e, "attn-qkv");
     let scale = 1.0 / (hd as f32).sqrt();
     // tcgen05 decode attention (pack slot 431, the <256,6> instantiation built
     // for qwen3.8's 24q/4kv/hd256 - the same geometry). Needs e4m3 pools
@@ -3873,6 +4535,42 @@ fn attn_pass(
                     &sc.d_tile_row0,
                     &sc.d_tile_slot,
                     n_qtiles(runs),
+                    nh,
+                    nkv,
+                    hd,
+                    max_ctx,
+                    kv_dim,
+                    0,
+                    n,
+                    scale,
+                    KV(),
+                )?
+            }
+            // The f16 tensor-core prefill (P6i, `pd_attn_prefill_f16`) for a
+            // 256-wide head on the fp16 pool: S = QK^T and O += VP on f16 WMMA
+            // fragments loaded straight from the cache, 32 queries a block, 64
+            // keys a tile. The tiled f32 walk below stages every K/V tile per
+            // (q head, 16-query tile) block - 12 q heads re-reading each kv
+            // head's bytes - and dots 16 keys over 32 lanes.
+            // bench/attn_prefill_q4x_gb10_bench.cu (24q / 2kv, 1024 rows): 4.83
+            // -> 0.65 ms a layer. A numerics CLASS change (f16 O accumulate,
+            // max |d| 1e-3 on the bench's outputs), judged by the golden;
+            // `PADDOCK_Q38FN_ATTN_PF16=0` is the A/B.
+            Phase::Prefill
+                if hd == 256
+                    && KV() == KvDtype::Fp16
+                    && max_ctx.is_multiple_of(64)
+                    && super::attn_pf16_enabled()
+                    && e.has_attn_prefill_f16() =>
+            {
+                e.attn_prefill_f16(
+                    &sc.d_qn,
+                    kc,
+                    vc,
+                    &sc.d_sinks,
+                    &mut sc.d_attn,
+                    &sc.d_pos,
+                    &sc.d_slots,
                     nh,
                     nkv,
                     hd,
@@ -4012,8 +4710,16 @@ fn attn_pass(
             )?,
         }
     }
+    pm_lap(e, "attn-core");
     e.mul_sigmoid(&mut sc.d_attn, &sc.d_agate, n * q_dim)?;
+    // The gate multiply is a full round trip of d_attn (~38 MB with the gate
+    // plane) and the o projection is a [q_dim -> hidden] Q8_0 GEMM (~31 MB).
+    // attn-out bills 0.813 ms a layer against a ~0.32 ms floor for the pair,
+    // so price them apart before deciding whether the lever is folding the
+    // gate into the GEMM's prologue or the GEMM itself.
+    pm_lap(e, "attn-gate");
     w.o.matmul(e, &sc.d_attn, &mut sc.d_mix, n, stage)?;
+    pm_lap(e, "attn-out");
     Ok(())
 }
 
@@ -4033,11 +4739,126 @@ fn attn_pass(
 /// activations the block loads anyway.
 const MOE_DOWN_CHUNK: usize = 256;
 
+/// Rows from which an UNGROUPED routed down takes the column-tiled kernel
+/// (`_cols`) instead of the per-(row, pair) kernel. It used to be 2, and that
+/// was never priced at those widths: the GB10 kernel bench
+/// (`bench/fnmoe_gb10_bench.cu`, 2026-09-12, UD-IQ3_XXS shape, DRAM-cold) read
+/// the production pair at 62.1 us / 148 GB/s at c1 and 496 us / 149 GB/s at c8
+/// against `_cols` at 103-162 us and 766-1131 us - slower at BOTH widths - and
+/// the verify-walk phase census (2026-09-14) showed the down growing 3.5 ->
+/// 9.8 -> 19.3 -> 37.7 ms/walk at 1/2/4/8 rows, where the gate_up pair beside
+/// it grew 4.3 -> 7.6 -> 13.6 -> 24.7. The two kernels are bit-exact, so this
+/// is a speed election only. Above 16 rows `_cols` keeps its election (the
+/// prefill chunks that stay below the grouped rung). `PADDOCK_Q38FN_DOWN_COLS_MIN`
+/// pins it for the A/B (2 = the old election).
+fn down_cols_min_rows() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PADDOCK_Q38FN_DOWN_COLS_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(17)
+    })
+}
+
 /// Blocks a `pd_moe_align_bm(bm)` layout needs for `rows` routed pairs over
 /// `n_expert` experts: every expert rounds its own count up to a whole block,
 /// so the worst case is one partial block per expert on top of the rows.
 fn grp_align_blocks(rows: usize, n_expert: usize, bm: usize) -> usize {
     (rows + n_expert * (bm - 1)).div_ceil(bm)
+}
+
+/// Whether the mix `w` reads its normalized state through the rebuild
+/// consumers at `n` rows (slots 607 / 608): its inject is a separate f32
+/// matvec and its up + mix takes the single-launch rebuild rung. `combine`
+/// (which then stores no state) and `hc_mix_pass` (which then has none to
+/// read) decide on this one predicate.
+fn hc_takes_rn(
+    e: &GpuExecutor,
+    w: &HcW,
+    n: usize,
+    hc: usize,
+    hidden: usize,
+    stage: &DenseStage,
+) -> bool {
+    w.inject_rows == 0
+        && w.inject
+            .as_ref()
+            .is_some_and(|wi| wi.buf.len() >= hc * hc * hidden)
+        && w.up.takes_hcmix_rn(e, n, hc, hidden, stage)
+}
+
+/// Whether the combine before the rebuilt mix `w` also folds that mix's inject
+/// into its norm pass (slot 609): a [hc][hc * hidden] f32 inject at hc 4, and
+/// scratch for its partials. A re-association of the matvec's dot, so it has
+/// its own switch.
+fn hc_inj_fold_ok(
+    e: &GpuExecutor,
+    w: &HcW,
+    n: usize,
+    hc: usize,
+    hidden: usize,
+    injp_len: usize,
+) -> bool {
+    hc == 4
+        && super::hc_inj_fold_enabled()
+        && e.has_q4x_combine_norm_q8mmq_nsi()
+        && injp_len >= n * hc * hc
+        && w.inject
+            .as_ref()
+            .is_some_and(|wi| wi.buf.len() == hc * hc * hidden)
+}
+
+/// One span of a single-sequence GDN prefill walk, rows `from..from + len`:
+/// slot 604's segment-tiled walk when `seg`, slot 596's P-split walk
+/// otherwise. Both are sequential token loops, so spans compose exactly.
+#[allow(clippy::too_many_arguments)]
+fn gdn_walk_rows(
+    e: &GpuExecutor,
+    sc: &mut Scratch,
+    state: &mut CudaSlice<f32>,
+    st_off: usize,
+    from: usize,
+    len: usize,
+    (hv, kd, vd): (usize, usize, usize),
+    seg: bool,
+) -> Result<(), GpuModelError> {
+    if seg {
+        e.gated_delta_recurrent_seg_rows(
+            &sc.d_dq,
+            &sc.d_dk,
+            &sc.d_dv,
+            &sc.d_g,
+            &sc.d_beta,
+            state,
+            st_off,
+            &mut sc.d_dattn,
+            &mut sc.d_dnrn,
+            from,
+            len,
+            hv,
+            kd,
+        )?;
+    } else {
+        e.gated_delta_recurrent_pn_rows(
+            &sc.d_dq,
+            &sc.d_dk,
+            &sc.d_dv,
+            &sc.d_g,
+            &sc.d_beta,
+            state,
+            st_off,
+            &mut sc.d_dattn,
+            &mut sc.d_dnrn,
+            from,
+            len,
+            hv,
+            kd,
+            vd,
+        )?;
+    }
+    Ok(())
 }
 
 fn kq_moe_routed(
@@ -4103,30 +4924,105 @@ fn kq_moe_routed(
         && e.has_kquant_moe_grp()
         && e.has_moe_align_bm())
     .then(|| GpuExecutor::kq_moe_group_for(rows, c.n_expert));
+    // TENSOR-CORE gate/up at the same prefill widths (slot 601's fused tail):
+    // the int8 mma pair reads each expert's weights over 32-row sorted tiles
+    // and quantizes its SwiGLU output in its own epilogue, so the float
+    // intermediate and the separate quantize pass disappear; the sorted rows
+    // are moved to the pair-major layout the grouped down (below, unchanged)
+    // reads. The shape the kernel serves: one dtype for gate and up, a
+    // super-block-aligned in_dim, a 32-aligned ff, no i-quant (no mma lane).
+    // Measured on Flash-Next UD-Q4_K_XL (2026-09-14): gate/up owned 757 ms of
+    // a 1656 ms 1024-token prefill on the register-tiled pair.
+    let mma = grp.is_some()
+        && super::moe_mma_enabled()
+        && g.ty == u.ty
+        && !crate::gpu::kq_is_iq(g.ty)
+        && h.is_multiple_of(256)
+        && ff.is_multiple_of(32)
+        && e.has_kquant_moe_mma()
+        && e.has_moe_q8_rows_unsort()
+        && e.kernels().is_ok_and(|kt| kt.moe_align.is_some());
+    // EXPERT-MAJOR tensor-core down (slot 603) behind the tensor-core gate/up:
+    // one block per (64-row output strip, expert) walks all of the expert's
+    // pairs straight off the gate/up's sorted rows, so the unsort to
+    // pair-major, the separate sums pass and the bm = 16 CSR the tiled down
+    // walks all drop out. Needs one scale per 32 weights (the flat 32-weight
+    // downs) and whole 128-weight stages. bench/fnmoe_prefill_gb10_bench.cu:
+    // the tiled down's time a layer was ~60% dp4a dot structure, not weight
+    // bytes.
+    let down_e = mma
+        && crate::gpu::kq_flat32(d.ty)
+        && ff.is_multiple_of(128)
+        && super::moe_down_mma_enabled()
+        && e.has_kquant_moe_down_mma_e();
     match grp {
         Some(bm) => {
             let blocks = grp_align_blocks(rows, c.n_expert, bm);
-            e.moe_align_bm(
-                idx,
-                &mut sc.d_msrow,
-                &mut sc.d_msslot,
-                &mut sc.d_mbexp,
-                n,
-                k,
-                c.n_expert,
-                bm,
-                blocks,
-            )?;
+            if !down_e {
+                e.moe_align_bm(
+                    idx,
+                    &mut sc.d_msrow,
+                    &mut sc.d_msslot,
+                    &mut sc.d_mbexp,
+                    n,
+                    k,
+                    c.n_expert,
+                    bm,
+                    blocks,
+                )?;
+            }
+            if mma {
+                let mb = grp_align_blocks(rows, c.n_expert, 32);
+                e.moe_align(
+                    idx,
+                    &mut sc.d_srow32,
+                    &mut sc.d_sslot32,
+                    &mut sc.d_bexp32,
+                    n,
+                    k,
+                    c.n_expert,
+                    mb,
+                )?;
+                e.kquant_moe_gate_up_mma(
+                    g,
+                    u,
+                    &sc.d_srow32,
+                    &sc.d_bexp32,
+                    &sc.d_xq,
+                    &sc.d_xs,
+                    ng.then_some(&sc.d_ssums),
+                    &mut sc.d_sfq,
+                    &mut sc.d_sfs,
+                    mb,
+                )?;
+                if !down_e {
+                    e.moe_q8_rows_unsort(
+                        &sc.d_sfq,
+                        &sc.d_sfs,
+                        &sc.d_srow32,
+                        &sc.d_sslot32,
+                        &sc.d_bexp32,
+                        &mut sc.d_fq,
+                        &mut sc.d_fs,
+                        ff,
+                        k,
+                        mb,
+                    )?;
+                }
+            }
             // REGISTER-TILED pair (slot 592) when the CSR group is its own
             // tile height and K divides its slice: it stages both operands per
             // BK and reads the group's activations once per column TILE, where
             // the grouped pair kernel reads them once per column - 47 GB a
             // layer at a 2114-row wave, which is what that kernel waits on.
-            let tiled = bm == GpuExecutor::KQ_MOE_TILE_BM
+            let tiled = !mma
+                && bm == GpuExecutor::KQ_MOE_TILE_BM
                 && h.is_multiple_of(128)
                 && super::moe_tile_enabled()
                 && e.has_kquant_moe_gate_up_tile();
-            if tiled {
+            if mma {
+                // gate/up already ran on the tensor cores above
+            } else if tiled {
                 e.kquant_moe_gate_up_tile(
                     g,
                     u,
@@ -4172,9 +5068,11 @@ fn kq_moe_routed(
         )?,
     }
     pm_lap(e, "gate_up");
-    e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, rows * ff)?;
+    if !mma {
+        e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, rows * ff)?;
+    }
     let nd = needs(d.ty);
-    if nd {
+    if nd && !down_e {
         e.q8_sums_strided(&sc.d_fq, &mut sc.d_ssums, ff, rows)?;
     }
     pm_lap(e, "act-quant");
@@ -4184,7 +5082,42 @@ fn kq_moe_routed(
     // 1.25 windows per lane to hide them with). Bit-identical, so the choice
     // is only about keeping the die full - which is why it is the prefill
     // widths that take it.
-    if let (Some(bm), true) = (grp, e.has_kquant_moe_down_grp()) {
+    if down_e {
+        // The partials plane is sized for the widest walk at MOE_DOWN_CHUNK
+        // columns ([max_tokens x n_active x 256]); a narrower walk spends the
+        // same bytes on wider chunks, in whole 64-row strips. Narrow launches
+        // cost this kernel more than they cost the tile: a hot expert's CTA
+        // walks all of its pairs, and every 256-column launch waits on it with
+        // only 4 of its strips running (bench/fnmoe_prefill_gb10_bench.cu at a
+        // skewed routing, 1024 tokens: 6.5 ms a layer at 256 columns, 5.3 at
+        // 1280, 5.2 at 2560 - bit-identical). The per-expert span pass reruns
+        // a chunk (one 256-thread block).
+        let mb = grp_align_blocks(rows, c.n_expert, 32);
+        let chunk = (sc.d_dpart.len() / rows / 64 * 64).clamp(64, h);
+        let mut o0 = 0;
+        while o0 < h {
+            let ocols = (h - o0).min(chunk);
+            e.kquant_moe_down_mma_e(
+                d,
+                &sc.d_srow32,
+                &sc.d_sslot32,
+                &sc.d_bexp32,
+                &sc.d_topw,
+                &sc.d_sfq,
+                &sc.d_sfs,
+                &mut sc.d_emap,
+                &mut sc.d_dpart,
+                o0,
+                ocols,
+                k,
+                n,
+                c.n_expert,
+                mb,
+            )?;
+            e.moe_part_fold_at(&sc.d_dpart, &mut sc.d_mix, h, o0, ocols, k, n)?;
+            o0 += ocols;
+        }
+    } else if let (Some(bm), true) = (grp, e.has_kquant_moe_down_grp()) {
         // Expert-grouped down over the CSR the gate_up half already built:
         // the ungrouped kernels unpack a weight row per (routed pair, column),
         // which is 42% of a wave walk (17.2 ms a layer at 2114 rows). One
@@ -4240,7 +5173,7 @@ fn kq_moe_routed(
             e.moe_part_fold_at(&sc.d_dpart, &mut sc.d_mix, h, o0, ocols, k, n)?;
             o0 += ocols;
         }
-    } else if (grp.is_some() || n >= 2) && e.has_kquant_moe_down_cols() {
+    } else if (grp.is_some() || n >= down_cols_min_rows()) && e.has_kquant_moe_down_cols() {
         e.kquant_moe_down_cols(
             d,
             idx,
@@ -4342,6 +5275,104 @@ fn kq_moe_routed_waves(
     Ok(())
 }
 
+/// Sorted-expert scratch for a Q8_0 seat (`q8_moe_routed` above
+/// `Q8_SORTED_MIN_ROWS` rows), sized for `max_rows` rows.
+pub(crate) struct Q8Wide {
+    pub srow: CudaSlice<u32>,
+    pub sslot: CudaSlice<u32>,
+    pub bexp: CudaSlice<u32>,
+    pub fused: CudaSlice<f32>,
+    pub fq: CudaSlice<i8>,
+    pub fs: CudaSlice<f32>,
+    pub part: CudaSlice<f32>,
+    pub max_rows: usize,
+    pub max_blocks: usize,
+}
+
+/// Rows above which a Q8_0 seat walks its experts sorted: token-batched, every
+/// routed pair reads its expert's rows once per pair; sorted, once per block of
+/// 32 pairs.
+const Q8_SORTED_MIN_ROWS: usize = 32;
+
+/// The routed pair on all-Q8_0 seats (the MTP head's block): the qwen3.6-A3B
+/// Q8_0 SwiGLU class - int8 activations per 32, f32 block scales, exact int
+/// dots. Leaves `d_mix` = the top-k-weighted routed output, as the other arms.
+#[allow(clippy::too_many_arguments)]
+fn q8_moe_routed(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    gate: &crate::gpu::RepackedQ8,
+    up: &crate::gpu::RepackedQ8,
+    down: &crate::gpu::RepackedQ8,
+    sc: &mut Scratch,
+    n: usize,
+    wide: Option<&mut Q8Wide>,
+) -> Result<(), GpuModelError> {
+    let (h, k, ff) = (c.hidden, c.n_active, c.moe_ff);
+    e.quantize_q8(&sc.d_bi, &mut sc.d_xq, &mut sc.d_xs, n * h)?;
+    match wide {
+        Some(wd) if n > Q8_SORTED_MIN_ROWS => {
+            if n > wd.max_rows {
+                return Err(GpuModelError::Unsupported(format!(
+                    "Q8_0 expert seat: {n} rows, the sorted scratch holds {}",
+                    wd.max_rows
+                )));
+            }
+            let nb = wd.max_blocks;
+            e.moe_align(
+                &sc.d_idx,
+                &mut wd.srow,
+                &mut wd.sslot,
+                &mut wd.bexp,
+                n,
+                k,
+                c.n_expert,
+                nb,
+            )?;
+            e.q8_0_moe_gate_up_sorted(
+                gate,
+                up,
+                &wd.srow,
+                &wd.bexp,
+                &sc.d_xq,
+                &sc.d_xs,
+                &mut wd.fused,
+                nb,
+            )?;
+            e.quantize_q8(&wd.fused, &mut wd.fq, &mut wd.fs, nb * 32 * ff)?;
+            e.q8_0_moe_down_sorted(
+                down,
+                &wd.srow,
+                &wd.sslot,
+                &wd.bexp,
+                &sc.d_topw,
+                &wd.fq,
+                &wd.fs,
+                &mut wd.part,
+                k,
+                nb,
+            )?;
+            e.zero_region(&mut sc.d_mix, 0, n * h)?;
+            e.moe_slot_combine(&wd.part, &mut sc.d_mix, h, k, n)?;
+        }
+        _ => {
+            e.q8_0_moe_gate_up(gate, up, &sc.d_idx, &sc.d_xq, &sc.d_xs, &mut sc.d_act, k, n)?;
+            e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, n * k * ff)?;
+            e.q8_0_moe_down(
+                down,
+                &sc.d_idx,
+                &sc.d_topw,
+                &sc.d_fq,
+                &sc.d_fs,
+                &mut sc.d_mix,
+                k,
+                n,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// 512-expert top-10 NVFP4 MoE + the bf16 sigmoid-gated shared expert.
 #[allow(clippy::too_many_arguments)]
 fn moe_pass(
@@ -4357,6 +5388,9 @@ fn moe_pass(
     // into the fold (513-row alignment trap) and the sh 2seg - the lone
     // RFOLD+SH leg ran -6.8% vs base while both arms win at decode widths.
     decode: bool,
+    // sorted-expert scratch for a Q8_0 seat above token-batch widths (the MTP
+    // head seeding a prompt); the trunk passes None
+    wide: Option<&mut Q8Wide>,
 ) -> Result<bool, GpuModelError> {
     let (h, k, sff) = (c.hidden, c.n_active, c.shared_ff);
     // Router: softmax over all experts, top-k, renormalized over the picks -
@@ -4445,6 +5479,11 @@ fn moe_pass(
             n,
         )?;
     }
+    // The router projection on its own: [h -> ne] at prefill width. Split out
+    // because "pre-route" bills whatever preceded it, and the fork block below
+    // is DECODE-ONLY (fork_ok gates on the phase), so at prefill that window
+    // is not the shared expert it looks like.
+    pm_lap(e, "router");
     let folded_wide = !fused_router && router_folded;
     // The shared expert reads `d_bi` and never touches the routed chain - the
     // two only meet at the gated add below. The routed chain is ~64 us/layer
@@ -4484,6 +5523,10 @@ fn moe_pass(
         w.sh_down.matmul(e, &sc.d_shg, &mut sc.d_shd, n, stage)?;
         e.side_end()?;
     }
+    // The routed pair's laps used to open at whatever lapped last, so the
+    // router and the shared-expert side billed as "x-quant" - 1.07 ms a layer
+    // for two streaming kernels that move 17 MB. Split here.
+    pm_lap(e, "pre-route");
     if !(folded_wide
         && e.moe_topk_batch_s(
             &sc.d_logits,
@@ -4506,6 +5549,7 @@ fn moe_pass(
             n,
         )?;
     }
+    pm_lap(e, "route");
     let fused = false;
     match &w.seats {
         ExpertSeats::Nvf4 { gate, up, down } => {
@@ -4546,6 +5590,7 @@ fn moe_pass(
             down,
             cache,
         } => kq_moe_routed(e, c, gate, up, down, cache.as_deref(), sc, n)?,
+        ExpertSeats::Q8 { gate, up, down } => q8_moe_routed(e, c, gate, up, down, sc, n, wide)?,
     }
     if moe_forked {
         e.side_join()?;
@@ -4763,7 +5808,9 @@ impl Scratch {
             d_sinks: e.alloc_no_sinks(c.n_heads)?,
             // + 1 row: the folded shared-expert gate
             d_logits: e.alloc(t * (c.n_expert + 1))?,
-            d_dnrn: e.alloc(t * c.gdn_v_heads * 2)?,
+            // slot 596's norms take 2 floats a (token, head), slot 604's
+            // pre-pass 4 ({exp(g), beta, q norm, k norm})
+            d_dnrn: e.alloc(t * c.gdn_v_heads * 4)?,
             // down z-split partials: [rows<=64][ceil(k/2)][embd]
             d_moe_part: e.alloc(64 * c.n_active.div_ceil(2) * c.hidden)?,
             // decode-only scratch: 64 rows x heads x S<=16 x (256+2) ~ 25 MB
@@ -4820,6 +5867,49 @@ impl Scratch {
             } else {
                 1
             })?,
+            d_srow32: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32
+            } else {
+                1
+            })?,
+            d_sslot32: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32
+            } else {
+                1
+            })?,
+            d_bexp32: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32)
+            } else {
+                1
+            })?,
+            d_sfq: e.alloc_i8(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32 * c.moe_ff
+            } else {
+                1
+            })?,
+            d_sfs: e.alloc(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32 * (c.moe_ff / 32)
+            } else {
+                1
+            })?,
+            d_emap: e.alloc_u32(if kq_lanes { 2 * c.n_expert } else { 1 })?,
+            d_hcaux: if kq_lanes && e.has_q4x_hc_rebuild() {
+                (0..2 * c.n_layer)
+                    .map(|_| e.alloc(c.hc_width() + t * c.hc_count))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            },
+            d_injp: e.alloc(if kq_lanes && e.has_q4x_combine_norm_q8mmq_nsi() {
+                t * c.hc_count * c.hc_count
+            } else {
+                1
+            })?,
+            d_hcq: e.alloc_u8(if kq_lanes && e.has_q4x_combine_norm_q8mmq() {
+                super::hc_preq_bytes(c.hc_width(), t.min(super::HC_PREQ_MAX_ROWS))
+            } else {
+                1
+            })?,
             d_topw: e.alloc(t * c.n_active)?,
             d_act: e.alloc(t * c.n_active * c.moe_ff)?,
             d_par: e.alloc_u32(t.max(1) * 4)?,
@@ -4870,6 +5960,9 @@ impl Scratch {
 // (n_heads, batch); `kv_append_batch` and the decode attention take slot
 // vectors), and `decode_step_batch` is gated by
 // `batched_slots_match_single_slot_runs`. So this is a seam, not a rewrite.
+mod mtp;
+mod spec;
+
 fn q4x_gen_err(e: GpuModelError) -> crate::generator::GenError {
     crate::generator::GenError::Backend(e.to_string())
 }
@@ -4997,6 +6090,7 @@ impl crate::generator::Generator for Qwen4ExpGpu {
             .collect();
         Self::check_positions(&self.pos, &rows, positions)?;
         let per_row = self.decode_step_batch(&rows).map_err(q4x_gen_err)?;
+        self.mtp_flush().map_err(q4x_gen_err)?;
         // hand back a full [rows, vocab] plane: hole rows keep their zeros,
         // which is what the caller's own Hole arm discards
         let mut out = vec![0f32; tokens.len() * self.cfg.vocab];
@@ -5060,7 +6154,57 @@ impl crate::generator::Generator for Qwen4ExpGpu {
             });
         }
         self.decode_batch_walk(&rows).map_err(q4x_gen_err)?;
-        self.sample_rows_from_logits(&rows, plans)
-            .map_err(q4x_gen_err)
+        let step = self
+            .sample_rows_from_logits(&rows, plans)
+            .map_err(q4x_gen_err)?;
+        // after the sample: feeding the head reuses the walk's scratch
+        self.mtp_flush().map_err(q4x_gen_err)?;
+        Ok(step)
+    }
+
+    /// A drafter exists once a head GGUF is attached (`attach_mtp`); the
+    /// service's policy resolution handles --spec / --no-spec on top.
+    fn spec_capable(&self) -> bool {
+        self.mtp.is_some() && self.exec.has_argmax_rows()
+    }
+
+    fn forward_spec_batch(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<u32>>, crate::generator::GenError> {
+        self.verify_round(reqs).map_err(q4x_gen_err)
+    }
+
+    fn spec_draft_batch(
+        &mut self,
+        pendings: &[(usize, u32)],
+        k: usize,
+    ) -> Result<Option<Vec<Vec<u32>>>, crate::generator::GenError> {
+        if self.mtp.is_none() {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(pendings.len());
+        for &(slot, tok) in pendings {
+            out.push(self.mtp_draft(slot, tok, k).map_err(q4x_gen_err)?);
+        }
+        Ok(Some(out))
+    }
+
+    /// No re-warm path: every walk feeds the head's stash, so a cold slot is
+    /// one whose rows outran what it tracks - it drafts nothing until its next
+    /// prompt, and the verify still serves it one token a round.
+    fn spec_ensure_warm(
+        &mut self,
+        slot: usize,
+        _committed: &[u32],
+        want_pos: u32,
+    ) -> Result<bool, crate::generator::GenError> {
+        Ok(self.mtp_warm(slot, want_pos as usize + 1))
+    }
+
+    /// The drafter decides warmth per slot (a cold slot gets an empty draft
+    /// list and rides the verify as a one-row chunk).
+    fn spec_draft_per_slot_warm(&self) -> bool {
+        self.mtp.is_some()
     }
 }

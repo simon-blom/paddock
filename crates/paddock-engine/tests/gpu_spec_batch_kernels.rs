@@ -630,3 +630,224 @@ fn dflash_ring_attention_runs_matches_per_block_loop() {
         "dflash ring attention: batched-runs launch BIT-EXACT vs per-block loop (n={n}, rows={rows})"
     );
 }
+
+/// Slot 599 (`gated_delta_recurrent_runs_slots`): the row-exact spec verify's
+/// GDN walk must be the decode tick's recurrence (slot 564, `slots_gn` at
+/// n = 1) row for row - outputs AND the carried state, bit for bit - or a
+/// verify row can part from the greedy stream at a near-tie. Reference: one
+/// slots_gn launch per row in run order (the per-row route the walk replaces).
+/// Three runs of different lengths on permuted slots, with the fused norm and
+/// without it (the rollback replay's form, checked against plain slots).
+#[test]
+fn runs_slots_walk_matches_per_row_slots_gn() {
+    let Some(exec) = exec() else { return };
+    let (n_slots, h, d) = (5usize, 3usize, 128usize);
+    let run_len: Vec<u32> = vec![2, 4, 1];
+    let run_slot: Vec<u32> = vec![3, 0, 4];
+    let run_off: Vec<u32> = run_len
+        .iter()
+        .scan(0u32, |acc, &l| {
+            let o = *acc;
+            *acc += l;
+            Some(o)
+        })
+        .collect();
+    let rows = run_len.iter().sum::<u32>() as usize;
+    let hd = h * d;
+    let q = det(rows * hd, 21);
+    let k = det(rows * hd, 22);
+    let v = det(rows * hd, 23);
+    // decay gate g = ssm_a * softplus(..) <= 0, beta in (0, 1)
+    let g: Vec<f32> = det(rows * h, 24).iter().map(|x| -(x + 0.5) * 2.0).collect();
+    let beta: Vec<f32> = det(rows * h, 25).iter().map(|x| x + 0.5).collect();
+    let z = det(rows * hd, 26);
+    let w: Vec<f32> = det(d, 27).iter().map(|x| 1.0 + x).collect();
+    let states0 = det(n_slots * h * d * d, 28);
+
+    let dq = exec.to_device(&q).expect("q");
+    let dk = exec.to_device(&k).expect("k");
+    let dv = exec.to_device(&v).expect("v");
+    let dg = exec.to_device(&g).expect("g");
+    let db = exec.to_device(&beta).expect("beta");
+    let dz = exec.to_device(&z).expect("z");
+    let dw = exec.to_device(&w).expect("w");
+    let d_off = exec.to_device_u32(&run_off).expect("off");
+    let d_len = exec.to_device_u32(&run_len).expect("len");
+    let d_slot = exec.to_device_u32(&run_slot).expect("slot");
+
+    for with_norm in [true, false] {
+        // the walk
+        let mut st_walk = exec.to_device(&states0).expect("states");
+        let mut out_walk = exec.alloc(rows * hd).expect("out");
+        let gn = with_norm.then_some((&dz, &dw, 1e-6f32));
+        let walked = exec
+            .gated_delta_recurrent_runs_slots(
+                &dq,
+                &dk,
+                &dv,
+                &dg,
+                &db,
+                &mut st_walk,
+                &mut out_walk,
+                &d_off,
+                &d_len,
+                &d_slot,
+                gn,
+                run_len.len(),
+                h,
+                d,
+            )
+            .expect("runs walk");
+        if !walked {
+            common::missing("pack has no gated_delta_recurrent_runs_slots (slot 599)");
+            return;
+        }
+
+        // per-row reference: the decode tick's entry at n = 1, rows staged at 0
+        let mut st_ref = exec.to_device(&states0).expect("states");
+        let mut out_ref = vec![0f32; rows * hd];
+        let (mut rq, mut rk, mut rv) = (
+            exec.alloc(hd).unwrap(),
+            exec.alloc(hd).unwrap(),
+            exec.alloc(hd).unwrap(),
+        );
+        let (mut rg, mut rb, mut rz) = (
+            exec.alloc(h).unwrap(),
+            exec.alloc(h).unwrap(),
+            exec.alloc(hd).unwrap(),
+        );
+        let mut rout = exec.alloc(hd).unwrap();
+        let mut rslot = exec.alloc_u32(1).unwrap();
+        for (ri, (&off, &len)) in run_off.iter().zip(&run_len).enumerate() {
+            exec.upload_u32(&[run_slot[ri]], &mut rslot).unwrap();
+            for t in 0..len as usize {
+                let row = off as usize + t;
+                exec.copy_region(&dq, row * hd, &mut rq, 0, hd).unwrap();
+                exec.copy_region(&dk, row * hd, &mut rk, 0, hd).unwrap();
+                exec.copy_region(&dv, row * hd, &mut rv, 0, hd).unwrap();
+                exec.copy_region(&dg, row * h, &mut rg, 0, h).unwrap();
+                exec.copy_region(&db, row * h, &mut rb, 0, h).unwrap();
+                exec.copy_region(&dz, row * hd, &mut rz, 0, hd).unwrap();
+                if with_norm {
+                    let ok = exec
+                        .gated_delta_recurrent_slots_gn(
+                            &rq,
+                            &rk,
+                            &rv,
+                            &rg,
+                            &rb,
+                            &rslot,
+                            &mut st_ref,
+                            &mut rout,
+                            &rz,
+                            &dw,
+                            None,
+                            1e-6,
+                            1,
+                            h,
+                            d,
+                        )
+                        .expect("slots_gn");
+                    assert!(ok, "slots_gn declined a geometry slot 599 accepted");
+                } else {
+                    exec.gated_delta_recurrent_slots(
+                        &rq,
+                        &rk,
+                        &rv,
+                        &rg,
+                        &rb,
+                        &rslot,
+                        &mut st_ref,
+                        &mut rout,
+                        1,
+                        h,
+                        d,
+                    )
+                    .expect("slots");
+                }
+                let o = exec.to_host(&rout).unwrap();
+                out_ref[row * hd..(row + 1) * hd].copy_from_slice(&o[..hd]);
+            }
+        }
+
+        let ow = exec.to_host(&out_walk).unwrap();
+        let sw = exec.to_host(&st_walk).unwrap();
+        let sr = exec.to_host(&st_ref).unwrap();
+        let bits = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count()
+        };
+        let (do_, ds) = (bits(&ow[..rows * hd], &out_ref), bits(&sw, &sr));
+        assert_eq!(
+            (do_, ds),
+            (0, 0),
+            "runs walk vs per-row slots{} (norm {with_norm}): {do_} output / {ds} state elements differ",
+            if with_norm { "_gn" } else { "" }
+        );
+    }
+}
+
+/// Slot 598 (`q8_0_gemv_repacked_rows`): each token of the multi-row twin must
+/// be the batch-1 Q8_0 GEMV's output on that token bit for bit - the row-exact
+/// spec verify runs the hyper-connection up and shared-expert down planes
+/// through it. Synthetic repacked planes at those planes' in_dims (320 and
+/// 640, one and two 32-blocks per 16-chunk lane) and a ragged output width,
+/// batches 2 / 5 / 9 (9 = the widest verify chunk).
+#[test]
+fn q8_gemv_rows_matches_batch1_gemv() {
+    let Some(exec) = exec() else { return };
+    for (in_dim, out_dim) in [(320usize, 1000usize), (640, 256)] {
+        let n_blocks = in_dim / 32;
+        // int8 weights, f16 scales, exactly the repacked layout
+        let wq: Vec<u8> = det(out_dim * in_dim, 31)
+            .iter()
+            .map(|x| ((x * 254.0).round() as i32).clamp(-127, 127) as i8 as u8)
+            .collect();
+        let ws: Vec<u8> = det(out_dim * n_blocks, 32)
+            .iter()
+            .flat_map(|x| half::f16::from_f32(0.004 + (x + 0.5) * 0.02).to_le_bytes())
+            .collect();
+        let mut data = exec.alloc_u8(wq.len()).expect("data");
+        exec.upload_u8_at(&wq, &mut data, 0).expect("data up");
+        let mut scale = exec.alloc_u8(ws.len()).expect("scale");
+        exec.upload_u8_at(&ws, &mut scale, 0).expect("scale up");
+        let w = paddock_engine::gpu::RepackedQ8 {
+            data,
+            scale,
+            dims: vec![in_dim, out_dim],
+        };
+        for batch in [2usize, 5, 9] {
+            let x = det(batch * in_dim, 33 + batch as u64);
+            let dx = exec.to_device(&x).expect("x");
+            let mut dy = exec.alloc(batch * out_dim).expect("y");
+            let took = exec
+                .q8_0_gemv_repacked_rows(&w, None, &dx, &mut dy, batch)
+                .expect("rows");
+            if !took {
+                common::missing("pack has no q8_0_gemv_repacked_rows (slot 598)");
+                return;
+            }
+            let rows = exec.to_host(&dy).unwrap();
+            let mut x1 = exec.alloc(in_dim).unwrap();
+            let mut y1 = exec.alloc(out_dim).unwrap();
+            for b in 0..batch {
+                exec.copy_region(&dx, b * in_dim, &mut x1, 0, in_dim)
+                    .unwrap();
+                exec.q8_0_gemv_repacked(&w, None, &x1, &mut y1)
+                    .expect("batch-1 gemv");
+                let one = exec.to_host(&y1).unwrap();
+                let diff = one
+                    .iter()
+                    .zip(&rows[b * out_dim..(b + 1) * out_dim])
+                    .filter(|(p, q)| p.to_bits() != q.to_bits())
+                    .count();
+                assert_eq!(
+                    diff, 0,
+                    "[{in_dim} -> {out_dim}] batch {batch} row {b}: {diff} outputs differ"
+                );
+            }
+        }
+    }
+}

@@ -59,6 +59,59 @@ struct Record {
     api_key: Option<String>,
 }
 
+/// What we know about the process behind a record. `NoHandle` is an adopted or
+/// attached runner - someone else's process, or one discovered after our boot -
+/// where there is nothing to wait on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChildState {
+    Alive,
+    Exited,
+    NoHandle,
+}
+
+/// Should a record for a port that did not answer `identify` be forgotten?
+///
+/// Only when it can be PROVEN gone, never merely because it went quiet. Gone
+/// means the admin socket is no longer enumerable AND no process of ours is
+/// still alive on it. The two halves both matter:
+///
+/// - a socket that still enumerates is a HUNG runner, and hung is a state an
+///   operator needs to see ("unreachable"), not one to quietly erase;
+/// - a live child with no socket yet is a runner still BOOTING, and dropping
+///   its record would strand the process handle - downgrading an Own runner to
+///   Adopted and losing the ability to stop it.
+///
+/// Before this existed nothing ever removed a record, so a crashed or
+/// kill -9'd runner left one for the life of the manager process: the endpoint
+/// showed as "unreachable" with no Start button, `configured()` reported it
+/// `running` so the fleet list hid it entirely, and its port stayed
+/// unallocatable.
+fn silent_record_is_gone(socket_enumerates: bool, child: ChildState) -> bool {
+    !socket_enumerates && child != ChildState::Alive
+}
+
+/// THE rule for "this port has something on it": a record of ours, or an admin
+/// endpoint that enumerates.
+///
+/// **Invariant: `list()` emits a row for exactly the ports this returns true
+/// for, and `configured()` marks exactly those `running`.** The two used to be
+/// separate expressions that did not agree, and the disagreement was not a
+/// cosmetic one: `/api/servers` called a port running if a record existed OR
+/// its socket enumerated, while `/api/runners` only emitted a row when
+/// `identify` answered or a record existed. A port that enumerated but did not
+/// answer satisfied the first and produced nothing for the second, so the
+/// endpoint appeared in NEITHER list and vanished from the UI with its config
+/// still on disk.
+///
+/// They agree by construction now: `identify` answering implies the socket
+/// enumerates (identify travels over that socket), so the three emission paths
+/// in `list()` - answered, recorded-but-silent, enumerated-but-silent - are
+/// precisely `record || enumerates`. Anything added to one side belongs on the
+/// other; that is what this function is for.
+fn port_has_endpoint(records: &HashMap<u16, Record>, serving: &[u16], port: u16) -> bool {
+    records.contains_key(&port) || serving.contains(&port)
+}
+
 /// A runner as the API/CLI sees it. `status` is live (queried per call):
 /// "ok" | "draining" | "unreachable" - unreachable means the admin endpoint
 /// exists but nothing answered (likely a corpse or a hung process).
@@ -628,10 +681,13 @@ pub enum SpawnError {
     Pull(String),
     #[error("no free runner port from {0} upward")]
     NoPort(u16),
+    /// The second field says WHAT holds the port - a pid, or the admin endpoint
+    /// path. Without it "already serving" is unactionable exactly when it is
+    /// wrong: a stale socket refuses every operation and names nothing.
     #[error(
-        "port {0} is already serving (stop it or pick another; takeover is the switch endpoint)"
+        "port {0} is already serving - {1} (stop it or pick another; takeover is the switch endpoint)"
     )]
-    PortTaken(u16),
+    PortTaken(u16, String),
     #[error("port {0} has no config file at {1} - `paddock serve <model> --port {0}` creates one")]
     NotConfigured(u16, String),
     #[error(
@@ -838,7 +894,31 @@ impl Supervisor {
     /// the admin surface? The boot-respawn pass uses this to skip elections
     /// that reconcile() already adopted.
     pub async fn is_serving(&self, port: u16) -> bool {
-        self.records.lock().await.contains_key(&port) || paddock_admin::enumerate().contains(&port)
+        self.port_blocker(port).await.is_some()
+    }
+
+    /// What is holding this port, phrased for the person who has to clear it -
+    /// or None if it is free. THE one predicate for "taken": it was written out
+    /// four times (both spawn paths, `is_serving`, `remove_config`), and every
+    /// copy answered with a bare bool, so each refusal could say that the port
+    /// was busy and none could say what was on it. That is the whole of the
+    /// DGX Spark dead end: a leftover admin socket held a port, three different
+    /// messages refused three different operations, and not one of them named
+    /// the file - which was also the only thing that would have fixed it.
+    ///
+    /// Order matters. Our own record is checked first because it carries a pid,
+    /// which is more actionable than a path; the socket answer is for anything
+    /// this manager did not start, or did not survive.
+    async fn port_blocker(&self, port: u16) -> Option<String> {
+        if let Some(pid) = self.records.lock().await.get(&port).map(|r| r.pid) {
+            return Some(format!("this manager has a runner on it, pid {pid}"));
+        }
+        paddock_admin::enumerate().contains(&port).then(|| {
+            format!(
+                "something is listening on {}",
+                paddock_admin::endpoint_display(port)
+            )
+        })
     }
 
     pub fn log_path(&self, port: u16) -> PathBuf {
@@ -1615,6 +1695,20 @@ impl Supervisor {
             let client = AdminClient::new(port);
             match tokio::time::timeout(Duration::from_secs(2), client.identify()).await {
                 Ok(Ok(id)) => {
+                    // Already ours: refresh only what identify can tell us and
+                    // leave the rest of the record alone. This runs on a timer
+                    // now, and the wholesale insert below would set `child` to
+                    // None every pass - dropping the process handle `stop()`
+                    // waits on and kills with, for every runner we launched.
+                    // Adoption is for ports we do not already know.
+                    {
+                        let mut recs = self.records.lock().await;
+                        if let Some(rec) = recs.get_mut(&port) {
+                            rec.pid = id.pid;
+                            rec.model = id.model.clone();
+                            continue;
+                        }
+                    }
                     // Reclaim our own first: a port whose servers/<port>.toml
                     // exists is a runner a previous manager life configured -
                     // the config FILE gives the full spec back (API key
@@ -1707,6 +1801,44 @@ impl Supervisor {
                 }
             }
         }
+        self.forget_departed().await;
+    }
+
+    /// The other direction of reconciliation: records whose runner is gone.
+    ///
+    /// The loop above only visits ports that still enumerate, so nothing in it
+    /// can notice a record whose socket has disappeared - and until this
+    /// existed, nothing anywhere did. A crashed or `kill -9`'d runner left its
+    /// record for the life of the manager process, which hid its endpoint from
+    /// the fleet list, pinned it as an "Unreachable" row with no Start button,
+    /// and held its port against `allocate_port`.
+    ///
+    /// Gone means the same thing it means in `list()`: no admin socket AND no
+    /// process of ours still alive. A live child with no socket yet is a runner
+    /// still booting and is kept - see `silent_record_is_gone`.
+    async fn forget_departed(&self) {
+        let serving = paddock_admin::enumerate();
+        let mut recs = self.records.lock().await;
+        let gone: Vec<u16> = recs
+            .iter_mut()
+            .filter_map(|(port, rec)| {
+                let child = match rec.child.as_mut() {
+                    Some(c) => match c.try_wait() {
+                        Ok(Some(_)) => ChildState::Exited,
+                        _ => ChildState::Alive,
+                    },
+                    None => ChildState::NoHandle,
+                };
+                silent_record_is_gone(serving.contains(port), child).then_some(*port)
+            })
+            .collect();
+        for port in gone {
+            recs.remove(&port);
+            tracing::info!(
+                port,
+                "runner gone (no admin socket, no live process) - record dropped"
+            );
+        }
     }
 
     /// Live view: own + adopted records, refreshed against enumeration, each
@@ -1714,11 +1846,12 @@ impl Supervisor {
     pub async fn list(&self) -> Vec<RunnerView> {
         // Merge: recorded ports ∪ currently-enumerable endpoints (a runner
         // started after our boot shows up here - adoption on sight).
+        let serving = paddock_admin::enumerate();
         let mut ports: Vec<u16> = {
             let recs = self.records.lock().await;
             recs.keys().copied().collect()
         };
-        for p in paddock_admin::enumerate() {
+        for p in serving.iter().copied() {
             if !ports.contains(&p) {
                 ports.push(p);
             }
@@ -1737,46 +1870,49 @@ impl Supervisor {
                         Ok(Ok(h)) => (h.status, Some(h.in_flight), Some(h.uptime_s)),
                         _ => ("unreachable".into(), None, None),
                     };
-                    let mut recs = self.records.lock().await;
-                    let rec = recs.entry(port).or_insert_with(|| {
-                        // Same rule as reconcile: our config file on the port
-                        // = attach with the full spec read off the TOML (e.g.
-                        // `paddock-runner --config servers/<port>.toml` run by
-                        // hand); no file = a foreign runner, adopted blind.
-                        match self.spec_from_config_file(&self.server_config_path(port)) {
+                    // READ ONLY. This used to adopt on sight - insert a record
+                    // for any port that answered - which made a *read* path an
+                    // owner of authoritative state, and that was the shape
+                    // behind the whole bug: `stop()` dropped a record, the SSE
+                    // watcher called list() 2s later while the runner was still
+                    // draining and answering, and the record came back with
+                    // nothing left to remove it. The adoption it did was also
+                    // lossier than the real one in `reconcile()`: it never
+                    // consulted elections, so a PINNED endpoint came back
+                    // pinned:false and silently lost its never-auto-stop
+                    // policy. reconcile() owns the map now; list() renders it.
+                    let cached = {
+                        let recs = self.records.lock().await;
+                        recs.get(&port).map(|r| {
+                            (
+                                r.origin,
+                                r.pinned,
+                                r.spec_desc.clone(),
+                                r.spec.as_ref().map(RunnerConfig::from_spec),
+                            )
+                        })
+                    };
+                    let (origin, pinned, spec_desc, config) = match cached {
+                        Some(t) => t,
+                        // Not adopted yet - the next reconcile pass will take
+                        // it. Render what its config file says in the meantime
+                        // so a just-started endpoint is not a blank row for a
+                        // couple of seconds. Same rule reconcile uses: our file
+                        // on the port = ours, no file = a foreign runner.
+                        None => match self.spec_from_config_file(&self.server_config_path(port)) {
                             Ok(mut spec) => {
                                 self.heal_spec_identity(&mut spec);
-                                tracing::info!(port, pid = id.pid, "attached runner discovered after boot (spec restored from its config file)");
-                                Record {
-                                    origin: Origin::Own,
-                                    child: None,
-                                    model: id.model.clone(),
-                                    spec_desc: self.describe_spec(&spec),
-                                    pid: id.pid,
-                                    api_key: spec.api_key.clone(),
-                                    pinned: false,
-                                    spec: Some(spec),
-                                }
+                                let desc = self.describe_spec(&spec);
+                                (
+                                    Origin::Own,
+                                    false,
+                                    desc,
+                                    Some(RunnerConfig::from_spec(&spec)),
+                                )
                             }
-                            Err(_) => {
-                                tracing::info!(port, pid = id.pid, "adopting runner discovered after boot");
-                                Record {
-                                    origin: Origin::Adopted,
-                                    child: None,
-                                    model: id.model.clone(),
-                                    spec_desc: None,
-                                    pid: id.pid,
-                                    api_key: None,
-                                    pinned: false,
-                                    spec: None,
-                                }
-                            }
-                        }
-                    });
-                    // A dead own runner replaced by a new process on the same
-                    // port would carry a different pid - trust identify.
-                    rec.pid = id.pid;
-                    rec.model = id.model.clone();
+                            Err(_) => (Origin::Adopted, false, None, None),
+                        },
+                    };
                     let labels = id
                         .model
                         .as_deref()
@@ -1787,11 +1923,11 @@ impl Supervisor {
                     out.push(RunnerView {
                         port,
                         pid: id.pid,
-                        origin: rec.origin,
+                        origin,
                         status,
                         // live self-report first; election-time prediction
                         // covers runners that predate the identify field
-                        spec: self.live_spec_label(&id).or_else(|| rec.spec_desc.clone()),
+                        spec: self.live_spec_label(&id).or(spec_desc),
                         model: id.model,
                         embedder: id.embedder,
                         asr: id.asr,
@@ -1802,12 +1938,16 @@ impl Supervisor {
                         uptime_s: uptime,
                         in_flight,
                         endpoint: format!("http://{}:{port}", Self::lan_ip()),
-                        pinned: rec.pinned,
-                        config: rec.spec.as_ref().map(RunnerConfig::from_spec),
+                        pinned,
+                        config,
                     });
                 }
                 _ => {
                     // Recorded or enumerated but silent: report honestly.
+                    // Forgetting it is `forget_departed`'s job, on the
+                    // reconcile pass - a read path does not get to decide a
+                    // runner is dead. Until that pass runs (seconds) a departed
+                    // runner shows as unreachable, which is what it is.
                     let recs = self.records.lock().await;
                     if let Some(rec) = recs.get(&port) {
                         let labels = rec
@@ -1832,6 +1972,36 @@ impl Supervisor {
                             endpoint: format!("http://{}:{port}", Self::lan_ip()),
                             pinned: rec.pinned,
                             config: rec.spec.as_ref().map(RunnerConfig::from_spec),
+                        });
+                    } else {
+                        // Enumerated, silent, and not ours - a runner someone
+                        // else started, or one that outlived our record, which
+                        // has stopped answering. This branch used to emit
+                        // NOTHING while `configured()` counted the very same
+                        // port as running, and an endpoint that is "running"
+                        // with no row renders in neither list: the vanishing.
+                        // See `port_has_endpoint` for the invariant.
+                        out.push(RunnerView {
+                            port,
+                            // identify is what would have told us, and it did
+                            // not answer. 0 reads as unknown rather than
+                            // inventing one.
+                            pid: 0,
+                            origin: Origin::Adopted,
+                            status: "unreachable".into(),
+                            model: None,
+                            spec: None,
+                            embedder: None,
+                            asr: None,
+                            aligner: None,
+                            display: None,
+                            vendor: None,
+                            version: None,
+                            uptime_s: None,
+                            in_flight: None,
+                            endpoint: format!("http://{}:{port}", Self::lan_ip()),
+                            pinned: false,
+                            config: None,
                         });
                     }
                 }
@@ -2430,9 +2600,8 @@ impl Supervisor {
         };
         let port = match spec.port {
             Some(p) => {
-                let recs = self.records.lock().await;
-                if recs.contains_key(&p) || paddock_admin::enumerate().contains(&p) {
-                    return Err(SpawnError::PortTaken(p));
+                if let Some(why) = self.port_blocker(p).await {
+                    return Err(SpawnError::PortTaken(p, why));
                 }
                 p
             }
@@ -2614,11 +2783,8 @@ impl Supervisor {
                 cfg_path.display().to_string(),
             ));
         }
-        {
-            let recs = self.records.lock().await;
-            if recs.contains_key(&port) || paddock_admin::enumerate().contains(&port) {
-                return Err(SpawnError::PortTaken(port));
-            }
+        if let Some(why) = self.port_blocker(port).await {
+            return Err(SpawnError::PortTaken(port, why));
         }
         // visible to VRAM admission from here until the record lands
         if let Ok(mut s) = self.spawning.lock() {
@@ -2871,7 +3037,33 @@ impl Supervisor {
     /// then wait for process exit. Own runners escalate to kill if the process
     /// outlives the timeout (safe: stateless on disk, driver reclaims VRAM);
     /// adopted runners are never force-killed (§6.1) - we report instead.
+    ///
+    /// The record is dropped twice on purpose. `stop_inner` drops it up front
+    /// so nothing treats the port as live while it drains, but the drain window
+    /// is seconds to minutes long and the runner keeps answering `identify`
+    /// throughout it (shutdown acks immediately, then drains in a background
+    /// task). Adoption runs on a timer - `reconcile()` now, `list()` before it -
+    /// and takes any port that answers, so the record came back mid-drain and
+    /// nothing ever removed it again. Moving adoption out of the read path did
+    /// NOT retire this: a draining runner answers whoever asks, whenever they
+    /// ask. The second drop is the guard, and it stays. That zombie made
+    /// `configured()` report `running: true` forever, which hid the endpoint
+    /// from the fleet list, pinned it as an "Unreachable" row with no Start
+    /// button, and blocked its port in `allocate_port`. Dropping it again here,
+    /// once the process is genuinely gone, closes that window.
     pub async fn stop(&self, port: u16, drain_timeout_ms: u64) -> Result<StopOutcome, String> {
+        let out = self.stop_inner(port, drain_timeout_ms).await;
+        // StillRunning means an adopted runner ignored the drain and is alive:
+        // its record is the truth and must stay.
+        if !matches!(out, Ok(StopOutcome::StillRunning))
+            && self.records.lock().await.remove(&port).is_some()
+        {
+            tracing::debug!(port, "record re-adopted during the drain, dropped again");
+        }
+        out
+    }
+
+    async fn stop_inner(&self, port: u16, drain_timeout_ms: u64) -> Result<StopOutcome, String> {
         // The stop request is the desired-state change - drop the election
         // first, even if nothing answers (a crashed runner's stale election
         // must not respawn a model the operator explicitly stopped).
@@ -3016,13 +3208,9 @@ impl Supervisor {
                 path.display()
             ));
         }
-        let running = {
-            let recs = self.records.lock().await;
-            recs.contains_key(&port)
-        } || paddock_admin::enumerate().contains(&port);
-        if running {
+        if let Some(why) = self.port_blocker(port).await {
             return Err(format!(
-                "port {port} is serving - stop it first, then remove"
+                "port {port} is serving - {why}. Stop it first, then remove"
             ));
         }
         if let Some(el) = &self.elections {
@@ -3076,7 +3264,9 @@ impl Supervisor {
                 spec_desc: spec.as_ref().and_then(|s| self.describe_spec(s)),
                 artifact: spec.and_then(|s| s.artifact),
                 weights,
-                running: recs.contains_key(&port) || serving.contains(&port),
+                // The same rule `list()` emits rows by - see
+                // `port_has_endpoint`. These two must never drift apart again.
+                running: port_has_endpoint(&recs, &serving, port),
             });
         }
         out.sort_by_key(|x| x.port);
@@ -3287,6 +3477,78 @@ pub enum StopOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal that does not name what it is refusing over sent a user
+    /// hunting for an hour. The blocker has to survive into the message.
+    #[test]
+    fn a_taken_port_says_what_is_holding_it() {
+        let sock = "/run/user/1000/paddock/runner-11540.sock";
+        let msg =
+            SpawnError::PortTaken(11540, format!("something is listening on {sock}")).to_string();
+        assert!(msg.contains("11540"), "{msg}");
+        assert!(
+            msg.contains(sock),
+            "the operator cannot act on what is not named: {msg}"
+        );
+
+        let msg = SpawnError::PortTaken(11540, "this manager has a runner on it, pid 4242".into())
+            .to_string();
+        assert!(msg.contains("pid 4242"), "{msg}");
+    }
+
+    fn bare_record(pid: u32) -> Record {
+        Record {
+            origin: Origin::Adopted,
+            child: None,
+            model: None,
+            spec_desc: None,
+            pid,
+            pinned: false,
+            spec: None,
+            api_key: None,
+        }
+    }
+
+    /// `list()` and `configured()` answer "is anything on this port" for two
+    /// different surfaces, and when they disagreed the endpoint rendered on
+    /// neither. One rule, both callers.
+    #[test]
+    fn a_port_counts_as_occupied_from_either_side_alone() {
+        let mut recs = HashMap::new();
+        assert!(!port_has_endpoint(&recs, &[], 11540), "nothing anywhere");
+
+        // Socket only: a runner we did not start, or one that outlived our
+        // record. This is the case that used to satisfy `configured().running`
+        // while producing no runner row at all.
+        assert!(port_has_endpoint(&recs, &[11540], 11540));
+
+        // Record only: ours, still booting, socket not up yet.
+        recs.insert(11540, bare_record(4242));
+        assert!(port_has_endpoint(&recs, &[], 11540));
+        assert!(port_has_endpoint(&recs, &[11540], 11540));
+
+        // Neighbouring ports are not implicated by either signal.
+        assert!(!port_has_endpoint(&recs, &[11540], 11541));
+    }
+
+    /// The zombie-record rule, which had no rule before: quiet is not gone.
+    #[test]
+    fn a_silent_record_is_only_forgotten_when_it_is_provably_gone() {
+        // Gone: nothing enumerates and the process we launched has exited, or
+        // there was never a process of ours to begin with (adopted/attached).
+        assert!(silent_record_is_gone(false, ChildState::Exited));
+        assert!(silent_record_is_gone(false, ChildState::NoHandle));
+
+        // Booting: our child is alive, its socket is not up yet. Dropping this
+        // record strands the process handle and we could never stop it again.
+        assert!(!silent_record_is_gone(false, ChildState::Alive));
+
+        // Hung: the socket is still there but identify does not answer. That is
+        // a real state an operator has to be able to SEE, so it keeps its row.
+        assert!(!silent_record_is_gone(true, ChildState::Alive));
+        assert!(!silent_record_is_gone(true, ChildState::Exited));
+        assert!(!silent_record_is_gone(true, ChildState::NoHandle));
+    }
 
     /// A line the browser actually met. What a toast can show
     /// is the first ~100 characters, so those characters have to be the answer.

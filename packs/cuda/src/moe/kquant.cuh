@@ -156,7 +156,7 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
                           uint32_t gdt, uint32_t udt, void* stream) {
     if (ff == 0 || n_active == 0 || batch == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
-    if ((in_dim & 255u) != 0 && !(gdt == PD_KQ_IQ4NL_ID && udt == PD_KQ_IQ4NL_ID))
+    if ((in_dim & 255u) != 0 && !(pd_kq_flat32(gdt) && pd_kq_flat32(udt)))
         return cudaErrorInvalidValue;   // partial superblocks: IQ4_NL's flat rows only
     if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
         return cudaErrorInvalidValue;
@@ -199,7 +199,7 @@ int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
                                const void* n_pairs, void* stream) {
     if (ff == 0 || n_active == 0 || batch == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
-    if ((in_dim & 255u) != 0 && !(gdt == PD_KQ_IQ4NL_ID && udt == PD_KQ_IQ4NL_ID))
+    if ((in_dim & 255u) != 0 && !(pd_kq_flat32(gdt) && pd_kq_flat32(udt)))
         return cudaErrorInvalidValue;
     if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
         return cudaErrorInvalidValue;
@@ -340,7 +340,7 @@ int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
                               uint32_t udt, void* stream) {
     if (ff == 0 || n_active == 0 || max_blocks == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
-    if ((in_dim & 255u) != 0 && !(gdt == PD_KQ_IQ4NL_ID && udt == PD_KQ_IQ4NL_ID))
+    if ((in_dim & 255u) != 0 && !(pd_kq_flat32(gdt) && pd_kq_flat32(udt)))
         return cudaErrorInvalidValue;
     if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
         return cudaErrorInvalidValue;
@@ -455,7 +455,7 @@ int pd_kquant_moe_down(const void* down_data, const void* down_scales,
                        uint32_t batch, uint32_t ddt, void* stream) {
     if (embd == 0 || n_active == 0 || batch == 0) return 0;
     if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
-    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID)
+    if ((ff & 255u) != 0 && !pd_kq_flat32(ddt))
         return cudaErrorInvalidValue;   // partial superblocks: IQ4_NL's flat rows only
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if ((pd_kq_has_mu(ddt)) && fsums == nullptr)
@@ -559,7 +559,7 @@ int pd_kquant_moe_down_cols(const void* down_data, const void* down_scales,
                             void* stream) {
     if (embd == 0 || n_active == 0 || batch == 0) return 0;
     if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
-    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && !pd_kq_flat32(ddt)) return cudaErrorInvalidValue;
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if (pd_kq_has_mu(ddt) && fsums == nullptr) return cudaErrorInvalidValue;
     cudaStream_t st = (cudaStream_t)stream;
@@ -1048,6 +1048,437 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_down_grp_kernel(
     }
 }
 
+// ---- sorted -> pair-major int8 activations (slot 601) ----------------------
+// The tensor-core gate/up (`pd_kquant_moe_gate_up_mma`) quantizes its SwiGLU
+// output in its own epilogue, straight into the moe_align SORTED layout
+// ([max_blocks][32][ff] int8 + per-32 scales) - the fused tail that retires the
+// float intermediate and its quantize pass. The expert-grouped down above reads
+// the PAIR-major layout (token * n_active + slot) instead, and it has to stay:
+// a flat 32-weight down row (640 = 2.5 super-blocks on Flash-Next) has no mma
+// lane. This moves each live sorted row to its pair, bytes and scales verbatim,
+// so the down consumes exactly what the fused tail produced. One writer per
+// pair (moe_align lists every (token, slot) once), PAD rows skipped.
+//
+// The block's expert is checked BEFORE its rows: moe_align PAD-fills
+// sorted_row only up to the used blocks and marks the tail blocks through
+// block_expert alone (every consumer early-outs on that), so a tail block's
+// rows hold a fresh buffer's zeros - token 0, slot 0 - or an earlier, wider
+// walk's stale pairs, and copying them would overwrite real pairs with the
+// gate/up's never-written PAD output.
+__global__ void pd_moe_q8_rows_unsort_kernel(const int8_t* __restrict__ sq,
+                                             const float* __restrict__ ss,
+                                             const unsigned int* __restrict__ sorted_row,
+                                             const unsigned int* __restrict__ sorted_slot,
+                                             const unsigned int* __restrict__ block_expert,
+                                             int8_t* __restrict__ fq, float* __restrict__ fs,
+                                             uint32_t ff, uint32_t n_active) {
+    if (block_expert[blockIdx.x] == PD_MOE_PAD) return;
+    const size_t sr = (size_t)blockIdx.x * 32u + blockIdx.y;
+    const unsigned int b = sorted_row[sr];
+    if (b == PD_MOE_PAD) return;
+    const size_t pair = (size_t)b * n_active + sorted_slot[sr];
+    const uint32_t nsb = ff >> 5u;
+    for (uint32_t j = threadIdx.x * 4u; j < ff; j += blockDim.x * 4u)
+        *reinterpret_cast<int*>(fq + pair * ff + j) =
+            *reinterpret_cast<const int*>(sq + sr * ff + j);
+    for (uint32_t j = threadIdx.x; j < nsb; j += blockDim.x)
+        fs[pair * nsb + j] = ss[sr * nsb + j];
+}
+
+PD_EXPORT
+int pd_moe_q8_rows_unsort(const void* sq, const void* ss, const void* sorted_row,
+                          const void* sorted_slot, const void* block_expert, void* fq,
+                          void* fs, uint32_t ff, uint32_t n_active, uint32_t max_blocks,
+                          void* stream) {
+    if (ff == 0 || max_blocks == 0) return 0;
+    if ((ff & 31u) != 0 || block_expert == nullptr) return cudaErrorInvalidValue;
+    pd_moe_q8_rows_unsort_kernel<<<dim3(max_blocks, 32u), 32u, 0u, (cudaStream_t)stream>>>(
+        (const int8_t*)sq, (const float*)ss, (const unsigned int*)sorted_row,
+        (const unsigned int*)sorted_slot, (const unsigned int*)block_expert, (int8_t*)fq,
+        (float*)fs, ff, n_active);
+    return pd_launch_status();
+}
+
+// ---- expert-major tensor-core down over the sorted rows (slot 603) ---------
+// Each expert's span of a bm = 32 moe_align layout, as sorted positions:
+// emap[2e] = first, emap[2e + 1] = end (exclusive). moe_align lays an expert's
+// blocks contiguously and fills its pairs from position 0, so PAD sits only in
+// the tail of its last block; an expert with no pairs keeps first == end == 0.
+// One writer per element, and tail blocks are skipped through block_expert
+// (the slot-601 rule).
+__global__ void pd_moe_emap_kernel(const unsigned int* __restrict__ block_expert,
+                                   const unsigned int* __restrict__ sorted_row,
+                                   unsigned int* __restrict__ emap, uint32_t n_expert,
+                                   uint32_t max_blocks) {
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+    for (uint32_t e = tid; e < n_expert; e += nth) {
+        emap[2u * e] = 0u;
+        emap[2u * e + 1u] = 0u;
+    }
+    __syncthreads();
+    for (uint32_t b = tid; b < max_blocks; b += nth) {
+        const unsigned int e = block_expert[b];
+        if (e >= n_expert) continue;
+        if (b == 0u || block_expert[b - 1u] != e) emap[2u * e] = b * 32u;
+        if (b + 1u == max_blocks || block_expert[b + 1u] != e) {
+            uint32_t live = 32u;
+            for (uint32_t i = 0; i < 32u; ++i) {
+                if (sorted_row[(size_t)b * 32u + i] == PD_MOE_PAD) {
+                    live = i;
+                    break;
+                }
+            }
+            emap[2u * e + 1u] = b * 32u + live;
+        }
+    }
+}
+
+// The routed down on the s8 tensor cores, one block per (64-row output strip,
+// expert). A block walks ALL of its expert's pairs, 64 columns at a time,
+// straight out of the SORTED rows the tensor-core gate/up quantized
+// (`pd_kquant_moe_gate_up_mma`: sfq/sfs over a bm = 32 layout - no unsort to
+// pair-major). Per 128-weight stage it unpacks the strip's weight windows to
+// s8 through the shared window unpack (f = d, g = the mu term) and copies the
+// group's activation rows plus their per-16 byte sums (exact integers - the
+// values pd_q8_sums_strided would hand in), then runs the dense int8 mma tile
+// (m16n8k32, 4 warp rows x 2 warp columns) and folds f / g against the
+// activation scale. It writes the same per-(pair, column) partials the tiled
+// down (slot 593) writes, for pd_moe_part_fold_at.
+//
+// Why expert-major: the tile's (16-pair block, 64-column tile) grid restaged a
+// block's activations for every column tile and dotted them on the dp4a pipe
+// - with no weight reads at all it still took ~60% of its 7 ms a layer; the
+// earlier tensor-core arm (a flat-32 pd_kq_moe_mma_kernel down) staged a ring
+// per (32-pair block, strip). Here a strip of one expert's weight rows is
+// staged once for up to 64 of its pairs. bench/fnmoe_prefill_gb10_bench.cu.
+//
+// Numeric class, per (pair, row): acc += xs * (f * dot32 + g * sum32), exact
+// int dots, K-ascending. Nothing depends on the pair's column or group, so the
+// order moe_align scatters an expert's pairs in does not reach the result. Not
+// the tile's per-16 window fold - the ~1e-7 class the grouped down carries
+// against it. Needs one scale per 32 weights: the flat 32-weight formats.
+// BN / NTH / BPS are a BENCH seam, not a knob: the shipped launcher below
+// instantiates one shape (64, 256, 1) and nothing reads them from the
+// environment. They exist because the pair count per expert is ~20 at a 1024
+// token prompt (bench: max 36, none past 64), so the BN = 64 tile runs its
+// `wc = 32` warps empty - and measuring a narrower tile means building the
+// same body at another shape, not a second copy of it.
+// BPS is ELECTED, not incidental - the register budget IS the block count
+// here, and nvcc spends whatever it is given. Measured on GB10, same body,
+// same binary, every arm bit-identical (ms a layer, uniform / skewed routing):
+//   1 an SM  167 regs  7.04 / 8.89   (what an explicit 1 asks for - never)
+//   2 an SM  124 regs  4.88 / 5.25   (where the bare `__launch_bounds__(256)`
+//                                     landed on its own, at 125 regs)
+//   3 an SM   79 regs  4.83 / 4.83   <- taken, and no spill at 79
+// A narrower BN 32 / 128-thread tile was tried on this same seam and is worse
+// (4.92 / 5.57) even though an expert holds only ~20 pairs at this prompt - so
+// the idle `wc = 32` warp half costs nothing. P is a probe cut for the BENCH
+// only: 1 drops the weight reads and their unpack, 2 zeroes the activations -
+// both give wrong answers by construction, like the tile's p1/p2. That probe
+// is what says where the time is: half of it is the weight path (4.88 -> 2.48
+// uniform, 5.25 -> 2.82 skewed), and activations are ~8%.
+// ST = 2 stages the PACKED weight bytes through shared with cp.async, double
+// buffered, so the next 128-weight slice is in flight while this one unpacks
+// and MMAs; ST = 1 is the synchronous walk (unpack straight off the weight
+// planes). Data movement only - same windows, same k order, same folds - so
+// ST = 2 is BIT-IDENTICAL to ST = 1, the mma stager's rule. It costs shared:
+// the ring is 2 x BM x 144 B, which drops the block count, so it is measured
+// against ST = 1 at the block count each one can actually hold.
+template <bool MU, uint32_t BN = 64u, uint32_t NTH = 256u, uint32_t BPS = 3u,
+          uint32_t P = 0u, uint32_t ST = 1u, uint32_t SUMD = 0u>
+__global__ void __launch_bounds__(NTH, BPS) pd_kquant_moe_down_mma_e_kernel(
+    const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
+    const unsigned int* __restrict__ sorted_row,
+    const unsigned int* __restrict__ sorted_slot,
+    const unsigned int* __restrict__ emap, const float* __restrict__ topk_w,
+    const int8_t* __restrict__ sfq, const float* __restrict__ sfs,
+    float* __restrict__ part, uint32_t ff, uint32_t embd, uint32_t o0,
+    uint32_t ocols, uint32_t n_active, uint32_t ddt) {
+#if PD_MMA_OK
+    // NSUB = the 8-column subtiles one warp covers: BN split over the block's
+    // warp COLUMNS (NTH / 128), so (64, 256) and (32, 128) both give 4.
+    constexpr uint32_t BM = 64u, KPAD = PD_MMA_KPAD, NSUB = BN * 16u / NTH;
+    const uint32_t e = blockIdx.y;
+    const uint32_t first = emap[2u * e], cnt = emap[2u * e + 1u] - first;
+    if (cnt == 0u) return;
+    const uint32_t c_base = blockIdx.x * BM;  // the strip's first row, chunk-relative
+    if (c_base >= ocols || o0 + c_base >= embd) return;
+
+    __shared__ __align__(16) int8_t sh_a[BM * KPAD];
+    __shared__ __align__(16) int8_t sh_b[BN * KPAD];
+    __shared__ float sh_wf[BM][4];
+    __shared__ float sh_wg[MU ? BM : 1u][MU ? 4u : 1u];
+    __shared__ float sh_xs[BN][4];
+    __shared__ short sh_x16[MU ? BN : 1u][MU ? 8u : 1u];
+    __shared__ unsigned int sp[BN];
+    // The packed ring (ST >= 2). A row's 128-weight stage is 4 blocks of 32:
+    // 4 * (datab >> 3) data bytes + 4 * (scb >> 3) record bytes, both laid
+    // flat and both starting 16B-aligned (Q5_1 64 + 32, Q8_0 128 + 8, IQ4_NL
+    // 64 + 8). PKROW is the widest of those rounded up, so one row's slice is
+    // a fixed stride and every cp.async destination stays aligned.
+    constexpr uint32_t PKROW = 144u;
+    __shared__ __align__(16) uint8_t sh_pk[ST >= 2u ? ST * BM * PKROW : 1u];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t g = lane >> 2u, t = lane & 3u;
+    const uint32_t wr = (warp & 3u) * 16u, wc = (warp >> 2u) * 32u;
+    const uint32_t nb32 = ff >> 5u;
+    const uint32_t ddb = pd_kq_datab(ddt), dscb = pd_kq_scb(ddt);
+    const uint32_t drb = pd_kq_row_datab(ddt, ff), drs = pd_kq_row_scb(ddt, ff);
+    // ldmatrix fragment rows, the dense int8 mma tile's map (gemm/int8_mma.cuh)
+    const uint32_t ldm_l7 = lane & 7u;
+    const uint32_t ldm_arow = wr + ((lane & 8u) ? 8u : 0u) + ldm_l7;
+    const uint32_t ldm_akof = (lane & 16u) ? 16u : 0u;
+    const uint32_t ldm_bkof = (lane & 8u) ? 16u : 0u;
+
+    // bytes a 32-weight block occupies in each plane, and a row's 4-block
+    // stage. Flat-32 rows are laid out block-flat (quant/iquant.cuh), so a
+    // stage is one contiguous run in each plane and block kt starts at
+    // kt * dpb / kt * rpb - no superblock arithmetic.
+    const uint32_t dpb = ddb >> 3u, rpb = dscb >> 3u;
+    const uint32_t dbn = 4u * dpb, rbn = 4u * rpb;
+    // Stage one 128-weight slice of the strip's packed bytes into ring buffer
+    // `buf`. Out-of-range copies zero-fill, and a zeroed record unpacks to
+    // f = g = 0 - the same nothing the synchronous walk contributes when it
+    // skips a tail window.
+    auto stage_pk = [&](uint32_t k4, uint32_t buf) {
+        uint8_t* dst0 = sh_pk + (size_t)buf * BM * PKROW;
+        const uint32_t dch = dbn >> 4u;  // 16B chunks of data a row
+        for (uint32_t i = tid; i < BM * dch; i += NTH) {
+            const uint32_t row = i / dch, ci = i % dch;
+            const uint32_t c = c_base + row;
+            const bool ok = c < ocols && o0 + c < embd && (k4 + (ci * 16u) / dpb) < nb32;
+            const size_t row_e = (size_t)e * embd + o0 + c;
+            pd_mma_cpa16p(dst0 + row * PKROW + ci * 16u,
+                          dd + row_e * drb + (size_t)k4 * dpb + ci * 16u, ok);
+        }
+        // records go 4B at a time: Q8_0's 8 bytes a stage are not a 16B run
+        const uint32_t rch = rbn >> 2u;
+        for (uint32_t i = tid; i < BM * rch; i += NTH) {
+            const uint32_t row = i / rch, ci = i % rch;
+            const uint32_t c = c_base + row;
+            const bool ok = c < ocols && o0 + c < embd && (k4 + (ci * 4u) / rpb) < nb32;
+            const size_t row_e = (size_t)e * embd + o0 + c;
+            pd_mma_cpa4p(dst0 + row * PKROW + dbn + ci * 4u,
+                         dsc + row_e * drs + (size_t)k4 * rpb + ci * 4u, ok);
+        }
+    };
+
+    for (uint32_t nbase = 0; nbase < cnt; nbase += BN) {
+        const uint32_t take = cnt - nbase < BN ? cnt - nbase : BN;
+        for (uint32_t i = tid; i < BN; i += NTH) {
+            const size_t pos = (size_t)first + nbase + i;
+            sp[i] = i < take ? sorted_row[pos] * n_active + sorted_slot[pos] : PD_MOE_PAD;
+        }
+        __syncthreads();
+        float acc[NSUB][4] = {};
+        if (ST >= 2u) {  // prime the ring with this group's first slice
+            stage_pk(0u, 0u);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+        for (uint32_t kt = 0; kt < nb32; kt += 4u) {
+            __syncthreads();
+            if (ST >= 2u) {
+                // issue the NEXT slice, then retire this one. The commit runs
+                // even when there is no next slice, so the group count the
+                // wait counts against stays the same on every pass.
+                if (kt + 4u < nb32) stage_pk(kt + 4u, ((kt >> 2u) + 1u) & 1u);
+                asm volatile("cp.async.commit_group;" ::: "memory");
+                pd_mma_cpa_waitN<1>();
+                __syncthreads();  // wait_group is per-thread; this makes it the block's
+            }
+            // the strip's weights: 64 rows x 8 windows of 16
+            for (uint32_t i = tid; i < BM * 8u; i += NTH) {
+                const uint32_t row = i >> 3u, w8 = i & 7u;
+                const uint32_t k = kt * 32u + w8 * 16u;
+                const uint32_t c = c_base + row;
+                int wq[4] = {0, 0, 0, 0};
+                float f = 0.0f, gm = 0.0f;
+                if (P == 1u) {
+                    // the probe: constant words, so neither plane is read and
+                    // the unpack folds away with them
+                    wq[0] = wq[1] = wq[2] = wq[3] = 0x01010101;
+                    f = 1.0f;
+                    gm = 0.0f;
+                } else if (P == 3u && k < ff && c < ocols && o0 + c < embd) {
+                    // the probe that P = 1 cannot give: the same bytes READ,
+                    // the unpack skipped. (full - this) is the unpack ALU,
+                    // (this - P1) the read. Block-flat offsets, so it reads
+                    // inside the row for every flat-32 seat; the words it
+                    // hands on are nonsense, which is why it is never compared.
+                    const size_t row_e = (size_t)e * embd + o0 + c;
+                    const uint32_t w = (k >> 4u) & 15u, dpb_ = ddb >> 3u;
+                    const uint8_t* dp = dd + row_e * drb + (size_t)(k >> 8u) * ddb +
+                                        (size_t)(w >> 1u) * dpb_ + (w & 1u) * (dpb_ >> 1u);
+                    const uint8_t* rp = dsc + row_e * drs + (size_t)(k >> 8u) * dscb +
+                                        (size_t)(w >> 1u) * (dscb >> 3u);
+                    const int2 raw = *reinterpret_cast<const int2*>(dp);
+                    wq[0] = raw.x;
+                    wq[1] = raw.y;
+                    wq[2] = raw.x;
+                    wq[3] = raw.y;
+                    f = (float)(*reinterpret_cast<const unsigned short*>(rp));
+                    gm = 0.0f;
+                } else if (k < ff && c < ocols && o0 + c < embd) {
+                    if (ST >= 2u) {
+                        // the staged slice IS 4 blocks, so its windows are
+                        // 0..7 and `ib = w >> 1` indexes them directly
+                        const uint8_t* pk = sh_pk + (size_t)((kt >> 2u) & 1u) * BM * PKROW +
+                                            (size_t)row * PKROW;
+                        pd_kq_win_unpack(ddt, pk, pk + dbn, w8, wq, &f, &gm);
+                    } else {
+                        const size_t row_e = (size_t)e * embd + o0 + c;
+                        pd_kq_win_unpack(ddt, dd + row_e * drb + (size_t)(k >> 8u) * ddb,
+                                         dsc + row_e * drs + (size_t)(k >> 8u) * dscb,
+                                         (k >> 4u) & 15u, wq, &f, &gm);
+                    }
+                }
+                *reinterpret_cast<int4*>(&sh_a[row * KPAD + w8 * 16u]) =
+                    make_int4(wq[0], wq[1], wq[2], wq[3]);
+                if ((w8 & 1u) == 0u) {
+                    sh_wf[row][w8 >> 1u] = f;
+                    if (MU) sh_wg[row][w8 >> 1u] = gm;
+                }
+            }
+            // the group's activation rows: 64 columns x 8 windows of 16
+            for (uint32_t i = tid; i < BN * 8u; i += NTH) {
+                const uint32_t col = i >> 3u, w8 = i & 7u;
+                const uint32_t k = kt * 32u + w8 * 16u;
+                const bool ok = col < take && k < ff;
+                const size_t pos = (size_t)first + nbase + (ok ? col : 0u);
+                const int4 v = (ok && P != 2u)
+                                   ? *reinterpret_cast<const int4*>(sfq + pos * ff + k)
+                                   : make_int4(0, 0, 0, 0);
+                *reinterpret_cast<int4*>(&sh_b[col * KPAD + w8 * 16u]) = v;
+                if (MU) {
+                    int s;
+                    if (SUMD == 1u) {
+                        // the same sum of 16 SIGNED bytes in 4 instructions -
+                        // what pd_q8_sums_strided_kernel already does. dp4a
+                        // against 1s IS the byte sum, so this is bit-identical
+                        // to the extract loop below, not a rewrite of it.
+                        s = __dp4a(v.x, 0x01010101, 0);
+                        s = __dp4a(v.y, 0x01010101, s);
+                        s = __dp4a(v.z, 0x01010101, s);
+                        s = __dp4a(v.w, 0x01010101, s);
+                    } else {
+                        const int wv[4] = {v.x, v.y, v.z, v.w};
+                        s = 0;
+                        #pragma unroll
+                        for (uint32_t q = 0; q < 16u; ++q)
+                            s += (int)(int8_t)(uint8_t)((uint32_t)wv[q >> 2u] >> (8u * (q & 3u)));
+                    }
+                    sh_x16[col][w8] = (short)s;
+                }
+                if ((w8 & 1u) == 0u)
+                    sh_xs[col][w8 >> 1u] = ok ? sfs[pos * nb32 + kt + (w8 >> 1u)] : 0.0f;
+            }
+            __syncthreads();
+            #pragma unroll
+            for (uint32_t sb = 0; sb < 4u; ++sb) {
+                if (kt + sb >= nb32) break;
+                const uint32_t ko = sb * 32u;
+                int a0, a1, a2, a3;
+                pd_mma_ldm_x4(&sh_a[ldm_arow * KPAD + ko + ldm_akof], a0, a1, a2, a3);
+                const float wf0 = sh_wf[wr + g][sb], wf8 = sh_wf[wr + 8u + g][sb];
+                const float wg0 = MU ? sh_wg[wr + g][sb] : 0.0f;
+                const float wg8 = MU ? sh_wg[wr + 8u + g][sb] : 0.0f;
+                #pragma unroll
+                for (uint32_t sub = 0; sub < NSUB; ++sub) {
+                    const uint32_t csub = wc + sub * 8u;
+                    if (csub >= take) break;  // take is block-uniform: every lane stops together
+                    int b0, b1;
+                    pd_mma_ldm_x2(&sh_b[(csub + ldm_l7) * KPAD + ko + ldm_bkof], b0, b1);
+                    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                    const uint32_t n0 = csub + 2u * t, n1 = n0 + 1u;
+                    const float xc0 = sh_xs[n0][sb], xc1 = sh_xs[n1][sb];
+                    if (MU) {
+                        const float xm0 = (float)((int)sh_x16[n0][2u * sb] + (int)sh_x16[n0][2u * sb + 1u]);
+                        const float xm1 = (float)((int)sh_x16[n1][2u * sb] + (int)sh_x16[n1][2u * sb + 1u]);
+                        acc[sub][0] += xc0 * (wf0 * (float)d0 + wg0 * xm0);
+                        acc[sub][1] += xc1 * (wf0 * (float)d1 + wg0 * xm1);
+                        acc[sub][2] += xc0 * (wf8 * (float)d2 + wg8 * xm0);
+                        acc[sub][3] += xc1 * (wf8 * (float)d3 + wg8 * xm1);
+                    } else {
+                        acc[sub][0] += xc0 * (wf0 * (float)d0);
+                        acc[sub][1] += xc1 * (wf0 * (float)d1);
+                        acc[sub][2] += xc0 * (wf8 * (float)d2);
+                        acc[sub][3] += xc1 * (wf8 * (float)d3);
+                    }
+                }
+            }
+        }
+        // one writer per (pair, row): the pair lives in exactly one group
+        const uint32_t r0 = c_base + wr + g, r8 = r0 + 8u;
+        #pragma unroll
+        for (uint32_t sub = 0; sub < NSUB; ++sub) {
+            const uint32_t c0 = wc + sub * 8u + 2u * t;
+            #pragma unroll
+            for (uint32_t q = 0; q < 4u; ++q) {
+                const uint32_t c = c0 + (q & 1u);
+                const uint32_t r = (q & 2u) ? r8 : r0;
+                if (c >= take || r >= ocols || o0 + r >= embd) continue;
+                const size_t pair = sp[c];
+                part[pair * ocols + r] = topk_w[pair] * acc[sub][q];
+            }
+        }
+        __syncthreads();
+    }
+#else
+    (void)dd; (void)dsc; (void)sorted_row; (void)sorted_slot; (void)emap; (void)topk_w;
+    (void)sfq; (void)sfs; (void)part; (void)ff; (void)embd; (void)o0; (void)ocols;
+    (void)n_active; (void)ddt;
+#endif
+}
+
+// slot 603: the expert-major tensor-core down over column chunk [o0, o0 +
+// ocols). The layout is the tensor-core gate/up's (bm = 32 moe_align, sorted
+// sfq/sfs); emap is u32 [2 * n_expert] scratch the launcher fills first. A flat
+// 32-weight down whose ff stages whole 128-weight slices, chunks on 64-row
+// strips.
+PD_EXPORT
+int pd_kquant_moe_down_mma_e(const void* down_data, const void* down_scales,
+                             const void* sorted_row, const void* sorted_slot,
+                             const void* block_expert, const void* topk_w,
+                             const void* sfq, const void* sfs, void* emap, void* part,
+                             uint32_t ff, uint32_t embd, uint32_t o0, uint32_t ocols,
+                             uint32_t n_active, uint32_t n_expert, uint32_t max_blocks,
+                             uint32_t ddt, void* stream) {
+    if (embd == 0 || ocols == 0 || n_expert == 0 || max_blocks == 0) return 0;
+    if ((ff % 128u) != 0 || (o0 % 64u) != 0 || o0 >= embd || !pd_kq_flat32(ddt))
+        return cudaErrorInvalidValue;
+    if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr ||
+        emap == nullptr || sfq == nullptr || sfs == nullptr)
+        return cudaErrorInvalidValue;
+    cudaStream_t st = (cudaStream_t)stream;
+    pd_moe_emap_kernel<<<1, 256, 0, st>>>((const unsigned int*)block_expert,
+                                          (const unsigned int*)sorted_row,
+                                          (unsigned int*)emap, n_expert, max_blocks);
+    const int rc = pd_launch_status();
+    if (rc != 0) return rc;
+    const uint32_t oc = ocols < embd - o0 ? ocols : embd - o0;
+    dim3 grid((oc + 63u) / 64u, n_expert);
+    if (pd_kq_has_mu(ddt)) {
+        pd_kquant_moe_down_mma_e_kernel<true, 64u, 256u, 3u, 0u><<<grid, 256, 0, st>>>(
+            (const uint8_t*)down_data, (const uint8_t*)down_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)emap, (const float*)topk_w, (const int8_t*)sfq,
+            (const float*)sfs, (float*)part, ff, embd, o0, ocols, n_active, ddt);
+    } else {
+        pd_kquant_moe_down_mma_e_kernel<false, 64u, 256u, 3u, 0u><<<grid, 256, 0, st>>>(
+            (const uint8_t*)down_data, (const uint8_t*)down_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)emap, (const float*)topk_w, (const int8_t*)sfq,
+            (const float*)sfs, (float*)part, ff, embd, o0, ocols, n_active, ddt);
+    }
+    return pd_launch_status();
+}
+
 // Fold a column chunk's per-(token, slot) partials into `out` in ASCENDING
 // slot order - the same order the ungrouped down kernel summed inside its
 // block. One writer per (token, column).
@@ -1078,7 +1509,7 @@ int pd_kquant_moe_down_grp(const void* down_data, const void* down_scales,
                            uint32_t group, uint32_t ddt, void* stream) {
     if (embd == 0 || n_active == 0 || max_blocks == 0 || ocols == 0) return 0;
     if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
-    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && !pd_kq_flat32(ddt)) return cudaErrorInvalidValue;
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if (pd_kq_has_mu(ddt) && fsums == nullptr) return cudaErrorInvalidValue;
     if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr)
@@ -1220,7 +1651,7 @@ int pd_kquant_moe_down_list(const void* down_data, const void* down_scales,
                             const void* n_rows, void* stream) {
     if (embd == 0 || n_active == 0 || batch == 0) return 0;
     if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
-    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && !pd_kq_flat32(ddt)) return cudaErrorInvalidValue;
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if ((pd_kq_has_mu(ddt)) && fsums == nullptr) return cudaErrorInvalidValue;
     if (rows == nullptr || n_rows == nullptr) return cudaErrorInvalidValue;

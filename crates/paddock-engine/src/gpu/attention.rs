@@ -2158,6 +2158,11 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether the pack exports the f16 tensor-core prefill attention (P6i).
+    pub fn has_attn_prefill_f16(&self) -> bool {
+        self.kernels.attn_prefill_f16.is_some()
+    }
+
     /// Tensor-core (f16 WMMA) prefill attention - same contract as
     /// [`Self::attn_prefill`] but f16 Q/K/V inputs with f16 O accumulation
     /// (llama's own prefill attention class). Requires head_dim == 256,

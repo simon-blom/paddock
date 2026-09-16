@@ -69,6 +69,57 @@ async fn serve_windows(port: u16, app: axum::Router) -> io::Result<()> {
     }
 }
 
+/// Take this process's admin endpoint off the host before it exits.
+///
+/// A Unix socket file outlives the process that bound it, and until
+/// 2026-09-13 nothing removed one: every stop left `runner-<port>.sock`
+/// behind, `enumerate` listed the port, and the manager then refused to start
+/// that endpoint again ("port 11540 is already serving") and showed a
+/// stopped model as running, so it vanished from the Studio's fleet. Found on
+/// the DGX Spark with a stop followed by a start.
+///
+/// Only the file we bound is removed: the inode is recorded at bind and
+/// checked here, so a socket some later process has put at the same path is
+/// left alone. Idempotent, and a no-op on Windows, where a pipe dies with its
+/// process. A crash still leaves the file, which is why `enumerate` also
+/// checks for a listener rather than trusting presence.
+pub fn release() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(slot) = BOUND.get() else {
+            return;
+        };
+        let Some((path, ino)) = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.ino() == ino) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The socket this process bound, as (path, inode), for `release`.
+#[cfg(unix)]
+static BOUND: std::sync::OnceLock<std::sync::Mutex<Option<(std::path::PathBuf, u64)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn remember_socket(path: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(m) = std::fs::symlink_metadata(path) {
+        *BOUND
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((path.to_path_buf(), m.ino()));
+    }
+}
+
 #[cfg(unix)]
 async fn serve_unix(port: u16, app: axum::Router) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -89,6 +140,7 @@ async fn serve_unix(port: u16, app: axum::Router) -> io::Result<()> {
     // so a present-but-stale socket can only be a corpse.
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    remember_socket(&path);
     tracing::info!(socket = %path.display(), "admin surface listening (unix socket, 0700 dir)");
     loop {
         let (stream, _addr) = listener.accept().await?;

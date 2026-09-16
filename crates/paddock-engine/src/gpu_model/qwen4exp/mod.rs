@@ -27,7 +27,7 @@ use cudarc::driver::CudaSlice;
 
 use crate::gpu::{
     DeviceTensor, ExpertCache, F8RowPlane, GpuError, GpuExecutor, HostMappedKq, Nvf4MoePlane,
-    QuantTensor, QuantW, RepackedKQ,
+    QuantTensor, QuantW, RepackedKQ, RepackedQ8,
 };
 
 /// Which class the dense projections load in. bf16 is the parity class and
@@ -226,6 +226,20 @@ pub enum DensePlane {
 /// (the batch > 1 arm). Owned by the model, not the scratch, so a call site
 /// can borrow an activation and the staging at the same time.
 pub struct DenseStage {
+    /// Verify walks: every `Kq` plane runs its BATCH-1 decode entry row by
+    /// row, so each row's output is bit-identical to a decode tick's call on
+    /// that row (`kq_matmul_rows_exact`). Set per walk, like the flags below.
+    pub row_exact: bool,
+    /// A prefill walk (`Phase::Prefill` / `PrefillRuns`): the Q8_0 dense
+    /// planes take the prefill-width rungs between 13 and 64 rows (see
+    /// `kq_matmul`). Set per walk; the MTP head's passes and every decode walk
+    /// leave it off, so their measured elections do not move.
+    pub prefill: bool,
+    /// single-row staging for `row_exact` ([hc_width] in, [max(vocab,
+    /// hc_width)] out), taken out of the stage while a row runs; None off the
+    /// GGUF lane
+    pub xrow: Option<CudaSlice<f32>>,
+    pub yrow: Option<CudaSlice<f32>>,
     pub q: cudarc::driver::CudaSlice<i8>,
     pub rs: CudaSlice<f32>,
     /// `Kq` class only: per-32 activation scales for `q` (`quantize_q8`),
@@ -590,6 +604,180 @@ pub(crate) fn moe_grp_enabled() -> bool {
     })
 }
 
+/// The tensor-core gate/up at prefill widths (`kq_moe_routed`, slot 601's
+/// fused tail): `PADDOCK_Q38FN_MOE_MMA=0` keeps the register-tiled / grouped
+/// gate/up and its separate quantize pass (A/B).
+pub(crate) fn moe_mma_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_MOE_MMA").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_MOE_DOWN_MMA=0|off` keeps the routed down on the register
+/// tile (slot 593, behind the unsort) when the tensor-core gate/up runs,
+/// instead of the expert-major tensor-core down over its sorted rows (slot
+/// 603). Dev instrument.
+pub(crate) fn moe_down_mma_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_MOE_DOWN_MMA").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_GDN_SEG=0|off` keeps a 128-wide head's single-sequence
+/// prefill walk on slot 596 instead of the segment-tiled walk (slot 604).
+/// Dev instrument.
+pub(crate) fn gdn_seg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_GDN_SEG").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_ATTN_PF16=0|off` keeps the single-slot prefill attention on
+/// the tiled f32 walk (`pd_attn_prefill`) instead of the f16 tensor-core
+/// prefill (`pd_attn_prefill_f16`). Dev instrument.
+pub(crate) fn attn_pf16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_ATTN_PF16").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_HCUP_MIX=0|off` runs a prefill-width hyper-connection up
+/// and its gated mix as two launches (pipe GEMM, then `q4x_hc_mix`) instead
+/// of the fused tile (slot 605). Dev instrument.
+pub(crate) fn hcup_mix_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_HCUP_MIX").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_HC_RN=0|off` keeps storing the normalized hyper-connection
+/// state at prefill widths instead of rebuilding it inside its inject and up +
+/// mix from the residual (slots 606 - 608). Dev instrument.
+pub(crate) fn hc_rn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_HC_RN").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// `PADDOCK_Q38FN_HC_INJ_FOLD=0|off` keeps a rebuilt mix's inject as its own
+/// launch (slot 607) instead of folding it into the combine that precedes the
+/// mix (slot 609). Dev instrument.
+pub(crate) fn hc_inj_fold_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_HC_INJ_FOLD").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// The cp.async-pipelined mmq tile for Q8_0 dense planes above 64 rows
+/// (`kq_matmul`): `PADDOCK_Q38FN_Q8_PIPE=0` keeps the plain tile (A/B).
+pub(crate) fn q8_pipe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_Q8_PIPE").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// The widest walk whose hyper-connection down reads mmq rows the preceding
+/// combine emitted (slot 602): the rows are one group that must exist before
+/// the down runs, 11.5 KB a row on Flash-Next (47 MB at this cap), so wider
+/// walks keep the separate quantize.
+pub(crate) const HC_PREQ_MAX_ROWS: usize = 4096;
+
+/// `PADDOCK_Q38FN_HC_PREQ=0` keeps the separate quantize ahead of the hc down
+/// (A/B for slot 602).
+pub(crate) fn hc_preq_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_HC_PREQ").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// Bytes of the group-laid mmq rows for `rows` rows of an `in_dim`-wide input.
+pub(crate) fn hc_preq_bytes(in_dim: usize, rows: usize) -> usize {
+    in_dim.div_ceil(128) * rows.next_multiple_of(128) * 144
+}
+
+/// Rows `kq_matmul`'s > 64-row Q8_0 rung stages per launch: as many as the
+/// stage's mmq buffer holds for this input width (at least `KQ_TILE_ROWS`).
+/// A pipe launch is flat in rows until its tiles fill the die, and no plane
+/// shape measured slower as one launch than as 512-row chunks
+/// (`bench/hcdown_gb10_bench.cu`, GB10: [2560 -> 512] 38 us vs 74 at 992
+/// rows, [2560 -> 640] 40 vs 74, [640 -> 2560] 68 vs 80, [6144 -> 2560] 351 vs
+/// 369, [2560 -> 6144] 351 vs 367; all byte-identical, the element K order is
+/// tile-invariant). `PADDOCK_Q38FN_Q8_WIDE_LAUNCH=0` keeps the 512-row step.
+pub(crate) fn q8_launch_rows(in_dim: usize, yq_len: usize) -> usize {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_Q8_WIDE_LAUNCH")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off")
+        )
+    });
+    if !on {
+        return KQ_TILE_ROWS;
+    }
+    ((yq_len / (in_dim.div_ceil(128) * 144)) & !127).max(KQ_TILE_ROWS)
+}
+
+/// Prefix-cache checkpoints taken inside the prefill walk (`prefill_from`):
+/// `PADDOCK_Q38FN_INWALK_CKPT=0` walks the cut chunks instead (A/B).
+pub(crate) fn inwalk_ckpt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_INWALK_CKPT").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
 pub(crate) fn mmaf_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -831,6 +1019,186 @@ impl DensePlane {
     /// `y = W x` over `batch` rows. Same operand convention as the bf16 lane:
     /// `x` is `[batch, in_dim]`, `y` is `[batch, out_dim]`.
     #[track_caller]
+    /// True when this plane's > 64-row Q8_0 pipe rung can run off mmq rows a
+    /// quantizing combine already emitted ([`Self::matmul_preq_mmq`]). The one
+    /// predicate both the producer and the consumer read, so the combine never
+    /// quantizes rows nothing takes (the dead-Q8-quant trap), and it
+    /// names every term `kq_matmul`'s own rung checks so the two routes launch
+    /// the same pipe.
+    pub fn takes_preq_mmq(&self, e: &GpuExecutor, batch: usize, stage: &DenseStage) -> bool {
+        matches!(self, DensePlane::Kq { w: QuantW::Q8(_), in_dim, .. } if in_dim.is_multiple_of(128))
+            && batch > 64
+            && batch <= HC_PREQ_MAX_ROWS
+            && !stage.row_exact
+            && hc_preq_enabled()
+            && q8_pipe_enabled()
+            && e.has_q8_0_gemm_mmq()
+            && e.has_q8_0_gemm_mmq_pipe()
+            && e.has_q4x_combine_norm_q8mmq()
+            && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_TILE").is_none()
+    }
+
+    /// The > 64-row Q8_0 pipe rung off `yq` rows already in the mmq layout for
+    /// the whole walk (one group padded to 128 rows - what
+    /// `q4x_combine_norm_q8mmq` emits for the hyper-connection down), as ONE
+    /// launch. On a 320-wide plane the 128x128 pipe tiles do not fill a
+    /// 48-SM die, so one launch over every row costs what a 512-row chunk
+    /// does (`bench/hcdown_gb10_bench.cu`: 155 us at 512 and at 1024 rows,
+    /// 304 as two chunks); the element K order is tile-invariant, so it is
+    /// bit-identical to `kq_matmul`'s chunked launches. `Ok(false)` when the
+    /// rung does not apply - the caller then takes [`Self::matmul`].
+    pub fn matmul_preq_mmq(
+        &self,
+        e: &GpuExecutor,
+        yq: &CudaSlice<u8>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+        stage: &DenseStage,
+    ) -> Result<bool, GpuError> {
+        if !self.takes_preq_mmq(e, batch, stage) {
+            return Ok(false);
+        }
+        let DensePlane::Kq {
+            w: QuantW::Q8(q),
+            in_dim,
+            ..
+        } = self
+        else {
+            return Ok(false);
+        };
+        if yq.len() < hc_preq_bytes(*in_dim, batch) {
+            return Ok(false);
+        }
+        e.q8_0_gemm_mmq_pipe_rows(q, yq, 0, y, 0, batch)?;
+        Ok(true)
+    }
+
+    /// A hyper-connection UP plane ([lowrank -> hc * hidden] Q8_0) and its
+    /// gated mix in one launch a chunk (slot 605): `out[rows][hidden]` is what
+    /// [`Self::matmul`] into a gate plane followed by `q4x_hc_mix(xn, gate)`
+    /// writes, byte for byte, but the [rows][hc * hidden] gate plane never
+    /// lands. The same > 64-row pipe rung and chunking `kq_matmul` takes;
+    /// `Ok(false)` when it does not apply - the caller then runs the two
+    /// launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_hcmix(
+        &self,
+        e: &GpuExecutor,
+        x: &CudaSlice<f32>,
+        xn: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        batch: usize,
+        hc: usize,
+        hidden: usize,
+        stage: &mut DenseStage,
+    ) -> Result<bool, GpuError> {
+        let DensePlane::Kq {
+            w: QuantW::Q8(q),
+            in_dim,
+            ..
+        } = self
+        else {
+            return Ok(false);
+        };
+        let in_dim = *in_dim;
+        let mmq_rows = in_dim.div_ceil(128) * KQ_TILE_ROWS * 144;
+        if !(batch > 64
+            && hc == 4
+            && hidden.is_multiple_of(8)
+            && q.dims[1] == hc * hidden
+            && in_dim.is_multiple_of(32)
+            && !stage.row_exact
+            && stage.yq.len() >= mmq_rows
+            && hcup_mix_enabled()
+            && q8_pipe_enabled()
+            && e.has_q8_0_gemm_mmq()
+            && e.has_q8_0_gemm_mmq_pipe_hcmix()
+            && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_TILE").is_none())
+        {
+            return Ok(false);
+        }
+        let step = q8_launch_rows(in_dim, stage.yq.len());
+        let mut off = 0;
+        while off < batch {
+            let rows = (batch - off).min(step);
+            e.quantize_q8_mmq_rows(x, off, &mut stage.yq, in_dim, rows)?;
+            e.q8_0_gemm_mmq_pipe_hcmix_rows(q, &stage.yq, xn, out, off, rows, hidden)?;
+            off += rows;
+        }
+        Ok(true)
+    }
+
+    /// Whether [`Self::matmul_hcmix_rn`] takes this plane at `batch` rows: the
+    /// [`Self::matmul_hcmix`] rung in ONE launch (the rebuild's 1/rms tail is
+    /// indexed from row 0) with the pack's rebuild slots present. A combine
+    /// reads this BEFORE it decides not to store the normalized state, so a
+    /// reader that would decline never meets a state that is not there.
+    pub fn takes_hcmix_rn(
+        &self,
+        e: &GpuExecutor,
+        batch: usize,
+        hc: usize,
+        hidden: usize,
+        stage: &DenseStage,
+    ) -> bool {
+        let DensePlane::Kq {
+            w: QuantW::Q8(q),
+            in_dim,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let in_dim = *in_dim;
+        batch > 64
+            && hc == 4
+            && hidden.is_multiple_of(8)
+            && q.dims[1] == hc * hidden
+            && in_dim.is_multiple_of(32)
+            && !stage.row_exact
+            && stage.yq.len() >= in_dim.div_ceil(128) * KQ_TILE_ROWS * 144
+            && q8_launch_rows(in_dim, stage.yq.len()) >= batch
+            && hcup_mix_enabled()
+            && hc_rn_enabled()
+            && q8_pipe_enabled()
+            && e.has_q8_0_gemm_mmq()
+            && e.has_q4x_hc_rebuild()
+            && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_TILE").is_none()
+    }
+
+    /// [`Self::matmul_hcmix`] over the normalized state REBUILT from the
+    /// residual `h` and `aux` = [norm_w | 1/rms] (slot 608), byte-identical to
+    /// it over the stored state. `Ok(false)` when [`Self::takes_hcmix_rn`]
+    /// declines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_hcmix_rn(
+        &self,
+        e: &GpuExecutor,
+        x: &CudaSlice<f32>,
+        h: &CudaSlice<f32>,
+        aux: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        batch: usize,
+        hc: usize,
+        hidden: usize,
+        stage: &mut DenseStage,
+    ) -> Result<bool, GpuError> {
+        if !self.takes_hcmix_rn(e, batch, hc, hidden, stage) {
+            return Ok(false);
+        }
+        let DensePlane::Kq {
+            w: QuantW::Q8(q),
+            in_dim,
+            ..
+        } = self
+        else {
+            return Ok(false);
+        };
+        e.quantize_q8_mmq_rows(x, 0, &mut stage.yq, *in_dim, batch)?;
+        e.q8_0_gemm_mmq_pipe_hcmix_rn(q, &stage.yq, h, aux, out, batch, hidden)?;
+        Ok(true)
+    }
+
     pub fn matmul(
         &self,
         e: &GpuExecutor,
@@ -925,6 +1293,9 @@ impl DensePlane {
                     batch,
                     if batch == 1 { "kq_gemv" } else { "kq_gemm" },
                 );
+                if stage.row_exact && batch > 1 {
+                    return kq_matmul_rows_exact(e, w, x, y, batch, *in_dim, *out_dim, stage);
+                }
                 kq_matmul(e, w, x, y, batch, stage)
             }
         }
@@ -1084,10 +1455,160 @@ pub(crate) const SK_MAX_BATCH: usize = 32;
 /// Rows per block of the batched row-parallel arm (`pd_q8_0_gemm_repacked_mt`,
 /// 8 warps x 2 rows) - the grid it launches is what the split has to beat.
 pub(crate) const SK_MT_TILE: usize = 16;
+/// Rows the Q8_0 mt tile holds per weight pass (the pack's `PD_MT_ROWS`).
+pub(crate) const Q8_MT_ROWS: usize = 16;
 
 /// A repacked Q8_0 plane's K extent (`dims = [in_dim, out_dim]`).
 fn in_dim_of(q: &crate::gpu::RepackedQ8) -> usize {
     q.dims[0]
+}
+
+/// The K-split rung's election for a Q8_0 plane at `batch` rows (slot 588), or
+/// None when a row-parallel arm keeps the plane. One function for the tick
+/// and the row-exact verify route, which asks it for the batch-1 answer.
+fn q8_sk_split(
+    e: &GpuExecutor,
+    q: &crate::gpu::RepackedQ8,
+    batch: usize,
+    stage: &DenseStage,
+) -> Option<usize> {
+    let (in_dim, out_dim) = (q.dims[0], q.dims[1]);
+    // What the row-parallel arm this would replace actually launches:
+    // one block per output row at batch 1, one per MT tile above it.
+    // A narrow-out plane's tile count does not grow with batch at all
+    // ([10240, 320] is TWENTY blocks at every width), so that arm
+    // covers a batch at `grid_arm / want` of the die while the split
+    // covers it at full fill for `batch` plane reads - which is the
+    // comparison this gate makes.
+    let grid_arm = if batch == 1 {
+        out_dim
+    } else {
+        out_dim.div_ceil(SK_MT_TILE)
+    };
+    let blocks = grid_arm * batch;
+    let want = e.sm_count() * SK_BLOCKS_PER_SM;
+    (batch <= SK_MAX_BATCH
+        && out_dim <= SK_MAX_OUT
+        && blocks < want
+        && in_dim >= SK_MIN_CHUNK * 2
+        && in_dim.is_multiple_of(32)
+        && e.has_q8_0_gemv_sk()
+        && stage.sk_part.len() >= batch * out_dim * 2
+        && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_SK").is_none())
+    .then(|| {
+        let by_die = want.div_ceil((out_dim * batch).max(1));
+        let by_depth = in_dim / SK_MIN_CHUNK;
+        let cap = stage.sk_part.len() / (batch * out_dim).max(1);
+        by_die.min(by_depth).min(cap).clamp(2, SK_MAX_SPLIT)
+    })
+}
+
+/// `PADDOCK_Q38FN_VERIFY_PER_ROW=1`: every row-exact dense call takes the
+/// per-row fallback (A/B against the multi-row exact arms; same bits).
+fn verify_per_row_forced() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PADDOCK_Q38FN_VERIFY_PER_ROW").is_some())
+}
+
+/// `kq_matmul` for a verify walk: every row lands exactly where a decode
+/// tick's batch-1 call on that row lands, bit for bit - the verify's
+/// exactness contract (the batched GEMMs reduce in a different order, and a
+/// near-tie token does not survive the difference). Row-exact multi-row
+/// kernels take what they can - the batch-1 reduction per row at one weight
+/// read (Q6_K through the multi-column W4A8 GEMV, K-split Q8_0 planes at
+/// their batch-1 split); the rest runs its batch-1 entry row by row, one
+/// plane read per row. That fallback (today the Q8_0 row-parallel GEMV
+/// planes: hc up, shared-expert down) is the interim until those get a
+/// multi-row twin too.
+#[allow(clippy::too_many_arguments)]
+fn kq_matmul_rows_exact(
+    e: &GpuExecutor,
+    w: &QuantW,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    stage: &mut DenseStage,
+) -> Result<(), GpuError> {
+    if !verify_per_row_forced() {
+        match w {
+            // Q6_K: the multi-column W4A8 GEMV walks each column exactly as the
+            // batch-1 GEMV walks its row - the same TPR at both of the
+            // launchers' row elections (64 from out 2048, 128 below), the same
+            // chunk order per thread, warp tree and fold - and quantize_q8 is
+            // quantize_q8_sums' q/scale bit for bit. So a column group lands
+            // where that many batch-1 calls land, at one weight read. Q6_K
+            // only: the mu formats fold differently from 4 columns and elect
+            // their batch-1 TPR per shape.
+            QuantW::Kq(k)
+                if k.ty == paddock_models::ggml_type::GgmlType::Q6K
+                    && e.has_kquant_gemv_w4a8()
+                    && e.has_kquant_gemv_w4a8_nc()
+                    && paddock_models::dev_var_os!("PADDOCK_KQ_EXACT_GEMV").is_none()
+                    && stage.q.len() >= batch * in_dim
+                    && stage.xs.len() >= batch * in_dim / 32 =>
+            {
+                e.quantize_q8(x, &mut stage.q, &mut stage.xs, batch * in_dim)?;
+                // balanced groups of 2..=5 columns (9 rows -> 4 + 5)
+                let groups = batch.div_ceil(5);
+                let mut off = 0;
+                for g in 0..groups {
+                    let cols = (batch - off) / (groups - g);
+                    e.kquant_gemv_w4a8_nc_at(k, &stage.q, &stage.xs, None, y, off, cols)?;
+                    off += cols;
+                }
+                return Ok(());
+            }
+            // a plane the batch-1 tick puts on the K-split rung: that kernel's
+            // (row, chunk, token) blocks never see the batch, so every row at
+            // the batch-1 split is that many batch-1 calls in one launch
+            QuantW::Q8(q) => {
+                match q8_sk_split(e, q, 1, stage) {
+                    Some(split)
+                        if batch <= SK_MAX_BATCH
+                            && stage.sk_part.len() >= batch * out_dim * split
+                            && stage.sk_cnt.len() >= batch * out_dim =>
+                    {
+                        return e.q8_0_gemv_sk(
+                            q,
+                            None,
+                            x,
+                            y,
+                            &mut stage.sk_part,
+                            &mut stage.sk_cnt,
+                            batch,
+                            split,
+                        );
+                    }
+                    // the batch-1 tick's row-parallel GEMV (hc up, shared-expert
+                    // down): its token-axis twin (slot 598) is that block per
+                    // (row, token), so all rows at one launch
+                    None if e.q8_0_gemv_repacked_rows(q, None, x, y, batch)? => return Ok(()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let (Some(mut xr), Some(mut yr)) = (stage.xrow.take(), stage.yrow.take()) else {
+        return Err(GpuError::Unsupported(
+            "row-exact matmul without its single-row staging".into(),
+        ));
+    };
+    let mut run = || -> Result<(), GpuError> {
+        for r in 0..batch {
+            e.copy_region(x, r * in_dim, &mut xr, 0, in_dim)?;
+            kq_matmul(e, w, &xr, &mut yr, 1, stage)?;
+            e.copy_region(&yr, 0, y, r * out_dim, out_dim)?;
+        }
+        Ok(())
+    };
+    let res = run();
+    stage.xrow = Some(xr);
+    stage.yrow = Some(yr);
+    res
 }
 
 fn kq_matmul(
@@ -1121,36 +1642,7 @@ fn kq_matmul(
             // the shape (rows the launch has vs the blocks the die holds),
             // not chosen: it is the factor that fills the machine, capped so
             // each chunk stays deep enough to amortize its own reduction.
-            let (in_dim, out_dim) = (q.dims[0], q.dims[1]);
-            // What the row-parallel arm this would replace actually launches:
-            // one block per output row at batch 1, one per MT tile above it.
-            // A narrow-out plane's tile count does not grow with batch at all
-            // ([10240, 320] is TWENTY blocks at every width), so that arm
-            // covers a batch at `grid_arm / want` of the die while the split
-            // covers it at full fill for `batch` plane reads - which is the
-            // comparison this gate makes.
-            let grid_arm = if batch == 1 {
-                out_dim
-            } else {
-                out_dim.div_ceil(SK_MT_TILE)
-            };
-            let blocks = grid_arm * batch;
-            let want = e.sm_count() * SK_BLOCKS_PER_SM;
-            let sk = (batch <= SK_MAX_BATCH
-                && out_dim <= SK_MAX_OUT
-                && blocks < want
-                && in_dim >= SK_MIN_CHUNK * 2
-                && in_dim.is_multiple_of(32)
-                && e.has_q8_0_gemv_sk()
-                && stage.sk_part.len() >= batch * out_dim * 2
-                && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_SK").is_none())
-            .then(|| {
-                let by_die = want.div_ceil((out_dim * batch).max(1));
-                let by_depth = in_dim / SK_MIN_CHUNK;
-                let cap = stage.sk_part.len() / (batch * out_dim).max(1);
-                by_die.min(by_depth).min(cap).clamp(2, SK_MAX_SPLIT)
-            });
-            if let Some(split) = sk {
+            if let Some(split) = q8_sk_split(e, q, batch, stage) {
                 return e.q8_0_gemv_sk(
                     q,
                     None,
@@ -1170,16 +1662,52 @@ fn kq_matmul(
                 && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_TILE").is_none()
             {
                 let in_dim = in_dim_of(q);
+                // the pipelined tile is the same tile arithmetic with its K
+                // stages streamed two deep - the dense prefill rung qwen35,
+                // gemma4 and gpt-oss already take
+                let pipe = e.has_q8_0_gemm_mmq_pipe() && q8_pipe_enabled();
+                let step = q8_launch_rows(in_dim, stage.yq.len());
                 let mut off = 0;
                 while off < batch {
-                    let rows = (batch - off).min(KQ_TILE_ROWS);
+                    let rows = (batch - off).min(step);
                     e.quantize_q8_mmq_rows(x, off, &mut stage.yq, in_dim, rows)?;
+                    // Split the dense rung in situ. The bench times this tile
+                    // at 348 us for [2560 -> 6144] x 1024 with its activations
+                    // staged, and the walk's attn-qmm lap bills 737 for the
+                    // same call - these two laps say which half carries it.
+                    forward::pm_lap(e, "dq-quant");
                     // no fixup plane: plain tiling, which is the bit-exact
                     // class against the mma route
-                    e.q8_0_gemm_mmq_rows(q, &stage.yq, None, y, off, rows)?;
+                    if pipe {
+                        e.q8_0_gemm_mmq_pipe_rows(q, &stage.yq, 0, y, off, rows)?;
+                        forward::pm_lap(e, "dq-gemm");
+                    } else {
+                        e.q8_0_gemm_mmq_rows(q, &stage.yq, None, y, off, rows)?;
+                    }
                     off += rows;
                 }
                 Ok(())
+            } else if stage.prefill && batch <= Q8_MT_ROWS {
+                // Prefill width, 13..=16 rows: the mt tile holds 16 rows per
+                // weight pass. The plain per-row GEMM below re-reads each
+                // activation row once per output row and the plane once per
+                // small row tile, which is what made a checkpoint cut's 16-row
+                // walk cost as much as seven decode ticks on the all-Q8_0
+                // UD-Q4_K_XL dense planes (227 ms, qwen4exp phase census
+                // 2026-09-14).
+                e.q8_0_gemm_repacked_mt(q, None, x, y, batch)
+            } else if stage.prefill
+                && batch <= 64
+                && e.has_q8_0_gemm_mt_dp4a_wide()
+                && stage.q.len() >= batch * in_dim_of(q)
+                && stage.xs.len() >= batch * in_dim_of(q) / 32
+            {
+                // 17..=64 rows: the wide dp4a GEMM, one weight pass per 32
+                // rows off int8 activations (the prefill class; the mmq tile
+                // takes over above 64)
+                let in_dim = in_dim_of(q);
+                e.quantize_q8(x, &mut stage.q, &mut stage.xs, batch * in_dim)?;
+                e.q8_0_gemm_mt_dp4a_wide(q, &stage.q, &stage.xs, y, batch)
             } else if batch <= 12 {
                 e.q8_0_gemm_repacked_mt(q, None, x, y, batch)
             } else {
@@ -1272,6 +1800,9 @@ fn kq_matmul(
 pub enum Embed {
     Bf16(QuantTensor),
     Kq(RepackedKQ),
+    /// raw Q8_0 blocks on the Q8_0 row gather (UD-Q4_K_XL keeps token_embd
+    /// at Q8_0): only the gathered rows dequantize, the table stays 8.5 bpw
+    Q8(QuantTensor),
 }
 
 /// One routed-expert plane of the GGUF lane: in VRAM, or in device-mapped
@@ -1322,6 +1853,14 @@ pub enum ExpertSeats {
         up: KqSeat,
         down: KqSeat,
         cache: Option<Box<ExpertCache>>,
+    },
+    /// All three planes Q8_0 - what the MTP head's block ships (the UD
+    /// trunk never elects it). Rides the qwen3.6-A3B Q8_0 SwiGLU streams:
+    /// token-batched at draft widths, expert-sorted above them. VRAM only.
+    Q8 {
+        gate: RepackedQ8,
+        up: RepackedQ8,
+        down: RepackedQ8,
     },
 }
 

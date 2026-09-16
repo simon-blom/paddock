@@ -104,7 +104,8 @@ __host__ __device__ __forceinline__ uint32_t pd_kq_scb(uint32_t dt) {
 // Formats with a per-16 MIN (mu) term: the int8 lanes need the per-16
 // activation sums for these (Q4_K, Q5_K, Q4_0's folded -8, Q2_K's dmin*m).
 __host__ __device__ constexpr bool pd_kq_has_mu(uint32_t dt) {
-    return dt == PD_KQ_Q4K || dt == PD_KQ_Q5K || dt == PD_KQ_Q40 || dt == PD_KQ_Q2K_ID;
+    return dt == PD_KQ_Q4K || dt == PD_KQ_Q5K || dt == PD_KQ_Q40 || dt == PD_KQ_Q2K_ID ||
+           dt == PD_KQ_Q51_ID;
 }
 
 __host__ __device__ __forceinline__ bool pd_kq_valid(uint32_t dtype) {
@@ -831,6 +832,13 @@ __global__ void pd_kquant_dequant_rp_kernel(const uint8_t* __restrict__ data,
 // dtype rides existing entry points and slot presence alone cannot say.
 PD_EXPORT
 int pd_kquant_q40(void) { return 0; }
+
+// Capability marker (slot 600): present iff the i-quant lanes serve the flat
+// 32-weight block formats Q5_1 and Q8_0 (quant/iquant.cuh) - the routed
+// expert types UD-Q4_K_XL exports mix in. Same reason as the Q4_0 marker:
+// the dtypes ride existing entry points.
+PD_EXPORT
+int pd_kquant_flat32(void) { return 0; }
 
 // Capability marker (slot 577): present iff the k-quant repack, dequant and
 // token-batched MoE pair serve the ggml i-quant family (IQ1_S/M, IQ2_XXS/XS/S,

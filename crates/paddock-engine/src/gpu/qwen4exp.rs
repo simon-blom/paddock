@@ -166,6 +166,256 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the quantizing combine_norm (slot 602).
+    pub fn has_q4x_combine_norm_q8mmq(&self) -> bool {
+        self.kernels.q4x_combine_norm_q8mmq.is_some()
+    }
+
+    /// [`Self::q4x_combine_norm`] that also writes the normalized state's mmq
+    /// activations for the next hyper-connection down (slot 602) into `yq`,
+    /// laid in `group_rows`-row groups of `ceil(hc * hidden / 128) x group_rows
+    /// x 144` bytes - what one `q8_0_gemm_mmq_pipe` launch reads per group.
+    /// The bytes are `quantize_q8_mmq_rows`' on the same `xn`, group by group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_combine_norm_q8mmq(
+        &self,
+        h: &mut CudaSlice<f32>,
+        block_out: &CudaSlice<f32>,
+        inj: &CudaSlice<f32>,
+        inj_off: usize,
+        norm_w: &CudaSlice<f32>,
+        xn: &mut CudaSlice<f32>,
+        yq: &mut CudaSlice<u8>,
+        rows: usize,
+        hc: usize,
+        hidden: usize,
+        eps: f32,
+        group_rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_combine_norm_q8mmq
+            .ok_or(GpuError::MissingOp("q4x_combine_norm_q8mmq"))?;
+        debug_assert!(
+            yq.len() >= rows.div_ceil(group_rows) * (hc * hidden).div_ceil(128) * group_rows * 144
+        );
+        let (bp, _g2) = block_out.device_ptr(&self.stream);
+        let (ip, _g3) = inj.device_ptr(&self.stream);
+        let (wp, _g4) = norm_w.device_ptr(&self.stream);
+        let (hp, _g1) = h.device_ptr_mut(&self.stream);
+        let (op, _g5) = xn.device_ptr_mut(&self.stream);
+        let (qp, _g6) = yq.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 602); the inject offset is inside `inj` by
+        // construction and `yq` holds every group the rows reach (asserted)
+        check(unsafe {
+            f(
+                hp as *mut _,
+                bp as *const _,
+                (ip + (inj_off * 4) as u64) as *const _,
+                wp as *const _,
+                op as *mut _,
+                core::ptr::null_mut(),
+                qp as *mut _,
+                rows as u32,
+                hc as u32,
+                hidden as u32,
+                eps,
+                group_rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the combine without a stored normalized
+    /// state and both of its rebuild consumers (slots 606 - 608).
+    pub fn has_q4x_hc_rebuild(&self) -> bool {
+        self.kernels.q4x_combine_norm_q8mmq_ns.is_some()
+            && self.kernels.q4x_hc_inject_rn.is_some()
+            && self.kernels.q8_0_gemm_mmq_pipe_hcmix_rn.is_some()
+    }
+
+    /// [`Self::q4x_combine_norm_q8mmq`] without the normalized state (slot
+    /// 606): writes `h`, the mmq rows and the per-(row, stream) 1/rms into
+    /// `aux[aux_off..aux_off + rows * hc]` - the tail of the next mix's
+    /// [norm_w | 1/rms] plane, which [`Self::q4x_hc_inject_rn`] and
+    /// `q8_0_gemm_mmq_pipe_hcmix_rn` rebuild every normalized value from,
+    /// byte for byte.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_combine_norm_q8mmq_ns(
+        &self,
+        h: &mut CudaSlice<f32>,
+        block_out: &CudaSlice<f32>,
+        inj: &CudaSlice<f32>,
+        inj_off: usize,
+        norm_w: &CudaSlice<f32>,
+        aux: &mut CudaSlice<f32>,
+        aux_off: usize,
+        yq: &mut CudaSlice<u8>,
+        rows: usize,
+        hc: usize,
+        hidden: usize,
+        eps: f32,
+        group_rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_combine_norm_q8mmq_ns
+            .ok_or(GpuError::MissingOp("q4x_combine_norm_q8mmq_ns"))?;
+        debug_assert!(
+            yq.len() >= rows.div_ceil(group_rows) * (hc * hidden).div_ceil(128) * group_rows * 144
+        );
+        debug_assert!(aux.len() >= aux_off + rows * hc);
+        let (bp, _g2) = block_out.device_ptr(&self.stream);
+        let (ip, _g3) = inj.device_ptr(&self.stream);
+        let (wp, _g4) = norm_w.device_ptr(&self.stream);
+        let (hp, _g1) = h.device_ptr_mut(&self.stream);
+        let (ap, _g5) = aux.device_ptr_mut(&self.stream);
+        let (qp, _g6) = yq.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 606); the inject and aux offsets are inside
+        // their planes (asserted / by construction), pointers + stream live
+        // across the call
+        check(unsafe {
+            f(
+                hp as *mut _,
+                bp as *const _,
+                (ip + (inj_off * 4) as u64) as *const _,
+                wp as *const _,
+                (ap + (aux_off * 4) as u64) as *mut _,
+                qp as *mut _,
+                rows as u32,
+                hc as u32,
+                hidden as u32,
+                eps,
+                group_rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// The hc inject (`matvec_f32_batch` of `w` [out_dim][hc * hidden]) over
+    /// the normalized state rebuilt from `h` and `aux` = [norm_w (hc * hidden)
+    /// | 1/rms (batch * hc)] (slot 607): byte-identical to the matvec over the
+    /// stored state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_hc_inject_rn(
+        &self,
+        w: &CudaSlice<f32>,
+        h: &CudaSlice<f32>,
+        aux: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        hidden: usize,
+        hc: usize,
+        out_dim: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_hc_inject_rn
+            .ok_or(GpuError::MissingOp("q4x_hc_inject_rn"))?;
+        debug_assert!(w.len() >= out_dim * hc * hidden && h.len() >= batch * hc * hidden);
+        debug_assert!(aux.len() >= hc * hidden + batch * hc && out.len() >= batch * out_dim);
+        let (wp, _g1) = w.device_ptr(&self.stream);
+        let (hp, _g2) = h.device_ptr(&self.stream);
+        let (ap, _g3) = aux.device_ptr(&self.stream);
+        let (op, _g4) = out.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 607); planes sized as asserted, pointers +
+        // stream live across the call
+        check(unsafe {
+            f(
+                wp as *const _,
+                hp as *const _,
+                ap as *const _,
+                op as *mut _,
+                hidden as u32,
+                hc as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries slot 606 with the inject fold (slot 609).
+    pub fn has_q4x_combine_norm_q8mmq_nsi(&self) -> bool {
+        self.kernels.q4x_combine_norm_q8mmq_nsi.is_some()
+    }
+
+    /// [`Self::q4x_combine_norm_q8mmq_ns`] that also produces the NEXT mix's
+    /// inject logits from its norm pass (slot 609): `w_inj` [4][hc * hidden]
+    /// f32, `ip` [rows][hc][hc] scratch, the logits into `inj_out` [rows][hc].
+    /// This combine's own inject logits come from `inj_in` at an element
+    /// offset, or - `None` - from `inj_out` itself at 0 (the fold launches
+    /// after the combine has read them). hc 4; the dot re-associates against
+    /// the matvec.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_combine_norm_q8mmq_nsi(
+        &self,
+        h: &mut CudaSlice<f32>,
+        block_out: &CudaSlice<f32>,
+        inj_in: Option<(&CudaSlice<f32>, usize)>,
+        norm_w: &CudaSlice<f32>,
+        aux: &mut CudaSlice<f32>,
+        aux_off: usize,
+        yq: &mut CudaSlice<u8>,
+        w_inj: &CudaSlice<f32>,
+        ip: &mut CudaSlice<f32>,
+        inj_out: &mut CudaSlice<f32>,
+        rows: usize,
+        hc: usize,
+        hidden: usize,
+        eps: f32,
+        group_rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_combine_norm_q8mmq_nsi
+            .ok_or(GpuError::MissingOp("q4x_combine_norm_q8mmq_nsi"))?;
+        debug_assert!(
+            yq.len() >= rows.div_ceil(group_rows) * (hc * hidden).div_ceil(128) * group_rows * 144
+        );
+        debug_assert!(aux.len() >= aux_off + rows * hc);
+        debug_assert!(w_inj.len() >= hc * hc * hidden && ip.len() >= rows * hc * hc);
+        debug_assert!(inj_out.len() >= rows * hc);
+        let (bp, _g2) = block_out.device_ptr(&self.stream);
+        let (wp, _g4) = norm_w.device_ptr(&self.stream);
+        let (hp, _g1) = h.device_ptr_mut(&self.stream);
+        let (ap, _g5) = aux.device_ptr_mut(&self.stream);
+        let (qp, _g6) = yq.device_ptr_mut(&self.stream);
+        let (wip, _g7) = w_inj.device_ptr(&self.stream);
+        let (ipp, _g8) = ip.device_ptr_mut(&self.stream);
+        let (op, _g9) = inj_out.device_ptr_mut(&self.stream);
+        let (inp, _g3);
+        let in_ptr: u64 = match inj_in {
+            Some((x, off)) => {
+                (inp, _g3) = x.device_ptr(&self.stream);
+                inp + (off * 4) as u64
+            }
+            None => op,
+        };
+        // SAFETY: ABI contract (slot 609); every offset is inside its plane
+        // (asserted / by construction), the aliasing inject read precedes the
+        // fold's write on the stream, pointers + stream live across the call
+        check(unsafe {
+            f(
+                hp as *mut _,
+                bp as *const _,
+                in_ptr as *const _,
+                wp as *const _,
+                (ap + (aux_off * 4) as u64) as *mut _,
+                qp as *mut _,
+                wip as *const _,
+                ipp as *mut _,
+                op as *mut _,
+                rows as u32,
+                hc as u32,
+                hidden as u32,
+                eps,
+                group_rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// [`Self::q4x_add_gated_row`] reading the per-row gate at an ELEMENT
     /// offset inside `s` - the folded MoE router writes the shared expert's
     /// scalar gate as row `n_expert` of its own logits.

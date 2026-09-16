@@ -1485,6 +1485,13 @@ fn build_generator(
                         max_batch.max(1),
                     )
                     .map_err(|e| e.to_string())?;
+                // The MTP head is a separate GGUF for this family (blk.48 +
+                // nextn, unsloth's mtp-*-shared-Q8_0.gguf); attached before
+                // the expert cache so its planes are out of the headroom that
+                // cache sizes from.
+                if let Some(mp) = mtp {
+                    model.attach_mtp(mp).map_err(|e| e.to_string())?;
+                }
                 let host = model.expert_host_bytes();
                 if host > 0 {
                     let headroom = exec.vram_headroom().unwrap_or(0);

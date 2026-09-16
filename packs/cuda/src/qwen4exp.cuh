@@ -165,6 +165,99 @@ int pd_q4x_hc_mix(const void* xn, const void* gate, void* out, void* out16,
     return pd_launch_status();
 }
 
+// ---- the hc inject over a REBUILT normalized state (slot 607) --------------
+// pd_matvec_f32_batch_kernel<BT>'s tile - same (output, BT-token) blocks, same
+// per-thread stride-256 ascending partials, same shuffle tree and serial
+// cross-warp sum - but each normalized value is rebuilt from the residual `h`
+// with the combine's own expression, v * inv + (v * inv) * w, off
+// `aux` = [norm_w (hc * hidden) | 1/rms (rows * hc)], which slot 606 publishes
+// instead of storing the [rows][hc * hidden] state. Byte-identical to the
+// matvec over the stored state at the same BT (the launcher mirrors that
+// election). dims = hidden | hc << 16 | out_dim << 24.
+template <uint32_t BT>
+__global__ void pd_q4x_hc_inject_rn_kernel(const float* __restrict__ w, const float* __restrict__ h,
+                                           const float* __restrict__ aux, float* __restrict__ out,
+                                           uint32_t dims, uint32_t batch) {
+    PD_PDL_ARM();
+    const uint32_t hidden = dims & 0xFFFFu, hc = (dims >> 16) & 0xFFu, out_dim = dims >> 24;
+    const uint32_t in_dim = hc * hidden;
+    const float* norm_w = aux;
+    const float* nscale = aux + in_dim;
+    const uint32_t o = blockIdx.x, t0 = blockIdx.y * BT;
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+    const float* wr = w + (size_t)o * in_dim;
+    float acc[BT] = {};
+    for (uint32_t i = tid; i < in_dim; i += nth) {
+        const float wv = wr[i];
+        const uint32_t s = i / hidden;
+        const float nw = norm_w[i];
+        #pragma unroll
+        for (uint32_t b = 0; b < BT; ++b) {
+            if (t0 + b < batch) {
+                const float v = h[(size_t)(t0 + b) * in_dim + i];
+                const float inv = nscale[(size_t)(t0 + b) * hc + s];
+                const float xv = v * inv + (v * inv) * nw;
+                acc[b] += wv * xv;
+            }
+        }
+    }
+    __shared__ float wsum[8][BT];
+    const uint32_t warp = tid >> 5, lane = tid & 31u;
+    #pragma unroll
+    for (uint32_t b = 0; b < BT; ++b) {
+        float v = acc[b];
+        for (uint32_t k = 16; k > 0; k >>= 1) v += __shfl_down_sync(0xffffffffu, v, k);
+        if (lane == 0) wsum[warp][b] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const uint32_t nwarps = (nth + 31u) >> 5;
+        #pragma unroll
+        for (uint32_t b = 0; b < BT; ++b) {
+            if (t0 + b >= batch) break;
+            float v = 0.0f;
+            for (uint32_t i = 0; i < nwarps; ++i) v += wsum[i][b];
+            out[(size_t)(t0 + b) * out_dim + o] = v;
+        }
+    }
+}
+
+PD_EXPORT
+int pd_q4x_hc_inject_rn(const void* w, const void* h, const void* aux, void* out, uint32_t hidden,
+                        uint32_t hc, uint32_t out_dim, uint32_t batch, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    if (hidden > 0xFFFFu || hc == 0 || hc > 0xFFu || out_dim > 0xFFu) return cudaErrorInvalidValue;
+    // pd_matvec_f32_batch's own BT election (and its dev pin), so the rebuilt
+    // inject folds exactly where the matvec over a stored state would
+    static const char* bt_e = pd_env("PADDOCK_MATVEC_BT");
+    static const int bt_pin = bt_e ? atoi(bt_e) : 0;
+    const uint32_t bt = (bt_pin == 2 || bt_pin == 4 || bt_pin == 8 || bt_pin == 16)
+                            ? (uint32_t)bt_pin
+                            : (batch < 16u ? 2u : 4u);
+    const uint32_t dims = hidden | (hc << 16) | (out_dim << 24);
+    dim3 grid(out_dim, (batch + bt - 1u) / bt);
+    cudaStream_t st = (cudaStream_t)stream;
+    switch (bt) {
+    case 16u:
+        pd_pdl_go(pd_q4x_hc_inject_rn_kernel<16u>, grid, 256, 0u, st, (const float*)w, (const float*)h,
+                  (const float*)aux, (float*)out, dims, batch);
+        break;
+    case 8u:
+        pd_pdl_go(pd_q4x_hc_inject_rn_kernel<8u>, grid, 256, 0u, st, (const float*)w, (const float*)h,
+                  (const float*)aux, (float*)out, dims, batch);
+        break;
+    case 4u:
+        pd_pdl_go(pd_q4x_hc_inject_rn_kernel<4u>, grid, 256, 0u, st, (const float*)w, (const float*)h,
+                  (const float*)aux, (float*)out, dims, batch);
+        break;
+    default:
+        pd_pdl_go(pd_q4x_hc_inject_rn_kernel<2u>, grid, 256, 0u, st, (const float*)w, (const float*)h,
+                  (const float*)aux, (float*)out, dims, batch);
+        break;
+    }
+    return pd_launch_status();
+}
+
 // H[s,:] += block_out * 2*sigmoid(inj[s]/hc)  - the combine half of the
 // hyper-connection residual. grid.x = ceil(hidden/256), grid.y = hc, grid.z = rows.
 __global__ void pd_q4x_hc_combine_kernel(float* __restrict__ h,
@@ -740,6 +833,18 @@ extern "C" int pd_q4x_combine_norm_moe(void* h, const void* cdn, const void* ids
     return pd_launch_status();
 }
 
+// NS (slot 606, with Q): the normalized state is NOT stored - `xn` receives the
+// per-(row, stream) 1/rms instead ([rows][hc]), which the rebuild consumers
+// (slots 607 / 608) turn back into every normalized value with this pass-2
+// expression. The mmq rows are emitted from the value in hand as before.
+// I (slot 609, with Q and NS): also the NEXT mix's inject, off the values in
+// hand - each thread dots its float4 against the four rows of `w_inj`
+// ([4][hc * hidden] f32), the four accumulators reduce like the sum of
+// squares (a warp butterfly, then the warps in shared) and thread 0 writes
+// the (row, stream) partial ip[r][s][k]; pd_q4x_hc_inj_fold_kernel sums them
+// over s. A re-association of the matvec's dot (a class change); it retires
+// the inject's own read of the residual.
+template <bool Q, bool NS = false, bool I = false>
 __global__ __launch_bounds__(1024) void pd_q4x_combine_norm_kernel(float* __restrict__ h,
                                            const float* __restrict__ block_out,
                                            const float* __restrict__ inj,
@@ -749,9 +854,22 @@ __global__ __launch_bounds__(1024) void pd_q4x_combine_norm_kernel(float* __rest
                                            // bf16 MIRROR of xn written at the store:
                                            // its consumers otherwise cast it per call
                                            // (96 casts of [8, 10240] a tick at c8).
-                                           __nv_bfloat16* __restrict__ xn16) {
+                                           __nv_bfloat16* __restrict__ xn16,
+                                           // Q (slot 602): the next hyper-connection
+                                           // down's mmq activations, group_rows-row
+                                           // groups of n_chunks_row 128-chunks
+                                           uint8_t* __restrict__ yq,
+                                           uint32_t n_chunks_row, uint32_t group_rows,
+                                           // I (slot 609): the next mix's inject weight
+                                           // and the (row, stream, output) partials
+                                           const float* __restrict__ w_inj,
+                                           float* __restrict__ ip) {
     PD_PDL_ARM();
-    __shared__ float wsum[8];
+    // one slot a warp: the launchers run up to 1024 threads (32 warps) - the
+    // hidden-2560 shape is 640 threads, 20 warps, which an 8-slot array
+    // overran into the neighbouring shared bytes (same values either way)
+    __shared__ float wsum[32];
+    __shared__ float isum[I ? 32u : 1u][4];
     __shared__ float s_inv;
     const uint32_t s = blockIdx.x, r = blockIdx.y;
     const size_t base = (size_t)r * hc * hidden + (size_t)s * hidden;
@@ -793,6 +911,7 @@ __global__ __launch_bounds__(1024) void pd_q4x_combine_norm_kernel(float* __rest
         const uint32_t nw = nth >> 5;
         for (uint32_t i = 0; i < nw; ++i) t += wsum[i];
         s_inv = 1.0f / sqrtf(t / (float)hidden + eps);
+        if (NS) xn[(size_t)r * hc + s] = s_inv;
     }
     __syncthreads();
     const float inv = s_inv;
@@ -803,7 +922,8 @@ __global__ __launch_bounds__(1024) void pd_q4x_combine_norm_kernel(float* __rest
         const float4* h4 = reinterpret_cast<const float4*>(hb);
         const float4* w4 = reinterpret_cast<const float4*>(wb);
         float4* o4 = reinterpret_cast<float4*>(ob);
-        __nv_bfloat162* m2 = xn16 ? reinterpret_cast<__nv_bfloat162*>(xn16 + base) : nullptr;
+        __nv_bfloat162* m2 = (xn16 && !NS) ? reinterpret_cast<__nv_bfloat162*>(xn16 + base) : nullptr;
+        float ia[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (uint32_t i = tid; i < n4; i += nth) {
             const float4 v = h4[i];
             const float4 wv = w4[i];
@@ -812,10 +932,59 @@ __global__ __launch_bounds__(1024) void pd_q4x_combine_norm_kernel(float* __rest
             o.y = v.y * inv + (v.y * inv) * wv.y;
             o.z = v.z * inv + (v.z * inv) * wv.z;
             o.w = v.w * inv + (v.w * inv) * wv.w;
-            o4[i] = o;
+            if (!NS) o4[i] = o;
+            if (I) {
+                #pragma unroll
+                for (uint32_t k = 0; k < 4u; ++k) {
+                    const float4 wi = *reinterpret_cast<const float4*>(
+                        w_inj + (size_t)k * hc * hidden + (size_t)s * hidden + (size_t)i * 4u);
+                    ia[k] += (wi.x * o.x + wi.y * o.y) + (wi.z * o.z + wi.w * o.w);
+                }
+            }
             if (m2) {
                 m2[2u * i] = __floats2bfloat162_rn(o.x, o.y);
                 m2[2u * i + 1u] = __floats2bfloat162_rn(o.z, o.w);
+            }
+            if (Q) {
+                // mmq epilogue: this thread's float4 is lane `lane` of 128-chunk
+                // `warp` of stream s (the launcher pins one float4 a thread), so
+                // pd_quantize_q8_mmq's exact math on the value just stored to xn
+                // gives the down the bytes quantizing xn afterwards would have
+                float a = fmaxf(fmaxf(fabsf(o.x), fabsf(o.y)), fmaxf(fabsf(o.z), fabsf(o.w)));
+                #pragma unroll
+                for (uint32_t sh = 4; sh > 0; sh >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, sh));
+                const float scl = a * (1.0f / 127.0f);
+                const float qinv = scl > 0.0f ? 1.0f / scl : 0.0f;
+                char4 q;
+                int qi;
+                qi = __float2int_rn(o.x * qinv); q.x = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+                qi = __float2int_rn(o.y * qinv); q.y = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+                qi = __float2int_rn(o.z * qinv); q.z = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+                qi = __float2int_rn(o.w * qinv); q.w = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+                const uint32_t grp = r / group_rows;
+                const size_t chunk = (size_t)grp * n_chunks_row + (size_t)s * (hidden >> 7) + warp;
+                uint8_t* blk = yq + (chunk * group_rows + (r - grp * group_rows)) * 144u;
+                ((char4*)(blk + 16u))[lane] = q;
+                if ((lane & 7u) == 0u) ((float*)blk)[lane >> 3] = scl;
+            }
+        }
+        if (I) {
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; ++k) {
+                float v = ia[k];
+                for (uint32_t m = 16; m > 0; m >>= 1) v += __shfl_down_sync(0xffffffffu, v, m);
+                if (lane == 0) isum[warp][k] = v;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                const uint32_t nw = nth >> 5;
+                #pragma unroll
+                for (uint32_t k = 0; k < 4u; ++k) {
+                    float t = 0.0f;
+                    for (uint32_t wi = 0; wi < nw; ++wi) t += isum[wi][k];
+                    ip[((size_t)r * hc + s) * 4u + k] = t;
+                }
             }
         }
     } else {
@@ -852,10 +1021,114 @@ int pd_q4x_combine_norm(void* h, const void* block_out, const void* inj,
         nth_env = (e && *e) ? atoi(e) : 0;
     }
     if (nth_env >= 32 && nth_env <= 1024) nth = (uint32_t)nth_env;
-    pd_pdl_go(pd_q4x_combine_norm_kernel, grid, nth, 0, (cudaStream_t)stream, 
+    pd_pdl_go(pd_q4x_combine_norm_kernel<false>, grid, nth, 0, (cudaStream_t)stream, 
         (float*)h, (const float*)block_out, (const float*)inj,
         (const float*)norm_w, (float*)xn, hc, hidden, eps,
-        (__nv_bfloat16*)xn16);
+        (__nv_bfloat16*)xn16, (uint8_t*)nullptr, 0u, 0u, (const float*)nullptr, (float*)nullptr);
+    return pd_launch_status();
+}
+
+// slot 602: combine_norm that also emits the NEXT hyper-connection down's mmq
+// activations (pd_quantize_q8_mmq's layout and math) from its own norm pass,
+// so the separate quantize launch and its read of the [rows][hc*hidden]
+// normalized state go. `yq` holds group_rows-row groups, each
+// ceil(hc*hidden/128) x group_rows x 144 B - the chunk-local layout one
+// pd_q8_0_gemm_mmq_pipe launch reads. The epilogue needs one float4 a thread
+// (the lane/chunk alignment), so any shape or thread override that would put
+// the plain launcher on another thread count is declined.
+PD_EXPORT
+int pd_q4x_combine_norm_q8mmq(void* h, const void* block_out, const void* inj,
+                              const void* norm_w, void* xn, void* xn16, void* yq,
+                              uint32_t rows, uint32_t hc, uint32_t hidden, float eps,
+                              uint32_t group_rows, void* stream) {
+    if (rows == 0 || hc == 0 || hidden == 0) return 0;
+    const uint32_t n4 = hidden >> 2;
+    if (yq == nullptr || (hidden & 127u) != 0 || n4 < 64u || n4 > 1024u ||
+        group_rows == 0 || (group_rows & 127u) != 0)
+        return cudaErrorInvalidValue;
+    const char* env = getenv("PADDOCK_Q4X_CN_THREADS");
+    if (env && *env && atoi(env) != (int)n4) return cudaErrorInvalidValue;
+    dim3 grid(hc, rows);
+    pd_pdl_go(pd_q4x_combine_norm_kernel<true>, grid, n4, 0, (cudaStream_t)stream,
+        (float*)h, (const float*)block_out, (const float*)inj,
+        (const float*)norm_w, (float*)xn, hc, hidden, eps,
+        (__nv_bfloat16*)xn16, (uint8_t*)yq, (hc * hidden) >> 7, group_rows,
+        (const float*)nullptr, (float*)nullptr);
+    return pd_launch_status();
+}
+
+// slot 606: slot 602 without the [rows][hc * hidden] normalized state - it
+// writes h, the next hc down's mmq rows, and the per-(row, stream) 1/rms into
+// `nscale` ([rows][hc]; the tail of an [norm_w | nscale] aux plane in the
+// engine). The inject and the up + mix that read the state rebuild it from h
+// (slots 607 / 608), byte for byte: at 1024 rows the combine drops from ~640 to
+// ~450 us and the chain 1223 -> 1022 us (bench/combine_rn_gb10_bench.cu).
+PD_EXPORT
+int pd_q4x_combine_norm_q8mmq_ns(void* h, const void* block_out, const void* inj,
+                                 const void* norm_w, void* nscale, void* yq, uint32_t rows,
+                                 uint32_t hc, uint32_t hidden, float eps, uint32_t group_rows,
+                                 void* stream) {
+    if (rows == 0 || hc == 0 || hidden == 0) return 0;
+    const uint32_t n4 = hidden >> 2;
+    if (yq == nullptr || nscale == nullptr || (hidden & 127u) != 0 || n4 < 64u || n4 > 1024u ||
+        group_rows == 0 || (group_rows & 127u) != 0)
+        return cudaErrorInvalidValue;
+    const char* env = getenv("PADDOCK_Q4X_CN_THREADS");
+    if (env && *env && atoi(env) != (int)n4) return cudaErrorInvalidValue;
+    dim3 grid(hc, rows);
+    pd_pdl_go(pd_q4x_combine_norm_kernel<true, true>, grid, n4, 0, (cudaStream_t)stream,
+        (float*)h, (const float*)block_out, (const float*)inj,
+        (const float*)norm_w, (float*)nscale, hc, hidden, eps,
+        (__nv_bfloat16*)nullptr, (uint8_t*)yq, (hc * hidden) >> 7, group_rows,
+        (const float*)nullptr, (float*)nullptr);
+    return pd_launch_status();
+}
+
+// A row's inject logits from slot 609's (row, stream, output) partials: the
+// streams summed ascending. One block per 256 rows.
+__global__ void pd_q4x_hc_inj_fold_kernel(const float* __restrict__ ip, float* __restrict__ out,
+                                          uint32_t hc, uint32_t rows) {
+    PD_PDL_ARM();
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    #pragma unroll
+    for (uint32_t k = 0; k < 4u; ++k) {
+        float t = 0.0f;
+        #pragma unroll
+        for (uint32_t s = 0; s < 4u; ++s) t += ip[((size_t)r * hc + s) * 4u + k];
+        out[(size_t)r * hc + k] = t;
+    }
+}
+
+// slot 609: slot 606 that also produces the NEXT mix's inject logits from its
+// own norm pass - the combine holds every normalized value in registers, and
+// the inject (a [4][hc * hidden] f32 matvec) was the one reader left walking
+// the residual for them. `ip` is [rows][hc][hc] caller scratch, `inj_out`
+// [rows][hc]; `inj` may be `inj_out` itself (the fold launches after the
+// combine has read it). hc 4. The dot re-associates - a class change against
+// the matvec (bench/combine_rn_gb10_bench.cu, 1024 rows: 606 + 607 702 -> 513
+// us, logits max |d| 7e-7 on 4.6).
+PD_EXPORT
+int pd_q4x_combine_norm_q8mmq_nsi(void* h, const void* block_out, const void* inj,
+                                  const void* norm_w, void* nscale, void* yq, const void* w_inj,
+                                  void* ip, void* inj_out, uint32_t rows, uint32_t hc,
+                                  uint32_t hidden, float eps, uint32_t group_rows, void* stream) {
+    if (rows == 0 || hc == 0 || hidden == 0) return 0;
+    const uint32_t n4 = hidden >> 2;
+    if (yq == nullptr || nscale == nullptr || w_inj == nullptr || ip == nullptr ||
+        inj_out == nullptr || hc != 4u || (hidden & 127u) != 0 || n4 < 64u || n4 > 1024u ||
+        group_rows == 0 || (group_rows & 127u) != 0)
+        return cudaErrorInvalidValue;
+    const char* env = getenv("PADDOCK_Q4X_CN_THREADS");
+    if (env && *env && atoi(env) != (int)n4) return cudaErrorInvalidValue;
+    cudaStream_t st = (cudaStream_t)stream;
+    pd_pdl_go(pd_q4x_combine_norm_kernel<true, true, true>, dim3(hc, rows), n4, 0, st,
+        (float*)h, (const float*)block_out, (const float*)inj,
+        (const float*)norm_w, (float*)nscale, hc, hidden, eps,
+        (__nv_bfloat16*)nullptr, (uint8_t*)yq, (hc * hidden) >> 7, group_rows,
+        (const float*)w_inj, (float*)ip);
+    pd_pdl_go(pd_q4x_hc_inj_fold_kernel, dim3((rows + 255u) / 256u), 256u, 0, st,
+        (const float*)ip, (float*)inj_out, hc, rows);
     return pd_launch_status();
 }
 

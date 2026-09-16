@@ -2967,6 +2967,98 @@ struct KernelTableV1 {
     int (*nvf4_gemm_f4tn)(const void*, const void*, const void*, const void*,
                           const void*, void*, float, uint32_t, uint32_t,
                           uint32_t, void*);
+    // 598: q8_0_gemv_repacked_rows - the batch-1 Q8_0 GEMV with a token axis,
+    // grid (out_dim, batch): each (row, token) block is the batch-1 block
+    // verbatim, so every token is the batch-1 call's bit for bit (row-exact
+    // spec verify). (data, scale, bias|NULL, x [batch, in], y [batch, out],
+    // in_dim, out_dim, batch, stream). Pure append.
+    int (*q8_0_gemv_repacked_rows)(const void*, const void*, const void*, const void*,
+                                   void*, uint32_t, uint32_t, uint32_t, void*);
+    // 599: gated_delta_recurrent_runs_slots - slot 564's decode body (per-token
+    // state load/store, fused gated norm) walked over each run's rows, grid
+    // (n_heads, n_runs). gn_w NULL writes the plain output (replay form). -1 =
+    // declined (non-f32 state, runtime-D, generic pin, 564's kill switch).
+    // (q, k, v, g, beta, states, out, run_off, run_len, run_slot, gn_z|NULL,
+    // gn_w|NULL, gn_eps, n_runs, n_heads, head_dim, stream). Pure append.
+    int (*gated_delta_recurrent_runs_slots)(const void*, const void*, const void*,
+                                            const void*, const void*, void*, void*,
+                                            const void*, const void*, const void*,
+                                            const void*, const void*, float, uint32_t,
+                                            uint32_t, uint32_t, void*);
+    // 600: kquant_flat32 - capability marker: the i-quant lanes (repack,
+    // dequant, MoE pair/cols/grp/tile/list, dense) serve Q5_1 and Q8_0 as flat
+    // 32-weight blocks. Pure append.
+    int (*kquant_flat32)(void);
+    // 601: moe_q8_rows_unsort - moe_align SORTED int8 activation rows
+    // ([max_blocks][32][ff] + per-32 scales) to the PAIR-major layout
+    // (token * n_active + slot); PAD blocks (block_expert) and PAD rows
+    // skipped. (sq, ss, sorted_row, sorted_slot, block_expert, fq, fs, ff,
+    // n_active, max_blocks, stream). Pure append.
+    int (*moe_q8_rows_unsort)(const void*, const void*, const void*, const void*,
+                              const void*, void*, void*, uint32_t, uint32_t, uint32_t,
+                              void*);
+    // 602: q4x_combine_norm_q8mmq - combine_norm that also emits the next
+    // hyper-connection down's mmq activations from its norm pass, laid in
+    // group_rows-row groups. (h, block_out, inj, norm_w, xn, xn16|NULL, yq,
+    // rows, hc, hidden, eps, group_rows, stream). Pure append.
+    int (*q4x_combine_norm_q8mmq)(void*, const void*, const void*, const void*, void*,
+                                  void*, void*, uint32_t, uint32_t, uint32_t, float,
+                                  uint32_t, void*);
+    // 603: kquant_moe_down_mma_e - the routed down on the tensor cores,
+    // expert-major, straight off the tensor-core gate/up's moe_align SORTED
+    // rows (bm = 32, no unsort); flat 32-weight downs. Writes the tiled down's
+    // per-(pair, column) partials for chunk [o0, o0 + ocols); emap is u32
+    // [2 * n_expert] scratch. (down_data, down_scales, sorted_row, sorted_slot,
+    // block_expert, topk_w, sfq, sfs, emap, part, ff, embd, o0, ocols,
+    // n_active, n_expert, max_blocks, dtype, stream). Pure append.
+    int (*kquant_moe_down_mma_e)(const void*, const void*, const void*, const void*,
+                                 const void*, const void*, const void*, const void*,
+                                 void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 604: gated_delta_recurrent_seg - slot 596's single-sequence walk
+    // segment-tiled for head_dim 128 (8-lane segments of 2 state columns, 32
+    // state floats a lane, 4 blocks an SM) behind a pre-pass of {exp(g), beta,
+    // q norm, k norm} a (token, head); gp is caller scratch of
+    // n_tokens * n_heads * 4 f32. (q, k, v, g, beta, state, out, n_tokens,
+    // n_heads, head_dim, gp, stream). Pure append.
+    int (*gated_delta_recurrent_seg)(const void*, const void*, const void*, const void*,
+                                     const void*, void*, void*, uint32_t, uint32_t,
+                                     uint32_t, void*, void*);
+    // 605: q8_0_gemm_mmq_pipe_hcmix - the Q8_0 pipe tile over a [in -> 4 *
+    // hidden] hyper-connection up plane with the gated mix folded into its
+    // epilogue: out[rows][hidden] = (1/4) sum_s sigmoid(gate[s,d]) * xn[s,d],
+    // byte-identical to pipe + q4x_hc_mix, and the gate plane never lands.
+    // (data, scale, yq, xn, out, in_dim, hidden, batch, stream). Pure append.
+    int (*q8_0_gemm_mmq_pipe_hcmix)(const void*, const void*, const void*, const void*,
+                                    void*, uint32_t, uint32_t, uint32_t, void*);
+    // 606: q4x_combine_norm_q8mmq_ns - slot 602 without the stored normalized
+    // state: h, the next hc down's mmq rows and the per-(row, stream) 1/rms
+    // ([rows][hc]). (h, block_out, inj, norm_w, nscale, yq, rows, hc, hidden,
+    // eps, group_rows, stream). Pure append.
+    int (*q4x_combine_norm_q8mmq_ns)(void*, const void*, const void*, const void*, void*,
+                                     void*, uint32_t, uint32_t, uint32_t, float, uint32_t,
+                                     void*);
+    // 607: q4x_hc_inject_rn - the hc inject matvec over the normalized state
+    // rebuilt from h and aux = [norm_w | 1/rms], byte-identical to
+    // matvec_f32_batch over the stored state. (w, h, aux, out, hidden, hc,
+    // out_dim, batch, stream). Pure append.
+    int (*q4x_hc_inject_rn)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 608: q8_0_gemm_mmq_pipe_hcmix_rn - slot 605 over the normalized state
+    // rebuilt from h and aux = [norm_w | 1/rms], byte-identical to slot 605
+    // over the stored state. (data, scale, yq, h, aux, out, in_dim, hidden,
+    // batch, stream). Pure append.
+    int (*q8_0_gemm_mmq_pipe_hcmix_rn)(const void*, const void*, const void*, const void*,
+                                       const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 609: q4x_combine_norm_q8mmq_nsi - slot 606 that also folds the NEXT
+    // mix's inject ([4][hc * hidden] f32) from its norm pass: (row, stream)
+    // partials into ip [rows][hc][hc], summed over streams into inj_out
+    // [rows][hc] (inj may alias inj_out). hc 4; a class change against the
+    // matvec. (h, block_out, inj, norm_w, nscale, yq, w_inj, ip, inj_out, rows,
+    // hc, hidden, eps, group_rows, stream). Pure append.
+    int (*q4x_combine_norm_q8mmq_nsi)(void*, const void*, const void*, const void*, void*,
+                                      void*, const void*, void*, void*, uint32_t, uint32_t,
+                                      uint32_t, float, uint32_t, void*);
 };
 
 } // extern "C"

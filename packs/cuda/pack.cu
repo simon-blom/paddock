@@ -28,6 +28,8 @@
 #include "src/deltanet/walk_rs.cuh"  // register-state bf16-operand walk (needs split.cuh's pd_dnc_cpa16; stage2_sample's launcher dispatches it)
 #include "src/deltanet/stage2_sample.cuh"
 #include "src/deltanet/spec_rs.cuh"   // canonical spec rejection sampling (sampled drafts + full-q verify)
+#include "src/deltanet/slots_runs.cuh"  // row-exact verify GDN walk: slot 564's decode body over a run's rows (needs stage2_sample's slots env + abi's state helpers)
+#include "src/gemm/q8_rows.cuh"        // row-exact multi-row twin of the batch-1 Q8_0 GEMV (abi.cuh helpers only)
 #include "src/mamba/core.cuh"       // Mamba-2 SSD lane (nemotron_h_moe): conv step w/ bias, seq scan, grouped gated norm, f8r GEMV (needs deltanet core's PD_CONV_K_MAX)
 #include"src/mamba/ssd.cuh"        // chunked SSD prefill scan: defines pd_mamba2_ssd_run, elected by core.cuh's seq launchers for long segments
 #include "src/gemm/mmq.cuh"

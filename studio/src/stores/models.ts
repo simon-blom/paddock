@@ -963,10 +963,19 @@ export const useModelsStore = defineStore('models', () => {
       // running. The background revalidate now clears the
       // stale entry, so the next capsFor asks the live endpoint.
       const next = [...local, ...cloud]
-      // Key on STATUS too, not just id+port. A configured server is already in
-      // this list while stopped, so starting it changes neither - the first cut
-      // keyed on id+port, never fired, and the composer kept the empty caps it
-      // had cached before the runner answered (the maintainer, twice).
+      // Key on STATUS too, not just id+port. A runner's row appears before it
+      // can answer - "loading", or "unreachable" while it boots - and becomes
+      // ready without its id or port changing, so a signature of id+port alone
+      // never fires on the transition that matters: the first cut did exactly
+      // that, and the composer kept the empty caps it had cached from before
+      // the runner answered (the maintainer, twice).
+      //
+      // (This list is built from /api/runners + /api/cloud only - it never
+      // reads /api/servers - so a STOPPED local endpoint is absent from the
+      // chat picker by construction, however it is listed under Manage. An
+      // earlier version of this comment claimed the opposite; whether a stopped
+      // model should be offered here and started on selection is a product
+      // question, not a caching one.)
       const sig = (m: { port?: number; status?: string }) => `${m.port ?? ''}:${m.status ?? ''}`
       const before = new Map(models.value.map((m) => [m.id, sig(m)]))
       const restale = next.filter((m) => before.get(m.id) !== sig(m))
