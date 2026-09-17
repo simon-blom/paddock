@@ -114,13 +114,37 @@ impl Dialect {
     /// has neither and still lands on `JsonToolCall`. Verified against both
     /// templates - 4.1 has 0 `<function=` and 0 `<think>`; 4.2
     /// has both.
+    ///
+    /// The other half: an arch the table has no row for. `Plain` there is not
+    /// a finding, it is "nobody wrote a row yet" - and Qwen3.8-Flash-Next
+    /// (`qwen4exp`) served every tool call as XML prose with
+    /// `finish_reason: "stop"` that way, from a template that is byte-for-byte
+    /// the Qwen3.8 one. So when the table falls through, the template decides:
+    /// all three pieces of the XML call syntax (`<tool_call>`, `<function=`,
+    /// `<parameter=`) mean the model was TOLD to answer in `QwenXml`, and that
+    /// is the parser it needs. No `<think>` requirement here - `thinking_open`
+    /// already reads the prompt's own suffix, so a qwen3-coder-shaped template
+    /// without a reasoning region parses correctly on the same dialect.
+    /// Every arch that HAS a row keeps it: laguna and granite 4.1 carry
+    /// `<tool_call>` but neither of the other two markers.
     pub fn for_arch_and_template(arch: &str, template: Option<&str>) -> Dialect {
         if arch == "granite"
             && template.is_some_and(|t| t.contains("<function=") && t.contains("<think>"))
         {
             return Dialect::QwenXml;
         }
-        Dialect::for_arch(arch)
+        match Dialect::for_arch(arch) {
+            Dialect::Plain
+                if template.is_some_and(|t| {
+                    t.contains("<tool_call>")
+                        && t.contains("<function=")
+                        && t.contains("<parameter=")
+                }) =>
+            {
+                Dialect::QwenXml
+            }
+            d => d,
+        }
     }
 
     /// Did the rendered generation prompt leave the model inside an open
@@ -874,6 +898,74 @@ mod tests {
             Dialect::for_arch_and_template("gpt-oss", Some("<function=<think>")),
             Dialect::Harmony
         );
+    }
+
+    /// Qwen3.8-Flash-Next's GGUF says `qwen4exp`, which the arch table never
+    /// named, and its tool calls reached the client as XML text with
+    /// `finish_reason: "stop"`. The template it carries is the qwen38 fixture
+    /// byte for byte (unsloth's UD export), so that fixture is the witness.
+    #[test]
+    fn an_unlisted_arch_takes_its_dialect_from_the_template() {
+        const QWEN38: &str = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        assert_eq!(Dialect::for_arch("qwen4exp"), Dialect::Plain);
+        assert_eq!(
+            Dialect::for_arch_and_template("qwen4exp", Some(QWEN38)),
+            Dialect::QwenXml
+        );
+        // and the dialect then does the job end to end: a call is a call
+        let t = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let p = parse(
+            Dialect::for_arch_and_template("qwen4exp", Some(QWEN38)),
+            t,
+            false,
+            hints_weather().as_ref(),
+        );
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].name, "get_weather");
+        // no template, or a template with only part of the syntax, stays Plain
+        assert_eq!(
+            Dialect::for_arch_and_template("qwen4exp", None),
+            Dialect::Plain
+        );
+        assert_eq!(
+            Dialect::for_arch_and_template("qwen4exp", Some("<tool_call><function=")),
+            Dialect::Plain
+        );
+        // listed arches keep their row: every fixture that is not qwen-shaped
+        // resolves exactly as the arch table says
+        for (arch, tpl, want) in [
+            (
+                "laguna",
+                include_str!("../tests/fixtures/laguna_chat_template.jinja"),
+                Dialect::Laguna,
+            ),
+            (
+                "granite",
+                include_str!("../tests/fixtures/granite_chat_template.jinja"),
+                Dialect::JsonToolCall,
+            ),
+            (
+                "gemma4",
+                include_str!("../tests/fixtures/gemma4_chat_template.jinja"),
+                Dialect::GemmaChannel,
+            ),
+            (
+                "muse-glimmer",
+                include_str!("../tests/fixtures/muse_chat_template.jinja"),
+                Dialect::MuseChannel,
+            ),
+            (
+                "gpt-oss",
+                include_str!("../tests/fixtures/gptoss_chat_template.jinja"),
+                Dialect::Harmony,
+            ),
+        ] {
+            assert_eq!(
+                Dialect::for_arch_and_template(arch, Some(tpl)),
+                want,
+                "{arch}"
+            );
+        }
     }
 
     /// granite 4.2's prompt ends inside an open think region, so `thinking_open`

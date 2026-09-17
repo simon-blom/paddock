@@ -238,6 +238,10 @@ export interface UsageGeneration {
   ended_ms?: number | null
   start_cause?: string | null
   end_cause?: string | null
+  /** Newest scrape folded for this band - its heartbeat. An open band is only
+   *  honestly running while this is recent; a stale one is a runner nothing
+   *  has heard from, which the table says rather than drawing it as healthy. */
+  last_seen_ms?: number | null
 }
 export interface UsageHistory {
   grain_ms: number

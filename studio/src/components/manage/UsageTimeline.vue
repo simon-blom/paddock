@@ -564,11 +564,23 @@ function startText(g: UsageGeneration): string {
   if (g.start_cause === 'batch-restore') return 'Restored after batch work'
   return 'Start not observed'
 }
+// An open band is "Running" only while its heartbeat is recent. The collector
+// folds a scrape about every 30 s, so a few missed rounds is a runner nothing
+// has heard from - which is worth saying, because the alternative is drawing a
+// wedged runner exactly like a healthy one.
+const HEARTBEAT_STALE_MS = 5 * 60_000
 function endText(g: UsageGeneration): string {
-  if (g.ended_ms == null) return 'Running'
+  if (g.ended_ms == null) {
+    const seen = g.last_seen_ms
+    if (seen != null && Date.now() - seen > HEARTBEAT_STALE_MS) {
+      return `Running, last seen ${new Date(seen).toLocaleTimeString()}`
+    }
+    return 'Running'
+  }
   if (g.end_cause === 'stopped') return 'Stopped'
   if (g.end_cause === 'takeover') return 'Replaced by a new start'
   if (g.end_cause === 'crashed') return 'Crashed'
+  if (g.end_cause === 'machine-restarted') return 'Ended when the machine restarted'
   return 'Ended unobserved'
 }
 const bands = computed(() =>

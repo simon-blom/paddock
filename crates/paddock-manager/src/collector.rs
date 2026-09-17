@@ -94,6 +94,36 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// When this machine booted, in wall-clock ms, from its uptime. `None` where
+/// the OS will not say, and then the sweep simply has one fewer fact.
+///
+/// Rounded to the second because uptime is read fresh each time and the wall
+/// clock drifts under it: two reads a minute apart otherwise differ by
+/// milliseconds and every band would look like a different boot. Compared with
+/// `same_boot`, never with `==`.
+fn machine_boot_ms() -> Option<i64> {
+    #[cfg(windows)]
+    let uptime_ms: Option<i64> = {
+        // SAFETY: no arguments, no out-params - the tick count since boot.
+        let ticks = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        i64::try_from(ticks).ok()
+    };
+    #[cfg(not(windows))]
+    let uptime_ms: Option<i64> = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|secs| (secs * 1000.0) as i64);
+    let boot = now_ms() - uptime_ms?;
+    Some(boot / 1000 * 1000)
+}
+
+/// Two boot readings that mean the same boot. The tolerance covers the clock
+/// moving under a fresh uptime read (NTP steps, a sleeping laptop); anything
+/// past it is a different boot and the processes of the earlier one are gone.
+fn same_boot(a: i64, b: i64) -> bool {
+    (a - b).abs() <= 60_000
+}
+
 /// Spawn the discovery loop. `retention_days = 0` disables the age-based
 /// activity purge (keep forever until an explicit user purge).
 pub fn start(db: Arc<Store>, retention_days: u32, mode: ActivityMode) {
@@ -135,6 +165,65 @@ pub fn start(db: Arc<Store>, retention_days: u32, mode: ActivityMode) {
                             has_snapshots: id.capabilities.iter().any(|c| c == "metrics-snapshots"),
                         },
                     ));
+                }
+            }
+
+            // Bands nobody is running any more. The reap below only sees a
+            // death this process WATCHED: a runner that died while the manager
+            // was down left its band open, and nothing ever closed it unless
+            // some later runner took the same port - two of them sat "running"
+            // for a month on a live install. This is the level-triggered half:
+            // every pass, an open band whose port has no listening admin
+            // endpoint at all (the kernel's answer, not a timeout) is a corpse,
+            // and so is any band from an earlier boot. Runs on the first pass
+            // too, so manager startup needs no separate recovery path.
+            //
+            // The evidence bar is deliberately "no endpoint", not "identify did
+            // not answer": a runner mid-load, or wedged, still holds its socket
+            // and must keep its band - a 2 s identify timeout is not death.
+            {
+                let listening = paddock_admin::enumerate();
+                let live_ids: Vec<&str> =
+                    live.iter().map(|(k, _)| k.instance_id.as_str()).collect();
+                let boot_now = machine_boot_ms();
+                for (id, port, started, boot_then) in db.open_generations().unwrap_or_default() {
+                    if live_ids.contains(&id.as_str()) {
+                        continue;
+                    }
+                    let rebooted = match (boot_now, boot_then) {
+                        (Some(now), Some(then)) => !same_boot(now, then),
+                        _ => false,
+                    };
+                    if !rebooted && listening.contains(&port) {
+                        continue; // something is there; the reap or a successor owns it
+                    }
+                    let cause = if rebooted {
+                        "machine-restarted"
+                    } else {
+                        "unobserved"
+                    };
+                    match db.close_orphan_generation(&id, started, cause) {
+                        Ok(ended) => {
+                            // The stretch after its last heartbeat is time we
+                            // cannot account for, so it is a hole, not uptime.
+                            let _ = db.insert_usage_gap(
+                                port,
+                                &id,
+                                ended,
+                                now_ms(),
+                                "manager-down",
+                                None,
+                                None,
+                            );
+                            tracing::info!(
+                                port,
+                                instance = %id,
+                                cause,
+                                "closed a lifecycle band nothing is serving (swept)"
+                            );
+                        }
+                        Err(e) => tracing::warn!(port, %e, "sweeping an orphaned band failed"),
+                    }
                 }
             }
 
@@ -198,6 +287,7 @@ pub fn start(db: Arc<Store>, retention_days: u32, mode: ActivityMode) {
                     meta.asr.as_deref(),
                     meta.aligner.as_deref(),
                     started_ms,
+                    machine_boot_ms(),
                 ) {
                     Ok(true) => tracing::info!(
                         port = key.port,

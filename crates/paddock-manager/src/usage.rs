@@ -201,6 +201,11 @@ pub struct GenerationRow {
     pub ended_ms: Option<i64>,
     pub start_cause: Option<String>,
     pub end_cause: Option<String>,
+    /// Newest scrape folded for this band - its heartbeat. `None` for a band
+    /// that never reported (a runner that died during load). An OPEN band is
+    /// only honestly "running" while this is recent: the reader decides, so a
+    /// wedged runner and a healthy one stop looking the same.
+    pub last_seen_ms: Option<i64>,
 }
 
 impl BucketDelta {

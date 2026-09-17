@@ -149,12 +149,18 @@ fn scrub_model(id: &str) -> String {
 
 /// Assemble the blob. Also the preview - there is only this one implementation.
 pub async fn context(state: &AppState) -> Context {
+    context_from(state, state.supervisor.list().await)
+}
+
+/// The blob over a fleet the caller already has. Split from `context` because
+/// `supervisor::list` merges the machine's live endpoints ("adoption on
+/// sight"), so a test that wants the empty-fleet shape cannot get one by
+/// asking: on a box serving anything it read the real runners and failed. The
+/// discovery is the caller's, the rendering is here.
+fn context_from(state: &AppState, fleet: Vec<crate::supervisor::RunnerView>) -> Context {
     let readiness = (*state.readiness).clone();
 
-    let runners = state
-        .supervisor
-        .list()
-        .await
+    let runners = fleet
         .into_iter()
         .map(|v| {
             let cfg = v.config.as_ref();
@@ -375,8 +381,14 @@ mod tests {
         // Not a leak test (there are no runners here to leak) - this covers the
         // empty fleet, which is what a first-run box looks like and the state a
         // "nothing starts" report is most likely to be filed from.
+        //
+        // The fleet is handed in rather than discovered: `context` asks the
+        // supervisor, which merges whatever this MACHINE is serving, so this
+        // test failed on any box with a model running - it was reported as
+        // "environmental" for weeks, which is what a machine-dependent test
+        // looks like from the outside.
         let state = AppState::for_tests();
-        let blob = context(&state).await;
+        let blob = context_from(&state, Vec::new());
         assert!(blob.runners.is_empty());
         assert_eq!(blob.manager.version, paddock_admin::version::SEMVER);
         assert!(!blob.gpu.cuda_needed.is_empty());

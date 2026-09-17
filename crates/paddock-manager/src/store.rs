@@ -597,7 +597,12 @@ CREATE TABLE IF NOT EXISTS service_generation (
     started_ms     INTEGER NOT NULL,
     ended_ms       INTEGER,
     start_cause    TEXT,
-    end_cause      TEXT
+    end_cause      TEXT,
+    -- When the MACHINE booted, as this band saw it. A band whose boot differs
+    -- from the current one cannot still be running whatever else we failed to
+    -- observe: no process survives a reboot. That is the one end a sweep can
+    -- state as fact rather than as an absence of sightings.
+    boot_ms        INTEGER
 );
 CREATE INDEX IF NOT EXISTS service_generation_port ON service_generation(port, started_ms);
 
@@ -831,6 +836,13 @@ impl Store {
         // name nothing ever recorded, and inventing one would be worse than
         // the dash it replaces.
         let _ = conn.execute("ALTER TABLE service_generation ADD COLUMN aligner TEXT", []);
+        // service_generation.boot_ms: the machine boot this band belongs to.
+        // Older rows stay NULL and the sweep treats that as "boot unknown",
+        // which is why it still needs the no-listener evidence below.
+        let _ = conn.execute(
+            "ALTER TABLE service_generation ADD COLUMN boot_ms INTEGER",
+            [],
+        );
         // conversations.kind arrived later - same harmless-error ALTER,
         // then a ONE-TIME backfill: every existing row is '' and would show
         // the wrong icon forever otherwise. `conversation_kind` never returns
@@ -2504,13 +2516,14 @@ impl Store {
         asr: Option<&str>,
         aligner: Option<&str>,
         started_ms: i64,
+        boot_ms: Option<i64>,
     ) -> Result<bool, StoreError> {
         let conn = self.lock();
         let n = conn.execute(
             "INSERT OR IGNORE INTO service_generation
                  (instance_id, port, pid, runner_version, model, embedder, asr, aligner,
-                  started_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                  started_ms, boot_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 instance_id,
                 port,
@@ -2520,7 +2533,8 @@ impl Store {
                 embedder,
                 asr,
                 aligner,
-                started_ms
+                started_ms,
+                boot_ms
             ],
         )?;
         if n > 0 {
@@ -2598,6 +2612,40 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Every open band, oldest first: (instance_id, port, started_ms, boot_ms).
+    /// The sweep's input; `close_orphan_generations` decides which of them are
+    /// corpses.
+    pub fn open_generations(&self) -> Result<Vec<(String, u16, i64, Option<i64>)>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance_id, port, started_ms, boot_ms FROM service_generation
+             WHERE ended_ms IS NULL ORDER BY started_ms",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Close one band that nothing is running any more, ending it where the
+    /// evidence ends: its last scrape, else its start. NEVER `now` - the time
+    /// between the last heartbeat and noticing is exactly what we do not know,
+    /// and charging it as uptime is the lie this sweep exists to stop. The
+    /// caller journals that stretch as a gap.
+    ///
+    /// Returns the end it chose, so the caller can record the hole after it.
+    pub fn close_orphan_generation(
+        &self,
+        instance_id: &str,
+        started_ms: i64,
+        cause: &str,
+    ) -> Result<i64, StoreError> {
+        let ended = self.last_scrape_of(instance_id)?.unwrap_or(started_ms);
+        // A scrape can land a hair before the band's own start on a clock
+        // edge; an end before its start would draw backwards.
+        let ended = ended.max(started_ms);
+        self.close_generation(instance_id, ended, cause)?;
+        Ok(ended)
     }
 
     /// Note why the next generation on a port will exist ('manual',
@@ -2818,12 +2866,18 @@ impl Store {
     ) -> Result<Vec<crate::usage::GenerationRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT instance_id, port, runner_version, model, embedder, asr, aligner,
-                    started_ms, ended_ms, start_cause, end_cause
-             FROM service_generation
-             WHERE started_ms < ?2 AND (ended_ms IS NULL OR ended_ms > ?1)
-               AND (?3 < 0 OR port = ?3)
-             ORDER BY port, started_ms",
+            // last_seen_ms is the band's own heartbeat: the newest scrape the
+            // collector folded for it. An open band with a stale one is a
+            // runner nobody has heard from, which the page says out loud
+            // instead of drawing it as healthy.
+            "SELECT g.instance_id, g.port, g.runner_version, g.model, g.embedder, g.asr,
+                    g.aligner, g.started_ms, g.ended_ms, g.start_cause, g.end_cause,
+                    (SELECT MAX(u.last_scrape_ms) FROM usage_total u
+                      WHERE u.instance_id = g.instance_id)
+             FROM service_generation g
+             WHERE g.started_ms < ?2 AND (g.ended_ms IS NULL OR g.ended_ms > ?1)
+               AND (?3 < 0 OR g.port = ?3)
+             ORDER BY g.port, g.started_ms",
         )?;
         let rows = stmt.query_map(params![from_ms, to_ms, port], |r| {
             Ok(crate::usage::GenerationRow {
@@ -2838,6 +2892,7 @@ impl Store {
                 ended_ms: r.get(8)?,
                 start_cause: r.get(9)?,
                 end_cause: r.get(10)?,
+                last_seen_ms: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -3599,7 +3654,8 @@ mod tests {
                 None,
                 None,
                 None,
-                1000
+                1000,
+                None,
             )
             .unwrap()
         );
@@ -3614,7 +3670,8 @@ mod tests {
                 None,
                 None,
                 None,
-                1000
+                1000,
+                None,
             )
             .unwrap()
         );
@@ -3645,7 +3702,8 @@ mod tests {
                 None,
                 None,
                 None,
-                10_000
+                10_000,
+                None,
             )
             .unwrap()
         );
@@ -3664,7 +3722,8 @@ mod tests {
                 None,
                 None,
                 None,
-                20_000
+                20_000,
+                None,
             )
             .unwrap()
         );
@@ -3701,7 +3760,7 @@ mod tests {
             let port = 11540 + i as u16;
             assert!(
                 s.open_generation(
-                    id, port, 1, "0.1.0", *model, *embedder, *asr, *aligner, 1000
+                    id, port, 1, "0.1.0", *model, *embedder, *asr, *aligner, 1000, None
                 )
                 .unwrap()
             );
@@ -3730,13 +3789,107 @@ mod tests {
         );
     }
 
+    /// The sweep's arithmetic, which is the whole reason it exists: a band
+    /// nobody is running ends where its evidence ended, not when we noticed.
+    /// Closing at `now` would charge a month of downtime as uptime - the shape
+    /// of the bug this replaced, where two bands read "running" since August.
+    #[test]
+    fn an_orphaned_band_ends_at_its_last_heartbeat_not_at_the_sweep() {
+        let s = mem_store();
+        s.open_generation(
+            "gen-a",
+            11540,
+            1,
+            "0.1.0",
+            Some("m"),
+            None,
+            None,
+            None,
+            1000,
+            Some(500),
+        )
+        .unwrap();
+        s.lock()
+            .execute(
+                "INSERT INTO usage_total (series_id, instance_id, started_ms, last_scrape_ms)
+                 VALUES (1, 'gen-a', 1000, 5000)",
+                [],
+            )
+            .unwrap();
+        let ended = s
+            .close_orphan_generation("gen-a", 1000, "unobserved")
+            .unwrap();
+        assert_eq!(ended, 5000, "the last scrape is the last thing we know");
+        let (e, cause): (i64, String) = s
+            .lock()
+            .query_row(
+                "SELECT ended_ms, end_cause FROM service_generation WHERE instance_id = 'gen-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((e, cause.as_str()), (5000, "unobserved"));
+    }
+
+    /// A band that never reported has no heartbeat to end at, so its start is
+    /// the only honest end - a zero-length band, not one running forever.
+    #[test]
+    fn a_band_that_never_reported_ends_at_its_start() {
+        let s = mem_store();
+        s.open_generation(
+            "gen-a", 11540, 1, "0.1.0", None, None, None, None, 7000, None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.close_orphan_generation("gen-a", 7000, "machine-restarted")
+                .unwrap(),
+            7000
+        );
+        assert!(
+            s.open_generations().unwrap().is_empty(),
+            "a swept band is not open any more"
+        );
+    }
+
+    /// `open_generations` is the sweep's input: open bands only, with the boot
+    /// they belong to, so the caller can tell a reboot from a blind window.
+    #[test]
+    fn open_generations_lists_only_unfinished_bands_with_their_boot() {
+        let s = mem_store();
+        s.open_generation(
+            "gen-a",
+            11540,
+            1,
+            "0.1.0",
+            None,
+            None,
+            None,
+            None,
+            1000,
+            Some(900),
+        )
+        .unwrap();
+        s.open_generation(
+            "gen-b", 11541, 2, "0.1.0", None, None, None, None, 2000, None,
+        )
+        .unwrap();
+        s.close_generation("gen-a", 3000, "stopped").unwrap();
+        let open = s.open_generations().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, "gen-b");
+        assert_eq!(open[0].1, 11541);
+        assert_eq!(open[0].3, None, "an older row carries no boot reading");
+    }
+
     #[test]
     fn a_noted_start_cause_labels_only_the_next_new_band() {
         let s = mem_store();
         s.note_start_cause(11540, "manual").unwrap();
         assert!(
-            s.open_generation("gen-a", 11540, 1, "0.1.0", None, None, None, None, 1000)
-                .unwrap()
+            s.open_generation(
+                "gen-a", 11540, 1, "0.1.0", None, None, None, None, 1000, None
+            )
+            .unwrap()
         );
         let cause: Option<String> = s
             .lock()
@@ -3749,8 +3902,10 @@ mod tests {
         assert_eq!(cause.as_deref(), Some("manual"));
         // consumed: the next band on the port carries no stale label
         assert!(
-            s.open_generation("gen-b", 11540, 2, "0.1.0", None, None, None, None, 2000)
-                .unwrap()
+            s.open_generation(
+                "gen-b", 11540, 2, "0.1.0", None, None, None, None, 2000, None
+            )
+            .unwrap()
         );
         let cause: Option<String> = s
             .lock()
@@ -4153,6 +4308,7 @@ mod tests {
             None,
             None,
             1000,
+            None,
         )
         .unwrap();
         s.close_generation("gen-a", 2000, "stopped").unwrap();
@@ -4166,6 +4322,7 @@ mod tests {
             None,
             None,
             3000,
+            None,
         )
         .unwrap();
         let bands = s.usage_generations_in(10_000, 20_000, -1).unwrap();
