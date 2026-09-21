@@ -24,10 +24,31 @@ that allows users to quickly work with models and test them against any cloud mo
 or other endpoints. Paddock (manager) will bundle the Studio to just make it so simple for users
 to download, just two binaries and that's all.
 
-User only needs the NVIDIA driver.
+On NVIDIA systems, users only need the NVIDIA driver.
 
 On a Mac there is a native app as well: Paddock for macOS, written in Swift, with the manager
 and the Studio in one window and our Metal backend running the models. It lives in `apps/macos`.
+
+## macOS support (pre-release)
+
+macOS support is available in [v0.1.8](https://github.com/truespar/paddock/releases/tag/v0.1.8)
+for Apple Silicon running **macOS 26 or later**. The native app is pre-release;
+expect visual glitches and incomplete features. The native Swift app is under
+active development and is not yet feature-complete.
+
+The `-cli.pkg` includes the built-in web Studio, which is currently more complete
+than the native app. It is shared between the NVIDIA Windows/Linux versions
+(including Linux arm64) and the Apple Silicon version of Paddock. We expect the
+native app to be more feature-complete by **late October 2026**.
+
+| Download | What it provides |
+|---|---|
+| **`.dmg` — native desktop app** | Includes the Swift app, model management, chat and Metal backend. Drag Paddock into Applications. |
+| **`-cli.pkg` — command-line installer** | Installs `paddock` and `paddock-runner` into `/usr/local/bin`. Run `paddock` for the manager and browser-based Studio. Does not install the native app. |
+| **`-cli.tar.gz` — manual installation** | The same command-line tools in an archive, without an installer. |
+
+You do **not** need the PKG to use the native app. Both options use Paddock's
+Metal backend. Downloads are Developer ID signed; the DMG and PKG are notarized.
 
 ## Our aim is being the fastest most modern inference platform
 
@@ -142,7 +163,7 @@ Paddock is young and under active development.
   Silicon. There is no Vulkan or ROCm backend.
 - **Platforms:** Windows and Linux on x64, Linux arm64 on the NVIDIA DGX Spark,
   and macOS on Apple Silicon with a native Swift app. Release downloads are
-  Windows and Linux; the macOS app is built from source, see below.
+  available for all three platforms; macOS support is pre-release, as described above.
 - **Models:** most modern families are supported, feel free to add support.
 
 ## What is pdfium doing in the project ?
