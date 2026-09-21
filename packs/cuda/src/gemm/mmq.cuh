@@ -1088,11 +1088,11 @@ int pd_q8_0_gemm_mmq_pipe(const void* data, const void* scale, const void* yq,
 }
 
 // ---------------------------------------- mmq_pipe + hyper-connection mix (slot 605)
-// The hyper-connection UP ([lowrank -> 4 * hidden] Q8_0) and its gated mix
+// The hyper-connection up ([lowrank -> 4 * hidden] Q8_0) and its gated mix
 //   out[d] = (1/4) sum_s sigmoid(gate[s*hidden + d]) * xn[s*hidden + d]
 // in one launch. The weight staging puts plane row (d, s) at tile slot
 // 32*floor(d/8) + d%8 + 8s, which makes a thread's four accumulator rows
-// (i0 + g, +8, +16, +24) ONE d's four streams for both of its columns, so the
+// (i0 + g, +8, +16, +24) one d's four streams for both of its columns, so the
 // epilogue folds the mix and writes the hidden-wide output: the [rows][4 *
 // hidden] gate plane is never written or read back (at prefill the separate
 // mix read 84 MB a call, at the bandwidth wall). A lane loads the float4 line
@@ -1299,7 +1299,7 @@ int pd_q8_0_gemm_mmq_pipe_hcmix(const void* data, const void* scale, const void*
 // all of its loads (the 16 columns' four h lines and their 1/rms rows) before
 // any arithmetic: loading and rebuilding per column measured 583 us a call
 // against 357 staged (bench/combine_rn_gb10_bench.cu, 1024 rows; slot 605 over
-// the stored state 414). EIGHT kernel arguments on purpose - the same tile at
+// the stored state 414). Eight kernel arguments deliberately - the same tile at
 // ten measured 590 us with its rebuild reduced to a plain load, 383 at eight.
 // Byte-identical to slot 605 over the stored state. dims = in_dim | hidden << 16.
 template <uint32_t HC>

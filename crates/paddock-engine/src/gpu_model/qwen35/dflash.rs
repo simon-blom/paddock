@@ -378,6 +378,16 @@ impl GpuQwen35 {
     /// geometry against the target, splits `fc` into per-tap bands, leaves
     /// serving untouched until `dflash_ensure_state`.
     pub fn attach_dflash(&mut self, path: &Path) -> Result<(), GpuModelError> {
+        // the verify / tap walks in spec.rs and here do not rotate their
+        // inputs, and the drafter would tap a target whose linears they run
+        // wrong - refuse rather than draft noise
+        if self.rot.is_some() {
+            return Err(GpuModelError::Unsupported(
+                "rotated-basis file (prism.hadamard.*): speculative decoding is not wired for \
+                 this model yet, so a drafter cannot be attached"
+                    .into(),
+            ));
+        }
         self.attach_dflash_inner(path).map_err(le)?;
         // Width elections for the ATTACHED block drafter.
         // serve_spec_k_budget's ladder with a 256-row serving budget and a
@@ -2042,6 +2052,7 @@ impl GpuQwen35 {
         let vocab = self.vocab;
         let r = n * rows;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let output = &self.output;
         let out_f8 = self.out_f8.as_ref();
         let df = self.dflash.as_mut().expect("armed");
@@ -2079,7 +2090,7 @@ impl GpuQwen35 {
         // own embeddings are unscaled).
         if let Some(p) = pld {
             // PLD: gather at target width, then enter the narrow block
-            embed_any(&exec, tok_embd, &st.d_toks, &mut st.pld_emb, embd_t, r)
+            embed_any(&exec, tok_embd, &st.d_toks, &mut st.pld_emb, embd_t, r, rot)
                 .map_err(|e| GpuError::Driver(e.to_string()))?;
             exec.quantize_q8(&st.pld_emb, &mut st.xq, &mut st.xs, r * embd_t)?;
             if r > 64 {
@@ -2102,7 +2113,7 @@ impl GpuQwen35 {
                 r,
             )?;
         } else {
-            embed_any(&exec, tok_embd, &st.d_toks, &mut st.x, embd, r)
+            embed_any(&exec, tok_embd, &st.d_toks, &mut st.x, embd, r, rot)
                 .map_err(|e| GpuError::Driver(e.to_string()))?;
         }
 

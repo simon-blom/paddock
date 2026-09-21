@@ -1,0 +1,44 @@
+[
+  {
+    "name": "legacy compare becomes one anchored step",
+    "document": {"id":"legacy","title":"Old chat","future":{"preserve":[1,true,null]},"messages":[
+      {"id":"q","role":"user","content":[{"type":"text","text":"Question"}]},
+      {"id":"a","role":"assistant","group":"g","content":[{"type":"text","text":"A"}]},
+      {"id":"b","role":"assistant","group":"g","content":[{"type":"text","text":"B"}]},
+      {"id":"q2","role":"user","content":[{"type":"file","attachmentId":"original","future":"keep"}]}
+    ]},
+    "operations":[{"kind":"migrate","path":["q","a","b","q2"],"leaf":"q2"},{"kind":"migrate","changed":false,"path":["q","a","b","q2"],"leaf":"q2"}]
+  },
+  {
+    "name":"branch memory retains depth and compare groups",
+    "document":{"id":"branches","title":"Branches","leafId":"deep","messages":[
+      {"id":"q","parentId":null,"role":"user","content":[]},
+      {"id":"a","parentId":"q","role":"assistant","group":"first","content":[]},
+      {"id":"b","parentId":"q","role":"assistant","group":"first","content":[]},
+      {"id":"other","parentId":"q","role":"assistant","group":"second","content":[]},
+      {"id":"other2","parentId":"q","role":"assistant","group":"second","content":[]},
+      {"id":"child","parentId":"a","role":"user","content":[]},
+      {"id":"deep","parentId":"child","role":"assistant","content":[]},
+      {"id":"deep2","parentId":"child","role":"assistant","content":[]}
+    ]},
+    "operations":[{"kind":"sibling","id":"a","delta":1,"path":["q","other","other2"],"leaf":"other"},
+      {"kind":"sibling","id":"other","delta":-1,"path":["q","a","b","child","deep"],"leaf":"deep"},
+      {"kind":"delete","id":"b","removed":["a","b","child","deep","deep2"],"path":["q","other","other2"],"leaf":"other"}]
+  },
+  {
+    "name":"orphan repair does not erase unknown content",
+    "document":{"id":"orphan","title":"Repair","leafId":"missing","branchMemory":{"missing":"q","q":"gone"},"messages":[
+      {"id":"q","role":"user","parentId":null,"content":[{"type":"future-part","data":{"keep":true}}]},
+      {"id":"a","role":"assistant","parentId":"gone","content":[],"response":{"output":[{"type":"future-output","value":"keep"}]}}
+    ]},
+    "operations":[{"kind":"migrate","changed":true,"path":["q","a"],"leaf":"a"},{"kind":"migrate","changed":false,"path":["q","a"],"leaf":"a"}]
+  },
+  {
+    "name":"cycle cannot hang traversal",
+    "document":{"id":"cycle","title":"Cycle","leafId":"b","messages":[
+      {"id":"a","role":"user","parentId":"b","content":[]},
+      {"id":"b","role":"assistant","parentId":"a","content":[]}
+    ]},
+    "operations":[{"kind":"migrate","changed":false,"path":["a","b"],"leaf":"b"},{"kind":"delete","id":"a","removed":["a","b"],"path":[],"leaf":null}]
+  }
+]

@@ -7,6 +7,37 @@ use std::io;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 
+fn routine_disconnect(e: &hyper::Error) -> bool {
+    use std::error::Error;
+    // Darwin returns ENOTCONN when Hyper shuts down a socket after a discovery
+    // probe has already closed it. Do not suppress resets, parse failures or
+    // arbitrary I/O errors: only this specific shutdown outcome is routine.
+    e.is_incomplete_message()
+        || (e.is_shutdown()
+            && e.source()
+                .and_then(|s| s.downcast_ref::<io::Error>())
+                .is_some_and(|s| s.kind() == io::ErrorKind::NotConnected))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn discovery_probe_shutdown_is_not_a_transport_failure() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        drop(client);
+        let error = hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(server),
+                TowerToHyperService::new(axum::Router::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is_shutdown());
+        assert!(routine_disconnect(&error));
+    }
+}
+
 /// Serve `app` on the admin endpoint for `port`, forever. Errors out only if
 /// the endpoint can't be created (name squatted, no runtime dir) - per-
 /// connection failures are logged and survived. Callers spawn this; a failure
@@ -59,10 +90,10 @@ async fn serve_windows(port: u16, app: axum::Router) -> io::Result<()> {
                 // NORMAL end of every manager poll (collector, reconciler,
                 // fleet health) - trace, or it floods the log many times a
                 // minute. Anything else is a real transport oddity.
-                if e.is_incomplete_message() {
+                if routine_disconnect(&e) {
                     tracing::trace!(error = %e, "admin client disconnected");
                 } else {
-                    tracing::debug!(error = %e, "admin connection ended with error");
+                    tracing::debug!(error = ?e, "admin connection ended with error");
                 }
             }
         });
@@ -152,10 +183,10 @@ async fn serve_unix(port: u16, app: axum::Router) -> io::Result<()> {
             {
                 // see the windows branch: keep-alive hang-ups are the normal
                 // end of every manager poll - trace, not log flood
-                if e.is_incomplete_message() {
+                if routine_disconnect(&e) {
                     tracing::trace!(error = %e, "admin client disconnected");
                 } else {
-                    tracing::debug!(error = %e, "admin connection ended with error");
+                    tracing::debug!(error = ?e, "admin connection ended with error");
                 }
             }
         });

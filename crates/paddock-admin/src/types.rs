@@ -216,3 +216,13 @@ pub struct SnapshotsPage {
     pub dropped: u64,
     pub snapshots: Vec<MetricsSnapshot>,
 }
+
+/// Credential-free restart status; absence means an older runner, not applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigStatus {
+    pub pid: u32,
+    pub restart_required: Option<bool>,
+    pub changed: Vec<String>,
+    pub max_ctx: usize,
+    pub max_batch: usize,
+}

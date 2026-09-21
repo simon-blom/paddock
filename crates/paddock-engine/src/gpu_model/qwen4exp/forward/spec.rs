@@ -1,9 +1,13 @@
 //! Speculative verify for Flash-Next: one ragged walk over every live slot's
-//! `[pending, drafts..]`, greedy picks for every row, and an exact commit of
-//! the accepted prefix.
+//! `[pending, drafts..]`, a pick per row, and an exact commit of the accepted
+//! prefix. Two rounds share all of that and differ only in where a pick comes
+//! from - `argmax_rows` for a pure-greedy cohort (`verify_round`), or
+//! `sample_rows` with the service's pre-drawn per-row plans when any slot
+//! samples (`verify_round_plans`, which is what lets temperature > 0
+//! speculate at all).
 //!
 //! The walk is the prefill wave's (`Phase::PrefillRuns`, each chunk a run that
-//! continues its slot) with the head over EVERY row. It advances the carried
+//! continues its slot) with the head over every row. It advances the carried
 //! state through all of a chunk's rows, so a rejecting round puts back what
 //! the rejected rows changed:
 //! - GDN recurrence: restored from the copy taken before the walk, then
@@ -71,6 +75,15 @@ pub(crate) struct Verify {
     rows_cap: usize,
     pub(crate) logits: CudaSlice<f32>,
     picks: CudaSlice<u32>,
+    /// Per-row sampler planes for the DEVICE-SAMPLED round (`verify_round`
+    /// with plans): `[rows, 4]` each, the same words the dense tick packs -
+    /// `samp_par` = {inv_t bits, u bits, mode, pad} and `samp_tpar` =
+    /// {k, top_p bits, min_p bits, pad} for the truncation modes. Allocated
+    /// with the rest of the round's planes rather than per round: 4 u32 a row
+    /// against a `[rows, vocab]` logits plane is nothing, and a round that
+    /// allocates cannot be the hot path.
+    samp_par: CudaSlice<u32>,
+    samp_tpar: CudaSlice<u32>,
     // per GDN layer, [rows_cap, width]: what a rejecting commit replays
     cap_q: Vec<Option<CudaSlice<f32>>>,
     cap_k: Vec<Option<CudaSlice<f32>>>,
@@ -111,6 +124,8 @@ impl Verify {
             rows_cap: rows,
             logits: e.alloc(rows * c.vocab)?,
             picks: e.alloc_u32(rows)?,
+            samp_par: e.alloc_u32(rows * 4)?,
+            samp_tpar: e.alloc_u32(rows * 4)?,
             cap_q: Vec::with_capacity(c.n_layer),
             cap_k: Vec::with_capacity(c.n_layer),
             cap_v: Vec::with_capacity(c.n_layer),
@@ -198,6 +213,55 @@ impl Qwen4ExpGpu {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        self.verify_round_impl(reqs, None)
+    }
+
+    /// The DEVICE-SAMPLED verify round (`Generator::forward_spec_batch_plans`).
+    ///
+    /// Same walk, same commit; the only difference is where a row's pick comes
+    /// from - `sample_rows` with the service's pre-drawn per-row plan instead
+    /// of `argmax_rows`. That is what lets a sampling request speculate at
+    /// all: the greedy round demands `is_pure_greedy()`, so before this existed
+    /// every temperature > 0 serve declined here (the Generator default is
+    /// `Ok(None)`) and fell back to the dense tick. Measured on the standing
+    /// aiperf scenarios, which all send temperature 0.7: 0 tokens drafted, and
+    /// the attached head's 2.74 GiB came out of the headroom the MoE expert
+    /// cache sizes from - it cost 2-3% and bought nothing (2026-09-17).
+    ///
+    /// **Why it stays exact.** The head drafts greedily (`mtp_draft` argmaxes),
+    /// so a chunk's drafts are a deterministic function of the accepted
+    /// prefix. For deterministic drafts, "sample every verify row with that
+    /// row's own plan, accept while the sample equals the next draft, and emit
+    /// the first mismatching row's sample" draws from exactly the target
+    /// distribution - the standard rejection-sampling argument with q a point
+    /// mass, and the same rule the dense tick would have drawn with the same
+    /// uniform. The accept walk below is unchanged and re-derives the prefix
+    /// from these picks, so the committed state cannot disagree with the
+    /// tokens the service streams.
+    ///
+    /// Rejection-sampling plans (`RsVerify`/`RsTrunc`) are declined: the row
+    /// sampler skips them (mode 0) and their resolve kernel is the drafter's
+    /// own K-candidate machinery, which this family does not record. They
+    /// cannot reach us today (the service only draws them for backends that
+    /// answer `supports_spec_rs*`), and declining beats leaving a pick plane
+    /// untouched.
+    ///
+    /// Still greedy-only: the mixed tick (`forward_mixed_spec_plans`, a
+    /// prefill chunk riding with spec rows). Without it a mixed tick takes the
+    /// dense route, which costs a round rather than correctness.
+    pub(super) fn verify_round_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        self.verify_round_impl(reqs, Some(plans))
+    }
+
+    fn verify_round_impl(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: Option<&[crate::sampler::DevicePlan]>,
+    ) -> Result<Option<Vec<u32>>, GpuModelError> {
         if reqs.is_empty() {
             return Ok(None);
         }
@@ -223,6 +287,37 @@ impl Qwen4ExpGpu {
                 || chunk.len() > VERIFY_MAX_CHUNK
                 || pos + chunk.len() > self.max_tokens
             {
+                return Ok(None);
+            }
+        }
+        // Plans preflight, before the state copies: one plan per verify row in
+        // request order (the service's flat layout), and every mode this round
+        // will spell has to have a kernel in the loaded pack. A pack without
+        // the truncation samplers is a decline, not an error - the round falls
+        // back to the dense tick and the serve keeps going.
+        if let Some(plans) = plans {
+            if plans.len() != total {
+                return Err(GpuModelError::Unsupported(format!(
+                    "verify: {} plans for {total} verify rows",
+                    plans.len()
+                )));
+            }
+            if !self.exec.has_sample_rows() {
+                return Ok(None);
+            }
+            let mut trunc = false;
+            for p in plans {
+                match p {
+                    crate::sampler::DevicePlan::Greedy
+                    | crate::sampler::DevicePlan::Categorical { .. } => {}
+                    crate::sampler::DevicePlan::TruncCat { .. } => trunc = true,
+                    // see the doc comment: mode-0 rows would keep whatever the
+                    // pick plane held
+                    crate::sampler::DevicePlan::RsVerify { .. }
+                    | crate::sampler::DevicePlan::RsTrunc { .. } => return Ok(None),
+                }
+            }
+            if trunc && !(self.exec.has_sample_rows_t() && self.exec.has_sample_rows_p()) {
                 return Ok(None);
             }
         }
@@ -270,7 +365,70 @@ impl Qwen4ExpGpu {
                 exec, verify, cfg, ..
             } = self;
             let vf: &mut Verify = verify.as_mut().expect("built");
-            exec.argmax_rows(&vf.logits, &mut vf.picks, total, cfg.vocab)?;
+            match plans {
+                None => exec.argmax_rows(&vf.logits, &mut vf.picks, total, cfg.vocab)?,
+                Some(plans) => {
+                    // The dense tick's packer is the one place the modes are
+                    // spelled, and a verify row is an ordinary sampled row -
+                    // so the two paths cannot drift apart on what a plan means.
+                    let rows: Vec<crate::generator::RowSample> = plans
+                        .iter()
+                        .map(|&p| crate::generator::RowSample::Device(p))
+                        .collect();
+                    let (par, tpar) = Self::pack_samp_par(&rows);
+                    {
+                        let mut v = vf
+                            .samp_par
+                            .try_slice_mut(0..total * 4)
+                            .ok_or_else(|| GpuError::Driver("verify samp_par slice".into()))?;
+                        exec.stream
+                            .memcpy_htod(&par, &mut v)
+                            .map_err(crate::gpu::from_driver)?;
+                    }
+                    if let Some(t) = &tpar {
+                        let mut v = vf
+                            .samp_tpar
+                            .try_slice_mut(0..total * 4)
+                            .ok_or_else(|| GpuError::Driver("verify samp_tpar slice".into()))?;
+                        exec.stream
+                            .memcpy_htod(t, &mut v)
+                            .map_err(crate::gpu::from_driver)?;
+                    }
+                    exec.sample_rows(&vf.logits, &vf.samp_par, &mut vf.picks, total, cfg.vocab)?;
+                    if tpar.is_some() {
+                        exec.sample_rows_t(
+                            &vf.logits,
+                            &vf.samp_par,
+                            &vf.samp_tpar,
+                            &mut vf.picks,
+                            total,
+                            cfg.vocab,
+                        )?;
+                        exec.sample_rows_p(
+                            &vf.logits,
+                            &vf.samp_par,
+                            &vf.samp_tpar,
+                            &mut vf.picks,
+                            total,
+                            cfg.vocab,
+                        )?;
+                    }
+                    // Engagement witness (the bisect-trap law): a path that
+                    // silently never runs is what this whole lane just cost a
+                    // session to find. Once per process, naming the modes.
+                    static ENGAGED: std::sync::Once = std::sync::Once::new();
+                    ENGAGED.call_once(|| {
+                        eprintln!(
+                            "[q4x-spec-plans] device-sampled verify engaged: {total} rows{}",
+                            if tpar.is_some() {
+                                " (truncation rows present)"
+                            } else {
+                                ""
+                            }
+                        );
+                    });
+                }
+            }
             let view = vf
                 .picks
                 .try_slice(0..total)

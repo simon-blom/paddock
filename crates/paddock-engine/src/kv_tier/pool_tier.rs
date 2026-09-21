@@ -274,21 +274,7 @@ pub enum TierRefused {
 /// witness snapshot for /metrics and the Studio panel - decision
 /// accountability, not just counters (each field names why bytes moved or
 /// did not).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TierStats {
-    pub resident_runs: u64,
-    pub ready_bytes: u64,
-    pub in_flight_demotes: u64,
-    pub open_tickets: u64,
-    pub tripped: bool,
-    pub single_flight_joins: u64,
-    pub io_failures: u64,
-    pub integrity_failures: u64,
-    pub evictions: u64,
-    pub stale_completions: u64,
-    /// T2 payload bytes written this UTC day (endurance budget, 3.3).
-    pub t2_written_day_bytes: u64,
-}
+pub use super::TierStats;
 
 /// A restorable extension found by [`PoolTier::probe`].
 #[derive(Debug, Clone)]

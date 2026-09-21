@@ -1059,7 +1059,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_down_grp_kernel(
 // so the down consumes exactly what the fused tail produced. One writer per
 // pair (moe_align lists every (token, slot) once), PAD rows skipped.
 //
-// The block's expert is checked BEFORE its rows: moe_align PAD-fills
+// The block's expert is checked before its rows: moe_align PAD-fills
 // sorted_row only up to the used blocks and marks the tail blocks through
 // block_expert alone (every consumer early-outs on that), so a tail block's
 // rows hold a fresh buffer's zeros - token 0, slot 0 - or an earlier, wider
@@ -1134,7 +1134,7 @@ __global__ void pd_moe_emap_kernel(const unsigned int* __restrict__ block_expert
 }
 
 // The routed down on the s8 tensor cores, one block per (64-row output strip,
-// expert). A block walks ALL of its expert's pairs, 64 columns at a time,
+// expert). A block walks all of its expert's pairs, 64 columns at a time,
 // straight out of the SORTED rows the tensor-core gate/up quantized
 // (`pd_kquant_moe_gate_up_mma`: sfq/sfs over a bm = 32 layout - no unsort to
 // pair-major). Per 128-weight stage it unpacks the strip's weight windows to
@@ -1163,7 +1163,7 @@ __global__ void pd_moe_emap_kernel(const unsigned int* __restrict__ block_expert
 // token prompt (bench: max 36, none past 64), so the BN = 64 tile runs its
 // `wc = 32` warps empty - and measuring a narrower tile means building the
 // same body at another shape, not a second copy of it.
-// BPS is ELECTED, not incidental - the register budget IS the block count
+// BPS is elected, not incidental - the register budget is the block count
 // here, and nvcc spends whatever it is given. Measured on GB10, same body,
 // same binary, every arm bit-identical (ms a layer, uniform / skewed routing):
 //   1 an SM  167 regs  7.04 / 8.89   (what an explicit 1 asks for - never)
@@ -1280,7 +1280,7 @@ __global__ void __launch_bounds__(NTH, BPS) pd_kquant_moe_down_mma_e_kernel(
         for (uint32_t kt = 0; kt < nb32; kt += 4u) {
             __syncthreads();
             if (ST >= 2u) {
-                // issue the NEXT slice, then retire this one. The commit runs
+                // issue the next slice, then retire this one. The commit runs
                 // even when there is no next slice, so the group count the
                 // wait counts against stays the same on every pass.
                 if (kt + 4u < nb32) stage_pk(kt + 4u, ((kt >> 2u) + 1u) & 1u);
@@ -1322,7 +1322,7 @@ __global__ void __launch_bounds__(NTH, BPS) pd_kquant_moe_down_mma_e_kernel(
                     gm = 0.0f;
                 } else if (k < ff && c < ocols && o0 + c < embd) {
                     if (ST >= 2u) {
-                        // the staged slice IS 4 blocks, so its windows are
+                        // the staged slice is 4 blocks, so its windows are
                         // 0..7 and `ib = w >> 1` indexes them directly
                         const uint8_t* pk = sh_pk + (size_t)((kt >> 2u) & 1u) * BM * PKROW +
                                             (size_t)row * PKROW;
@@ -1356,7 +1356,7 @@ __global__ void __launch_bounds__(NTH, BPS) pd_kquant_moe_down_mma_e_kernel(
                     if (SUMD == 1u) {
                         // the same sum of 16 SIGNED bytes in 4 instructions -
                         // what pd_q8_sums_strided_kernel already does. dp4a
-                        // against 1s IS the byte sum, so this is bit-identical
+                        // against 1s is the byte sum, so this is bit-identical
                         // to the extract loop below, not a rewrite of it.
                         s = __dp4a(v.x, 0x01010101, 0);
                         s = __dp4a(v.y, 0x01010101, s);

@@ -124,6 +124,9 @@ const KV_POOL_SHARE_CAP: f64 = 0.4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KvDtype {
+    /// Checkpoint-native F32 (e.g. Bonsai's F32 auxiliary tensors promote the
+    /// entire Metal decoder). This is storage accounting, not a CUDA election.
+    F32,
     /// Exact, and what a card without FP8 tensor cores serves whatever it was
     /// asked for - this crate has no hardware input of its own, so the CALLER
     /// resolves that (`paddock_models::gpu_support::fp8_kv`) and hands the
@@ -137,6 +140,7 @@ pub enum KvDtype {
 impl KvDtype {
     pub fn bytes(self) -> u64 {
         match self {
+            KvDtype::F32 => 4,
             KvDtype::F16 => 2,
             KvDtype::Fp8E4m3 => 1,
         }
@@ -235,6 +239,11 @@ pub struct ModelShape {
     pub workspace_bytes: u64,
     pub kind: ModelKind,
     pub kv_layers: Vec<KvLayer>,
+    /// Additional context-sized KV capacity reserved by the backend (e.g.
+    /// one prefix-cache sequence beyond the active Metal GPT-OSS slots).
+    /// Zero preserves the original CUDA planner's pool policy. This is not
+    /// additional concurrency and must not multiply logits or recurrent state.
+    pub kv_reserve_sequences: u64,
     pub vocab: u64,
     pub recurrent: Option<RecurrentShape>,
     /// Static per-slot cross-attention cache, for encoder-decoders. See
@@ -381,6 +390,7 @@ impl PublishedShape {
             tower_bytes,
             workspace_bytes,
             kind: self.kind,
+            kv_reserve_sequences: 0,
             kv_layers: self
                 .kv_layers
                 .iter()
@@ -422,6 +432,7 @@ impl ModelShape {
             tower_bytes: 0,
             workspace_bytes: 0,
             kind,
+            kv_reserve_sequences: 0,
             kv_layers: r
                 .kv_layers
                 .iter()
@@ -711,6 +722,7 @@ fn logits(shape: &ModelShape, env: &Envelope) -> u64 {
 pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     let encoder = shape.kind == ModelKind::Encoder;
     let n = env.concurrency.max(1);
+    let kv_sequences = n.saturating_add(shape.kv_reserve_sequences);
     // An encoder holds nothing between calls, so concurrency is the only knob
     // that touches it at all, and then only through transient activations.
     let (state, conv_scratch) = match (&shape.recurrent, encoder) {
@@ -857,7 +869,7 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     let want = if encoder {
         0
     } else {
-        shape.kv_per_sequence(shape.max_ctx, env.kv_dtype) * n
+        shape.kv_per_sequence(shape.max_ctx, env.kv_dtype) * kv_sequences
     };
     let kv_pool = want
         // the self-sized checkpoint pool is spent before the KV pool gets what
@@ -872,7 +884,7 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
         (0, LimitedBy::NotApplicable)
     } else {
         // round down to a whole 16-token page, the engine's allocation unit
-        let by_vram = (kv_pool / n / per_token) / 16 * 16;
+        let by_vram = (kv_pool / kv_sequences / per_token) / 16 * 16;
         if by_vram >= shape.max_ctx {
             (shape.max_ctx, LimitedBy::Model)
         } else {
@@ -995,6 +1007,7 @@ mod tests {
     fn qwen35_9b() -> ModelShape {
         ModelShape {
             weight_bytes: 9_786_061_152,
+            kv_reserve_sequences: 0,
             tower_bytes: 0,
             workspace_bytes: 0,
             kind: ModelKind::Generative,
@@ -1027,6 +1040,7 @@ mod tests {
     fn whisper_large_v3() -> ModelShape {
         ModelShape {
             weight_bytes: 3_223_785_280,
+            kv_reserve_sequences: 0,
             tower_bytes: 0,
             workspace_bytes: 0,
             kind: ModelKind::Generative,
@@ -1190,6 +1204,7 @@ mod tests {
         ]);
         ModelShape {
             weight_bytes: 26_859_861_728,
+            kv_reserve_sequences: 0,
             tower_bytes: 1_194_828_256,
             workspace_bytes: 6_070_491_580,
             kind: ModelKind::Generative,
@@ -1266,6 +1281,7 @@ mod tests {
     fn embedding_0_6b() -> ModelShape {
         ModelShape {
             weight_bytes: 639_150_592,
+            kv_reserve_sequences: 0,
             tower_bytes: 0,
             workspace_bytes: 0,
             kind: ModelKind::Encoder,
@@ -1454,6 +1470,7 @@ mod tests {
     fn sliding_window_layers_stop_growing() {
         let shape = ModelShape {
             weight_bytes: 0,
+            kv_reserve_sequences: 0,
             tower_bytes: 0,
             workspace_bytes: 0,
             kind: ModelKind::Generative,
@@ -1477,6 +1494,55 @@ mod tests {
         };
         let at = |ctx| shape.kv_per_sequence(ctx, KvDtype::F16);
         assert_eq!(at(8192) - at(4096), 4096 * (512 + 512) * 2);
+    }
+
+    #[test]
+    fn reserved_kv_capacity_costs_memory_but_is_not_serving_concurrency() {
+        let mut shape = qwen35_9b();
+        shape.recurrent = None;
+        shape.weight_bytes = 0;
+        shape.max_ctx = 4096;
+        let dev = Device {
+            free_bytes: 64 << 30,
+            total_bytes: 64 << 30,
+        };
+        for n in [1, 4] {
+            let env = Envelope {
+                concurrency: n,
+                kv_dtype: KvDtype::F16,
+                spec: None,
+                offload: None,
+            };
+            shape.kv_reserve_sequences = 0;
+            let ordinary = estimate(&shape, &env, &dev);
+            shape.kv_reserve_sequences = 1;
+            let reserved = estimate(&shape, &env, &dev);
+            let per_sequence = shape.kv_per_sequence(4096, KvDtype::F16);
+            assert_eq!(ordinary.kv_pool, n * per_sequence);
+            assert_eq!(reserved.kv_pool, (n + 1) * per_sequence);
+            assert_eq!(reserved.resident, ordinary.resident);
+            assert_eq!(reserved.max_ctx, 4096);
+        }
+        // Under memory pressure, the inverse must pay for the reserved
+        // sequence too, or it advertises a context that cannot be allocated.
+        shape.max_ctx = 131072;
+        let dev = Device {
+            free_bytes: 5 << 30,
+            total_bytes: 5 << 30,
+        };
+        let env = Envelope {
+            concurrency: 1,
+            kv_dtype: KvDtype::F16,
+            spec: None,
+            offload: None,
+        };
+        shape.kv_reserve_sequences = 0;
+        let ordinary = estimate(&shape, &env, &dev);
+        shape.kv_reserve_sequences = 1;
+        let reserved = estimate(&shape, &env, &dev);
+        assert_eq!(reserved.kv_pool, ordinary.kv_pool);
+        assert!(reserved.max_ctx <= ordinary.max_ctx / 2);
+        assert!(shape.kv_per_sequence(reserved.max_ctx, KvDtype::F16) * 2 <= reserved.kv_pool);
     }
 
     /// An in-file drafter (nextn) is inside `weight_bytes` because that is the

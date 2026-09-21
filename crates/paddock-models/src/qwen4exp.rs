@@ -79,8 +79,19 @@ pub struct Qwen4ExpConfig {
     pub heads_per_ngram: usize, // 8 (x2 ngram orders = 16 heads)
     pub ngram_vocab_base: u64,  // 20000000
     pub ngram_split: usize,     // 128 shards
-    /// `ple_embedding_dtype` as written ("float8_e4m3fn")
-    pub ple_dtype: String,
+    /// `ple_embedding_dtype` exactly as the checkpoint wrote it
+    /// ("float8_e4m3fn"), or `None` when it does not declare one.
+    ///
+    /// Deliberately optional. This parser was written against the RadixArk
+    /// NVFP4 export, which carries the key (the sglang PR#40 knob); NVIDIA's
+    /// official `nvidia/Qwen3.8-Flash-Next-NVFP4` does not, and requiring it
+    /// refused that checkpoint outright - "missing ple_embedding_dtype", with
+    /// 132.7 GB of perfectly good weights on disk (measured 2026-09-19 on a
+    /// GB10). Nothing in the engine reads this field; it is provenance, and a
+    /// missing annotation must not be fatal when the tensors themselves are
+    /// the ground truth. If a consumer ever needs the PLE element type, take
+    /// it from the PLE tensor's own dtype in the shard header, not from here.
+    pub ple_dtype: Option<String>,
 
     // MTP (1 full-attention layer, bf16 fused experts, shared lm_head)
     pub mtp_layers: usize,
@@ -120,9 +131,17 @@ impl Qwen4ExpConfig {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
             .map_err(|e| StError::Header(e.to_string()))?;
         let top_type = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
-        if top_type != "qwen4_exp" {
+        // One architecture, two spellings in the wild: NVIDIA's export says
+        // `qwen4_exp`, Mia-AiLab's says `qwen3_8_flash_next` (text_config
+        // `qwen3_8_flash_next_text`). Everything this loader reads is
+        // identical across the two - 2560 hidden, 48 layers, 512 experts
+        // top-10, moe_ff 640, vocab 248320, head_dim 256, 24/2 heads, the same
+        // one-layer `mtp` block - so the name is the only difference and the
+        // fields below are what actually validate the file. Refusing on the
+        // string alone would reject a checkpoint we serve correctly.
+        if !matches!(top_type, "qwen4_exp" | "qwen3_8_flash_next") {
             return Err(StError::Header(format!(
-                "qwen4exp: model_type is {top_type:?}, not qwen4_exp"
+                "qwen4exp: model_type is {top_type:?}, not qwen4_exp / qwen3_8_flash_next"
             )));
         }
         let tc = v
@@ -274,7 +293,10 @@ impl Qwen4ExpConfig {
                 .and_then(|x| x.as_u64())
                 .ok_or_else(|| miss("ngram_vocab_size_base"))?,
             ngram_split: u("split_ngram_parts")?,
-            ple_dtype: s("ple_embedding_dtype")?,
+            ple_dtype: tc
+                .get("ple_embedding_dtype")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned),
             mtp_layers,
             eos_ids,
             bos_id,
@@ -482,7 +504,7 @@ impl Qwen4ExpConfig {
             ngram_vocab_base,
             // one tensor, not the checkpoint's 128 shards
             ngram_split: 1,
-            ple_dtype: "gguf".to_owned(),
+            ple_dtype: Some("gguf".to_owned()),
             mtp_layers: 0,
             eos_ids,
             bos_id,
@@ -568,7 +590,7 @@ pub(super) mod tests {
         assert_eq!((c.hc_count, c.hc_lowrank, c.hc_width()), (4, 320, 10240));
         assert_eq!(c.ple_layers, vec![1], "one-indexed id 2 -> decoder layer 1");
         assert_eq!((c.ple_embed, c.ple_heads(), c.ngram_split), (2560, 16, 128));
-        assert_eq!(c.ple_dtype, "float8_e4m3fn");
+        assert_eq!(c.ple_dtype.as_deref(), Some("float8_e4m3fn"));
         assert_eq!(c.mtp_layers, 1);
         assert_eq!(c.eos_ids, vec![248046, 248044]);
         assert_eq!(c.bos_id, 248044);

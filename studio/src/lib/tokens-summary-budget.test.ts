@@ -8,7 +8,7 @@
 // "model maximum" asks for a reply that cannot fit beside it - the same class
 // of overflow the outCap clamp in `windowRemaining` exists to absorb.
 //
-// The injected text is KNOWN at plan time, so it is charged: once, wrapper
+// The injected text is known at plan time, so it is charged: once, wrapper
 // included, and never together with the raw messages it replaced.
 //
 // Out of scope here (and still uncounted by this estimator): the date line,
@@ -29,7 +29,7 @@ import {
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 //
-// Synthetic and round on purpose: every expected number below is arithmetic
+// Synthetic and round deliberately: every expected number below is arithmetic
 // anyone can redo by hand. The estimator is 4 chars/token with 4 tokens of
 // per-message overhead (lib/tokens.ts).
 

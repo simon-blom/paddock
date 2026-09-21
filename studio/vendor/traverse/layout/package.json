@@ -1,0 +1,14 @@
+{
+  "name": "@truespar/traverse-layout",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "dependencies": {
+    "graphology": "0.26.0",
+    "graphology-layout-forceatlas2": "0.10.1",
+    "d3-force": "3.0.0"
+  }
+}

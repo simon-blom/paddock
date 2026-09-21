@@ -16,7 +16,9 @@
 //!   5. flush latency - the WAL group-commit budget (persistent-format spec).
 //!
 //! Windows: FILE_FLAG_NO_BUFFERING positioned IO (seek_read/seek_write).
-//! Unix: O_DIRECT + read_at/write_at. Queue depth is emulated with threads -
+//! Linux: O_DIRECT + read_at/write_at. macOS: F_NOCACHE + read_at/write_at
+//! (advisory cache bypass, not Linux's hard alignment contract).
+//! Queue depth is emulated with threads -
 //! it measures what the device can do; the production backend (overlapped /
 //! IORing / io_uring) is a separate Phase-3 election measured against these
 //! same ceilings.
@@ -32,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 
@@ -76,11 +80,23 @@ fn open_direct(path: &Path, create: bool) -> std::io::Result<File> {
         // FILE_FLAG_NO_BUFFERING: bypass the cache manager entirely.
         o.custom_flags(0x2000_0000);
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         o.custom_flags(libc::O_DIRECT);
     }
-    o.open(path)
+    let file = o.open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: fcntl receives a live owned file descriptor and an integer
+        // flag. A probe must fail if cache bypass is refused, not report cached
+        // memory throughput as a device ceiling.
+        let result =
+            unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_NOCACHE, 1) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(file)
 }
 
 fn pread(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
@@ -325,4 +341,46 @@ fn main() {
     }
     println!("\ndone.");
     let _ = std::io::stdout().flush();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncached_open_preserves_create_and_positioned_io_semantics() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "paddock-kvnvme-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).expect("create isolated probe fixture");
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0.join("probe.dat"));
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let fixture = Fixture(directory);
+        let path = fixture.0.join("probe.dat");
+        assert_eq!(
+            open_direct(&path, false).expect_err("missing file").kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let file = open_direct(&path, true).expect("open with F_NOCACHE accepted");
+        let expected = AlignedBuf::new(4096, 4096);
+        assert_eq!(pwrite(&file, expected.slice(), 4096).expect("write"), 4096);
+        file.sync_data().expect("sync fixture");
+        drop(file);
+        let file = open_direct(&path, false).expect("reopen uncached fixture");
+        let mut actual = AlignedBuf::new(4096, 4096);
+        actual.slice_mut().fill(0);
+        assert_eq!(pread(&file, actual.slice_mut(), 4096).expect("read"), 4096);
+        assert_eq!(actual.slice(), expected.slice());
+        assert_eq!(file.metadata().expect("fixture size").len(), 8192);
+    }
 }

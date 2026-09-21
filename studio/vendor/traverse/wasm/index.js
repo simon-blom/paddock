@@ -15,15 +15,12 @@
 //   const ctl = new AbortController()
 //   setTimeout(() => ctl.abort('user cancelled'), 5000)
 //   await db.query(cypher, params, { signal: ctl.signal })
-// (Note: in-flight cancellation hits the Rust-side cancellation token
-//  at iteration boundaries — long-running pure CPU loops between
-//  checks may take a moment to notice.)
+// Queued AbortSignals prevent dispatch. An active synchronous query cannot
+// receive an abort message until it returns; its caller rejects, but the
+// physical slot remains occupied until the execution deadline/result. Active
+// AbortError carries executionMayHaveCompleted=true, never a rollback promise.
 
-/**
- * Per-instance counter for matching requests with responses.
- * @private
- */
-let _nextRequestId = 0
+import { RequestQueue } from './request-queue.js'
 
 /**
  * In-tab Traverse graph engine, hosted in a dedicated Web Worker so the
@@ -35,8 +32,7 @@ let _nextRequestId = 0
 export class TraverseDb {
   /** @type {Worker} */
   #worker
-  /** @type {Map<number, { resolve: (v: any) => void, reject: (e: any) => void, signal?: AbortSignal, onAbort?: () => void }>} */
-  #pending = new Map()
+  #queue
   /** @type {string | null} Library version reported by the worker post-init. */
   version = null
 
@@ -46,7 +42,14 @@ export class TraverseDb {
    */
   constructor(worker) {
     this.#worker = worker
-    worker.addEventListener('message', (ev) => this.#onMessage(ev))
+    this.#queue = new RequestQueue(message => worker.postMessage(message))
+    worker.addEventListener('message', ev => this.#queue.reply(ev.data ?? {}))
+    const fail = () => {
+      this.#queue.close(new Error('Database worker failed; reopen the database'))
+      worker.terminate()
+    }
+    worker.addEventListener('error', fail)
+    worker.addEventListener('messageerror', fail)
   }
 
   /**
@@ -82,7 +85,9 @@ export class TraverseDb {
       options.numThreads ?? (globalThis.navigator?.hardwareConcurrency ?? 4),
       16,
     )
-    const initResult = await db.#call('init', { numThreads })
+    let initResult
+    try { initResult = await db.#call('init', { numThreads }) }
+    catch (error) { db.close(); throw error }
     db.version = initResult?.version ?? null
     if (options.name) {
       await db.load(options.name).catch(() => undefined)
@@ -306,73 +311,14 @@ export class TraverseDb {
    * Tear down the worker. Pending requests reject with `AbortError`.
    */
   close() {
-    for (const [, entry] of this.#pending) {
-      entry.reject(new DOMException('Database closed', 'AbortError'))
-    }
-    this.#pending.clear()
+    this.#queue.close()
     this.#worker.terminate()
   }
 
-  // ── Internal ────────────────────────────────────────────────────
+  get queueStats() { return this.#queue.stats }
 
-  /**
-   * @template T
-   * @param {string} kind
-   * @param {object} payload
-   * @param {{ signal?: AbortSignal, transfer?: Transferable[] }} [opts]
-   * @returns {Promise<T>}
-   * @private
-   */
-  #call(kind, payload, opts = {}) {
-    const id = ++_nextRequestId
-    return new Promise((resolve, reject) => {
-      const signal = opts.signal
-      let onAbort
-      if (signal) {
-        if (signal.aborted) {
-          reject(new DOMException('Aborted', 'AbortError'))
-          return
-        }
-        onAbort = () => {
-          // Best-effort: tell the worker to flip its cancellation
-          // token; the resolve/reject path is local.
-          this.#worker.postMessage({ id: -1, kind: 'abort', payload: { requestId: id } })
-          const entry = this.#pending.get(id)
-          if (entry) {
-            this.#pending.delete(id)
-            entry.reject(new DOMException('Aborted', 'AbortError'))
-          }
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-      }
-      this.#pending.set(id, { resolve, reject, signal, onAbort })
-      const msg = { id, kind, payload }
-      if (opts.transfer && opts.transfer.length > 0) {
-        this.#worker.postMessage(msg, opts.transfer)
-      } else {
-        this.#worker.postMessage(msg)
-      }
-    })
-  }
-
-  #onMessage(ev) {
-    const { id, ok, result, error } = ev.data ?? {}
-    const entry = this.#pending.get(id)
-    if (!entry) return
-    this.#pending.delete(id)
-    if (entry.signal && entry.onAbort) {
-      entry.signal.removeEventListener('abort', entry.onAbort)
-    }
-    if (ok) {
-      entry.resolve(result)
-    } else {
-      const err = new Error(error?.message ?? 'unknown WASM error')
-      // @ts-ignore — attach the structured error info as non-standard
-      // properties so callers can inspect `err.code` if they want.
-      err.code = error?.code
-      err.stack = error?.stack ?? err.stack
-      entry.reject(err)
-    }
+  #call(kind, payload, options = {}) {
+    return this.#queue.call(kind, payload, options)
   }
 }
 

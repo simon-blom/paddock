@@ -477,10 +477,19 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_mut().expect("decode");
 
-        embed_any(&exec, tok_embd, &ds.d_pf_tokens, &mut sc.d_x, embd, t_len)?;
+        embed_any(
+            &exec,
+            tok_embd,
+            &ds.d_pf_tokens,
+            &mut sc.d_x,
+            embd,
+            t_len,
+            rot,
+        )?;
 
         // Per-tensor prefill matmul dispatch: Q8_0 keeps the exact existing
         // int8-MMA ladder; the k-quant arm rides the stage-2 W4A8 GEMM (int8
@@ -556,7 +565,7 @@ impl GpuQwen35 {
             // materializes for Linear mixers (alpha/beta still read it) - and
             // on the k-quant f32-interim fallback (its arms read the f32 rows).
             let keep_xn = matches!(&layer.mixer, Mixer::Linear(_)) || (kq_res && kq_f32);
-            prefill_add_norm_quant(
+            prefill_add_norm_quant_rot(
                 &exec,
                 &mut sc.d_x,
                 None,
@@ -570,6 +579,7 @@ impl GpuQwen35 {
                 embd,
                 t_len,
                 eps,
+                rot,
             )?;
             dbg_norm!(li, "x_embed", &sc.d_x, t_len * embd);
             dbg_norm!(li, "xn", &sc.d_xn, t_len * embd);
@@ -663,6 +673,7 @@ impl GpuQwen35 {
                         Some((&mut sc.d_attn_o, &mut sc.d_attn_ml)),
                     )?;
                     exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, t_len * q_dim)?;
+                    rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, t_len)?;
                     pmm!(&w.wo, &sc.d_attn, &mut sc.d_proj);
                 }
                 Mixer::Linear(w) => {
@@ -830,7 +841,15 @@ impl GpuQwen35 {
                         eps,
                     )?;
                     dbg_norm!(li, "core", &sc.d_core, t_len * n_v_heads * state_size);
-                    pmm!(&w.out_w, &sc.d_core, &mut sc.d_proj);
+                    if let Some(r) = rot {
+                        // ssm_out reads the regrouped + rotated rows; d_dattn
+                        // is free once the gated norm above has consumed it
+                        let vd = n_v_heads * state_size;
+                        r.rotate_ssm_out(&exec, &sc.d_core, &mut sc.d_dattn, vd, t_len)?;
+                        pmm!(&w.out_w, &sc.d_dattn, &mut sc.d_proj);
+                    } else {
+                        pmm!(&w.out_w, &sc.d_core, &mut sc.d_proj);
+                    }
                     dbg_norm!(li, "mix_proj", &sc.d_proj, t_len * embd);
                 }
             }
@@ -839,7 +858,7 @@ impl GpuQwen35 {
                     // residual add + post_norm + gate/up quantize in one pass (P6k);
                     // xn skipped where possible - the ffn quantize is its only
                     // consumer here (the k-quant f32-interim fallback reads xn)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -853,6 +872,7 @@ impl GpuQwen35 {
                         embd,
                         t_len,
                         eps,
+                        rot,
                     )?;
                     pmm_pre!(gate, &mut sc.d_ffn_gate);
                     pmm_pre!(up, &mut sc.d_ffn_up);
@@ -863,6 +883,7 @@ impl GpuQwen35 {
                             // exact-f32 fallback: swiglu explicitly, then the
                             // interim GEMM off the f32 activation
                             exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, t_len * ff)?;
+                            rotate_opt(rot, &exec, &mut sc.d_ffn_gate, ff, t_len)?;
                             kq_gemm(
                                 &exec,
                                 k,
@@ -872,7 +893,7 @@ impl GpuQwen35 {
                                 t_len,
                             )?;
                         }
-                        w => prefill_ffn_down_any(
+                        w => prefill_ffn_down_rot(
                             &exec,
                             w,
                             &mut sc.d_pxq,
@@ -886,6 +907,7 @@ impl GpuQwen35 {
                             &mut sc.d_proj,
                             ff,
                             t_len,
+                            rot,
                         )?,
                     }
                     dbg_norm!(li, "ffn_proj", &sc.d_proj, t_len * embd);
@@ -894,7 +916,7 @@ impl GpuQwen35 {
                     // off the f32 xn - write_xn=true, the int8 staging
                     // outputs are unused (the chain quantizes to nvf4 itself
                     // on the W4A4 arm, and consumes f32 below the band)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -908,6 +930,7 @@ impl GpuQwen35 {
                         embd,
                         t_len,
                         eps,
+                        rot,
                     )?;
                     nvf4_ffn(
                         &exec,
@@ -934,7 +957,7 @@ impl GpuQwen35 {
                     // MoE needs the f32 xn for the router + shared expert -
                     // write_xn=true (the fused quantize output is unused here;
                     // moe_ffn quantizes into its own staging)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -948,6 +971,7 @@ impl GpuQwen35 {
                         embd,
                         t_len,
                         eps,
+                        rot,
                     )?;
                     moe_ffn(
                         &exec,
@@ -1003,6 +1027,7 @@ impl GpuQwen35 {
         // inputs), then lm_head on the last row only.
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, t_len)?;
         exec.copy_region(&sc.d_h, (t_len - 1) * embd, &mut sc.d_xn, 0, embd)?;
+        rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         if let Some(p) = super::head_f8(self.out_f8.as_ref(), 1) {
             // f8 head - the Q8_0 twin is dropped at load (REPLACE lane)
             super::head_f8_gemm(
@@ -1063,11 +1088,12 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_mut().expect("decode");
 
         // embed the single token (device-resident id) into the residual stream
-        embed_any(&exec, tok_embd, &ds.d_token, &mut sc.d_x, embd, 1)?;
+        embed_any(&exec, tok_embd, &ds.d_token, &mut sc.d_x, embd, 1, rot)?;
 
         // b=1 lin-GEMV arm, same election as the batched path
         let lin_gemv_on =
@@ -1075,6 +1101,7 @@ impl GpuQwen35 {
 
         for (li, layer) in layers.iter().enumerate() {
             exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
+            rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
             match &layer.mixer {
                 Mixer::Full(w) => {
                     super::stub_guard(&w.wq, "forward.rs serial wq")?;
@@ -1167,6 +1194,7 @@ impl GpuQwen35 {
                         None,
                     )?;
                     exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, q_dim)?;
+                    rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, 1)?;
                     super::stub_guard(&w.wo, "forward.rs serial wo")?;
                     gemv_any(&exec, &w.wo, &sc.d_attn, &mut sc.d_proj)?;
                 }
@@ -1252,7 +1280,15 @@ impl GpuQwen35 {
                         eps,
                     )?;
                     super::stub_guard(&w.out_w, "forward.rs serial out_w")?;
-                    gemv_any(&exec, &w.out_w, &sc.d_core, &mut sc.d_proj)?;
+                    if let Some(r) = rot {
+                        // regrouped + rotated rows land in d_dattn, free once
+                        // the gated norm has consumed it
+                        let vd = n_v_heads * state_size;
+                        r.rotate_ssm_out(&exec, &sc.d_core, &mut sc.d_dattn, vd, 1)?;
+                        gemv_any(&exec, &w.out_w, &sc.d_dattn, &mut sc.d_proj)?;
+                    } else {
+                        gemv_any(&exec, &w.out_w, &sc.d_core, &mut sc.d_proj)?;
+                    }
                 }
             }
             exec.add_rmsnorm_batch(
@@ -1264,6 +1300,7 @@ impl GpuQwen35 {
                 eps,
                 1,
             )?;
+            rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
                     // sm_100 tcgen05 arm (PADDOCK_QWEN_F8T). Stands on its own:
@@ -1454,6 +1491,7 @@ impl GpuQwen35 {
                     gemv_any(&exec, gate, &sc.d_xn, &mut sc.d_ffn_gate)?;
                     gemv_any(&exec, up, &sc.d_xn, &mut sc.d_ffn_up)?;
                     exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, ff)?;
+                    rotate_opt(rot, &exec, &mut sc.d_ffn_gate, ff, 1)?;
                     gemv_any(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 }
                 Ffn::Nvf4Dense { gu, down } => {
@@ -1559,6 +1597,7 @@ impl GpuQwen35 {
         }
 
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
+        rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         // single token: d_xn's first row is the last position - lm_head directly.
         if let Some(p) = super::head_f8(self.out_f8.as_ref(), 1) {
             // f8 head - the Q8_0 twin is dropped at load (REPLACE lane)

@@ -1,5 +1,5 @@
 import { type PropType } from 'vue';
-import { LectorEngine, type LectorEngineOptions, type LectorViewerOptions, type LayoutMode, type ThemeMode, type PluginDefinition } from '@truespar/lector-core';
+import { LectorEngine, type LectorEngineOptions, type LayoutMode, type ThemeMode, type PluginDefinition } from '@truespar/lector-core';
 type AnyPlugin = PluginDefinition<any, any>;
 /**
  * Drop-in PDF viewer component for Vue 3.
@@ -97,25 +97,6 @@ export declare const LectorPdfViewer: import("vue").DefineComponent<import("vue"
         default: boolean;
     };
     /**
-     * Show the document tab bar. Defaults to true; pass false when the host
-     * app has its own document switcher (see `LectorViewerOptions`).
-     * `default: undefined` rather than `true` on purpose - Vue casts an ABSENT
-     * Boolean prop to false, which would silently turn the bar off for every
-     * embedder that never mentions it.
-     */
-    documentTabs: {
-        type: BooleanConstructor;
-        default: undefined;
-    };
-    /**
-     * Host-contributed toolbar buttons, rendered by lector so they match its
-     * own metrics (see `LectorViewerOptions.toolbarExtras`).
-     */
-    toolbarExtras: {
-        type: PropType<NonNullable<LectorViewerOptions["toolbarExtras"]>>;
-        default: undefined;
-    };
-    /**
      * Partial UI schema override, merged over `DEFAULT_UI_SCHEMA` — the same
      * option `LectorViewer` takes. Lets an embedding app trim or reorder the
      * toolbar without giving up the drop-in component.
@@ -195,25 +176,6 @@ export declare const LectorPdfViewer: import("vue").DefineComponent<import("vue"
         default: boolean;
     };
     /**
-     * Show the document tab bar. Defaults to true; pass false when the host
-     * app has its own document switcher (see `LectorViewerOptions`).
-     * `default: undefined` rather than `true` on purpose - Vue casts an ABSENT
-     * Boolean prop to false, which would silently turn the bar off for every
-     * embedder that never mentions it.
-     */
-    documentTabs: {
-        type: BooleanConstructor;
-        default: undefined;
-    };
-    /**
-     * Host-contributed toolbar buttons, rendered by lector so they match its
-     * own metrics (see `LectorViewerOptions.toolbarExtras`).
-     */
-    toolbarExtras: {
-        type: PropType<NonNullable<LectorViewerOptions["toolbarExtras"]>>;
-        default: undefined;
-    };
-    /**
      * Partial UI schema override, merged over `DEFAULT_UI_SCHEMA` — the same
      * option `LectorViewer` takes. Lets an embedding app trim or reorder the
      * toolbar without giving up the drop-in component.
@@ -227,15 +189,6 @@ export declare const LectorPdfViewer: import("vue").DefineComponent<import("vue"
     "onDocument-loaded"?: ((_handle: unknown) => any) | undefined;
     onError?: ((_err: Error) => any) | undefined;
 }>, {
-    toolbarExtras: readonly {
-        id: string;
-        icon: string;
-        tooltip: string;
-        section?: "left" | "center" | "right";
-        placement?: "start" | "end";
-        onSelect: () => void;
-        disabled?: () => boolean;
-    }[];
     engine: LectorEngine;
     engineOptions: LectorEngineOptions;
     plugins: readonly AnyPlugin[];
@@ -248,7 +201,6 @@ export declare const LectorPdfViewer: import("vue").DefineComponent<import("vue"
     initialZoom: number | "fit-width" | "fit-page";
     panels: string[];
     allowLocalOpen: boolean;
-    documentTabs: boolean;
     uiSchema: Record<string, unknown>;
 }, {}, {}, {}, string, import("vue").ComponentProvideOptions, true, {}, any>;
 export {};

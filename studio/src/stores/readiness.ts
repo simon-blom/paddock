@@ -24,6 +24,7 @@ export interface SupportedGen {
 }
 
 export interface Readiness {
+  backend?: string
   state: ReadyState
   card?: string
   generation?: string
@@ -52,6 +53,9 @@ export const useReadinessStore = defineStore('readiness', () => {
    *  probe answers: a machine that has one must not watch its GPU button
    *  appear a moment after the page does. */
   const hasCard = computed(() => !info.value || info.value.state !== 'no-card')
+  // The current metrics sampler is NVML-only. Do not present empty NVIDIA
+  // instruments as Apple GPU measurements; runner allocation stats still work.
+  const hasMetrics = computed(() => hasCard.value && info.value?.backend !== 'metal')
   /** Nothing to say when everything is fine; silence is the goal state. */
   const notice = computed(() => (info.value && info.value.state !== 'ready' ? info.value : null))
 
@@ -79,5 +83,5 @@ export const useReadinessStore = defineStore('readiness', () => {
     }
   }
 
-  return { info, blocked, hasCard, notice, load, ensureLoaded }
+  return { info, blocked, hasCard, hasMetrics, notice, load, ensureLoaded }
 })

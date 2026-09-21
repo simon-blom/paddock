@@ -23,7 +23,7 @@ export interface InjectedBlock {
   text: string
 }
 
-export function useInjectedPrompt(conv: Ref<Conversation> | ComputedRef<Conversation>): {
+export function useInjectedPrompt(conv: Ref<Conversation | null | undefined> | ComputedRef<Conversation | null | undefined>): {
   blocks: ComputedRef<InjectedBlock[]>
 } {
   const mcpTools = useMcpToolsStore()
@@ -48,9 +48,9 @@ export function useInjectedPrompt(conv: Ref<Conversation> | ComputedRef<Conversa
 
   /** The servers armed for this chat, as (label, cache key) pairs. */
   const armed = computed<Array<{ label: string; key: string }>>(() => {
-    const sel = toolSelection(conv.value)
+    const sel = conv.value ? toolSelection(conv.value) : { mode: 'all' as const }
     const out = [{ label: ARTIFACTS_LABEL, key: builtinKey(ARTIFACTS_LABEL) }]
-    const ids = conv.value.connectorIds ?? []
+    const ids = conv.value?.connectorIds ?? []
     for (const c of connectors.list) {
       if (!ids.includes(c.id)) continue
       out.push({ label: c.label, key: connectorKey(c.id) })

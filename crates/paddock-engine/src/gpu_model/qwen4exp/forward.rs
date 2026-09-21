@@ -448,6 +448,12 @@ pub struct Qwen4ExpGpu {
     mtp: Option<Box<mtp::Mtp>>,
     /// The verify round's planes (forward/spec.rs), built at its first round.
     verify: Option<Box<spec::Verify>>,
+    /// Canonical RS (PADDOCK_SPEC_RS): this round's per-slot chain draws, put
+    /// here by the service immediately before it arms the chain. The backend
+    /// has no sampler access, so the inverse temperature and the per-step draft
+    /// uniforms have to arrive from the slot's own seed stream or the draw is
+    /// not the one the request asked for. Cleared as the chain consumes it.
+    spec_rs_draws: Option<Vec<crate::generator::SpecRsDraw>>,
 }
 
 /// Every device buffer the walk touches, allocated once at `max_tokens`.
@@ -559,6 +565,29 @@ struct Scratch {
     d_dpart: CudaSlice<f32>,
     // the tensor-core gate/up's moe_align (bm = 32) CSR and its fused-quantize
     // output in that SORTED layout: [blocks][32][moe_ff] int8 + per-32 scales
+    /// NVFP4 activation pair for the W4A4 routed arm (slot 631): packed e2m1
+    /// over an i8 plane plus its per-16 e4m3 scales. Only the PREFILL arm
+    /// stages these - the decode GEMV eats f32 straight.
+    d_xq4: CudaSlice<i8>,
+    d_xs4: CudaSlice<u8>,
+    /// the W4A4 pair's intermediate: SwiGLU output requantized to nvf4,
+    /// sorted-position indexed, which is nvf4_moe_down_bs's direct B input
+    d_nfq: CudaSlice<u8>,
+    d_nfs: CudaSlice<u8>,
+    /// Per-(token, slot) f32 partials for the W4A4 down half. Its OWN plane,
+    /// not `d_moe_part`: that one is a decode-band buffer (64 rows x the
+    /// z-split's halved slots, ~3 MB) and `nvf4_moe_down_bs` lands
+    /// n * (k+1) * hidden floats, so a 128-token prefill overran it 4x and
+    /// took the serve down with CUDA_ERROR_ILLEGAL_ADDRESS.
+    ///
+    /// BOUNDED, not full-width: at max_tokens 4096 a full-width plane is 461
+    /// MB out of the same headroom the KV pool sizes from, for an arm that
+    /// only engages on prefill. Sized to `NVF4_BS_MAX_ROWS` tokens instead,
+    /// and the dispatch checks this length before electing - so a wave wider
+    /// than the plane keeps the GEMV, correctly and quietly, instead of
+    /// scribbling. Proper token-chunking (nemotron's shape) would lift that
+    /// ceiling; it needs token offsets on four shared wrappers.
+    d_nvf4_part: CudaSlice<f32>,
     d_srow32: CudaSlice<u32>,
     d_sslot32: CudaSlice<u32>,
     d_bexp32: CudaSlice<u32>,
@@ -676,35 +705,60 @@ impl Qwen4ExpGpu {
         for li in 0..cfg.n_layer {
             let mut layer = load_layer(exec, &st, &cfg, li)?;
             if cfg.ple_layers.contains(&li) {
-                let mut ple = load_ple_projections(exec, &st, &cfg, li)?;
-                // The 51.2 GB n-gram table goes to the device unless it will
-                // not fit (or the host lane is forced). The host mmap gather
-                // it replaces is a uniform random read at 160 useful bytes
-                // per 4 KB page over a 51.2 GB file: it put prefill ticks of
-                // 891-48697 ms and a c8 TTFT p50 of 7858 ms on the serve
-                // ladder. vLLM has always kept this table device-resident
-                // (`NgramEmbedding.oe_embedder`, a `VocabParallelEmbedding`).
-                if ple_device_table(exec, &cfg) {
-                    match load_ple_table(exec, &st, &cfg, li, &mut ple) {
-                        Ok(()) => {
-                            tracing::info!(
-                                "qwen4exp: PLE n-gram table resident on device ({} rows)",
-                                ple.table_rows
-                            );
-                            eprintln!("[q4x-ple] device table: {} rows", ple.table_rows);
-                        }
-                        // Never silent: the host lane is the same answer at
-                        // ~100x the prefill cost, and the bench that measures
-                        // it looks identical from the outside
-                        Err(e) => {
-                            tracing::warn!("qwen4exp: PLE table stays on the host: {e}");
-                            eprintln!("[q4x-ple] HOST lane (device table refused): {e}");
-                        }
-                    }
-                }
-                layer.ple = Some(ple);
+                layer.ple = Some(load_ple_projections(exec, &st, &cfg, li)?);
             }
             layers.push(layer);
+        }
+
+        // The 51.2 GB n-gram table goes to the device unless it will not fit
+        // (or the host lane is forced). The host mmap gather it replaces is a
+        // uniform random read at 160 useful bytes per 4 KB page over a 51.2 GB
+        // file: it put prefill ticks of 891-48697 ms and a c8 TTFT p50 of
+        // 7858 ms on the serve ladder. vLLM has always kept this table
+        // device-resident (`NgramEmbedding.oe_embedder`, a
+        // `VocabParallelEmbedding`).
+        //
+        // After the layer loop, deliberately. `ple_device_table` prices the
+        // table against memory free at the moment it runs, which is only a
+        // sound test if the table is the last big claim - and inside the loop
+        // it is not: `ple_layer_ids` puts it at decoder layer 1 of 48, so the
+        // check saw a nearly empty device, took the table, and the remaining
+        // 46 layers then ran the box out of memory. On a unified-memory board
+        // that is not a CUDA OOM the loader can catch and fall back from - it
+        // is the kernel's OOM killer taking the process, with nothing in the
+        // log but the "resident on device" line it had just printed
+        // (measured 2026-09-19: NVIDIA's official NVFP4 checkpoint, 132.7 GB
+        // over 10 shards, killed at layer ~1 of 48 on a 121 GiB GB10).
+        // Loading it last makes the comment above true on every board and
+        // costs nothing: the projections are already seated, and the table is
+        // a single contiguous claim either way.
+        for li in cfg.ple_layers.clone() {
+            let Some(ple) = layers.get_mut(li).and_then(|l| l.ple.as_mut()) else {
+                continue;
+            };
+            if ple_device_table(exec, &cfg) {
+                match load_ple_table(exec, &st, &cfg, li, ple) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "qwen4exp: PLE n-gram table resident on device ({} rows)",
+                            ple.table_rows
+                        );
+                        eprintln!("[q4x-ple] device table: {} rows", ple.table_rows);
+                    }
+                    // Never silent: the host lane is the same answer at
+                    // ~100x the prefill cost, and the bench that measures
+                    // it looks identical from the outside
+                    Err(e) => {
+                        tracing::warn!("qwen4exp: PLE table stays on the host: {e}");
+                        eprintln!("[q4x-ple] HOST lane (device table refused): {e}");
+                        warm_ple_table(&st, &cfg, li);
+                    }
+                }
+            } else {
+                // Host lane by election, not by failure - fault the table in
+                // now rather than one disk seek at a time on the critical path
+                warm_ple_table(&st, &cfg, li);
+            }
         }
 
         let embed = Embed::Bf16(bf16_plane(
@@ -977,6 +1031,9 @@ impl Qwen4ExpGpu {
                 None
             },
             q: exec.alloc_i8(max_tokens * cfg.hc_width())?,
+            // widest activation row any dense plane takes is hc_width
+            xq8: exec.alloc_i8(max_tokens * cfg.hc_width())?,
+            xs8: exec.alloc_u8(max_tokens * cfg.hc_width() / 32)?,
             rs: exec.alloc(max_tokens)?,
             xs: exec.alloc(if kq_lanes {
                 max_tokens * cfg.hc_width() / 32
@@ -1057,6 +1114,7 @@ impl Qwen4ExpGpu {
             reply_track: vec![false; slots],
             mtp: None,
             verify: None,
+            spec_rs_draws: None,
         };
         if slots >= 1 && !super::prefix::prefix_disabled() {
             me.prefix =
@@ -1335,7 +1393,7 @@ impl Qwen4ExpGpu {
         };
         let mut pos = start;
         self.mtp_begin(slot, start);
-        // The checkpoints taken INSIDE the one walk: a cut walk on this
+        // The checkpoints taken inside the one walk: a cut walk on this
         // routed-expert family costs rows, not a weight pass (~290 ms of a
         // 1024-token prompt as two 16-row walks). The pn recurrence is the
         // one that can stop at a cut row, so its absence keeps the cut walks.
@@ -3457,6 +3515,45 @@ fn stage_ple_device(
 /// the card cannot hold it on top of everything already loaded, so a smaller
 /// board still runs (slowly) rather than failing to load; `PADDOCK_Q4X_PLE_HOST`
 /// forces the host lane for A/Bs.
+/// Fault the host-lane PLE table into the page cache at LOAD, not during the
+/// first prompts.
+///
+/// The gather reads 16 rows a token out of a table that is 26.8 GiB on an
+/// MX-quantized export, so a cold mapping pays those as disk seeks on the
+/// critical path - a TTFT problem, not a throughput one, and the repo has met
+/// it before (`ple-table-page-cache-trap`, which the GGUF lane's baselines
+/// note handles by warming the shards by hand before every lane). Measured on
+/// Mia's export before this, 3 reps of one serve: 1486.8 -> 1312.5 -> 1168.1
+/// ms p50 latency, i.e. still warming on the third rep, with aiperf's
+/// end-to-end throughput climbing 24.35 -> 27.26 -> 28.24 underneath it.
+///
+/// Costs a one-off sequential read at load, which is the cheap way to buy it:
+/// the load is already disk-bound and the table is contiguous per shard. On
+/// an integrated die this is the whole table's residency plan - the mapping
+/// IS device memory there, so there is no second copy to make.
+fn warm_ple_table(st: &ShardedSafetensors, c: &Qwen4ExpConfig, li: usize) {
+    let emb = format!("model.language_model.layers.{li}.ple.ple_embedding");
+    let t0 = std::time::Instant::now();
+    let mut bytes = 0usize;
+    for sh in 0..c.ngram_split {
+        for suffix in ["weight", "weight_scale"] {
+            let name = format!("{emb}.ngram_embedding.shard_{sh}.{suffix}");
+            // a shard that has no scale plane is the FP8 table, not an error
+            if let Ok(n) = st.warm_tensor(&name) {
+                bytes += n;
+            }
+        }
+    }
+    if bytes > 0 {
+        let s = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[q4x-ple] warmed {:.1} GiB of n-gram table in {s:.1}s ({:.0} MB/s)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            bytes as f64 / 1e6 / s.max(1e-9),
+        );
+    }
+}
+
 fn ple_device_table(exec: &Arc<GpuExecutor>, c: &Qwen4ExpConfig) -> bool {
     if std::env::var("PADDOCK_Q4X_PLE_HOST").is_ok_and(|v| v != "0") {
         eprintln!("[q4x-ple] HOST lane (PADDOCK_Q4X_PLE_HOST)");
@@ -3464,6 +3561,24 @@ fn ple_device_table(exec: &Arc<GpuExecutor>, c: &Qwen4ExpConfig) -> bool {
     }
     if !exec.has_q4x_ple_gather() {
         eprintln!("[q4x-ple] HOST lane: pack has no q4x_ple_gather (slot 532)");
+        return false;
+    }
+    // UNIFIED-MEMORY DIE: there is nothing to move. The table is already in
+    // DRAM as a file mapping, and on GB10/Jetson a "device" allocation is the
+    // same physical memory - so copying it in does not shorten a single read,
+    // it just holds 51.2 GB twice. The device table is a DISCRETE-card
+    // optimization: there the copy turns a PCIe round trip per gather into a
+    // local read, which is what bought the 891-48697 ms prefill ticks back.
+    //
+    // Taking it here is how NVIDIA's official NVFP4 checkpoint killed the box
+    // (2026-09-19): 79 GB of weights plus a 51.2 GB second copy of a table
+    // that was already resident, on a 121 GiB board. The GGUF lane has always
+    // host-mapped this table on this hardware and serves 29-34 tok/s doing it.
+    if exec.is_integrated() {
+        eprintln!(
+            "[q4x-ple] HOST lane: unified-memory die - the mapping IS device memory, \
+             a device copy would hold the table twice"
+        );
         return false;
     }
     let want = (c.ngram_vocab_base as usize) * c.ple_heads() * (c.ple_embed / c.ple_heads());
@@ -3482,6 +3597,12 @@ fn ple_device_table(exec: &Arc<GpuExecutor>, c: &Qwen4ExpConfig) -> bool {
         return false;
     }
     true
+}
+
+/// One row out of a `[rows, per_row]` plane. The n-gram table is read a row
+/// at a time (16 of ~10M per token), so this never materializes a shard.
+fn scb_slice(plane: &[u8], row: usize, per_row: usize) -> &[u8] {
+    &plane[row * per_row..(row + 1) * per_row]
 }
 
 fn gather_ple_rows(
@@ -3534,16 +3655,47 @@ fn gather_ple_rows(
             let (tinfo, sb) = st
                 .bytes(&name)
                 .ok_or_else(|| GpuModelError::Unsupported(format!("{name}: missing")))?;
-            if tinfo.dtype != StDtype::F8E4m3 {
-                return Err(GpuModelError::Unsupported(format!(
-                    "{name}: dtype {:?}, want F8E4m3",
-                    tinfo.dtype
-                )));
-            }
-            let row = &sb[local * width..(local + 1) * width];
             let dst = t * c.ple_embed + hh * width;
-            for (i, &byte) in row.iter().enumerate() {
-                out[dst + i] = rq::e4m3_to_f32(byte) * ple.table_scale;
+            match tinfo.dtype {
+                // FP8 table: e4m3 bytes, one scalar for the whole tensor
+                StDtype::F8E4m3 => {
+                    let row = &sb[local * width..(local + 1) * width];
+                    for (i, &byte) in row.iter().enumerate() {
+                        out[dst + i] = rq::e4m3_to_f32(byte) * ple.table_scale;
+                    }
+                }
+                // NVFP4 table: e2m1 nibbles with per-16 e4m3 group scales in a
+                // companion plane, times the tensor's global f32. Decoded
+                // through `Nvfp4View`, which is the same reference decode the
+                // expert seats validate against - low nibble is the even
+                // element, and the group scale is a second level, not a
+                // replacement for the global one.
+                StDtype::U8 => {
+                    let sname = format!("{name}_scale");
+                    let (st_i, scb) = st.bytes(&sname).ok_or_else(|| {
+                        GpuModelError::Unsupported(format!("{sname}: missing (NVFP4 table)"))
+                    })?;
+                    if st_i.dtype != StDtype::F8E4m3 {
+                        return Err(GpuModelError::Unsupported(format!(
+                            "{sname}: dtype {:?}, want F8E4m3 group scales",
+                            st_i.dtype
+                        )));
+                    }
+                    let view = paddock_models::modelopt::Nvfp4View {
+                        packed: scb_slice(sb, local, width / 2),
+                        scales: scb_slice(scb, local, width / 16),
+                        scale2: ple.table_scale,
+                        n: 1,
+                        k: width,
+                    };
+                    let vals = view.dequant_row_f32(0);
+                    out[dst..dst + width].copy_from_slice(&vals);
+                }
+                other => {
+                    return Err(GpuModelError::Unsupported(format!(
+                        "{name}: dtype {other:?}, want F8E4m3 (FP8 table) or U8 (NVFP4 table)"
+                    )));
+                }
             }
         }
     }
@@ -4381,7 +4533,7 @@ fn attn_pass(
         )?;
         e.side_join()?;
     } else {
-        // Close the window BEFORE the q matmul: attn-qmm opened at whatever
+        // Close the window before the q matmul: attn-qmm opened at whatever
         // lap last closed before this function, so it billed the layer's
         // pre-attention work too. With this, attn-qmm is the q GEMM and the
         // activation quantize `kq_matmul` runs inside it - and nothing else -
@@ -4402,7 +4554,7 @@ fn attn_pass(
             w.v.matmul(e, &sc.d_bi, &mut sc.d_v, n, stage)?;
         }
         // Split the projections from the passes that follow them: attn-qkv is
-        // 1.62 ms a layer and holds THREE narrow GEMMs plus six full-plane
+        // 1.62 ms a layer and holds three narrow GEMMs plus six full-plane
         // passes (split, 2 norms, 2 mrope, 2 append), and which half carries
         // the cost decides whether the lever is a fused-QKV plane (concat_q8 +
         // one wide GEMM) or a fused post-pass (the slot-309 shape).
@@ -4744,7 +4896,7 @@ const MOE_DOWN_CHUNK: usize = 256;
 /// was never priced at those widths: the GB10 kernel bench
 /// (`bench/fnmoe_gb10_bench.cu`, 2026-09-12, UD-IQ3_XXS shape, DRAM-cold) read
 /// the production pair at 62.1 us / 148 GB/s at c1 and 496 us / 149 GB/s at c8
-/// against `_cols` at 103-162 us and 766-1131 us - slower at BOTH widths - and
+/// against `_cols` at 103-162 us and 766-1131 us - slower at both widths - and
 /// the verify-walk phase census (2026-09-14) showed the down growing 3.5 ->
 /// 9.8 -> 19.3 -> 37.7 ms/walk at 1/2/4/8 rows, where the gate_up pair beside
 /// it grew 4.3 -> 7.6 -> 13.6 -> 24.7. The two kernels are bit-exact, so this
@@ -4765,8 +4917,26 @@ fn down_cols_min_rows() -> usize {
 /// Blocks a `pd_moe_align_bm(bm)` layout needs for `rows` routed pairs over
 /// `n_expert` experts: every expert rounds its own count up to a whole block,
 /// so the worst case is one partial block per expert on top of the rows.
+///
+/// Clamped to `rows`, which is the other bound and the binding one whenever a
+/// launch touches fewer experts than the pool holds. An expert that takes no
+/// row contributes no block (pd_moe_align_kernel scans ceil(count/bm), which
+/// is 0 at count 0), and a present expert contributes at most its own count,
+/// so the total can never exceed `rows`. Without the clamp a 35-row verify
+/// batch over 512 experts asks for a 452-block grid to run 26 blocks of work -
+/// the count is only a grid/allocation bound, but an unclamped one makes
+/// the grouped arm look absurd at decode widths and is why it was only ever
+/// elected for prefill. Prefill is unaffected (at 2050 rows the first term
+/// already wins).
+/// Widest token wave the W4A4 routed pair will serve, set by what its
+/// partials plane costs: n * (k+1) * hidden f32, which at 512 tokens, top-10
+/// and hidden 2560 is 57.7 MB. Full width (max_tokens 4096) would be 461 MB
+/// of the KV pool's headroom for an arm that only runs at prefill, and the
+/// GEMV above this is correct, just slower.
+const NVF4_BS_MAX_ROWS: usize = 512;
+
 fn grp_align_blocks(rows: usize, n_expert: usize, bm: usize) -> usize {
-    (rows + n_expert * (bm - 1)).div_ceil(bm)
+    (rows + n_expert * (bm - 1)).div_ceil(bm).min(rows)
 }
 
 /// Whether the mix `w` reads its normalized state through the rebuild
@@ -4861,6 +5031,104 @@ fn gdn_walk_rows(
     Ok(())
 }
 
+/// Counts how many distinct experts a routed launch actually touches, against
+/// the `rows` windows the pair kernel will unpack.
+///
+/// Asked of the speculative verify batch specifically. `kq_moe_routed`'s
+/// grouped arm is gated on `rows > n_expert` because at decode widths the
+/// rows are assumed to spread thin over 512 experts - true when the rows are
+/// unrelated, which is every ordinary decode. A depth-K verify batch is the
+/// one decode shape where they are not unrelated: K+1 consecutive positions
+/// of one sentence, and MoE routing is known to correlate between adjacent
+/// tokens. If it correlates here, every duplicate is a weight window the pair
+/// kernel unpacks twice and a fetch we already paid for.
+///
+/// Bucketed by width, because an aggregate over a serving run is worthless
+/// here: a prefill launch carries n~128 rows and collides ~63% by chance
+/// (1280 draws over 512 experts), so it swamps the decode launches that the
+/// question is about AND it already takes the grouped arm. Only the 2..=8
+/// bucket is the speculative verify.
+///
+/// Dev instrument (`PADDOCK_Q38FN_ROUTE_CENSUS=1`): it syncs the stream and
+/// copies the index plane every launch, so a census run is not a timing run.
+fn route_census(e: &GpuExecutor, sc: &Scratch, n: usize, k: usize) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("PADDOCK_Q38FN_ROUTE_CENSUS").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    // batch 1 has nothing to share
+    if n < 2 {
+        return;
+    }
+    let rows = n * k;
+    let Ok(idx) = e.to_host_u32(&sc.d_idx) else {
+        return;
+    };
+    let Some(ids) = idx.get(..rows) else { return };
+    let mut seen_all = ids.to_vec();
+    seen_all.sort_unstable();
+    let mut seen = seen_all.clone();
+    seen.dedup();
+    // the widest single expert in this launch: separates "a few hot experts"
+    // from "uniformly a bit denser", which decides whether a compacted CSR
+    // gets stragglers
+    let mut hottest = 1usize;
+    {
+        let mut run = 1usize;
+        let v = &seen_all;
+        for i in 1..v.len() {
+            if v[i] == v[i - 1] {
+                run += 1;
+                if run > hottest {
+                    hottest = run;
+                }
+            } else {
+                run = 1;
+            }
+        }
+    }
+    // 0: n 2..=8 (the speculative verify band), 1: 9..=32, 2: >32 (prefill)
+    let b = if n <= 8 {
+        0
+    } else if n <= 32 {
+        1
+    } else {
+        2
+    };
+    static LAUNCH: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static ROWS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static UNIQ: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static WIDTH: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static HOT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    LAUNCH[b].fetch_add(1, Relaxed);
+    ROWS[b].fetch_add(rows as u64, Relaxed);
+    UNIQ[b].fetch_add(seen.len() as u64, Relaxed);
+    WIDTH[b].fetch_add(n as u64, Relaxed);
+    HOT[b].fetch_add(hottest as u64, Relaxed);
+    let t = TOTAL.fetch_add(1, Relaxed) + 1;
+    if t.is_multiple_of(4800) {
+        for (i, tag) in ["spec n2-8", "dec n9-32", "prefill  "].iter().enumerate() {
+            let l = LAUNCH[i].load(Relaxed);
+            if l == 0 {
+                continue;
+            }
+            let (r, u) = (ROWS[i].load(Relaxed) as f64, UNIQ[i].load(Relaxed) as f64);
+            eprintln!(
+                "[route-census] {tag} launches {l:>7} mean_n {:>6.2} mean_rows {:>7.1} \
+                 mean_uniq {:>7.1} re-unpacks {:>5.1}% hottest_expert {:.2} rows",
+                WIDTH[i].load(Relaxed) as f64 / l as f64,
+                r / l as f64,
+                u / l as f64,
+                100.0 * (1.0 - u / r),
+                HOT[i].load(Relaxed) as f64 / l as f64,
+            );
+        }
+    }
+}
+
 fn kq_moe_routed(
     e: &GpuExecutor,
     c: &Qwen4ExpConfig,
@@ -4873,6 +5141,7 @@ fn kq_moe_routed(
 ) -> Result<(), GpuModelError> {
     let (h, k, ff) = (c.hidden, c.n_active, c.moe_ff);
     let rows = n * k;
+    route_census(e, sc, n, k);
     // Expert-major prefill: more routed rows than slots, and the pack has
     // the wave kernels. Bytes moved are bounded by one pass over the experts
     // this launch touches (<= n_expert x slot bytes per layer), never by the
@@ -4918,8 +5187,21 @@ fn kq_moe_routed(
     // rows <= n_expert (every decode width here) the group holds one row and
     // the two kernels do exactly the same work, so the pair kernel keeps the
     // narrow band where its grid is the simpler one.
+    // ...and at decode widths too when the rows are correlated, which is what
+    // a speculative verify batch is: K+1 consecutive positions of one
+    // sentence. The `rows > n_expert` bound above reads as "only a prefill can
+    // share", and that is true of unrelated rows - at top-10 of 512, four
+    // independent rows collide 2.5% of the time. Measured in serving on this
+    // family (route_census, 23040 launches, syn_128x128_c1, 2026-09-19): the
+    // n 2..=8 band runs 35.5 rows to 26.3 distinct experts, i.e. 26.0% of the
+    // windows the pair kernel unpacks are re-unpacks - 10x chance - and the
+    // hottest expert in a launch takes 2.89 of the 3.55 rows. The dedup grows
+    // with width (n 9..=32: 181.4 rows to 52.2 uniq, 71.2%), which is the
+    // interesting part, because expert fetch is the only term that scales
+    // with speculative depth and is the whole reason `spec_depth_cap` is
+    // pinned at 3 while the row budget asks for 7.
     let grp = (cache.is_none()
-        && rows > c.n_expert
+        && (rows > c.n_expert || super::moe_grp_decode_on())
         && super::moe_grp_enabled()
         && e.has_kquant_moe_grp()
         && e.has_moe_align_bm())
@@ -5553,35 +5835,106 @@ fn moe_pass(
     let fused = false;
     match &w.seats {
         ExpertSeats::Nvf4 { gate, up, down } => {
-            e.q4x_moe_gu_swiglu(gate, up, &sc.d_idx, &sc.d_bi, &mut sc.d_act, k, n)?;
-            // z-split + deterministic combine (ncu: warp-per-row is CTA-starved;
-            // ascending-z init-fold == the serial walk's exact order)
-            let zs = n <= 64;
-            if zs {
-                e.nvf4_moe_down_acc(
-                    down,
+            // W4A4 PREFILL arm (slot 631 + 408): the checkpoint quantizes the
+            // routed experts at `input_activations` 4-bit, and the GEMV below
+            // serves them W4A16 off f32 - GEMV cost for precision the export
+            // was never quantized at. The bs pair is BM=32 token columns, so
+            // it is the PREFILL geometry by construction: at decode routing a
+            // 32-wide block is ~7.5% live (measured for the _st arm), which is
+            // why the width gate is here and the decode tick keeps the GEMV
+            // until the BM=8 tiled twin exists.
+            let rows = n * k;
+            // `nvf4_moe_down_bs` lands per-(token, slot) partials at
+            // part[(tok*np + slot)*embd], so it needs n * (k+1) * hidden
+            // floats. `d_moe_part` is a DECODE-BAND buffer (64 rows x the
+            // z-split's halved slots) and a 128-token prefill overruns it 4x -
+            // measured as CUDA_ERROR_ILLEGAL_ADDRESS on the first serve where
+            // this arm actually ran. The bench never saw it because it
+            // allocates its own part. Refuse rather than scribble: the pair
+            // wants a chunked partials plane of its own (nemotron sizes one
+            // per chunk), which is the work this arm is waiting on.
+            let part_need = n * (k + 1) * h;
+            let bs = n >= super::nvf4_bs_min_rows()
+                && e.has_nvf4_moe_gu_swiglu_bs()
+                && e.has_nvf4_moe_bs()
+                && c.hidden.is_multiple_of(32)
+                && c.moe_ff.is_multiple_of(16)
+                && sc.d_nvf4_part.len() >= part_need;
+            if bs {
+                let nb = grp_align_blocks(rows, c.n_expert, 32);
+                e.moe_align(
                     &sc.d_idx,
-                    &sc.d_topw,
-                    &sc.d_act,
-                    &mut sc.d_mix,
-                    Some(&mut sc.d_moe_part),
-                    k,
+                    &mut sc.d_srow32,
+                    &mut sc.d_sslot32,
+                    &mut sc.d_bexp32,
                     n,
-                    false,
+                    k,
+                    c.n_expert,
+                    nb,
                 )?;
-                e.moe_slot_combine_init(&sc.d_moe_part, &mut sc.d_mix, h, k.div_ceil(2), n)?;
+                e.quantize_nvf4(&sc.d_bi, &mut sc.d_xq4, &mut sc.d_xs4, n * h)?;
+                e.nvf4_moe_gu_swiglu_bs(
+                    gate,
+                    up,
+                    &sc.d_srow32,
+                    &sc.d_bexp32,
+                    &sc.d_xq4,
+                    &sc.d_xs4,
+                    &mut sc.d_nfq,
+                    &mut sc.d_nfs,
+                    nb,
+                )?;
+                e.nvf4_moe_down_bs(
+                    down,
+                    &sc.d_srow32,
+                    &sc.d_sslot32,
+                    &sc.d_bexp32,
+                    Some(&sc.d_topw),
+                    &sc.d_nfq,
+                    &sc.d_nfs,
+                    &mut sc.d_nvf4_part,
+                    k,
+                    k + 1,
+                    0,
+                    nb,
+                )?;
+                // the INIT twin: residual = sum. The plain `moe_slot_combine`
+                // ACCUMULATES, so using it here added every layer's MoE on top
+                // of the previous layer's stale d_mix - coherent-looking text
+                // that drifts from the GEMV arm on every prompt. The GEMV path
+                // beside this one has always used _init.
+                e.moe_slot_combine_init(&sc.d_nvf4_part, &mut sc.d_mix, h, k + 1, n)?;
             } else {
-                e.nvf4_moe_down_acc(
-                    down,
-                    &sc.d_idx,
-                    &sc.d_topw,
-                    &sc.d_act,
-                    &mut sc.d_mix,
-                    None,
-                    k,
-                    n,
-                    false,
-                )?;
+                e.q4x_moe_gu_swiglu(gate, up, &sc.d_idx, &sc.d_bi, &mut sc.d_act, k, n)?;
+                // z-split + deterministic combine (ncu: warp-per-row is CTA-starved;
+                // ascending-z init-fold == the serial walk's exact order)
+                let zs = n <= 64;
+                if zs {
+                    e.nvf4_moe_down_acc(
+                        down,
+                        &sc.d_idx,
+                        &sc.d_topw,
+                        &sc.d_act,
+                        &mut sc.d_mix,
+                        Some(&mut sc.d_moe_part),
+                        k,
+                        n,
+                        false,
+                    )?;
+                    e.moe_slot_combine_init(&sc.d_moe_part, &mut sc.d_mix, h, k.div_ceil(2), n)?;
+                } else {
+                    e.nvf4_moe_down_acc(
+                        down,
+                        &sc.d_idx,
+                        &sc.d_topw,
+                        &sc.d_act,
+                        &mut sc.d_mix,
+                        None,
+                        k,
+                        n,
+                        false,
+                    )?;
+                }
             }
         }
         ExpertSeats::Kq {
@@ -5724,6 +6077,9 @@ impl Scratch {
         // is ~15 KB per token of max_ctx (2 GB at 128k), so it is a stub there
         kq_lanes: bool,
     ) -> Result<Self, GpuModelError> {
+        // the safetensors lane is the one that seats NVFP4 routed experts,
+        // which is the only seat the W4A4 pair (slot 631) can read
+        let nvf4_lane = !kq_lanes;
         let (h, hw, hc) = (c.hidden, c.hc_width(), c.hc_count);
         let kv_dim = c.n_kv_heads * c.head_dim;
         let q_dim = c.n_heads * c.head_dim;
@@ -5867,17 +6223,42 @@ impl Scratch {
             } else {
                 1
             })?,
-            d_srow32: e.alloc_u32(if kq_lanes {
+            // W4A4 routed arm (slot 631), PREFILL widths only: the activation
+            // pair and the pair's nvf4 intermediate. Sized on the nvf4 seat,
+            // so a k-quant lane pays one byte each.
+            d_xq4: e.alloc_i8(if nvf4_lane { t * c.hidden / 2 } else { 1 })?,
+            d_xs4: e.alloc_u8(if nvf4_lane { t * c.hidden / 16 } else { 1 })?,
+            d_nfq: e.alloc_u8(if nvf4_lane {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32 * (c.moe_ff / 2)
+            } else {
+                1
+            })?,
+            d_nfs: e.alloc_u8(if nvf4_lane {
+                grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32 * (c.moe_ff / 16)
+            } else {
+                1
+            })?,
+            d_nvf4_part: e.alloc(if nvf4_lane {
+                t.min(NVF4_BS_MAX_ROWS) * (c.n_active + 1) * h
+            } else {
+                1
+            })?,
+            d_srow32: e.alloc_u32(if kq_lanes || nvf4_lane {
                 grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32
             } else {
                 1
             })?,
-            d_sslot32: e.alloc_u32(if kq_lanes {
+            // the W4A4 pair reads the SAME bm=32 CSR, so all THREE planes
+            // follow the same condition - changing only `d_srow32` left these
+            // two at length 1 on the safetensors lane while moe_align wrote
+            // nb*32 and nb entries into them (the second illegal address this
+            // arm produced)
+            d_sslot32: e.alloc_u32(if kq_lanes || nvf4_lane {
                 grp_align_blocks(t * c.n_active, c.n_expert, 32) * 32
             } else {
                 1
             })?,
-            d_bexp32: e.alloc_u32(if kq_lanes {
+            d_bexp32: e.alloc_u32(if kq_lanes || nvf4_lane {
                 grp_align_blocks(t * c.n_active, c.n_expert, 32)
             } else {
                 1
@@ -6168,11 +6549,39 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         self.mtp.is_some() && self.exec.has_argmax_rows()
     }
 
+    /// Per-tick: keep feeding the draft head only while speculation is the
+    /// plan for this width. Stashing every decode row and draining it through
+    /// a head pass is most of the cost of having a drafter attached at all -
+    /// at 8 live slots it was 19 ms of a 45 ms tick that no round consumed.
+    fn spec_fuse_hint(&mut self, on: bool) {
+        if let Some(m) = self.mtp.as_mut() {
+            m.feed = on;
+        }
+    }
+
+    /// Same question for the eager prefill seed.
+    fn spec_warm_hint(&mut self, on: bool) {
+        if let Some(m) = self.mtp.as_mut() {
+            m.warm_prefills = on;
+        }
+    }
+
     fn forward_spec_batch(
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, crate::generator::GenError> {
         self.verify_round(reqs).map_err(q4x_gen_err)
+    }
+
+    /// The sampled twin: every verify row drawn on device from its own plan.
+    /// Without it a temperature > 0 serve never speculated at all - see
+    /// `verify_round_plans` for the exactness argument and what it measured.
+    fn forward_spec_batch_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<u32>>, crate::generator::GenError> {
+        self.verify_round_plans(reqs, plans).map_err(q4x_gen_err)
     }
 
     fn spec_draft_batch(
@@ -6202,9 +6611,70 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         Ok(self.mtp_warm(slot, want_pos as usize + 1))
     }
 
+    /// Depth 3, elected in serving - the row budget asks for 7 at one live
+    /// slot and this family cannot repay it.
+    ///
+    /// Every extra verify row costs a full per-row pass over the routed
+    /// experts it touches, while the tokens it returns grow only with
+    /// acceptance. GB10, code prompt, greedy, MTP head attached, decode-only
+    /// tok/s with TTFT excluded (2026-09-19):
+    ///
+    ///   depth 1   29.95 median of 5   (acceptance 90.2%)
+    ///   depth 3   33.95 median of 3   (acceptance 81.2%)   ELECTED
+    ///
+    /// Depth 7 - what the row budget asks for at one live slot - was capped
+    /// here without ever being measured until 2026-09-20, when the line above
+    /// said only that this family "cannot repay it". It does not: on
+    /// syn_128x128_c1, 3 reps each, depth 3 medians 30.45 (30.45/32.12/30.01)
+    /// against depth 7's 26.70 (26.70/27.23/23.73), -12.3%, losing every rep.
+    /// A/B it with `PADDOCK_Q38FN_SPEC_DEPTH`.
+    ///
+    /// Why it loses is worth keeping, because the original reasoning here was
+    /// wrong in a way that invites re-litigation. It used to say each extra
+    /// row "re-streams" its experts; it does not - the rows of a verify batch
+    /// share experts ~10x more than chance (26.3 distinct of 35.5 rows,
+    /// measured in serving) and L2 banks ~41% of that for free, so the bytes
+    /// are largely not re-read. The cost is per-row unpack on the i-quant
+    /// seat, which no routing trick removes (priced on the seat formats,
+    /// 2026-09-20), and on top of it the dense side is not flat in n either:
+    /// GDN's per-token recurrence, attention over the wider batch and the K
+    /// sequential MTP draft passes all grow with depth. Two terms growing
+    /// against an acceptance curve that decays is why deeper does not pay.
+    ///
+    /// Elect this in serving, not in the harness. `examples/q38fn_spec_bench`
+    /// prices the same depths at 31.60 (d1) against 28.09 (d3) - it inverts
+    /// the ordering, and an earlier cut of this election took its answer and
+    /// shipped depth 1. The harness is a bare loop over draft + verify and
+    /// says so itself ("its numbers are never a serving cell"); a serving
+    /// round also carries the state save, the rollback bookkeeping, the accept
+    /// walk and the stream, and those are per-ROUND costs that a deeper draft
+    /// amortizes over more committed tokens. Acceptance moves the other way
+    /// (a single draft is easier to hit) and is not the thing to maximize -
+    /// tokens per round against the round's real cost is.
+    ///
+    /// Re-measure in serving when the verify row's cost moves (the
+    /// routed-expert seat, the expert byte count, the walk's kernel election).
+    fn spec_depth_cap(&self) -> Option<usize> {
+        Some(super::spec_depth_override().unwrap_or(3))
+    }
+
     /// The drafter decides warmth per slot (a cold slot gets an empty draft
     /// list and rides the verify as a one-row chunk).
     fn spec_draft_per_slot_warm(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Canonical rejection sampling: armed only when the head's RS buffers
+    /// exist, which needs PADDOCK_SPEC_RS *and* a pack carrying both kernels
+    /// (`mtp::RsBufs`). Answering truthfully is load-bearing - the service
+    /// stashes chain draws exactly when this is true, and a backend that
+    /// claimed the arm without the buffers would take sampled rounds it cannot
+    /// resolve and emit the wrong distribution.
+    fn supports_spec_rs(&self) -> bool {
+        self.mtp.as_ref().is_some_and(|m| m.rs.is_some())
+    }
+
+    fn spec_rs_stash(&mut self, draws: Vec<crate::generator::SpecRsDraw>) {
+        self.spec_rs_draws = Some(draws);
     }
 }

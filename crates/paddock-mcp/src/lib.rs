@@ -123,7 +123,15 @@ impl McpClient {
                 // constructor takes the uri and the rest stays at its defaults.
                 let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
                 config.custom_headers = custom;
-                let transport = StreamableHttpClientTransport::from_config(config);
+                config.max_sse_event_size = 4 * 1024 * 1024;
+                // Credential-bearing MCP requests must never follow redirects
+                // to an unreviewed destination, including custom API-key headers.
+                let client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(8))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|_| McpError::Transport("HTTP client unavailable".into()))?;
+                let transport = StreamableHttpClientTransport::with_client(client, config);
                 ().serve(transport)
                     .await
                     .map_err(|e| McpError::Service(e.to_string()))?
@@ -138,11 +146,39 @@ impl McpClient {
 
     /// Discover the server's tools.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
-        let tools = self
-            .service
-            .list_all_tools()
-            .await
-            .map_err(|e| McpError::Service(e.to_string()))?;
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut total_bytes = 0usize;
+        for page in 0..64 {
+            let mut params = rmcp::model::PaginatedRequestParams::default();
+            params.cursor = cursor;
+            let response = self
+                .service
+                .list_tools(Some(params))
+                .await
+                .map_err(|e| McpError::Service(e.to_string()))?;
+            total_bytes = total_bytes.saturating_add(
+                serde_json::to_vec(&response)
+                    .map_err(|_| McpError::Service("Invalid tool listing".into()))?
+                    .len(),
+            );
+            if tools.len() + response.tools.len() > 4096 || total_bytes > 16 * 1024 * 1024 {
+                return Err(McpError::Service(
+                    "Tool listing exceeds the 4096-tool / 16 MiB limit".into(),
+                ));
+            }
+            tools.extend(response.tools);
+            cursor = response.next_cursor;
+            let Some(next) = &cursor else {
+                break;
+            };
+            if page == 63 || !seen.insert(next.clone()) {
+                return Err(McpError::Service(
+                    "Tool listing pagination did not terminate".into(),
+                ));
+            }
+        }
         Ok(tools
             .into_iter()
             .map(|t| McpTool {

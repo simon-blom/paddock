@@ -1,4 +1,4 @@
-// Tests for the compaction DEADLINE (lib/compact.ts).
+// Tests for the compaction deadline (lib/compact.ts).
 //
 // Background compaction takes a per-conversation slot in `inflight` before it
 // POSTs and gives it back only when the request has settled. Without a
@@ -7,16 +7,16 @@
 // the tab: every later turn sees the conversation as already compacting and
 // the thread silently stops rolling its summary forward.
 //
-// So the contract exercised here is: the call is BOUNDED, the bound covers
-// response headers AND the response body, a call that gives up leaves the
+// So the contract exercised here is: the call is bounded, the bound covers
+// response headers and the response body, a call that gives up leaves the
 // summary and the raw history exactly as they were, and the slot comes back so
 // a later turn retries. Nothing here sleeps - the deadline is driven with
 // Vitest's fake timers - and no request leaves the process: `fetch` and the
 // models store (the endpoint lookup) are the only mocked boundaries.
 //
 // DEADLINE_MS below mirrors COMPACTION_TIMEOUT_MS in compact.ts. That number
-// is a proposed retry bound, not a measured optimum; maintainers should
-// review it against representative compaction latencies.
+// is a hang guard, not a measured optimum: long enough for a slow prefill,
+// short enough that a stalled request gives the slot back.
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Conversation, Message } from '@/types/chat'
@@ -33,7 +33,7 @@ vi.mock('@/stores/models', () => ({
 import { maybeCompact } from './compact'
 
 /** The whole-call budget compact.ts is expected to enforce. */
-const DEADLINE_MS = 5 * 60_000
+const DEADLINE_MS = 10 * 60_000
 const MAX_CTX = 4096
 const MAX_REPLY = 512
 
@@ -137,7 +137,7 @@ function never<T>(): Promise<T> {
   return new Promise<T>(() => {})
 }
 
-/** Resolve `value` after `ms` of FAKE time. */
+/** Resolve `value` after `ms` of fake time. */
 function after<T>(ms: number, value: T): Promise<T> {
   return new Promise<T>((resolve) => {
     setTimeout(() => resolve(value), ms)
@@ -153,7 +153,7 @@ function track(p: Promise<unknown>): { done: boolean } {
   return s
 }
 
-/** Hand the clock back and let one REAL macrotask run: an unhandled rejection
+/** Hand the clock back and let one real macrotask run: an unhandled rejection
  *  is reported by the runtime on a real tick, so a faked clock cannot see one.
  *  Called only once a test has finished advancing fake time. */
 async function flushReal(): Promise<void> {
@@ -182,7 +182,7 @@ function lastSignal(): AbortSignal {
 
 /** A rejection nobody handled is how "the losing race branch was left
  *  dangling" shows up, so the tests watch for one. Reached through globalThis
- *  because this tree's tsconfig types the BROWSER: `process` is the test
+ *  because this tree's tsconfig types the browser: `process` is the test
  *  runner's, not the app's. */
 type RejectionWatcher = {
   on: (event: 'unhandledRejection', fn: (reason: unknown) => void) => void
@@ -283,7 +283,7 @@ describe('maybeCompact deadline', () => {
 
     await vi.advanceTimersByTimeAsync(240_000)
     expect(call.done).toBe(false)
-    // the remaining minute of the ONE budget, not a fresh one per phase
+    // the remaining minute of the one budget, not a fresh one per phase
     await vi.advanceTimersByTimeAsync(DEADLINE_MS - 240_000 - 1)
     expect(call.done).toBe(false)
     await vi.advanceTimersByTimeAsync(1)

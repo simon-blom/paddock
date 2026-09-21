@@ -9,6 +9,8 @@
  *  of the artifact and neither needs the whole type to ask this. */
 export interface ArchFloor {
   min_cc?: [number, number]
+  backend_supported?: boolean
+  runtime?: { backends?: string[] }
 }
 
 /** The generation NAME for a floor, because "Needs a Blackwell GPU" is what a
@@ -21,6 +23,7 @@ const GEN_FOR_CC: Record<string, string> = { '12.0': 'a Blackwell GPU' }
  *  no `cc` (silicon we do not recognise), makes no claim: the engine already
  *  warns on an unvalidated arch, so a guess here would be noise. */
 export function archBlocked(a: ArchFloor, cc: [number, number] | undefined): boolean {
+  if (a.backend_supported === false) return true
   const need = a.min_cc
   if (!need || !cc) return false
   return cc[0] < need[0] || (cc[0] === need[0] && cc[1] < need[1])
@@ -32,6 +35,11 @@ export function archBlockReason(
   a: ArchFloor,
   cc: [number, number] | undefined,
 ): string | null {
+  if (a.backend_supported === false) {
+    return a.runtime?.backends?.length === 1 && a.runtime.backends[0] === 'metal'
+      ? 'Needs macOS on Apple Silicon (Metal runner)'
+      : 'Not supported by this runner backend'
+  }
   if (!archBlocked(a, cc)) return null
   const need = a.min_cc as [number, number]
   return `Needs ${GEN_FOR_CC[need.join('.')] ?? `compute ${need.join('.')}`}`

@@ -132,16 +132,28 @@ pub enum AudioFrontend {
     None,
     /// transformers `Qwen3ASRFeatureExtractor` (whisper-derived)
     Qwen3Asr,
+    /// Same author frontend, bounded by the native Metal tower's admission.
+    Qwen3AsrMetal,
     /// transformers `GraniteSpeechFeatureExtractor` (torchaudio-derived)
     GraniteSpeech,
+    /// Same extractor, bounded by the experimental native Metal tower.
+    GraniteSpeechMetal,
 }
 
 impl AudioFrontend {
     /// Run this frontend over a 16 kHz mono clip.
     pub fn features(self, samples: &[f32]) -> Result<paddock_engine::audio::MelFeatures, String> {
         match self {
-            AudioFrontend::Qwen3Asr => paddock_engine::audio::qwen3_asr_features(samples),
-            AudioFrontend::GraniteSpeech => {
+            AudioFrontend::Qwen3AsrMetal if samples.len() > 120 * 16000 => {
+                Err("Qwen3-ASR Metal clip exceeds the 120-second implementation limit".into())
+            }
+            AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal => {
+                paddock_engine::audio::qwen3_asr_features(samples)
+            }
+            AudioFrontend::GraniteSpeechMetal if samples.len() > 120 * 16000 => {
+                Err("Granite Speech Metal clip exceeds the 120-second implementation limit".into())
+            }
+            AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
                 paddock_engine::audio::granite::speech_features(samples)
             }
             AudioFrontend::None => Err("this model does not take audio input".into()),
@@ -153,8 +165,10 @@ impl AudioFrontend {
     /// it is the one that will actually bind.
     pub fn prompt_rows(self, len: usize) -> usize {
         match self {
-            AudioFrontend::Qwen3Asr => paddock_engine::audio::audio_tokens_for_samples(len),
-            AudioFrontend::GraniteSpeech => {
+            AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal => {
+                paddock_engine::audio::audio_tokens_for_samples(len)
+            }
+            AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
                 paddock_engine::audio::granite::audio_tokens_for_samples(len)
             }
             AudioFrontend::None => 0,
@@ -182,7 +196,17 @@ impl AudioFrontend {
         // 24 h is a ceiling for the search, not a promise - anything near it
         // means the context is enormous and the answer stops being the binding
         // constraint anyway.
-        let (mut lo, mut hi) = (0usize, rate * 60 * 60 * 24);
+        let (mut lo, mut hi) = (
+            0usize,
+            if matches!(
+                self,
+                AudioFrontend::GraniteSpeechMetal | AudioFrontend::Qwen3AsrMetal
+            ) {
+                rate * 120
+            } else {
+                rate * 60 * 60 * 24
+            },
+        );
         if self.prompt_rows(hi) <= rows {
             return Some(hi as f64 / rate as f64);
         }
@@ -234,6 +258,8 @@ pub struct EmbedModel {
 /// own thread seam rather than the generative `Engine`, the same way the
 /// embeddings encoder does.
 pub struct AsrModel {
+    /// Only advertise the teacher-forced alignment pass when this backend implements it.
+    pub word_times: bool,
     pub id: String,
     pub transcriber: Transcriber,
     pub tokenizer: Arc<GgufTokenizer>,
@@ -254,6 +280,16 @@ pub struct AsrModel {
     pub metrics: Arc<paddock_engine::metrics::EngineMetrics>,
 }
 
+impl AsrModel {
+    pub fn timestamp_granularities(&self) -> serde_json::Value {
+        if self.word_times {
+            serde_json::json!(["segment", "word"])
+        } else {
+            serde_json::json!(["segment"])
+        }
+    }
+}
+
 /// The forced-alignment served model (Qwen3-ForcedAligner):
 /// serves `/v1/audio/alignments` only. Like the embeddings encoder it is a
 /// single-forward lane on its own thread seam - audio + transcript in, word
@@ -270,7 +306,8 @@ pub struct AlignModel {
     pub segment_ms: f32,
     /// the packing ceiling - audio rows + word tokens + timestamp slots
     pub max_ctx: usize,
-    /// bin count × bin width = the longest clip a single call can address
+    pub mel_policy: paddock_engine::audio::MelPolicy,
+    /// Effective backend clip ceiling, no greater than bin count × bin width.
     pub max_clip_s: f32,
 }
 
@@ -292,6 +329,79 @@ pub fn aligner_dir(path: &Path) -> Option<std::path::PathBuf> {
     paddock_models::safetensors::AlignerConfig::read(&dir.join("config.json"))
         .ok()
         .map(|_| dir.to_path_buf())
+}
+
+/// The dense-prediction served model (tic-forestry-v1: DINOv3 + a multi-scale
+/// decoder): serves `/v1/segmentations` only. Chips in, rasters out - no
+/// tokenizer, no context, no sampling, so the handle is the engine seam and
+/// the checkpoint's own description of its input and output.
+pub struct SegmentModel {
+    pub id: String,
+    pub segmenter: paddock_engine::segment::Segmenter,
+}
+
+/// The dense-prediction checkpoint directory for `path`, if it is one: a dir
+/// whose config.json names this family. Same contract as [`aligner_dir`] -
+/// the directory itself, or the `.safetensors` entry-point file the manager's
+/// spawn path hands every model.
+pub fn segment_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_dir() {
+        path
+    } else if path.extension().is_some_and(|x| x == "safetensors") {
+        path.parent()?
+    } else {
+        return None;
+    };
+    paddock_models::dinov3::Dinov3SegConfig::is_ours(dir).then(|| dir.to_path_buf())
+}
+
+/// Load a dense-prediction model from its checkpoint directory. CUDA only.
+/// `max_batch` is the chips one forward pass takes - the width requests are
+/// coalesced (and short passes padded) to, and what sizes the resident
+/// workspace. It is capped at the engine's elected width: the runner's
+/// server-wide default of 32 is a decode-slot count, and here it would buy
+/// under 2% of throughput for 1.6 GB and a slower lone chip.
+pub fn load_segmenter(
+    id: String,
+    dir: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    max_batch: usize,
+    vram_budget: Option<u64>,
+) -> Result<SegmentModel, ServeError> {
+    if device != "cuda" {
+        return Err(ServeError::Engine(format!(
+            "dense-prediction models need cuda (got {device:?})"
+        )));
+    }
+    // parse here first so a malformed config is an Open error naming the
+    // directory, not an opaque engine-thread string
+    paddock_models::dinov3::Dinov3SegConfig::read(dir)
+        .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+    let pack = pack.map(Path::to_path_buf);
+    let dir_owned = dir.to_path_buf();
+    let segmenter = paddock_engine::segment::Segmenter::spawn(move || {
+        let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+            .map_err(|e| e.to_string())?;
+        note_device_cc(&exec);
+        // the cap is the die's: the pass width this card measured fastest at
+        let max_batch = max_batch.clamp(
+            1,
+            paddock_engine::gpu_model::dinov3::max_pass_width(exec.compute_capability()),
+        );
+        if let Some(b) = vram_budget {
+            exec.set_vram_budget(b);
+        }
+        paddock_engine::gpu_model::dinov3::GpuDinov3Seg::load_dir(
+            Arc::new(exec),
+            &dir_owned,
+            max_batch,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(ServeError::Engine)?;
+    Ok(SegmentModel { id, segmenter })
 }
 
 /// True for architectures Paddock serves as SPEECH-TO-TEXT models - the
@@ -544,7 +654,7 @@ pub fn calib_corpus() -> (Vec<String>, usize, Vec<usize>) {
     (texts, n_docs, rel)
 }
 
-/// Load an encoder-only model (Qwen3 dense). CUDA only.
+/// Load a dense Qwen3 retrieval model through the shared encoder scheduler.
 pub fn load_embedder(
     id: String,
     path: &Path,
@@ -561,9 +671,9 @@ pub fn load_embedder(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
-    if device != "cuda" {
+    if !matches!(device, "cuda" | "metal") {
         return Err(ServeError::Engine(format!(
-            "{arch} encoder needs cuda (got {device:?})"
+            "{arch} encoder needs cuda or metal (got {device:?})"
         )));
     }
     let tokenizer =
@@ -586,7 +696,17 @@ pub fn load_embedder(
     let pack = pack.map(Path::to_path_buf);
     let path = path.to_path_buf();
     let metrics = Arc::new(paddock_engine::metrics::EngineMetrics::default());
-    let encoder = Encoder::spawn(
+    let encoder = if device == "metal" {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if gpu != 0 || pack.is_some() {
+                return Err(ServeError::Engine("Metal encoder uses the system Apple GPU and native kernels; CUDA ordinal/pack is not applicable".into()));
+            }
+            Encoder::spawn(move || paddock_metal::Qwen3Encoder::load(&path, max_ctx, vram_budget).map_err(|e|e.to_string()), Some(Arc::clone(&metrics)))
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        { return Err(ServeError::Engine("this runner has no native Metal encoder".into())); }
+    } else { Encoder::spawn(
         move || {
             let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
                 .map_err(|e| e.to_string())?;
@@ -600,7 +720,7 @@ pub fn load_embedder(
                 .map_err(|e| e.to_string())
         },
         Some(Arc::clone(&metrics)),
-    )
+    ) }
     .map_err(ServeError::Engine)?;
 
     Ok(EmbedModel {
@@ -615,7 +735,7 @@ pub fn load_embedder(
     })
 }
 
-/// Load the forced aligner from its HF checkpoint directory. CUDA only.
+/// Load the forced aligner from its HF checkpoint directory. Native CUDA or Metal.
 /// Special ids are looked up by literal token text in the checkpoint's own
 /// tokenizer.json and CROSS-CHECKED against config.json's stamped ids - a
 /// drifted pair means the packing would silently address the wrong rows.
@@ -628,9 +748,9 @@ pub fn load_aligner(
     max_ctx: usize,
     vram_budget: Option<u64>,
 ) -> Result<AlignModel, ServeError> {
-    if device != "cuda" {
+    if !matches!(device, "cuda" | "metal") {
         return Err(ServeError::Engine(format!(
-            "forced aligner needs cuda (got {device:?})"
+            "forced aligner needs cuda or metal (got {device:?})"
         )));
     }
     let cfg = paddock_models::safetensors::AlignerConfig::read(&dir.join("config.json"))
@@ -656,24 +776,55 @@ pub fn load_aligner(
         )));
     }
     let max_clip_s = cfg.n_labels as f32 * cfg.segment_ms / 1000.0;
+    let max_clip_s = if device == "metal" {
+        max_clip_s.min(120.)
+    } else {
+        max_clip_s
+    };
+    if device == "metal" && (audio_start != 151669 || audio_end != 151670) {
+        return Err(ServeError::Tokenizer(
+            "Metal aligner audio boundary token drift".into(),
+        ));
+    }
 
     let pack = pack.map(Path::to_path_buf);
     let dir_owned = dir.to_path_buf();
-    let aligner = paddock_engine::align::Aligner::spawn(move || {
-        let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
-            .map_err(|e| e.to_string())?;
-        note_device_cc(&exec);
-        if let Some(b) = vram_budget {
-            exec.set_vram_budget(b);
+    let aligner = if device == "metal" {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            if gpu != 0 || pack.is_some() {
+                return Err(ServeError::Engine(
+                    "Metal aligner requires the default Apple GPU and no CUDA pack".into(),
+                ));
+            }
+            paddock_engine::align::Aligner::spawn(move || {
+                paddock_metal::Qwen3Aligner::load(&dir_owned, max_ctx, vram_budget)
+                    .map_err(|e| e.to_string())
+            })
         }
-        paddock_engine::gpu_model::qwen3_asr::GpuQwen3Asr::load_aligner(
-            Arc::new(exec),
-            &dir_owned,
-            max_ctx,
-        )
-        .map(|(m, _meta)| m)
-        .map_err(|e| e.to_string())
-    })
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            return Err(ServeError::Engine(
+                "Metal alignment requires a macOS Metal runner".into(),
+            ));
+        }
+    } else {
+        paddock_engine::align::Aligner::spawn(move || {
+            let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+                .map_err(|e| e.to_string())?;
+            note_device_cc(&exec);
+            if let Some(b) = vram_budget {
+                exec.set_vram_budget(b);
+            }
+            paddock_engine::gpu_model::qwen3_asr::GpuQwen3Asr::load_aligner(
+                Arc::new(exec),
+                &dir_owned,
+                max_ctx,
+            )
+            .map(|(m, _meta)| m)
+            .map_err(|e| e.to_string())
+        })
+    }
     .map_err(ServeError::Engine)?;
 
     Ok(AlignModel {
@@ -686,6 +837,11 @@ pub fn load_aligner(
         timestamp,
         segment_ms: cfg.segment_ms,
         max_ctx,
+        mel_policy: if device == "metal" {
+            paddock_engine::audio::MelPolicy::Qwen3Aligner
+        } else {
+            paddock_engine::audio::MelPolicy::Qwen3Asr
+        },
         max_clip_s,
     })
 }
@@ -818,9 +974,13 @@ pub fn load_asr(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if device == "metal" {
+        return load_asr_metal(id, path, max_ctx, max_batch, vram_budget);
+    }
     if device != "cuda" {
         return Err(ServeError::Engine(format!(
-            "{arch} needs cuda (got {device:?})"
+            "{arch} requires native CUDA or Metal (got {device:?})"
         )));
     }
     let tokenizer =
@@ -865,11 +1025,45 @@ pub fn load_asr(
     // the prompt takes four of those rows
     let max_tokens = max_ctx.min(448).saturating_sub(8).max(16);
     Ok(AsrModel {
+        word_times: card.word_times,
         id,
         transcriber,
         metrics,
         tokenizer,
         max_tokens,
+        time_scale: card.time_scale,
+        languages: card.languages,
+    })
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn load_asr_metal(
+    id: String,
+    path: &Path,
+    max_ctx: usize,
+    max_batch: usize,
+    budget: Option<u64>,
+) -> Result<AsrModel, ServeError> {
+    let map =
+        MappedGguf::open(path).map_err(|e| ServeError::Open(path.to_path_buf(), e.to_string()))?;
+    let tokenizer = Arc::new(
+        GgufTokenizer::from_gguf(map.gguf()).map_err(|e| ServeError::Tokenizer(e.to_string()))?,
+    );
+    let metrics = Arc::new(paddock_engine::metrics::EngineMetrics::default());
+    let path = path.to_owned();
+    let (transcriber, card) = Transcriber::spawn(
+        move || paddock_metal::Whisper::load(&path, max_ctx, budget).map_err(|e| e.to_string()),
+        max_batch,
+        Some(Arc::clone(&metrics)),
+    )
+    .map_err(ServeError::Engine)?;
+    Ok(AsrModel {
+        id,
+        transcriber,
+        tokenizer,
+        metrics,
+        word_times: card.word_times,
+        max_tokens: max_ctx.min(448).saturating_sub(8).max(16),
         time_scale: card.time_scale,
         languages: card.languages,
     })
@@ -949,8 +1143,28 @@ pub fn load_with(
     // HF-native lane - no GGUF exists in it, so everything (arch, tokenizer,
     // template, weights) comes from the checkpoint's own files. First family:
     // nemotron_h_moe served straight from the NVFP4 export.
-    if path.is_dir() && path.join("config.json").exists() {
-        return load_hf_dir(id, path, device, gpu, pack, max_ctx, max_batch, vram_budget);
+    if path.is_dir() && (path.join("config.json").exists() || path.join("manifest.json").is_file())
+    {
+        if device == "metal" && (mmproj.is_some() || fp8_native.is_some()) {
+            return Err(ServeError::Open(path.to_path_buf(),
+                "native MLX Metal does not accept GGUF vision/FP8 companions; supported vision towers are embedded in the checkpoint".into()));
+        }
+        if device == "metal" && max_image_tokens.is_some() {
+            tracing::warn!(
+                "native MLX Metal uses the checkpoint's fixed image processor budget; max_image_tokens is not applied"
+            );
+        }
+        return load_hf_dir(
+            id,
+            path,
+            device,
+            gpu,
+            pack,
+            max_ctx,
+            max_batch,
+            vram_budget,
+            if device == "metal" { mtp } else { None },
+        );
     }
     // open once here for tokenizer + metadata; the engine reopens on its thread
     let map =
@@ -1063,7 +1277,11 @@ pub fn load_with(
     // table keyed on `arch` or `dialect`.
     // Read off the template too, not just `arch`: one arch string can cover
     // two incompatible dialects (granite 4.1 JSON vs 4.2 XML+thinking).
-    let dialect = crate::parsers::Dialect::for_arch_and_template(&arch, chat_template.as_deref());
+    let dialect = if granite_audio {
+        crate::parsers::Dialect::Transcript
+    } else {
+        crate::parsers::Dialect::for_arch_and_template(&arch, chat_template.as_deref())
+    };
     // Same split, other axis: what this file publishes for sampling, used only
     // where the arch-keyed table has nothing.
     let published_sampling = paddock_models::sampling::published_in_gguf(map.gguf());
@@ -1123,7 +1341,9 @@ pub fn load_with(
     Ok(ServingModel {
         id,
         spec: SpecReport {
-            heads: arch_has_infile_heads(&arch),
+            heads: arch_has_infile_heads(&arch)
+                && (device != "metal"
+                    || (matches!(arch.as_str(), "qwen35" | "qwen35moe") && mtp.is_none())),
             drafter: mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned())),
         },
         arch: arch.clone(),
@@ -1156,8 +1376,12 @@ pub fn load_with(
         supports_audio: audio_serving,
         audio_frontend: if !audio_serving {
             AudioFrontend::None
+        } else if granite_audio && device == "metal" {
+            AudioFrontend::GraniteSpeechMetal
         } else if granite_audio {
             AudioFrontend::GraniteSpeech
+        } else if device == "metal" {
+            AudioFrontend::Qwen3AsrMetal
         } else {
             AudioFrontend::Qwen3Asr
         },
@@ -1175,10 +1399,9 @@ pub fn load_with(
 }
 
 /// Serve an HF checkpoint directory (safetensors-primary lane).
-/// Arch detection is `config.json`'s `model_type` - currently the one
-/// supported family is `nemotron_h` (nemotron_h_moe / Nemotron 3.5
-/// Lightning); anything else fails loudly rather than guessing a graph.
-/// The tokenizer, decode contract (eos SET -> eos+eot) and chat template all
+/// Arch detection and strict backend-specific validation use `config.json`.
+/// Unknown geometries fail loudly rather than guessing a graph.
+/// The tokenizer, complete terminal-token set and chat template all
 /// come from the checkpoint's own files via `GgufTokenizer::from_hf_dir`.
 #[allow(clippy::too_many_arguments)]
 fn load_hf_dir(
@@ -1190,12 +1413,33 @@ fn load_hf_dir(
     max_ctx: usize,
     max_batch: usize,
     vram_budget: Option<u64>,
+    mtp: Option<&Path>,
 ) -> Result<ServingModel, ServeError> {
+    let splash = dir.join("manifest.json").is_file() && dir.join("target").is_dir();
+    if splash && mtp.is_some_and(|p| p != dir) {
+        return Err(ServeError::Open(
+            dir.to_path_buf(),
+            "Splash packages use their bundled DFlash2 draft".into(),
+        ));
+    }
+    let mtp = if splash { Some(dir) } else { mtp };
+    let tokenizer_dir = if splash {
+        if device != "metal" {
+            return Err(ServeError::Open(
+                dir.to_path_buf(),
+                "Splash packages require the native Metal backend".into(),
+            ));
+        }
+        paddock_models::splash::tokenizer_dir(dir)
+            .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?
+    } else {
+        dir.to_path_buf()
+    };
     // The family comes from the checkpoint's own `model_type`, because in this
     // lane there is no GGUF header to ask. Parsing the config here is also the
     // validation: reaching `build_engine` means the geometry is readable, so a
     // malformed checkpoint fails with its own name rather than inside a loader.
-    let model_type = std::fs::read(dir.join("config.json"))
+    let model_type = std::fs::read(tokenizer_dir.join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| {
@@ -1207,6 +1451,25 @@ fn load_hf_dir(
             ServeError::Open(dir.to_path_buf(), "config.json has no model_type".into())
         })?;
     let arch = match model_type.as_str() {
+        "gemma4" | "muse_glimmer" if device == "metal" => {
+            let config = paddock_models::mlx::MultimodalConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            match config.family {
+                paddock_models::mlx::MultimodalFamily::Gemma31 => "gemma4",
+                paddock_models::mlx::MultimodalFamily::Muse30 => "muse-glimmer",
+            }
+            .to_owned()
+        }
+        "qwen3_5" if device == "metal" => {
+            paddock_models::mlx::QwenConfig::read(&tokenizer_dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            "qwen35".to_owned()
+        }
+        "prism_hadamard_qwen35" if device == "metal" => {
+            paddock_models::bonsai::BonsaiConfig::read(&tokenizer_dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            "qwen35".to_owned()
+        }
         "nemotron_h" => {
             paddock_models::nemotron::NemotronConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
@@ -1221,11 +1484,26 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
             "granite".to_owned()
         }
-        // Qwen3.8-Flash-Next: NVFP4 safetensors only (no GGUF exists for this
-        // arch, and the FP8 checkpoint does not fit the disk). Serving it is
-        // what turns this lane's bare-loop numbers into board cells - before
-        // this arm, `qwen4_exp` appeared in gpu_model/ and nowhere else.
-        "qwen4_exp" => {
+        // Off macOS this arm returns before its tail, which the lint reads as
+        // dead code; the two halves belong to different builds.
+        #[allow(unreachable_code)]
+        "qwen4_exp" if device == "metal" => {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            paddock_metal::FlashNextMlxPlan::inspect(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            return Err(ServeError::Open(
+                dir.to_path_buf(),
+                "native Flash Next MLX requires a macOS Metal build".into(),
+            ));
+            "qwen4exp".to_owned()
+        }
+        // CUDA retains its independent NVFP4 schema. In particular, do not
+        // weaken its required PLE dtype to admit an affine MLX checkpoint.
+        // `qwen3_8_flash_next` is the same architecture under Mia-AiLab's
+        // spelling - see Qwen4ExpConfig::read, which validates the fields
+        // rather than the name.
+        "qwen4_exp" | "qwen3_8_flash_next" => {
             paddock_models::qwen4exp::Qwen4ExpConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
             "qwen4exp".to_owned()
@@ -1234,28 +1512,17 @@ fn load_hf_dir(
             return Err(ServeError::Open(
                 dir.to_path_buf(),
                 format!(
-                    "no safetensors-primary lane for model_type {other:?} - this lane serves \
-                     checkpoint directories, and only nemotron_h, granite and qwen4_exp \
-                     have one"
+                    "no safetensors-primary lane for model_type {other:?}; \
+                     checkpoint directories require an implemented backend-specific loader"
                 ),
             ));
         }
     };
 
-    let tokenizer =
-        GgufTokenizer::from_hf_dir(dir).map_err(|e| ServeError::Tokenizer(e.to_string()))?;
+    let tokenizer = GgufTokenizer::from_hf_dir(&tokenizer_dir)
+        .map_err(|e| ServeError::Tokenizer(e.to_string()))?;
     let bos = tokenizer.add_bos.then_some(tokenizer.bos_id).flatten();
-    // the generation_config eos SET landed as eos_id + eot_id ([2, 11] -
-    // `</s>` and `<|im_end|>`); both stop a turn
-    let mut stop_tokens = Vec::new();
-    if let Some(eos) = tokenizer.eos_id {
-        stop_tokens.push(eos);
-    }
-    if let Some(eot) = tokenizer.eot_id
-        && !stop_tokens.contains(&eot)
-    {
-        stop_tokens.push(eot);
-    }
+    let stop_tokens = tokenizer.stop_ids();
     let chat_template = tokenizer.chat_template.clone();
     let task_tags = chat_template
         .as_deref()
@@ -1270,6 +1537,25 @@ fn load_hf_dir(
         .map_or_else(crate::reasoning::ReasoningCaps::none, |t| {
             crate::reasoning::probe(t, dialect)
         });
+    let bonsai = model_type == "prism_hadamard_qwen35";
+    let supports_vision = device == "metal"
+        && (splash || bonsai || matches!(arch.as_str(), "gemma4" | "muse-glimmer"));
+    let image_pad_id = if supports_vision {
+        tokenizer.token_to_id(if splash || bonsai {
+            "<|image_pad|>"
+        } else if arch == "muse-glimmer" {
+            "<|patch|>"
+        } else {
+            "<|image|>"
+        })
+    } else {
+        None
+    };
+    if supports_vision && image_pad_id.is_none() {
+        return Err(ServeError::Tokenizer(
+            "MLX vision checkpoint lacks its image placeholder".into(),
+        ));
+    }
     let tokenizer = Arc::new(tokenizer);
     let engine = build_engine(
         &arch,
@@ -1280,22 +1566,28 @@ fn load_hf_dir(
         max_ctx,
         max_batch,
         None,
-        None,
+        mtp.map(Path::to_path_buf),
         None,
         vram_budget,
-        // safetensors-directory lane: no mmproj is attached here, so the
-        // image budget has nothing to apply to
+        // Embedded MLX towers use their validated checkpoint processor budget.
         None,
     )?;
 
     Ok(ServingModel {
         id,
-        spec: SpecReport::default(),
+        spec: SpecReport {
+            heads: false,
+            drafter: if splash {
+                Some("DFlash2".into())
+            } else {
+                mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned()))
+            },
+        },
         arch: arch.clone(),
         // Read from `generation_config.json`, so this lane and the GGUF lane
         // answer at the same sampling for the same model - granite 4.2 serves
         // from either file and must not change behaviour with the format.
-        published_sampling: paddock_models::sampling::published_in_hf_dir(dir),
+        published_sampling: paddock_models::sampling::published_in_hf_dir(&tokenizer_dir),
         engine,
         tokenizer,
         bos,
@@ -1304,10 +1596,10 @@ fn load_hf_dir(
         task_tags,
         dialect,
         reasoning,
-        supports_vision: false,
+        supports_vision,
         supports_audio: false,
         audio_frontend: AudioFrontend::None,
-        image_pad_id: None,
+        image_pad_id,
         audio_pad_id: None,
         audio_inline_marker: None,
         audio_word_times: false,
@@ -1379,22 +1671,285 @@ fn build_generator(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
 ) -> Result<Box<dyn Generator>, String> {
-    // Say so when the field cannot bite, rather than letting it read as
-    // effective: only the gemma4 tower takes an image budget today (the
-    // others size from their own checkpoint), and none of them take one
-    // without an mmproj to attach it to.
+    // Only the CUDA gemma4 tower takes the endpoint image budget today.
+    // Warn before Metal's early return too: accepting the config must not
+    // imply that a backend silently applied a budget it does not support.
     if max_image_tokens.is_some() {
         if mmproj.is_none() {
             tracing::warn!(
                 arch,
                 "max_image_tokens is set but this endpoint has no mmproj - it serves no images"
             );
-        } else if arch != "gemma4" {
+        } else if arch != "gemma4" || device != "cuda" {
             tracing::warn!(
                 arch,
-                "max_image_tokens is set but only the gemma4 tower reads it - this endpoint                  keeps its checkpoint's own image budget"
+                device,
+                "max_image_tokens is set but only the CUDA gemma4 tower reads it - this endpoint keeps its checkpoint's own image budget"
             );
         }
+    }
+    if device == "metal" {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if paddock_metal::kv_offload_config().is_some()
+                && !matches!(
+                    arch,
+                    "qwen35" | "qwen35moe" | "granite" | "gpt-oss" | "laguna"
+                )
+            {
+                return Err(format!(
+                    "Metal KV offload supports Qwen35, Granite, GPT-OSS and Laguna checkpoints, not {arch}"
+                ));
+            }
+            if matches!(arch, "gemma4" | "muse-glimmer") && path.is_dir() {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err("native Gemma/Muse MLX uses its embedded vision tower; GGUF companions and CUDA packs are not accepted".into());
+                }
+                tracing::warn!(
+                    "native Gemma/Muse MLX: affine4 text, BF16 tower/KV; parity and performance qualification pending"
+                );
+                return paddock_metal::Gemma4::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .map_err(|e| e.to_string());
+            }
+            if arch == "qwen4exp" && path.is_dir() {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err("native Flash Next MLX is text-only; no vision/MTP companions, FP8 sidecars or CUDA packs".into());
+                }
+                return paddock_metal::FlashNext::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .map_err(|e| e.to_string());
+            }
+            if arch == "qwen35" && path.is_dir() {
+                if mmproj.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err(
+                        "native Qwen MLX Metal uses its bundled tower when present; no external vision companions or CUDA packs"
+                            .into(),
+                    );
+                }
+                if path.join("hadamard.json").is_file() {
+                    tracing::info!(
+                        "native Bonsai packed ternary-2/group-128: signed Hadamard, F32 activations/KV/recurrent state"
+                    );
+                } else if path.join("manifest.json").is_file() {
+                    tracing::info!(
+                        "native Splash packed-Q4/group-64: BF16 KV, F32 recurrent state, bundled vision and DFlash2"
+                    );
+                } else {
+                    tracing::info!(
+                        "native MLX affine-4/group-64 text path: BF16 KV, F32 recurrent state; text-only checkpoint serving"
+                    );
+                }
+                return paddock_metal::Qwen35::load(path, max_ctx, max_batch, vram_budget)
+                    .and_then(|mut m| {
+                        if path.join("manifest.json").is_file()
+                            || path.join("hadamard.json").is_file()
+                        {
+                            m.attach_vision(path)?;
+                        }
+                        if std::env::var_os("PADDOCK_NO_SPEC").is_none()
+                            && let Some(draft) = mtp
+                        {
+                            // This export has no MTP weights. Only its validated
+                            // DFlash2 companion can use the native BF16 verifier.
+                            m.attach_dflash(draft)?;
+                        }
+                        if let Some(config) = paddock_metal::kv_offload_config() {
+                            let mut paths = vec![path];
+                            paths.extend(mtp);
+                            m.enable_kv_offload(config, &paths)?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    })
+                    .map_err(|e| e.to_string());
+            }
+            if !matches!(
+                arch,
+                "granite"
+                    | "qwen35"
+                    | "qwen35moe"
+                    | "gemma4"
+                    | "muse-glimmer"
+                    | "gpt-oss"
+                    | "laguna"
+                    | "nemotron_h_moe"
+                    | "paddleocr"
+                    | "deepseek2-ocr"
+                    | "qwen3vl"
+                    | "qwen4exp"
+            ) || path.is_dir()
+            {
+                return Err("Metal supports elected Granite, Qwen dense/35B MoE/ASR/Flash Next IQ3, Gemma 4, Muse Glimmer, GPT-OSS, Laguna XS/S, Nemotron Q8, PaddleOCR-VL and Unlimited-OCR GGUF graphs".into());
+            }
+            if matches!(arch, "gpt-oss" | "laguna" | "nemotron_h_moe" | "qwen4exp")
+                && (mmproj.is_some() || mtp.is_some())
+            {
+                return Err(format!(
+                    "Metal {arch} is text-only without vision or speculative companions"
+                ));
+            }
+            if fp8_native.is_some() || pack.is_some() || (arch == "granite" && mtp.is_some()) {
+                return Err(
+                    "Metal supports vision companions for Granite/Qwen/Gemma/Muse/PaddleOCR/Unlimited-OCR; Granite drafters, FP8 sidecars and CUDA packs are not implemented".into(),
+                );
+            }
+            tracing::warn!(
+                "experimental Metal backend: native GGUF weights, F16 KV; performance qualification is pending"
+            );
+            return match arch {
+                "qwen4exp" => paddock_metal::FlashNext::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>),
+                "qwen3vl" => {
+                    let mp = mmproj.ok_or_else(|| {
+                        "Qwen3-ASR Metal requires its BF16 audio mmproj".to_string()
+                    })?;
+                    if mtp.is_some() {
+                        return Err("Qwen3-ASR Metal has no speculative companion".into());
+                    }
+                    paddock_metal::Qwen3Asr::load(path, max_ctx, max_batch, vram_budget).and_then(
+                        |mut m| {
+                            m.attach_audio(mp)?;
+                            Ok(Box::new(m) as Box<dyn Generator>)
+                        },
+                    )
+                }
+                "deepseek2-ocr" => {
+                    let mp = mmproj.ok_or_else(|| {
+                        "Unlimited-OCR Metal requires its DeepEncoder mmproj".to_string()
+                    })?;
+                    if mtp.is_some() {
+                        return Err("Unlimited-OCR Metal has no speculative companion".into());
+                    }
+                    paddock_metal::UnlimitedOcr::load(path, max_ctx, max_batch, vram_budget)
+                        .and_then(|mut m| {
+                            m.attach_vision(mp)?;
+                            Ok(Box::new(m) as Box<dyn Generator>)
+                        })
+                }
+                "paddleocr" => {
+                    let mp = mmproj
+                        .ok_or_else(|| "PaddleOCR Metal requires its vision mmproj".to_string())?;
+                    if mtp.is_some() {
+                        return Err("PaddleOCR Metal has no speculative companion".into());
+                    }
+                    paddock_metal::PaddleOcr::load(path, max_ctx, max_batch, vram_budget).and_then(
+                        |mut m| {
+                            m.attach_vision(mp)?;
+                            Ok(Box::new(m) as Box<dyn Generator>)
+                        },
+                    )
+                }
+                "nemotron_h_moe" => {
+                    paddock_metal::Nemotron::load(path, max_ctx, max_batch, vram_budget)
+                        .map(|m| Box::new(m) as Box<dyn Generator>)
+                }
+                "laguna" => paddock_metal::Laguna::load(path, max_ctx, max_batch, vram_budget)
+                    .and_then(|mut m| {
+                        if let Some(config) = paddock_metal::kv_offload_config() {
+                            m.enable_kv_offload(config, &[path])?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    }),
+                "gpt-oss" => paddock_metal::GptOss::load(path, max_ctx, max_batch, vram_budget)
+                    .and_then(|mut m| {
+                        if let Some(config) = paddock_metal::kv_offload_config() {
+                            m.enable_kv_offload(config, &[path])?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    }),
+                "gemma4" | "muse-glimmer" => {
+                    paddock_metal::Gemma4::load(path, max_ctx, max_batch, vram_budget).and_then(
+                        |mut m| {
+                            if let Some(mp) = mmproj {
+                                m.attach_vision(mp)?;
+                            }
+                            if std::env::var_os("PADDOCK_NO_SPEC").is_none()
+                                && let Some(dp) = mtp
+                            {
+                                if arch == "muse-glimmer" {
+                                    m.attach_dflash(dp)?;
+                                } else {
+                                    m.attach_mtp(dp)?;
+                                }
+                            }
+                            Ok(Box::new(m) as Box<dyn Generator>)
+                        },
+                    )
+                }
+                "qwen35" | "qwen35moe" => {
+                    paddock_metal::Qwen35::load(path, max_ctx, max_batch, vram_budget).and_then(
+                        |mut m| {
+                            if let Some(mp) = mmproj {
+                                m.attach_vision(mp)?;
+                            }
+                            if std::env::var_os("PADDOCK_NO_SPEC").is_none() {
+                                let mapped = paddock_models::mapped::MappedGguf::open(path)
+                                    .map_err(|e| paddock_metal::MetalError::Model(e.to_string()))?;
+                                // Explicit companions select the drafting mode. Do
+                                // not warm an unused nextn graph on every DFlash2
+                                // commit: hybrid routing needs its own measured
+                                // election, not both graphs running unconditionally.
+                                let companion_arch = mtp
+                                    .map(paddock_models::mapped::MappedGguf::open)
+                                    .transpose()
+                                    .map_err(|e| paddock_metal::MetalError::Model(e.to_string()))?;
+                                if let (Some(dp), Some(draft)) = (mtp, companion_arch.as_ref())
+                                    && draft.gguf().architecture() != Some("dflash")
+                                {
+                                    m.attach_mtp(dp)?;
+                                }
+                                if companion_arch.is_none()
+                                    && mapped
+                                        .gguf()
+                                        .arch_field("nextn_predict_layers")
+                                        .and_then(|v| v.as_u64())
+                                        == Some(1)
+                                {
+                                    m.attach_mtp(path)?;
+                                }
+                                if let (Some(dp), Some(draft)) = (mtp, companion_arch.as_ref())
+                                    && draft.gguf().architecture() == Some("dflash")
+                                {
+                                    m.attach_dflash(dp)?;
+                                }
+                            }
+                            if let Some(config) = paddock_metal::kv_offload_config() {
+                                let mut paths = vec![path];
+                                paths.extend(mmproj);
+                                paths.extend(mtp);
+                                m.enable_kv_offload(config, &paths)?;
+                            }
+                            Ok(Box::new(m) as Box<dyn Generator>)
+                        },
+                    )
+                }
+                _ => paddock_metal::Granite::load(path, max_ctx, max_batch, vram_budget).and_then(
+                    |mut m| {
+                        if m.requires_audio() && mmproj.is_none() {
+                            return Err(paddock_metal::MetalError::Model(
+                                "Granite Speech Metal requires its audio mmproj".into(),
+                            ));
+                        }
+                        if let Some(mp) = mmproj {
+                            if mmproj_is_audio(mp) {
+                                m.attach_audio(mp)?;
+                            } else {
+                                m.attach_vision(mp)?;
+                            }
+                        }
+                        if let Some(config) = paddock_metal::kv_offload_config() {
+                            let mut paths = vec![path];
+                            paths.extend(mmproj);
+                            m.enable_kv_offload(config, &paths)?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    },
+                ),
+            }
+            .map_err(|e| e.to_string());
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        return Err("Metal requires macOS and a runner built with --features metal".into());
     }
     // one constructor applies the config'd VRAM budget so a new family arm
     // can't forget it - the executor's headroom seam does the enforcing
@@ -1443,13 +1998,44 @@ fn build_generator(
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
             "qwen4exp" => {
-                let model = paddock_engine::gpu_model::qwen4exp::Qwen4ExpGpu::load_with_slots(
+                let mut model = paddock_engine::gpu_model::qwen4exp::Qwen4ExpGpu::load_with_slots(
                     &exec,
                     path,
                     max_ctx,
                     max_batch.max(1),
                 )
                 .map_err(|e| e.to_string())?;
+                // The head this checkpoint ships (`mtp.*`). The GGUF lane needs
+                // `--mtp` because the UD export strips the block; here the
+                // weights are in the shards and an operator should not have to
+                // know that. Declining is not fatal - a checkpoint without the
+                // block, or a pack missing the chain's entries, still serves,
+                // just without speculation - but it is said out loud, because
+                // a drafter that is present and unused looks exactly like one
+                // that is working badly.
+                // Off until the head's drafts are right. It loads and drafts,
+                // but on NVIDIA's NVFP4 checkpoint none of them is accepted
+                // (measured 2026-09-19: 128 drafted, 0 accepted, and the
+                // wasted draft+verify took decode from 18.89 to 7.01 tok/s) -
+                // the proposals come back scattered uniformly over the 248k
+                // vocab, so the head's logits are noise rather than merely
+                // imprecise. The FP8 expert transcode is not the cause (cosine
+                // 0.99998 against the source) and the block's dims match a
+                // decoder attention layer exactly, so something in how the
+                // head is assembled is still wrong. Attaching it by default
+                // would make this lane slower, so it asks to be switched on:
+                // PADDOCK_Q4X_INFILE_MTP=1.
+                if model.has_in_file_mtp()
+                    && std::env::var("PADDOCK_Q4X_INFILE_MTP").is_ok_and(|v| v != "0")
+                {
+                    match model.attach_mtp_in_file() {
+                        Ok(()) => {}
+                        Err(e) => eprintln!(
+                            "[q4x-mtp] in-file head NOT attached ({e}) - serving without \
+                             speculation"
+                        ),
+                    }
+                }
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
             other => Err(format!("{other}: no safetensors-primary lane")),

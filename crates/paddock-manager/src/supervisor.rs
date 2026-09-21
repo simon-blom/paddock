@@ -90,7 +90,7 @@ fn silent_record_is_gone(socket_enumerates: bool, child: ChildState) -> bool {
     !socket_enumerates && child != ChildState::Alive
 }
 
-/// THE rule for "this port has something on it": a record of ours, or an admin
+/// The rule for "this port has something on it": a record of ours, or an admin
 /// endpoint that enumerates.
 ///
 /// **Invariant: `list()` emits a row for exactly the ports this returns true
@@ -100,7 +100,7 @@ fn silent_record_is_gone(socket_enumerates: bool, child: ChildState) -> bool {
 /// its socket enumerated, while `/api/runners` only emitted a row when
 /// `identify` answered or a record existed. A port that enumerated but did not
 /// answer satisfied the first and produced nothing for the second, so the
-/// endpoint appeared in NEITHER list and vanished from the UI with its config
+/// endpoint appeared in neither list and vanished from the UI with its config
 /// still on disk.
 ///
 /// They agree by construction now: `identify` answering implies the socket
@@ -530,6 +530,10 @@ pub struct SpawnSpec {
     /// saving the tower's VRAM.
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Native desktop endpoints are local-only by default. None preserves
+    /// the web/CLI LAN-serving default; a saved bind survives round-trips.
+    #[serde(default)]
+    pub host: Option<std::net::IpAddr>,
     pub port: Option<u16>,
     pub max_ctx: Option<usize>,
     pub max_batch: Option<usize>,
@@ -645,6 +649,7 @@ impl Default for SpawnSpec {
             pull: false,
             fp8_native: false,
             vision: None,
+            host: None,
             port: None,
             max_ctx: None,
             max_batch: None,
@@ -681,7 +686,7 @@ pub enum SpawnError {
     Pull(String),
     #[error("no free runner port from {0} upward")]
     NoPort(u16),
-    /// The second field says WHAT holds the port - a pid, or the admin endpoint
+    /// The second field says what holds the port - a pid, or the admin endpoint
     /// path. Without it "already serving" is unactionable exactly when it is
     /// wrong: a stale socket refuses every operation and names nothing.
     #[error(
@@ -712,6 +717,25 @@ pub enum SpawnError {
          the data dir, or set PADDOCK_KERNEL_PACK"
     )]
     NoKernelPack,
+}
+
+impl SpawnError {
+    /// Stable, credential-free category for native UI diagnostics. The complete
+    /// privileged message/log tail stays in the manager response, never in Swift.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Unsupported(_) => "unsupported_configuration",
+            Self::ModelNotFound(_) => "model_missing",
+            Self::Pull(_) => "download_failed",
+            Self::NoPort(_) | Self::PortTaken(..) => "port_unavailable",
+            Self::AlreadyConfigured(_) => "already_configured",
+            Self::NoBinary(_) => "runner_missing",
+            Self::Io(_) => "launch_io",
+            Self::DiedOnStartup { .. } => "startup_exit",
+            Self::HealthTimeout(..) => "startup_timeout",
+            _ => "configuration_unavailable",
+        }
+    }
 }
 
 /// The runner's last log line is the actual reason ("device \"cuda\" needs a
@@ -833,6 +857,7 @@ pub struct SpawnDefaults {
 
 pub struct Supervisor {
     records: tokio::sync::Mutex<HashMap<u16, Record>>,
+    port_allocation: tokio::sync::Mutex<()>,
     defaults: SpawnDefaults,
     registry: Arc<crate::registry::Registry>,
     /// Desired-state mirror (managed.toml). None only in unit tests.
@@ -873,6 +898,7 @@ impl Supervisor {
     ) -> Self {
         Self {
             records: tokio::sync::Mutex::new(HashMap::new()),
+            port_allocation: tokio::sync::Mutex::new(()),
             defaults,
             registry,
             elections,
@@ -898,7 +924,7 @@ impl Supervisor {
     }
 
     /// What is holding this port, phrased for the person who has to clear it -
-    /// or None if it is free. THE one predicate for "taken": it was written out
+    /// or None if it is free. The one predicate for "taken": it was written out
     /// four times (both spawn paths, `is_serving`, `remove_config`), and every
     /// copy answered with a bare bool, so each refusal could say that the port
     /// was busy and none could say what was on it. That is the whole of the
@@ -1045,17 +1071,21 @@ impl Supervisor {
     /// SHA-256 (hex) of an endpoint's config file - the edit page's
     /// optimistic-concurrency token. None = no file.
     pub fn config_file_hash(&self, port: u16) -> Option<String> {
-        use sha2::Digest;
-        let bytes = std::fs::read(self.server_config_path(port)).ok()?;
-        Some(crate::registry::hex(&sha2::Sha256::digest(&bytes)))
+        self.read_config_file(port).ok().map(|(_, hash)| hash)
     }
 
     /// The raw config file + its hash - what the Advanced editor loads.
     pub fn read_config_file(&self, port: u16) -> Result<(String, String), String> {
         use sha2::Digest;
+        use std::io::Read;
         let path = self.server_config_path(port);
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("no config file at {}: {e}", path.display()))?;
+        let mut content = String::new();
+        std::fs::File::open(&path)
+            .and_then(|f| f.take(2 * 1024 * 1024 + 1).read_to_string(&mut content))
+            .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
+        if content.len() > 2 * 1024 * 1024 {
+            return Err("Endpoint configuration exceeds 2 MiB.".into());
+        }
         let hash = crate::registry::hex(&sha2::Sha256::digest(content.as_bytes()));
         Ok((content, hash))
     }
@@ -1071,6 +1101,21 @@ impl Supervisor {
     /// (tools and web search are control-plane, restart-free).
     const LIVE_KEYS: &'static [&'static str] =
         &["mcp_servers", "web_search_provider", "web_search_api_key"];
+
+    /// Native tools-only save. Unlike the general editor, this never spawns,
+    /// drains or restarts a model, including when the endpoint is stopped.
+    pub fn write_live_tools_config(
+        &self,
+        port: u16,
+        content: &str,
+        expected: &str,
+    ) -> Result<(), String> {
+        let (old, hash) = self.read_config_file(port)?;
+        if hash != expected || !Self::only_live_keys_changed(&old, content) {
+            return Err("Endpoint changed or non-tool settings were modified.".into());
+        }
+        crate::integrations::atomic_config(&self.server_config_path(port), content)
+    }
 
     fn only_live_keys_changed(old: &str, new: &str) -> bool {
         let (Ok(a), Ok(b)) = (
@@ -1092,6 +1137,7 @@ impl Supervisor {
         content: &str,
         expect_hash: Option<&str>,
         drain_timeout_ms: u64,
+        expected_pid: Option<u32>,
     ) -> Result<(RunnerView, bool), String> {
         // Syntax gate here; SEMANTIC errors surface from the runner's own
         // parse at start (deny_unknown_fields), with the log tail attached.
@@ -1106,13 +1152,34 @@ impl Supervisor {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let running = {
-            let recs = self.records.lock().await;
-            recs.contains_key(&port)
-        } || paddock_admin::enumerate().contains(&port);
+        let running = self.is_serving(port).await;
+        // Admission and composition can take time. Revalidate the native
+        // confirmation after those awaits, before publishing the new file.
+        self.verify_reviewed_runner(port, expected_pid).await?;
         let old = std::fs::read_to_string(&path).unwrap_or_default();
-        std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-        if running && Self::only_live_keys_changed(&old, content) {
+        if let Some(expect) = expect_hash
+            && self.config_file_hash(port).as_deref() != Some(expect)
+        {
+            return Err(SpawnError::ConfigDrift.to_string());
+        }
+        crate::integrations::atomic_config(&path, content)?;
+        let pending_restart = if running {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                AdminClient::new(port).config_status(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|s| s.restart_required)
+        } else {
+            Some(false)
+        };
+        let apply_saved = expected_pid.is_some()
+            && pending_restart == Some(true)
+            && toml::from_str::<toml::Value>(&old).ok()
+                == toml::from_str::<toml::Value>(content).ok();
+        if running && Self::only_live_keys_changed(&old, content) && !apply_saved {
             // control-plane-only edit: the running runner re-reads these on
             // its next request - bouncing the model would be pure downtime
             if let Some(v) = self.list().await.into_iter().find(|v| v.port == port) {
@@ -1131,15 +1198,35 @@ impl Supervisor {
                 .elections
                 .as_ref()
                 .and_then(|el| el.list().into_iter().find(|e| e.port == port));
-            self.stop(port, drain_timeout_ms).await?;
+            self.verify_reviewed_runner(port, expected_pid).await?;
+            let stopped = self.stop(port, drain_timeout_ms).await;
             if let (Some(el), Some(p)) = (&self.elections, prior) {
                 el.record(p);
+            }
+            let stopped = stopped?;
+            if matches!(stopped, StopOutcome::StillRunning) {
+                return Err("The configuration was saved, but the runner did not exit. Restart was not attempted.".into());
             }
         }
         self.start_config(port)
             .await
             .map(|v| (v, false))
             .map_err(|e| e.to_string())
+    }
+
+    async fn verify_reviewed_runner(&self, port: u16, expected: Option<u32>) -> Result<(), String> {
+        if let Some(expected) = expected {
+            let client = AdminClient::new(port);
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(2), client.identify()).await,
+                Ok(Ok(id)) if id.pid == expected
+            ) {
+                return Err(
+                    "The reviewed runner changed or stopped. Reload before restarting.".into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// `write_config_file`'s save-without-applying twin, for the raw-TOML tabs:
@@ -1162,9 +1249,71 @@ impl Supervisor {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+        crate::integrations::atomic_config(&path, content)?;
         tracing::info!(port, config = %path.display(), "configuration saved without applying");
         Ok(())
+    }
+
+    /// Publish a fully reviewed new configuration without clobbering a saved
+    /// endpoint. Allocation and publication share the spawn allocation gate;
+    /// persist_noclobber also protects against other manager processes.
+    pub async fn create_config_file(
+        &self,
+        requested: Option<u16>,
+        content: &str,
+    ) -> Result<u16, String> {
+        use std::io::Write;
+        let _allocation = self.port_allocation.lock().await;
+        let port = match requested {
+            Some(port) if port >= 1024 => {
+                if self.server_config_path(port).exists()
+                    || self.records.lock().await.contains_key(&port)
+                    || self
+                        .spawning
+                        .lock()
+                        .is_ok_and(|ports| ports.contains(&port))
+                    || AdminClient::new(port).is_present().await
+                    || std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+                {
+                    return Err(
+                        "This port is already in use. Choose Automatic or another port.".into(),
+                    );
+                }
+                port
+            }
+            Some(_) => return Err("Use a port between 1024 and 65535.".into()),
+            None => self
+                .allocate_port()
+                .await
+                .map_err(|_| "No free model port is available.")?,
+        };
+        let mut doc: toml::Value =
+            toml::from_str(content).map_err(|_| "Invalid model settings.")?;
+        let table = doc.as_table_mut().ok_or("Invalid model settings.")?;
+        if table.get("port").and_then(toml::Value::as_integer) != Some(0) {
+            return Err("Only an unsaved configuration can be created.".into());
+        }
+        table.insert("port".into(), toml::Value::Integer(port.into()));
+        let text = toml::to_string(&doc).map_err(|_| "Cannot prepare model settings.")?;
+        let path = self.server_config_path(port);
+        let parent = path.parent().ok_or("Invalid model settings location.")?;
+        std::fs::create_dir_all(parent).map_err(|_| "Cannot create the model settings folder.")?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|_| "Cannot prepare model settings.")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| "Cannot protect model settings.")?;
+        }
+        file.write_all(text.as_bytes())
+            .and_then(|_| file.as_file().sync_all())
+            .map_err(|_| "Cannot write model settings.")?;
+        file.persist_noclobber(&path).map_err(
+            |_| "This endpoint already exists or could not be saved. Nothing was overwritten.",
+        )?;
+        Ok(port)
     }
 
     /// Save without applying: render `spec` into the endpoint's config FILE and
@@ -1244,6 +1393,9 @@ impl Supervisor {
                 .ok(),
         };
         if let Some(old) = prior {
+            if spec.host.is_none() {
+                spec.host = old.host;
+            }
             if spec.api_key.is_none() {
                 spec.api_key = old.api_key.clone();
             }
@@ -1421,6 +1573,9 @@ impl Supervisor {
             // the config file speaks for itself: a file with mmproj serves
             // vision, one without stays text-only
             vision: None,
+            host: get_str("host")
+                .map(|host| host.parse().map_err(|_| "invalid endpoint bind address"))
+                .transpose()?,
             port: v
                 .get("port")
                 .and_then(toml::Value::as_integer)
@@ -1453,17 +1608,22 @@ impl Supervisor {
     /// own - see `spec_from_config_text` for what that cost when it did.
     pub fn project_config_text(&self, raw: &str) -> Result<ConfigProjection, String> {
         let spec = self.spec_from_config_text(raw)?;
-        // `mmproj` presence is the vision switch, and SpawnSpec deliberately
+        // `mmproj` presence is the optional vision switch, and SpawnSpec deliberately
         // carries `vision: None` for a file ("the file speaks for itself" - a
         // spawn must not re-decide it), so read it here rather than bend that.
         let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw);
         let v: toml::Value = toml::from_str(trimmed).map_err(|e| e.to_string())?;
+        let embedded_vision = self
+            .registry
+            .catalog_of(&spec.model)
+            .and_then(|m| spec.artifact.as_deref().and_then(|id| m.artifact(id)))
+            .is_some_and(|a| a.runtime.embedded_vision);
         Ok(ConfigProjection {
             weights: v
                 .get("model")
                 .and_then(toml::Value::as_str)
                 .map(String::from),
-            vision: v.get("mmproj").is_some(),
+            vision: v.get("mmproj").is_some() || embedded_vision,
             fp8_native: spec.fp8_native,
             model: spec.model,
             artifact: spec.artifact,
@@ -1841,6 +2001,13 @@ impl Supervisor {
         }
     }
 
+    /// Test the instance's own bookkeeping without enumerating the developer's
+    /// live runners. A preparation/publication test must not require stopping them.
+    #[cfg(test)]
+    pub(crate) async fn has_records_for_test(&self) -> bool {
+        !self.records.lock().await.is_empty()
+    }
+
     /// Live view: own + adopted records, refreshed against enumeration, each
     /// queried for identify/health with a short timeout.
     pub async fn list(&self) -> Vec<RunnerView> {
@@ -1870,7 +2037,7 @@ impl Supervisor {
                         Ok(Ok(h)) => (h.status, Some(h.in_flight), Some(h.uptime_s)),
                         _ => ("unreachable".into(), None, None),
                     };
-                    // READ ONLY. This used to adopt on sight - insert a record
+                    // Read only. This used to adopt on sight - insert a record
                     // for any port that answered - which made a *read* path an
                     // owner of authoritative state, and that was the shape
                     // behind the whole bug: `stop()` dropped a record, the SSE
@@ -1977,7 +2144,7 @@ impl Supervisor {
                         // Enumerated, silent, and not ours - a runner someone
                         // else started, or one that outlived our record, which
                         // has stopped answering. This branch used to emit
-                        // NOTHING while `configured()` counted the very same
+                        // nothing while `configured()` counted the very same
                         // port as running, and an endpoint that is "running"
                         // with no row renders in neither list: the vanishing.
                         // See `port_has_endpoint` for the invariant.
@@ -2049,9 +2216,18 @@ impl Supervisor {
         let spec_on = want_spec.is_some() && !spec_off;
         match self.registry.resolve(name, artifact, pull, drafter).await {
             Ok(Some(r)) => {
+                let default_policy = self
+                    .registry
+                    .identify_weights(&r.weights)
+                    .and_then(|(model, artifact)| {
+                        self.registry.catalog_of(&model)?.artifact(&artifact)
+                    })
+                    .and_then(|a| a.runtime.default_spec.as_deref());
+                let effective_policy = want_spec.or(default_policy);
+                let default_on = want_spec.is_none() && default_policy.is_some();
                 let mtp = if spec_off {
                     None
-                } else if spec_on {
+                } else if spec_on || default_on {
                     if !r.speculative {
                         // Plain "on" was every endpoint's form default before the
                         // capability gate existed, so a legacy granite-class toml
@@ -2093,19 +2269,21 @@ impl Supervisor {
                 // The drafter identity only means something when one was
                 // actually wired - spec "off" resolves a path and then drops it.
                 let pick = mtp.is_some().then_some(r.drafter_pick).flatten();
-                let adaptive = want_spec.is_some_and(|s| s.trim().eq_ignore_ascii_case("adaptive"));
+                let adaptive =
+                    effective_policy.is_some_and(|s| s.trim().eq_ignore_ascii_case("adaptive"));
                 let spec_desc = if !r.speculative {
                     None // nothing to speculate with - no badge, not a choice
                 } else if spec_off {
                     Some("off".to_owned())
                 } else {
-                    // An attached drafter REPLACES nothing on an in-file MTP
-                    // model - the hybrid runs both (drafter single-stream,
-                    // MTP chain for wide rounds) - so the badge says both.
+                    // CUDA can route between both mechanisms. Metal elects
+                    // one companion, and an MLX export has no in-file heads.
                     let in_file = self
                         .registry
                         .catalog_of(name)
-                        .is_some_and(|c| c.mtp_in_file);
+                        .is_some_and(|c| c.mtp_in_file)
+                        && (self.defaults.device != "metal"
+                            || (!r.weights.is_dir() && mtp.is_none()));
                     let mech = match &pick {
                         Some((_, label)) if in_file => {
                             format!("MTP + {}", Self::spec_token(label))
@@ -2209,8 +2387,15 @@ impl Supervisor {
     async fn allocate_port(&self) -> Result<u16, SpawnError> {
         let taken = paddock_admin::enumerate();
         let recs = self.records.lock().await;
-        for port in self.defaults.base_port..self.defaults.base_port.saturating_add(64) {
-            if recs.contains_key(&port) || taken.contains(&port) {
+        for port in self.defaults.base_port.max(1024)..=self.defaults.base_port.saturating_add(63) {
+            if recs.contains_key(&port)
+                || self.server_config_path(port).exists()
+                || self
+                    .spawning
+                    .lock()
+                    .is_ok_and(|ports| ports.contains(&port))
+                || (taken.contains(&port) && AdminClient::new(port).is_present().await)
+            {
                 continue;
             }
             if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
@@ -2255,10 +2440,21 @@ impl Supervisor {
         let dir = self.defaults.work_dir.join("servers");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{port}.toml"));
-        std::fs::write(
-            &path,
-            self.render_server_config(port, weights, mmproj, mtp, gpu, fp8, spec)?,
-        )?;
+        let text = self.render_server_config(port, weights, mmproj, mtp, gpu, fp8, spec)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        // The file carries runner and connector credentials. New native
+        // endpoints must not inherit a permissive shell umask. Existing
+        // configs rewritten by an explicit edit are tightened as well.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(0o600);
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        std::io::Write::write_all(&mut options.open(&path)?, text.as_bytes())?;
         Ok(path)
     }
 
@@ -2275,11 +2471,133 @@ impl Supervisor {
         fp8: Option<&Path>,
         spec: &SpawnSpec,
     ) -> Result<String, SpawnError> {
+        let identity = self.catalog_identity(spec, weights);
+        let selected = identity.as_ref().and_then(|(id, art)| {
+            let model = self.registry.catalog_of(id)?;
+            model.artifact(art.as_deref()?).map(|a| (model, a))
+        });
+        let fixed_kv = selected.and_then(|(_, a)| a.runtime.kv_cache_dtype.as_deref());
+        let max_ctx = spec
+            .max_ctx
+            .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().0));
+        let max_batch = spec
+            .max_batch
+            .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().1));
+        let no_spec = selected.is_some_and(|(model, a)| {
+            (self.defaults.device == "metal" || a.runtime.capability.is_some())
+                && !a.capabilities(model).iter().any(|c| c == "speculative")
+        });
+        // Apply the export contract to previews as well as real spawns. A
+        // not-yet-downloaded checkpoint can otherwise take the planned-path
+        // fallback and produce a config the runner must refuse.
+        if let Some((model, a)) = selected {
+            if let Some(memory) = &a.runtime.memory
+                && max_ctx.is_some_and(|ctx| ctx == 0 || ctx as u64 > memory.max_ctx)
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} on {} requires max_ctx <= {} (backend implementation limit)",
+                    a.label, self.defaults.device, memory.max_ctx
+                )));
+            }
+            if let Some(memory) = &a.runtime.memory
+                && max_batch.is_some_and(|batch| batch == 0 || batch as u64 > memory.max_batch)
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} on {} requires max_batch in 1..={} (backend implementation limit)",
+                    a.label, self.defaults.device, memory.max_batch
+                )));
+            }
+            if let Some(id) = spec.drafter.as_deref()
+                && !model.artifacts.iter().any(|companion| {
+                    companion.id == id
+                        && companion.kind == crate::registry::ArtifactKind::Drafter
+                        && companion.runtime.supports_backend(&self.defaults.device)
+                        && a.runtime.allows_companion(id)
+                })
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} does not support companion {id} on {}",
+                    a.label, self.defaults.device
+                )));
+            }
+            if no_spec
+                && spec.spec_policy.as_deref().is_some_and(|s| {
+                    !matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "none" | "0"
+                    )
+                })
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} does not support speculative decoding; use spec = \"off\"",
+                    a.label
+                )));
+            }
+            if !a.runtime.supports_backend(&self.defaults.device) {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} requires backend {}",
+                    a.label,
+                    a.runtime.backends.join(" or ")
+                )));
+            }
+            if let (Some(required), Some(asked)) = (fixed_kv, spec.kv_cache_dtype.as_deref())
+                && asked != required
+                && !(required == "f16" && asked == "auto")
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} requires kv_cache_dtype = {required:?} (checkpoint-native cache)",
+                    a.label
+                )));
+            }
+            if (spec.fp8_native || fp8.is_some())
+                && !model.artifacts.iter().any(|companion| {
+                    companion.kind == crate::registry::ArtifactKind::Fp8Snapshot
+                        && companion.runtime.supports_backend(&self.defaults.device)
+                        && a.runtime.allows_companion(&companion.id)
+                })
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} does not support FP8/native snapshot companions on {}",
+                    a.label, self.defaults.device
+                )));
+            }
+            if a.runtime.companions.as_ref().is_some_and(Vec::is_empty)
+                && (mmproj.is_some()
+                    || mtp.is_some()
+                    || fp8.is_some()
+                    || spec.fp8_native
+                    || spec.drafter.is_some())
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} does not support companion artifacts",
+                    a.label
+                )));
+            }
+            if a.runtime.embedded_vision && spec.vision == Some(false) {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} includes a built-in vision tower; it cannot be disabled as an optional mmproj",
+                    a.label
+                )));
+            }
+            if a.runtime.capability.is_some()
+                && spec.vision == Some(true)
+                && !a.capabilities(model).iter().any(|c| c == "vision")
+            {
+                return Err(SpawnError::Unsupported(format!(
+                    "{} currently supports text only",
+                    a.label
+                )));
+            }
+        }
         let mut t = toml::value::Table::new();
-        // All interfaces: the endpoint is FOR other machines (agents on the
-        // LAN are the tier-1 workload). The key below gates them; loopback
-        // callers are exempt runner-side.
-        t.insert("host".into(), "0.0.0.0".into());
+        // Existing web/CLI callers retain the LAN default. The native app
+        // explicitly elects loopback; never widen that on a config edit.
+        t.insert(
+            "host".into(),
+            spec.host
+                .map_or_else(|| "0.0.0.0".into(), |host| host.to_string())
+                .into(),
+        );
         t.insert("port".into(), i64::from(port).into());
         t.insert("model".into(), weights.display().to_string().into());
         // PROVENANCE: which catalog entry those bytes are. The
@@ -2291,7 +2609,7 @@ impl Supervisor {
         //
         // `model` above stays the path deliberately: one file, one meaning, and
         // still runnable by hand on a box that has no catalog.
-        if let Some((id, art)) = self.catalog_identity(spec, weights) {
+        if let Some((id, art)) = identity {
             let mut c = toml::value::Table::new();
             c.insert("model".into(), id.into());
             if let Some(a) = art {
@@ -2308,7 +2626,13 @@ impl Supervisor {
         if let Some(mm) = mmproj {
             t.insert("mmproj".into(), mm.display().to_string().into());
         }
-        if let Some(m) = mtp {
+        let spec_off = spec.spec_policy.as_deref().is_some_and(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "no" | "none" | "0"
+            )
+        });
+        if let Some(m) = mtp.as_ref().filter(|_| !spec_off && !no_spec) {
             t.insert("mtp".into(), m.display().to_string().into());
         }
         // native-FP8 plane ingestion: the resolved snapshot dir, a plain
@@ -2351,20 +2675,26 @@ impl Supervisor {
                 ),
             );
         }
-        if let Some(c) = spec.max_ctx {
+        if let Some(c) = max_ctx {
             t.insert("max_ctx".into(), (c as i64).into());
         }
-        if let Some(b) = spec.max_batch {
+        if let Some(b) = max_batch {
             t.insert("max_batch".into(), (b as i64).into());
         }
         if let Some(k) = &spec.api_key {
             t.insert("api_key".into(), k.clone().into());
         }
-        if let Some(kv) = &spec.kv_cache_dtype {
-            t.insert("kv_cache_dtype".into(), kv.clone().into());
+        if let Some(kv) = fixed_kv.or(spec.kv_cache_dtype.as_deref()) {
+            t.insert("kv_cache_dtype".into(), kv.to_owned().into());
         }
-        if let Some(sp) = &spec.spec_policy {
-            t.insert("spec".into(), sp.clone().into());
+        if no_spec {
+            t.insert("spec".into(), "off".into());
+        } else if let Some(sp) = spec
+            .spec_policy
+            .as_deref()
+            .or_else(|| selected.and_then(|(_, a)| a.runtime.default_spec.as_deref()))
+        {
+            t.insert("spec".into(), sp.to_owned().into());
         }
         // the admission grant (MiB): the engine's hard cage - pools size
         // inside it, so co-resident endpoints can never sum past the card
@@ -2473,6 +2803,13 @@ impl Supervisor {
                 None => return Err(e),
             },
         };
+        // Preview must apply the same explicit vision-off election as spawn,
+        // including when resolve_model fell back to not-yet-downloaded paths.
+        let mmproj = if spec.vision == Some(false) {
+            None
+        } else {
+            mmproj
+        };
         let fp8 = if spec.fp8_native { fp8_dir } else { None };
         // no NVML wait in a preview - an unsampled tracker just previews the
         // numeric index; Save resolves it properly
@@ -2525,7 +2862,7 @@ impl Supervisor {
         // "start it" would be the wrong advice there)
         if let Some(p) = spec.port
             && self.server_config_path(p).exists()
-            && !paddock_admin::enumerate().contains(&p)
+            && !self.is_serving(p).await
         {
             return Err(SpawnError::AlreadyConfigured(p));
         }
@@ -2598,19 +2935,31 @@ impl Supervisor {
         } else {
             None
         };
-        let port = match spec.port {
-            Some(p) => {
-                if let Some(why) = self.port_blocker(p).await {
-                    return Err(SpawnError::PortTaken(p, why));
+        let port = {
+            // Serialize selection through the in-flight reservation. This does
+            // not hold the lock during model loading. Saved endpoints and
+            // another spawn's pending port are never reused by automatic starts.
+            let _allocation = self.port_allocation.lock().await;
+            let port = match spec.port {
+                Some(p) => {
+                    if self.spawning.lock().is_ok_and(|ports| ports.contains(&p)) {
+                        return Err(SpawnError::PortTaken(
+                            p,
+                            "a model is already starting".into(),
+                        ));
+                    }
+                    if let Some(why) = self.port_blocker(p).await {
+                        return Err(SpawnError::PortTaken(p, why));
+                    }
+                    p
                 }
-                p
+                None => self.allocate_port().await?,
+            };
+            if let Ok(mut s) = self.spawning.lock() {
+                s.insert(port);
             }
-            None => self.allocate_port().await?,
+            port
         };
-        // visible to VRAM admission from here until the record lands
-        if let Ok(mut s) = self.spawning.lock() {
-            s.insert(port);
-        }
         let _spawning = SpawningGuard { sup: self, port };
         let bin = self.runner_bin(spec.runner_version.as_deref())?;
 
@@ -2734,12 +3083,23 @@ impl Supervisor {
 
     fn describe_spec(&self, spec: &SpawnSpec) -> Option<String> {
         let cat = self.registry.catalog_of(&spec.model)?;
-        if !cat.capability.iter().any(|c| c == "speculative") {
+        let weights = spec
+            .artifact
+            .as_deref()
+            .and_then(|id| cat.artifact(id))
+            .or_else(|| {
+                self.registry
+                    .identify_weights(Path::new(&spec.model))
+                    .and_then(|(_, id)| cat.artifact(&id))
+            })
+            .or_else(|| cat.default_weights_for_backend(&self.defaults.device, None))?;
+        if !weights.capabilities(cat).iter().any(|c| c == "speculative") {
             return None;
         }
         let policy = spec
             .spec_policy
             .as_deref()
+            .or(weights.runtime.default_spec.as_deref())
             .map(|s| s.trim().to_ascii_lowercase());
         if matches!(
             policy.as_deref(),
@@ -2751,6 +3111,10 @@ impl Supervisor {
             .artifacts
             .iter()
             .filter(|a| matches!(a.kind, crate::registry::ArtifactKind::Drafter))
+            .filter(|a| {
+                a.runtime.supports_backend(&self.defaults.device)
+                    && weights.runtime.allows_companion(&a.id)
+            })
             // installed-only, mirroring the spawn election: a stopped row must
             // not claim a drafter a start would not actually wire
             .filter(|a| self.registry.is_artifact_installed(a))
@@ -2762,11 +3126,15 @@ impl Supervisor {
             .or_else(|| drafters.iter().find(|a| a.default))
             .or_else(|| drafters.first())
             .map(|a| Self::spec_token(&a.label));
-        // same hybrid rule as the spawn path: in-file heads + a drafter = both
+        // Mirror the backend-specific mechanism election in resolve_model.
+        let in_file = cat.mtp_in_file
+            && !weights.runtime.checkpoint_dir
+            && (self.defaults.device != "metal" || picked.is_none());
         let mech = match picked {
-            Some(t) if cat.mtp_in_file => format!("MTP + {t}"),
+            Some(t) if in_file => format!("MTP + {t}"),
             Some(t) => t,
-            None => "MTP".to_owned(),
+            None if in_file => "MTP".to_owned(),
+            None => return None,
         };
         Some(if policy.as_deref() == Some("adaptive") {
             format!("{mech} (adaptive)")
@@ -3038,14 +3406,14 @@ impl Supervisor {
     /// outlives the timeout (safe: stateless on disk, driver reclaims VRAM);
     /// adopted runners are never force-killed (§6.1) - we report instead.
     ///
-    /// The record is dropped twice on purpose. `stop_inner` drops it up front
+    /// The record is dropped twice deliberately. `stop_inner` drops it up front
     /// so nothing treats the port as live while it drains, but the drain window
     /// is seconds to minutes long and the runner keeps answering `identify`
     /// throughout it (shutdown acks immediately, then drains in a background
     /// task). Adoption runs on a timer - `reconcile()` now, `list()` before it -
     /// and takes any port that answers, so the record came back mid-drain and
     /// nothing ever removed it again. Moving adoption out of the read path did
-    /// NOT retire this: a draining runner answers whoever asks, whenever they
+    /// not retire this: a draining runner answers whoever asks, whenever they
     /// ask. The second drop is the guard, and it stays. That zombie made
     /// `configured()` report `running: true` forever, which hid the endpoint
     /// from the fleet list, pinned it as an "Unreachable" row with no Start
@@ -3124,7 +3492,7 @@ impl Supervisor {
         let deadline =
             tokio::time::Instant::now() + Duration::from_millis(drain_timeout_ms + 10_000);
         loop {
-            if !paddock_admin::enumerate().contains(&port) {
+            if !AdminClient::new(port).is_present().await {
                 return Ok(StopOutcome::Stopped);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -3190,7 +3558,7 @@ impl Supervisor {
             // Nothing answered and nothing serves the port: a STOPPED
             // configured endpoint being edited - the takeover degenerates
             // into a plain start from the new spec.
-            Err(_) if !paddock_admin::enumerate().contains(&port) => {}
+            Err(_) if !AdminClient::new(port).is_present().await => {}
             Err(e) => return Err(e),
         }
         spec.port = Some(port);
@@ -3201,6 +3569,15 @@ impl Supervisor {
     /// and any election. Refused while the port serves - stopping is how a
     /// running model ends; removal is for configuration you no longer want.
     pub async fn remove_config(&self, port: u16) -> Result<(), String> {
+        self.remove_config_checked(port, None).await
+    }
+
+    /// Native removal is revision-guarded again after the async serving probe.
+    pub async fn remove_config_checked(
+        &self,
+        port: u16,
+        expected: Option<&str>,
+    ) -> Result<(), String> {
         let path = self.server_config_path(port);
         if !path.exists() {
             return Err(format!(
@@ -3213,10 +3590,15 @@ impl Supervisor {
                 "port {port} is serving - {why}. Stop it first, then remove"
             ));
         }
+        if let Some(expected) = expected
+            && self.config_file_hash(port).as_deref() != Some(expected)
+        {
+            return Err(SpawnError::ConfigDrift.to_string());
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))?;
         if let Some(el) = &self.elections {
             el.remove(port);
         }
-        std::fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))?;
         tracing::info!(port, config = %path.display(), "endpoint configuration removed");
         Ok(())
     }
@@ -3478,6 +3860,44 @@ pub enum StopOutcome {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn automatic_port_skips_saved_loading_and_unrelated_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = socket.local_addr().unwrap().port();
+        let sup = Supervisor::new(
+            SpawnDefaults {
+                runner_bin: None,
+                runners_dir: dir.path().join("runners"),
+                device: "metal".into(),
+                kernel_pack: None,
+                models_dirs: vec![],
+                logs_dir: dir.path().join("logs"),
+                work_dir: dir.path().into(),
+                base_port: base,
+                health_timeout: Duration::from_secs(1),
+            },
+            Arc::new(crate::registry::Registry::new(dir.path().join("models"))),
+            None,
+            None,
+        );
+        let first = sup.allocate_port().await.unwrap();
+        assert_ne!(first, base, "never take over another service's listener");
+        let config = sup.server_config_path(first);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "# saved endpoint fixture\n").unwrap();
+        let second = sup.allocate_port().await.unwrap();
+        assert_ne!(second, first, "a stopped model's address stays reserved");
+        sup.spawning.lock().unwrap().insert(second);
+        let third = sup.allocate_port().await.unwrap();
+        assert!(![base, first, second].contains(&third));
+        assert_eq!(
+            std::fs::read_to_string(config).unwrap(),
+            "# saved endpoint fixture\n"
+        );
+        assert!(socket.local_addr().is_ok(), "unrelated listener stays open");
+    }
+
     /// A refusal that does not name what it is refusing over sent a user
     /// hunting for an hour. The blocker has to survive into the message.
     #[test]
@@ -3544,7 +3964,7 @@ mod tests {
         assert!(!silent_record_is_gone(false, ChildState::Alive));
 
         // Hung: the socket is still there but identify does not answer. That is
-        // a real state an operator has to be able to SEE, so it keeps its row.
+        // a real state an operator has to be able to see, so it keeps its row.
         assert!(!silent_record_is_gone(true, ChildState::Alive));
         assert!(!silent_record_is_gone(true, ChildState::Exited));
         assert!(!silent_record_is_gone(true, ChildState::NoHandle));
@@ -3833,6 +4253,7 @@ server_label = \"tic\"
     fn a_spec_round_trips_so_a_swap_can_keep_what_it_did_not_mention() {
         let original = SpawnSpec {
             model: "tiny".into(),
+            host: Some(std::net::Ipv4Addr::LOCALHOST.into()),
             max_ctx: Some(8192),
             max_batch: Some(4),
             kv_cache_dtype: Some("f16".into()),
@@ -3851,6 +4272,7 @@ server_label = \"tic\"
         );
 
         let back: SpawnSpec = serde_json::from_value(json).expect("and deserialize");
+        assert_eq!(back.host, Some(std::net::Ipv4Addr::LOCALHOST.into()));
         // the fields the old verb dropped
         assert_eq!(back.kv_cache_dtype.as_deref(), Some("f16"));
         assert_eq!(back.spec_policy.as_deref(), Some("off"));

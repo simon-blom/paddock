@@ -18,6 +18,22 @@ use serde_json::{Value, json};
 
 use crate::routes::AppState;
 
+// Shared by web and native writes: a connector's file materialization may
+// span multiple endpoints, so two scope/edit operations must not interleave.
+pub(crate) static MUTATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// HTTP field names are case-insensitive. A manually configured bearer always
+/// wins, irrespective of the capitalization used by the user or shared Studio.
+fn merge_oauth_header(headers: &mut serde_json::Map<String, Value>, oauth: &Value) {
+    if let Some(token) = oauth.get("access_token").and_then(Value::as_str)
+        && !headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("authorization"))
+    {
+        headers.insert("Authorization".into(), json!(format!("Bearer {token}")));
+    }
+}
+
 /// Public shape: the internal `oauth` blob never leaves the manager - the
 /// row exposes `connected` and, when signed in, the bearer merged into
 /// `headers` (the Studio rides headers inline; same v1 posture as pasted
@@ -27,11 +43,8 @@ async fn public_row(state: &Arc<AppState>, row: Value) -> Value {
     let oauth = row["oauth"].take();
     let connected = oauth.get("access_token").and_then(Value::as_str).is_some();
     row["connected"] = json!(connected);
-    if let Some(tok) = oauth.get("access_token").and_then(Value::as_str)
-        && let Some(h) = row["headers"].as_object_mut()
-        && !h.contains_key("Authorization")
-    {
-        h.insert("Authorization".into(), json!(format!("Bearer {tok}")));
+    if let Some(h) = row["headers"].as_object_mut() {
+        merge_oauth_header(h, &oauth);
     }
     row
 }
@@ -54,7 +67,17 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
 /// OAuth flow uses after a token lands, refreshes or is dropped, so the
 /// TOML-carried bearer always matches the stored one (runners re-read live).
 pub fn rematerialize(state: &Arc<AppState>, id: &str) {
-    if let Ok(Some(row)) = state.db.get_connector(id) {
+    if let Err(e) = rematerialize_checked(state, id) {
+        tracing::warn!(error = %e, "connector re-materialization failed");
+    }
+}
+
+pub(crate) fn rematerialize_checked(state: &Arc<AppState>, id: &str) -> Result<(), String> {
+    if let Some(row) = state
+        .db
+        .get_connector(id)
+        .map_err(|_| "Connector credentials unavailable for endpoint synchronization.")?
+    {
         let (all, ports) = row_scope(&row);
         if (all || !ports.is_empty())
             && let Err(e) = materialize(
@@ -65,13 +88,15 @@ pub fn rematerialize(state: &Arc<AppState>, id: &str) {
                 &ports,
             )
         {
-            tracing::warn!(error = %e, "connector re-materialization failed");
+            return Err(e);
         }
     }
+    Ok(())
 }
 
 /// `POST /api/connectors` - create `{label, url, headers?, registryKey?}`.
 pub async fn create(State(state): State<Arc<AppState>>, Json(doc): Json<Value>) -> Response {
+    let _guard = MUTATIONS.lock().await;
     match state.db.create_connector(&doc) {
         Ok(row) => Json(row).into_response(),
         Err(crate::store::StoreError::Bad(m)) => err(StatusCode::BAD_REQUEST, m),
@@ -87,6 +112,7 @@ pub async fn update(
     Path(id): Path<String>,
     Json(doc): Json<Value>,
 ) -> Response {
+    let _guard = MUTATIONS.lock().await;
     match state.db.update_connector(&id, &doc) {
         Ok(()) => {
             if let Ok(Some(row)) = state.db.get_connector(&id) {
@@ -113,8 +139,32 @@ pub async fn update(
 /// `DELETE /api/connectors/{id}`. A system connector is dematerialized from
 /// every server config first - deleting the library row must never leave
 /// ghost tool entries behind in the TOMLs.
-pub async fn remove(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    if let Ok(Some(row)) = state.db.get_connector(&id) {
+pub async fn remove(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let _guard = MUTATIONS.lock().await;
+    if let Some(expected) = headers.get("x-paddock-revision") {
+        let expected = expected.to_str().ok().and_then(|s| s.parse::<u64>().ok());
+        if expected.is_none()
+            || state
+                .db
+                .native_connectors()
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|r| r["id"] == id))
+                .and_then(|r| r["revision"].as_u64())
+                != expected
+        {
+            return err(
+                StatusCode::CONFLICT,
+                "This connector changed. Reload before removing it.".into(),
+            );
+        }
+    }
+    if let Ok(rows) = state.db.native_connectors()
+        && let Some(row) = rows.into_iter().find(|r| r["id"] == id)
+    {
         let (all, ports) = row_scope(&row);
         if (all || !ports.is_empty())
             && let Err(e) = materialize(&state.supervisor.servers_dir(), &id, None, false, &[])
@@ -153,6 +203,7 @@ pub async fn scope(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let _guard = MUTATIONS.lock().await;
     let all = body.get("all").and_then(Value::as_bool).unwrap_or(false);
     let ports: Vec<u16> = body
         .get("ports")
@@ -174,6 +225,12 @@ pub async fn scope(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let entry = entry_from_row(&id, &row);
+    if body.get("revision").is_some() && body["revision"] != row["revision"] {
+        return err(
+            StatusCode::CONFLICT,
+            "This connector changed. Reload before changing its scope.".into(),
+        );
+    }
     match materialize(
         &state.supervisor.servers_dir(),
         &id,
@@ -213,11 +270,7 @@ pub(crate) fn entry_from_row(id: &str, row: &Value) -> Value {
         "connector_id": id,
     });
     let mut headers = row["headers"].as_object().cloned().unwrap_or_default();
-    if let Some(tok) = row["oauth"].get("access_token").and_then(Value::as_str)
-        && !headers.contains_key("Authorization")
-    {
-        headers.insert("Authorization".into(), json!(format!("Bearer {tok}")));
-    }
+    merge_oauth_header(&mut headers, &row["oauth"]);
     if !headers.is_empty() {
         e["headers"] = Value::Object(headers);
     }
@@ -236,6 +289,7 @@ fn materialize(
 ) -> Result<Vec<u16>, String> {
     use toml_edit::{DocumentMut, Item};
     let mut changed = Vec::new();
+    let mut planned = Vec::new();
     let listing = match std::fs::read_dir(servers_dir) {
         Ok(l) => l,
         Err(_) => return Ok(changed), // no servers dir yet = nothing to do
@@ -323,10 +377,36 @@ fn materialize(
             doc.remove("mcp_servers");
         }
         if touched {
-            std::fs::write(&path, doc.to_string())
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            changed.push(port);
+            planned.push((port, path, text, doc.to_string()));
         }
+    }
+    // Parse every destination before touching any. On an ordinary write
+    // failure restore already-published files, but never overwrite an external
+    // edit made since our publication. Crash reconciliation remains separate.
+    let mut published: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+    for (port, path, old, new) in planned {
+        let result = if std::fs::read_to_string(&path).ok().as_deref() != Some(old.as_str()) {
+            Err("An endpoint changed during the scope review.".into())
+        } else {
+            crate::integrations::atomic_config(&path, &new)
+        };
+        if let Err(error) = result {
+            let mut restored = true;
+            for (path, old, new) in published.into_iter().rev() {
+                if std::fs::read_to_string(&path).ok().as_deref() != Some(new.as_str())
+                    || crate::integrations::atomic_config(&path, &old).is_err()
+                {
+                    restored = false;
+                }
+            }
+            return Err(if restored {
+                error
+            } else {
+                "Endpoint synchronization partially failed. Reapply the connector scope to reconcile it.".into()
+            });
+        }
+        changed.push(port);
+        published.push((path, old, new));
     }
     changed.sort_unstable();
     Ok(changed)
@@ -356,6 +436,9 @@ pub fn system_entries(db: &crate::store::Store, existing: &[Value]) -> Vec<Value
 /// connect, list, drop. Failures come back soft (`ok:false`) - the picker
 /// still offers the whole server when its listing is unreachable.
 pub async fn tools(State(state): State<Arc<AppState>>, Json(doc): Json<Value>) -> Response {
+    if doc.get("builtin").and_then(Value::as_str) == Some("graph") {
+        return Json(json!({"ok":true,"tools":crate::graph::tool_list(),"instructions":crate::graph::INSTRUCTIONS})).into_response();
+    }
     // The manager's own MCP server (artifacts) is answered in-process: it is
     // not a remote to dial, and reading its live router keeps the picker from
     // drifting when a tool is added.
@@ -373,11 +456,7 @@ pub async fn tools(State(state): State<Arc<AppState>>, Json(doc): Json<Value>) -
         };
         let row = crate::oauth::ensure_fresh(&state, row).await;
         let mut headers = row["headers"].as_object().cloned().unwrap_or_default();
-        if let Some(tok) = row["oauth"].get("access_token").and_then(Value::as_str)
-            && !headers.contains_key("Authorization")
-        {
-            headers.insert("Authorization".into(), json!(format!("Bearer {tok}")));
-        }
+        merge_oauth_header(&mut headers, &row["oauth"]);
         (row["url"].as_str().unwrap_or_default().to_string(), headers)
     } else if let (Some(port), Some(label)) = (
         doc.get("port").and_then(Value::as_u64),
@@ -587,6 +666,23 @@ mod tests {
             "emptied array is removed, not left as noise"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_authorization_precedes_oauth_case_insensitively() {
+        let oauth = json!({"access_token": "oauth-fixture"});
+        for name in ["Authorization", "authorization", "AUTHORIZATION"] {
+            let mut headers = serde_json::Map::new();
+            headers.insert(name.into(), json!("Bearer manual-fixture"));
+            super::merge_oauth_header(&mut headers, &oauth);
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[name], "Bearer manual-fixture");
+            let entry = super::entry_from_row("fixture", &json!({"headers":headers,"oauth":oauth}));
+            assert_eq!(entry["headers"][name], "Bearer manual-fixture");
+        }
+        let mut headers = serde_json::Map::new();
+        super::merge_oauth_header(&mut headers, &oauth);
+        assert_eq!(headers["Authorization"], "Bearer oauth-fixture");
     }
 
     #[test]

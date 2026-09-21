@@ -1476,8 +1476,9 @@ pub(crate) fn live_verbose(
     duration_s: f64,
 ) -> serde_json::Value {
     let mut guards = whisper_guards(out, scale.window_s as f64, duration_s);
-    // both granularities, always: a closed utterance is exactly where the
-    // timing pass is worth paying for, and the segments are the word grouping
+    // Segments always; timed words only if the backend supplied alignment.
+    // Without alignment these remain confidence-only `paddock_words`, never
+    // fabricated word timestamps or a reason to fail final transcription.
     let segs = whisper_segments(tok, scale, out, duration_s).ok();
     let words = whisper_words(
         segs.as_deref(),
@@ -2052,7 +2053,9 @@ pub(crate) async fn generative_pass(
     // was forced, in which case the envelope is in the prompt and the answer is
     // bare.
     Ok(match frontend {
-        crate::serving::AudioFrontend::Qwen3Asr if language.is_none() => {
+        crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal
+            if language.is_none() =>
+        {
             let (lang, text) = parse_output(&raw);
             (text.trim().to_owned(), lang)
         }
@@ -2080,7 +2083,7 @@ pub(crate) fn generative_prompt(
         // the converter's generic ChatML fallback with no audio branch at all
         // (see `serving::load`) - the official one ships in a file GGUF
         // converters never read.
-        crate::serving::AudioFrontend::Qwen3Asr => {
+        crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal => {
             let mut pre = String::new();
             if let Some(ctx) = context {
                 let clean = sanitize_user_text(ctx);
@@ -2123,7 +2126,8 @@ pub(crate) fn generative_prompt(
         // also how IBM's own llama-server example drives this endpoint
         // (`-F "prompt=transcribe the speech with proper punctuation and
         // capitalization."`). Absent, we send the card's headline prompt.
-        crate::serving::AudioFrontend::GraniteSpeech => {
+        crate::serving::AudioFrontend::GraniteSpeech
+        | crate::serving::AudioFrontend::GraniteSpeechMetal => {
             let instruction = if ts_mode {
                 // `prompt` and this are mutually exclusive and the handler
                 // already refused the pair, so nothing of the caller's is
@@ -2600,6 +2604,13 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             format!("{asked} - {why}"),
         );
     }
+    if grans.word && whisper.is_some_and(|w| !w.word_times) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "word timestamps are not implemented on this Whisper backend; segment timestamps are available",
+        );
+    }
     if grans.word && whisper.is_none() && !ts_mode {
         return err(
             StatusCode::BAD_REQUEST,
@@ -3021,7 +3032,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                         // envelope never reaches a delta - while it is still
                         // being emitted the transcript half is empty.
                         let body = match frontend {
-                            crate::serving::AudioFrontend::Qwen3Asr if forced.is_none() => {
+                            crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal if forced.is_none() => {
                                 let (lang, t) = parse_output(&raw);
                                 if lang.is_some() {
                                     detected = lang;
@@ -3061,7 +3072,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             let mut guards = guard.guards(duration_s);
             let raw = tok.decode(&ids, true).unwrap_or_default();
             let text = match frontend {
-                crate::serving::AudioFrontend::Qwen3Asr if forced.is_none() => {
+                crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal if forced.is_none() => {
                     let (lang, t) = parse_output(&raw);
                     if lang.is_some() {
                         detected = lang;
@@ -3158,8 +3169,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         // Qwen3-ASR: the forced-language path already put the envelope head
         // in the PROMPT, so raw output is bare transcript there; otherwise
         // strip the `language {X}<asr_text>` envelope the model emits.
-        crate::serving::AudioFrontend::Qwen3Asr if language.is_some() => (language.clone(), raw),
-        crate::serving::AudioFrontend::Qwen3Asr => parse_output(&raw),
+        crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal
+            if language.is_some() =>
+        {
+            (language.clone(), raw)
+        }
+        crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal => {
+            parse_output(&raw)
+        }
         // granite-speech emits a bare transcript with no envelope, and it
         // detects the input language without reporting it. So `language` here
         // is the caller's own hint echoed back, never a detection we made -
@@ -3168,10 +3185,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         // In timestamp mode the transcript is not bare: the times are text, and
         // they come back out here so `text` reads as a transcript rather than
         // as a tag stream. The words keep them (`granite_timed_words`).
-        crate::serving::AudioFrontend::GraniteSpeech if ts_mode => {
+        crate::serving::AudioFrontend::GraniteSpeech
+        | crate::serving::AudioFrontend::GraniteSpeechMetal
+            if ts_mode =>
+        {
             (language.clone(), granite_strip_ts(&raw))
         }
-        crate::serving::AudioFrontend::GraniteSpeech => (language.clone(), raw),
+        crate::serving::AudioFrontend::GraniteSpeech
+        | crate::serving::AudioFrontend::GraniteSpeechMetal => (language.clone(), raw),
         crate::serving::AudioFrontend::None => (None, raw),
     };
     let text = text.trim().to_owned();

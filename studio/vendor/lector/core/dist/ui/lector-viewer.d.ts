@@ -1,6 +1,7 @@
 import type { LectorEngine } from '../engine/lector-engine.js';
 import type { UICapability } from '../plugins/ui-plugin.js';
 import type { DocumentId } from '../types/handle-id.js';
+import { PageRenderer } from './page-renderer.js';
 /**
  * Options for constructing a {@link LectorViewer} instance.
  *
@@ -46,51 +47,6 @@ export interface LectorViewerOptions {
      * the entire schema.
      */
     uiSchema?: Record<string, unknown>;
-    /**
-     * Whether the document tab bar is shown. Defaults to `true`.
-     *
-     * Turn it off when the HOST already owns document switching — an app with
-     * its own file list, where the viewer shows whichever document that list
-     * has selected. Two controls for one choice is confusing on its own, and
-     * the tab's close button is worse: in a host like that, "close" has no
-     * meaning the host can honour (the document is still in its list) and
-     * closing one leaves the host pointing at a document the viewer no longer
-     * holds. Switching keeps working through `document.setActive()` either way.
-     */
-    documentTabs?: boolean;
-    /**
-     * Buttons the HOST contributes to the toolbar, rendered by lector so they
-     * are the same size, spacing and hover treatment as its own — which is the
-     * whole point. An embedder that draws its own bar above or below the
-     * viewer gets two rows of chrome with two different button metrics; there
-     * is nowhere for a host action to sit that looks like it belongs.
-     *
-     * `icon` is a built-in icon name (see icons.ts). Unknown names render an
-     * empty button rather than throwing, so a typo is visible but not fatal.
-     */
-    toolbarExtras?: ReadonlyArray<{
-        /** Stable id, used as `data-action` so hosts can find the button. */
-        id: string;
-        /** Built-in icon name. */
-        icon: string;
-        /** Tooltip text — already localized by the host. */
-        tooltip: string;
-        /** Which group it joins. Defaults to `'right'`. */
-        section?: 'left' | 'center' | 'right';
-        /**
-         * Where inside that group. `'end'` (the default) puts it after the
-         * viewer's own controls; `'start'` puts it before them, which is what a
-         * host action that OWNS the pane wants — collapsing the whole viewer
-         * belongs outside the controls it collapses, not tacked on after them.
-         * The divider follows: it lands between the extras and lector's buttons
-         * either way.
-         */
-        placement?: 'start' | 'end';
-        /** Runs on click. */
-        onSelect: () => void;
-        /** Greys the button out and blocks the click. Re-read on every rebuild. */
-        disabled?: () => boolean;
-    }>;
 }
 /**
  * One entry in the viewer's tab bar. A tab is either a single document
@@ -199,6 +155,9 @@ export declare class LectorViewer implements Disposable {
     closeTabSide(index: number, side: 'left' | 'right'): Promise<void>;
     /** The {@link LectorEngine} instance powering this viewer. */
     get engine(): LectorEngine;
+    /** Shared renderer accounting; browser/WASM overhead is measured separately. */
+    get renderStats(): PageRenderer['stats'];
+    isPageReady(pageIndex: number): boolean;
     /** The UI capability for programmatic sidebar / theme / schema control. */
     get ui(): UICapability;
     /**

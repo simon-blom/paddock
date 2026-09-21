@@ -3050,7 +3050,7 @@ struct KernelTableV1 {
     // batch, stream). Pure append.
     int (*q8_0_gemm_mmq_pipe_hcmix_rn)(const void*, const void*, const void*, const void*,
                                        const void*, void*, uint32_t, uint32_t, uint32_t, void*);
-    // 609: q4x_combine_norm_q8mmq_nsi - slot 606 that also folds the NEXT
+    // 609: q4x_combine_norm_q8mmq_nsi - slot 606 that also folds the next
     // mix's inject ([4][hc * hidden] f32) from its norm pass: (row, stream)
     // partials into ip [rows][hc][hc], summed over streams into inj_out
     // [rows][hc] (inj may alias inj_out). hc 4; a class change against the
@@ -3059,6 +3059,134 @@ struct KernelTableV1 {
     int (*q4x_combine_norm_q8mmq_nsi)(void*, const void*, const void*, const void*, void*,
                                       void*, const void*, void*, void*, uint32_t, uint32_t,
                                       uint32_t, float, uint32_t, void*);
+    // 610: dp_u8_patch_rows - dense-prediction patch stem: u8 HWC chips of ch
+    // (<= 4) bands -> normalized f16 patch rows in im2row order, each chip owning
+    // chip_rows rows with the tail past the patch grid zeroed (the class and
+    // register token rows). (pixels, out, m0..m3, s0..s3, chips, px, patch, ch,
+    // chip_rows, stream). Pure append.
+    int (*dp_u8_patch_rows)(const void*, void*, float, float, float, float, float, float,
+                            float, float, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                            void*);
+    // 611: dp_qkv_split_rope - fused q|k|v landing -> q, k, v with the q/v
+    // biases folded and a cos/sin TABLE rope ([n_rope][hd/2], rotate_half pairs)
+    // on the first n_rope rows of every chip_rows-row chip. (qkv, bq, bv, cos,
+    // sin, q, k, v, d, hd, rows, chip_rows, n_rope, stream). Pure append.
+    int (*dp_qkv_split_rope)(const void*, const void*, const void*, const void*, const void*,
+                             void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                             uint32_t, void*);
+    // 612: dp_res_ls_ln_f16 - the LayerScale residual seam: x += ls * (proj +
+    // bias), then out = f16(LayerNorm(x)). (x, proj, bias, ls, w, b, out, rows,
+    // n, eps, stream). Pure append.
+    int (*dp_res_ls_ln_f16)(void*, const void*, const void*, const void*, const void*,
+                            const void*, void*, uint32_t, uint32_t, float, void*);
+    // 613: dp_group_norm_gelu_f16 - torch GroupNorm over an NHWC plane (the
+    // producing conv's bias xb folded at the load) + exact GELU + the f16
+    // store. part: chips*ceil(P/64)*C f32 scratch, stat: 2*chips*G. (x, xb, w,
+    // b, out, part, stat, chips, P, C, G, eps, stream). Pure append.
+    int (*dp_group_norm_gelu_f16)(const void*, const void*, const void*, const void*, void*,
+                                  void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                                  void*);
+    // 614/615: dp_im2row3_f32 / _f16 - 3x3 stride-1 zero-pad-1 im2row over an
+    // NHWC plane (f32 or f16 source) into f16 staging, TAP-outer columns; source
+    // chips strided by src_chip_rows rows. (src, out, chips, H, W, C,
+    // src_chip_rows, stream). Pure append.
+    int (*dp_im2row3_f32)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, void*);
+    int (*dp_im2row3_f16)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, void*);
+    // 616: dp_convt2_skip - depth-to-space of a 2x2/stride-2 transposed conv's
+    // GEMM landing [chips][h*w][4*C], + bias, + the hs x hs skip grid sampled
+    // bilinearly (align_corners=False) at the 2h x 2w output. (g, bias, skip,
+    // out, chips, h, w, C, hs, skip_chip_rows, stream). Pure append.
+    int (*dp_convt2_skip)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 617: dp_seg_heads - the stacked class + height 1x1 landing [rows][ncls+1]
+    // -> u8 argmax raster, f32 regression raster, optional biased f16 logits.
+    // (o, bias, cls, height, logits|NULL, rows, ncls, stream). Pure append.
+    int (*dp_seg_heads)(const void*, const void*, void*, void*, void*, uint32_t, uint32_t,
+                        void*);
+    // ---- 618-623: the half activation interface (dinov3's backbone) ----
+    // 618: f16_gemm_h - pd_f16_gemm with the landing narrowed to f16: y is
+    // [batch][out_dim] halves, beta 0, in_dim % 8 == 0. Same ring, same K
+    // order: bit-for-bit __float2half of the f32 landing. (w, x, y, in_dim,
+    // out_dim, batch, stream). Pure append.
+    int (*f16_gemm_h)(const void*, const void*, void*, unsigned int, unsigned int,
+                      unsigned int, void*);
+    // 619: f16_gemm_h_elected - 1 when the half landing is this device's
+    // elected wide-batch route, 0 when the f32 entry owns an arm it has no
+    // twin of (tcgen05 on cc 10.0). Asked once, at load. Pure append.
+    int (*f16_gemm_h_elected)(void);
+    // 620: vision_attn_h - pd_vision_attn_x on halves: q (pre-scaled), k, v
+    // and out are [batch][row][head][dim] f16. (q, k, v, out, nq, nkv,
+    // n_heads, head_dim, n_batch, stream). Pure append.
+    int (*vision_attn_h)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                         uint32_t, uint32_t, uint32_t, void*);
+    // 621: dp_qkv_split_rope_h - 611 off a half qkv landing into half q/k/v,
+    // 1/sqrt(hd) folded into q before its round. (qkv, bq, bv, cos, sin, q, k,
+    // v, d, hd, rows, chip_rows, n_rope, qscale, stream). Pure append.
+    int (*dp_qkv_split_rope_h)(const void*, const void*, const void*, const void*,
+                               const void*, void*, void*, void*, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, float, void*);
+    // 622: dp_res_ls_ln_h - 612 off a half projection landing. (x, proj, bias,
+    // ls, w, b, out, rows, n, eps, stream). Pure append.
+    int (*dp_res_ls_ln_h)(void*, const void*, const void*, const void*, const void*,
+                          const void*, void*, uint32_t, uint32_t, float, void*);
+    // 623: dp_gelu_bias_h - bias + exact GELU on halves, in place.
+    // (x, bias, rows, n, stream). Pure append.
+    int (*dp_gelu_bias_h)(void*, const void*, uint32_t, uint32_t, void*);
+    // 624: f16_gemm_h_gelu - 618 with a per-output-row bias and the exact GELU
+    // folded into the landing, before its one round: y = f16(gelu(acc + b[m])).
+    // Retires 623's pass over the plane. (w, x, y, bias, in_dim, out_dim,
+    // batch, stream). Pure append.
+    int (*f16_gemm_h_gelu)(const void*, const void*, void*, const void*, unsigned int,
+                           unsigned int, unsigned int, void*);
+    // 625: kquant_ternary - capability marker: the i-quant lanes serve PrismML's
+    // ternary packings PTQ1_0 (GGUF raw id 143) and PQ2_0 (142). Pure append.
+    int (*kquant_ternary)(void);
+    // 626: hadamard_rows - blockwise Walsh-Hadamard rotation of rotated-basis
+    // checkpoints: y = H(s * x) per `block`-wide strip, or y = s * H(x) with
+    // mode bit 0 (a looked-up row of a rotated table); hd != 0 permutes GDN
+    // value heads tiled -> grouped on the way in. (x, y, signs, rows, width,
+    // block, mode, hd, nk, rep, stream). Pure append.
+    int (*hadamard_rows)(const void*, void*, const void*, uint32_t, uint32_t, uint32_t,
+                         uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 627: quantize_q8_b128 - int8 activations with ONE scale per 128 (the
+    // ternary decode lane's class; sound on Hadamard-rotated rows only).
+    // (x f32 [n], q int8 [n], scale f32 [n/128], n, stream). Pure append.
+    int (*quantize_q8_b128)(const void*, void*, void*, uint32_t, void*);
+    // 628: ternary_gemv_b128 - batch-1 PTQ1_0 GEMV off slot 627's
+    // activations: one table read per weight byte, a lane owns whole
+    // super-blocks. (data, scales, xq, xs, y, in_dim, out_dim, dtype,
+    // stream). Pure append.
+    int (*ternary_gemv_b128)(const void*, const void*, const void*, const void*, void*,
+                             uint32_t, uint32_t, uint32_t, void*);
+    // 629: hadamard_rows_q8_b128 - slot 626's forward rotation and slot 627's
+    // quantize in one launch; y (nullable) also takes the f32 rotated rows.
+    // (x, y, signs, xq, xs, rows, width, block, hd, nk, rep, stream). Pure append.
+    int (*hadamard_rows_q8_b128)(const void*, void*, const void*, void*, void*, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 630: ternary_gemv_b128_multi - slot 628 over up to three planes that
+    // read the same staged row, or (glu) a gate|up pair folded with SwiGLU.
+    // (d0, r0, d1, r1, d2, r2, xq, xs, y0, y1, y2, in_dim, o0, o1, o2,
+    // n_planes, glu, stream). Pure append.
+    int (*ternary_gemv_b128_multi)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, const void*, const void*, void*,
+                                   void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                   uint32_t, uint32_t, void*);
+    // 631: sorted-tile NVFP4 routed gate+up+SwiGLU - slot 407's twin with a
+    // SECOND weight plane and silu(g)*u where it squares a relu. This is the
+    // qwen4exp routed pair's W4A4 arm; that family served its experts on the
+    // W4A16 dot4 GEMV (slot 619) even though modelopt declares the routed
+    // experts `input_activations` 4-bit, so the GEMV was paying GEMV cost for
+    // precision the export was never quantized at. The MTP head's experts ARE
+    // W4A16 and keep the GEMV, which is why this is an election.
+    // fq/fs are sorted-position indexed, slot 408's direct B input.
+    // (gdata, gscale, gscale2, udata, uscale, uscale2, sorted_row,
+    //  block_expert, xq, xs, fq, fs, in_dim, ff, nb, stream). Pure append.
+    int (*nvf4_moe_gu_swiglu_bs)(const void*, const void*, const void*, const void*,
+                                 const void*, const void*, const void*, const void*,
+                                 const void*, const void*, void*, void*, uint32_t,
+                                 uint32_t, uint32_t, void*);
 };
 
 } // extern "C"

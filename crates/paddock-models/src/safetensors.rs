@@ -27,6 +27,8 @@ pub enum StDtype {
     /// Opaque byte tensors - modelopt NVFP4 exports pack two e2m1 nibbles per
     /// byte under dtype "U8" (the [N, K/2] `weight` of the fp4 triple).
     U8,
+    /// MLX affine quantization packs eight 4-bit codes in each little-endian word.
+    U32,
     /// Anything else - carried so callers can report it, never silently skipped.
     Other,
 }
@@ -39,6 +41,7 @@ impl StDtype {
             "F16" => StDtype::F16,
             "F32" => StDtype::F32,
             "U8" => StDtype::U8,
+            "U32" => StDtype::U32,
             "I64" => StDtype::I64,
             _ => StDtype::Other,
         }
@@ -49,7 +52,7 @@ impl StDtype {
         match self {
             StDtype::F8E4m3 | StDtype::U8 => 1,
             StDtype::Bf16 | StDtype::F16 => 2,
-            StDtype::F32 => 4,
+            StDtype::F32 | StDtype::U32 => 4,
             StDtype::I64 => 8,
             StDtype::Other => 0,
         }
@@ -69,6 +72,8 @@ pub struct StTensor {
 /// A memory-mapped safetensors file with its parsed tensor map.
 pub struct SafetensorsFile {
     map: memmap2::Mmap,
+    #[cfg(unix)]
+    file: std::fs::File,
     data_off: usize,
     tensors: HashMap<String, StTensor>,
     pub metadata: HashMap<String, String>,
@@ -126,11 +131,10 @@ impl SafetensorsFile {
             let shape: Vec<usize> = v
                 .get("shape")
                 .and_then(|s| s.as_array())
-                .map(|a| {
+                .and_then(|a| {
                     a.iter()
-                        .filter_map(|x| x.as_u64())
-                        .map(|x| x as usize)
-                        .collect()
+                        .map(|x| x.as_u64().and_then(|v| usize::try_from(v).ok()))
+                        .collect::<Option<Vec<_>>>()
                 })
                 .ok_or_else(|| StError::Header(format!("{name}: missing shape")))?;
             let offs = v
@@ -149,8 +153,11 @@ impl SafetensorsFile {
             }
             // element count × dtype size must match the byte span (dtype
             // Other is exempt - bytes() is 0 and callers reject on use)
-            let n: usize = shape.iter().product();
-            if dtype.bytes() != 0 && n * dtype.bytes() != end - begin {
+            let n = shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| StError::Header(format!("{name}: element count overflow")))?;
+            if dtype.bytes() != 0 && n.checked_mul(dtype.bytes()) != Some(end - begin) {
                 return Err(StError::Header(format!(
                     "{name}: shape {shape:?} x {dtype:?} != {} bytes",
                     end - begin
@@ -168,6 +175,8 @@ impl SafetensorsFile {
         }
         Ok(Self {
             map,
+            #[cfg(unix)]
+            file: f,
             data_off,
             tensors,
             metadata,
@@ -183,6 +192,24 @@ impl SafetensorsFile {
         let t = self.tensors.get(name)?;
         Some((t, &self.map[self.data_off + t.begin..self.data_off + t.end]))
     }
+
+    /// Positional file I/O directly into a caller-owned allocation. Unlike
+    /// copying a touched mmap, this does not retain a second process-resident
+    /// view of large immutable weights. No shared seek cursor or model math.
+    #[cfg(unix)]
+    fn read_into(&self, name: &str, out: &mut [u8]) -> Result<(), StError> {
+        use std::os::unix::fs::FileExt;
+        let t = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
+        if out.len() != t.end - t.begin {
+            return Err(StError::Header(format!("read size differs for {name}")));
+        }
+        self.file
+            .read_exact_at(out, (self.data_off + t.begin) as u64)?;
+        Ok(())
+    }
 }
 
 /// A sharded checkpoint directory (model.safetensors.index.json + shards).
@@ -194,6 +221,60 @@ pub struct ShardedSafetensors {
 }
 
 impl ShardedSafetensors {
+    /// Fault a tensor's bytes into the page cache and BLOCK until they are
+    /// there. For a table the serve will random-read forever after - the PLE
+    /// n-gram table is 26.8 GiB of this checkpoint and every token gathers 16
+    /// rows out of it - the alternative is paying those faults one disk seek
+    /// at a time on the critical path, which is a TTFT problem, not a
+    /// throughput one (the repo's own `ple-table-page-cache-trap`).
+    ///
+    /// `advise(WillNeed)` only starts readahead, so the touch loop is the part
+    /// that makes residency deterministic: one byte a page, which costs a
+    /// fault the first time and nothing after. Returns bytes touched.
+    ///
+    /// Every platform, not only Unix: the touch loop is plain reads of a mapped
+    /// file, and this model is served on Windows as well. Only the advisory
+    /// hint is Unix (memmap2 has no Windows `advise`), and without it the loop
+    /// does the same work a little less cleverly.
+    pub fn warm_tensor(&self, name: &str) -> Result<usize, StError> {
+        let Some((_, bytes)) = self.bytes(name) else {
+            return Err(StError::Header(format!("missing tensor {name}")));
+        };
+        // advisory only - best effort, and a kernel that declines it just
+        // means the touch loop below does the work itself
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let shard = self
+                .index
+                .get(name)
+                .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
+            let file = &self.shards[*shard];
+            // offset of this tensor inside the mapping
+            let base = file.map.as_ptr() as usize;
+            let off = bytes.as_ptr() as usize - base;
+            let _ = file.map.advise_range(Advice::WillNeed, off, bytes.len());
+        }
+        let mut sink = 0u64;
+        let page = 4096usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            // volatile so the loop cannot be optimized away into nothing
+            sink = sink.wrapping_add(unsafe { std::ptr::read_volatile(&bytes[i]) } as u64);
+            i += page;
+        }
+        std::hint::black_box(sink);
+        Ok(bytes.len())
+    }
+
+    #[cfg(unix)]
+    pub fn read_into(&self, name: &str, out: &mut [u8]) -> Result<(), StError> {
+        let shard = self
+            .index
+            .get(name)
+            .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
+        self.shards[*shard].read_into(name, out)
+    }
     pub fn open_dir(dir: &Path) -> Result<Self, StError> {
         let idx_path = dir.join("model.safetensors.index.json");
         if !idx_path.exists() {
@@ -220,6 +301,16 @@ impl ShardedSafetensors {
         let mut shards = Vec::with_capacity(shard_ids.len());
         let mut pos = HashMap::new();
         for (i, sid) in shard_ids.iter().enumerate() {
+            // An index names sibling shards, never an arbitrary host path.
+            if Path::new(sid).components().count() != 1
+                || sid.contains(['/', '\\'])
+                || !matches!(
+                    Path::new(sid).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(StError::Header(format!("invalid shard filename {sid:?}")));
+            }
             pos.insert(sid.clone(), i);
             shards.push(SafetensorsFile::open(&dir.join(sid))?);
         }
@@ -235,6 +326,11 @@ impl ShardedSafetensors {
 
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.index.keys()
+    }
+
+    /// Mapped storage, including tensor headers, for conservative load budgeting.
+    pub fn total_len(&self) -> u64 {
+        self.shards.iter().map(|s| s.map.len() as u64).sum()
     }
 
     pub fn bytes(&self, name: &str) -> Option<(&StTensor, &[u8])> {
@@ -337,6 +433,13 @@ impl DflashConfig {
 /// `n_labels` time bins of `segment_ms` milliseconds. Same parsing stance as
 /// [`DflashConfig`]: every consumed field validated present, loud on miss.
 pub struct AlignerConfig {
+    /// Exact ordinary causal Qwen3/audio semantics. Native backends must not
+    /// silently ignore a scaled rotary, biased classifier or changed frontend.
+    pub vanilla_graph: bool,
+    /// Exact integrated audio frontend declaration; old CUDA readers do not
+    /// require it, but a new native loader must fail closed on missing/drifted
+    /// preprocessing instead of serving with guessed defaults.
+    pub vanilla_frontend: bool,
     // text stack (config.text_config)
     pub n_layer: usize,
     pub hidden: usize,
@@ -406,7 +509,55 @@ impl AlignerConfig {
             .and_then(|m| m.as_object())
             .map(|m| m.len())
             .ok_or_else(|| StError::Header("aligner config.json: missing id2label".into()))?;
+        let processor = path
+            .parent()
+            .and_then(|dir| std::fs::read(dir.join("processor_config.json")).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let vanilla_frontend = processor.as_ref().is_some_and(|p| {
+            p.get("processor_class").and_then(|x| x.as_str()) == Some("Qwen3ASRProcessor")
+                && p.get("timestamp_segment_time").and_then(|x| x.as_u64()) == Some(80)
+                && p.get("feature_extractor").is_some_and(|f| {
+                    [
+                        ("feature_size", 128),
+                        ("hop_length", 160),
+                        ("min_length", 8000),
+                        ("n_fft", 400),
+                        ("n_window", 50),
+                        ("sampling_rate", 16000),
+                        ("chunk_length", 30),
+                    ]
+                    .iter()
+                    .all(|&(k, n)| f.get(k).and_then(|x| x.as_u64()) == Some(n))
+                        && f.get("dither").and_then(|x| x.as_f64()) == Some(0.)
+                        && f.get("padding_value").and_then(|x| x.as_f64()) == Some(0.)
+                        && f.get("padding_side").and_then(|x| x.as_str()) == Some("right")
+                        && f.get("return_attention_mask").and_then(|x| x.as_bool()) == Some(true)
+                })
+        });
         Ok(Self {
+            vanilla_frontend,
+            vanilla_graph: t.get("hidden_act").and_then(|x| x.as_str()) == Some("silu")
+                && t.get("attention_bias").and_then(|x| x.as_bool()) == Some(false)
+                && t.get("use_sliding_window").and_then(|x| x.as_bool()) == Some(false)
+                && t.get("sliding_window").is_none_or(|x| x.is_null())
+                && t.get("layer_types")
+                    .and_then(|x| x.as_array())
+                    .is_some_and(|ls| {
+                        ls.len()
+                            == t.get("num_hidden_layers")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0) as usize
+                            && ls.iter().all(|x| x.as_str() == Some("full_attention"))
+                    })
+                && t.get("rope_parameters").is_some_and(|r| {
+                    r.get("rope_type").and_then(|x| x.as_str()) == Some("default")
+                        && r.as_object().is_some_and(|o| o.len() == 2)
+                })
+                && a.get("activation_function").and_then(|x| x.as_str()) == Some("gelu")
+                && a.get("scale_embedding").and_then(|x| x.as_bool()) == Some(false)
+                && a.get("n_window").and_then(|x| x.as_u64()) == Some(50)
+                && a.get("n_window_infer").and_then(|x| x.as_u64()) == Some(800)
+                && v.get("token_classification_bias").and_then(|x| x.as_bool()) == Some(false),
             n_layer: getu(t, "text_config.", "num_hidden_layers")?,
             hidden: getu(t, "text_config.", "hidden_size")?,
             n_heads: getu(t, "text_config.", "num_attention_heads")?,
@@ -508,6 +659,29 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn unique_path() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "paddock-st-{}-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn write_header(header: serde_json::Value, data: &[u8]) -> std::path::PathBuf {
+        let path = unique_path();
+        let header = header.to_string();
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header.as_bytes()).unwrap();
+        f.write_all(data).unwrap();
+        path
+    }
+
     fn write_st(tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) -> std::path::PathBuf {
         let mut header = serde_json::Map::new();
         let mut data: Vec<u8> = Vec::new();
@@ -520,15 +694,110 @@ mod tests {
                                    "data_offsets": [begin, data.len()]}),
             );
         }
-        let hjson = serde_json::Value::Object(header).to_string();
-        let dir = std::env::temp_dir().join("paddock-st-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("t{}.safetensors", tensors.len()));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&(hjson.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(hjson.as_bytes()).unwrap();
-        f.write_all(&data).unwrap();
-        path
+        write_header(serde_json::Value::Object(header), &data)
+    }
+
+    #[test]
+    fn parses_packed_u32_and_rejects_malformed_dimensions() {
+        let path = write_st(&[("w", "U32", vec![2, 4], vec![0; 32])]);
+        let file = SafetensorsFile::open(&path).unwrap();
+        assert_eq!(file.bytes("w").unwrap().0.dtype, StDtype::U32);
+        assert_eq!(file.bytes("w").unwrap().1.len(), 32);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        for shape in [
+            serde_json::json!([1, "bad"]),
+            serde_json::json!([-1]),
+            serde_json::json!([u64::MAX, 2]),
+            serde_json::json!([u64::MAX]),
+        ] {
+            let path = write_header(
+                serde_json::json!({"w":{"dtype":"U32","shape":shape,"data_offsets":[0,4]}}),
+                &[0; 4],
+            );
+            assert!(SafetensorsFile::open(&path).is_err());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn positional_weight_io_preserves_bytes_and_has_no_shared_cursor() {
+        let path = write_st(&[
+            ("first", "U32", vec![4], (0..16).collect()),
+            ("second", "BF16", vec![3], vec![7, 8, 9, 10, 11, 12]),
+        ]);
+        let file = SafetensorsFile::open(&path).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let file = &file;
+                scope.spawn(move || {
+                    for name in ["second", "first", "second"] {
+                        let expected = file.bytes(name).unwrap().1;
+                        let mut out = vec![0; expected.len()];
+                        file.read_into(name, &mut out).unwrap();
+                        assert_eq!(out, expected);
+                    }
+                });
+            }
+        });
+        let mut short = [42; 2];
+        assert!(file.read_into("first", &mut short).is_err());
+        assert!(file.read_into("missing", &mut short).is_err());
+        assert_eq!(short, [42; 2]);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// No cfg on this one deliberately: the method went in Unix-only, the
+    /// engine called it unconditionally, and the Windows build broke. It has to
+    /// exist and do its work wherever the workspace compiles.
+    #[test]
+    fn warming_a_tensor_touches_all_of_it_on_every_platform() {
+        let dir = unique_path().with_extension("warm");
+        std::fs::create_dir(&dir).unwrap();
+        // three pages and a bit, so the touch loop takes more than one step
+        let table: Vec<u8> = (0..4096 * 3 + 17).map(|i| (i % 251) as u8).collect();
+        let single = write_st(&[
+            ("small", "U8", vec![4], vec![1, 2, 3, 4]),
+            ("table", "U8", vec![table.len()], table.clone()),
+        ]);
+        std::fs::rename(&single, dir.join("model.safetensors")).unwrap();
+        let st = ShardedSafetensors::open_dir(&dir).unwrap();
+        assert_eq!(st.warm_tensor("table").unwrap(), table.len());
+        assert_eq!(st.warm_tensor("small").unwrap(), 4);
+        // warming reads, it does not change what the mapping holds
+        assert_eq!(st.bytes("table").unwrap().1, &table[..]);
+        assert!(st.warm_tensor("missing").is_err());
+        drop(st);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_sibling_shard_paths_before_opening() {
+        let dir = unique_path().with_extension("shards");
+        std::fs::create_dir(&dir).unwrap();
+        let index = dir.join("model.safetensors.index.json");
+        for name in [
+            "../w.safetensors",
+            "/tmp/w.safetensors",
+            "a/b.safetensors",
+            "a\\b.safetensors",
+            ".",
+            "..",
+        ] {
+            std::fs::write(
+                &index,
+                serde_json::json!({"weight_map":{"w":name}}).to_string(),
+            )
+            .unwrap();
+            assert!(matches!(
+                ShardedSafetensors::open_dir(&dir),
+                Err(StError::Header(_))
+            ));
+        }
+        std::fs::remove_file(index).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

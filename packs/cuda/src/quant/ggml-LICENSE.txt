@@ -1,5 +1,6 @@
 The i-quant codebooks in iq_grids.cuh and in
-crates/paddock-kernels/src/reference/iq_grids.rs (the IQ1_S, IQ2_XXS,
+crates/paddock-kernels/src/reference/iq_grids.rs (also the exact IQ2_S/IQ3_S
+subset in packs/metal/iquant_tables.metal; the IQ1_S, IQ2_XXS,
 IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S grids and the IQ4_NL value table) are the
 format definition of ggml's i-quant types, transcribed from ggml-common.h
 in ggml / llama.cpp. They are used under ggml's licence, reproduced below.

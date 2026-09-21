@@ -53,6 +53,8 @@ const filtered = computed(() => {
 
 // ── save-as (inline in the footer) ──────────────────────────────────────────
 const saving = ref(false)
+const committing = ref(false)
+const saveError = ref('')
 const saveName = ref('')
 const nameInput = ref<HTMLInputElement | null>(null)
 const canSave = computed(() => hasBody.value && !!saveName.value.trim())
@@ -93,6 +95,7 @@ function usePreset(p: SavedPrompt): void {
   picking.value = false
 }
 function startSave(): void {
+  saveError.value = ''
   saving.value = true
   picking.value = false
   saveName.value = activePreset.value?.name ?? ''
@@ -102,13 +105,17 @@ function startSave(): void {
   })
 }
 async function confirmSave(): Promise<void> {
-  if (!canSave.value) return
+  if (!canSave.value || committing.value) return
   // update a same-named preset, else create a new one.
   const id = prompts.prompts.find(
     (p) => p.name.trim().toLowerCase() === saveName.value.trim().toLowerCase(),
   )?.id
-  await prompts.save(saveName.value, bodyText.value, id)
-  saving.value = false
+  committing.value = true; saveError.value = ''
+  try {
+    await prompts.save(saveName.value, bodyText.value, id)
+    saving.value = false
+  } catch (e) { saveError.value = e instanceof Error ? e.message : String(e) }
+  finally { committing.value = false }
 }
 function manageLibrary(): void {
   emit('close')
@@ -119,6 +126,7 @@ function manageLibrary(): void {
 <template>
   <Dialog :open="open" title="System prompt" icon="sliders" @close="emit('close')">
     <div class="sp">
+      <p v-if="saveError || prompts.error" role="alert">{{ saveError || prompts.error }}</p>
       <textarea
         class="pk-input sp__ta"
         :value="conv.systemPrompt"
@@ -207,13 +215,14 @@ function manageLibrary(): void {
         <input
           ref="nameInput"
           v-model="saveName"
+          :disabled="committing"
           class="pk-input sp__savename"
           placeholder="Preset name"
           @keydown.enter="confirmSave"
-          @keydown.esc="saving = false"
+          @keydown.esc="!committing && (saving = false)"
         />
-        <button class="pk-btn pk-btn--ghost" type="button" @click="saving = false">Cancel</button>
-        <button class="pk-btn pk-btn--primary" type="button" :disabled="!canSave" @click="confirmSave">
+        <button class="pk-btn pk-btn--ghost" type="button" :disabled="committing" @click="saving = false">Cancel</button>
+        <button class="pk-btn pk-btn--primary" type="button" :disabled="!canSave || committing" @click="confirmSave">
           Save
         </button>
       </template>

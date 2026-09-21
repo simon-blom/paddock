@@ -31,12 +31,11 @@ import { computed, ref, shallowRef } from 'vue'
 
 import { openMic } from './useAudioDevices'
 import { useMicLevels } from './useMicLevels'
+import { recordAudio, type AudioRecording } from '@/lib/audio-recording'
 
 /** Container preference, best first. Opus in WebM is the small, well-supported
  *  one; Safari answers mp4. Whatever the browser accepts, the runner and the
  * providers both decode it. */
-const TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
-const EXT: Record<string, string> = { webm: 'webm', mp4: 'm4a', ogg: 'ogg' }
 
 /** How long to wait for the device to wake before recording anyway. Generous
  *  deliberately: a wireless (DECT) headset has to bring up its radio link to the
@@ -83,10 +82,10 @@ export function useRecorder() {
   /** Seconds left, floored at 0 - what a countdown renders. */
   const remaining = computed(() => Math.max(0, limit.value - elapsed.value))
   const error = ref<string | null>(null)
-  const rec = shallowRef<MediaRecorder | null>(null)
+  const rec = shallowRef<AudioRecording | null>(null)
 
   let stream: MediaStream | null = null
-  let chunks: BlobPart[] = []
+  let recordingTypes: readonly string[] | undefined
   let tick: ReturnType<typeof setInterval> | null = null
   let watch: ReturnType<typeof setInterval> | null = null
   let ac: AudioContext | null = null
@@ -99,6 +98,7 @@ export function useRecorder() {
   /** ...and we were actually able to look, so `!heard` means something. */
   let watched = false
   let opened = 0
+  let generation = 0
 
   function teardown(): void {
     meter.detach()
@@ -158,15 +158,15 @@ export function useRecorder() {
 
   function begin(): void {
     if (!stream || state.value !== 'arming') return
-    const mime = TYPES.find((t) => MediaRecorder.isTypeSupported(t))
-    const r = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
-    r.ondataavailable = (e) => {
-      if (e.data.size) chunks.push(e.data)
+    try {
+      rec.value = recordAudio(stream, recordingTypes, bytes => {
+        if (bytes >= 96 * 1024 * 1024) capped.value = true
+      })
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'The audio recorder could not start'
+      teardown()
+      return
     }
-    // A timeslice, so a long recording is not one enormous blob held whole in
-    // memory until stop.
-    r.start(1000)
-    rec.value = r
     state.value = 'recording'
     const from = performance.now()
     tick = setInterval(() => {
@@ -188,8 +188,9 @@ export function useRecorder() {
    *  `maxSeconds` lowers this take's ceiling - what the model about to hear it
    *  can actually take. Clamped to RECORD_MAX_S, so a server that says nothing
    *  (or says something absurd) still lands inside the hard limit. */
-  async function start(maxSeconds?: number): Promise<boolean> {
+  async function start(maxSeconds?: number, types?: readonly string[]): Promise<boolean> {
     if (state.value !== 'idle') return false
+    const ticket = ++generation
     limit.value =
       maxSeconds && maxSeconds > 0 ? Math.min(maxSeconds, RECORD_MAX_S) : RECORD_MAX_S
     capped.value = false
@@ -201,7 +202,8 @@ export function useRecorder() {
       return false
     }
     error.value = null
-    chunks = []
+    state.value = 'arming'
+    recordingTypes = types
     elapsed.value = 0
     heard = false
     watched = false
@@ -212,12 +214,16 @@ export function useRecorder() {
       // A chosen device that has gone away falls back to the system default
       // and says so (`micLost`), which the composer shows before the first
       // word.
-      stream = await openMic()
+      const input = await openMic()
+      if (ticket !== generation) { input.getTracks().forEach(t => t.stop()); return false }
+      stream = input
     } catch (e) {
+      if (ticket !== generation) return false
       error.value =
         e instanceof DOMException && e.name === 'NotAllowedError'
           ? 'The microphone was blocked. Allow it for this page and try again.'
           : 'No microphone is available.'
+      teardown()
       return false
     }
     state.value = 'arming'
@@ -236,46 +242,34 @@ export function useRecorder() {
    *  with no reason attached. */
   async function stop(): Promise<File | null> {
     if (state.value === 'arming') {
+      ++generation
       teardown()
       error.value = 'Nothing was recorded - the microphone had not started yet.'
       return null
     }
     const r = rec.value
-    if (!r || r.state === 'inactive') {
+    if (!r) {
       teardown()
       return null
     }
     const silent = watched && !heard
-    const type = r.mimeType || 'audio/webm'
-    const ext = EXT[type.split('/')[1]?.split(';')[0] ?? 'webm'] ?? 'webm'
-    const file = await new Promise<File | null>((resolve) => {
-      r.onstop = () => {
-        const parts = chunks
-        chunks = []
-        const size = parts.reduce((n, p) => n + (p instanceof Blob ? p.size : 0), 0)
-        // The name says what this is rather than pretending to be a file
-        // someone chose - it is what the turn falls back to if the transcript
-        // comes back empty.
-        resolve(size ? new File(parts, `recording.${ext}`, { type }) : null)
-      }
-      r.stop()
-    })
+    const ticket = generation
+    let file: File | undefined
+    try { file = await r.finish() }
+    catch (e) { if (ticket === generation) error.value = e instanceof Error ? e.message : 'The recording could not be finalized' }
+    if (ticket !== generation) return null
     teardown()
     if (silent) {
       error.value = 'That recording is silent - check the microphone is not muted or in use elsewhere.'
       return null
     }
-    return file
+    return file ?? null
   }
 
   /** Throw the recording away - the mic is released and nothing is returned. */
   function cancel(): void {
-    const r = rec.value
-    if (r && r.state !== 'inactive') {
-      r.onstop = null
-      r.stop()
-    }
-    chunks = []
+    ++generation
+    rec.value?.cancel()
     teardown()
   }
 

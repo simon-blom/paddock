@@ -12,6 +12,7 @@ import Slider from '@/components/ui/Slider.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Select, { type SelectOption } from '@/components/ui/Select.vue'
 import TextInput from '@/components/ui/TextInput.vue'
+import { replyLengthStops, replyStopLabel as fmtStop, formatReplyTokens as fmtTokens, TOOL_CALL_STOPS } from '@/lib/studio-settings-layout'
 
 const settings = useSettingsStore()
 const models = useModelsStore()
@@ -26,13 +27,7 @@ onMounted(() => {
 // reserving the whole window for the reply leaves nothing for the prompt, and
 // the cap doubled as that reservation. Model maximum is
 // the default now; a numbered stop is an explicit ceiling the user chose.
-const stops = computed<(number | null)[]>(() => {
-  const cap = models.maxCtx || 8192
-  const arr: (number | null)[] = []
-  for (let v = 512; v < cap; v *= 2) arr.push(v)
-  arr.push(null)
-  return arr
-})
+const stops = computed(() => replyLengthStops(models.maxCtx))
 
 const idx = computed<number>({
   get: () => {
@@ -54,38 +49,17 @@ const idx = computed<number>({
 // clamps server-side; providers clamp themselves); the slider just shows
 // its top stop while such a model is current.
 
-function fmtStop(n: number | null): string {
-  return n == null ? 'Model maximum' : `${fmtTokens(n)} tokens`
-}
-
 // How many tools one reply may run. "Server default" (0 here, null on the
 // wire) sends nothing and leaves the server's own budget alone - the
 // honour-the-defaults stance. A number rides as the Responses API's
 // `max_tool_calls`, which caps the calls AND lifts the server's round ceiling
 // to match, so raising it actually buys more work rather than only less.
-const TOOL_CALL_STOPS: SelectOption[] = [
-  { value: 0, label: 'Server default' },
-  { value: 5, label: '5 tool calls' },
-  { value: 10, label: '10 tool calls' },
-  { value: 25, label: '25 tool calls' },
-  { value: 50, label: '50 tool calls' },
-  { value: 100, label: '100 tool calls' },
-]
-
 const toolCalls = computed<number>({
   get: () => settings.maxToolCalls ?? 0,
   set: (v) => {
     settings.maxToolCalls = v > 0 ? v : null
   },
 })
-
-function fmtTokens(n: number): string {
-  if (n >= 1024) {
-    const k = n / 1024
-    return `${Number.isInteger(k) ? k : k.toFixed(1)}K`
-  }
-  return String(n)
-}
 
 // ── Microphone ──────────────────────────────────────────────────────────────
 // The durable default for every mic path in the Studio. The COMPOSER's mic

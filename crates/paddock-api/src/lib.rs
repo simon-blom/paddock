@@ -13,6 +13,7 @@ pub mod error;
 pub mod messages;
 pub mod models;
 pub mod responses;
+pub mod segmentation;
 
 pub use completions::{CompletionChoice, CompletionRequest, CompletionResponse, Prompt, Usage};
 pub use error::{ApiError, ErrorBody};

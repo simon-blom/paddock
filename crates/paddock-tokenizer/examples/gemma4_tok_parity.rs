@@ -21,6 +21,17 @@ fn main() {
         .expect("usage: gemma4_tok_parity <model.gguf> <text>");
 
     let map = MappedGguf::open(path.as_ref()).expect("open gguf");
+    if text == "--metadata" {
+        for (key, value) in &map.gguf().metadata {
+            if key.starts_with("general.")
+                || key == "tokenizer.ggml.model"
+                || key == "tokenizer.ggml.pre"
+            {
+                println!("{key}: {value:?}");
+            }
+        }
+        return;
+    }
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("build tokenizer");
 
     if tok.add_bos

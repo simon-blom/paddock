@@ -71,7 +71,7 @@ function onOpenChange(v: boolean): void {
   <DialogRoot :open="open" @update:open="onOpenChange">
     <DialogPortal>
       <DialogOverlay class="pv__overlay" />
-      <DialogContent class="pv__content" @escape-key-down="emit('close')">
+      <DialogContent class="pv__content pv__content--info" @escape-key-down="emit('close')">
         <VisuallyHidden as-child>
           <DialogTitle>{{ title || 'Metadata' }}</DialogTitle>
         </VisuallyHidden>

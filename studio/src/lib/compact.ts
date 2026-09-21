@@ -19,13 +19,14 @@ const SUMMARY_MAX_TOKENS = 640
 /** Window held back from the transcript beyond the summary itself: the
  *  instructions, the chat template, and the slack the ~4-chars/token estimate
  *  needs. Named because the floor it implies - a window has to beat
- *  SUMMARY_MAX_TOKENS + this before ANY transcript fits - is reportable. */
+ *  SUMMARY_MAX_TOKENS + this before any transcript fits - is reportable. */
 const REQUEST_HEADROOM = 2048
 
-/** Proposed upper wait for background compaction; not a latency guarantee.
- *  Keep the slot retryable when a request stalls. Five minutes needs maintainer
- *  review against slow/loaded models; browser timer suspension can delay it. */
-const COMPACTION_TIMEOUT_MS = 5 * 60_000
+/** Upper wait for a background compaction. A hang guard, not a latency
+ *  budget: a long transcript on a slow or loaded model can take minutes to
+ *  prefill, so this only has to be short enough that a stalled request gives
+ *  its conversation's slot back. Browser timer suspension can delay it. */
+const COMPACTION_TIMEOUT_MS = 10 * 60_000
 
 const INSTRUCTIONS =
   'Summarize the conversation transcript below into a compact brief for continuing ' +
@@ -79,7 +80,7 @@ export async function maybeCompact(
   const lastId = covered[covered.length - 1]?.id
   if (!lastId) return
 
-  // The model this compaction IS FOR, fixed before anything is built from it.
+  // The model this compaction is for, fixed before anything is built from it.
   // `conv.model` is mutable and reachable for as long as the request is out -
   // the header dropdown goes through lib/select-model.ts `selectStudioModel`
   // into the chat store's `edit` - and it decides three things that have to
@@ -98,7 +99,7 @@ export async function maybeCompact(
   // (possible when many turns arrive between compactions) keeps the newest end.
   const capChars = (maxCtx - SUMMARY_MAX_TOKENS - REQUEST_HEADROOM) * 4
   // A window under the floor has no room for one line of transcript, and the
-  // clamp this used to carry (`Math.max(0, ...)`) made that the WORST case
+  // clamp this used to carry (`Math.max(0, ...)`) made that the worst case
   // rather than a refused one: `slice(-0)` keeps the whole string, so the
   // budget nothing fits into was sent everything. compactionTarget only needs
   // `maxCtx - maxReply - 1024 > 0`, so it does ask on windows this small.
@@ -173,7 +174,7 @@ export async function maybeCompact(
     // anchored by id), but if the covered prefix itself changed, discard.
     if (activeMessages(conv)[count - 1]?.id !== lastId) return
     // Same for the model: the selection moved while this was out, so what came
-    // back is the OLD model's summary of the OLD model's own history. Keeping
+    // back is the old model's summary of the old model's own history. Keeping
     // it would put one model's context under another's name - a compare lane's
     // answers are filtered per model, so it is the wrong text as well as the
     // wrong label, and `summaryModel` is what the thread divider shows. Drop

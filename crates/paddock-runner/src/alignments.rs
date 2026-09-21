@@ -60,6 +60,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         );
     };
 
+    let permit = match model.aligner.reserve() {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, "server_busy", e),
+    };
+
     let mut file: Option<Vec<u8>> = None;
     let mut text: Option<String> = None;
     let mut language: Option<String> = None;
@@ -140,18 +145,25 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
 
     // decode + resample + mel off the async threads (transcriptions.rs's
     // pattern - a long WAV is real CPU work)
+    let max_clip_s = model.max_clip_s;
+    let mel_policy = model.mel_policy;
     let decoded = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let wav = decode_audio(&file)?;
         if wav.samples.is_empty() {
             return Err("audio file holds no samples".into());
         }
+        if wav.samples.len() as f64 / wav.sample_rate as f64 > max_clip_s as f64 {
+            return Err(format!(
+                "audio exceeds this backend's {max_clip_s:.0}-second clip limit; align per segment"
+            ));
+        }
         let samples = resample(&wav.samples, wav.sample_rate, 16000)?;
-        let mel = paddock_engine::audio::qwen3_asr_features(&samples)?;
-        let n_audio = paddock_engine::audio::audio_tokens_for_samples(samples.len());
-        Ok((samples.len(), mel, n_audio))
+        let mel = paddock_engine::audio::mel_features(&samples, mel_policy)?;
+        let n_audio = paddock_engine::audio::audio_token_count(mel.n_frames);
+        Ok((samples.len(), mel, n_audio, permit))
     })
     .await;
-    let (n_samples, mel, n_audio) = match decoded {
+    let (n_samples, mel, n_audio, permit) = match decoded {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
         Err(e) => {
@@ -168,11 +180,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
-                "clip is {duration:.1} s but this aligner addresses at most {:.0} s \
-                 ({} bins of {} ms); align per segment instead",
-                model.max_clip_s,
-                (model.max_clip_s * 1000.0 / model.segment_ms) as u64,
-                model.segment_ms
+                "clip is {duration:.1} s but this backend accepts at most {:.0} s \
+                 ({} ms timestamp bins); align per segment instead",
+                model.max_clip_s, model.segment_ms
             ),
         );
     }
@@ -218,13 +228,16 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
 
     let bins = match model
         .aligner
-        .align(paddock_engine::align::AlignReq {
-            ids,
-            mel,
-            splice_at,
-            n_audio,
-            ts_rows,
-        })
+        .align_reserved(
+            paddock_engine::align::AlignReq {
+                ids,
+                mel,
+                splice_at,
+                n_audio,
+                ts_rows,
+            },
+            permit,
+        )
         .await
     {
         Ok(b) => b,

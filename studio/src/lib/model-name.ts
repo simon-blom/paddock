@@ -5,6 +5,7 @@
 import { cloudVendor, useModelsStore } from '@/stores/models'
 import { useRegistryStore } from '@/stores/registry'
 import { friendlyModelName } from '@/lib/model-caps'
+import type { Message } from '@/types/chat'
 
 const baseName = (p: string): string => p.split(/[\\/]/).pop() ?? p
 
@@ -81,4 +82,21 @@ export function fleetVendor(id: string | null | undefined): string | undefined {
   if (hit?.vendor) return hit.vendor
   const bare = bareId(id)
   return modelVendor(bare) ?? cloudVendor(bare)
+}
+
+/** Header badges describe active speculation only. Keep the raw mode in run
+ * details/configuration, where an explicit disabled state is useful. */
+export function speculationBadge(spec: string | null | undefined): string {
+  const label = spec?.trim() ?? ''
+  return label.toLowerCase() === 'off' ? '' : label
+}
+
+/** The author of this particular reply, not the model selected in the composer.
+ * Recorded 'off' wins over the live fleet, then disappears from the header. */
+export function messageStamp(message: Pick<Message, 'role' | 'model' | 'run'>) {
+  const id = message.role === 'user' ? '' : (message.model ?? message.run?.model ?? '')
+  return {
+    id, label: fleetLabel(id), vendor: fleetVendor(id) ?? '',
+    spec: speculationBadge(message.run?.spec ?? (id ? useModelsStore().specFor(id) : undefined)),
+  }
 }

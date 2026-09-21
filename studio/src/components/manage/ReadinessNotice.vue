@@ -25,14 +25,28 @@ const HEAD: Record<string, { icon: string; label: string }> = {
   untested: { icon: 'alert-triangle', label: 'Not tested yet' },
   'driver-too-old': { icon: 'alert-triangle', label: 'Needs attention' },
 }
-const head = computed(() => HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
+const head = computed(() => rd.notice?.backend === 'metal' && rd.notice.state === 'untested'
+  ? { icon: 'alert-triangle', label: 'Metal preview' }
+  : HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
 </script>
 
 <template>
   <section v-if="rd.notice" class="rn" :class="`rn--${rd.notice.state}`">
     <p class="rn__hd"><Icon :name="head.icon" :size="14" /> {{ head.label }}</p>
 
-    <template v-if="rd.notice.state === 'driver-too-old'">
+    <template v-if="rd.notice.backend === 'metal'">
+      <p v-if="rd.notice.state === 'untested'" class="rn__txt">
+        <strong>{{ card }} can run Metal previews.</strong>
+        Choose a compatible macOS artifact. Model qualification is shown on each
+        artifact; full Mac application and device-telemetry qualification remain open.
+      </p>
+      <p v-else class="rn__txt">
+        <strong>This Metal build requires an Apple Silicon GPU (M1 or later).</strong>
+        Intel Macs cannot load this kernel pack.
+        Cloud models remain available.
+      </p>
+    </template>
+    <template v-else-if="rd.notice.state === 'driver-too-old'">
       <p class="rn__txt">
         <strong>Update your graphics driver.</strong>
         {{ card }} can run models - its driver is behind what Paddock needs. Updating takes a
@@ -81,7 +95,7 @@ const head = computed(() => HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
       </p>
     </template>
 
-    <RouterLink class="rn__more" :to="{ name: 'gpus' }">
+    <RouterLink v-if="rd.notice.backend !== 'metal'" class="rn__more" :to="{ name: 'gpus' }">
       Which graphics cards run models <Icon name="chevron-right" :size="13" />
     </RouterLink>
   </section>

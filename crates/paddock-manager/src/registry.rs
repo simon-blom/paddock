@@ -1,8 +1,8 @@
 //! Model registry + download engine. The set of models a paddock build can pull
 //! is a **compiled-in manifest** (`models.toml`, embedded via `include_str!`), so
-//! a release only ever offers models it was built to load - compatibility is by
-//! construction: if a model is in this release's manifest, it works with this
-//! release. There is no remote catalog to fetch or keep in sync; the origin
+//! artifact/backend contracts determine what this build can offer. Test coverage
+//! and benchmark progress are tracked separately, never used as availability gates.
+//! There is no remote catalog to fetch or keep in sync; the origin
 //! (Cloudflare R2) is a dumb file host, and each manifest entry carries the file's
 //! stable URL, sha256 and size.
 //!
@@ -18,6 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc};
+
+#[cfg(test)]
+mod multimodal_mlx_tests;
+mod recovery;
+mod transfer;
+use transfer::fetch_range;
+#[cfg(test)]
+mod recovery_tests;
+mod runtime;
+pub use runtime::{ArtifactRuntime, ArtifactSource, Qualification};
 
 // ─── the embedded manifest (models.toml, compiled into the binary) ──────────
 
@@ -118,6 +128,10 @@ pub struct CatalogArtifact {
     pub format: String,
     /// Human label, e.g. "Full quality", "Vision (mmproj BF16)".
     pub label: String,
+    #[serde(default)]
+    pub runtime: ArtifactRuntime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ArtifactSource>,
     /// The honest quant tag for weights ("Q8_0", "UD-Q4_K_XL", "MXFP4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant: Option<String>,
@@ -178,6 +192,22 @@ pub struct CatalogArtifact {
 }
 
 impl CatalogArtifact {
+    pub fn entry_path(&self, models_dir: &Path) -> Option<PathBuf> {
+        let file = models_dir.join(&self.files.first()?.dest);
+        if self.runtime.checkpoint_dir {
+            file.parent().map(Path::to_path_buf)
+        } else {
+            Some(file)
+        }
+    }
+
+    pub fn capabilities<'a>(&'a self, model: &'a CatalogModel) -> &'a [String] {
+        self.runtime
+            .capability
+            .as_deref()
+            .unwrap_or(&model.capability)
+    }
+
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
@@ -212,6 +242,41 @@ fn artifact_holds(a: &CatalogArtifact, name: &str) -> bool {
 }
 
 impl CatalogModel {
+    /// Backend gates are independent of CUDA compute capability. Never pick
+    /// an MLX checkpoint for CUDA just because it has no `min_cc` floor.
+    pub fn default_weights_for_backend(
+        &self,
+        backend: &str,
+        cc: Option<[u32; 2]>,
+    ) -> Option<&CatalogArtifact> {
+        let compatible = || {
+            self.weights()
+                .filter(|a| a.runtime.supports_backend(backend))
+        };
+        compatible()
+            .find(|a| a.default && a.fits_cc(cc))
+            .or_else(|| compatible().find(|a| a.fits_cc(cc)))
+            .or_else(|| compatible().next())
+    }
+
+    pub fn default_bundle_for_backend(
+        &self,
+        backend: &str,
+        cc: Option<[u32; 2]>,
+    ) -> Vec<&CatalogArtifact> {
+        let Some(w) = self.default_weights_for_backend(backend, cc) else {
+            return Vec::new();
+        };
+        let mut out = vec![w];
+        out.extend(self.artifacts.iter().filter(|a| {
+            a.kind != ArtifactKind::Weights
+                && a.default
+                && a.runtime.supports_backend(backend)
+                && w.runtime.allows_companion(&a.id)
+        }));
+        out
+    }
+
     pub fn weights(&self) -> impl Iterator<Item = &CatalogArtifact> {
         self.artifacts
             .iter()
@@ -283,6 +348,13 @@ impl CatalogModel {
 /// struct-literal test sites compiling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelSpecs {
+    /// Upstream model publication date (YYYY-MM-DD), not the export revision,
+    /// upload time or registry insertion date. Absent until sourced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// Evidence for the publication date, independent of the current model card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_source: Option<String>,
     /// Parameter count, e.g. "20.9B total · 3.6B active (MoE)".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<String>,
@@ -330,6 +402,13 @@ const WORKERS: usize = 8; // concurrent range connections
 
 #[derive(Debug, thiserror::Error)]
 pub enum DlError {
+    #[error("network transfer failed: {0}")]
+    Transport(String),
+    #[error("origin is busy (status {status}); retry later")]
+    RetryableStatus {
+        status: u16,
+        retry_after: Option<u64>,
+    },
     #[error("http error: {0}")]
     Http(String),
     #[error("io error: {0}")]
@@ -421,10 +500,39 @@ fn write_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
 }
 
 fn part_path(dest: &Path) -> PathBuf {
-    dest.with_extension("part")
+    sidecar_path(dest, ".part")
 }
 fn state_path(dest: &Path) -> PathBuf {
-    dest.with_extension("part.state")
+    sidecar_path(dest, ".part.state")
+}
+fn sidecar_path(dest: &Path, suffix: &str) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn bind_resume(dest: &Path, url: &str, size: u64, sha: &str) -> Result<(), DlError> {
+    let identity = sidecar_path(dest, ".part.identity");
+    let expected = hex(&Sha256::digest(format!("{url}\n{size}\n{sha}")));
+    if std::fs::read_to_string(&identity).ok().as_deref() != Some(&expected)
+        || !std::fs::metadata(part_path(dest)).is_ok_and(|m| m.is_file() && m.len() == size)
+    {
+        match std::fs::remove_file(state_path(dest)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let tmp = sidecar_path(dest, ".part.identity.tmp");
+    std::fs::write(&tmp, expected)?;
+    // Opened for writing: Windows refuses to flush a read-only handle
+    // ("Access is denied"), where Unix lets a read-only fd fsync.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)?
+        .sync_all()?;
+    std::fs::rename(tmp, identity)?;
+    Ok(())
 }
 
 fn seg_len(idx: usize, size: u64) -> u64 {
@@ -441,37 +549,14 @@ fn load_state(path: &Path, n_seg: usize) -> Vec<bool> {
     }
 }
 
-async fn fetch_range(
-    client: &reqwest::Client,
-    url: &str,
-    start: u64,
-    end_inclusive: u64,
-) -> Result<Vec<u8>, DlError> {
-    let resp = client
-        .get(url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes={start}-{end_inclusive}"),
-        )
-        .send()
-        .await
-        .map_err(|e| DlError::Http(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(classify_status(resp.status(), url));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| DlError::Http(e.to_string()))?;
-    Ok(bytes.to_vec())
-}
-
 /// Probe the origin: `Ok(true)` = honours Range (206), `Ok(false)` = serves the
 /// whole file (2xx, no Range). A definitively-gone file (404/410/403) errors
 /// here as `NotFound` - fail fast, before any `.part` file is created on disk.
 async fn supports_range(client: &reqwest::Client, url: &str) -> Result<bool, DlError> {
     let resp = client
         .get(url)
+        .timeout(std::time::Duration::from_secs(20))
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::RANGE, "bytes=0-0")
         .send()
         .await
@@ -486,13 +571,19 @@ async fn supports_range(client: &reqwest::Client, url: &str) -> Result<bool, DlE
     Err(classify_status(status, url))
 }
 
-async fn sha256_file(path: PathBuf) -> Result<String, DlError> {
+async fn sha256_file_cancel(
+    path: PathBuf,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<String, DlError> {
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut f = std::fs::File::open(&path)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 8 * 1024 * 1024];
         loop {
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(DlError::Cancelled);
+            }
             let n = f.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -503,6 +594,24 @@ async fn sha256_file(path: PathBuf) -> Result<String, DlError> {
     })
     .await
     .map_err(|e| DlError::Http(format!("hash task: {e}")))?
+}
+
+/// Dropping an in-flight HTTP future closes that request. Hashing is different:
+/// its blocking worker checks the flag itself and is always joined before exit.
+async fn cancellable<T>(
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    future: impl std::future::Future<Output = Result<T, DlError>>,
+) -> Result<T, DlError> {
+    tokio::pin!(future);
+    loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(DlError::Cancelled);
+        }
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
 }
 
 /// Download `url` -> `dest`, verifying `sha256` (+ `size`). Parallel range
@@ -521,21 +630,55 @@ pub async fn download_file(
     downloaded: Arc<AtomicU64>,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), DlError> {
+    download_file_staged(client, url, dest, sha256, size, downloaded, cancel, None).await
+}
+
+async fn download_file_staged(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    sha256: &str,
+    size: u64,
+    downloaded: Arc<AtomicU64>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    stage: Option<&std::sync::Mutex<&'static str>>,
+) -> Result<(), DlError> {
+    if let Some(stage) = stage {
+        *stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = "downloading";
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let part = part_path(dest);
     let want_sha = sha256.to_lowercase();
 
-    if supports_range(client, url).await? {
+    if cancellable(cancel.as_ref(), supports_range(client, url)).await? {
+        bind_resume(dest, url, size, &want_sha)?;
         download_ranged(client, url, &part, dest, size, &downloaded, cancel.as_ref()).await?;
     } else {
-        download_stream(client, url, &part, &downloaded, cancel.as_ref()).await?;
+        download_stream(client, url, &part, size, &downloaded, cancel.as_ref()).await?;
     }
 
     // verify then publish atomically
-    let got = sha256_file(part.clone()).await?;
+    if let Some(stage) = stage {
+        *stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = "verifying";
+    }
+    let length = std::fs::metadata(&part)?.len();
+    if length != size {
+        return Err(DlError::Size {
+            expected: size,
+            got: length,
+        });
+    }
+    let got = sha256_file_cancel(part.clone(), cancel.clone()).await?;
     if got != want_sha {
+        // Never trust the same bitmap on Retry after failed integrity. The
+        // incomplete bytes remain recoverable, but every segment is fetched again.
+        let _ = std::fs::remove_file(state_path(dest));
         return Err(DlError::Checksum {
             name: dest
                 .file_name()
@@ -546,8 +689,16 @@ pub async fn download_file(
             got,
         });
     }
+    if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(DlError::Cancelled);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)?
+        .sync_all()?;
     std::fs::rename(&part, dest)?;
     let _ = std::fs::remove_file(state_path(dest));
+    let _ = std::fs::remove_file(sidecar_path(dest, ".part.identity"));
     Ok(())
 }
 
@@ -586,26 +737,51 @@ async fn download_ranged(
 
     // one persister task: single-byte positioned writes to the state sidecar as
     // segments complete, so a crash resumes without re-downloading them.
-    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<usize>();
+    let (state_tx, mut state_rx) = mpsc::channel::<usize>(WORKERS * 2);
     let statep2 = statep.clone();
+    let datap = part.to_path_buf();
     let n_seg_u = n_seg as u64;
     let persister = tokio::spawn(async move {
-        let sf = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&statep2);
-        if let Ok(sf) = sf {
-            // full length up front so an out-of-order completion never leaves the
-            // sidecar short of n_seg (which load_state requires to resume).
-            let _ = sf.set_len(n_seg_u);
-            while let Some(idx) = state_rx.recv().await {
-                let _ = write_at(&sf, &[1u8], idx as u64);
+        let sf = Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&statep2)?,
+        );
+        let data = Arc::new(std::fs::OpenOptions::new().write(true).open(datap)?);
+        // full length up front so an out-of-order completion never leaves the
+        // sidecar short of n_seg (which load_state requires to resume).
+        sf.set_len(n_seg_u)?;
+        while let Some(idx) = state_rx.recv().await {
+            let mut batch = vec![idx];
+            while let Ok(idx) = state_rx.try_recv() {
+                batch.push(idx);
             }
+            let sf = sf.clone();
+            let data = data.clone();
+            // Commit data before its resume bits, off the async executor.
+            // Group completed segments so durable progress doesn't demand a
+            // filesystem sync for every worker's individual write.
+            tokio::task::spawn_blocking(move || {
+                data.sync_data()?;
+                for idx in batch {
+                    write_at(&sf, &[1u8], idx as u64)?;
+                }
+                sf.sync_data()?;
+                Ok::<(), DlError>(())
+            })
+            .await
+            .map_err(|e| DlError::Http(format!("resume commit: {e}")))??;
         }
+        sf.sync_all()?;
+        Ok::<(), DlError>(())
     });
 
     let mut tasks = Vec::new();
+    // A terminal range failure stops peers promptly, without detaching disk
+    // writes or returning while workers can still mutate resumable files.
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for _ in 0..WORKERS.min(n_seg) {
         let client = client.clone();
         let url = url.to_owned();
@@ -614,39 +790,57 @@ async fn download_ranged(
         let downloaded = downloaded.clone();
         let state_tx = state_tx.clone();
         let cancel = cancel.cloned();
+        let failed = failed.clone();
         tasks.push(tokio::spawn(async move {
-            let fh = std::fs::OpenOptions::new().write(true).open(&part)?;
-            loop {
-                // cooperative cancel between segments: completed segments are
-                // already persisted in the sidecar, so nothing is lost
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return Err(DlError::Cancelled);
+            let outcome = async {
+                let fh = Arc::new(std::fs::OpenOptions::new().write(true).open(&part)?);
+                loop {
+                    // cooperative cancel between segments: completed segments are
+                    // already persisted in the sidecar, so nothing is lost
+                    if failed.load(Ordering::Relaxed)
+                        || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+                    {
+                        return Err(DlError::Cancelled);
+                    }
+                    let idx = {
+                        let mut q = queue.lock().await;
+                        q.next()
+                    };
+                    let Some(idx) = idx else { break };
+                    let start = idx as u64 * SEGMENT;
+                    let end = (start + SEGMENT).min(size) - 1;
+                    let (bytes, progress) = cancellable(
+                        cancel.as_ref(),
+                        cancellable(
+                            Some(&failed),
+                            fetch_range(&client, &url, start, end, size, &downloaded),
+                        ),
+                    )
+                    .await?;
+                    let file = fh.clone();
+                    tokio::task::spawn_blocking(move || write_at(&file, &bytes, start))
+                        .await
+                        .map_err(|e| DlError::Http(format!("range write: {e}")))??;
+                    state_tx.send(idx).await.map_err(|_| {
+                        DlError::Http("Resume checkpoint could not be saved".into())
+                    })?;
+                    progress.commit();
                 }
-                let idx = {
-                    let mut q = queue.lock().await;
-                    q.next()
-                };
-                let Some(idx) = idx else { break };
-                let start = idx as u64 * SEGMENT;
-                let end = (start + SEGMENT).min(size) - 1;
-                let bytes = fetch_range(&client, &url, start, end).await?;
-                if bytes.len() as u64 != end - start + 1 {
-                    return Err(DlError::Size {
-                        expected: end - start + 1,
-                        got: bytes.len() as u64,
-                    });
-                }
-                write_at(&fh, &bytes, start)?;
-                downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                let _ = state_tx.send(idx);
+                Ok::<(), DlError>(())
             }
-            Ok::<(), DlError>(())
+            .await;
+            if outcome.is_err() {
+                failed.store(true, Ordering::Relaxed);
+            }
+            outcome
         }));
     }
     drop(state_tx); // so the persister ends when all workers finish
     let mut outcome: Result<(), DlError> = Ok(());
     for t in tasks {
-        let r = t.await.map_err(|e| DlError::Http(format!("worker: {e}")))?;
+        let r = t
+            .await
+            .unwrap_or_else(|e| Err(DlError::Http(format!("worker: {e}"))));
         // join every worker before reporting (a cancel hits all of them);
         // keep the first real error, with Cancelled winning only over Ok
         match (&outcome, r) {
@@ -657,7 +851,9 @@ async fn download_ranged(
             _ => {}
         }
     }
-    let _ = persister.await;
+    persister
+        .await
+        .map_err(|e| DlError::Http(format!("resume-state worker: {e}")))??;
     outcome
 }
 
@@ -666,26 +862,45 @@ async fn download_stream(
     client: &reqwest::Client,
     url: &str,
     part: &Path,
+    size: u64,
     downloaded: &Arc<AtomicU64>,
     cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), DlError> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| DlError::Http(e.to_string()))?;
+    let resp = cancellable(cancel, async {
+        client
+            .get(url)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|e| DlError::Http(e.to_string()))
+    })
+    .await?;
     if !resp.status().is_success() {
         return Err(classify_status(resp.status(), url));
     }
     let mut file = tokio::fs::File::create(part).await?;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    let mut received = 0u64;
+    while let Some(chunk) = cancellable(cancel, async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            .await
+            .map_err(|_| DlError::Http("Origin stalled while downloading".into()))
+    })
+    .await?
+    {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(DlError::Cancelled);
         }
         let chunk = chunk.map_err(|e| DlError::Http(e.to_string()))?;
+        received += chunk.len() as u64;
+        if received > size {
+            return Err(DlError::Size {
+                expected: size,
+                got: received,
+            });
+        }
         file.write_all(&chunk).await?;
         downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
@@ -696,7 +911,7 @@ async fn download_stream(
 // ─── pull manager (stateful, on AppState) ───────────────────────────────────
 
 /// Status of a pull job, JSON-tagged for the Studio to poll.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum PullStatus {
     Running,
@@ -733,6 +948,12 @@ pub struct PullJob {
     /// keeps the plan.
     pub follow: std::sync::Mutex<Option<serde_json::Value>>,
     pub follow_state: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Frozen catalog identity and destinations prevent resume across an
+    /// updated manifest and overlapping writers across different model IDs.
+    files: Vec<CatalogFile>,
+    selection_digest: String,
+    phase: std::sync::Mutex<String>,
+    stage: std::sync::Mutex<&'static str>,
 }
 
 impl PullJob {
@@ -746,6 +967,9 @@ impl PullJob {
             "total": self.total,
             "created_ms": self.created_ms,
             "status": &*self.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            "phase": &*self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            "stage": &*self.stage.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            "cancelling": self.cancel.load(Ordering::Relaxed),
         });
         if let Some(f) = &*self
             .follow
@@ -773,6 +997,9 @@ fn unix_ms() -> u64 {
 /// jobs into the models dir. One per server (on `AppState`).
 pub struct Registry {
     client: reqwest::Client,
+    /// Immutable declared contracts. Re-project from these when selecting a
+    /// backend, never from an already narrowed Metal view of the catalog.
+    source_catalog: Catalog,
     catalog: Catalog,
     models_dir: PathBuf,
     jobs: std::sync::Mutex<std::collections::HashMap<String, Arc<PullJob>>>,
@@ -782,10 +1009,19 @@ pub struct Registry {
     /// and Q8_0 the default on a card that cannot run it - see
     /// `CatalogModel::default_weights_for`.
     cc: Option<[u32; 2]>,
+    backend: String,
+    store: Option<Arc<crate::store::Store>>,
 }
 
 /// The release's blessed-models manifest, compiled into the binary.
 const MANIFEST_TOML: &str = include_str!("../models.toml");
+
+/// Rows that are not published with the source: checkpoints we serve but do
+/// not hand out. The file is optional - `build.rs` sets `private_catalog` only
+/// where it exists - so a tree without it builds the published catalog and
+/// nothing else.
+#[cfg(private_catalog)]
+const PRIVATE_MANIFEST_TOML: &str = include_str!("../models.private.toml");
 
 /// A model resolved to a concrete serving composition on disk.
 #[derive(Debug)]
@@ -839,10 +1075,13 @@ impl Registry {
                 .artifacts
                 .iter()
                 .find(|x| x.id == a && x.kind == ArtifactKind::Weights)?,
-            None => m.default_weights_for(self.cc)?,
+            None => m.default_weights_for_backend(&self.backend, self.cc)?,
         };
+        if !w.runtime.supports_backend(&self.backend) {
+            return None;
+        }
         let dest = |a: &CatalogArtifact| a.files.first().map(|f| self.models_dir.join(&f.dest));
-        let weights = dest(w)?;
+        let weights = w.entry_path(&self.models_dir)?;
         // Vision OR Audio: both are mmproj companions riding the same
         // `--mmproj` flag, and a model has one or the other (a speech tower
         // and an image tower are different files for different senses). Only
@@ -853,12 +1092,22 @@ impl Registry {
         let mmproj = m
             .artifacts
             .iter()
-            .find(|a| a.kind.is_mmproj() && a.default)
+            .find(|a| {
+                a.kind.is_mmproj()
+                    && a.default
+                    && w.runtime.allows_companion(&a.id)
+                    && a.runtime.supports_backend(&self.backend)
+            })
             .and_then(dest);
         let mtp = m
             .artifacts
             .iter()
-            .find(|a| a.kind == ArtifactKind::Drafter && a.default)
+            .find(|a| {
+                a.kind == ArtifactKind::Drafter
+                    && a.default
+                    && w.runtime.allows_companion(&a.id)
+                    && a.runtime.supports_backend(&self.backend)
+            })
             .and_then(dest);
         Some((weights, mmproj, mtp))
     }
@@ -890,8 +1139,28 @@ impl Registry {
     /// Parse the embedded manifest. It ships with the binary and is author-
     /// controlled, so a parse failure is a build bug, not a runtime condition.
     pub fn new(models_dir: PathBuf) -> Self {
-        let catalog: Catalog =
+        #[cfg_attr(not(private_catalog), allow(unused_mut))]
+        let mut catalog: Catalog =
             toml::from_str(MANIFEST_TOML).expect("embedded models.toml is malformed");
+        // After the published rows, so nothing about their order or their
+        // defaults depends on whether this file was there at build time.
+        #[cfg(private_catalog)]
+        {
+            let private: Catalog = toml::from_str(PRIVATE_MANIFEST_TOML)
+                .expect("embedded models.private.toml is malformed");
+            assert_eq!(
+                private.schema, catalog.schema,
+                "models.private.toml is on a different schema than models.toml"
+            );
+            for m in private.models {
+                assert!(
+                    catalog.models.iter().all(|p| p.id != m.id),
+                    "models.private.toml repeats the published id {:?}",
+                    m.id
+                );
+                catalog.models.push(m);
+            }
+        }
         Self::from_catalog(catalog, models_dir)
     }
 
@@ -900,11 +1169,15 @@ impl Registry {
     pub fn from_catalog(catalog: Catalog, models_dir: PathBuf) -> Self {
         Self {
             client: reqwest::Client::new(),
+            source_catalog: catalog.clone(),
             catalog,
             models_dir,
             jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
             cc: None,
+            backend: "cuda".into(),
+            store: None,
         }
+        .with_backend("cuda")
     }
 
     /// Wire the local GPU's compute-capability (from `readiness::probe`) so the
@@ -912,6 +1185,77 @@ impl Registry {
     /// registry is built once at startup, then wrapped in an Arc.
     pub fn with_cc(mut self, cc: Option<[u32; 2]>) -> Self {
         self.cc = cc;
+        self
+    }
+
+    pub fn with_backend(mut self, backend: impl Into<String>) -> Self {
+        self.backend = backend.into();
+        self.catalog = self.source_catalog.clone();
+        for model in &mut self.catalog.models {
+            for artifact in &mut model.artifacts {
+                if let Some(default) = artifact
+                    .runtime
+                    .backend_overrides
+                    .get(&self.backend)
+                    .and_then(|contract| contract.default)
+                {
+                    artifact.default = default;
+                }
+                artifact.runtime = artifact.runtime.for_backend(&self.backend);
+                if let Some(shape) = artifact
+                    .runtime
+                    .memory
+                    .as_ref()
+                    .and_then(|m| m.published_shape.clone())
+                {
+                    artifact.shape = Some(shape);
+                }
+                if let Some(workspace) = artifact
+                    .runtime
+                    .memory
+                    .as_ref()
+                    .and_then(|m| m.workspace_bytes)
+                {
+                    artifact.workspace = Some(workspace);
+                }
+                if let (Some(memory), Some(shape)) = (&artifact.runtime.memory, &mut artifact.shape)
+                {
+                    memory.apply_published(shape);
+                }
+                // A personal Metal chat starts with 32K, not the runner's
+                // legacy 4K server default. Publish the same recommendation
+                // consumed by native creation, previews and web admission.
+                // Export-specific defaults and real loader/model ceilings win;
+                // speech/embedding companions and saved files are untouched.
+                if self.backend == "metal"
+                    && artifact.kind == ArtifactKind::Weights
+                    && artifact.runtime.supports_backend("metal")
+                    && artifact
+                        .runtime
+                        .capability
+                        .as_ref()
+                        .unwrap_or(&model.capability)
+                        .iter()
+                        .any(|c| c == "chat")
+                {
+                    let ceiling = artifact
+                        .shape
+                        .as_ref()
+                        .map(|s| s.max_ctx)
+                        .into_iter()
+                        .chain(artifact.runtime.memory.as_ref().map(|m| m.max_ctx))
+                        .min()
+                        .unwrap_or(1_048_576) as usize;
+                    artifact.runtime.default_max_ctx = Some(
+                        artifact
+                            .runtime
+                            .default_max_ctx
+                            .unwrap_or(32_768)
+                            .min(ceiling),
+                    );
+                }
+            }
+        }
         self
     }
 
@@ -942,7 +1286,7 @@ impl Registry {
                 let mut v = serde_json::to_value(m).unwrap_or_default();
                 v["installed"] = serde_json::json!(self.is_installed(m));
                 v["total_size"] = serde_json::json!(
-                    m.default_bundle_for(self.cc)
+                    m.default_bundle_for_backend(&self.backend, self.cc)
                         .iter()
                         .map(|a| a.total_size())
                         .sum::<u64>()
@@ -951,6 +1295,8 @@ impl Registry {
                     for (av, a) in arts.iter_mut().zip(&m.artifacts) {
                         av["installed"] = serde_json::json!(self.is_artifact_installed(a));
                         av["total_size"] = serde_json::json!(a.total_size());
+                        av["backend_supported"] =
+                            serde_json::json!(a.runtime.supports_backend(&self.backend));
                     }
                 }
                 v
@@ -972,7 +1318,8 @@ impl Registry {
 
     /// Servable now: at least one weights artifact fully present.
     pub fn is_installed(&self, m: &CatalogModel) -> bool {
-        m.weights().any(|a| self.is_artifact_installed(a))
+        m.weights()
+            .any(|a| a.runtime.supports_backend(&self.backend) && self.is_artifact_installed(a))
     }
 
     /// Reverse resolution: which catalog `(model id, weights-artifact id)`
@@ -991,15 +1338,38 @@ impl Registry {
     /// files carry their own `[catalog]` block now and why this is
     /// the FALLBACK inside `identity_for`, not the answer.
     pub fn identify_weights(&self, path: &Path) -> Option<(String, String)> {
-        let name = path.file_name()?.to_string_lossy().to_lowercase();
+        // Safetensors packages commonly share `model.safetensors` (and shard
+        // basenames). The qualified checkpoint path outranks that basename,
+        // independent of catalog ordering and the host's path separator.
+        let normalized = path.to_string_lossy().replace('\\', "/").to_lowercase();
+        let normalized = Path::new(&normalized);
         for m in &self.catalog.models {
             for a in m.weights() {
-                if artifact_holds(a, &name) {
+                if a.files.iter().any(|f| {
+                    let dest = f.dest.replace('\\', "/").to_lowercase();
+                    let dest = Path::new(&dest);
+                    dest.parent().is_some_and(|p| !p.as_os_str().is_empty())
+                        && normalized.ends_with(dest)
+                }) {
                     return Some((m.id.clone(), a.id.clone()));
                 }
             }
         }
-        None
+        let name = normalized.file_name()?.to_string_lossy();
+        let mut found: Option<(String, String)> = None;
+        for m in &self.catalog.models {
+            for a in m.weights() {
+                if artifact_holds(a, &name) {
+                    if found.as_ref().is_some_and(|(id, _)| id != &m.id) {
+                        // A declaration may disambiguate this in identity_for;
+                        // guessing would attach another model's settings.
+                        return None;
+                    }
+                    found.get_or_insert_with(|| (m.id.clone(), a.id.clone()));
+                }
+            }
+        }
+        found
     }
 
     /// The catalog identity of an endpoint, from what its config file DECLARES
@@ -1068,6 +1438,22 @@ impl Registry {
         }
     }
 
+    /// The same backend-aware defaults feed native creation, web admission and
+    /// saved runner configuration. Missing values are choices, not chat defaults.
+    pub fn default_envelope(&self, name: &str, artifact: Option<&str>) -> (usize, usize) {
+        let selected = self.catalog_of(name).and_then(|model| {
+            let identified = self.identify_weights(Path::new(name));
+            let id = artifact.or_else(|| identified.as_ref().map(|(_, id)| id.as_str()));
+            match id {
+                Some(id) => model.artifact(id),
+                None => model.default_weights_for_backend(&self.backend, self.cc),
+            }
+        });
+        selected
+            .map(|a| a.runtime.default_envelope())
+            .unwrap_or((4096, 32))
+    }
+
     /// Human labels for a runner's advertised model: `(display, vendor)`.
     /// None when the catalog doesn't know it: callers fall back to the raw
     /// name rather than invent a pretty one.
@@ -1082,7 +1468,11 @@ impl Registry {
     /// stopped one has nothing to ask, and the Studio still has to know
     /// whether starting it would get you a speech model.
     pub fn capability_of(&self, name: &str) -> Option<Vec<String>> {
-        Some(self.catalog_of(name)?.capability.clone())
+        let m = self.catalog_of(name)?;
+        if let Some((_, id)) = self.identify_weights(Path::new(name)) {
+            return Some(m.artifact(&id)?.capabilities(m).to_vec());
+        }
+        Some(m.capability.clone())
     }
 
     /// Resolve a model id to a serving composition. `weights` selects the
@@ -1121,12 +1511,39 @@ impl Registry {
                 a.clone()
             }
             None => model
-                .weights()
-                .find(|a| self.is_artifact_installed(a))
-                .or_else(|| model.default_weights_for(self.cc))
-                .ok_or_else(|| DlError::Http(format!("model {name} has no weights artifact")))?
+                .default_weights_for_backend(&self.backend, self.cc)
+                .filter(|a| self.is_artifact_installed(a))
+                .or_else(|| {
+                    model.weights().find(|a| {
+                        a.runtime.supports_backend(&self.backend) && self.is_artifact_installed(a)
+                    })
+                })
+                .or_else(|| model.default_weights_for_backend(&self.backend, self.cc))
+                .ok_or_else(|| {
+                    DlError::Http(format!(
+                        "model {name} has no compatible weights for backend {}",
+                        self.backend
+                    ))
+                })?
                 .clone(),
         };
+
+        if !chosen.runtime.supports_backend(&self.backend) {
+            return Err(DlError::Http(format!(
+                "artifact {} of {name} requires backend {}; configured backend is {}",
+                chosen.id,
+                chosen.runtime.backends.join(" or "),
+                self.backend
+            )));
+        }
+        if let Some(id) = drafter
+            && !chosen.runtime.allows_companion(id)
+        {
+            return Err(DlError::Http(format!(
+                "artifact {} of {name} does not support companion {id}",
+                chosen.id
+            )));
+        }
 
         // the pieces this composition wants: the chosen weights + the default
         // companions (pull mode fetches them; no-pull mode uses what's there)
@@ -1135,7 +1552,12 @@ impl Registry {
             model
                 .artifacts
                 .iter()
-                .filter(|a| a.kind != ArtifactKind::Weights && a.default)
+                .filter(|a| {
+                    a.kind != ArtifactKind::Weights
+                        && a.default
+                        && chosen.runtime.allows_companion(&a.id)
+                        && a.runtime.supports_backend(&self.backend)
+                })
                 .cloned(),
         );
 
@@ -1182,18 +1604,18 @@ impl Registry {
         }
 
         // assemble the composition from what is actually on disk
-        let weights_path = chosen
-            .files
-            .first()
-            .map(|f| self.models_dir.join(&f.dest))
-            .ok_or_else(|| {
-                DlError::Http(format!("artifact {} of {name} has no files", chosen.id))
-            })?;
+        let weights_path = chosen.entry_path(&self.models_dir).ok_or_else(|| {
+            DlError::Http(format!("artifact {} of {name} has no files", chosen.id))
+        })?;
         let installed_path = |kind: ArtifactKind| -> Option<PathBuf> {
             model
                 .artifacts
                 .iter()
-                .filter(|a| a.kind == kind)
+                .filter(|a| {
+                    a.kind == kind
+                        && chosen.runtime.allows_companion(&a.id)
+                        && a.runtime.supports_backend(&self.backend)
+                })
                 .find(|a| self.is_artifact_installed(a))
                 .and_then(|a| a.files.first())
                 .map(|f| self.models_dir.join(&f.dest))
@@ -1204,7 +1626,11 @@ impl Registry {
             model
                 .artifacts
                 .iter()
-                .filter(|a| a.kind.is_mmproj())
+                .filter(|a| {
+                    a.kind.is_mmproj()
+                        && chosen.runtime.allows_companion(&a.id)
+                        && a.runtime.supports_backend(&self.backend)
+                })
                 .find(|a| self.is_artifact_installed(a))
                 .and_then(|a| a.files.first())
                 .map(|f| self.models_dir.join(&f.dest))
@@ -1221,16 +1647,16 @@ impl Registry {
         // wired, silencing "which drafter did On get me" exactly where the
         // answer is least guessable.
         let ds = || {
-            model
-                .artifacts
-                .iter()
-                .filter(|a| a.kind == ArtifactKind::Drafter)
+            model.artifacts.iter().filter(|a| {
+                a.kind == ArtifactKind::Drafter
+                    && chosen.runtime.allows_companion(&a.id)
+                    && a.runtime.supports_backend(&self.backend)
+            })
         };
         // The pin's rung is consent for that artifact and nothing else: a pin
-        // whose bytes are missing must not read as consent for a non-default
-        // sibling in the default lane below (spec/MTP is a user toggle, never
-        // default-on - `installed` alone would silently re-enable
-        // spec for anyone who once downloaded a drafter).
+        // whose bytes are missing must not silently elect a non-default
+        // sibling. Default companions enable speculation automatically;
+        // merely having downloaded a non-default draft does not opt into it.
         let pin_hit =
             drafter.and_then(|w| ds().find(|a| a.id == w && self.is_artifact_installed(a)));
         let default_hit = ds()
@@ -1258,11 +1684,11 @@ impl Registry {
             // One elected artifact feeds all three fields, so what is WIRED
             // and what is NAMED cannot part ways again.
             drafter_pick: picked.map(|a| (a.id.clone(), a.label.clone())),
-            drafter_declared: model
-                .artifacts
+            drafter_declared: ds().next().is_some(),
+            speculative: chosen
+                .capabilities(&model)
                 .iter()
-                .any(|a| a.kind == ArtifactKind::Drafter),
-            speculative: model.capability.iter().any(|c| c == "speculative"),
+                .any(|c| c == "speculative"),
             fp8_snapshot,
         }))
     }
@@ -1327,6 +1753,11 @@ impl Registry {
         ) {
             return Err(DlError::Http("job is still running or already done".into()));
         }
+        if recovery::digest(&self.pull_files(&old.model_id, old.artifacts.as_deref())?)
+            != old.selection_digest
+        {
+            return Err(DlError::Http("The catalog changed since this download. Review the model's current download options before continuing.".into()));
+        }
         let new_id = self.start_pull(&old.model_id, old.artifacts.as_deref())?;
         if let Some(new) = self.job(&new_id) {
             *new.follow
@@ -1367,33 +1798,102 @@ impl Registry {
                 }
                 out
             }
-            None => model.default_bundle_for(self.cc),
+            None => model.default_bundle_for_backend(&self.backend, self.cc),
         };
-        // de-dup by dest (defensive - pieces should not share files anymore)
-        let mut seen = std::collections::HashSet::new();
-        let files: Vec<CatalogFile> = selected
-            .iter()
-            .flat_map(|a| a.files.iter())
-            .filter(|f| seen.insert(f.dest.clone()))
-            .cloned()
-            .collect();
+        if selected.is_empty() {
+            return Err(DlError::Http(format!(
+                "model {model_id} has no compatible artifacts for backend {}",
+                self.backend
+            )));
+        }
+        for a in &selected {
+            if !a.runtime.supports_backend(&self.backend) {
+                return Err(DlError::Http(format!(
+                    "artifact {} of {model_id} requires backend {}; configured backend is {}",
+                    a.id,
+                    a.runtime.backends.join(" or "),
+                    self.backend
+                )));
+            }
+        }
+        let files = self.pull_files(model_id, artifacts)?;
         let total: u64 = files.iter().map(|f| f.size).sum();
+
+        // Admission and insertion share one lock. Never let two selections
+        // write the same part file or spend the same disk-space reservation.
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active: Vec<_> = jobs
+            .values()
+            .filter(|j| {
+                matches!(
+                    *j.status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    PullStatus::Running
+                )
+            })
+            .collect();
+        if active.len() >= 2 {
+            return Err(DlError::Http(
+                "Two downloads are already active. Pause one or wait for it to finish.".into(),
+            ));
+        }
+        if active.iter().any(|j| {
+            j.files
+                .iter()
+                .any(|prior| files.iter().any(|f| f.dest == prior.dest))
+        }) {
+            return Err(DlError::Http(
+                "These files are already downloading. Open Downloads to view their progress."
+                    .into(),
+            ));
+        }
+        if jobs.len() >= 128 {
+            let oldest = jobs
+                .values()
+                .filter(|j| {
+                    matches!(
+                        *j.status
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        PullStatus::Done
+                    )
+                })
+                .min_by_key(|j| j.created_ms)
+                .map(|j| j.id.clone());
+            if let Some(id) = oldest {
+                jobs.remove(&id);
+            } else {
+                return Err(DlError::Http("Download history is full of unfinished work. Resume the existing downloads first.".into()));
+            }
+        }
 
         // disk guard: refuse the pull up front if the not-yet-present bytes
         // wouldn't fit (keep ~1 GiB headroom), so the UI can warn instead of
         // filling the drive mid-download.
         let need: u64 = files
             .iter()
-            .filter(|f| {
-                std::fs::metadata(self.models_dir.join(&f.dest))
-                    .map(|m| m.len())
-                    .ok()
-                    != Some(f.size)
+            .map(|f| recovery::additional_bytes(&self.models_dir, f))
+            .sum();
+        std::fs::create_dir_all(&self.models_dir)?;
+        let reserved: u64 = jobs
+            .values()
+            .filter(|j| {
+                matches!(
+                    *j.status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    PullStatus::Running
+                )
             })
-            .map(|f| f.size)
+            .flat_map(|j| &j.files)
+            .map(|f| recovery::additional_bytes(&self.models_dir, f))
             .sum();
         if let Some(free) = disk_free(&self.models_dir)
-            && need > free.saturating_sub(1 << 30)
+            && need.saturating_add(reserved) > free.saturating_sub(1 << 30)
         {
             return Err(DlError::Disk {
                 need,
@@ -1406,7 +1906,7 @@ impl Registry {
             id: uuid::Uuid::new_v4().simple().to_string(),
             model_id: model_id.to_owned(),
             display: model.display.clone(),
-            artifacts: artifacts.map(<[String]>::to_vec),
+            artifacts: Some(selected.iter().map(|a| a.id.clone()).collect()),
             downloaded: Arc::new(AtomicU64::new(0)),
             total,
             created_ms: unix_ms(),
@@ -1414,15 +1914,23 @@ impl Registry {
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             follow: std::sync::Mutex::new(None),
             follow_state: std::sync::Mutex::new(None),
+            files: files.clone(),
+            selection_digest: recovery::digest(&files),
+            phase: std::sync::Mutex::new("Preparing download".into()),
+            stage: std::sync::Mutex::new("preparing"),
         });
-        self.jobs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(job.id.clone(), job.clone());
+        if let Some(store) = &self.store {
+            store
+                .save_download(&job.record())
+                .map_err(|e| DlError::Http(e.to_string()))?;
+        }
+        jobs.insert(job.id.clone(), job.clone());
+        drop(jobs);
 
         let client = self.client.clone();
         let models_dir = self.models_dir.clone();
         let job2 = job.clone();
+        let store = self.store.clone();
         tokio::spawn(async move {
             let mut outcome: Result<(), DlError> = Ok(());
             for f in &files {
@@ -1431,12 +1939,37 @@ impl Registry {
                     break;
                 }
                 let dest = models_dir.join(&f.dest);
-                // already present at the right size -> skip the download (de-dup)
+                *job2
+                    .phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = f.dest.clone();
+                // Size alone is not an integrity check. Imported/pre-existing
+                // bytes are read off-thread and must match this exact artifact.
                 if std::fs::metadata(&dest).map(|m| m.len()).ok() == Some(f.size) {
-                    job2.downloaded.fetch_add(f.size, Ordering::Relaxed);
-                    continue;
+                    *job2
+                        .stage
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = "verifying";
+                    match sha256_file_cancel(dest.clone(), Some(job2.cancel.clone())).await {
+                        Ok(sha) if sha == f.sha256.to_lowercase() => {
+                            job2.downloaded.fetch_add(f.size, Ordering::Relaxed);
+                            continue;
+                        }
+                        Ok(sha) => {
+                            outcome = Err(DlError::Checksum {
+                                name: f.dest.clone(),
+                                expected: f.sha256.clone(),
+                                got: sha,
+                            });
+                            break;
+                        }
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    }
                 }
-                if let Err(e) = download_file(
+                if let Err(e) = download_file_staged(
                     &client,
                     &f.url,
                     &dest,
@@ -1444,6 +1977,7 @@ impl Registry {
                     f.size,
                     job2.downloaded.clone(),
                     Some(job2.cancel.clone()),
+                    Some(&job2.stage),
                 )
                 .await
                 {
@@ -1461,994 +1995,31 @@ impl Registry {
                     message: e.to_string(),
                 },
             };
+            if let Some(store) = store
+                && let Err(e) = store.save_download(&job2.record())
+            {
+                *job2
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = PullStatus::Error {
+                    message: format!(
+                        "Files were processed, but saving download state failed: {e}. Resume to verify."
+                    ),
+                };
+            }
         });
         Ok(job.id.clone())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn nvfp4_is_the_default_only_where_it_runs() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        for id in ["granite-4.2-8b", "granite-4.2-30b"] {
-            let m = reg.catalog().models.iter().find(|m| m.id == id).expect(id);
-            // Blackwell (sm_120): the NVFP4 lane is the default.
-            assert_eq!(
-                m.default_weights_for(Some([12, 0]))
-                    .and_then(|a| a.quant.as_deref()),
-                Some("NVFP4"),
-                "{id}: NVFP4 is the default on Blackwell",
-            );
-            // Ampere (sm_86): NVFP4's min_cc is unmet, so the floorless Q8_0 wins.
-            assert_eq!(
-                m.default_weights_for(Some([8, 6]))
-                    .and_then(|a| a.quant.as_deref()),
-                Some("Q8_0"),
-                "{id}: falls back to Q8_0 off Blackwell",
-            );
-            // No card / unknown cc: never hand out a gated default.
-            assert_eq!(
-                m.default_weights_for(None).and_then(|a| a.quant.as_deref()),
-                Some("Q8_0"),
-                "{id}: falls back to Q8_0 when cc is unknown",
-            );
-            // The nominal (cc-agnostic) default is still the marked one.
-            assert_eq!(
-                m.default_weights().and_then(|a| a.quant.as_deref()),
-                Some("NVFP4"),
-                "{id}: nominal default is the marked NVFP4",
-            );
-        }
-    }
-    use axum::extract::State;
-    use axum::http::{HeaderMap, StatusCode};
-    use axum::response::IntoResponse;
-
-    /// Over the real catalog: a model that declares a default mmproj
-    /// companion must get one back in its composition - whichever sense it
-    /// serves. Written after Qwen3-ASR shipped unservable: the manager
-    /// downloaded its speech encoder, resolved Vision only, passed no
-    /// `--mmproj`, and the runner refused with "pass its audio mmproj" for a
-    /// file already on disk. Asserting the CLASS rather than that one model
-    /// is the point - the next sense (video, whatever) fails here first.
-    #[test]
-    fn every_default_mmproj_companion_reaches_the_composition() {
-        let reg = Registry::new(std::path::PathBuf::from("./this-dir-does-not-exist"));
-        let mut checked = 0;
-        for m in &reg.catalog().models {
-            let Some((_, mmproj, _)) = reg.planned_paths(&m.id, None) else {
-                continue;
-            };
-            let declares = m.artifacts.iter().any(|a| a.kind.is_mmproj() && a.default);
-            assert_eq!(
-                declares,
-                mmproj.is_some(),
-                "{}: declares a default mmproj companion = {declares}, composition carries one = {}",
-                m.id,
-                mmproj.is_some()
-            );
-            checked += 1;
-        }
-        assert!(
-            checked > 0,
-            "the embedded catalog resolved no models at all"
-        );
-    }
-
-    // A tiny origin that serves a fixed buffer and honours `Range: bytes=a-b`
-    // (206 + Content-Range), so we exercise the parallel path.
-    async fn serve(State(data): State<Arc<Vec<u8>>>, headers: HeaderMap) -> impl IntoResponse {
-        let total = data.len() as u64;
-        if let Some(r) = headers.get(axum::http::header::RANGE) {
-            let spec = r.to_str().unwrap_or("").trim_start_matches("bytes=");
-            let (a, b) = spec.split_once('-').unwrap_or(("0", ""));
-            let start: u64 = a.parse().unwrap_or(0);
-            let end: u64 = if b.is_empty() {
-                total - 1
-            } else {
-                b.parse::<u64>().unwrap_or(total - 1).min(total - 1)
-            };
-            let slice = data[start as usize..=end as usize].to_vec();
-            let mut h = HeaderMap::new();
-            h.insert(
-                axum::http::header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{total}").parse().unwrap(),
-            );
-            h.insert(axum::http::header::ACCEPT_RANGES, "bytes".parse().unwrap());
-            (StatusCode::PARTIAL_CONTENT, h, slice).into_response()
-        } else {
-            (StatusCode::OK, data.to_vec()).into_response()
-        }
-    }
-
-    async fn spawn_origin(data: Vec<u8>) -> String {
-        let app = axum::Router::new()
-            .route("/f", axum::routing::get(serve))
-            .with_state(Arc::new(data));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/f")
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn parallel_range_download_verifies_and_publishes() {
-        // ~40 MiB of a deterministic pattern -> several segments across workers
-        let data: Vec<u8> = (0..40 * 1024 * 1024u32)
-            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
-            .collect();
-        let sha = hex(&Sha256::digest(&data));
-        let size = data.len() as u64;
-        let url = spawn_origin(data.clone()).await;
-
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("model.gguf");
-        let client = reqwest::Client::new();
-        let progress = Arc::new(AtomicU64::new(0));
-
-        download_file(&client, &url, &dest, &sha, size, progress.clone(), None)
-            .await
-            .expect("download");
-
-        assert!(dest.exists(), "final file published");
-        assert!(!part_path(&dest).exists(), "part file cleaned up");
-        assert_eq!(
-            progress.load(Ordering::Relaxed),
-            size,
-            "progress reached total"
-        );
-        assert_eq!(std::fs::read(&dest).unwrap(), data, "bytes match exactly");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn wrong_checksum_is_rejected() {
-        let data: Vec<u8> = vec![7u8; 3 * 1024 * 1024];
-        let size = data.len() as u64;
-        let url = spawn_origin(data).await;
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("bad.gguf");
-        let client = reqwest::Client::new();
-        let bad_sha = "0".repeat(64);
-        let err = download_file(
-            &client,
-            &url,
-            &dest,
-            &bad_sha,
-            size,
-            Arc::new(AtomicU64::new(0)),
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, DlError::Checksum { .. }), "got {err:?}");
-        assert!(!dest.exists(), "a bad download is never published");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn missing_origin_file_is_a_clean_not_found() {
-        // origin serves only /f; any other path 404s - as R2 would for a file
-        // that was force-deleted while still listed in the manifest.
-        let base = spawn_origin(vec![1u8; 4096]).await;
-        let gone = base.replace("/f", "/deleted-from-r2.gguf");
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("x.gguf");
-        let err = download_file(
-            &reqwest::Client::new(),
-            &gone,
-            &dest,
-            &"0".repeat(64),
-            4096,
-            Arc::new(AtomicU64::new(0)),
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, DlError::NotFound { .. }),
-            "gone file -> NotFound, got {err:?}"
-        );
-        assert!(!dest.exists(), "nothing published");
-        assert!(
-            !part_path(&dest).exists(),
-            "no .part left behind (failed fast before disk write)"
-        );
-    }
-
-    /// Two models, so "the file names a different model" is expressible.
-    fn two_model_registry() -> Registry {
-        let art = |id: &str, kind: ArtifactKind, dest: &str| CatalogArtifact {
-            id: id.into(),
-            kind,
-            format: "gguf".into(),
-            label: "Full quality".into(),
-            quant: None,
-            default: id == "q8",
-            required: false,
-            min_cc: None,
-            workspace: None,
-            shape: None,
-            files: vec![CatalogFile {
-                url: String::new(),
-                dest: dest.into(),
-                sha256: String::new(),
-                size: 1,
-            }],
-        };
-        let model = |id: &str, artifacts: Vec<CatalogArtifact>| CatalogModel {
-            id: id.into(),
-            display: id.into(),
-            vendor: None,
-            family: None,
-            mtp_in_file: false,
-            capability: vec!["chat".into()],
-            revision: None,
-            license: None,
-            kv_default: None,
-            specs: Default::default(),
-            artifacts,
-        };
-        let catalog = Catalog {
-            schema: 3,
-            models: vec![
-                model(
-                    "tiny",
-                    vec![
-                        art("q8", ArtifactKind::Weights, "tiny-GGUF/Tiny-Q8_0.gguf"),
-                        art("q4", ArtifactKind::Weights, "tiny-GGUF/Tiny-Q4_K_M.gguf"),
-                        // a vision companion must not identify as weights
-                        art("vision", ArtifactKind::Vision, "tiny-GGUF/mmproj-BF16.gguf"),
-                    ],
-                ),
-                model(
-                    "other",
-                    vec![art("q4", ArtifactKind::Weights, "other-GGUF/Other-Q4.gguf")],
-                ),
-            ],
-        };
-        Registry::from_catalog(catalog, PathBuf::from("unused"))
-    }
-
-    #[test]
-    fn identify_weights_maps_a_path_back_to_catalog_identity() {
-        let reg = two_model_registry();
-        // case-insensitive, matched by file name regardless of the dir it
-        // actually lives in (an election path uses the real install root)
-        assert_eq!(
-            reg.identify_weights(Path::new(r"E:\models\tiny-GGUF/tiny-q8_0.gguf")),
-            Some(("tiny".into(), "q8".into()))
-        );
-        // a runner's file-derived id has no extension - the stem still matches
-        assert_eq!(
-            reg.identify_weights(Path::new("Tiny-Q8_0")),
-            Some(("tiny".into(), "q8".into()))
-        );
-        // directory-shaped serving (a safetensors checkpoint dir like the
-        // forced aligner) reports the DIRECTORY name as its id - the dest's
-        // parent matches it back to the model
-        assert_eq!(
-            reg.identify_weights(Path::new("tiny-gguf")),
-            Some(("tiny".into(), "q8".into()))
-        );
-        assert_eq!(
-            reg.identify_weights(Path::new(r"E:\models\tiny-GGUF/mmproj-BF16.gguf")),
-            None
-        );
-        assert_eq!(reg.identify_weights(Path::new("something-else.gguf")), None);
-    }
-
-    /// The four ways a config file's `[catalog]` block and its `model` path can
-    /// stand to each other. The fourth is the one that motivates
-    /// the block at all: a file the catalog cannot recognize by name.
-    #[test]
-    fn identity_for_reconciles_the_declaration_with_the_weights() {
-        let reg = two_model_registry();
-        // Mixed separators deliberately, exactly as the sibling test above does:
-        // `\` is not a path separator on unix, so an all-backslash literal makes
-        // `file_name()` return the whole string and `identify_weights` answer
-        // None for a path that is perfectly recognizable on Windows. That is
-        // not a harmless platform quirk here - with `by_file` forced to None,
-        // most assertions below stop testing reconciliation at all and pass
-        // through the "declaration stands" arm instead. Only the `retired`
-        // case, where the declaration is discarded, ever noticed.
-        let q8 = Path::new(r"E:\models\tiny-GGUF/Tiny-Q8_0.gguf");
-
-        // agree -> the declaration names the model, the FILE names the artifact
-        assert_eq!(
-            reg.identity_for(Some(("tiny", Some("q8"))), q8),
-            Some(("tiny".into(), Some("q8".into())))
-        );
-        // same model, other quant: repointing `model` does not require editing
-        // the block, and the artifact follows the bytes
-        assert_eq!(
-            reg.identity_for(Some(("tiny", Some("q8"))), Path::new("Tiny-Q4_K_M.gguf")),
-            Some(("tiny".into(), Some("q4".into())))
-        );
-        // the file is a different model - somebody repointed `model` and left
-        // the block behind. Serving `other` while claiming `tiny` is the one
-        // outcome worth overruling the declaration for.
-        assert_eq!(
-            reg.identity_for(Some(("tiny", Some("q8"))), Path::new("Other-Q4.gguf")),
-            Some(("other".into(), Some("q4".into())))
-        );
-        // The CASE identify_weights can never serve: renamed, copied, imported
-        // in place. The declaration stands - an endpoint does not lose its
-        // identity because someone reorganized their disk.
-        assert_eq!(
-            reg.identity_for(
-                Some(("tiny", Some("q4"))),
-                Path::new(r"D:\keep\my-copy.gguf")
-            ),
-            Some(("tiny".into(), Some("q4".into())))
-        );
-        // an id the catalog has never heard of is discarded rather than passed
-        // through: every consumer assumes catalog id or path, and a third kind
-        // would offer the user a selection they cannot select
-        assert_eq!(
-            reg.identity_for(Some(("retired", None)), Path::new("my-copy.gguf")),
-            None
-        );
-        assert_eq!(
-            reg.identity_for(Some(("retired", None)), q8),
-            Some(("tiny".into(), Some("q8".into())))
-        );
-        // no block at all = every config file written before then, and the
-        // answer is exactly what those files got then
-        assert_eq!(
-            reg.identity_for(None, q8),
-            Some(("tiny".into(), Some("q8".into())))
-        );
-        assert_eq!(reg.identity_for(None, Path::new("my-copy.gguf")), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn registry_pull_from_manifest_downloads_to_dest() {
-        let data: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i >> 3) as u8).collect();
-        let sha = hex(&Sha256::digest(&data));
-        let size = data.len() as u64;
-        let url = spawn_origin(data.clone()).await; // serves the bytes at /f, honours Range
-
-        // a one-model manifest pointing at the local origin (as models.toml would
-        // at real R2), with an explicit dest - no remote catalog is ever fetched.
-        let catalog = Catalog {
-            schema: 3,
-            models: vec![CatalogModel {
-                id: "tiny".into(),
-                display: "Tiny".into(),
-                vendor: None,
-                family: None,
-                mtp_in_file: false,
-                capability: vec!["chat".into()],
-                revision: None,
-                license: Some("apache-2.0".into()),
-                kv_default: None,
-                specs: Default::default(),
-                artifacts: vec![CatalogArtifact {
-                    id: "q8".into(),
-                    kind: ArtifactKind::Weights,
-                    format: "gguf".into(),
-                    label: "Full quality".into(),
-                    quant: Some("Q8_0".into()),
-                    default: true,
-                    required: false,
-                    min_cc: None,
-                    workspace: None,
-                    shape: None,
-                    files: vec![CatalogFile {
-                        url: url.clone(),
-                        dest: "tiny-GGUF/tiny.gguf".into(),
-                        sha256: sha.clone(),
-                        size,
-                    }],
-                }],
-            }],
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let reg = Registry::from_catalog(catalog, dir.path().to_path_buf());
-        assert_eq!(reg.catalog().models[0].id, "tiny");
-        assert!(
-            !reg.is_installed(&reg.catalog().models[0]),
-            "not installed before pull"
-        );
-
-        let jid = reg.start_pull("tiny", None).expect("start pull");
-        // poll to completion
-        let mut done = false;
-        for _ in 0..300 {
-            let st = reg
-                .job(&jid)
-                .unwrap()
-                .status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            match st {
-                PullStatus::Done => {
-                    done = true;
-                    break;
-                }
-                PullStatus::Error { message } => panic!("pull failed: {message}"),
-                PullStatus::Cancelled => panic!("nothing cancelled this pull"),
-                PullStatus::Running => {}
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-        }
-        assert!(done, "pull reached Done");
-        let job = reg.job(&jid).unwrap();
-        assert_eq!(
-            job.downloaded.load(Ordering::Relaxed),
-            size,
-            "progress = total"
-        );
-        let landed = dir.path().join("tiny-GGUF").join("tiny.gguf");
-        assert!(landed.exists(), "model file landed at its dest");
-        assert_eq!(std::fs::read(&landed).unwrap(), data, "bytes verified");
-        assert!(
-            reg.is_installed(&reg.catalog().models[0]),
-            "installed after pull"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn resolve_pulls_missing_files_and_splits_weights_from_mmproj() {
-        let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i >> 2) as u8).collect();
-        let sha = hex(&Sha256::digest(&data));
-        let size = data.len() as u64;
-        let url = spawn_origin(data.clone()).await;
-
-        // a weights + vision model (schema 3 artifacts) - both files point at
-        // the local origin.
-        let catalog = Catalog {
-            schema: 3,
-            models: vec![CatalogModel {
-                id: "vis".into(),
-                display: "Vis".into(),
-                vendor: None,
-                family: None,
-                mtp_in_file: false,
-                capability: vec!["chat".into(), "vision".into()],
-                revision: None,
-                license: None,
-                kv_default: None,
-                specs: Default::default(),
-                artifacts: vec![
-                    CatalogArtifact {
-                        id: "q8".into(),
-                        kind: ArtifactKind::Weights,
-                        format: "gguf".into(),
-                        label: "Full quality".into(),
-                        quant: Some("Q8_0".into()),
-                        default: true,
-                        required: false,
-                        min_cc: None,
-                        workspace: None,
-                        shape: None,
-                        files: vec![CatalogFile {
-                            url: url.clone(),
-                            dest: "Vis-GGUF/vis-Q8_0.gguf".into(),
-                            sha256: sha.clone(),
-                            size,
-                        }],
-                    },
-                    CatalogArtifact {
-                        id: "vision".into(),
-                        kind: ArtifactKind::Vision,
-                        format: "gguf".into(),
-                        label: "Vision".into(),
-                        quant: None,
-                        default: true,
-                        required: false,
-                        min_cc: None,
-                        workspace: None,
-                        shape: None,
-                        files: vec![CatalogFile {
-                            url: url.clone(),
-                            dest: "Vis-GGUF/vis-mmproj-F16.gguf".into(),
-                            sha256: sha.clone(),
-                            size,
-                        }],
-                    },
-                ],
-            }],
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let reg = Registry::from_catalog(catalog, dir.path().to_path_buf());
-
-        // an unknown name resolves to None -> caller treats it as a path
-        assert!(
-            reg.resolve("not-a-model", None, true, None)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        // the deploy contract: pull=false on a not-installed model is an
-        // honest error naming the fix, never a silent download
-        let err = reg.resolve("vis", None, false, None).await.unwrap_err();
-        assert!(
-            err.to_string().contains("not downloaded"),
-            "honest no-pull error: {err}"
-        );
-
-        // pull=true fetches the composition and returns split paths
-        let r = reg
-            .resolve("vis", None, true, None)
-            .await
-            .unwrap()
-            .expect("known id resolves");
-        assert!(r.weights.exists(), "weights pulled to disk");
-        assert!(
-            !r.weights.to_string_lossy().contains("mmproj"),
-            "weights is the weights artifact"
-        );
-        let mm = r.mmproj.expect("vision companion detected");
-        assert!(mm.exists(), "mmproj pulled to disk");
-        assert!(
-            mm.to_string_lossy().contains("mmproj"),
-            "mmproj is the vision artifact"
-        );
-
-        // now installed: the no-pull path resolves the same composition
-        let r2 = reg
-            .resolve("vis", Some("q8"), false, None)
-            .await
-            .unwrap()
-            .expect("resolves installed");
-        assert_eq!(r2.weights, r.weights);
-    }
-
-    /// Two catalogued drafters (muse ships DFlash1 and DFlash2) must elect
-    /// deliberately, not by declaration order. Plain first-match made the
-    /// choice invisible and the ordering load-bearing.
-    #[tokio::test]
-    async fn drafter_election_prefers_the_pin_then_the_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let drafter = |id: &str, dest: &str, default: bool| CatalogArtifact {
-            id: id.into(),
-            kind: ArtifactKind::Drafter,
-            format: "gguf".into(),
-            label: format!("Speed drafter ({id})"),
-            quant: None,
-            default,
-            required: false,
-            min_cc: None,
-            workspace: None,
-            shape: None,
-            files: vec![CatalogFile {
-                url: "http://invalid.invalid/x".into(),
-                dest: dest.into(),
-                sha256: "0".repeat(64),
-                size: 3,
-            }],
-        };
-        let catalog = Catalog {
-            schema: 3,
-            models: vec![CatalogModel {
-                id: "m".into(),
-                display: "M".into(),
-                vendor: None,
-                family: None,
-                mtp_in_file: false,
-                capability: vec!["chat".into(), "speculative".into()],
-                revision: None,
-                license: None,
-                kv_default: None,
-                specs: Default::default(),
-                artifacts: vec![
-                    CatalogArtifact {
-                        id: "q8".into(),
-                        kind: ArtifactKind::Weights,
-                        format: "gguf".into(),
-                        label: "Full quality".into(),
-                        quant: Some("Q8_0".into()),
-                        default: true,
-                        required: false,
-                        min_cc: None,
-                        workspace: None,
-                        shape: None,
-                        files: vec![CatalogFile {
-                            url: "http://invalid.invalid/w".into(),
-                            dest: "M/w.gguf".into(),
-                            sha256: "0".repeat(64),
-                            size: 3,
-                        }],
-                    },
-                    // v2 declared first and default; v1 second. Order must not
-                    // be what decides.
-                    drafter("d2", "M/d2.gguf", true),
-                    drafter("d1", "M/d1.gguf", false),
-                ],
-            }],
-        };
-        let reg = Registry::from_catalog(catalog, dir.path().to_path_buf());
-        let put = |rel: &str| {
-            let p = dir.path().join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"abc").unwrap();
-        };
-        put("M/w.gguf");
-
-        // Only v1 on disk: the default is unavailable, so the installed one is
-        // wired rather than nothing - an endpoint should not lose speculation
-        // because a newer drafter exists that was never downloaded.
-        put("M/d1.gguf");
-        let r = reg
-            .resolve("m", Some("q8"), false, None)
-            .await
-            .unwrap()
-            .expect("resolves");
-        assert_eq!(r.drafter_pick.as_ref().map(|(i, _)| i.as_str()), Some("d1"));
-
-        // both on disk: the DEFAULT wins, not the first declared or the first
-        // installed
-        put("M/d2.gguf");
-        let r = reg
-            .resolve("m", Some("q8"), false, None)
-            .await
-            .unwrap()
-            .expect("resolves");
-        assert_eq!(r.drafter_pick.as_ref().map(|(i, _)| i.as_str()), Some("d2"));
-
-        // an explicit pin beats the default, and is wired without being
-        // default: asking for it is the same consent `default` expresses
-        let r = reg
-            .resolve("m", Some("q8"), false, Some("d1"))
-            .await
-            .unwrap()
-            .expect("resolves");
-        assert_eq!(r.drafter_pick.as_ref().map(|(i, _)| i.as_str()), Some("d1"));
-        assert!(
-            r.mtp
-                .expect("pin wires without asking")
-                .ends_with("d1.gguf")
-        );
-
-        // a pin naming an artifact this model does not have falls back rather
-        // than serving nothing
-        let r = reg
-            .resolve("m", Some("q8"), false, Some("nope"))
-            .await
-            .unwrap()
-            .expect("resolves");
-        assert_eq!(r.drafter_pick.as_ref().map(|(i, _)| i.as_str()), Some("d2"));
-    }
-
-    /// The corner that used to go silent (a follow-up): a pin naming
-    /// a real catalogued artifact whose bytes are not downloaded. The election
-    /// skipped the installed check on the pin arm, and the three consumers each
-    /// patched around it separately - so `drafter_any` wired the installed
-    /// sibling while `drafter_pick` reported nothing, and the "which drafter
-    /// did On get me" surface said nothing in the one case where the answer is
-    /// least guessable. One election feeds all three fields now.
-    #[tokio::test]
-    async fn a_dead_pin_falls_back_and_the_fallback_is_named() {
-        let dir = tempfile::tempdir().unwrap();
-        let drafter = |id: &str, dest: &str, default: bool| CatalogArtifact {
-            id: id.into(),
-            kind: ArtifactKind::Drafter,
-            format: "gguf".into(),
-            label: format!("Speed drafter ({id})"),
-            quant: None,
-            default,
-            required: false,
-            min_cc: None,
-            workspace: None,
-            shape: None,
-            files: vec![CatalogFile {
-                url: "http://invalid.invalid/x".into(),
-                dest: dest.into(),
-                sha256: "0".repeat(64),
-                size: 3,
-            }],
-        };
-        let catalog = Catalog {
-            schema: 3,
-            models: vec![CatalogModel {
-                id: "m".into(),
-                display: "M".into(),
-                vendor: None,
-                family: None,
-                mtp_in_file: false,
-                capability: vec!["chat".into(), "speculative".into()],
-                revision: None,
-                license: None,
-                kv_default: None,
-                specs: Default::default(),
-                artifacts: vec![
-                    CatalogArtifact {
-                        id: "q8".into(),
-                        kind: ArtifactKind::Weights,
-                        format: "gguf".into(),
-                        label: "Full quality".into(),
-                        quant: Some("Q8_0".into()),
-                        default: true,
-                        required: false,
-                        min_cc: None,
-                        workspace: None,
-                        shape: None,
-                        files: vec![CatalogFile {
-                            url: "http://invalid.invalid/w".into(),
-                            dest: "M/w.gguf".into(),
-                            sha256: "0".repeat(64),
-                            size: 3,
-                        }],
-                    },
-                    drafter("d2", "M/d2.gguf", true),
-                    drafter("d1", "M/d1.gguf", false),
-                ],
-            }],
-        };
-        let reg = Registry::from_catalog(catalog, dir.path().to_path_buf());
-        let put = |rel: &str| {
-            let p = dir.path().join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"abc").unwrap();
-        };
-        put("M/w.gguf");
-        put("M/d1.gguf"); // Only the non-default sibling is on disk
-
-        // Pin the default (d2) while its bytes are missing: an explicit "on"
-        // wires the installed sibling, and NAMES it - wired and named must be
-        // the same artifact.
-        let r = reg
-            .resolve("m", Some("q8"), false, Some("d2"))
-            .await
-            .unwrap()
-            .expect("resolves");
-        assert_eq!(r.drafter_pick.as_ref().map(|(i, _)| i.as_str()), Some("d1"));
-        assert!(
-            r.drafter_any
-                .as_ref()
-                .expect("explicit on wires the sibling")
-                .ends_with("d1.gguf"),
-            "drafter_any must wire what drafter_pick names"
-        );
-        // ...but the DEFAULT lane stays empty: a dead pin was consent for d2,
-        // not for silently enabling the non-default d1 (never default-on).
-        assert!(
-            r.mtp.is_none(),
-            "a dead pin must not default-enable a non-default sibling"
-        );
-    }
-
-    // The blessed-models manifest ships in the binary - it must always parse and
-    // every entry must be complete, so a hand-edited models.toml can't ship broken.
-    // /api/servers answers the capability of a STOPPED endpoint from here, and
-    // the composer's mic decides from that whether starting it would give you
-    // a transcriber. The lookup has to survive the shape a config
-    // file actually stores: `model` is normally the resolved WEIGHTS PATH, not
-    // the catalog id, so a by-id-only match would report no capability for
-    // every configured endpoint and the mic would offer nothing.
-    #[test]
-    fn capability_resolves_by_id_and_by_weights_path() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        let speech = reg
-            .catalog()
-            .models
-            .iter()
-            .find(|m| m.capability.iter().any(|c| c == "transcription"))
-            .expect("catalog ships at least one speech model");
-
-        let by_id = reg
-            .capability_of(&speech.id)
-            .expect("resolves by catalog id");
-        assert!(
-            by_id.iter().any(|c| c == "transcription"),
-            "{}: speech by id",
-            speech.id
-        );
-
-        // ...and by the weights filename, which is what servers/<port>.toml holds.
-        let file = speech
-            .default_weights()
-            .and_then(|a| a.files.first())
-            .map(|f| f.dest.clone())
-            .expect("speech model has a default weights file");
-        let path = format!("/some/models/dir/{file}");
-        let by_path = reg
-            .capability_of(&path)
-            .unwrap_or_else(|| panic!("{path}: resolves by weights path"));
-        assert!(
-            by_path.iter().any(|c| c == "transcription"),
-            "{path}: speech by path"
-        );
-
-        // A model the catalog has never heard of stays unknown rather than
-        // being guessed at - the mic then leaves it out instead of offering a
-        // "speech model" that would not work once started.
-        assert!(reg.capability_of("/models/somebody-elses.gguf").is_none());
-    }
-
-    /// Every GGUF weights artifact publishes a shape.
-    ///
-    /// "Always publish the shape" is only a rule if something enforces it, and
-    /// this is the half that can be enforced with no GPU and no models on disk:
-    /// the block is PRESENT. `the shapes generator --check` is the other half -
-    /// it re-probes installed files and catches a block that drifted from the
-    /// bytes it describes.
-    ///
-    /// The consequence of a missing block is not cosmetic: the picker has no
-    /// second path any more (`approxResident` is gone), so an unpriced artifact
-    /// shows a dash where a fit verdict belongs.
-    #[test]
-    fn every_gguf_weights_artifact_publishes_a_shape() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        let mut naked = Vec::new();
-        for m in &reg.catalog().models {
-            for a in m.weights() {
-                // safetensors is exempt and NAMED, not silently skipped:
-                // `probe_path` reads GGUF only, so the generator has no
-                // geometry source for those and refuses to invent one. The
-                // exemption disappears the day the runner can report its own
-                // shape after a load.
-                if a.format != "gguf" {
-                    continue;
-                }
-                if a.shape.is_none() {
-                    naked.push(format!("{}/{}", m.id, a.id));
-                }
-            }
-        }
-        assert!(
-            naked.is_empty(),
-            "these GGUF weights artifacts publish no shape, so will-it-fit cannot price them: \
-             {naked:?}\nregenerate with the shapes generator"
-        );
-    }
-
-    /// `speculative` and the drafter artifact travel together.
-    ///
-    /// The resolver wires a default drafter as `--mtp` on its own, but a spawn
-    /// ASKED to speculate refuses unless the model claims `speculative` - so a
-    /// drafter catalogued without the capability is bytes nobody can turn on,
-    /// and the capability without in-file heads or a drafter is a promise the
-    /// runner cannot keep. Both are one-line catalog edits away (a drafter
-    /// added to an entry that predates it, as Flash-Next's was), so the pair
-    /// is checked here rather than remembered.
-    #[test]
-    fn speculative_capability_matches_a_drafter_or_in_file_heads() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        let mut claims_without_means = Vec::new();
-        let mut drafter_without_claim = Vec::new();
-        for m in &reg.catalog().models {
-            let claims = m.capability.iter().any(|c| c == "speculative");
-            let drafter = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Drafter);
-            if claims && !drafter && !m.mtp_in_file {
-                claims_without_means.push(m.id.clone());
-            }
-            if drafter && !claims {
-                drafter_without_claim.push(m.id.clone());
-            }
-        }
-        assert!(
-            claims_without_means.is_empty() && drafter_without_claim.is_empty(),
-            "claim `speculative` with neither in-file heads nor a drafter: \
-             {claims_without_means:?}; catalogue a drafter without claiming \
-             `speculative`: {drafter_without_claim:?}"
-        );
-    }
-
-    #[test]
-    fn a_published_shape_round_trips_through_the_estimator() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        let a = reg
-            .catalog()
-            .models
-            .iter()
-            .flat_map(|m| m.weights())
-            .find(|a| a.shape.is_some())
-            .expect("at least one artifact publishes a shape");
-        let s = a.shape.clone().unwrap();
-        let weight_bytes = s.weight_bytes;
-        let kv_runs: u64 = s.kv_layers.iter().map(|r| r.count).sum();
-        let shape = s.into_model_shape(1234, 5678);
-        assert_eq!(
-            shape.weight_bytes, weight_bytes,
-            "weights survive the completion"
-        );
-        assert_eq!(shape.tower_bytes, 1234, "tower comes from the caller");
-        assert_eq!(
-            shape.workspace_bytes, 5678,
-            "workspace comes from the caller"
-        );
-        // The published form collapses identical consecutive blocks into runs;
-        // the estimator still prices block by block, so the expansion has to
-        // give every one of them back.
-        assert_eq!(
-            shape.kv_layers.len() as u64,
-            kv_runs,
-            "every KV block in the runs is expanded"
-        );
-    }
-
-    #[test]
-    fn embedded_manifest_parses_and_is_well_formed() {
-        let reg = Registry::new(std::path::PathBuf::from("./models"));
-        assert!(!reg.catalog().models.is_empty(), "manifest lists models");
-        for m in &reg.catalog().models {
-            assert!(!m.capability.is_empty(), "{}: has a capability", m.id);
-            assert!(
-                m.weights().next().is_some(),
-                "{}: has a weights artifact",
-                m.id
-            );
-            assert!(
-                m.default_weights().is_some(),
-                "{}: has a default weights choice",
-                m.id
-            );
-            for a in &m.artifacts {
-                assert!(!a.files.is_empty(), "{}/{}: artifact has files", m.id, a.id);
-                for f in &a.files {
-                    assert!(f.url.starts_with("http"), "{}: absolute url", m.id);
-                    assert_eq!(f.sha256.len(), 64, "{}: sha256 present", m.id);
-                    assert!(f.size > 0, "{}: nonzero size", m.id);
-                    assert!(
-                        !f.dest.is_empty() && !f.dest.starts_with('/'),
-                        "{}: relative dest",
-                        m.id
-                    );
-                }
-            }
-        }
-        // A weights artifact can span several files, for two different
-        // reasons, and only one of them is sharding.
-        //
-        // The spawn path hands the runner `files.first()` and the engine takes
-        // it from there - for a gguf-split family the loader walks the
-        // remaining shards from that first shard's own metadata. So whatever
-        // else the artifact carries, file[0] has to be the thing the engine
-        // can open: shard 1 of a split, or the single .gguf otherwise.
-        // Listing a middle shard first would fail at load, and it is a
-        // hand-editing mistake nothing else here would catch - the sizes and
-        // hashes would all be correct.
-        //
-        // The other reason is a NOTICE riding with the weights: Røst's licence
-        // is use-restricted and its text has to be undownloadable-without-the-
-        // model, so LICENSE.txt sits in the same artifact rather than in an
-        // optional companion someone could decline. That is not a shard and
-        // must not be read as one.
-        for m in &reg.catalog().models {
-            for a in m.weights().filter(|a| a.files.len() > 1) {
-                let first = &a.files[0].dest;
-                let sharded = a.files.iter().any(|f| f.dest.contains("-of-"));
-                if sharded {
-                    assert!(
-                        first.contains("-00001-of-"),
-                        "{}/{}: a sharded weights artifact must list shard 1 first, not {first}",
-                        m.id,
-                        a.id
-                    );
-                } else {
-                    assert!(
-                        first.ends_with(".gguf") || first.ends_with(".safetensors"),
-                        "{}/{}: file[0] is what the runner is handed - it must be the \
-                         loadable weights, not {first}",
-                        m.id,
-                        a.id
-                    );
-                }
-            }
-        }
-        // the annotated view the Studio consumes is valid JSON with the fields it needs
-        let v = reg.catalog_annotated();
-        assert!(
-            v["models"]
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(false)
-        );
-        assert!(v["models"][0]["installed"].is_boolean());
-        assert!(v["models"][0]["total_size"].is_number());
-        assert!(
-            v["models"][0]["artifacts"].is_array(),
-            "serialized as `artifacts`, not `artifact`"
-        );
-        assert!(
-            v["models"][0]["artifacts"][0]["installed"].is_boolean(),
-            "piece-level install state"
-        );
-    }
-}
+#[cfg(test)]
+mod backend_tests;
+#[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
+mod flash_next_mlx_tests;
+#[cfg(test)]
+mod flash_next_nvfp4_tests;

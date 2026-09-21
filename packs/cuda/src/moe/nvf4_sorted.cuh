@@ -289,6 +289,305 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_up_relu2_bs_kernel(
 #endif
 }
 
+// ---- sorted-tile NVFP4 gate+up+SwiGLU (the qwen4exp routed pair) ---------
+//
+// The relu2 twin above with a SECOND weight plane and a SwiGLU epilogue.
+// Why it exists: qwen4exp served its NVFP4 routed experts on
+// `pd_q4x_moe_gu_swiglu`, a warp-per-output-row dot4 GEMV taking f32
+// activations - W4A16, no tensor core, unsorted `idx`, row-major planes. That
+// is the weakest class in this file, and it is not what the checkpoint asks
+// for: modelopt's `group_nvfp4_routed_experts` declares `input_activations`
+// 4-bit group 16, i.e. W4A4. The GEMV was paying GEMV cost to deliver MORE
+// precision than the export was quantized for. (The MTP head's experts really
+// are W4A16 - `group_w4a16_nvfp4_mtp_routed_experts` - so that lane keeps the
+// GEMV, which is why this is an election and not a replacement.)
+//
+// Measured before it, serve phase census on a 4-row walk: MoE 34.3% of the
+// walk at ~193 GB/s while the lm_head on the same walk ran ~234 - a dot4 GEMV
+// cannot reach the pipe the mma path does.
+//
+// Geometry is the relu2 kernel's verbatim (BM=32 token columns x 128 output
+// rows, 256 threads, 2-stage cp.async ring, flattened (kt, k64) accumulate
+// order) so the numbers are the same class. Two differences, both forced:
+//   - TWO accumulator sets (gate and up), +16 registers a thread;
+//   - TWO staged weight planes a stage, so the shared budget doubles on the
+//     W side. KB=4 (WROW=80) lands the pair at 4*128*80 + 2*32*80 = 46080 B,
+//     which is EXACTLY the relu2 kernel's KB=8 single-plane budget - so the
+//     occupancy class is unchanged (2 CTAs/SM) and KB=8 is not offered here.
+// The epilogue quantize is the relu2 kernel's, verbatim, only the value
+// differs: `g * sigmoid(g) * u` against `relu(a)^2`, matching
+// pd_q4x_moe_gu_swiglu's math exactly (no bias, no clamp, alpha 1, up_add 0 -
+// "qwen plain silu(g)*u" in pd_bs_gu_epilogue's terms).
+#define PD_NV4M_GU_SMEM(KB) \
+    (4u * 128u * PD_NV4M_WROW(KB) + 2u * PD_NV4M_BM * PD_NV4M_YROW(KB))
+
+// GATE: with SWIGLU=false the epilogue computes relu(gate)^2 and IGNORES the
+// up plane, which is exactly `pd_nvf4_moe_up_relu2_bs_kernel`'s math over the
+// same staging, mma and quantize. A byte-compare of fq/fs against that kernel
+// therefore separates THIS kernel's plumbing from its SwiGLU epilogue - the
+// one question a pipeline-vs-pipeline rel-l2 cannot answer. Production always
+// instantiates true; the bench instantiates both.
+template <uint32_t KB, uint32_t MODE = 1u>   // 0 = relu2(gate), 1 = swiglu, 2 = relu2(up)
+__global__ void __launch_bounds__(256, 2) pd_nvf4_moe_gu_swiglu_bs_kernel(
+    const uint8_t* __restrict__ gdata, const uint8_t* __restrict__ gscale,
+    const float* __restrict__ gscale2, const uint8_t* __restrict__ udata,
+    const uint8_t* __restrict__ uscale, const float* __restrict__ uscale2,
+    const uint32_t* __restrict__ sorted_row,
+    const uint32_t* __restrict__ block_expert, const uint8_t* __restrict__ xq,
+    const uint8_t* __restrict__ xs, uint8_t* __restrict__ fq,
+    uint8_t* __restrict__ fs, uint32_t in_dim, uint32_t ff) {
+#if PD_BS_OK
+    constexpr uint32_t WROW = PD_NV4M_WROW(KB);
+    constexpr uint32_t YROW = PD_NV4M_YROW(KB);
+    const uint32_t blk = blockIdx.x;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t row_base = blockIdx.y * 128u;
+
+    extern __shared__ unsigned char pd_bs_sh[];
+    unsigned char* wg0 = pd_bs_sh;
+    unsigned char* wg1 = wg0 + 128u * WROW;
+    unsigned char* wu0 = wg1 + 128u * WROW;
+    unsigned char* wu1 = wu0 + 128u * WROW;
+    unsigned char* yb0 = wu1 + 128u * WROW;
+    unsigned char* yb1 = yb0 + PD_NV4M_BM * YROW;
+    __shared__ uint32_t tok[PD_NV4M_BM];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t n_kb = in_dim >> 5;
+    const uint32_t n_k16 = in_dim >> 4;
+    const uint32_t nk = (in_dim + KB * 32u - 1u) / (KB * 32u);
+    const size_t wrow0 = (size_t)e * ff + row_base;
+
+    if (tid < PD_NV4M_BM) tok[tid] = sorted_row[(size_t)blk * PD_NV4M_BM + tid];
+    __syncthreads();
+
+    float accg[4][4] = {};
+    float accu[4][4] = {};
+
+    // one plane's packed rows for chunk `kt` (the relu2 kernel's ISSUE_W with
+    // the plane as a parameter - both planes share every index)
+    #define PD_GU_ISSUE_W(dst, src, kt)                                           \
+        for (uint32_t u = tid; u < 128u * KB; u += 256u) {                        \
+            const uint32_t row = u / KB, seg = u % KB;                            \
+            const bool ok = (row_base + row) < ff && (kt) * KB + seg < n_kb;      \
+            pd_cp_async16((int*)((dst) + row * WROW + seg * 16u),                 \
+                          (src) + (wrow0 + row) * (size_t)(in_dim >> 1) +         \
+                              (kt) * (KB * 16u) + seg * 16u,                      \
+                          ok);                                                    \
+        }
+    #define PD_GU_ISSUE_Y(dst, kt)                                                \
+        for (uint32_t u = tid; u < PD_NV4M_BM * KB; u += 256u) {                  \
+            const uint32_t col = u / KB, seg = u % KB;                            \
+            const uint32_t r = tok[col];                                          \
+            const bool ok = r != PD_MOE_PAD && (kt) * KB + seg < n_kb;            \
+            pd_cp_async16((int*)((dst) + col * YROW + 16u + seg * 16u),           \
+                          xq + ((size_t)(ok ? r : 0u) * in_dim >> 1) +            \
+                              (kt) * (KB * 16u) + seg * 16u,                      \
+                          ok);                                                    \
+        }
+
+    PD_GU_ISSUE_W(wg0, gdata, 0u)
+    PD_GU_ISSUE_W(wu0, udata, 0u)
+    PD_GU_ISSUE_Y(yb0, 0u)
+    asm volatile("cp.async.commit_group;");
+    for (uint32_t kt = 0; kt < nk; ++kt) {
+        unsigned char* tg = (kt & 1u) ? wg1 : wg0;
+        unsigned char* tu = (kt & 1u) ? wu1 : wu0;
+        unsigned char* ty = (kt & 1u) ? yb1 : yb0;
+        if (kt + 1u < nk) {
+            PD_GU_ISSUE_W((kt & 1u) ? wg0 : wg1, gdata, kt + 1u)
+            PD_GU_ISSUE_W((kt & 1u) ? wu0 : wu1, udata, kt + 1u)
+            PD_GU_ISSUE_Y((kt & 1u) ? yb0 : yb1, kt + 1u)
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        // e4m3 scale planes, both weights and the activation - plain global
+        // loads like the relu2 kernel's !sfold arm (the SFOLD ring variant is
+        // not offered here: the gu pair already spends its stage budget on the
+        // second plane, so there is no spare ring capacity to fold into)
+        for (uint32_t u = tid; u < 128u * KB * 2u; u += 256u) {
+            const uint32_t row = u / (KB * 2u), kb16 = u % (KB * 2u);
+            const bool wok = (row_base + row) < ff && kt * (KB * 2u) + kb16 < n_k16;
+            const size_t so = (wrow0 + row) * (size_t)n_k16 + kt * (KB * 2u) + kb16;
+            tg[row * WROW + KB * 16u + kb16] = wok ? gscale[so] : 0u;
+            tu[row * WROW + KB * 16u + kb16] = wok ? uscale[so] : 0u;
+        }
+        for (uint32_t u = tid; u < PD_NV4M_BM * KB * 2u; u += 256u) {
+            const uint32_t row = u / (KB * 2u), kb16 = u % (KB * 2u);
+            const uint32_t r = tok[row];
+            const bool yok = r != PD_MOE_PAD && kt * (KB * 2u) + kb16 < n_k16;
+            ty[row * YROW + kb16] =
+                yok ? xs[(size_t)r * n_k16 + kt * (KB * 2u) + kb16] : 0u;
+        }
+        __syncthreads();
+
+        uint32_t amg[2][KB / 2u][4], amu[2][KB / 2u][4];
+        uint32_t sag[2][KB / 2u], sau[2][KB / 2u];
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = i0 + n * 16u + g;
+            const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+            const uint32_t wo =
+                (i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u)) * WROW;
+            #pragma unroll
+            for (uint32_t k64 = 0; k64 < KB / 2u; ++k64) {
+                pd_ldm_x4(amg[n][k64], tg + wo + k64 * 32u + (lane >> 4) * 16u);
+                pd_ldm_x4(amu[n][k64], tu + wo + k64 * 32u + (lane >> 4) * 16u);
+                sag[n][k64] = *(const uint32_t*)(tg + rs * WROW + KB * 16u + k64 * 4u);
+                sau[n][k64] = *(const uint32_t*)(tu + rs * WROW + KB * 16u + k64 * 4u);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < PD_NV4M_BM; j0 += 16u) {
+            uint32_t bm[2u * (KB / 2u)];
+            #pragma unroll
+            for (uint32_t q = 0; q < KB / 4u; ++q)
+                pd_ldm_x4(bm + q * 4u, ty + (j0 + joff + (lane & 7u)) * YROW + 16u +
+                                           q * 64u + (lane >> 3) * 16u);
+            const unsigned char* ysr = ty + (j0 + joff + g) * YROW;
+            #pragma unroll
+            for (uint32_t k64 = 0; k64 < KB / 2u; ++k64) {
+                const uint32_t sb = *(const uint32_t*)(ysr + k64 * 4u);
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    pd_nv4_mma(accg[(j0 >> 3) + n], amg[n][k64][0], amg[n][k64][1],
+                               amg[n][k64][2], amg[n][k64][3], bm[k64 * 2u],
+                               bm[k64 * 2u + 1u], sag[n][k64], sb);
+                    pd_nv4_mma(accu[(j0 >> 3) + n], amu[n][k64][0], amu[n][k64][1],
+                               amu[n][k64][2], amu[n][k64][3], bm[k64 * 2u],
+                               bm[k64 * 2u + 1u], sau[n][k64], sb);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #undef PD_GU_ISSUE_W
+    #undef PD_GU_ISSUE_Y
+
+    // epilogue: v = silu(g) * u, then the relu2 kernel's nvf4 quantize per 16
+    // ALONG ff, verbatim (same shuffle scheme, same pd_nvf4_scale pick).
+    const float s2g = gscale2[e], s2u = uscale2[e];
+    const uint32_t tmask = 0x11111111u << tq;
+    #pragma unroll
+    for (uint32_t j0 = 0; j0 < PD_NV4M_BM; j0 += 16u) {
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t rb = row_base + i0 + n * 16u;
+            #pragma unroll
+            for (uint32_t qc = 0; qc < 2u; ++qc) {
+                const uint32_t c = j0 + joff + 2u * tq + qc;
+                const bool pad = tok[c] == PD_MOE_PAD;
+                const float g0 = accg[(j0 >> 3) + n][qc] * s2g;
+                const float g1 = accg[(j0 >> 3) + n][qc + 2u] * s2g;
+                const float u0 = accu[(j0 >> 3) + n][qc] * s2u;
+                const float u1 = accu[(j0 >> 3) + n][qc + 2u] * s2u;
+                float v0, v1;
+                if (MODE == 1u) {
+                    v0 = pad ? 0.0f : g0 * (1.0f / (1.0f + __expf(-g0))) * u0;
+                    v1 = pad ? 0.0f : g1 * (1.0f / (1.0f + __expf(-g1))) * u1;
+                } else {
+                    // the relu2 twin's epilogue verbatim, on ONE plane: mode 0
+                    // exercises accg, mode 2 exercises accu. The plumbing gate
+                    // at mode 0 passed byte-identical while never touching
+                    // accu at all, so mode 2 is what isolates the up half.
+                    const float x0 = (MODE == 0u) ? g0 : u0;
+                    const float x1 = (MODE == 0u) ? g1 : u1;
+                    const float r0 = fmaxf(x0, 0.0f), r1 = fmaxf(x1, 0.0f);
+                    v0 = pad ? 0.0f : r0 * r0;
+                    v1 = pad ? 0.0f : r1 * r1;
+                }
+                // SwiGLU is signed, relu^2 is not - the twin takes the raw
+                // max, so match it exactly under the gate
+                float a = (MODE == 1u) ? fmaxf(fabsf(v0), fabsf(v1)) : fmaxf(v0, v1);
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 4));
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 8));
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 16));
+                float inv;
+                const unsigned sbyte = pd_nvf4_scale(a, &inv);
+                const uint32_t n0 = pd_e2m1_rn(v0 * inv);
+                const uint32_t n1 = pd_e2m1_rn(v1 * inv);
+                const uint32_t m = (g & 3u) * 2u;
+                const uint32_t lo0 = __shfl_sync(0xffffffffu, n0, m * 4u + tq);
+                const uint32_t hi0 = __shfl_sync(0xffffffffu, n0, (m + 1u) * 4u + tq);
+                const uint32_t lo1 = __shfl_sync(0xffffffffu, n1, m * 4u + tq);
+                const uint32_t hi1 = __shfl_sync(0xffffffffu, n1, (m + 1u) * 4u + tq);
+                const uint32_t lo = (g < 4u) ? lo0 : lo1;
+                const uint32_t hi = (g < 4u) ? hi0 : hi1;
+                if (rb < ff) {
+                    const size_t srow = (size_t)blk * PD_NV4M_BM + c;
+                    fq[srow * (ff >> 1) + (rb >> 1) + g] =
+                        (unsigned char)(lo | (hi << 4));
+                    if (g == 0)
+                        fs[srow * (ff >> 4) + (rb >> 4)] = (unsigned char)sbyte;
+                }
+            }
+        }
+    }
+#else
+    (void)gdata; (void)gscale; (void)gscale2; (void)udata; (void)uscale;
+    (void)uscale2; (void)sorted_row; (void)block_expert; (void)xq; (void)xs;
+    (void)fq; (void)fs; (void)in_dim; (void)ff;
+#endif
+}
+
+#ifdef PD_BS_HOST
+// defined below with the relu2 twin's election - declared here because this
+// launcher sits above it in the file
+static bool pd_nv4t_arm();
+#endif
+
+PD_EXPORT
+int pd_nvf4_moe_gu_swiglu_bs(const void* gdata, const void* gscale,
+                             const void* gscale2, const void* udata,
+                             const void* uscale, const void* uscale2,
+                             const void* sorted_row, const void* block_expert,
+                             const void* xq, const void* xs, void* fq, void* fs,
+                             uint32_t in_dim, uint32_t ff, uint32_t nblocks,
+                             void* stream) {
+// PD_BS_HOST, not PD_BS_OK: the latter is the DEVICE arch guard and is false
+// while the host half of this TU compiles, so guarding the launcher with it
+// makes every call return cudaErrorNotSupported on a die that supports the
+// kernel perfectly well. Measured the hard way - the first serve A/B of this
+// pair failed every rep with CUDA 801 and the kernel never ran once.
+#ifndef PD_BS_HOST
+    (void)gdata; (void)gscale; (void)gscale2; (void)udata; (void)uscale;
+    (void)uscale2; (void)sorted_row; (void)block_expert; (void)xq; (void)xs;
+    (void)fq; (void)fs; (void)in_dim; (void)ff; (void)nblocks; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (nblocks == 0 || ff == 0) return 0;
+    // ARM: packed-fp4 tensor core only. The relu2 twin answers a die without
+    // one by falling back to its weight-only bf16 tile arm; this pair has no
+    // such twin, so it REFUSES rather than issue an mma that raises
+    // illegal-instruction there. cc12-only as a set, the same law the _st
+    // family carries - the caller keeps the W4A16 GEMV on every other die.
+    if (pd_nv4t_arm()) return cudaErrorNotSupported;
+    // the mma path needs whole 32-element K blocks and the epilogue whole
+    // 16-row ff blocks; anything else belongs on the GEMV
+    if ((in_dim & 31u) != 0 || (ff & 15u) != 0) return cudaErrorInvalidValue;
+    constexpr uint32_t KB = 4u;   // see PD_NV4M_GU_SMEM: two planes at KB=8 would
+                                  // halve occupancy for no extra reuse
+    const uint32_t smem = PD_NV4M_GU_SMEM(KB);
+    dim3 grid(nblocks, (ff + 127u) / 128u);
+    cudaFuncSetAttribute(pd_nvf4_moe_gu_swiglu_bs_kernel<KB>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    pd_nvf4_moe_gu_swiglu_bs_kernel<KB, 1u><<<grid, 256, smem, (cudaStream_t)stream>>>(
+        (const uint8_t*)gdata, (const uint8_t*)gscale, (const float*)gscale2,
+        (const uint8_t*)udata, (const uint8_t*)uscale, (const float*)uscale2,
+        (const uint32_t*)sorted_row, (const uint32_t*)block_expert,
+        (const uint8_t*)xq, (const uint8_t*)xs, (uint8_t*)fq, (uint8_t*)fs,
+        in_dim, ff);
+    return pd_launch_status();
+#endif
+}
+
 // ---- sm_100 sorted-tile MoE: WEIGHT-ONLY bf16 tensor cores ----------------
 // The datacenter-Blackwell arm of the *_bs pair.
 //

@@ -306,6 +306,12 @@ pub(crate) fn kq_params(ty: GgmlType) -> Option<(u32, usize, usize)> {
         // the nibbles as data and {d, m, qh} per block as the record. Gate on
         // GpuExecutor::has_kquant_flat32.
         GgmlType::Q5_1 => Some((7, 192, 128)),
+        // PrismML's ternary packings (the Bonsai files): two 128-weight blocks
+        // to a super-block, resident at their file size. PTQ1_0's data is the
+        // two qs[24] (48 B) and its record {d0, d1, qh0[2], qh1[2]} - 56 B per
+        // 256 weights, 1.75 bpw. Gate on GpuExecutor::has_kquant_ternary.
+        GgmlType::Ptq1_0 => Some((143, 56, 48)),
+        GgmlType::Pq2_0 => Some((142, 68, 64)),
         _ => None,
     }
 }
@@ -313,7 +319,7 @@ pub(crate) fn kq_params(ty: GgmlType) -> Option<(u32, usize, usize)> {
 /// The repack/kernel layout of a type that can sit in a `RepackedKQ` -
 /// `kq_params` plus Q8_0 as a flat 32-weight block format on the i-quant
 /// lanes (8 x 34 B raw, the int8 bytes as data, one f16 d per block as the
-/// record). Kept apart from `kq_params` on purpose: that function answers
+/// record). Kept apart from `kq_params` deliberately: that function answers
 /// "is this a k-quant-lane type" for every loader's dispatch, and Q8_0 must
 /// keep taking its own repacked-Q8 lanes there. A Q8_0 `RepackedKQ` exists
 /// only where a caller asks for one by name (qwen4exp's mixed expert seat).
@@ -337,7 +343,8 @@ pub(crate) fn kq_flat32(ty: GgmlType) -> bool {
 /// `n_super * kq_scb(ty)` bytes.
 pub(crate) fn kq_scb(ty: GgmlType) -> usize {
     match ty {
-        GgmlType::Iq2Xxs | GgmlType::Iq3Xxs | GgmlType::Iq1S => 4,
+        GgmlType::Iq2Xxs | GgmlType::Iq3Xxs | GgmlType::Iq1S | GgmlType::Pq2_0 => 4,
+        GgmlType::Ptq1_0 => 8,
         GgmlType::Iq3S => 8,
         GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq1M => 12,
         GgmlType::Iq4Nl => 16,
@@ -365,7 +372,15 @@ pub(crate) fn kq_is_iq(ty: GgmlType) -> bool {
             | GgmlType::Q3K
             | GgmlType::Q5_1
             | GgmlType::Q8_0
+            | GgmlType::Ptq1_0
+            | GgmlType::Pq2_0
     )
+}
+
+/// PrismML's ternary packings: i-quant-lane types behind their own pack
+/// capability slot (625), since an older pack's lanes would misread them.
+pub(crate) fn kq_is_ternary(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::Ptq1_0 | GgmlType::Pq2_0)
 }
 
 /// Formats with a per-16 MIN (mu) term - the int8 lanes need the per-16

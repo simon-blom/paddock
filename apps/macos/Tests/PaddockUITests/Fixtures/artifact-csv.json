@@ -1,0 +1,9 @@
+[
+  {"name":"quotes and commas","source":"name,note\r\nAda,\"a,b\"\r\n","rows":[["name","note"],["Ada","a,b"]]},
+  {"name":"multiline and escaped quotes","source":"x,y\n\"first\nsecond\",\"say \"\"hi\"\"\"","rows":[["x","y"],["first\nsecond","say \"hi\""]]},
+  {"name":"unicode","source":"stad,djur\nMalmö,🦊","rows":[["stad","djur"],["Malmö","🦊"]]},
+  {"name":"blank rows and trailing cells","source":"\r\n\"\"\r\na,b,\r\n,\n","rows":[["a","b",""],["",""]]},
+  {"name":"quoted CRLF","source":"h\r\n\"a\r\nb\"\r\n","rows":[["h"],["a\r\nb"]]},
+  {"name":"empty","source":"","rows":[]},
+  {"name":"final empty quoted cell","source":"a,\"\"","rows":[["a",""]]}
+]

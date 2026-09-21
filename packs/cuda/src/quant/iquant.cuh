@@ -32,6 +32,21 @@
 //   IQ1_S    48: qs[32] @0, qh u16[8] @32                      rec: d
 //   IQ1_M    48: qs[32] @0, qh[16] @32                         rec: d (from scales) @0, scales u16[4] @2
 //   IQ4_NL  128: 8 x qs[16] (per 32-weight block)             rec: d[8] f16 @0
+//   PTQ1_0   48: b0.qs[0..16] @0, b1.qs[0..16] @16,
+//                b0.qs[16..24] @32, b1.qs[16..24] @40          rec: d0, d1 @0, qh0[2] @4, qh1[2] @6
+//   PQ2_0    64: b0.qs[32] @0, b1.qs[32] @32                   rec: d0, d1 @0
+//
+// The last two are PrismML's ternary packings (the Bonsai GGUF files; ids
+// 142 / 143, private to their llama.cpp fork): 128-weight blocks of
+// {-1, 0, +1} under one f16 scale, two to a super-block. Both stay at their
+// file size - PTQ1_0's 56 B per 256 weights is 1.75 bpw resident. PTQ1_0
+// packs five trits a byte as a base-3 fraction of 256 (ggml TQ1_0's codec):
+// trit n of byte b is the high byte of ((b * 3^n) & 0xFF) * 3, and element
+// n*16 + m is trit n of qs[m], 80 + n*8 + m trit n of qs[16 + m],
+// 120 + n*2 + h trit n of qh[h] - so a 16-weight window is ONE trit
+// position of 16 neighbouring bytes, one aligned load. The repack only moves
+// the two 8-byte tails behind the two 16-byte heads so all three loads of a
+// super-block are 16-aligned; no trit is re-encoded.
 //
 // The dense lanes (quant/iquant_dense.cuh) read the same streams through
 // the same window unpack; the k-quant exports dispatch i-quant types there.
@@ -63,6 +78,9 @@
 // the file.
 #define PD_KQ_Q51_ID 7u
 #define PD_KQ_Q80_ID 8u
+// PrismML ternary, 128-weight blocks (see the layout note above)
+#define PD_KQ_PQ2_ID 142u
+#define PD_KQ_PTQ1_ID 143u
 
 #define PD_IQ1S_DELTA 0.125f
 
@@ -71,7 +89,8 @@ __host__ __device__ constexpr bool pd_kq_valid_iq(uint32_t dt) {
            dt == PD_KQ_IQ3XXS || dt == PD_KQ_IQ3S || dt == PD_KQ_IQ1S ||
            dt == PD_KQ_IQ1M || dt == PD_KQ_IQ4NL_ID ||
            dt == PD_KQ_Q2K_ID || dt == PD_KQ_Q3K_ID ||
-           dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID;
+           dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID ||
+           dt == PD_KQ_PQ2_ID || dt == PD_KQ_PTQ1_ID;
 }
 
 // 32-weight block formats whose rows lie flat (no whole-super-block rule):
@@ -94,6 +113,8 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_srcb(uint32_t dt) {
         case PD_KQ_Q3K_ID: return 110u;  // hmask[32] qs[64] scales[12] d
         case PD_KQ_Q51_ID: return 192u;  // 8 x 24
         case PD_KQ_Q80_ID: return 272u;  // 8 x 34
+        case PD_KQ_PQ2_ID: return 68u;   // 2 x {d, qs[32]}
+        case PD_KQ_PTQ1_ID: return 56u;  // 2 x {qs[24], qh[2], d}
         default: return 144u;  // IQ4_NL: 8 x 18
     }
 }
@@ -116,6 +137,8 @@ __host__ __device__ constexpr uint32_t pd_iq_scb(uint32_t dt) {
         case PD_KQ_Q3K_ID: return 24u;  // d + 16 unpacked int8 scales (6-bit, -32 applied)
         case PD_KQ_Q51_ID: return 64u;  // 8 x {f16 d, f16 m, u32 qh}
         case PD_KQ_Q80_ID: return 16u;  // 8 x f16 d
+        case PD_KQ_PQ2_ID: return 4u;   // d0, d1
+        case PD_KQ_PTQ1_ID: return 8u;  // d0, d1 + qh0[2], qh1[2]
         default: return 16u;            // IQ4_NL: 8 x f16 d
     }
 }
@@ -134,6 +157,8 @@ __host__ __device__ constexpr uint32_t pd_iq_datab(uint32_t dt) {
         case PD_KQ_Q3K_ID: return 96u;   // qs[64] + hmask[32]
         case PD_KQ_Q51_ID: return 128u;  // 8 x qs[16]
         case PD_KQ_Q80_ID: return 256u;  // 8 x qs[32]
+        case PD_KQ_PQ2_ID: return 64u;   // 2 x qs[32]
+        case PD_KQ_PTQ1_ID: return 48u;  // 2 x qs[24]
         default: return 128u;
     }
 }
@@ -274,6 +299,22 @@ __device__ __forceinline__ void pd_iq_repack_super(uint32_t dt, const uint8_t* _
                 for (uint32_t i = 0; i < 16u; ++i) d[16u * j + i] = s[o + 8u + i]; // qs
             }
             break;
+        case PD_KQ_PQ2_ID:
+            for (uint32_t b = 0; b < 2u; ++b) {
+                const uint32_t o = b * 34u;
+                rec[2u * b] = s[o]; rec[2u * b + 1u] = s[o + 1u];
+                for (uint32_t i = 0; i < 32u; ++i) d[32u * b + i] = s[o + 2u + i];
+            }
+            break;
+        case PD_KQ_PTQ1_ID:
+            for (uint32_t b = 0; b < 2u; ++b) {
+                const uint32_t o = b * 28u;
+                for (uint32_t i = 0; i < 16u; ++i) d[16u * b + i] = s[o + i];          // qs head
+                for (uint32_t i = 0; i < 8u; ++i) d[32u + 8u * b + i] = s[o + 16u + i]; // qs tail
+                rec[4u + 2u * b] = s[o + 24u]; rec[5u + 2u * b] = s[o + 25u];         // qh
+                rec[2u * b] = s[o + 26u]; rec[2u * b + 1u] = s[o + 27u];              // d
+            }
+            break;
         case PD_KQ_Q80_ID:
             for (uint32_t j = 0; j < 8u; ++j) {
                 const uint32_t o = j * 34u;
@@ -330,6 +371,31 @@ __device__ __forceinline__ int pd_iq_pack_signed32(uint32_t grid, uint32_t signs
 __device__ __forceinline__ int pd_iq1_pack(uint32_t word, bool neg) {
     const uint32_t g8 = (word << 3u) & 0xF8F8F8F8u;
     return (int)__vadd4(g8, neg ? 0xFFFFFFFFu : 0x01010101u);
+}
+
+// ---- PrismML ternary: the base-3 digit and the 2-bit slot, 4 bytes wide ----
+// Trit n of four packed bytes at once. The bytes are widened to 16-bit lanes
+// so neither multiply can carry into a neighbour (255 * 81 < 2^16): times
+// 3^n and the low byte kept is the fraction with n digits shifted out, times
+// 3 again and the HIGH byte is the digit. The high bytes are gathered back
+// into one word and offset by -1, which is the s8 weight the dp4a wants.
+__device__ __forceinline__ int pd_trit_digit4(uint32_t bytes4, uint32_t pow3) {
+    const uint32_t lo = (__byte_perm(bytes4, 0u, 0x4140u) * pow3) & 0x00FF00FFu;
+    const uint32_t hi = (__byte_perm(bytes4, 0u, 0x4342u) * pow3) & 0x00FF00FFu;
+    return (int)__vsub4(__byte_perm(lo * 3u, hi * 3u, 0x7531u), 0x01010101u);
+}
+__host__ __device__ constexpr uint32_t pd_trit_pow3(uint32_t n) {
+    return n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u;
+}
+// The four 2-bit slots of one byte as four s8 weights (slot - 1; slot 3 is
+// the codec's +2, which a ternary checkpoint never writes). The slot picks
+// its value out of a 4-entry byte table held in both permute operands, so the
+// select's third bit is a don't-care and a nibble can carry two slots.
+__device__ __forceinline__ void pd_slot2_unpack8(uint32_t q16, int* w0, int* w1) {
+    const uint32_t ev = __byte_perm(0x020100FFu, 0x020100FFu, q16);
+    const uint32_t od = __byte_perm(0x020100FFu, 0x020100FFu, q16 >> 2u);
+    *w0 = (int)__byte_perm(ev, od, 0x5140u);
+    *w1 = (int)__byte_perm(ev, od, 0x7362u);
 }
 
 // The codebooks one format reads. The window unpack takes them through this
@@ -568,6 +634,56 @@ __device__ __forceinline__ void pd_iq_win_unpack_t(uint32_t dt, const uint8_t* _
                 }
                 wq[v] = out;
             }
+            break;
+        }
+        case PD_KQ_PQ2_ID: {
+            // window w = block w >> 3, its 4 bytes (16 slots) number w & 7
+            const uint32_t b = w >> 3u;
+            *f = pd_iq_f16a(rec + 2u * b);
+            const uint32_t q = pd_iq_u32a(sb + 32u * b + 4u * (w & 7u));
+            pd_slot2_unpack8(q & 0xFFFFu, &wq[0], &wq[1]);
+            pd_slot2_unpack8(q >> 16u, &wq[2], &wq[3]);
+            break;
+        }
+        case PD_KQ_PTQ1_ID: {
+            // window w = block b = w >> 3, 16 weights number wi = w & 7 of it:
+            //   wi 0..4  trit wi of the 16 head bytes
+            //   wi 5, 6  trits (0, 1) / (2, 3) of the 8 tail bytes
+            //   wi 7     trit 4 of the tail, then qh's eight
+            const uint32_t b = w >> 3u, wi = w & 7u;
+            *f = pd_iq_f16a(rec + 2u * b);
+            if (wi < 5u) {
+                const uint4 qa = pd_iq_ld16(sb + 16u * b);
+                const uint32_t p = pd_trit_pow3(wi);
+                wq[0] = pd_trit_digit4(qa.x, p);
+                wq[1] = pd_trit_digit4(qa.y, p);
+                wq[2] = pd_trit_digit4(qa.z, p);
+                wq[3] = pd_trit_digit4(qa.w, p);
+                break;
+            }
+            const uint4 ta = pd_iq_ld16(sb + 32u);
+            const uint32_t t0 = b ? ta.z : ta.x, t1 = b ? ta.w : ta.y;
+            if (wi < 7u) {
+                const uint32_t p0 = wi == 5u ? 1u : 9u;
+                wq[0] = pd_trit_digit4(t0, p0);
+                wq[1] = pd_trit_digit4(t1, p0);
+                wq[2] = pd_trit_digit4(t0, 3u * p0);
+                wq[3] = pd_trit_digit4(t1, 3u * p0);
+                break;
+            }
+            wq[0] = pd_trit_digit4(t0, 81u);
+            wq[1] = pd_trit_digit4(t1, 81u);
+            // element 120 + n*2 + h is trit n of qh[h]: the two bytes side by
+            // side with n digits already shifted out, (h0, h1) at n then at
+            // n + 1, and the digit on top of each is the weight. Each byte is
+            // shifted on its own - a product would carry into its neighbour.
+            const uint32_t h0 = rec[4u + 2u * b], h1 = rec[5u + 2u * b];
+            const uint32_t n0 = h0 | (h1 << 8u);
+            const uint32_t n1 = ((h0 * 3u) & 0xFFu) | (((h1 * 3u) & 0xFFu) << 8u);
+            const uint32_t n2 = ((h0 * 9u) & 0xFFu) | (((h1 * 9u) & 0xFFu) << 8u);
+            const uint32_t n3 = ((h0 * 27u) & 0xFFu) | (((h1 * 27u) & 0xFFu) << 8u);
+            wq[2] = pd_trit_digit4(n0 | (n1 << 16u), 1u);
+            wq[3] = pd_trit_digit4(n2 | (n3 << 16u), 1u);
             break;
         }
         case PD_KQ_Q80_ID: {

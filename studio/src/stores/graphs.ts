@@ -13,7 +13,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { attachmentsApi } from '@/lib/api'
-import { useChatStore } from '@/stores/chat'
+import type { Message } from '@/types/chat'
 // Type-only here - the implementation modules arrive via dynamic import in
 // boot(), because this store is reached from the main chunk (useChatStream)
 // and must not pull graphology/sigma/the wasm glue into it.
@@ -69,7 +69,7 @@ export const useGraphsStore = defineStore('graphs', () => {
    * pair; anything else is released first. `bytes` short-circuits the fetch
    * when the caller just uploaded the file and still holds it.
    */
-  function ensure(conv: string, attId: string, attName: string, bytes?: Uint8Array): Promise<void> {
+  function ensure(conv: string, attId: string, attName: string, bytes?: Uint8Array, history: readonly Message[] = []): Promise<void> {
     if (conversationId.value === conv && attachmentId.value === attId && status.value !== 'error') {
       return booting ?? Promise.resolve()
     }
@@ -78,7 +78,7 @@ export const useGraphsStore = defineStore('graphs', () => {
     attachmentId.value = attId
     name.value = attName
     status.value = 'loading'
-    booting = boot(conv, attId, bytes)
+    booting = boot(conv, attId, bytes, history)
       .catch((e) => {
         // A load that dies here is overwhelmingly the will-it-fit wall - the
         // worker ran out of wasm memory parsing the image. Say what the
@@ -94,7 +94,7 @@ export const useGraphsStore = defineStore('graphs', () => {
     return booting
   }
 
-  async function boot(conv: string, attId: string, bytes?: Uint8Array): Promise<void> {
+  async function boot(conv: string, attId: string, bytes?: Uint8Array, history: readonly Message[] = []): Promise<void> {
     const [{ GraphSession }, { GraphBridge, answerModelQuery }] = await Promise.all([
       import('@/lib/graph/session'),
       import('@/lib/graph/bridge'),
@@ -148,10 +148,9 @@ export const useGraphsStore = defineStore('graphs', () => {
     // Restore the model's earlier queries from the conversation's stored
     // tool calls, so returning to a chat keeps its chips - re-run on click,
     // which is exact: the graph is deterministic from the tvdb.
-    const chat = useChatStore()
-    if (chat.active?.id === conv) {
+    if (history.length) {
       const restored: typeof modelRuns.value = []
-      for (const m of chat.active.messages) {
+      for (const m of history) {
         for (const tc of m.toolCalls ?? []) {
           if (tc.serverLabel !== 'graph' || tc.name !== 'graph_query') continue
           try {

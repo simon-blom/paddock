@@ -5,10 +5,12 @@ members = [
     "crates/paddock-bench",
     "crates/paddock-runner",
     "crates/paddock-manager",
+    "crates/paddock-desktop",
     "crates/paddock-models",
     "crates/paddock-tokenizer",
     "crates/paddock-estimator",
     "crates/paddock-engine",
+    "crates/paddock-metal",
     "crates/paddock-kernels",
     "crates/paddock-mcp",
     "crates/paddock-filemeta",
@@ -22,7 +24,8 @@ members = [
 ]
 
 # Dual MIT OR Apache-2.0, the Rust ecosystem's standard pair, and it covers the
-# whole workspace - engine, kernels, runner and the CUDA pack included.
+# whole workspace - engine, kernels, runner, the CUDA and Metal packs and the
+# macOS app included.
 #
 # An earlier decision split the tree into an "open" control plane and a
 # permanently-closed serving edge, enforced by
@@ -30,7 +33,7 @@ members = [
 # Nothing here is reserved.
 #
 # `publish = false` stays, and is about crates.io rather than about openness: a
-# workspace this size is not something to publish 19 crates of by accident, and
+# workspace this size is not something to publish crate by crate by accident, and
 # a git dependency would block it anyway. Publishing is its own later decision.
 [workspace.package]
 version = "0.1.7"

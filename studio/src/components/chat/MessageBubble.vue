@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { providerErrorMessage } from '@/lib/provider-error'
 import { copyText } from '@/lib/clipboard'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
@@ -6,11 +7,12 @@ import type { AudioPart, ContentPart, FilePart, ImagePart, Message } from '@/typ
 import { messageText } from '@/types/chat'
 import { taskLabel } from '@/lib/tasks'
 import { cleanOcrText, htmlTablesToMarkdown, ocrModeLabel } from '@/lib/ocr'
-import { fleetLabel, fleetVendor } from '@/lib/model-name'
+import { fleetLabel, fleetVendor, messageStamp } from '@/lib/model-name'
+import { answerMetrics, answerMetricsHint, tokenLimitNote } from '@/lib/message-presentation'
 import VendorLogo from '@/components/manage/VendorLogo.vue'
 import { clock, srt, vtt } from '@/lib/subtitles'
 import { languageName } from '@/lib/languages'
-import { fmtCost, fmtDuration, fmtFileSize } from '@/lib/format'
+import { fmtDuration, fmtFileSize } from '@/lib/format'
 import { alignClip, alignmentRefused, mergeWordTimes } from '@/lib/align'
 import { attachmentsApi } from '@/lib/api'
 import { useModelsStore } from '@/stores/models'
@@ -113,21 +115,11 @@ const isUser = computed(() => props.message.role === 'user')
 // name when the fleet still knows one (a cloud id like
 // "cloud:...:anthropic/claude-x" is unreadable); the technical id keeps its
 // usual place in the hover.
-const stampId = computed(() =>
-  isUser.value ? '' : (props.message.model ?? props.message.run?.model ?? ''),
-)
-// Same attribution rule as the lane header and the artifact badge - and it has
-// to survive the model being stopped, which a fleet-only lookup did not.
-const stampModel = computed(() => fleetLabel(stampId.value))
-/** Speculation provenance: the run record's snapshot first (what actually
- *  served this turn), the live lane second (old turns predating the field). */
-const stampSpec = computed(
-  () => props.message.run?.spec ?? (stampId.value ? models.specFor(stampId.value) : undefined),
-)
-// Through the same pair the compare lane header uses, deliberately: the
-// artifact panel's pane badges read them too, and three call sites deriving a
-// vendor from an id independently is how they drift apart.
-const stampVendor = computed(() => fleetVendor(stampId.value))
+const stampPresentation = computed(() => messageStamp(props.message))
+const stampId = computed(() => stampPresentation.value.id)
+const stampModel = computed(() => stampPresentation.value.label)
+const stampSpec = computed(() => stampPresentation.value.spec)
+const stampVendor = computed(() => stampPresentation.value.vendor)
 const text = computed(() => messageText(props.message))
 
 // ── HTML preview (table-to-html): SEEING the table beside the original
@@ -327,66 +319,11 @@ const pending = computed(
   () => !!props.message.streaming && text.value.length === 0 && !props.message.reasoning,
 )
 
-// answer metrics row: tokens · tok/s · TOTAL time. The time is send->done -
-// what the user actually waited - never just the streaming phase: a cloud
-// lane that sat 2s before its first token must not read as the faster one
-// tok/s keeps telling the pure streaming story.
-const answerMeta = computed(() => {
-  const u = props.message.usage
-  // Tokens are not the only currency. A speech model bills by the SECOND and
-  // reports no token counts at all, so keying the whole row on
-  // `completionTokens` hid the one number that mattered - the money - on
-  // exactly the lanes that charge for it (a cloud transcribe
-  // turn showed nothing while its $0.00014 sat in the ledger). Show the row
-  // when we know something about what the turn consumed; time alone is not
-  // that, and still stays quiet.
-  if (!u || (!u.completionTokens && u.costUsd === undefined && !realtime.value)) return ''
-  const parts: string[] = []
-  if (u.completionTokens) parts.push(`${u.completionTokens} tokens`)
-  // On a transcription, speed against the CLIP replaces tok/s outright - see
-  // `realtime` for why tok/s measures the wrong thing there. Chat keeps tok/s,
-  // where the model's own output rate is exactly the question.
-  if (!realtime.value && u.tps) parts.push(`${Math.round(u.tps)} tok/s`)
-  const t = u.ms ?? u.answerMs
-  if (t) {
-    // Attached to the time, not standing beside it. They are one fact - the
-    // multiplier is just that duration read against the clip - and listing
-    // them as peers made the row read as two competing speeds
-    // ("feel disoriented").
-    const r = realtime.value
-    const rt = r ? ` (${r >= 10 ? Math.round(r) : r.toFixed(1)}× realtime)` : ''
-    parts.push(`${fmtDuration(t)}${rt}`)
-  }
-  // what the turn actually cost, when the provider says (OpenRouter does;
-  // tool turns carry the whole loop's sum)
-  if (u.costUsd !== undefined) parts.push(fmtCost(u.costUsd))
-  return parts.join(' · ')
-})
-// The cut note does the arithmetic the reader would otherwise have to:
-// max tokens covers thinking AND answer together, so a lane that thought
-// 3596 tokens into a 4096 cap "hit the limit" at a 500-token reply - which
-// reads as impossible unless the note says where the budget went.
-const cutNote = computed(() => {
-  const u = props.message.usage
-  const rt = u?.reasoningTokens ?? 0
-  if (!rt || !u?.completionTokens) return 'Reply hit the max-token limit.'
-  const cap = rt + u.completionTokens
-  return `Reply hit the ${cap}-token limit: thinking used ${rt} of it.`
-})
-
-/** hover breakdown for the total: where the time went, and who served it
- *  (routed cloud requests land on different hosts with different behavior -
- *  the :free gemma thought on one host and not the other). */
-const answerMetaTip = computed(() => {
-  const u = props.message.usage
-  if (!u?.ms) return undefined
-  const bits = ['Total time from send to done']
-  if (u.ttftMs) bits.push(`${fmtDuration(u.ttftMs)} to the first token`)
-  if (u.reasoningMs) bits.push(`${fmtDuration(u.reasoningMs)} thinking`)
-  if (u.answerMs) bits.push(`${fmtDuration(u.answerMs)} writing the answer`)
-  if (u.provider) bits.push(`served by ${u.provider}`)
-  return bits.join(' · ')
-})
+// Shared with the native message footer: answer speed, total send-to-done
+// latency, provider cost and reasoning-aware output-limit explanation.
+const answerMeta = computed(() => answerMetrics(props.message.usage, realtime.value))
+const cutNote = computed(() => tokenLimitNote(props.message.usage))
+const answerMetaTip = computed(() => answerMetricsHint(props.message.usage) || undefined)
 
 // The three-dot "typing" pill only appears after a short delay, so a fast reply
 // never flashes it (Ollama does the same to avoid flicker).
@@ -955,9 +892,9 @@ onBeforeUnmount(() => clearTimeout(dotTimer))
         v-if="message.reasoning"
         :reasoning="message.reasoning"
         :active="reasoningActive"
-        :ms="message.usage?.reasoningMs"
+        :ms="undefined"
         :tokens="message.usage?.reasoningTokens"
-        :tps="message.usage?.reasoningTps"
+        :tps="undefined"
       />
 
       <div v-if="message.webSearches?.length || message.toolCalls?.length" class="msg__tools">
@@ -1099,7 +1036,7 @@ onBeforeUnmount(() => clearTimeout(dotTimer))
         <div v-else-if="showDots" class="msg__typing"><span /><span /><span /></div>
         <div v-if="message.error" class="msg__error">
           <Icon name="x" :size="14" />
-          <span class="msg__error-text">{{ message.error }}</span>
+          <span class="msg__error-text">{{ providerErrorMessage(message.error) }}</span>
         </div>
         <div v-if="message.stopped && !text" class="msg__stopped">Stopped</div>
         <div v-if="message.incomplete === 'length' && !message.streaming" class="msg__cut">

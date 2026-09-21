@@ -38,6 +38,17 @@ impl GpuQwen35 {
     /// `commit_chunk` rolls state to the accepted row. Emits logits + h for every
     /// row (`spec.d_logits_chunk` / `d_h_chunk`).
     fn forward_chunk(&mut self, tokens: &[u32]) -> Result<(), GpuModelError> {
+        // this walk has no rotating sites (rotation.rs); the loader and
+        // attach_dflash keep a rotated-basis model from ever getting a
+        // drafter, and this keeps a future caller from finding out the
+        // hard way
+        if self.rot.is_some() {
+            return Err(GpuModelError::Unsupported(
+                "rotated-basis file (prism.hadamard.*): the speculative verify walk does \
+                 not rotate its inputs"
+                    .into(),
+            ));
+        }
         let r = tokens.len();
         assert!(
             r > 0 && r <= SPEC_ROWS,
@@ -70,6 +81,7 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         // e4m3 dense-FFN twins. This WALK had no f8 ARM at all, and the Q8_0
         // reclaim stubs exactly the planes its `Ffn::Dense` arm
         // reads to 32 bytes -- so on the default build every `--spec auto`
@@ -87,7 +99,7 @@ impl GpuQwen35 {
         let ds = self.decode.as_mut().expect("decode");
         let sp = self.spec.as_mut().expect("spec");
 
-        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r)?;
+        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
 
         for (li, layer) in layers.iter().enumerate() {
             exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, r)?;
@@ -825,6 +837,7 @@ impl GpuQwen35 {
         let (embd, eps) = (self.embd, self.rms_eps);
         let m = self.mtp.as_ref().expect("mtp weights");
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_ref().expect("decode");
         let sp = self.spec.as_mut().expect("spec");
@@ -834,7 +847,7 @@ impl GpuQwen35 {
         } else {
             &sp.d_mtp_tok
         };
-        embed_any(&exec, tok_embd, toks, &mut sp.d_e, embd, r)?;
+        embed_any(&exec, tok_embd, toks, &mut sp.d_e, embd, r, rot)?;
         exec.rmsnorm_batch(&sp.d_e, &m.enorm.buf, &mut sp.d_en, embd, eps, r)?;
         exec.rmsnorm_batch(&sp.d_hin, &m.hnorm.buf, &mut sp.d_hn, embd, eps, r)?;
         for i in 0..r {
@@ -1358,9 +1371,10 @@ impl GpuQwen35 {
         let (embd, eps) = (self.embd, self.rms_eps);
         let m = self.mtp.as_ref().expect("mtp weights");
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let sb = self.spec_batch.as_mut().expect("spec batch");
-        embed_any(&exec, tok_embd, &sb.d_mtp_tok, &mut sb.d_e, embd, r)?;
+        embed_any(&exec, tok_embd, &sb.d_mtp_tok, &mut sb.d_e, embd, r, rot)?;
         exec.rmsnorm_batch(&sb.d_e, &m.enorm.buf, &mut sb.d_en, embd, eps, r)?;
         exec.rmsnorm_batch(&sb.d_hin, &m.hnorm.buf, &mut sb.d_hn, embd, eps, r)?;
         for i in 0..r {
@@ -2156,6 +2170,17 @@ impl GpuQwen35 {
     /// backbone with per-slot KV/conv/state routing, snapshots for the ragged
     /// commit, then row logits + device argmax picks.
     fn record_spec_verify(&mut self) -> Result<(), GpuModelError> {
+        // this walk has no rotating sites (rotation.rs); the loader and
+        // attach_dflash keep a rotated-basis model from ever getting a
+        // drafter, and this keeps a future caller from finding out the
+        // hard way
+        if self.rot.is_some() {
+            return Err(GpuModelError::Unsupported(
+                "rotated-basis file (prism.hadamard.*): the speculative verify walk does \
+                 not rotate its inputs"
+                    .into(),
+            ));
+        }
         let exec = self.exec.clone();
         let (b, k1) = {
             let sb = self.spec_batch.as_ref().expect("spec batch");
@@ -2178,6 +2203,7 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         // f8 class mirror: the verify decides the EMITTED stream, so it must
         // run the same numeric class the dense decode path serves at this
         // width (the Q8 twin of the nvfp4 flip below) - and the f8d lane is
@@ -2215,7 +2241,7 @@ impl GpuQwen35 {
             .as_mut()
             .filter(|d| d.state.is_some() && !super::dflash::fuse_off());
 
-        embed_any(&exec, tok_embd, &sb.d_mtp_tok, &mut sc.d_x, embd, r)?;
+        embed_any(&exec, tok_embd, &sb.d_mtp_tok, &mut sc.d_x, embd, r, rot)?;
 
         for (li, layer) in layers.iter().enumerate() {
             if let Some(df) = dtap.as_mut()

@@ -2,6 +2,20 @@
 var activeEffect = null;
 var batchDepth = 0;
 var batchQueue = /* @__PURE__ */ new Set();
+var dependencies = /* @__PURE__ */ new WeakMap();
+function track(subs, fn) {
+  subs.add(fn);
+  let sources = dependencies.get(fn);
+  if (!sources) {
+    sources = /* @__PURE__ */ new Set();
+    dependencies.set(fn, sources);
+  }
+  sources.add(subs);
+}
+function untrack(fn) {
+  for (const source of dependencies.get(fn) ?? []) source.delete(fn);
+  dependencies.delete(fn);
+}
 function signal(initial) {
   let value = initial;
   const subs = /* @__PURE__ */ new Set();
@@ -9,7 +23,7 @@ function signal(initial) {
     get value() {
       if (activeEffect !== null) {
         const eff = activeEffect;
-        subs.add(eff);
+        track(subs, eff);
       }
       return value;
     },
@@ -52,6 +66,7 @@ function computed(fn) {
     }
   };
   function recompute() {
+    untrack(tracker);
     const prevEffect = activeEffect;
     activeEffect = tracker;
     try {
@@ -65,7 +80,7 @@ function computed(fn) {
     get value() {
       if (activeEffect !== null) {
         const eff = activeEffect;
-        subs.add(eff);
+        track(subs, eff);
       }
       if (dirty) recompute();
       return value;
@@ -80,6 +95,10 @@ function computed(fn) {
       return () => {
         subs.delete(fn2);
       };
+    },
+    [Symbol.dispose]() {
+      untrack(tracker);
+      subs.clear();
     }
   };
   return self;
@@ -89,6 +108,7 @@ function effect(fn) {
   let disposed = false;
   function run() {
     if (disposed) return;
+    untrack(run);
     if (typeof cleanup === "function") cleanup();
     const prevEffect = activeEffect;
     activeEffect = run;
@@ -100,7 +120,9 @@ function effect(fn) {
   }
   run();
   return () => {
+    if (disposed) return;
     disposed = true;
+    untrack(run);
     if (typeof cleanup === "function") cleanup();
   };
 }
@@ -114,7 +136,7 @@ function batch(fn) {
       const queued = [...batchQueue];
       batchQueue.clear();
       for (const subs of queued) {
-        for (const sub of subs) {
+        for (const sub of [...subs]) {
           sub(void 0);
         }
       }
@@ -132,3 +154,4 @@ export {
   effect,
   signal
 };
+//# sourceMappingURL=index.js.map

@@ -6,16 +6,15 @@
 // property card. A theme flip re-creates the renderer - the WebGL canvas
 // bakes colors in, so a full re-init is the correct move, not a workaround.
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { budgetGraphCanvases, disposeGraphRenderer } from '@/lib/graph/canvas-budget'
+import { createHoverRefresh } from '@/lib/graph/hover-refresh'
 import Graph from 'graphology'
 import Sigma from 'sigma'
-import { EdgeArrowProgram } from 'sigma/rendering'
+import { EdgeArrowProgram, drawDiscNodeLabel } from 'sigma/rendering'
 import Icon from '@/components/Icon.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
-import forceAtlas2 from 'graphology-layout-forceatlas2'
-import FA2Layout from 'graphology-layout-forceatlas2/worker'
-import noverlap from 'graphology-layout-noverlap'
+import { LayoutController, type LayoutStats } from '../../../../vendor/traverse/layout/index.js'
 import { downloadAsPNG } from '@sigma/export-image'
-import { D3ForceLayoutController } from '@/lib/graph/force-layout'
 import NodeHexagonProgram from '@/lib/graph/node-hexagon'
 import NodePulseProgram from '@/lib/graph/node-pulse'
 import { GRAPH_COLORS_LIGHT, fadeColor, graphColors } from '@/lib/graph/session'
@@ -25,6 +24,8 @@ const props = defineProps<{
   dark: boolean
   /** names the exported PNG; '' falls back to "graph". */
   exportName?: string
+  /** Optional lab instrumentation; inclusive CPU spans, never GPU timestamps. */
+  trace?: (stage: string, started: number) => void
 }>()
 const emit = defineEmits<{
   /** double-click on a node: the caller expands its neighborhood. */
@@ -33,6 +34,8 @@ const emit = defineEmits<{
 
 const host = ref<HTMLElement | null>(null)
 let sigma: Sigma | null = null
+let invalidateAppearance: (() => void) | null = null
+let pulseGraph: Graph | null = null
 const hovered = ref<string | null>(null)
 let highlightNodes = new Set<string>()
 let highlightEdges = new Set<string>()
@@ -65,15 +68,13 @@ function startPulse(): void {
       return // frozen: the emphasis styling stays, the clock stops
     }
     pulseRaf = requestAnimationFrame(tick)
-    // Half-rate, repaint-only: a bare refresh() re-runs the whole data
-    // pipeline (indexation, label grid) and this loop runs for as long as
-    // anything is emphasized - a full reprocess 60x/s pinned a core (seen in
-    // Chrome's task manager). The ripple only needs the clock to
-    // advance and a redraw.
+    // Only a shader uniform changes. refresh({skipIndexation:true}) without
+    // partialGraph still rebuilds Sigma 3's entire index; scheduleRender is
+    // its public redraw-only API and coalesces with pending graph renders.
     odd = !odd
     if (odd) return
     NodePulseProgram.currentTime = performance.now() / 1000 - start
-    sigma?.refresh({ skipIndexation: true })
+    sigma?.scheduleRender()
   }
   pulseRaf = requestAnimationFrame(tick)
 }
@@ -93,110 +94,64 @@ function syncPulse(): void {
   else stopPulse()
 }
 
-// ── layout: traverse's default, ported faithfully - ForceAtlas2 in its own
-// web worker, animating the scatter into place with convergence detection
-// and a hard 5 s cap; labels hidden while it runs, noverlap cleanup after.
-let fa2: InstanceType<typeof FA2Layout> | null = null
-let fa2Check: ReturnType<typeof setInterval> | null = null
-let d3ctl: D3ForceLayoutController | null = null
-
-/** ForceAtlas2 by default, d3-force on the toggle - the same pair traverse
- *  studio switches between. */
+// Shared, disposable worker layout. A theme remount reuses completed positions;
+// explicit re-layout still recomputes. Query execution owns a different worker.
+let layout: LayoutController | null = null
 const layoutKind = ref<'fa2' | 'd3'>('fa2')
+const layoutError = ref('')
+const layoutStats = ref<LayoutStats | null>(null)
+const completedLayouts = new WeakMap<Graph, LayoutStats>()
+const topologyEvents = ['nodeAdded', 'nodeDropped', 'edgeAdded', 'edgeDropped', 'cleared'] as const
+function invalidateLayoutCache(): void {
+  if (pulseGraph) completedLayouts.delete(pulseGraph)
+}
+function detachGraphListeners(): void {
+  pulseGraph?.removeListener('nodeAttributesUpdated', scheduleSyncPulse)
+  for (const event of topologyEvents) pulseGraph?.removeListener(event, invalidateLayoutCache)
+  pulseGraph = null
+}
 
 function stopLayout(): void {
-  if (fa2Check) {
-    clearInterval(fa2Check)
-    fa2Check = null
-  }
-  fa2?.kill()
-  fa2 = null
-  d3ctl?.kill()
-  d3ctl = null
-}
-
-function layoutDone(graph: Graph, s: Sigma): void {
+  layout?.kill()
+  layout = null
   animating = false
-  noverlap.assign(graph, 120)
-  s.setSetting('renderLabels', true)
-  s.getCamera().animatedReset({ duration: 300 })
 }
-
 function animateLayout(graph: Graph, s: Sigma): void {
   stopLayout()
+  completedLayouts.delete(graph)
   animating = true
-  s.setSetting('renderLabels', false)
-
-  if (layoutKind.value === 'd3') {
-    // Faithful port of upstream startD3ForceLayout: the animated controller
-    // ticks against the live sigma until convergence or the 5 s cap.
-    const ctl = new D3ForceLayoutController(graph, s)
-    d3ctl = ctl
-    ctl.start({
-      maxRuntime: 5000,
-      onEnd: () => {
-        if (d3ctl === ctl) d3ctl = null
-        layoutDone(graph, s)
-      },
-    })
-    return
-  }
-
-  const inferred = forceAtlas2.inferSettings(graph)
-  const layout = new FA2Layout(graph, {
-    settings: {
-      ...inferred,
-      barnesHutOptimize: graph.order > 100,
-      barnesHutTheta: 0.5,
-      adjustSizes: true,
-      gravity: 1,
-      scalingRatio: (inferred.scalingRatio || 1) * 10,
-      strongGravityMode: true,
-      outboundAttractionDistribution: true,
+  layoutError.value = ''
+  layoutStats.value = null
+  s.scheduleRender()
+  const ctl = new LayoutController(graph, {
+    onCancel: () => {
+      if (layout !== ctl) return
+      animating = false
+      s.scheduleRender()
+    },
+    kind: layoutKind.value,
+    onProgress: stats => { if (layout === ctl) layoutStats.value = stats },
+    onComplete: stats => {
+      if (layout !== ctl) return
+      layoutStats.value = stats
+      completedLayouts.set(graph, stats)
+      animating = false
+      s.scheduleRender()
+      s.getCamera().animatedReset({ duration: 300 })
+    },
+    onError: error => {
+      if (layout !== ctl) return
+      layoutError.value = error.message
+      animating = false
+      s.scheduleRender()
     },
   })
-  fa2 = layout
-  layout.start()
-
-  const startTime = performance.now()
-  // Sample up to 100 nodes for the convergence check, like upstream - the
-  // check must not cost more than the layout.
-  const sample: string[] = []
-  graph.forEachNode((n) => {
-    if (sample.length < 100) sample.push(n)
-  })
-  const prev = new Map<string, { x: number; y: number }>()
-  sample.forEach((n) => {
-    const a = graph.getNodeAttributes(n)
-    prev.set(n, { x: a.x as number, y: a.y as number })
-  })
-  let stable = 0
-
-  const finish = (): void => {
+  layout = ctl
+  try { ctl.start() } catch (error) {
+    layoutError.value = error instanceof Error ? error.message : String(error)
     stopLayout()
-    layoutDone(graph, s)
+    s.scheduleRender()
   }
-
-  fa2Check = setInterval(() => {
-    if (!fa2) return
-    if (performance.now() - startTime > 5000) {
-      finish()
-      return
-    }
-    let movement = 0
-    sample.forEach((n) => {
-      const a = graph.getNodeAttributes(n)
-      const p = prev.get(n)
-      if (p) movement += Math.hypot((a.x as number) - p.x, (a.y as number) - p.y)
-      prev.set(n, { x: a.x as number, y: a.y as number })
-    })
-    if (sample.length > 0 && movement / sample.length < 0.5) {
-      stable++
-      if (stable >= 3) finish()
-    } else {
-      stable = 0
-    }
-  }, 400)
 }
 
 /** True while a layout animation owns the positions - dragging against it
@@ -204,16 +159,30 @@ function animateLayout(graph: Graph, s: Sigma): void {
 let animating = false
 
 function mount(): void {
+  detachGraphListeners()
+  layoutError.value = ''
+  layoutStats.value = null
   stopLayout()
   stopPulse()
-  sigma?.kill()
+  disposeGraphRenderer(sigma)
   sigma = null
+  invalidateAppearance = null
   selected.value = null
   hovered.value = null
   if (!host.value || !props.graph || props.graph.order === 0) return
 
+  const previous = completedLayouts.get(props.graph)
+  animating = !previous
   const colors = graphColors(props.dark)
+  const mountStarted = props.trace ? performance.now() : 0
   const s = new Sigma(props.graph, host.value, {
+    // Visibility is a draw decision, not a data/index mutation. Toggling
+    // renderLabels via setSetting rebuilt all caches at both layout endpoints.
+    // Every installed node program uses this default label painter; hovered
+    // bubbles retain Sigma's existing separate painter during animation.
+    defaultDrawNodeLabel: (context, data, settings) => {
+      if (!animating) drawDiscNodeLabel(context, data, settings)
+    },
     renderEdgeLabels: false,
     labelRenderedSizeThreshold: 8,
     labelFont: 'Inter, system-ui, sans-serif',
@@ -233,7 +202,9 @@ function mount(): void {
       const res = { ...data }
       if (hovered.value && hovered.value !== node && !highlightNodes.has(node)) {
         res.color = fadeColor(String(data.originalColor), props.dark)
-        res.label = ''
+        // Empty strings stay in Sigma's label grid; null labels stay out.
+        // Preserve that membership so hover needs no spatial reindex.
+        if (data.label || data.label === '') res.label = ''
       } else if (hovered.value) {
         res.forceLabel = true
         if (hovered.value === node) {
@@ -254,6 +225,19 @@ function mount(): void {
       return res
     },
   })
+  props.trace?.('sigma-constructor', mountStarted)
+  budgetGraphCanvases(s)
+  if (props.trace) {
+    let processStarted = 0; let renderStarted = 0
+    s.on('beforeProcess', () => { processStarted = performance.now() })
+    s.on('afterProcess', () => props.trace?.('sigma-process', processStarted))
+    s.on('beforeRender', () => { renderStarted = performance.now() })
+    s.on('afterRender', () => props.trace?.('sigma-render-inclusive', renderStarted))
+  }
+  // Register after timing hooks so the inclusive render span charges the
+  // appearance flush as well as index processing and WebGL submission.
+  const hoverRefresh = createHoverRefresh(s, props.graph)
+  invalidateAppearance = hoverRefresh.invalidate
 
   // Node dragging, ported from upstream setupEventHandlers: down arms, body
   // moves write positions straight into the graph, up releases. The custom
@@ -292,14 +276,14 @@ function mount(): void {
     highlightNodes = new Set([node, ...g.neighbors(node)])
     highlightEdges = new Set(g.edges(node))
     s.getContainer().style.cursor = 'pointer'
-    s.refresh()
+    hoverRefresh.update({ node, nodes: highlightNodes, edges: highlightEdges })
   })
   s.on('leaveNode', () => {
     hovered.value = null
     highlightNodes = new Set()
     highlightEdges = new Set()
     s.getContainer().style.cursor = 'default'
-    s.refresh()
+    hoverRefresh.update({ node: null, nodes: highlightNodes, edges: highlightEdges })
   })
   s.on('enterEdge', () => {
     s.getContainer().style.cursor = 'pointer'
@@ -342,13 +326,16 @@ function mount(): void {
 
   sigma = s
 
-  animateLayout(props.graph, s)
+  if (previous) layoutStats.value = previous
+  else animateLayout(props.graph, s)
 
   // Emphasis flips node types after mount, so the ripple clock follows the
   // graph's attribute events. Coalesced: position updates fire this per node
   // per layout tick, and a full-graph scan on each would be O(n^2) a frame.
   syncPulse()
   props.graph.on('nodeAttributesUpdated', scheduleSyncPulse)
+  pulseGraph = props.graph
+  for (const event of topologyEvents) pulseGraph.on(event, invalidateLayoutCache)
 }
 
 let pulseSyncTimer: ReturnType<typeof setTimeout> | null = null
@@ -380,19 +367,21 @@ onMounted(() => {
     } else if (h.style.width) {
       h.style.width = ''
       h.style.height = ''
-      requestAnimationFrame(() => sigma?.refresh())
+      requestAnimationFrame(() => { invalidateAppearance?.(); sigma?.refresh() })
     }
   })
   dragWatch.observe(document.body, { attributes: true, attributeFilter: ['class'] })
 })
 
 onBeforeUnmount(() => {
+  detachGraphListeners()
   dragWatch?.disconnect()
   stopLayout()
   stopPulse()
   if (pulseSyncTimer != null) clearTimeout(pulseSyncTimer)
-  sigma?.kill()
+  disposeGraphRenderer(sigma)
   sigma = null
+  invalidateAppearance = null
 })
 
 /** Jiggle + re-animate: upstream applyLayout's randomize, so a re-run gives
@@ -418,7 +407,7 @@ function switchLayout(kind: 'fa2' | 'd3'): void {
 function relayoutMerged(): void {
   if (props.graph && sigma) animateLayout(props.graph, sigma)
 }
-defineExpose({ relayoutMerged })
+defineExpose({ relayoutMerged, layoutStats, layoutError })
 
 /** PNG of the visible layers, 2x for crisp text - upstream exportAsImage. */
 function exportImage(): void {
@@ -431,7 +420,7 @@ function exportImage(): void {
   void downloadAsPNG(sigma, {
     fileName: (props.exportName || 'graph').replace(/\.tvdb$/i, '').replace(/[^\w.-]+/g, '-'),
     layers,
-    backgroundColor: props.dark ? '#12161a' : '#ffffff',
+    backgroundColor: getComputedStyle(container).getPropertyValue('--pk-bg-base').trim(),
     width: container.offsetWidth * 2,
     height: container.offsetHeight * 2,
   }).catch((e) => console.error('graph image export failed', e))
@@ -456,8 +445,9 @@ function propText(v: unknown): string {
 </script>
 
 <template>
-  <div class="gc">
+  <div class="gc" :data-layout-phase="layoutStats?.phase" :data-layout-error="layoutError || undefined">
     <div ref="host" class="gc__canvas" />
+    <div v-if="layoutError" class="gc__card" role="alert">{{ layoutError }}</div>
     <div class="gc__zoom">
       <Tooltip label="Save as image">
         <button class="gc__btn" @click="exportImage"><Icon name="image" :size="13" /></button>

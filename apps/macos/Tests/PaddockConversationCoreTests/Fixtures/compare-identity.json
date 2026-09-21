@@ -1,0 +1,168 @@
+[
+  {
+    "id": "moonshotai/kimi-k3",
+    "display": "MoonshotAI: Kimi K3",
+    "kind": "openai-compat",
+    "provider": "deepinfra/bf16",
+    "name": "Kimi K3 (deepinfra/bf16)",
+    "vendor": "Moonshot"
+  },
+  {
+    "id": "meta/muse-spark-1.3",
+    "display": "Meta: Muse Spark 1.3",
+    "provider": "meta",
+    "name": "Muse Spark 1.3 (meta)",
+    "vendor": "Meta"
+  },
+  {
+    "id": "qwen/qwen3.8-27b",
+    "display": "Qwen: Qwen 3.8 27B",
+    "name": "Qwen 3.8 27B",
+    "vendor": "Alibaba"
+  },
+  {
+    "id": "anthropic/claude-sonnet",
+    "display": "Anthropic: Claude Sonnet",
+    "name": "Claude Sonnet",
+    "vendor": "Anthropic"
+  },
+  {
+    "id": "google/gemma-4",
+    "display": "Google: Gemma 4",
+    "name": "Gemma 4",
+    "vendor": "Google"
+  },
+  {
+    "id": "o3-mini",
+    "name": "o3-mini",
+    "vendor": "OpenAI"
+  },
+  {
+    "id": "local-custom",
+    "display": "Research: Custom endpoint",
+    "kind": "openai-compat",
+    "name": "Research: Custom endpoint",
+    "vendor": null
+  },
+  {
+    "id": "private-model",
+    "display": "My private model",
+    "kind": "anthropic",
+    "name": "My private model",
+    "vendor": "Anthropic"
+  },
+  {
+    "id": "private-model",
+    "kind": "openai",
+    "name": "private-model",
+    "vendor": "OpenAI"
+  },
+  {
+    "id": "~meta/latest",
+    "display": "Meta: Latest",
+    "name": "Latest",
+    "vendor": "Meta"
+  },
+  {
+    "id": "x-ai/grok",
+    "display": "xAI: Grok",
+    "name": "Grok",
+    "vendor": "xAI"
+  },
+  {
+    "id": "z-ai/glm",
+    "display": "Z.ai: GLM",
+    "name": "GLM",
+    "vendor": "Z.ai"
+  },
+  {
+    "id": "openai/model",
+    "name": "openai/model",
+    "vendor": "OpenAI"
+  },
+  {
+    "id": "meta-llama/model",
+    "name": "meta-llama/model",
+    "vendor": "Meta"
+  },
+  {
+    "id": "deepseek/model",
+    "name": "deepseek/model",
+    "vendor": "DeepSeek"
+  },
+  {
+    "id": "tencent/model",
+    "name": "tencent/model",
+    "vendor": "Tencent"
+  },
+  {
+    "id": "xiaomi/model",
+    "name": "xiaomi/model",
+    "vendor": "Xiaomi"
+  },
+  {
+    "id": "nvidia/model",
+    "name": "nvidia/model",
+    "vendor": "NVIDIA"
+  },
+  {
+    "id": "mistralai/model",
+    "name": "mistralai/model",
+    "vendor": "Mistral"
+  },
+  {
+    "id": "mistral/model",
+    "name": "mistral/model",
+    "vendor": "Mistral"
+  },
+  {
+    "id": "alibaba/model",
+    "name": "alibaba/model",
+    "vendor": "Alibaba"
+  },
+  {
+    "id": "perplexity/model",
+    "name": "perplexity/model",
+    "vendor": "Perplexity"
+  },
+  {
+    "id": "baidu/model",
+    "name": "baidu/model",
+    "vendor": "Baidu"
+  },
+  {
+    "id": "bytedance/model",
+    "name": "bytedance/model",
+    "vendor": "ByteDance"
+  },
+  {
+    "id": "minimax/model",
+    "name": "minimax/model",
+    "vendor": "MiniMax"
+  },
+  {
+    "id": "poolside/model",
+    "name": "poolside/model",
+    "vendor": "Poolside"
+  },
+  {
+    "id": "ibm/model",
+    "name": "ibm/model",
+    "vendor": "IBM"
+  },
+  {
+    "id": "cohere/model",
+    "name": "cohere/model",
+    "vendor": "Cohere"
+  },
+  {
+    "id": "huggingface/model",
+    "name": "huggingface/model",
+    "vendor": "Hugging Face"
+  },
+  {
+    "id": "openrouter/model",
+    "name": "openrouter/model",
+    "vendor": "OpenRouter"
+  }
+]

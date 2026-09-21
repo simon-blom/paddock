@@ -2,7 +2,7 @@
   "name": "@truespar/traverse-wasm",
   "version": "0.8.5",
   "description": "Traverse graph engine in a browser tab \u2014 Cypher + 32 GDS algorithms via WebAssembly. Runs in a dedicated Web Worker; no server required.",
-  "license": "MIT OR Apache-2.0",
+  "license": "LicenseRef-Proprietary",
   "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",
@@ -18,6 +18,7 @@
     "index.js",
     "index.d.ts",
     "worker.js",
+    "request-queue.js",
     "pkg/"
   ],
   "keywords": [

@@ -2669,6 +2669,80 @@ impl GpuExecutor {
     /// `sorted_row`), `fq`/`fs` the sorted-position nvf4 output planes
     /// ([nb*32, ff/2] + [nb*32, ff/16]) - the down kernel's direct input.
     #[allow(clippy::too_many_arguments)]
+    /// Whether the pack carries the sorted NVFP4 gate+up+SwiGLU arm (slot 631).
+    pub fn has_nvf4_moe_gu_swiglu_bs(&self) -> bool {
+        self.kernels.nvf4_moe_gu_swiglu_bs.is_some()
+    }
+
+    /// Sorted-tile NVFP4 routed gate+up+SwiGLU (slot 631) - the W4A4 twin of
+    /// the W4A16 `q4x_moe_gu_swiglu` GEMV. `fq`/`fs` land sorted-position
+    /// indexed, which is [`Self::nvf4_moe_down_bs`]'s direct B input, so the
+    /// pair runs without an unsort between halves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_gu_swiglu_bs(
+        &self,
+        gate: &Nvf4MoePlane,
+        up: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        fq: &mut CudaSlice<u8>,
+        fs: &mut CudaSlice<u8>,
+        nb: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_gu_swiglu_bs
+            .ok_or(GpuError::MissingOp("nvf4_moe_gu_swiglu_bs"))?;
+        // both planes are read by ONE kernel, so a mixed layout is not a
+        // degraded case - it is garbage. Check each.
+        Self::moe_layout_ok(gate, Nvf4MoeLayout::Row, "nvf4_moe_gu_swiglu_bs")?;
+        Self::moe_layout_ok(up, Nvf4MoeLayout::Row, "nvf4_moe_gu_swiglu_bs")?;
+        if gate.ff != up.ff || gate.in_dim != up.in_dim {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_gu_swiglu_bs: gate and up planes differ in shape".into(),
+            ));
+        }
+        debug_assert!(sorted_row.len() >= nb * 32);
+        debug_assert!(block_expert.len() >= nb);
+        debug_assert!(fq.len() >= nb * 32 * (gate.ff / 2));
+        debug_assert!(fs.len() >= nb * 32 * (gate.ff / 16));
+        let (gd, _a1) = gate.data.device_ptr(&self.stream);
+        let (gs, _a2) = gate.scale.device_ptr(&self.stream);
+        let (g2, _a3) = gate.scale2.device_ptr(&self.stream);
+        let (ud, _a4) = up.data.device_ptr(&self.stream);
+        let (us, _a5) = up.scale.device_ptr(&self.stream);
+        let (u2, _a6) = up.scale2.device_ptr(&self.stream);
+        let (rp, _a7) = sorted_row.device_ptr(&self.stream);
+        let (bp, _a8) = block_expert.device_ptr(&self.stream);
+        let (xqp, _a9) = xq.device_ptr(&self.stream);
+        let (xsp, _a10) = xs.device_ptr(&self.stream);
+        let (fqp, _a11) = fq.device_ptr_mut(&self.stream);
+        let (fsp, _a12) = fs.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; shapes and sizes checked above
+        check(unsafe {
+            f(
+                gd as *const _,
+                gs as *const _,
+                g2 as *const _,
+                ud as *const _,
+                us as *const _,
+                u2 as *const _,
+                rp as *const _,
+                bp as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                fqp as *mut _,
+                fsp as *mut _,
+                gate.in_dim as u32,
+                gate.ff as u32,
+                nb as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn nvf4_moe_up_relu2_bs(
         &self,
         w: &Nvf4MoePlane,

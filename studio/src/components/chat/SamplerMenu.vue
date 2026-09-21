@@ -12,6 +12,7 @@
 // entirely (Sonnet 5 rejects explicit temperature) - said here, never
 // silently leveled.
 import { computed } from 'vue'
+import { samplerIsSet, samplerDefaults, samplerLabel, samplerCaveats, type DialKey } from '@/lib/composer-policy'
 import { useChatStore } from '@/stores/chat'
 import { useModelsStore } from '@/stores/models'
 import Menu from '@/components/ui/Menu.vue'
@@ -23,7 +24,6 @@ import TextInput from '@/components/ui/TextInput.vue'
 const chat = useChatStore()
 const models = useModelsStore()
 
-type DialKey = 'temperature' | 'topP' | 'topK' | 'minP' | 'presencePenalty' | 'repeatPenalty'
 const WIRE_KEY = {
   temperature: 'temperature',
   topP: 'top_p',
@@ -35,12 +35,6 @@ const WIRE_KEY = {
 // presence 0 = no penalty, repeat 1 = no penalty. Those dials' scales START
 // at their off value, so "off" is a real slider position, never a lie about
 // some other number. Temperature and top-p have no off.
-const OFF_VALUE: Partial<Record<DialKey, number>> = {
-  topK: 0,
-  minP: 0,
-  presencePenalty: 0,
-  repeatPenalty: 1,
-}
 
 // Slider models: while the param is unset the thumb parks at the endpoint's
 // ADVERTISED default (so it agrees with the "default (x)" label), else at a
@@ -98,30 +92,10 @@ const seedText = computed<string>({
 // rather than an invented figure.
 // These dials read as tenths by convention (1.0, 0.8, 0.95) - print them that
 // way even when the value is whole; top-k is a plain count.
-function num(key: DialKey, n: number): string {
-  if (key === 'topK') return String(n)
-  return Number.isInteger(n) ? n.toFixed(1) : String(n)
-}
 function fmt(key: DialKey): string {
-  const v = chat.active?.params[key]
-  if (v != null) return v === OFF_VALUE[key] ? 'off' : num(key, v)
-  const d = advertised(key) ?? OFF_VALUE[key]
-  if (d == null) return 'default'
-  return d === OFF_VALUE[key] ? 'default (off)' : `default (${num(key, d)})`
+  return samplerLabel(key, chat.active?.params[key], advertised(key))
 }
-const anySet = computed(() => {
-  const p = chat.active?.params
-  return (
-    !!p &&
-    (p.temperature != null ||
-      p.topP != null ||
-      p.topK != null ||
-      p.minP != null ||
-      p.presencePenalty != null ||
-      p.repeatPenalty != null ||
-      p.seed != null)
-  )
-})
+const anySet = computed(() => samplerIsSet(chat.active?.params))
 // Where the "default (x)" numbers come from. Worth one line because they are
 // not a house setting any more: each model is served at what
 // its own authors published, so two models here legitimately read different.
@@ -131,14 +105,7 @@ const defaultsSource = computed<string | undefined>(() =>
 function reset(): void {
   const c = chat.active
   if (!c) return
-  c.params.temperature = null
-  c.params.topP = null
-  c.params.topK = null
-  c.params.minP = null
-  c.params.presencePenalty = null
-  c.params.frequencyPenalty = null
-  c.params.repeatPenalty = null
-  c.params.seed = null
+  Object.assign(c.params, samplerDefaults())
   chat.persist(c)
 }
 
@@ -155,34 +122,12 @@ function laneKind(id: string): string | undefined {
   const cl = models.models.find((m) => m.id === id)?.cloud
   return cl ? models.cloudEndpoints.find((e) => e.id === cl.endpoint)?.kind : undefined
 }
-const oaiReasoningLane = computed(() =>
-  laneIds().some((id) => {
-    if (laneKind(id) !== 'openai') return false
-    const bare = id.replace(/^cloud:[^:]+:/, '')
-    return bare.startsWith('gpt-5') || /^o[134]/.test(bare)
-  }),
-)
-const claudeThinkingLane = computed(
-  () =>
-    (chat.active?.params.thinking ?? true) && laneIds().some((id) => laneKind(id) === 'anthropic'),
-)
-// The extension dials don't travel to the native cloud APIs: OpenAI's
-// Responses wire takes temperature/top-p only, Anthropic adds top-k but has
-// no penalty or min-p knobs. Said when a set dial would stay home.
-const oaiInertSet = computed(() => {
-  const p = chat.active?.params
-  const oai = laneIds().some((id) => laneKind(id) === 'openai')
-  return (
-    oai &&
-    !!p &&
-    (p.topK != null || p.minP != null || p.presencePenalty != null || p.repeatPenalty != null)
-  )
-})
-const claudeInertSet = computed(() => {
-  const p = chat.active?.params
-  const claude = laneIds().some((id) => laneKind(id) === 'anthropic')
-  return !!p && claude && (p.minP != null || p.presencePenalty != null || p.repeatPenalty != null)
-})
+const caveats = computed(() => samplerCaveats(laneIds().map(id => ({ id, kind: laneKind(id) })), chat.active?.params))
+const oaiReasoningLane = computed(() => caveats.value.oaiReasoning)
+const claudeThinkingLane = computed(() => caveats.value.claudeThinking)
+const oaiInertSet = computed(() => caveats.value.oaiInert)
+const claudeInertSet = computed(() => caveats.value.claudeInert)
+
 </script>
 
 <template>

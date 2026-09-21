@@ -85,6 +85,22 @@
 
 use std::str::FromStr;
 
+/// A synchronous chain only needs the deepest prefix any slot will verify.
+/// Drafting the global ceiling (often seven) when all slots consume two
+/// wastes target-head reads and GPU steps. Block drafters keep their original
+/// geometry: shortening their input changes every position's prediction.
+pub(crate) fn synchronous_draft_budget(
+    ceiling: usize,
+    block: Option<usize>,
+    requested: impl IntoIterator<Item = usize>,
+) -> usize {
+    if block.is_some() {
+        ceiling
+    } else {
+        requested.into_iter().max().unwrap_or(0).min(ceiling)
+    }
+}
+
 /// What the operator asked for. `Auto` is the interesting one; the rest exist
 /// because benchmarking and parity work need to pin the variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -466,6 +482,38 @@ impl SpecController {
         total
     }
 
+    /// Will a round at this width speculate at all, as far as the table can
+    /// tell? A read-only companion to `pick_k` for the scheduler's draft-head
+    /// hints: a drafter fed from every forward (qwen4exp stashes each decode
+    /// row and drains it through a head pass) otherwise pays that feeding on
+    /// ticks no round will ever consume. The width caps alone cannot answer
+    /// it - at 8 live slots Flash-Next is inside every cap and still decides
+    /// not to speculate, and the feeding was 19 ms of a 45 ms tick.
+    ///
+    /// Exploration counts as yes: while the bucket's anchors are unmeasured
+    /// the controller is about to run rounds, and a head that stopped being
+    /// fed cannot serve them.
+    pub fn will_speculate(&self, live: usize, k_ladder: usize) -> bool {
+        let k_cap = k_ladder.min(MAX_K);
+        match self.policy {
+            SpecPolicy::Off => false,
+            SpecPolicy::Ladder => k_cap > 0,
+            SpecPolicy::Fixed(k) => k.min(k_cap) > 0,
+            SpecPolicy::Auto => {
+                if k_cap == 0 || live == 0 {
+                    return false;
+                }
+                let b = bucket_of(live);
+                let row = &self.lat[b];
+                let mid = (k_cap / 2).max(1);
+                if [0, k_cap, mid].iter().any(|&k| !row[k].ready()) {
+                    return true;
+                }
+                self.argmax(b, k_cap) > 0
+            }
+        }
+    }
+
     pub fn pick_k(&mut self, live: usize, k_ladder: usize) -> usize {
         let k_cap = k_ladder.min(MAX_K);
         match self.policy {
@@ -490,12 +538,25 @@ impl SpecController {
         // full (visible as a several-percent gap between the first and
         // second run of the same load). Round latency is close to affine in the
         // verify rows inside a bucket (weights stream once; rows add
-        // compute), so two anchors - the cap and its midpoint - pin the
-        // line and every other K is priced by interpolation until a probe
-        // or a natural visit measures it. K=0 is measured for free by the
-        // dense ticks the loop already reports.
+        // compute), so a few anchors pin the line and every other K is priced
+        // by interpolation until a probe or a natural visit measures it.
+        //
+        // K=0 is one of those anchors, and it used to be left out with the
+        // note that dense ticks measure it for free. They do not: a dense tick
+        // is only booked when this controller itself returns 0 (the serve loop
+        // opens a tick for the speculative branches only), so on a bucket that
+        // never chose 0 the baseline cell stayed n=0 and `argmax` had to
+        // extrapolate it off the speculative cells' fit. That fit is the
+        // round's own line, fixed cost included - and a family whose round
+        // copies recurrent state per round (qwen4exp saves GDN + PLE windows)
+        // has a big one. Measured on Flash-Next at 8 live slots, 2026-09-17:
+        // the fit put k=0 at ~59 ms against a real dense tick of ~26 ms, so
+        // k=2 won the goodput comparison forever and the serve ran 40% under
+        // its own no-spec throughput at 79% acceptance. Anchoring the baseline
+        // costs one dense tick per bucket and is the cell every other K is
+        // judged against.
         let mid = (k_cap / 2).max(1);
-        for k in [k_cap, mid] {
+        for k in [0, k_cap, mid] {
             if !row[k].ready() {
                 return k;
             }
@@ -676,6 +737,18 @@ mod tests {
         let mut c = SpecController::new(SpecPolicy::Off);
         assert_eq!(c.pick_k(1, 7), 0);
         assert_eq!(c.pick_k(32, 7), 0);
+    }
+
+    #[test]
+    fn synchronous_chains_skip_unused_depth_but_blocks_keep_their_geometry() {
+        assert_eq!(synchronous_draft_budget(7, None, [2]), 2);
+        assert_eq!(synchronous_draft_budget(7, None, [1, 4, 2]), 4);
+        assert_eq!(synchronous_draft_budget(3, None, [7, 2]), 3);
+        assert_eq!(synchronous_draft_budget(0, None, [7]), 0);
+        assert_eq!(synchronous_draft_budget(7, None, []), 0);
+        assert_eq!(synchronous_draft_budget(7, Some(8), [2]), 7);
+        assert_eq!(synchronous_draft_budget(3, Some(8), [7]), 3);
+        assert_eq!(synchronous_draft_budget(0, Some(8), [7]), 0);
     }
 
     #[test]
@@ -957,21 +1030,56 @@ mod tests {
     }
 
     #[test]
-    fn cold_buckets_anchor_at_the_cap_and_its_midpoint() {
+    fn cold_buckets_anchor_at_the_baseline_the_cap_and_its_midpoint() {
         let mut c = SpecController::new(SpecPolicy::Auto);
         let mut seen = [0u32; 8];
-        for _ in 0..10 {
+        for _ in 0..15 {
             let k = c.pick_k(4, 7);
             seen[k] += 1;
             c.observe(4, k, 0.01 + 0.001 * k as f64, RoundTally::one(k, k));
         }
-        // the warm start measures exactly the two anchors, MIN_SAMPLES each
+        // the warm start measures exactly the three anchors, MIN_SAMPLES each,
+        // and the baseline is one of them: until k=0 is measured, every
+        // goodput comparison runs against an extrapolation of the round's own
+        // line (see the note in pick_auto)
+        assert_eq!(seen[0], 5, "baseline anchor: {seen:?}");
         assert_eq!(seen[7], 5, "cap anchor: {seen:?}");
         assert_eq!(seen[3], 5, "midpoint anchor: {seen:?}");
-        assert_eq!(seen.iter().sum::<u32>(), 10);
+        assert_eq!(seen.iter().sum::<u32>(), 15);
         // and from then on the argmax runs on the fitted line - a perfect
         // drafter with near-flat latency rides the cap, no further sweep
         let k = c.pick_k(4, 7);
         assert_eq!(k, 7, "should ride the cap on the fitted line, got {k}");
+    }
+
+    /// A round with a big fixed cost has to lose to not speculating, however
+    /// well its drafts land. This is the Flash-Next pathology of 2026-09-17:
+    /// at 8 live slots its verify round (which copies GDN and PLE state per
+    /// round) measured 82/107/131 ms at k=1/2/3 against a 26 ms dense tick,
+    /// and 79% of drafts were accepted - yet the serve ran 40% under its own
+    /// no-spec throughput, because k=0 had never been measured and the
+    /// affine fit through the speculative cells priced it at ~59 ms. With the
+    /// baseline anchored, the goodput comparison is against the real thing.
+    #[test]
+    fn a_round_whose_fixed_cost_dominates_backs_off_to_zero() {
+        let mut c = SpecController::new(SpecPolicy::Auto);
+        // t(0) = 26 ms; a round costs 59 ms of setup + 23 ms a draft row
+        let lat = |k: usize| {
+            if k == 0 {
+                0.026
+            } else {
+                0.059 + 0.023 * k as f64
+            }
+        };
+        // drafts land 79% of the time, one accepted per drafted row
+        let tally = |k: usize| RoundTally::one(k, (k * 79) / 100);
+        for _ in 0..60 {
+            let k = c.pick_k(8, 3);
+            c.observe(8, k, lat(k), tally(k));
+        }
+        // goodput at k=0 is 1/26ms = 38/s; the best speculative option is
+        // 1+3*0.79 = 3.37 tokens per 128 ms = 26/s. Not speculating wins.
+        let k = c.pick_k(8, 3);
+        assert_eq!(k, 0, "should stop speculating, got k={k}");
     }
 }

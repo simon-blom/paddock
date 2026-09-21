@@ -332,9 +332,13 @@ export interface WebSearchCall {
 
 export interface Usage {
   promptTokens: number
-  /** answer (content-only) tokens - reasoning is counted separately. */
+  /** Non-reasoning output, including generated tool arguments and markers. */
   completionTokens: number
-  /** answer tokens/sec. */
+  timingSource?: 'engine' | 'end-to-end'
+  decodeMs?: number
+  prefillMs?: number
+  queueMs?: number
+  /** All output tokens per second; timingSource names the denominator. */
   tps?: number
   /** total wall-clock ms for the turn. */
   ms?: number
@@ -389,6 +393,12 @@ export interface RunMeta {
   params: SamplingParams
   /** enabled MCP server labels this turn could use. */
   tools: string[]
+  /** What this turn's request carried besides its messages (lib/tokens.ts
+   *  `PromptShape`). A later send with the same shape can trust this turn's
+   *  server-counted `usage.promptTokens` as the exact size of the prefix the
+   *  two share. Absent on turns recorded before it existed, and on turns the
+   *  macOS app wrote - those are simply never used as an anchor. */
+  shape?: { from: string | null; summary: string | null; tools: string }
   /** peak GPU/engine conditions during the turn. */
   gpu?: RunGpuEnv
   /** the turn ran while other compare lanes shared the GPU - its speed
@@ -536,6 +546,10 @@ export interface ServerCompaction {
 export interface Conversation {
   id: string
   title: string
+  /** Absent on older chats: never infer permission to overwrite an old name. */
+  titleSource?: 'fallback' | 'generated' | 'manual'
+  titleModel?: string
+  titleCostUsd?: number
   /** Every turn in this conversation - every branch, not just the one on
    *  screen. What to render and what to send both come from the active path
    *  (lib/tree.ts `activeSteps` / `activeMessages`); reading this array

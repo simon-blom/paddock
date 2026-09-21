@@ -4,6 +4,7 @@
 //! (same-weights reference; no CPU references).
 
 pub mod deepseek_ocr;
+pub mod dinov3;
 pub mod gemma4;
 pub mod gpt_oss;
 pub mod granite;

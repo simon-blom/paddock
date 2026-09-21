@@ -8,6 +8,9 @@ use cudarc::driver::CudaSlice;
 use paddock_models::gguf::Value;
 use paddock_models::mapped::MappedGguf;
 
+/// Token rows into the residual stream. A rotated-basis file stores the
+/// table's rows rotated, so what the gather returns goes back through the
+/// inverse here - the one place, so no walk can forget it.
 pub(super) fn embed_any(
     exec: &GpuExecutor,
     te: &TokEmbd,
@@ -15,10 +18,14 @@ pub(super) fn embed_any(
     out: &mut CudaSlice<f32>,
     embd: usize,
     n: usize,
+    rot: Option<&Rotation>,
 ) -> Result<(), GpuModelError> {
     match te {
         TokEmbd::Q8(t) => exec.embed_gather_batch_q8(t, tokens, out, embd, n)?,
         TokEmbd::Kq(t) => exec.kquant_gather(t, tokens, out, embd, n)?,
+    }
+    if let Some(r) = rot {
+        r.after_embed(exec, out, embd, n)?;
     }
     Ok(())
 }
@@ -2550,6 +2557,78 @@ pub(crate) fn prefill_add_norm_quant(
         prefill_quant(exec, xq, xs, yq, xn, n, batch)?;
     }
     Ok(())
+}
+
+/// [`prefill_add_norm_quant`] for a model that may be rotated-basis: the
+/// rotation sits between the norm and the quantize, so such a model takes
+/// the three-step form at every width and `xn` always materializes - holding
+/// the ROTATED rows, which is what every consumer of this buffer wants (the
+/// loader moved alpha / beta into the same basis). INTERIM, stated: the
+/// serving target is norm -> signs -> H -> quantize in one kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_add_norm_quant_rot(
+    exec: &GpuExecutor,
+    x: &mut CudaSlice<f32>,
+    proj: Option<&CudaSlice<f32>>,
+    proj_b16: bool,
+    w: &CudaSlice<f32>,
+    xn: &mut CudaSlice<f32>,
+    write_xn: bool,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<f32>,
+    yq: &mut CudaSlice<u8>,
+    n: usize,
+    batch: usize,
+    eps: f32,
+    rot: Option<&Rotation>,
+) -> Result<(), GpuModelError> {
+    let Some(r) = rot else {
+        return prefill_add_norm_quant(
+            exec, x, proj, proj_b16, w, xn, write_xn, xq, xs, yq, n, batch, eps,
+        );
+    };
+    if let Some(p) = proj {
+        if proj_b16 {
+            return Err(GpuModelError::Unsupported(
+                "qwen35 prefill: a bf16 residual on a rotated-basis model".into(),
+            ));
+        }
+        exec.add(x, p, batch * n)?;
+    }
+    exec.rmsnorm_batch(x, w, xn, n, eps, batch)?;
+    r.rotate(exec, xn, n, batch)?;
+    prefill_quant(exec, xq, xs, yq, xn, n, batch)
+}
+
+/// [`prefill_ffn_down_any`] for a model that may be rotated-basis: the down
+/// projection reads the ROTATED SwiGLU product, so the fused
+/// swiglu+quantize is out and the product lands in `gate` first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_ffn_down_rot(
+    exec: &GpuExecutor,
+    w: &QuantW,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<f32>,
+    yq: &mut CudaSlice<u8>,
+    xsums: &mut CudaSlice<f32>,
+    ssums: &mut CudaSlice<f32>,
+    skfix: &mut CudaSlice<f32>,
+    gate: &mut CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    ff: usize,
+    batch: usize,
+    rot: Option<&Rotation>,
+) -> Result<(), GpuModelError> {
+    let Some(r) = rot else {
+        return prefill_ffn_down_any(
+            exec, w, xq, xs, yq, xsums, ssums, skfix, gate, up, y, ff, batch,
+        );
+    };
+    exec.swiglu(gate, up, batch * ff)?;
+    r.rotate(exec, gate, ff, batch)?;
+    prefill_quant(exec, xq, xs, yq, gate, ff, batch)?;
+    prefill_mm_pre_any(exec, w, xq, xs, yq, xsums, ssums, skfix, y, batch)
 }
 
 /// Index of the max logit (greedy next token).

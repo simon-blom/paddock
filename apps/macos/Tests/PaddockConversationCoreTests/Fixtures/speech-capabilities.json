@@ -1,0 +1,14 @@
+[
+  {"name":"KB Whisper", "caps":{"audio":true,"timestamp_granularities":["segment","word"],"realtime_transcription":{"supported":true,"enrichment":true}},"enrich":true},
+  {"name":"NB Whisper", "caps":{"audio":true,"timestamp_granularities":["segment","word"],"realtime_transcription":{"supported":true,"enrichment":true}},"enrich":true},
+  {"name":"Røst", "caps":{"audio":true,"timestamp_granularities":["segment","word"],"realtime_transcription":{"supported":true,"enrichment":true}},"enrich":true},
+  {"name":"Qwen ASR", "caps":{"audio":true,"timestamp_granularities":[],"realtime_transcription":{"supported":true,"enrichment":false}},"enrich":false},
+  {"name":"Granite Speech", "caps":{"audio":true,"timestamp_granularities":[],"realtime_transcription":{"supported":true,"enrichment":false}},"enrich":false},
+  {"name":"Granite Speech Plus", "caps":{"audio":true,"timestamp_granularities":["word"],"realtime_transcription":{"supported":true,"enrichment":false}},"enrich":false},
+  {"name":"legacy Whisper", "caps":{"timestamp_granularities":["segment","word"]},"enrich":true},
+  {"name":"legacy segment-only Whisper", "caps":{"timestamp_granularities":["segment"]},"enrich":false},
+  {"name":"legacy Granite Plus", "caps":{"timestamp_granularities":["word"]},"enrich":false},
+  {"name":"explicit live refusal overrides file timing", "caps":{"timestamp_granularities":["segment","word"],"realtime_transcription":{"supported":false,"enrichment":false}},"enrich":false},
+  {"name":"new segment-only enriched runner", "caps":{"timestamp_granularities":["segment"],"realtime_transcription":{"supported":true,"enrichment":true}},"enrich":true},
+  {"name":"unknown", "caps":{},"enrich":false}
+]

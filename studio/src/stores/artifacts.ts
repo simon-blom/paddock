@@ -42,6 +42,7 @@ export const useArtifactsStore = defineStore('artifacts', () => {
   /** Artifacts of the conversation currently on screen, newest first. */
   const list = ref<ArtifactMeta[]>([])
   const conversationId = ref('')
+  let refreshEpoch = 0
   /** How many panes the panel has room for; it measures itself and says. */
   const paneCapacity = ref(1)
   /** Which artifact each model's pane is showing, keyed by model. */
@@ -134,6 +135,8 @@ export const useArtifactsStore = defineStore('artifacts', () => {
   }
 
   async function refresh(convId: string): Promise<void> {
+    const epoch = ++refreshEpoch
+    if (conversationId.value !== convId) list.value = []
     conversationId.value = convId
     if (!convId) {
       list.value = []
@@ -143,6 +146,7 @@ export const useArtifactsStore = defineStore('artifacts', () => {
       const res = await fetch(`/api/conversations/${encodeURIComponent(convId)}/artifacts`)
       if (!res.ok) return
       const data = (await res.json()) as { artifacts: ArtifactMeta[] }
+      if (epoch !== refreshEpoch || conversationId.value !== convId) return
       list.value = data.artifacts ?? []
     } catch (e) {
       console.error('failed to list artifacts', e)

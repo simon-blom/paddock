@@ -1,0 +1,24 @@
+{
+  "sections": [
+    { "id": "maxTokens", "title": "Max reply length" },
+    { "id": "maxToolCalls", "title": "Tools per reply" },
+    { "id": "summarize", "title": "Summarize older messages" },
+    { "id": "microphone", "title": "Microphone" },
+    { "id": "mapTiles", "title": "Map tiles" }
+  ],
+  "replyStops": [
+    { "value": 512, "label": "512 tokens", "shortLabel": "512" },
+    { "value": 1024, "label": "1K tokens", "shortLabel": "1K" },
+    { "value": 2048, "label": "2K tokens", "shortLabel": "2K" },
+    { "value": 4096, "label": "4K tokens", "shortLabel": "4K" },
+    { "value": null, "label": "Model maximum", "shortLabel": "Max" }
+  ],
+  "toolStops": [
+    { "value": 0, "label": "Server default" },
+    { "value": 5, "label": "5 tool calls" },
+    { "value": 10, "label": "10 tool calls" },
+    { "value": 25, "label": "25 tool calls" },
+    { "value": 50, "label": "50 tool calls" },
+    { "value": 100, "label": "100 tool calls" }
+  ]
+}

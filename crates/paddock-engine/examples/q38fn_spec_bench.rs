@@ -1,4 +1,4 @@
-//! Flash-Next decode / verify timing harness: ONE model load, then the pieces
+//! Flash-Next decode / verify timing harness: one model load, then the pieces
 //! a serving round is built from, each timed on its own and each inside its
 //! own cuProfiler window - so
 //!
@@ -67,7 +67,7 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// Row-exactness oracle: per-layer dumps (`PADDOCK_Q38FN_DUMP`) of two plain
-/// decode ticks and of ONE 2-row verify over the same two tokens from the same
+/// decode ticks and of one 2-row verify over the same two tokens from the same
 /// state, written to `<dir>/{dec0,dec1,ver}`. Verify row 0 must equal tick 0
 /// bit for bit and row 1 tick 1; the comparison script names the first tensor
 /// in walk order that does not.

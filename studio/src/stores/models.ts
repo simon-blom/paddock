@@ -4,6 +4,7 @@ import type { VisionBudget } from '@/lib/vision'
 import type { TaskTag } from '@/lib/tasks'
 import { ocrCapsFrom, type OcrCaps } from '@/lib/ocr'
 import { isHarmony, isVisionModel } from '@/lib/model-caps'
+import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
 
 export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner'
 
@@ -109,6 +110,9 @@ export interface CloudEndpoint {
   kind: 'openai' | 'openai-compat' | 'anthropic'
   baseUrl: string
   hasKey: boolean
+  /** Desktop preloads credentials at startup; a request never prompts Keychain. */
+  credentialReady?: boolean
+  allowUnauthenticated?: boolean
   models: CloudModelPick[]
   createdAt: number
 }
@@ -142,12 +146,13 @@ const CLOUD_ORGS: Record<string, string> = {
   ibm: 'IBM',
   cohere: 'Cohere',
   huggingface: 'Hugging Face',
+  openrouter: 'OpenRouter',
 }
 export function cloudVendor(id: string): string | undefined {
   const s = id.toLowerCase()
   const slash = s.indexOf('/')
   if (slash > 0) {
-    const org = CLOUD_ORGS[s.slice(0, slash)]
+    const org = CLOUD_ORGS[s.slice(0, slash).replace(/^~+/, '')]
     if (org) return org
   }
   if (s.includes('gpt') || /^o[134]\b/.test(s)) return 'OpenAI'
@@ -162,6 +167,14 @@ export function cloudVendor(id: string): string | undefined {
   if (s.includes('deepseek')) return 'DeepSeek'
   if (s.includes('mistral') || s.includes('mixtral')) return 'Mistral'
   return undefined
+}
+
+/** Shared naming seam for catalog/Compare parity tests with the native client. */
+export function cloudModelIdentity(id: string, display?: string, kind = '', provider?: string) {
+  const inferred = cloudVendor(id)
+  const vendor = inferred ?? (kind === 'openai' ? 'OpenAI' : kind === 'anthropic' ? 'Anthropic' : undefined)
+  const name = inferred ? (display ?? id).replace(/^[^:]{2,24}:\s+/, '') : (display ?? id)
+  return { name: provider ? `${name} (${provider})` : name, vendor }
 }
 
 /** One endpoint's advertised SERVER TOOLS (its per-model config, read from
@@ -236,6 +249,7 @@ export interface ModelCaps {
    *  granite-speech), which chats as well. That is why audio is a CAPABILITY
    *  question here and never a kind check. */
   audio?: boolean
+  realtimeTranscription?: RealtimeTranscriptionCaps
   /** Which `timestamp_granularities[]` this endpoint can answer. Whisper says
    *  `["segment", "word"]` - two unrelated mechanisms, its timestamp
    *  vocabulary and cross-attention alignment; the generative ASR families
@@ -299,6 +313,7 @@ interface ServerBody {
   document_parser?: boolean | null
   current_time?: boolean | null
   audio?: boolean
+  realtime_transcription?: RealtimeTranscriptionCaps | null
   aligner?: string | null
   alignment_max_clip_s?: number | null
   transcription_max_clip_s?: number | null
@@ -340,6 +355,7 @@ function parseCaps(body: ServerBody): ModelCaps {
     ocr: ocrCapsFrom(body.ocr),
     docParser: body.document_parser ?? undefined,
     audio: body.audio ?? undefined,
+    realtimeTranscription: body.realtime_transcription ?? undefined,
     aligner: body.aligner ? true : undefined,
     alignmentMaxClipS: body.alignment_max_clip_s ?? undefined,
     transcriptionMaxClipS: body.transcription_max_clip_s ?? undefined,
@@ -481,6 +497,14 @@ export const useModelsStore = defineStore('models', () => {
   function transcribeStreams(id?: string): boolean {
     const want = id || currentId.value
     return !models.value.find((m) => m.id === want)?.cloud
+  }
+
+  function canLiveTranscribe(id: string): boolean {
+    return transcribeStreams(id) && canTranscribe(id) && caps.value[id]?.realtimeTranscription?.supported !== false
+  }
+  function canEnrichLive(id: string): boolean {
+    const cap = caps.value[id]
+    return realtimeEnrichment(cap?.realtimeTranscription, cap?.timestampGranularities)
   }
 
   /** Attachment-costing endpoint (composer chip): the runner's count_tokens
@@ -904,33 +928,30 @@ export const useModelsStore = defineStore('models', () => {
             spec: r.spec ?? undefined,
           }
         })
-      // Cloud models join the one list. Keyless endpoints stay out - nothing
-      // could be sent there, and the management page says why. Vision
+      // Cloud models join the one list. Keyless endpoints require an explicit
+      // no-auth choice (custom local servers); absence of a key alone is not
+      // permission to send. Vision
       // defaults to true: silently not sending an image would be the worse
       // failure, and a text-only provider model refuses with its own words.
       const cloud: ModelInfo[] = cloudEndpoints.value
-        .filter((ep) => ep.hasKey)
+        .filter((ep) => ep.hasKey || ep.allowUnauthenticated === true)
         .flatMap((ep) =>
           (ep.models ?? []).map((cm) => {
             // bare native ids (o3-mini, claude-sonnet-5) name no maker; the
             // endpoint KIND does
-            const vendor =
-              cloudVendor(cm.id) ??
-              (ep.kind === 'openai' ? 'OpenAI' : ep.kind === 'anthropic' ? 'Anthropic' : undefined)
             // OpenRouter bakes the maker into the display ("Qwen: Qwen3.5-9B")
             // while the vendor mark next to it says the same thing - "Qwen
             // twice" . The mark carries the brand, so the
             // name sheds the prefix here and every view downstream agrees.
-            let name = cm.display ?? cm.id
-            if (cloudVendor(cm.id)) name = name.replace(/^[^:]{2,24}:\s+/, '')
+            const identity = cloudModelIdentity(cm.id, cm.display, ep.kind, cm.provider)
             return {
               // a provider-pinned pick is its own pickable model: the @suffix
               // rides the wire model, where the relay turns it into
               // OpenRouter's provider-routing preference
               id: `cloud:${ep.id}:${cm.id}${cm.provider ? `@${cm.provider}` : ''}`,
               ownedBy: 'cloud',
-              display: cm.provider ? `${name} (${cm.provider})` : name,
-              vendor,
+              display: identity.name,
+              vendor: identity.vendor,
               vision: cm.vision ?? true,
               // A cloud speech model is a TRANSCRIBER, exactly like a
               // whisper-family runner: `takesTurns` still seats it in a lane,
@@ -940,7 +961,7 @@ export const useModelsStore = defineStore('models', () => {
               // `canChat` reads the kind, and the timing/confidence gates read
               // fetched caps, which a cloud model has none of.
               kind: cm.asr ? ('transcriber' as const) : ('chat' as const),
-              status: 'ok',
+              status: ep.credentialReady === false ? 'credential-unavailable' : 'ok',
               cloud: {
                 endpoint: ep.id,
                 endpointName: ep.name,
@@ -1118,6 +1139,8 @@ export const useModelsStore = defineStore('models', () => {
     outCapFor,
     transcribeUrl,
     transcribeStreams,
+    canLiveTranscribe,
+    canEnrichLive,
     visionFor,
     ocrFor,
     canTranscribe,

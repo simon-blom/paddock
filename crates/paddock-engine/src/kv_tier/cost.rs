@@ -176,6 +176,15 @@ impl CostModel {
         }
     }
 
+    /// A backend's first actual span replaces the generic boot seed. Subsequent
+    /// observations still use the conservative EWMA; a CUDA throughput prior
+    /// must not take dozens of requests to converge on a smaller Apple GPU.
+    pub fn seed_prefill(&mut self, tokens: u32, actual_us: f64) {
+        if tokens > 0 && actual_us.is_finite() && actual_us > 0.0 {
+            self.prefill_tpus = Ewma::new(tokens as f64 / actual_us);
+        }
+    }
+
     /// Current per-tier restore rates in bytes/us (T1, T2) - an export.
     pub fn rates_bpus(&self) -> (f64, f64) {
         (self.restore_bpus.get(), self.restore_nvme_bpus.get())

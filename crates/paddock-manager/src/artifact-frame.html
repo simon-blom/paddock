@@ -1,0 +1,114 @@
+<!doctype html>
+<html><head><meta charset="utf-8"></head><body><script>
+(() => {
+  // An opaque origin makes Web Storage THROW on access, so ordinary canvas
+  // code dies on its first localStorage read. Shim both with a memory map.
+  const memory = () => {
+    const d = new Map();
+    return {
+      get length() { return d.size },
+      key: (i) => Array.from(d.keys())[i] ?? null,
+      getItem: (k) => d.has(String(k)) ? d.get(String(k)) : null,
+      setItem: (k, v) => d.set(String(k), String(v)),
+      removeItem: (k) => d.delete(String(k)),
+      clear: () => d.clear(),
+    };
+  };
+  for (const name of ["localStorage", "sessionStorage"]) {
+    try { void window[name]; continue } catch {}
+    try { Object.defineProperty(window, name, { value: memory(), configurable: true }) } catch {}
+  }
+  const resize = '<scr' + 'ipt>(()=>{const p=()=>parent.postMessage(' +
+    '{paddockArtifactHeight:document.documentElement.scrollHeight},"*");' +
+    'new ResizeObserver(p).observe(document.documentElement);' +
+    'addEventListener("load",p);p();})();</scr' + 'ipt>';
+  // The Studio's own thin, tinted scrollbars, applied to a document we do not
+  // otherwise style. Both properties INHERIT, so setting them on <html> reaches
+  // every scroller inside the artifact, and going through CSSOM rather than
+  // writing a <style> means a bad value is rejected instead of injected. The
+  // panel sends the colour because only it knows the current theme.
+  const skin = (thumb, minimal) => {
+    const de = document.documentElement;
+    if (!de || typeof thumb !== "string") return;
+    de.style.setProperty("scrollbar-width", "thin");
+    de.style.setProperty("scrollbar-color", thumb + " transparent");
+    // The native app explicitly opts into its fixed-width chrome. Standalone
+    // web Studio keeps its existing thin system scrollbar. No model CSS is
+    // interpolated, and the iframe's sandbox/network policy is unchanged.
+    if (minimal === true && CSS.supports("color", thumb)) {
+      de.style.setProperty("--paddock-scroll-thumb", thumb);
+      const style = document.createElement("style");
+      style.textContent = `
+        html,html *{scrollbar-width:auto!important;scrollbar-color:auto!important}
+        ::-webkit-scrollbar{width:10px!important;height:10px!important;background:transparent!important}
+        ::-webkit-scrollbar-thumb{background:var(--paddock-scroll-thumb)!important;background-clip:padding-box!important;border:3px solid transparent!important;border-radius:8px!important}
+        ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent!important}
+        ::-webkit-scrollbar-button{display:none!important}
+      `;
+      document.head.append(style);
+    }
+  };
+  // No silent failures, even in here. A picture that never arrives renders as
+  // a page that is simply wrong - the case that forced this drew white hero
+  // text over a background that never loaded, which reads as blank. Report
+  // every one, and say which kind of nothing it was: refused by our policy
+  // (the panel can offer to allow pictures) or fetched and failed (the address
+  // is dead, as via.placeholder.com now is - and no policy fixes that).
+  //
+  // A CSS background announces itself through neither channel: no load event,
+  // no error event, and once pictures are allowed not even a violation. So the
+  // shell collects every URL the finished document references and test-loads
+  // each. Listeners go on the WINDOW - document.open() below drops everything
+  // registered on the document.
+  const missing = { blocked: [], failed: [] };
+  const seen = new Set();
+  const report = () => parent.postMessage({ paddockArtifactMissing: missing }, "*");
+  addEventListener("securitypolicyviolation", (ev) => {
+    const u = String(ev.blockedURI || "").slice(0, 300);
+    if (!u || u === "inline" || seen.has(u)) return;
+    seen.add(u); missing.blocked.push(u); report();
+  }, true);
+  const probe = () => {
+    const urls = new Set();
+    for (const el of Array.from(document.querySelectorAll("*")).slice(0, 600)) {
+      let bg = "";
+      try { bg = getComputedStyle(el).backgroundImage || "" } catch {}
+      for (const m of bg.matchAll(/url\((['"]?)([^'")]+)\1\)/g)) urls.add(m[2]);
+      const src = el.currentSrc || el.src || "";
+      if (src) urls.add(String(src));
+    }
+    for (const u of urls) {
+      if (!/^https?:/i.test(u) || seen.has(u)) continue;
+      const im = new Image();
+      // A refused fetch fires both a violation and an error; let the violation
+      // land first so it reads as refused rather than as broken.
+      im.onerror = () => setTimeout(() => {
+        if (seen.has(u)) return;
+        seen.add(u); missing.failed.push(String(u).slice(0, 300)); report();
+      }, 0);
+      im.src = u;
+    }
+  };
+  addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.type !== "paddock:artifact" || typeof d.html !== "string") return;
+    // document.write() on PURPOSE, and Chrome will log a [Violation] for it.
+    // That advisory is about write() during the INITIAL PARSE, where it blocks
+    // the parser and stalls load; this runs from a message handler long after
+    // load, so the harm it warns about does not apply.
+    //
+    // Do not "fix" it. The alternatives cannot do this job: innerHTML and
+    // DOMParser do not EXECUTE scripts, and both the appended `resize` snippet
+    // and the artifact's own scripts (mermaid and friends) have to run. srcdoc
+    // is out for a different reason - see ArtifactPane.vue: the frame is served
+    // from a real URL precisely so frame-ancestors and sandbox apply to it.
+    document.open();
+    document.write(d.html + resize);
+    document.close();
+    // After close(): document.write replaced the element we just styled.
+    skin(d.scrollbar, d.minimalScrollbar);
+    // Let styles apply before asking what the page references.
+    setTimeout(probe, 50);
+  });
+})();
+</script></body></html>

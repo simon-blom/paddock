@@ -51,7 +51,9 @@ use axum::http::request::Parts;
 use rmcp::ErrorData;
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ServerCapabilities, ServerConfig as McpServerConfig,
+};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -763,6 +765,11 @@ async fn content(
                 axum::http::HeaderName::from_static("x-artifact-version"),
                 axum::http::HeaderValue::from(seq),
             );
+            h.insert(
+                axum::http::header::ETAG,
+                axum::http::HeaderValue::from_str(&format!("\"{seq}\""))
+                    .expect("a quoted integer is a valid header value"),
+            );
             (h, body).into_response()
         }
         Ok(None) => err404("no such artifact or version"),
@@ -777,11 +784,36 @@ async fn content(
 async fn put_content(
     axum::extract::State(s): axum::extract::State<Arc<crate::routes::AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match s.db.append_artifact_version(&id, "edit", &body) {
+    let expected = match headers.get(axum::http::header::IF_MATCH) {
+        None => None, // Older clients retain the unconditional append protocol.
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|s| s.strip_prefix('"')?.strip_suffix('"')?.parse::<i64>().ok())
+            .filter(|seq| *seq > 0)
+        {
+            Some(seq) => Some(seq),
+            None => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "If-Match must be a quoted artifact revision",
+                )
+                    .into_response();
+            }
+        },
+    };
+    match s
+        .db
+        .append_artifact_version_if_current(&id, "edit", &body, expected)
+    {
         Ok(seq) => axum::response::Json(serde_json::json!({ "seq": seq })).into_response(),
+        Err(crate::store::StoreError::Conflict(m)) => {
+            (axum::http::StatusCode::PRECONDITION_FAILED, m).into_response()
+        }
         // The store reports an unknown id this way; everything else is ours.
         Err(crate::store::StoreError::Bad(m)) => err404(&m),
         Err(e) => err500(e),
@@ -834,105 +866,7 @@ const FRAME_CSP_IMG: &str = "default-src 'none'; \
 /// panel posts the body in after load. Sandboxed with `allow-scripts` and no
 /// `allow-same-origin`, so the document runs at an opaque origin and can touch
 /// nothing of ours.
-const FRAME_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"></head><body><script>
-(() => {
-  // An opaque origin makes Web Storage THROW on access, so ordinary canvas
-  // code dies on its first localStorage read. Shim both with a memory map.
-  const memory = () => {
-    const d = new Map();
-    return {
-      get length() { return d.size },
-      key: (i) => Array.from(d.keys())[i] ?? null,
-      getItem: (k) => d.has(String(k)) ? d.get(String(k)) : null,
-      setItem: (k, v) => d.set(String(k), String(v)),
-      removeItem: (k) => d.delete(String(k)),
-      clear: () => d.clear(),
-    };
-  };
-  for (const name of ["localStorage", "sessionStorage"]) {
-    try { void window[name]; continue } catch {}
-    try { Object.defineProperty(window, name, { value: memory(), configurable: true }) } catch {}
-  }
-  const resize = '<scr' + 'ipt>(()=>{const p=()=>parent.postMessage(' +
-    '{paddockArtifactHeight:document.documentElement.scrollHeight},"*");' +
-    'new ResizeObserver(p).observe(document.documentElement);' +
-    'addEventListener("load",p);p();})();</scr' + 'ipt>';
-  // The Studio's own thin, tinted scrollbars, applied to a document we do not
-  // otherwise style. Both properties INHERIT, so setting them on <html> reaches
-  // every scroller inside the artifact, and going through CSSOM rather than
-  // writing a <style> means a bad value is rejected instead of injected. The
-  // panel sends the colour because only it knows the current theme.
-  const skin = (thumb) => {
-    const de = document.documentElement;
-    if (!de || typeof thumb !== "string") return;
-    de.style.setProperty("scrollbar-width", "thin");
-    de.style.setProperty("scrollbar-color", thumb + " transparent");
-  };
-  // No silent failures, even in here. A picture that never arrives renders as
-  // a page that is simply wrong - the case that forced this drew white hero
-  // text over a background that never loaded, which reads as blank. Report
-  // every one, and say which kind of nothing it was: refused by our policy
-  // (the panel can offer to allow pictures) or fetched and failed (the address
-  // is dead, as via.placeholder.com now is - and no policy fixes that).
-  //
-  // A CSS background announces itself through neither channel: no load event,
-  // no error event, and once pictures are allowed not even a violation. So the
-  // shell collects every URL the finished document references and test-loads
-  // each. Listeners go on the WINDOW - document.open() below drops everything
-  // registered on the document.
-  const missing = { blocked: [], failed: [] };
-  const seen = new Set();
-  const report = () => parent.postMessage({ paddockArtifactMissing: missing }, "*");
-  addEventListener("securitypolicyviolation", (ev) => {
-    const u = String(ev.blockedURI || "").slice(0, 300);
-    if (!u || u === "inline" || seen.has(u)) return;
-    seen.add(u); missing.blocked.push(u); report();
-  }, true);
-  const probe = () => {
-    const urls = new Set();
-    for (const el of Array.from(document.querySelectorAll("*")).slice(0, 600)) {
-      let bg = "";
-      try { bg = getComputedStyle(el).backgroundImage || "" } catch {}
-      for (const m of bg.matchAll(/url\((['"]?)([^'")]+)\1\)/g)) urls.add(m[2]);
-      const src = el.currentSrc || el.src || "";
-      if (src) urls.add(String(src));
-    }
-    for (const u of urls) {
-      if (!/^https?:/i.test(u) || seen.has(u)) continue;
-      const im = new Image();
-      // A refused fetch fires both a violation and an error; let the violation
-      // land first so it reads as refused rather than as broken.
-      im.onerror = () => setTimeout(() => {
-        if (seen.has(u)) return;
-        seen.add(u); missing.failed.push(String(u).slice(0, 300)); report();
-      }, 0);
-      im.src = u;
-    }
-  };
-  addEventListener("message", (e) => {
-    const d = e.data;
-    if (!d || d.type !== "paddock:artifact" || typeof d.html !== "string") return;
-    // document.write() on PURPOSE, and Chrome will log a [Violation] for it.
-    // That advisory is about write() during the INITIAL PARSE, where it blocks
-    // the parser and stalls load; this runs from a message handler long after
-    // load, so the harm it warns about does not apply.
-    //
-    // Do not "fix" it. The alternatives cannot do this job: innerHTML and
-    // DOMParser do not EXECUTE scripts, and both the appended `resize` snippet
-    // and the artifact's own scripts (mermaid and friends) have to run. srcdoc
-    // is out for a different reason - see ArtifactPane.vue: the frame is served
-    // from a real URL precisely so frame-ancestors and sandbox apply to it.
-    document.open();
-    document.write(d.html + resize);
-    document.close();
-    // After close(): document.write replaced the element we just styled.
-    skin(d.scrollbar);
-    // Let styles apply before asking what the page references.
-    setTimeout(probe, 50);
-  });
-})();
-</script></body></html>"#;
+const FRAME_HTML: &str = include_str!("artifact-frame.html");
 
 #[derive(Deserialize)]
 pub struct FrameQuery {
@@ -964,8 +898,8 @@ async fn frame(
 
 #[tool_handler]
 impl ServerHandler for Artifacts {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> McpServerConfig {
+        McpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
     }
 }
@@ -1614,6 +1548,55 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn conditional_edits_do_not_overwrite_a_model_update() {
+        let state = Arc::new(AppState::for_tests());
+        let id = state
+            .db
+            .create_artifact("conv-cas", "html", "T", "html", "m", "one")
+            .unwrap();
+        let route = router(state.clone());
+        let get = route
+            .clone()
+            .oneshot(
+                axum::http::Request::get(format!("/api/artifacts/{id}/content"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.headers()[axum::http::header::ETAG], "\"1\"");
+        state
+            .db
+            .append_artifact_version(&id, "update", "two")
+            .unwrap();
+        for (etag, body, status) in [
+            ("\"1\"", "stale edit", 412),
+            ("garbage", "bad edit", 400),
+            ("\"2\"", "human edit", 200),
+            ("\"3\"", "human edit", 200), // No-op does not manufacture a revision.
+            ("\"2\"", "human edit", 412), // Stale even if body happens to match.
+        ] {
+            let response = route
+                .clone()
+                .oneshot(
+                    axum::http::Request::put(format!("/api/artifacts/{id}/content"))
+                        .header(axum::http::header::IF_MATCH, etag)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+        }
+        let (_, body, seq) = state.db.artifact_content(&id, None).unwrap().unwrap();
+        assert_eq!((body.as_str(), seq), ("human edit", 3));
+        assert_eq!(
+            state.db.artifact_content(&id, Some(2)).unwrap().unwrap().1,
+            "two"
+        );
     }
 
     /// Asking for pictures widens one directive and nothing else - in

@@ -22,7 +22,7 @@
 //! and keeps the trunk rows for `[end, pos)` in a small stash - their next
 //! token is not all known yet (the newest one's never is). While a slot is
 //! tracked, `end + stash_n == pos`, and `stash_n >= 1` after any walk. A draft
-//! feeds the whole stash plus the pending token in ONE head pass (the catch-up
+//! feeds the whole stash plus the pending token in one head pass (the catch-up
 //! rows and chain step 0 together), so the head's cache holds TRUNK rows for
 //! every committed position and chain rows only above the frontier, where the
 //! next feed rewrites them before anything reads them.
@@ -78,27 +78,145 @@ pub(crate) struct Mtp {
     /// cost acceptance, never correctness.
     draft_prefix: usize,
     draft_tail: usize,
+    /// Scheduler hints (`Generator::spec_fuse_hint` / `spec_warm_hint`): is
+    /// speculation the plan for the current width at all? Feeding this head is
+    /// not free (every decode row is stashed, and every drain runs a head
+    /// pass), so on a tick no round will consume, that work is pure loss.
+    /// Measured at 8 live slots (2026-09-17): a k=0 tick with the head fed
+    /// took 45.6 ms against ~26 ms with no head attached, which is the whole
+    /// c8 margin.
+    ///
+    /// Default true: a backend must behave as before until the scheduler says
+    /// otherwise, and the hints arrive once per tick.
+    pub(super) feed: bool,
+    pub(super) warm_prefills: bool,
+    /// Canonical rejection sampling (PADDOCK_SPEC_RS). `None` when the arm is
+    /// off, which is the default and costs nothing - the buffers below are the
+    /// arm, exactly as gemma4 does it.
+    pub(crate) rs: Option<RsBufs>,
+    /// True for the duration of one chain that is drafting under RS: the round
+    /// had draws for this slot and the buffers are primed. Per round, not per
+    /// attach, because a greedy slot in an otherwise sampled tick still draws
+    /// inv_t 0 and must take the argmax path.
+    #[allow(dead_code)]
+    pub(crate) rs_active: bool,
+}
+
+/// Canonical-RS device state for the Flash-Next head.
+///
+/// Why this exists: the chain's picks are device argmaxes, so a slot sampling
+/// at temperature > 0 cannot take them without changing the emitted
+/// distribution - which is why `service::run_batched`'s greedy gate sends every
+/// sampled request down the dense path, and why this family measured 29.3 tok/s
+/// on real traffic against 35+ on a greedy benchmark (2026-09-19). The fix is
+/// the canonical rule: draft sampled from the drafter softmax q, accept with
+/// probability min(1, p/q), recover from the residual. Same emitted
+/// distribution as sampling without a drafter - lossless, not an approximation.
+///
+/// The q-store holds the fp16 exp mass of each chain row so the verify's
+/// resolve can read q back for the row it is accepting against; `qsum` carries
+/// the exact f32 normalizer, and 0 there marks a greedy (argmax) row so mixed
+/// greedy/sampled rounds resolve correctly in one pass.
+// Fields are read by the batched chain and the verify resolve, which land with
+// the async round (see the module note on `rs_active`); allow until then so the
+// arm can be reviewed and built in isolation.
+#[allow(dead_code)]
+pub(crate) struct RsBufs {
+    /// [MTP_MAX_DRAFT, rows, vocab] fp16 exp mass: q of each chain row
+    pub(crate) qstore: CudaSlice<u16>,
+    /// exact f32 sums of the stored rows; 0 marks a greedy (argmax) row
+    pub(crate) qsum: CudaSlice<f32>,
+    /// per-chain-row 1/T for the draft draw (0 = argmax)
+    pub(crate) invt: CudaSlice<f32>,
+    /// [k, rows] per-step draft-draw uniforms, from the slot's own seed stream
+    pub(crate) uplane: CudaSlice<f32>,
+    /// device chain-step counter (reset per round, +1 per step)
+    pub(crate) step: CudaSlice<u32>,
+    /// verify-resolve params, 8 u32 words per drafted row
+    pub(crate) par: CudaSlice<u32>,
+}
+
+/// Drafted-row ceiling the RS resolve param buffer is sized for. The service's
+/// row budget is 32 on this family and a chunk is at most `VERIFY_MAX_CHUNK`,
+/// so 256 is an order of magnitude of headroom.
+#[allow(dead_code)]
+pub(crate) const RS_PAR_ROWS: usize = 256;
+
+/// PADDOCK_SPEC_RS=1 arms canonical rejection sampling. Off by default: the
+/// arm is new on this arch (2026-09-19) and has not been through a
+/// distribution-equivalence gate here, so it must be asked for by name.
+#[allow(dead_code)]
+pub(crate) fn spec_rs_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_SPEC_RS").is_some())
 }
 
 impl Qwen4ExpGpu {
-    /// Attach the MTP head GGUF (`--mtp`). GGUF lane only: the head borrows
-    /// this model's token embedding and lm_head.
+    /// Attach a sideloaded MTP head GGUF (`--mtp`). The GGUF lane needs this
+    /// because unsloth's UD export strips the in-file block; a safetensors
+    /// checkpoint that carries its own takes `attach_mtp_in_file` instead.
     pub fn attach_mtp(&mut self, path: &Path) -> Result<(), GpuModelError> {
         if !matches!(self.st, PleSource::Gguf { .. }) {
             return Err(GpuModelError::Unsupported(
-                "the qwen4exp MTP head attaches to the GGUF lane only".into(),
+                "a sideloaded qwen4exp MTP head attaches to the GGUF lane only; the \
+                 safetensors lane carries its own under mtp.*"
+                    .into(),
             ));
         }
-        if !self.exec.has_argmax_rows() {
-            return Err(GpuModelError::Unsupported(
-                "kernel pack has no argmax_rows - the draft chain needs it".into(),
-            ));
-        }
+        Self::mtp_precheck(&self.exec)?;
         let map = MappedGguf::open(path)
             .map_err(|e| GpuModelError::Unsupported(format!("MTP head {}: {e}", path.display())))?;
         let before = self.exec.settled_mem_used();
         let w = crate::gpu_model::qwen4exp::load_gguf::load_mtp(&self.exec, &map, &self.cfg)?;
         drop(map);
+        self.attach_mtp_weights(w, before, &path.display().to_string())
+    }
+
+    /// Attach the head the checkpoint ships (`mtp.*`), safetensors lane.
+    ///
+    /// Called at load when the config declares one, so speculation is simply
+    /// available on such a checkpoint - no `--mtp`, nothing for an operator to
+    /// know. Before this the weights loaded not at all and the serve decoded
+    /// dense with a resident-but-unused drafter, which is exactly the silent
+    /// class the load-time warning in `service::run_batched` now names.
+    pub fn attach_mtp_in_file(&mut self) -> Result<(), GpuModelError> {
+        let PleSource::St(st) = &self.st else {
+            return Err(GpuModelError::Unsupported(
+                "the in-file qwen4exp MTP head is a safetensors-lane feature".into(),
+            ));
+        };
+        Self::mtp_precheck(&self.exec)?;
+        let before = self.exec.settled_mem_used();
+        let w = crate::gpu_model::qwen4exp::load::load_mtp_st(&self.exec, st, &self.cfg)?;
+        self.attach_mtp_weights(w, before, "in-file (mtp.*)")
+    }
+
+    /// Does this checkpoint carry its own MTP block? `text_config.mtp_num_
+    /// hidden_layers` is the declaration; the GGUF lane always answers false
+    /// because the export it reads has the block stripped.
+    pub fn has_in_file_mtp(&self) -> bool {
+        matches!(self.st, PleSource::St(_)) && self.cfg.mtp_layers > 0
+    }
+
+    /// The pack entries a draft chain cannot run without.
+    fn mtp_precheck(exec: &Arc<GpuExecutor>) -> Result<(), GpuModelError> {
+        if !exec.has_argmax_rows() {
+            return Err(GpuModelError::Unsupported(
+                "kernel pack has no argmax_rows - the draft chain needs it".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Seat a loaded head: its KV, the chain scratch and the draft shortlist.
+    /// Shared by both lanes so a head is the same resident object however it
+    /// arrived.
+    fn attach_mtp_weights(
+        &mut self,
+        w: crate::gpu_model::qwen4exp::load_gguf::MtpWeights,
+        before: Option<u64>,
+        src: &str,
+    ) -> Result<(), GpuModelError> {
         let (c, e) = (&self.cfg, &self.exec);
         let (slots, t) = (self.slots, self.max_tokens);
         let kv_bytes = slots * t * c.n_kv_heads * c.head_dim * KV().bytes();
@@ -161,6 +279,31 @@ impl Qwen4ExpGpu {
             seed_chunk: seed,
             draft_prefix,
             draft_tail,
+            feed: true,
+            warm_prefills: true,
+            rs_active: false,
+            // Parked, deliberately, and it must stay parked until the verify
+            // resolve below exists.
+            //
+            // `supports_spec_rs` answers from this field, and the service
+            // stashes per-slot chain draws exactly when that answers true. A
+            // backend that claimed the arm without a `spec_rs_resolve` in its
+            // verify would take sampled rounds it resolves with the greedy
+            // accept-while-match rule - silently emitting the wrong
+            // distribution, which is worse than declining.
+            //
+            // It also turned out not to be the lever this family needs first.
+            // `pd_draft_rs`/`pd_spec_rs_resolve` buy the broad-distribution
+            // headroom (sum min(p,q) vs p(argmax q)) and need sampled drafts
+            // with a real q, which forces the chain to be batched across slots
+            // (the kernel is one CTA per chain row, q at
+            // `[step*rmax + row]`). But the resolve's own `qsum == 0` arm is
+            // the point-mass rule, and `service`'s Phase 2b-dev already runs
+            // exact rejection sampling against deterministic argmax drafts
+            // through `forward_spec_batch_plans` - which is what actually
+            // unblocks temperature > 0 traffic here, at a fraction of the work.
+            // So: plans path first, canonical RS after, and this stays None.
+            rs: None,
         };
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         let held = match (before, self.exec.settled_mem_used()) {
@@ -168,14 +311,14 @@ impl Qwen4ExpGpu {
             _ => 0,
         };
         tracing::info!(
-            path = %path.display(),
+            source = %src,
             resident_gib = gib(held),
             head_kv_gib = gib(2 * kv_bytes as u64),
             "qwen4exp MTP head attached"
         );
         eprintln!(
             "[q4x-mtp] head attached ({}): {:.2} GiB resident incl. {:.2} GiB head KV",
-            path.display(),
+            src,
             gib(held),
             gib(2 * kv_bytes as u64)
         );
@@ -233,7 +376,10 @@ impl Qwen4ExpGpu {
             let Some(m) = self.mtp.as_mut() else {
                 return Ok(());
             };
-            if !m.tracked[slot] || to <= from {
+            // The eager warm the scheduler's `spec_warm_hint` governs: seeding
+            // a prompt whose width will not speculate is prefill cost for a
+            // round that never comes.
+            if !m.warm_prefills || !m.tracked[slot] || to <= from {
                 return Ok(());
             }
             if m.stash_n[slot] != 0 || m.end[slot] != from {
@@ -286,6 +432,15 @@ impl Qwen4ExpGpu {
         let Some(m) = self.mtp.as_mut() else {
             return Ok(());
         };
+        // Not speculating at this width: stop stashing. The slots then fall
+        // out of step with their stash and `mtp_note_rows` marks them cold on
+        // the tick feeding resumes, which is the same self-healing path a
+        // dense interlude already used - a cold slot drafts nothing until its
+        // next prompt seeds it, and that is the documented trade for the ticks
+        // this saves (see the `feed` field).
+        if !m.feed {
+            return Ok(());
+        }
         for (j, &(sl, _)) in rows.iter().enumerate() {
             if !m.tracked[sl] {
                 continue;
@@ -343,6 +498,9 @@ impl Qwen4ExpGpu {
     /// are read.
     pub(super) fn mtp_flush(&mut self) -> Result<(), GpuModelError> {
         let due: Vec<usize> = match self.mtp.as_ref() {
+            // the drain is where the head PASS happens - the expensive half of
+            // feeding, and the half a non-speculating width must not pay
+            Some(m) if !m.feed => return Ok(()),
             Some(m) => (0..self.slots)
                 .filter(|&s| m.tracked[s] && m.stash_n[s] >= FLUSH_AT)
                 .collect(),
@@ -468,7 +626,7 @@ impl Qwen4ExpGpu {
     /// One head pass over `toks.len()` rows of `slot` at positions `p0..`:
     /// row i pairs the stream row the caller staged at `d_gate[i]` with
     /// `toks[i]`, the token at `p0 + i + 1`. Writes head KV. With `draft`,
-    /// returns the head's pick after the LAST row and leaves that row's block
+    /// returns the head's pick after the last row and leaves that row's block
     /// output in `multi` for the next chain step.
     ///
     /// Reuses the walk's scratch wholesale (the head is a full qwen4exp
@@ -647,6 +805,43 @@ impl Qwen4ExpGpu {
                     )?;
                 }
                 e.argmax_rows(logits, pick, 1, prefix + tail)?;
+                true
+            }
+            // Every OTHER dense class (the safetensors lanes: bf16, its f16
+            // twin, f8row, MXFP8) takes the same shortlist through
+            // `matmul_rows`, which is a ROW PREFIX of the plane and therefore
+            // exactly the same bytes the k-quant arm above reads. Until this
+            // existed the shortlist fired on the GGUF lane only and every
+            // safetensors draft read the whole 248320-row head - 1.18 GB of
+            // bf16 a pass, three passes a round, 26% of the round's bytes on
+            // a lane whose drafts are otherwise cheap.
+            //
+            // Prefix only: `matmul_rows` lands its output at 0, so the added
+            // -token tail would need a second landing offset the k-quant arm
+            // gets for free. The prefix is the part that matters (BPE ids are
+            // merge-ordered, so the low ids ARE the frequent tokens) and a
+            // missing tail costs acceptance, never correctness.
+            // ...but only the classes whose `matmul_rows` IS a row prefix.
+            // F8Row holds a per-row-scaled plane with no row-offset entry and
+            // answers Unsupported, and a draft pass that errors does not fail
+            // the serve - the drafter just returns nothing and speculation
+            // silently dies. Measured: f8row + this shortlist ran 8800 rounds
+            // at 0.00 drafted, 1.00 tokens a round, 23.8 tok/s against 46.9,
+            // and the only sign was "no folded planes" in the serve log. So
+            // the class check is here rather than at the call, and an
+            // unsupported class keeps the FULL-vocab head.
+            _ if prefix > 0
+                && tail == 0
+                && matches!(
+                    lm_head,
+                    DensePlane::Bf16(_)
+                        | DensePlane::Dual { .. }
+                        | DensePlane::F16 { .. }
+                        | DensePlane::Mxf8 { .. }
+                ) =>
+            {
+                lm_head.matmul_rows(e, 0, prefix, &sc.d_bi, logits, 1, stage)?;
+                e.argmax_rows(logits, pick, 1, prefix)?;
                 true
             }
             _ => {

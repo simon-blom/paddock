@@ -40,6 +40,9 @@ pub struct MoeOffload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Exact file parsed at startup, before environment/CLI overlays. Never sent to clients.
+    #[serde(skip)]
+    pub loaded_file: Option<toml::Value>,
     /// All interfaces by default: the endpoint exists for other
     /// machines. The auth policy is what makes that safe - a non-loopback
     /// bind with no key auto-generates and requires one, and loopback peers
@@ -67,7 +70,7 @@ pub struct Config {
     /// any key the runner doesn't know into a hard spawn failure, so a manager
     /// that writes this needs a runner that accepts it in the same release.
     pub catalog: Option<CatalogRef>,
-    /// Serving device - "cuda" is the only backend (GPU-only law; the CPU
+    /// Serving device - "cuda", or experimental "metal" on M5 (the CPU
     /// reference arm is gone). Kept a string for the ROCm /
     /// Metal / Vulkan packs to come.
     pub device: String,
@@ -150,8 +153,8 @@ pub struct Config {
     /// owner's call, not a default we move.
     ///
     /// Clamped by the tower to what its position tables can address, and
-    /// read today only by the gemma4 family - the log says so at load if it
-    /// is set for a model that does not use it.
+    /// read today only by the CUDA gemma4 tower - the log says so at load
+    /// if it is set for a model/backend that does not use it.
     pub max_image_tokens: Option<u32>,
 
     // --- Abuse controls for intentionally-exposed (public/demo) instances.
@@ -200,6 +203,7 @@ pub struct Config {
     pub seed: Option<u64>,
     /// KV cache element type: "auto" (per-family default: gemma4 fp8-e4m3
     /// when pooled, others f16), "f16", or "fp8_e4m3" (`--kv-cache-dtype`).
+    /// Native Bonsai Metal also accepts its fixed "f32" checkpoint precision.
     pub kv_cache_dtype: String,
     /// Serve the model under this id instead of the file-derived one
     /// (`--served-model-name`, the vLLM flag).
@@ -315,6 +319,7 @@ pub struct CatalogRef {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            loaded_file: None,
             // All interfaces by default: agents on other
             // machines are the tier-1 workload. The API key + the loopback
             // exemption in auth_mw are what make this safe - network callers
@@ -470,7 +475,10 @@ impl Config {
     /// a hard error, never a silent fallback to defaults.
     pub fn from_toml(path: &PathBuf) -> Result<Self, ConfigError> {
         let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.clone(), e))?;
-        toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.clone(), e))
+        let mut cfg: Self =
+            toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.clone(), e))?;
+        cfg.loaded_file = toml::from_str(&raw).ok();
+        Ok(cfg)
     }
 
     /// Overlay `PADDOCK_*` environment variables onto this config. Every field
@@ -731,6 +739,7 @@ pub const ENV_SURFACE: &[&str] = &[
     "PADDOCK_NVFP4_NATIVE",
     "PADDOCK_PDF_MAX_PAGES",
     "PADDOCK_PDF_PAGE_LONG_EDGE",
+    "PADDOCK_MAX_IMAGE_TOKENS",
     "PADDOCK_PORT",
     "PADDOCK_RATELIMIT_PER_DAY",
     "PADDOCK_RATELIMIT_PER_MINUTE",

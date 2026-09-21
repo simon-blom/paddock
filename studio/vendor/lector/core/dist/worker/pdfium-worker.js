@@ -724,7 +724,7 @@ async function renderPageTileToImageBitmap(pdfium2, docHandle, pageIndex, tileX,
     }
     const rgbaBytes = new Uint8ClampedArray(pixelsCopy.buffer);
     const imageData = new ImageData(rgbaBytes, tileW, tileH);
-    return await createImageBitmap(imageData);
+    return createImageBitmap(imageData);
   } finally {
     if (bitmap !== 0) fn._FPDFBitmap_Destroy(bitmap);
     if (page !== 0) fn._FPDF_ClosePage(page);
@@ -799,8 +799,7 @@ async function renderPageToImageBitmap(pdfium2, docHandle, pageIndex, width, hei
     }
     const rgbaBytes = new Uint8ClampedArray(pixelsCopy.buffer);
     const imageData = new ImageData(rgbaBytes, width, height);
-    const imageBitmap = await createImageBitmap(imageData);
-    return imageBitmap;
+    return createImageBitmap(imageData);
   } finally {
     if (bitmap !== 0) {
       fn._FPDFBitmap_Destroy(bitmap);
@@ -5335,3 +5334,4 @@ comlink/dist/esm/comlink.mjs:
    * SPDX-License-Identifier: Apache-2.0
    *)
 */
+//# sourceMappingURL=pdfium-worker.js.map

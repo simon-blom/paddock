@@ -1,0 +1,11 @@
+[
+  {"input":"banner\u0000", "raw":"banner", "level":null,"effective":null,"module":null,"message":null},
+  {"input":"\u001b[32m2026-09-16T09:12:01.123456Z  INFO paddock_runner::load: model ready\u001b[0m", "raw":"2026-09-16T09:12:01.123456Z  INFO paddock_runner::load: model ready", "level":"INFO","effective":"INFO","module":"paddock_runner::load","message":"model ready"},
+  {"input":"  continuation", "raw":"  continuation", "level":null,"effective":"INFO","module":null,"message":null},
+  {"input":"2026-09-16T09:12:02Z WARN paddock_runner::kv: memory pressure", "raw":"2026-09-16T09:12:02Z WARN paddock_runner::kv: memory pressure", "level":"WARN","effective":"WARN","module":"paddock_runner::kv","message":"memory pressure"},
+  {"input":"\u001b]0;title\u0007details\t€", "raw":"details\t€", "level":null,"effective":"WARN","module":null,"message":null},
+  {"input":"thread 'worker' panicked at fixture", "raw":"thread 'worker' panicked at fixture", "level":"ERROR","effective":"ERROR","module":null,"message":null},
+  {"input":"  stack frame", "raw":"  stack frame", "level":null,"effective":"ERROR","module":null,"message":null},
+  {"input":"[12481] 2026-09-16T09:12:03 DEBUG paddock_runner::scheduler: next batch", "raw":"[12481] 2026-09-16T09:12:03 DEBUG paddock_runner::scheduler: next batch", "level":"DEBUG","effective":"DEBUG","module":"paddock_runner::scheduler","message":"next batch"},
+  {"input":"2026-09-16T09:12:04Z TRACE paddock_runner: tick", "raw":"2026-09-16T09:12:04Z TRACE paddock_runner: tick", "level":"TRACE","effective":"TRACE","module":"paddock_runner","message":"tick"}
+]

@@ -36,8 +36,11 @@ export function builtinKey(name: string): string {
 
 export const useMcpToolsStore = defineStore('mcpTools', () => {
   const listings = reactive(new Map<string, ToolListing>())
+  const epochs = new Map<string, number>()
 
   async function fetchListing(key: string, body: Record<string, unknown>): Promise<void> {
+    const epoch = (epochs.get(key) ?? 0) + 1
+    epochs.set(key, epoch)
     listings.set(key, { status: 'loading', tools: [] })
     try {
       const res = await fetch('/api/mcp/tools', {
@@ -51,6 +54,7 @@ export const useMcpToolsStore = defineStore('mcpTools', () => {
         instructions?: string
         error?: { message?: string } | string
       } | null
+      if (epochs.get(key) !== epoch) return
       if (res.ok && doc?.ok && Array.isArray(doc.tools)) {
         listings.set(key, { status: 'ok', tools: doc.tools, instructions: doc.instructions })
       } else {
@@ -58,6 +62,7 @@ export const useMcpToolsStore = defineStore('mcpTools', () => {
         listings.set(key, { status: 'error', tools: [], error: msg ?? `listing failed (${res.status})` })
       }
     } catch (e) {
+      if (epochs.get(key) !== epoch) return
       listings.set(key, { status: 'error', tools: [], error: e instanceof Error ? e.message : String(e) })
     }
   }
@@ -91,5 +96,12 @@ export const useMcpToolsStore = defineStore('mcpTools', () => {
     return listings.get(key)
   }
 
-  return { listings, ensureServer, ensureConnector, ensureBuiltin, get }
+  /** Invalidate on configuration edits, not every time the picker opens.
+   * Old in-flight probes cannot repopulate a stale credential/tool listing. */
+  function invalidate(): void {
+    for (const [key, epoch] of epochs) epochs.set(key, epoch + 1)
+    listings.clear()
+  }
+
+  return { listings, ensureServer, ensureConnector, ensureBuiltin, get, invalidate }
 })

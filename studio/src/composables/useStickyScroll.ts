@@ -30,7 +30,8 @@ export function useStickyScroll(
     if (!stuck.value || raf) return
     raf = requestAnimationFrame(() => {
       raf = 0
-      pin()
+      // The user may have scrolled up after ResizeObserver queued this frame.
+      if (stuck.value) pin()
     })
   }
 

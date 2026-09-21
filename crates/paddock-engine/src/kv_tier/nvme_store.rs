@@ -229,6 +229,18 @@ pub struct StoreStats {
     pub quota: u64,
 }
 
+/// Verified aligned read storage. Keep the I/O allocation as the immutable
+/// payload rather than copying a hundreds-of-MiB checkpoint into a second Vec.
+pub struct VerifiedRead {
+    buffer: AlignedBuf,
+    len: usize,
+}
+impl AsRef<[u8]> for VerifiedRead {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer.slice()[..self.len]
+    }
+}
+
 pub struct NvmeStore {
     dir: PathBuf,
     _lock: File,
@@ -394,11 +406,9 @@ impl NvmeStore {
         // machine offers a 15 GB/s tier and a 0.25 GB/s trap one drive
         // letter apart, and a tier on the trap serves restores that lose to
         // recompute - an honest refusal beats a silent pessimisation.
-        let io = Backend::open(&dir.join("segments"))?;
         // row 5: a checkpoint interrupted before its rename leaves a temp
         // file; the superblock still names the old checkpoint, so the temp
         // is garbage - GC it
-        let _ = std::fs::remove_file(dir.join("index.ckpt.tmp"));
         // exclusive lock: Windows share_mode(0) is real OS exclusion; on
         // unix this is advisory create-or-open (the manager already ensures
         // one runner per store - this catches the accident loudly on the
@@ -420,6 +430,19 @@ impl NvmeStore {
                 Err(e) => return Err(e.into()),
             }
         };
+
+        // macOS/Linux need actual process exclusion too. Acquire before probes,
+        // recovery, or removing a writer's temporary checkpoint.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock only consumes this live owned descriptor.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(StoreError::Locked);
+            }
+        }
+        let io = Backend::open(&dir.join("segments"))?;
+        let _ = std::fs::remove_file(dir.join("index.ckpt.tmp"));
 
         let mut report = RecoveryReport::default();
 
@@ -812,6 +835,13 @@ impl NvmeStore {
     /// Read + VERIFY a payload. A checksum mismatch tombstones the entry
     /// (never propagate a misread) and reports `Integrity`.
     pub fn read(&mut self, key: &[u8; 32]) -> Result<(u64, Vec<u8>), StoreError> {
+        self.read_owned(key)
+            .map(|(generation, bytes)| (generation, bytes.as_ref().to_vec()))
+    }
+
+    /// One allocation, no heap-to-heap payload copy. The checksum is verified
+    /// before this owned storage can be published by any asynchronous caller.
+    pub fn read_owned(&mut self, key: &[u8; 32]) -> Result<(u64, VerifiedRead), StoreError> {
         let rec = *self.live.get(key).ok_or(StoreError::NotFound)?;
         let a = self.io.align();
         let padded = io_align_up(rec.len, a) as usize;
@@ -821,8 +851,9 @@ impl NvmeStore {
             ab.slice_mut(),
             rec.offset,
         )?;
-        let buf = ab.slice()[..rec.len as usize].to_vec();
-        if super::digest::Checksum::of_payload(&buf).0 != rec.payload_checksum {
+        if super::digest::Checksum::of_payload(&ab.slice()[..rec.len as usize]).0
+            != rec.payload_checksum
+        {
             self.integrity_failures += 1;
             let _ = self.tombstone(key); // rides the next group flush
             tracing::error!(
@@ -830,7 +861,13 @@ impl NvmeStore {
             );
             return Err(StoreError::Integrity);
         }
-        Ok((rec.generation, buf))
+        Ok((
+            rec.generation,
+            VerifiedRead {
+                buffer: ab,
+                len: rec.len as usize,
+            },
+        ))
     }
 
     /// Read + VERIFY straight into a caller-owned buffer - the restore
@@ -844,6 +881,12 @@ impl NvmeStore {
     /// than issuing an IO the device would reject.
     pub fn read_into(&mut self, key: &[u8; 32], dst: &mut [u8]) -> Result<(u64, u64), StoreError> {
         let rec = *self.live.get(key).ok_or(StoreError::NotFound)?;
+        if dst.len() < rec.len as usize {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "KV restore destination is shorter than the payload",
+            )));
+        }
         let a = self.io.align();
         let padded = io_align_up(rec.len, a) as usize;
         let aligned = (dst.as_ptr() as usize).is_multiple_of(a as usize);
@@ -1017,6 +1060,15 @@ impl NvmeStore {
     /// count on every probe that elects it.
     pub fn make_room(&mut self, bytes: u64) -> Result<Vec<[u8; 32]>, StoreError> {
         let mut evicted = Vec::new();
+        // A sub-segment quota must still make progress. Previously a cache
+        // smaller than 1 GiB could fill its first segment and never evict it.
+        if bytes <= self.quota
+            && self.live_bytes().saturating_add(bytes) > self.quota
+            && self.live.values().any(|r| r.segment == self.open_seg)
+        {
+            self.open_seg += 1;
+            self.cursor = 0;
+        }
         loop {
             if self.live_bytes() + bytes <= self.quota {
                 break;
@@ -1193,6 +1245,28 @@ mod tests {
         assert_eq!(s.read(&k(1)).unwrap(), (7, payload(1, 100_000)));
         assert_eq!(s.read(&k(3)).unwrap(), (9, payload(3, 250_000)));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn owned_read_excludes_padding_and_short_destinations_fail_without_writes() {
+        let d = tdir("owned-read");
+        let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+        let data = payload(9, 50_003);
+        s.store(k(9), 17, 1, &data).unwrap();
+        let (generation, owned) = s.read_owned(&k(9)).unwrap();
+        assert_eq!(generation, 17);
+        assert_eq!(owned.as_ref(), data);
+        let mut short = vec![121; 50_002];
+        assert!(
+            matches!(s.read_into(&k(9), &mut short), Err(StoreError::Io(e)) if e.kind()==std::io::ErrorKind::InvalidInput)
+        );
+        assert!(short.iter().all(|b| *b == 121));
+        drop(s);
+        let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+        assert_eq!(s.read_owned(&k(9)).unwrap().1.as_ref(), data);
+        drop(s);
+        drop(owned);
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

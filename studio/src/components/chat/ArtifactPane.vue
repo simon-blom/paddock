@@ -15,6 +15,7 @@
 // shell is the only way to attach a real header. The body is posted in after
 // load, so the frame URL carries nothing. Everything else renders inline.
 import { copyText } from '@/lib/clipboard'
+import { parseCsv } from '@/lib/artifact-presentation'
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import CodeEditor from '@/components/ui/CodeEditor.vue'
 // The graph panel drags sigma + the 7.4 MB traverse wasm with it, so it loads
@@ -237,41 +238,6 @@ const srcLang = computed(() => {
     : ''
 })
 // ── csv ──────────────────────────────────────────────────────────────────
-/** RFC4180 enough for what a model writes: quoted fields, doubled quotes
- *  inside them, and commas or newlines that only count when unquoted. */
-function parseCsv(src: string): string[][] {
-  const rows: string[][] = []
-  let row: string[] = []
-  let cell = ''
-  let quoted = false
-  for (let i = 0; i < src.length; i++) {
-    const c = src[i]
-    if (quoted) {
-      if (c === '"' && src[i + 1] === '"') {
-        cell += '"'
-        i++
-      } else if (c === '"') quoted = false
-      else cell += c
-      continue
-    }
-    if (c === '"') quoted = true
-    else if (c === ',') {
-      row.push(cell)
-      cell = ''
-    } else if (c === '\n' || c === '\r') {
-      if (c === '\r' && src[i + 1] === '\n') i++
-      row.push(cell)
-      rows.push(row)
-      row = []
-      cell = ''
-    } else cell += c
-  }
-  if (cell || row.length) {
-    row.push(cell)
-    rows.push(row)
-  }
-  return rows.filter((r) => r.length > 1 || r[0] !== '')
-}
 /** Rendering ten thousand rows into the DOM would wedge the panel, so the
  *  table stops - and SAYS it stopped, with the real count. */
 const CSV_ROWS = 500

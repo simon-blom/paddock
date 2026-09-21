@@ -1,0 +1,57 @@
+@import './scrollbars.css';
+/* Colors and radii come from PaddockDesign/appearance.json via theme.ts. */
+:root {
+  --pk-font-sans: -apple-system, BlinkMacSystemFont, sans-serif;
+  --pk-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --pk-chat-width: 760px;
+  --pk-popup-font-size: 12px;
+}
+/* Match Swift's atomic appearance change; no differently timed color fades. */
+body { transition: none; }
+:root[data-native-theme] .pv__overlay {
+  background: var(--pk-bg-overlay);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* Flat, document-scoped details. Keep Reka's focus/dismissal behavior and
+   viewport sizing; changing modality to a window-wide sheet is separate.
+   Local surface aliases also reach loading states and metadata filter bands,
+   without changing status roles, document pixels or the standalone web UI. */
+:root[data-native-theme] .pv__content--info {
+  --pk-bg-surface: var(--pk-bg-popup);
+  --pk-bg-inset: var(--pk-bg-popup);
+  --pk-font-size-sm: 12px;
+  --pk-font-size-xs: 12px;
+}
+:root[data-native-theme] .pv__content--info :is(.pv__bar, .pv__tabs) {
+  background: var(--pk-bg-popup);
+}
+:root[data-native-theme] .pv__content--info :is(.fmp__k, .fmp__v):not(.fmp__v--flag) {
+  background: transparent;
+}
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--pk-bg-base); }
+.chatview--native { height: 100%; min-height: 0; --pk-composer-h: 0px; }
+.chatview--native .chatview__main { --pk-composer-h: 0px; min-width: 280px; padding-bottom: var(--native-composer-height, 0px); }
+/* The visible content column, not a padded outer wrapper, is 760 points.
+   Swift follows this measured box rather than applying another gutter. */
+.chatview--native .thread__inner,
+.chatview--native .native-content-column {
+  width: calc(100% - 56px);
+  max-width: var(--pk-chat-width);
+  margin-inline: auto;
+  padding-inline: 0;
+}
+.chatview--native .thread__inner--wide { max-width: 1240px; }
+.chatview--native .native-content-column { height: 0; flex-shrink: 0; pointer-events: none; }
+.chatview--native .thread__inner { padding-bottom: 20px; }
+.chatview--native .threadwrap { height: 100%; }
+.chatview--native .chatview__main--home { background: var(--pk-bg-base); }
+.native-notice { position: fixed; top: 12px; left: 20%; right: 20%; z-index: 100; padding: 12px; background: var(--pk-bg-elevated); border: 1px solid var(--pk-border-default); border-radius: 8px; }
+.chatview--native .native-document-surface { width: 100%; min-width: 0; max-width: none; flex: 1; border: 0; }
+/* The bundled viewer does not yet implement its document-tabs attribute.
+   Swift owns the selected-file header and close action in this single-file
+   surface; hide only this redundant tab strip, not navigation/search tools. */
+.native-document-surface .lector-doctabs { display: none; }
+.native-audio-preview { width: min(760px, calc(100% - 56px)); margin: 32px auto; }
+.native-audio-preview header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; color: var(--pk-text-primary); font-size: 13px; }
+.native-audio-preview header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

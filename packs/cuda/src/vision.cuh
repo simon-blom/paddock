@@ -618,17 +618,79 @@ static void pd_vision_attn_carveout(void) {
 // agree, so both go through this.
 #define PD_VM_SMEM(DP) (2u * PD_VM_KT * ((DP) + 8u) * 2u)
 
-template <uint32_t DP>
-__global__ void __launch_bounds__(32u * PD_VM_QW) pd_vision_attn_mma_kernel(
-    const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ v, float* __restrict__ out, uint32_t nq,
+// ---- the element interface: T = float (every tower so far) or __half ----
+// The kernel has always rounded q/k/v to f16 on their way into the fragments
+// and the tiles; reading them as f32 only to convert at the stage is the f32
+// interface's cost, not the math's. A producer that already writes halves
+// (dinov3's qkv split, which folds 1/sqrt(hd) into q before its round - the
+// same single round the f32 path does here) gets T = __half: the q fragment
+// is a word load, the stage is a 16 B copy, and the output lands as halves -
+// so the f32 attention plane and the convert pass behind it both disappear.
+// Bit-for-bit the f32 kernel's result rounded by __float2half
+// (bench/vis_attn_h_bench.cu: 0 of 16.9 M differ), 18.6% faster on the
+// dinov3 shape, and the three overload pairs below are the whole difference.
+// A double-buffered cp.async stage was built on the half interface and is
+// worth nothing at this key tile (KT 64: 980 vs 970 us, bit-equal; at KT 32 it
+// only recovers what the smaller tile loses) - the kernel is issue/latency-
+// bound (ncu: tensor pipe 56%, DRAM 19%), not stage-bound.
+//
+// f32: the original predicated form, verbatim. Half: clamped unconditional
+// loads zeroed afterwards - a predicated load costs per-lane preserve-MOVs.
+// `qrow` is the head's row, or a valid row when rowok is false (half only).
+__device__ __forceinline__ uint32_t pd_vm_qpair(const float* qrow, bool rowok, uint32_t c,
+                                                uint32_t hd, float scale) {
+    const float f0 = (rowok && c < hd) ? qrow[c] * scale : 0.f;
+    const float f1 = (rowok && c + 1u < hd) ? qrow[c + 1u] * scale : 0.f;
+    const __half2 p = __floats2half2_rn(f0, f1);
+    return *reinterpret_cast<const uint32_t*>(&p);
+}
+__device__ __forceinline__ uint32_t pd_vm_qpair(const __half* qrow, bool rowok, uint32_t c,
+                                                uint32_t hd, float) {
+    const uint32_t raw = *reinterpret_cast<const uint32_t*>(qrow + (c < hd ? c : 0u));
+    return (rowok && c < hd) ? raw : 0u;
+}
+// 8 dims of one key into the f16 tile
+__device__ __forceinline__ void pd_vm_stage8(__half* dst, const float* src) {
+    const float4 a = *reinterpret_cast<const float4*>(src);
+    const float4 b = *reinterpret_cast<const float4*>(src + 4);
+    *reinterpret_cast<__half2*>(dst + 0) = __floats2half2_rn(a.x, a.y);
+    *reinterpret_cast<__half2*>(dst + 2) = __floats2half2_rn(a.z, a.w);
+    *reinterpret_cast<__half2*>(dst + 4) = __floats2half2_rn(b.x, b.y);
+    *reinterpret_cast<__half2*>(dst + 6) = __floats2half2_rn(b.z, b.w);
+}
+__device__ __forceinline__ void pd_vm_stage8(__half* dst, const __half* src) {
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+}
+// one output pair. hd is even on the half interface, so `second` is always
+// true there and the pair is one 4 B store.
+__device__ __forceinline__ void pd_vm_store2(float* op, float a, float b, bool second) {
+    op[0] = a;
+    if (second) op[1] = b;
+}
+__device__ __forceinline__ void pd_vm_store2(__half* op, float a, float b, bool) {
+    *reinterpret_cast<__half2*>(op) = __floats2half2_rn(a, b);
+}
+
+// QW: warps a block, 16 query rows each - block geometry only, the per-row
+// math is untouched, so every QW lands the same bits. PD_VM_QW (8) is what
+// every f32 tower was measured at; the half path on cc 12.0 takes 4 (see
+// pd_vision_attn_h): on the dinov3 shape (1029 rows, 8 chips, hd 64) the
+// 64-row block ran 8.1% faster than the 128-row one - the same 16 warps an
+// SM from twice the blocks, and a 1029-row sequence pads 5.7% of its rows
+// instead of 12% (bench/vis_attn_h2_bench.cu, which also tried two m-tiles
+// a warp: bit-equal, 216 registers, at best the same 6-8% from the block
+// shape alone - the K/V fragment reuse itself is worth nothing here).
+template <uint32_t DP, typename T = float, uint32_t QW = PD_VM_QW>
+__global__ void __launch_bounds__(32u * QW) pd_vision_attn_mma_kernel(
+    const T* __restrict__ q, const T* __restrict__ k,
+    const T* __restrict__ v, T* __restrict__ out, uint32_t nq,
     uint32_t nkv, uint32_t n_heads, uint32_t hd, float scale) {
 #if PD_FA_OK
-    constexpr uint32_t KT = PD_VM_KT, DPD = DP + 8u, NT = 32u * PD_VM_QW;
+    constexpr uint32_t KT = PD_VM_KT, DPD = DP + 8u, NT = 32u * QW;
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t g8 = lane >> 2, t4 = lane & 3u, lg = lane >> 3;
     const uint32_t h = blockIdx.y;
-    const uint32_t row0 = blockIdx.x * PD_VM_QT + warp * 16u;
+    const uint32_t row0 = blockIdx.x * (QW * 16u) + warp * 16u;
     // q/out are indexed by query rows, k/v by KV rows - the two strides differ
     // whenever this is a cross-attention (the Q-Former's 16x64).
     const size_t qbase = (size_t)blockIdx.z * nq * n_heads * hd;
@@ -648,18 +710,14 @@ __global__ void __launch_bounds__(32u * PD_VM_QW) pd_vision_attn_mma_kernel(
 #pragma unroll
         for (uint32_t e = 0; e < 2u; ++e) {
             const uint32_t b = row0 + jr[e];
-            const float* qp =
-                b < nq ? q + qbase + ((size_t)b * n_heads + h) * hd : nullptr;
+            const bool rowok = b < nq;
+            // past the last query the pointer stays on a valid row: the f32
+            // overload never dereferences it, the half one zeroes what it read
+            const T* qp = q + qbase + ((size_t)(rowok ? b : nq - 1u) * n_heads + h) * hd;
             const uint32_t c0 = d0 * 16u + 2u * t4, c1 = c0 + 8u;
             // scale folds into q before the round, exactly as v3c does it
-            const float f0 = (qp && c0 < hd) ? qp[c0] * scale : 0.f;
-            const float f1 = (qp && c0 + 1u < hd) ? qp[c0 + 1u] * scale : 0.f;
-            const float f8 = (qp && c1 < hd) ? qp[c1] * scale : 0.f;
-            const float f9 = (qp && c1 + 1u < hd) ? qp[c1 + 1u] * scale : 0.f;
-            const __half2 p01 = __floats2half2_rn(f0, f1);
-            const __half2 p89 = __floats2half2_rn(f8, f9);
-            qa[d0][e] = *reinterpret_cast<const uint32_t*>(&p01);
-            qa[d0][e + 2u] = *reinterpret_cast<const uint32_t*>(&p89);
+            qa[d0][e] = pd_vm_qpair(qp, rowok, c0, hd, scale);
+            qa[d0][e + 2u] = pd_vm_qpair(qp, rowok, c1, hd, scale);
         }
     }
 
@@ -682,14 +740,9 @@ __global__ void __launch_bounds__(32u * PD_VM_QW) pd_vision_attn_mma_kernel(
             const uint32_t ks = t0 + kk;
             __half* dst = (isv ? sh_v : sh_k) + (size_t)kk * DPD + d8;
             if (ks < nkv && d8 < hd) {
-                const float* src = (isv ? v : k) + kbase
-                                   + ((size_t)ks * n_heads + h) * hd + d8;
-                const float4 a = *reinterpret_cast<const float4*>(src);
-                const float4 b = *reinterpret_cast<const float4*>(src + 4);
-                *reinterpret_cast<__half2*>(dst + 0) = __floats2half2_rn(a.x, a.y);
-                *reinterpret_cast<__half2*>(dst + 2) = __floats2half2_rn(a.z, a.w);
-                *reinterpret_cast<__half2*>(dst + 4) = __floats2half2_rn(b.x, b.y);
-                *reinterpret_cast<__half2*>(dst + 6) = __floats2half2_rn(b.z, b.w);
+                const T* src = (isv ? v : k) + kbase
+                               + ((size_t)ks * n_heads + h) * hd + d8;
+                pd_vm_stage8(dst, src);
             } else {
                 *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -808,9 +861,9 @@ __global__ void __launch_bounds__(32u * PD_VM_QW) pd_vision_attn_mma_kernel(
         for (uint32_t r = 0; r < 2u; ++r) {
             const uint32_t b = row0 + jr[r];
             if (b >= nq) continue;
-            float* op = out + qbase + (size_t)b * n_heads * hd + (size_t)h * hd + dcol;
-            op[0] = o_acc[nt][2u * r] * nrm[r];
-            if (dcol + 1u < hd) op[1] = o_acc[nt][2u * r + 1u] * nrm[r];
+            T* op = out + qbase + (size_t)b * n_heads * hd + (size_t)h * hd + dcol;
+            pd_vm_store2(op, o_acc[nt][2u * r] * nrm[r], o_acc[nt][2u * r + 1u] * nrm[r],
+                         dcol + 1u < hd);
         }
     }
 #else
@@ -933,6 +986,77 @@ int pd_vision_attn_x(const void* q, const void* k, const void* v, void* out, uin
     return pd_vision_attn_dispatch((const float*)q, (const float*)k, (const float*)v,
                                    (float*)out, nq, nkv, n_heads, head_dim, n_batch,
                                    scale, (cudaStream_t)stream);
+}
+
+// 620: the same attention on the half interface - q (PRE-SCALED by the caller,
+// see pd_vm_qpair), k, v and out are all [batch][row][head][dim] halves. There
+// is no f32 fallback to fall to: head_dim must be a multiple of 8 in
+// [16, 128] and the device sm_80+, or this refuses and the caller keeps the
+// f32 entry. 16 B-aligned planes (any pooled allocation is).
+PD_EXPORT
+int pd_vision_attn_h(const void* q, const void* k, const void* v, void* out, uint32_t nq,
+                     uint32_t nkv, uint32_t n_heads, uint32_t head_dim, uint32_t n_batch,
+                     void* stream) {
+    if (nq == 0 || nkv == 0 || n_heads == 0 || n_batch == 0) return 0;
+    if ((head_dim % 8u) != 0u || head_dim < 16u || head_dim > PD_VA_MAXD)
+        return cudaErrorInvalidValue;
+    int dev = 0, cc = 0, ccm = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMinor, dev);
+    if (cc < 8) return cudaErrorInvalidValue;
+    const uint32_t dp = (head_dim + 15u) & ~15u;
+    // 64-row blocks on cc 12.0 (measured, see the kernel note); 128 elsewhere
+    const bool qw4 = (cc == 12 && ccm == 0);
+    const uint32_t qw = qw4 ? 4u : PD_VM_QW;
+    dim3 grid((nq + qw * 16u - 1u) / (qw * 16u), n_heads, n_batch);
+    const uint32_t nth = 32u * qw;
+    static bool vh_attr = false;
+    if (!vh_attr) {
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<16u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<32u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<48u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<64u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<80u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<96u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<112u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<128u, __half>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<16u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<32u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<48u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<64u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<80u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<96u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<112u, __half, 4u>);
+        pd_prefer_max_shared(pd_vision_attn_mma_kernel<128u, __half, 4u>);
+        vh_attr = true;
+    }
+#define PD_VH_LAUNCH(DP)                                                        \
+    case DP:                                                                    \
+        if (qw4)                                                                \
+            pd_vision_attn_mma_kernel<DP, __half, 4u>                           \
+                <<<grid, nth, PD_VM_SMEM(DP), (cudaStream_t)stream>>>(          \
+                    (const __half*)q, (const __half*)k, (const __half*)v,       \
+                    (__half*)out, nq, nkv, n_heads, head_dim, 1.0f);            \
+        else                                                                    \
+            pd_vision_attn_mma_kernel<DP, __half>                               \
+                <<<grid, nth, PD_VM_SMEM(DP), (cudaStream_t)stream>>>(          \
+                    (const __half*)q, (const __half*)k, (const __half*)v,       \
+                    (__half*)out, nq, nkv, n_heads, head_dim, 1.0f);            \
+        break;
+    switch (dp) {
+        PD_VH_LAUNCH(16u)
+        PD_VH_LAUNCH(32u)
+        PD_VH_LAUNCH(48u)
+        PD_VH_LAUNCH(64u)
+        PD_VH_LAUNCH(80u)
+        PD_VH_LAUNCH(96u)
+        PD_VH_LAUNCH(112u)
+        PD_VH_LAUNCH(128u)
+        default: return cudaErrorInvalidValue;
+    }
+#undef PD_VH_LAUNCH
+    return pd_launch_status();
 }
 
 // Row gather with an averaging fan-in (312) - granite-vision's

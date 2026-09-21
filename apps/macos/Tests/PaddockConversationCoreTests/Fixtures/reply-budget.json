@@ -1,0 +1,20 @@
+[
+  {"name":"4K short hero request", "context":4096, "prompt":24, "expected":3048},
+  {"name":"4K used history", "context":4096, "prompt":1600, "expected":1472},
+  {"name":"nearly full context", "context":4096, "prompt":3000, "expected":512},
+  {"name":"unknown context", "context":0, "prompt":24, "expected":4096},
+  {"name":"unknown context with provider ceiling", "context":0, "prompt":24, "ceiling":2048, "expected":2048},
+  {"name":"large context safety margin", "context":100000, "prompt":100, "expected":97900},
+  {"name":"cloud output ceiling", "context":100000, "prompt":100, "ceiling":2048, "expected":2048},
+  {"name":"small provider ceiling must not be raised", "context":4096, "prompt":24, "ceiling":128, "expected":128},
+  {"name":"zero ceiling is unknown", "context":4096, "prompt":24, "ceiling":0, "expected":3048},
+  {"name":"the floor never exceeds what is really left", "context":4096, "prompt":3700, "expected":396},
+  {"name":"under the minimum useful reply the turn is refused", "context":4096, "prompt":3900, "expected":0},
+  {"name":"a prompt past the window is refused", "context":4096, "prompt":5000, "expected":0},
+  {"name":"a small ceiling is not a refusal", "context":4096, "prompt":3700, "ceiling":128, "expected":128},
+  {"name":"exact anchor charges the margin to the new turn only", "context":4096, "exact":2000, "prompt":400, "expected":1568},
+  {"name":"exact anchor with a long new turn", "context":100000, "exact":50000, "prompt":8000, "expected":40000},
+  {"name":"exact anchor near the end borrows from its margin only", "context":4096, "exact":3500, "prompt":200, "expected":396},
+  {"name":"exact anchor with nothing left is refused", "context":4096, "exact":3900, "prompt":100, "expected":0},
+  {"name":"exact anchor under a provider ceiling", "context":100000, "exact":1000, "prompt":100, "ceiling":2048, "expected":2048}
+]

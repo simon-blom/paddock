@@ -39,8 +39,19 @@ impl AdminClient {
         Self { port }
     }
 
+    /// A Unix socket pathname outlives its process. Only a definitive missing
+    /// or refused connection makes it free; timeout, permissions and transport
+    /// ambiguity must never authorize taking over a possibly live endpoint.
+    pub async fn is_present(&self) -> bool {
+        endpoint_present(connect(self.port)).await
+    }
+
     pub async fn identify(&self) -> Result<Identify, AdminError> {
         self.get_json("/v1/identify").await
+    }
+
+    pub async fn config_status(&self) -> Result<crate::types::ConfigStatus, AdminError> {
+        self.get_json("/v1/config-status").await
     }
 
     pub async fn health(&self) -> Result<Health, AdminError> {
@@ -160,6 +171,15 @@ impl AdminClient {
     }
 }
 
+async fn endpoint_present<T>(
+    connection: impl std::future::Future<Output = std::io::Result<T>>,
+) -> bool {
+    !matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), connection).await,
+        Ok(Err(error)) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+    )
+}
+
 #[cfg(windows)]
 async fn connect(port: u16) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
@@ -186,4 +206,45 @@ async fn connect(port: u16) -> std::io::Result<tokio::net::windows::named_pipe::
 #[cfg(unix)]
 async fn connect(port: u16) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::connect(crate::socket_path(port)).await
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn uncertain_connection_never_authorizes_takeover() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(endpoint_present(async { Err::<(), _>(std::io::Error::from(kind)) }).await);
+        }
+        assert!(
+            !endpoint_present(async {
+                Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+            })
+            .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_unix_socket_does_not_block_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "pd-admin-presence-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert!(endpoint_present(tokio::net::UnixStream::connect(&path)).await);
+        drop(listener);
+        assert!(path.exists(), "the stale pathname is the regression");
+        assert!(!endpoint_present(tokio::net::UnixStream::connect(&path)).await);
+        std::fs::remove_file(path).unwrap();
+    }
 }

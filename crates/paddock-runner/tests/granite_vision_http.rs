@@ -58,25 +58,25 @@ fn app() -> Option<axum::Router> {
     let mmproj = dir.join("mmproj-model-f16.gguf");
     let pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packs/cuda/build/pd-cuda-sm86.dll");
-    if !model_path.exists() || !mmproj.exists() || !pack.exists() {
-        eprintln!("model/mmproj/pack missing - skipping");
-        return None;
-    }
+    let metal = cfg!(all(target_os = "macos", feature = "metal"));
+    assert!(
+        model_path.exists() && mmproj.exists() && (metal || pack.exists()),
+        "explicit heavy gate requires the model/mmproj and matching backend pack"
+    );
     let model = serving::load(
         MODEL.into(),
         &model_path,
-        "cuda",
+        if metal { "metal" } else { "cuda" },
         0,
-        Some(&pack),
+        if metal { None } else { Some(&pack) },
         4096,
-        8,
+        if metal { 4 } else { 8 },
         Some(&mmproj),
         None,
         None,
         None,
     )
-    .map_err(|e| eprintln!("load: {e}"))
-    .ok()?;
+    .expect("explicit heavy gate must load the real backend");
     Some(router(Arc::new(AppState::for_tests(Some(model)))))
 }
 

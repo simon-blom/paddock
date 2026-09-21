@@ -342,22 +342,6 @@ var LectorPdfViewer = defineComponent({
     /** Allow opening local files from UI. */
     allowLocalOpen: { type: Boolean, default: false },
     /**
-     * Show the document tab bar. Defaults to true; pass false when the host
-     * app has its own document switcher (see `LectorViewerOptions`).
-     * `default: undefined` rather than `true` on purpose - Vue casts an ABSENT
-     * Boolean prop to false, which would silently turn the bar off for every
-     * embedder that never mentions it.
-     */
-    documentTabs: { type: Boolean, default: void 0 },
-    /**
-     * Host-contributed toolbar buttons, rendered by lector so they match its
-     * own metrics (see `LectorViewerOptions.toolbarExtras`).
-     */
-    toolbarExtras: {
-      type: Array,
-      default: void 0
-    },
-    /**
      * Partial UI schema override, merged over `DEFAULT_UI_SCHEMA` — the same
      * option `LectorViewer` takes. Lets an embedding app trim or reorder the
      * toolbar without giving up the drop-in component.
@@ -414,8 +398,6 @@ var LectorPdfViewer = defineComponent({
         initialZoom: props.initialZoom,
         panels: props.panels,
         allowLocalOpen: props.allowLocalOpen,
-        documentTabs: props.documentTabs,
-        toolbarExtras: props.toolbarExtras,
         uiSchema: props.uiSchema
       });
       emit("ready", eng);
@@ -525,3 +507,4 @@ export {
   useViewport,
   useZoom
 };
+//# sourceMappingURL=index.js.map

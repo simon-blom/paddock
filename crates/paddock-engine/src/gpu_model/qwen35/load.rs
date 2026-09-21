@@ -464,6 +464,28 @@ impl GpuQwen35 {
         let gb = |used: u64| used as f64 / 1e9;
         let v_start = vfree();
 
+        // A rotated-basis file (prism.hadamard.*) is read and checked before
+        // the first tensor: the weight loaders refuse such a file until the
+        // family has said it applies the rotation.
+        let rot = Rotation::load(
+            &exec,
+            map,
+            &super::rotation::RotationGeometry {
+                n_layers,
+                full_attn_interval,
+                embd,
+                q_dim: n_heads * head_dim,
+                value_dim,
+                ff,
+                state_size,
+                n_k_heads,
+                n_v_heads,
+                moe: moe.is_some(),
+                n_nextn,
+                fp8_native: fp8_native_dir.is_some(),
+            },
+        )?;
+
         // token_embd stays RESIDENT in its file quant (input lookup only -
         // gathered rows are dequantized on the fly, exactly like llama). UD
         // k-quant files ship it Q4_K; plain exports Q8_0.
@@ -781,9 +803,14 @@ impl GpuQwen35 {
                 // repacked pair and make the ab_f32 plane MANDATORY - tiny
                 // ([embd, 2*n_v_heads] f32) and exact (host widen / exact
                 // dequant), consumed by matvec_f32 + delta_gate_ab.
-                let ab_q8 = map
-                    .tensor_info(&format!("blk.{i}.ssm_alpha.weight"))
-                    .is_some_and(|t| t.ggml_type == GgmlType::Q8_0)
+                // A rotated-basis model always takes the f32 plane: alpha and
+                // beta read the pre-mixer norm, which such a model rotates in
+                // place for in_qkv / gate, so the pair is moved into the
+                // rotated basis below - and only an f32 plane can be.
+                let ab_q8 = rot.is_none()
+                    && map
+                        .tensor_info(&format!("blk.{i}.ssm_alpha.weight"))
+                        .is_some_and(|t| t.ggml_type == GgmlType::Q8_0)
                     && map
                         .tensor_info(&format!("blk.{i}.ssm_beta.weight"))
                         .is_some_and(|t| t.ggml_type == GgmlType::Q8_0);
@@ -815,6 +842,12 @@ impl GpuQwen35 {
                         let mut buf = exec.alloc(na + b.buf.len())?;
                         exec.copy_region(&a.buf, 0, &mut buf, 0, na)?;
                         exec.copy_region(&b.buf, 0, &mut buf, na, b.buf.len())?;
+                        // W x = (W S H)(H S x): each weight row takes the same
+                        // rotation the activations do (see rotation.rs)
+                        if let Some(r) = &rot {
+                            let width = a.dims[0];
+                            r.rotate(&exec, &mut buf, width, (na + b.buf.len()) / width)?;
+                        }
                         Some(DeviceTensor {
                             buf,
                             dims: vec![a.dims[0], 2 * a.dims[1]],
@@ -1935,6 +1968,21 @@ impl GpuQwen35 {
             exec.load_quantw(map, "token_embd.weight")?
         };
         let kq_resident = kq_resident || output.kq().is_some();
+        // the dedicated ternary decode lane: all of the file's linears or none
+        let tern_b128 =
+            rot.is_some() && paddock_models::dev_var_os!("PADDOCK_NO_TERNARY_B128").is_none() && {
+                let fits = |w: &QuantW| w.kq().is_some_and(|k| exec.ternary_gemv_b128_fits(k));
+                fits(&output)
+                    && layers.iter().all(|l| {
+                        (match &l.mixer {
+                            Mixer::Full(w) => [&w.wq, &w.wk, &w.wv, &w.wo].into_iter().all(fits),
+                            Mixer::Linear(w) => {
+                                [&w.in_qkv, &w.gate_w, &w.out_w].into_iter().all(fits)
+                            }
+                        }) && matches!(&l.ffn, Ffn::Dense { gate, up, down }
+                            if [gate, up, down].into_iter().all(fits))
+                    })
+            };
         // f8 lm_head (PADDOCK_F8_LMHEAD): Q8 head -> f8w -> tile-linear, the
         // same conversion pipeline as the FFN planes. The mt_dp4a head GEMM
         // measured 870 GB/s (access-pattern bound); the lin stream runs the
@@ -2609,7 +2657,58 @@ impl GpuQwen35 {
                 );
             }
         }
-        if kq_resident {
+        // A rotated-basis model rides the plain quantized ladders only. Every
+        // twin-plane arm (fp8 / tile / NVFP4 projections, FFN and head, the
+        // fused Q8 gate|up and in_qkv|gate planes) either quantizes inside a
+        // fused norm - which would skip the rotation - or was never wired for
+        // it. None of them builds off a ternary file today; if that ever
+        // changes, this stops the load instead of serving noise.
+        if rot.is_some() {
+            let w8 = |l: &LayerW8| {
+                l.wq.is_some()
+                    || l.wk.is_some()
+                    || l.wv.is_some()
+                    || l.wo.is_some()
+                    || l.in_qkv.is_some()
+                    || l.gate_w.is_some()
+                    || l.out_w.is_some()
+            };
+            let twin = bs_w8.iter().any(w8)
+                || bs_nv4.iter().any(w8)
+                || bs_gu_planes.iter().any(Option::is_some)
+                || bs_dn_planes.iter().any(Option::is_some)
+                || bs_f8ffn_planes.iter().any(Option::is_some)
+                || bs_f8ffn_bs_planes.iter().any(Option::is_some)
+                || bs_f8t_ffn_planes.iter().any(Option::is_some)
+                || bs_f8row_ffn_planes.iter().any(Option::is_some)
+                || bs_f8t_attn_planes.iter().any(Option::is_some)
+                || out_f8.is_some()
+                || out_f8t.is_some();
+            if twin {
+                return Err(GpuModelError::Unsupported(
+                    "rotated-basis file (prism.hadamard.*): a twin-plane lane was built for \
+                     this model, and those lanes do not rotate their inputs"
+                        .into(),
+                ));
+            }
+        }
+        // a file whose quantized tensors are all ternary has its own label
+        // above - calling it a "Q4_K/Q5_K/Q6_K/IQ4_XS mix" would be wrong
+        let ternary_only = map.tensor_infos().all(|t| {
+            crate::gpu::kq_params(t.ggml_type).is_none() || crate::gpu::kq_is_ternary(t.ggml_type)
+        });
+        if kq_resident && ternary_only {
+            tracing::info!(
+                "qwen35: ternary weights resident as shipped (PTQ1_0 1.75 bpw / PQ2_0 2.13 bpw), \
+                 int8 activations; single-stream decode on the {}",
+                if tern_b128 {
+                    "table-decoded ternary lane (one activation scale per 128)"
+                } else {
+                    "generic i-quant lane (one activation scale per 32)"
+                }
+            );
+        }
+        if kq_resident && !ternary_only {
             // "show which quant" product principle + honest serving-mode label
             tracing::info!(
                 "qwen35: k-quant weights resident (Q4_K/Q5_K/Q6_K/IQ4_XS mix) - \
@@ -2658,6 +2757,8 @@ impl GpuQwen35 {
             out_f8t,
             out_norm,
             output,
+            rot,
+            tern_b128,
             kq_resident,
             kq_max_elems,
             mtp,

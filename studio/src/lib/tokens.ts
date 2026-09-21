@@ -41,6 +41,14 @@ export function replyReserve(cap: number | null): number {
   return cap != null && cap > 0 ? cap : REPLY_RESERVE
 }
 
+/** Local Paddock clamps against exact prompt/vision token counts at admission.
+ * Send an explicit window-sized ceiling instead of either electing the API's
+ * 1024 default or wasting an additional estimated safety margin. Cloud providers
+ * may reject input+output overflow and still need windowRemaining below. */
+export function localOutputMaximum(maxCtx: number): number {
+  return maxCtx > 0 ? maxCtx : REPLY_RESERVE
+}
+
 /** The reply cap for a request whose prompt is `promptTokens` long: everything
  *  the window has left, but never more than the model will actually emit.
  *
@@ -56,11 +64,51 @@ export function replyReserve(cap: number | null): number {
  *  (tool schemas, which no client-side estimate can see), so input + output
  * crossed the window and the send died on a 400. Taking
  *  the smaller of the two makes the estimator's error harmless: 384k of output
- *  on a 1M window cannot overflow whatever the prompt turns out to be. */
-export function windowRemaining(maxCtx: number, promptTokens: number, outCap?: number): number {
-  const byModel = outCap && outCap > 0 ? outCap : Infinity
-  if (!maxCtx) return Math.min(REPLY_RESERVE, byModel)
-  return Math.max(512, Math.min(maxCtx - promptTokens - windowSlack(maxCtx), byModel))
+ *  on a 1M window cannot overflow whatever the prompt turns out to be.
+ *
+ *  `exact` is the part of the prompt a server has already counted (see
+ *  `replyPrompt`); `promptTokens` is then only what is newer and still an
+ *  estimate. The margin is charged against the estimate, because that is the
+ *  only part that can be wrong: a flat 1024 over a prompt we know to the token
+ *  throws away a quarter of a 4K window for nothing.
+ *
+ *  Two rules hold in both cases, and the macOS app's `NativeReplyBudget` and
+ *  the fixture the two share pin them:
+ *  - the floor borrows from the margin, never from the window. A short reply
+ *    is worth more than a margin, so a nearly full window still asks for
+ *    `REPLY_FLOOR` - but only if that many tokens are really left. The floor
+ *    used to be unconditional, which on a full window asked for 512 tokens
+ *    that did not exist and left the refusal to the provider's 400.
+ *  - 0 is an answer and means "refuse this turn": under `MIN_USEFUL_REPLY` of
+ *    real room a send buys a sentence fragment and a second refusal on
+ *    Continue, so the caller owes the user an error instead of a request. */
+export function windowRemaining(
+  maxCtx: number,
+  promptTokens: number,
+  outCap?: number,
+  exact = 0,
+): number {
+  // A ceiling counts only as a finite positive number of tokens; anything else
+  // (absent, 0, negative, NaN) reads as "this provider publishes none".
+  const byModel = outCap !== undefined && Number.isFinite(outCap) && outCap > 0 ? outCap : Infinity
+  if (!maxCtx) return Math.floor(Math.min(REPLY_RESERVE, byModel))
+  const room = maxCtx - exact - promptTokens
+  if (room < MIN_USEFUL_REPLY) return 0
+  const margin = exact > 0 ? anchoredMargin(promptTokens) : windowSlack(maxCtx)
+  return Math.floor(Math.min(byModel, Math.max(room - margin, Math.min(REPLY_FLOOR, room))))
+}
+
+/** Below this much real room a turn is refused rather than sent. */
+export const MIN_USEFUL_REPLY = 256
+/** What a nearly full window still asks for, out of its margin. */
+const REPLY_FLOOR = 512
+
+/** Margin over a prompt whose bulk is an exact server count: a quarter of the
+ *  estimated remainder (the ~4 chars/token guess is off by that much on code
+ *  and non-English text), and never under 128 for what no estimate sees - the
+ *  new turn's template tokens, a date line that moved. */
+function anchoredMargin(estimated: number): number {
+  return Math.max(128, Math.ceil(estimated * 0.25))
 }
 
 /** Slack between "everything the window has left" and what we actually ask
@@ -80,7 +128,7 @@ function windowSlack(maxCtx: number): number {
 /** Rough size of what a send will carry, for windowRemaining. Same estimator
  *  the trimmer uses, so the two agree.
  *
- *  `summary` is the compaction summary this send will INJECT - a
+ *  `summary` is the compaction summary this send will inject - a
  *  `ContextPlan`'s own, never the stored one, because a summary held in
  *  reserve is not in the prompt and costs nothing. It is charged with its
  *  wrapper (`summaryBlock`, the one owner of that wording), once, and the
@@ -96,6 +144,120 @@ export function promptTokensFrom(conv: Conversation, from: number, summary?: str
   const msgs = thread(conv)
   for (let i = Math.max(0, from); i < msgs.length; i++) t += messageTokens(msgs[i])
   return t
+}
+
+/** What a request carried besides its messages, as far as the client can name
+ *  it: the first message sent, the summary standing in for the ones before it,
+ *  and the tool set whose schemas rode along. Stored on the turn's run record.
+ *  Two requests with the same shape share their whole prefix, which is what
+ *  lets a later send trust an earlier turn's server-counted prompt. */
+export interface PromptShape {
+  /** id of the first message sent, null for an empty thread */
+  from: string | null
+  /** `summaryLastId` of the summary that rode, null when none did */
+  summary: string | null
+  /** the tool sources and built-in tools that rode, as one comparable string */
+  tools: string
+}
+
+export function promptShape(conv: Conversation, plan: ContextPlan, tools: string): PromptShape {
+  return {
+    from: thread(conv)[Math.max(0, plan.from)]?.id ?? null,
+    summary: plan.summary ? (conv.summaryLastId ?? null) : null,
+    tools,
+  }
+}
+
+/** A prompt split into what a server has counted and what is still a guess. */
+export interface ReplyPrompt {
+  exact: number
+  estimated: number
+}
+
+/** The prompt a send will carry, anchored on the newest turn a server has
+ *  already counted.
+ *
+ *  `usage.promptTokens` of an answered turn is the provider's own tokenizer
+ *  over everything that turn's request held - the system prompt, the summary,
+ *  the date line, the tool schemas no client estimate can see. When the next
+ *  request has the same shape, that number is the exact size of their shared
+ *  prefix, and only the answer and whatever came after it still need
+ *  estimating. That is where the 1024-token slack and the unconditional floor
+ *  came from: a prompt guessed end to end. With the bulk known they are not
+ *  needed.
+ *
+ *  The anchor is refused, and the whole prompt estimated as before, unless all
+ *  of this holds for the newest answered turn on screen:
+ *  - same model (another model's tokenizer counts a different number);
+ *  - same shape and same system prompt (otherwise the prefix is not shared);
+ *  - it ran in one round. A turn that called tools reports the sum of every
+ *    round's prompt - the manager's cloud loop adds them up for billing - which
+ *    is a cost, not a size;
+ *  - it is not a compare lane, whose history is filtered per model.
+ *
+ *  `pending` is the placeholder of the turn being generated, which is on the
+ *  thread already and has nothing to say. On a Continue it is the turn being
+ *  extended and is itself the anchor.
+ *
+ *  Known gap: a first turn, and any turn after the shape changed, is still a
+ *  full estimate. A provider's count-tokens endpoint would make those exact as
+ *  well. It is not used because it costs a round trip on every such send, not
+ *  every provider has one, and the corrected resend in the send path already
+ *  turns the rare miss into one extra request instead of an error. */
+export function replyPrompt(
+  conv: Conversation,
+  plan: ContextPlan,
+  now: { model: string; shape: PromptShape; pending?: string },
+): ReplyPrompt {
+  const msgs = thread(conv)
+  for (let i = msgs.length - 1; i >= Math.max(0, plan.from); i--) {
+    const a = msgs[i]
+    if (a.role !== 'assistant') continue
+    if (a.id === now.pending && !a.usage) continue
+    const u = a.usage
+    const r = a.run
+    const s = r?.shape
+    const usable =
+      !!u &&
+      u.promptTokens > 0 &&
+      !!r &&
+      !!s &&
+      r.model === now.model &&
+      (r.systemPrompt ?? '') === (conv.systemPrompt ?? '') &&
+      s.from === now.shape.from &&
+      s.summary === now.shape.summary &&
+      s.tools === now.shape.tools &&
+      !a.group &&
+      !a.toolCalls?.length &&
+      !a.webSearches?.length
+    // only the newest answered turn is a candidate: an older one would leave
+    // more to estimate than it saves
+    if (!usable || !u) break
+    // the answer is re-sent as input. Its text estimate or its counted output,
+    // whichever is larger: over-counting costs a few tokens of reply,
+    // under-counting costs a 400.
+    let estimated = Math.max(messageTokens(a), u.completionTokens + PER_MESSAGE_OVERHEAD)
+    for (let j = i + 1; j < msgs.length; j++) estimated += messageTokens(msgs[j])
+    return { exact: u.promptTokens, estimated }
+  }
+  return { exact: 0, estimated: promptTokensFrom(conv, plan.from, plan.summary) }
+}
+
+/** The numbers out of a provider's "this does not fit" refusal, when it states
+ *  them. Anthropic validates `input + max_tokens` against the window before it
+ *  runs anything and says all three; OpenAI-style servers (vLLM among them)
+ *  name the window and the prompt. Those are the provider's own tokenizer, so
+ *  `limit - input` is the exact reply that fits and one corrected resend is
+ *  safe. Anything unrecognised is null and the error is shown as it came. */
+export function parseContextOverflow(message: string): { limit: number; input: number } | null {
+  const anthropic = /exceed context limit:\s*(\d+)\s*\+\s*(\d+)\s*>\s*(\d+)/i.exec(message)
+  if (anthropic) return { input: Number(anthropic[1]), limit: Number(anthropic[3]) }
+  const openai =
+    /maximum context length is (\d+) tokens.*?requested (\d+) tokens \((\d+) in the messages/is.exec(
+      message,
+    )
+  if (openai) return { limit: Number(openai[1]), input: Number(openai[3]) }
+  return null
 }
 
 export function estimateTokens(text: string): number {
@@ -182,7 +344,7 @@ export function summaryValid(conv: Conversation): boolean {
 
 /** The summary exactly as it rides in the prompt: the send path puts this
  *  string in `instructions` and `promptTokensFrom` charges this string, so
- *  ONE owner of the wording. Two owners is how the budget came to ignore text
+ *  one owner of the wording. Two owners is how the budget came to ignore text
  *  the request had been carrying all along. */
 export function summaryBlock(summary: string): string {
   return `Summary of the earlier part of this conversation (older messages were compacted):\n${summary}`

@@ -99,7 +99,7 @@ pub fn parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Pars
             .filter_map(|d| cur.find(d))
             .min()
             .unwrap_or(cur.len());
-        push(&mut reasoning, cur[..end].trim());
+        push(&mut reasoning, &cur[..end]);
         // leave the terminator in place: the loop below consumes an `<|eom|>`
         // only via the next message's `<|start|>` search, same as any body
         cur = &cur[end..];
@@ -177,8 +177,11 @@ pub fn parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Pars
         let body = &body_start[..end];
 
         match recipient {
-            Some("self") => push(&mut reasoning, body.trim()),
-            None | Some("user") => push(&mut content, body.trim()),
+            // Whitespace is generated output, not message framing. Trimming
+            // lost code's final newline and reasoning's paragraph boundary
+            // despite identical model tokens in the same-weights Muse gate.
+            Some("self") => push(&mut reasoning, body),
+            None | Some("user") => push(&mut content, body),
             // Any other recipient is a tool. A body that carries no parseable
             // invoke - or a request that declared no tools - keeps its text
             // as content: this dialect never drops what the model wrote.
@@ -343,6 +346,47 @@ mod tests {
                 "units":{"type":"string"}
             }}
         }})]))
+    }
+
+    #[test]
+    fn generated_body_whitespace_survives_both_prompt_modes_and_streaming() {
+        let body = [
+            "\n",
+            "thinking",
+            " ",
+            "hard",
+            "\n\n",
+            EOM,
+            START,
+            "assistant",
+            " to",
+            "=user",
+            MESSAGE,
+            "    ",
+            "s[::-1]",
+            "\n",
+            EOT,
+        ];
+        for preopened in [false, true] {
+            let mut text = if preopened {
+                String::new()
+            } else {
+                PREOPEN.into()
+            };
+            let (mut previous_reasoning, mut previous_content) = (String::new(), String::new());
+            for token in body {
+                text.push_str(token);
+                let parsed = parse(&text, preopened, None);
+                let reasoning = parsed.reasoning.unwrap_or_default();
+                let content = parsed.content.unwrap_or_default();
+                assert!(reasoning.starts_with(&previous_reasoning));
+                assert!(content.starts_with(&previous_content));
+                previous_reasoning = reasoning;
+                previous_content = content;
+            }
+            assert_eq!(previous_reasoning, "\nthinking hard\n\n");
+            assert_eq!(previous_content, "    s[::-1]\n");
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@
 import type { LectorEngine } from '../engine/lector-engine.js';
 import type { ViewportInstance } from '../plugins/viewport-plugin.js';
 import type { DocumentId } from '../types/handle-id.js';
+import { PageRenderer } from './page-renderer.js';
 import { PageOverlayManager } from './page-overlays.js';
 export interface LectorPaneOptions {
     /** Shared Lector engine. */
@@ -62,8 +63,12 @@ export declare class LectorPane implements Disposable {
      * Use this in split-view to show different docs in different panes.
      */
     setDocument(docId: DocumentId | null): void;
-    /** Force a re-render of currently visible pages. */
+    /** Force fresh content for this pane without affecting another pane. */
     rerenderVisible(): void;
+    /** Raster accounting, separate from total process/WASM memory. */
+    get renderStats(): PageRenderer['stats'];
+    /** Current full-resolution viewport detail, not a prefetched preview. */
+    isPageReady(pageIndex: number): boolean;
     /** Tear down the pane: viewport, overlays, DOM, listeners. */
     destroy(): void;
     [Symbol.dispose](): void;

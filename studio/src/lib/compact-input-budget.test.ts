@@ -1,13 +1,13 @@
-// PD-01: what compaction does when the window leaves NO room for transcript.
+// PD-01: what compaction does when the window leaves no room for transcript.
 //
 // `maybeCompact` sizes its input as `(maxCtx - 640 - 2048) * 4` characters.
 // On a small window that number is zero or negative, and the clamp that was
 // meant to make it safe (`Math.max(0, ...)`) turns it into `.slice(-0)` -
-// which keeps the WHOLE string. So the one case where nothing fits is the
+// which keeps the whole string. So the one case where nothing fits is the
 // case that sends the most: a full transcript into a window that cannot hold
 // it, with 640 output tokens asked on top.
 //
-// The compaction TARGET is positive there (`compactionTarget` only needs
+// The compaction target is positive there (`compactionTarget` only needs
 // `maxCtx - maxReply - 1024 > 0`), so this is not a case the caller filters
 // out - see the reachability block below, which builds both windows out of
 // the real stores rather than asserting the arithmetic.
@@ -355,7 +355,7 @@ describe('the 2688-token boundary', () => {
     expect(out[0].body.temperature).toBe(0)
     expect(out[0].body.max_output_tokens).toBe(640)
     expect(out[0].body.chat_template_kwargs).toEqual({ enable_thinking: false })
-    // (2704 - 640 - 2048) * 4 = 64 characters, kept from the NEWEST end - the
+    // (2704 - 640 - 2048) * 4 = 64 characters, kept from the newest end - the
     // tail of the last covered assistant turn.
     expect(out[0].body.input).toBe('y'.repeat(64))
 

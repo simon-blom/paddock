@@ -75,7 +75,34 @@
 # Serve the model under this id in /v1/models (vLLM's --served-model-name).
 # served_model_name = "my-model"
 
-# Disable speculative decode / MTP.
+# Speculative decode. One key, whatever shape the model's drafter takes
+# (in-file MTP or a sideloaded `mtp` file):
+#
+#   "off"       never speculate. The only setting that gives the drafter's
+#               VRAM back, because no drafter is loaded at all.
+#   "on"        the tuned per-batch ladder. This is the default when the key
+#               is absent, so an endpoint that never sets `spec` is running it.
+#   "adaptive"  closed loop: the engine re-picks the draft length every round
+#               to maximize goodput, including 0 when speculation is not
+#               paying at the current load. It pays an exploration toll on
+#               short runs and only ties the ladder once warm, so it is not
+#               the setting to reach for to make a 200-token reply faster.
+#   1..16       pin the draft length.
+#
+# Aliases that also parse: false/no/none/0 -> off, true/yes/ladder/legacy ->
+# on, auto -> adaptive.
+#
+# When to pin a depth. The ladder's depth comes from the row budget - at one
+# live slot it asks for the cap (7) - and every extra draft costs a wider
+# verify pass. On a bandwidth-bound box that pass is expensive: a GB10 serving
+# Qwen3.8-Flash-Next pays ~6 ms of routed-expert traffic per extra verify row,
+# where the same drafter at `spec = 2` measured 10-40% faster than `spec =
+# "on"`. If decode is slower than you expect on a big MoE, A/B `spec = 1` /
+# `2` / `3` against "on" before concluding speculation is not paying.
+# spec = "on"
+
+# Older spelling of `spec = "off"`. Kept for configs that predate `spec`; when
+# both are set and disagree the runner refuses to start rather than pick one.
 # no_spec = false
 
 # --- Request filters + admission (llama-swap lessons)

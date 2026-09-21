@@ -19,9 +19,6 @@
 import * as wasm from './pkg/traverse_wasm.js'
 const init = wasm.default
 const TraverseDb = wasm.TraverseDb
-// Looked up at runtime on purpose: a static `wasm.initThreadPool` (or a
-// literal-keyed `wasm['initThreadPool']`) is reported by rolldown as an
-// import that is always undefined on the single-threaded build.
 const initThreadPool = Reflect.get(wasm, 'initThreadPool')
 
 /** @type {TraverseDb | null} */
@@ -46,20 +43,23 @@ function ensureReady(numThreads) {
   return readyPromise
 }
 
-self.addEventListener('message', async (ev) => {
+// Serialize asynchronous file I/O as well as synchronous WASM. The previous
+// async event handler allowed an open/commit to interleave with later queries.
+let tail = Promise.resolve()
+let pending = 0
+self.addEventListener('message', (ev) => {
   const { id, kind, payload } = ev.data ?? {}
-  try {
-    const result = await handle(kind, payload)
-    self.postMessage({ id, ok: true, result })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const stack = err instanceof Error ? err.stack : undefined
-    self.postMessage({
-      id,
-      ok: false,
-      error: { code: 'WasmError', message: msg, stack },
-    })
-  }
+  const reject = err => self.postMessage({ id, ok: false, error: { code: 'WasmError', message: err instanceof Error ? err.message : String(err) } })
+  if (!Number.isSafeInteger(id) || id <= 0 || pending >= 32) { reject(new Error('Invalid or excessive worker request')); return }
+  pending++
+  tail = tail.then(async () => {
+    try {
+      const result = await handle(kind, payload)
+      const transfer = result?.bytes instanceof Uint8Array ? [result.bytes.buffer] : []
+      self.postMessage({ id, ok: true, result }, transfer)
+    } catch (error) { reject(error) }
+    finally { pending-- }
+  })
 })
 
 /** Dispatch a single request kind. Returns a structured-cloneable
@@ -79,7 +79,7 @@ async function handle(kind, payload) {
       // `timeoutMs` (optional, > 0) installs the executor's
       // thread-local deadline before running. Pair with the JS-side
       // AbortController so a runaway algorithm can be cancelled.
-      const timeoutMs = typeof payload.timeoutMs === 'number' ? payload.timeoutMs : null
+      const timeoutMs = Math.min(30000, Math.max(1, Number.isFinite(payload.timeoutMs) && payload.timeoutMs > 0 ? payload.timeoutMs : 10000))
       // `dialect` (optional) — 'gql' routes through the ISO/IEC 39075
       // parser; anything else (or absent) is openCypher.
       const dialect = typeof payload.dialect === 'string' ? payload.dialect : undefined

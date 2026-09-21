@@ -198,13 +198,7 @@ struct Scratch {
 /// the margin - a step where the model was torn between two words reads very
 /// differently from one where it was merely diffuse, and only the second is
 /// usually still correct.
-#[derive(Default)]
-pub struct StepOut {
-    pub next: Vec<u32>,
-    pub logprob: Vec<f32>,
-    pub nospeech: Vec<f32>,
-    pub runner_up: Vec<Option<(u32, f32)>>,
-}
+pub use crate::whisper::StepOut;
 
 impl DecodeBatch {
     pub fn cap(&self) -> usize {

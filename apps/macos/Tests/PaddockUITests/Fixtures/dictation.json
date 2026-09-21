@@ -1,0 +1,12 @@
+[
+  {"name":"empty composer", "draft":"", "provisional":"  Hej världen. ", "ghost":"Hej världen. ", "committed":"Hej världen."},
+  {"name":"sentence boundary", "draft":"Fix this.", "provisional":"Next sentence.", "ghost":" Next sentence.", "committed":"Fix this. Next sentence."},
+  {"name":"existing space", "draft":"Already ", "provisional":"  spaced ", "ghost":"spaced ", "committed":"Already spaced"},
+  {"name":"newline", "draft":"First line.\n", "provisional":"  Second line.", "ghost":"Second line.", "committed":"First line.\nSecond line."},
+  {"name":"blank paragraph", "draft":"First line.\n\n", "provisional":"Next.", "ghost":"Next.", "committed":"First line.\n\nNext."},
+  {"name":"empty recognition", "draft":"Keep this.", "provisional":"", "ghost":"", "committed":"Keep this."},
+  {"name":"whitespace recognition", "draft":"Keep this.", "provisional":" \t\n", "ghost":"", "committed":"Keep this."},
+  {"name":"multiline utterance", "draft":"Draft", "provisional":"\nFirst.\nSecond.\n", "ghost":" First.\nSecond.\n", "committed":"Draft First.\nSecond."},
+  {"name":"nonbreaking space", "draft":"Draft ", "provisional":" Hej", "ghost":"Hej", "committed":"Draft Hej"},
+  {"name":"unicode caret offsets", "draft":"👩‍💻 Ändra", "provisional":"  världen.", "ghost":" världen.", "committed":"👩‍💻 Ändra världen."}
+]

@@ -11,6 +11,7 @@
 // product); the only differences are the per-binary description and filename.
 
 fn main() {
+    #[cfg(feature = "pdf")]
     pdfium_static();
     #[cfg(windows)]
     windows_resource();
@@ -27,6 +28,7 @@ fn main() {
 ///
 /// The libraries come from `packs/pdfium/build/build-{windows.ps1,linux.sh}`
 /// and are not in git (~25 MB build artifacts).
+#[cfg(feature = "pdf")]
 fn pdfium_static() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

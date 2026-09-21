@@ -12,7 +12,9 @@ pub mod cloud;
 pub mod cloud_loop;
 pub mod collector;
 pub mod config;
+pub mod connections;
 pub mod connectors;
+mod credentials;
 pub mod elections;
 pub mod estimate;
 pub mod feedback;
@@ -20,15 +22,23 @@ pub mod forensics;
 pub mod graph;
 pub mod hostmem;
 pub mod inspect;
+pub mod integrations;
+pub mod log_tail;
 pub mod logs;
+pub mod native_endpoints;
 pub mod nvml;
 pub mod oauth;
+mod oauth_http;
+pub mod ownership;
+mod provider_error;
 pub mod push;
 pub mod readiness;
 pub mod registry;
 pub mod routes;
 pub mod static_assets;
 pub mod store;
+pub mod studio_chat;
+pub mod studio_stream;
 pub mod supervisor;
 pub mod telemetry;
 pub mod updates;
@@ -39,19 +49,50 @@ use std::sync::Arc;
 use config::Config;
 use routes::AppState;
 
-/// Bind and serve the manager (Studio + its API) until stopped.
-pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+/// The native application embeds the control plane, not its web server.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HostMode {
+    Web,
+    Desktop,
+}
+
+pub struct ManagerCore {
+    pub state: Arc<AppState>,
+    pub tls: Option<paddock_tls::Identity>,
+    // Keep the directory exclusively owned for the entire host lifetime.
+    _ownership: ownership::ManagerOwnership,
+}
+
+/// Shared product state for the web host and native app. Desktop startup
+/// reconciles existing runners but does not load elected models automatically.
+/// No TCP listener, certificate, browser or separate manager is needed there.
+pub async fn initialize(
+    cfg: &Config,
+    mode: HostMode,
+) -> Result<ManagerCore, Box<dyn std::error::Error>> {
+    let ownership = ownership::ManagerOwnership::acquire(&Config::data_dir())?;
     let db = Arc::new(
         store::Store::open(&store::default_db_path())
             .map_err(|e| format!("failed to open store: {e}"))?,
     );
+    if mode == HostMode::Desktop {
+        // Finish OS credential authorization during app startup. A denied or
+        // unavailable item remains visibly locked; generation cannot reopen a
+        // Keychain dialog. No DB mutex or Tokio I/O worker waits on the OS.
+        let startup_db = db.clone();
+        tokio::task::spawn_blocking(move || {
+            startup_db.prepare_cloud_credentials()?;
+            startup_db.prepare_connector_credentials()
+        })
+        .await??;
+    }
 
     // Can this machine serve at all, and on what silicon? Probed first because
     // everything below wants the answer  - including the registry,
     // whose default-weights resolution is compute-capability-aware (NVFP4 is
     // the default on Blackwell, Q8_0 elsewhere). Never fails, never blocks:
     // hardware does not change under a running process.
-    let readiness = Arc::new(readiness::probe());
+    let readiness = Arc::new(readiness::probe_for_backend(&cfg.device));
 
     // Model registry (compiled-in manifest): the catalog the Studio browses and
     // pulls from. The origin (Cloudflare R2) is a dumb file host.
@@ -62,7 +103,9 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .cloned()
                 .unwrap_or_else(|| std::path::PathBuf::from("./models")),
         )
-        .with_cc(readiness.cc),
+        .with_cc(readiness.cc)
+        .with_backend(&cfg.device)
+        .with_store(db.clone())?,
     );
     tracing::info!(
         models = registry.catalog().models.len(),
@@ -99,6 +142,10 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             card = readiness.card.as_deref().unwrap_or("?"),
             "graphics card supported - models can run on this computer"
         ),
+        readiness::State::Untested if cfg.device == "metal" => tracing::warn!(
+            card = readiness.card.as_deref().unwrap_or("?"),
+            "Metal preview available; qualification is artifact-specific and full Mac product/telemetry qualification remains open"
+        ),
         readiness::State::Untested => tracing::warn!(
             card = readiness.card.as_deref().unwrap_or("?"),
             "graphics card found, but paddock has not finished testing it - \
@@ -112,7 +159,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             "graphics driver is too old for this build - update it and models can run"
         ),
         readiness::State::NoCard => tracing::warn!(
-            "no usable NVIDIA graphics card found - models cannot run on this \
+            "no usable graphics card for the configured backend - models cannot run on this \
              computer, but cloud models work normally"
         ),
     }
@@ -127,7 +174,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // logged as if something had gone wrong, one line above the line that
     // calmly explains there is no NVIDIA card. Nothing went
     // wrong. It is a computer without an NVIDIA GPU.
-    let gpu = if readiness.state == readiness::State::NoCard {
+    let gpu = if cfg.device != "cuda" || readiness.state == readiness::State::NoCard {
         telemetry::Telemetry::disabled()
     } else {
         telemetry::start()
@@ -168,7 +215,7 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // elected port is left alone. A failed respawn keeps its election (the
     // operator sees the error; next boot retries) - silently dropping desired
     // state would be a silent failure.
-    {
+    if mode == HostMode::Web {
         let sup = supervisor.clone();
         let el = elections.clone();
         let causes = db.clone();
@@ -246,18 +293,22 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // A failure here degrades to cleartext and says so. It never stops the
     // manager: a box that cannot write a key file is still a box that should
     // come up.
-    let tls = match paddock_tls::Identity::load_or_create(&data_dir.join("tls")) {
-        Ok(id) => {
-            if id.issued {
-                tracing::info!(names = ?id.names, "issued this computer's certificate");
+    let tls = if mode == HostMode::Desktop {
+        None
+    } else {
+        match paddock_tls::Identity::load_or_create(&data_dir.join("tls")) {
+            Ok(id) => {
+                if id.issued {
+                    tracing::info!(names = ?id.names, "issued this computer's certificate");
+                }
+                Some(id)
             }
-            Some(id)
-        }
-        Err(e) => {
-            tracing::error!(%e, "could not establish a TLS identity - serving over plain http, \
+            Err(e) => {
+                tracing::error!(%e, "could not establish a TLS identity - serving over plain http, \
                  which means no microphone and no clipboard for any browser that is not on this \
                  computer");
-            None
+                None
+            }
         }
     };
 
@@ -302,6 +353,18 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // the /api/events stream open, publishing on change (crate::push)
     crate::push::spawn_watcher(state.clone());
 
+    Ok(ManagerCore {
+        state,
+        tls,
+        _ownership: ownership,
+    })
+}
+
+/// The existing web/CLI host remains available on Windows and Linux (and to
+/// explicit CLI users on macOS). The native app never calls this entry point.
+pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut core = initialize(&cfg, HostMode::Web).await?;
+
     // A one-time CUDA fetch used to start here, for a box that had
     // a supported card and no maths libraries. Paddock ships no NVIDIA
     // redistributable and fetches none, so there is no such box: a supported
@@ -309,8 +372,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = std::net::SocketAddr::new(cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, tls = tls.is_some(), "paddock manager listening");
-    print_banner(&cfg, auth_key.as_deref(), tls.as_ref());
+    tracing::info!(%addr, tls = core.tls.is_some(), "paddock manager listening");
+    print_banner(&cfg, core.state.auth_key.as_deref(), core.tls.as_ref());
 
     // One port, both schemes, chosen per connection by the first byte
     // (paddock_tls::serve). `axum::serve` cannot do that, so the accept loop
@@ -318,8 +381,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // auth_mw exempts loopback peers and a request without it looks remote.
     paddock_tls::serve(
         listener,
-        routes::router(state),
-        tls.map(|t| t.server),
+        routes::router(core.state.clone()),
+        core.tls.take().map(|t| t.server),
         cfg.port,
     )
     .await?;

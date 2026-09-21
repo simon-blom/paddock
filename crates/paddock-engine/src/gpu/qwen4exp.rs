@@ -340,7 +340,7 @@ impl GpuExecutor {
         self.kernels.q4x_combine_norm_q8mmq_nsi.is_some()
     }
 
-    /// [`Self::q4x_combine_norm_q8mmq_ns`] that also produces the NEXT mix's
+    /// [`Self::q4x_combine_norm_q8mmq_ns`] that also produces the next mix's
     /// inject logits from its norm pass (slot 609): `w_inj` [4][hc * hidden]
     /// f32, `ip` [rows][hc][hc] scratch, the logits into `inj_out` [rows][hc].
     /// This combine's own inject logits come from `inj_in` at an element

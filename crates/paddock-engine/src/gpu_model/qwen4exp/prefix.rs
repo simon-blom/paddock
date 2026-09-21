@@ -102,7 +102,7 @@ pub(super) struct PrefixCache {
     last_reused: Vec<usize>,
     stats: bool,
     /// per pool index: the (length, hash) of the prompt that took the
-    /// checkpoint INSIDE its own prefill walk - an exact re-send of that prompt
+    /// checkpoint inside its own prefill walk - an exact re-send of that prompt
     /// prefills cold (see `resume`). None for a checkpoint a walk boundary
     /// took (cut walks, the reply checkpoint).
     src: Vec<Option<(usize, u64)>>,

@@ -20,5 +20,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # Only to build the HTTP transport's header map; rmcp owns the reqwest client.
 http = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 # Parse the `state` (CSRF) param out of the authorization URL rmcp generates.
 url = "2"

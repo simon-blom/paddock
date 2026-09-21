@@ -18,6 +18,10 @@
 // audio agree on it (LocalAgreement-2), so what arrives here only ever grows.
 // This file therefore appends deltas and never rewrites - if it ever needed to
 // rewrite, the promise would already be broken upstream.
+// The explicitly negotiated final-revision mode is the one exception at the
+// utterance boundary: completed text replaces the provisional hypothesis so
+// the persisted words and final alignment describe the same decode. Older
+// runners/clients keep the original append-only mode.
 //
 // The UNIT is the UTTERANCE, not the recording. The session runs
 // server VAD, so a pause closes an utterance and the runner answers it with a
@@ -34,9 +38,12 @@
 // assumed anyway: a lane that disagrees about where its item started is a lane
 // whose column cannot be compared, and saying so beats rendering it.
 import { computed, ref, shallowRef } from 'vue'
+import { recordAudio, type AudioRecording } from '@/lib/audio-recording'
+import { SpeechProgress } from '@/lib/speech-progress'
 
 import { openMic } from './useAudioDevices'
 import { useMicLevels } from './useMicLevels'
+import { PcmResampler } from '@/lib/pcm-resampler'
 
 /** Sent to the model, and what the session is told to expect. Whisper works at
  *  16 kHz, so anything above it is bytes on the wire for nothing - the browser
@@ -58,8 +65,6 @@ const BACKLOG_MAX = 240
 /** What the browser will record the clip as, best first. The list is a
  *  fallback ladder because Safari has no webm/opus and Chrome has no mp4/aac -
  *  `isTypeSupported` picks, and the extension follows from what it picked. */
-const REC_TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus']
-const REC_EXT: Record<string, string> = { webm: 'webm', mp4: 'm4a', ogg: 'ogg' }
 
 interface Started {
   /** One runner port per lane. A single-element list is dictation; several is
@@ -85,6 +90,10 @@ interface Started {
    *  prompt is what some fine-tunes condition their no-speech refusal on
     */
   detail?: boolean[]
+  /** Ordered Stop barrier, only for runners which explicitly advertise it. */
+  drain?: boolean[]
+  /** Final text may correct stable partials to match final-pass word timings. */
+  finalRevision?: boolean[]
   /** The session ended without anyone stopping it - every lane failed, or the
    *  runner closed the socket. Called with what was heard and the recording so
    *  far, so the caller can close its turn instead of leaving one open
@@ -103,6 +112,7 @@ interface Started {
    *  already owns the microphone - a second getUserMedia for the same voice
    *  would be a second capture of the same sound. */
   record?: boolean
+  recordingTypes?: readonly string[]
 }
 
 /** What one utterance produced: every lane's transcript, and the recording
@@ -271,17 +281,20 @@ export function useMicTranscribe() {
   let backlogs: string[][] = []
   const ctx = shallowRef<AudioContext | null>(null)
   let stream: MediaStream | null = null
+  let generation = 0
   let pending: Float32Array[] = []
   let pendingLen = 0
   let done: ((lanes: MicLane[]) => void) | null = null
-  let rec: MediaRecorder | null = null
-  let chunks: BlobPart[] = []
+  let rec: AudioRecording | null = null
   /** `stop` has been called: the next time a lane runs out of outstanding
    *  utterances it is finished, rather than waiting for the next one. */
   let closing = false
   let straggler: ReturnType<typeof setTimeout> | null = null
   /** per lane, whether it asked for enriched utterances (see `Started.detail`) */
   let details: boolean[] = []
+  let drainable: boolean[] = []
+  let finalRevisions: boolean[] = []
+  const draining = new Set<number>()
   /** what this session calls a quiet room (see `Started.idleMs`) */
   let idleMs = IDLE_MS
   /** Samples sent since the current run of speech began - the client's mirror
@@ -297,7 +310,11 @@ export function useMicTranscribe() {
    *  a second and a half of speech may only get one - and settling a lane on
    *  "no partial text pending" would throw that utterance away at the moment
    *  its final pass was about to answer it. */
-  const outstanding = new Map<number, number>()
+  const outstanding = new Map<number, SpeechProgress>()
+  function progress(port: number): SpeechProgress {
+    if (!outstanding.has(port)) outstanding.set(port, new SpeechProgress())
+    return outstanding.get(port)!
+  }
 
   /** Close the recording and hand back the file, or undefined when nothing was
    *  being recorded. Must finish before teardown stops the microphone track,
@@ -305,35 +322,10 @@ export function useMicTranscribe() {
   function finishRecording(): Promise<File | undefined> {
     const r = rec
     rec = null
-    if (!r || r.state === 'inactive') return Promise.resolve(undefined)
-    const type = r.mimeType || 'audio/webm'
-    const ext = REC_EXT[type.split('/')[1]?.split(';')[0] ?? 'webm'] ?? 'webm'
-    return new Promise((resolve) => {
-      r.onstop = () => {
-        const parts = chunks
-        chunks = []
-        // The name is what the chat will fall back to if the transcript comes
-        // back empty, so it says what this is rather than pretending to be a
-        // file someone chose.
-        resolve(new File(parts, `recording.${ext}`, { type }))
-      }
-      r.stop()
-    })
-  }
-
-  /** Linear resample to 16 kHz. Cheap and adequate: this is speech headed for
-   *  a mel filterbank, not audio anyone will listen to. */
-  function downRate(input: Float32Array, from: number): Float32Array {
-    if (from === TARGET_RATE) return input
-    const ratio = from / TARGET_RATE
-    const out = new Float32Array(Math.floor(input.length / ratio))
-    for (let i = 0; i < out.length; i++) {
-      const at = i * ratio
-      const lo = Math.floor(at)
-      const hi = Math.min(lo + 1, input.length - 1)
-      out[i] = input[lo] + (input[hi] - input[lo]) * (at - lo)
-    }
-    return out
+    return r?.finish().catch(e => {
+      error.value = e instanceof Error ? e.message : 'The recording could not be finalized'
+      return undefined
+    }) ?? Promise.resolve(undefined)
   }
 
   function toPcm16Base64(samples: Float32Array): string {
@@ -408,6 +400,15 @@ export function useMicTranscribe() {
     }
   }
 
+  function releaseCapture(): void {
+    meter.detach()
+    stream?.getTracks().forEach((t) => t.stop())
+    stream = null
+    const previousContext = ctx.value
+    ctx.value = null
+    void previousContext?.close().catch(() => {})
+  }
+
   async function teardown(): Promise<void> {
     if (straggler) {
       clearTimeout(straggler)
@@ -417,16 +418,14 @@ export function useMicTranscribe() {
     died = null
     spoken = 0
     details = []
+    drainable = []
+    finalRevisions = []
+    draining.clear()
     idleMs = IDLE_MS
     outstanding.clear()
-    if (rec && rec.state !== 'inactive') rec.stop()
+    rec?.cancel()
     rec = null
-    chunks = []
-    meter.detach()
-    stream?.getTracks().forEach((t) => t.stop())
-    stream = null
-    await ctx.value?.close().catch(() => {})
-    ctx.value = null
+    releaseCapture()
     for (const s of socks.value) s.close()
     socks.value = []
     backlogs = []
@@ -465,9 +464,8 @@ export function useMicTranscribe() {
       // `??` and not `||`: millisecond zero is where the first utterance of a
       // session that opened on a word actually starts.
       at: (msg.paddock_audio_start_ms as number | undefined) ?? null,
-      // the completed transcript is the concatenated deltas - the server
-      // guarantees it - so this replaces `open` rather than appending, and the
-      // two agree either way
+      // Terminal text is authoritative. In negotiated final-revision mode it
+      // can correct the provisional prefix without decoding the audio again.
       text: ((msg.transcript as string) ?? l.open).trim(),
       duration: (v?.duration as number | undefined) ?? usage?.seconds,
       words: words?.map((w) => ({
@@ -496,14 +494,15 @@ export function useMicTranscribe() {
     l.settled = true
     if (why) l.error = why
     if (!lanes.value.every((x) => x.settled)) return
-    finishing.value = false
     if (done) {
       const finish = done
       done = null
-      void teardown()
+      // Stop owns teardown after both the recorder and all lanes finish.
+      // A quiet lane can settle synchronously, before final data is delivered.
       finish(lanes.value)
       return
     }
+    finishing.value = false
     // Nobody asked for this. Every lane is gone while the microphone is still
     // open - a runner died, or the session hit a limit and the socket closed.
     // Tearing down here would stop the recorder and drop its chunks, leaving
@@ -511,9 +510,13 @@ export function useMicTranscribe() {
     // properly and hand back what there is. What was said is still worth
     // keeping; it is the rest of the sentence that was lost.
     const was = lanes.value
+    const diedGeneration = ++generation // Invalidate an outstanding microphone permission/open.
     listening.value = false
+    finishing.value = true
     const tell = died
     void finishRecording().then((clip) => {
+      if (diedGeneration !== generation) return
+      finishing.value = false
       void teardown()
       tell?.({ lanes: was, clip })
     })
@@ -546,7 +549,12 @@ export function useMicTranscribe() {
       }
       const l = laneAt(port)
       if (!l) return
+      if (!progress(port).receive(msg)) return
       switch (msg.type as string) {
+        case 'input_audio_buffer.drained':
+          draining.delete(port)
+          if (closing && !progress(port).waiting) settle(port)
+          break
         case 'error': {
           const e = msg.error as { message?: string } | undefined
           settle(port, e?.message ?? 'This model failed.')
@@ -567,13 +575,12 @@ export function useMicTranscribe() {
           l.speaking = true
           idle.value = false
           spoken = 0
-          outstanding.set(port, (outstanding.get(port) ?? 0) + 1)
           break
         case 'input_audio_buffer.speech_stopped':
           // The turn is over but its answer is not here yet - the lane is not
           // idle, it is thinking, and `outstanding` is what knows the
           // difference.
-          l.speaking = false
+          l.speaking = progress(port).speaking !== undefined
           break
         case 'input_audio_buffer.timeout_triggered':
           // Every lane runs the same detector on the same audio, so one lane
@@ -585,13 +592,12 @@ export function useMicTranscribe() {
           retext(l)
           break
         case 'conversation.item.input_audio_transcription.completed': {
-          l.speaking = false
+          l.speaking = progress(port).speaking !== undefined
           finalise(l, msg)
-          outstanding.set(port, Math.max(0, (outstanding.get(port) ?? 1) - 1))
           // These arrive all session long now, so a completed is the END of the
           // lane only once the page has stopped listening and this was the last
           // utterance owed.
-          if (closing && !outstanding.get(port)) settle(port)
+          if (closing && !progress(port).waiting && !draining.has(port)) settle(port)
           break
         }
       }
@@ -621,6 +627,7 @@ export function useMicTranscribe() {
                   // Only where this model can answer it. Asking a lane that
                   // cannot gets the whole update refused, rate and VAD with it.
                   ...(details[i] ? { paddock_verbose: true } : {}),
+                  ...(finalRevisions[i] ? { paddock_final_revision: true } : {}),
                 },
               },
             },
@@ -641,7 +648,8 @@ export function useMicTranscribe() {
   }
 
   async function start(opts: Started): Promise<void> {
-    if (listening.value || !opts.ports.length) return
+    if (listening.value || finishing.value || !opts.ports.length) return
+    const ticket = ++generation
     // Browsers only hand the microphone to secure origins (https, or the
     // localhost carve-out). On a plain-http LAN address `navigator.mediaDevices`
     // does not exist at all - say the real reason instead of crashing on it.
@@ -658,6 +666,9 @@ export function useMicTranscribe() {
     idle.value = false
     closing = false
     details = opts.ports.map((_, i) => opts.detail?.[i] === true)
+    drainable = opts.ports.map((_, i) => opts.drain?.[i] === true)
+    finalRevisions = opts.ports.map((_, i) => opts.finalRevision?.[i] === true)
+    draining.clear()
     idleMs = opts.idleMs ?? IDLE_MS
     died = opts.onDied ?? null
     spoken = 0
@@ -682,7 +693,12 @@ export function useMicTranscribe() {
     //
     // None of this needs a microphone, and doing it before the permission call
     // also hides the socket handshakes behind the prompt.
-    const ac = new AudioContext()
+    // Prefer the browser audio engine's anti-aliased conversion on its render
+    // thread. Older engines can refuse this rate; their fallback keeps phase.
+    let ac: AudioContext
+    try { ac = new AudioContext({ sampleRate: TARGET_RATE }) }
+    catch { ac = new AudioContext() }
+    const resampler = new PcmResampler(ac.sampleRate)
     ctx.value = ac
     backlogs = opts.ports.map(() => [])
     socks.value = opts.ports.map((p, i) => openLane(p, i, opts.language))
@@ -698,14 +714,17 @@ export function useMicTranscribe() {
       // created outside a user gesture can come up suspended, and after the
       // permission prompt the gesture is spent.
       if (ac.state === 'suspended') await ac.resume()
+      if (ticket !== generation) return
       const onBlock = (block: Float32Array) => {
-        const down = downRate(block, ac.sampleRate)
+        if (closing || ticket !== generation) return
+        const down = resampler.push(block)
         pending.push(down)
         pendingLen += down.length
         flush()
       }
       if (ac.audioWorklet) {
         await ac.audioWorklet.addModule('/pcm-capture-worklet.js')
+        if (ticket !== generation) return
         const worklet = new AudioWorkletNode(ac, 'pcm-capture')
         worklet.port.onmessage = (e: MessageEvent<Float32Array>) => onBlock(e.data)
         node = worklet
@@ -733,6 +752,7 @@ export function useMicTranscribe() {
       sink.gain.value = 0
       node.connect(sink).connect(ac.destination)
     } catch (e) {
+      if (ticket !== generation) return
       fail(`Audio capture failed: ${e instanceof Error ? e.message : String(e)}`)
       return
     }
@@ -743,8 +763,11 @@ export function useMicTranscribe() {
       // the only one there is, since the session refuses that parameter rather
       // than pretending to have it, and on a laptop microphone it is the
       // difference between a transcript and a guess.
-      stream = await openMic()
+      const opened = await openMic()
+      if (ticket !== generation) { opened.getTracks().forEach(t => t.stop()); return }
+      stream = opened
     } catch (e) {
+      if (ticket !== generation) return
       error.value = `Microphone unavailable: ${e instanceof Error ? e.message : String(e)}`
       void teardown()
       lanes.value = []
@@ -769,13 +792,7 @@ export function useMicTranscribe() {
       micLive = true
       if (opts.record) {
         try {
-          const mime = REC_TYPES.find((t) => MediaRecorder.isTypeSupported(t))
-          chunks = []
-          rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
-          rec.ondataavailable = (e) => {
-            if (e.data.size) chunks.push(e.data)
-          }
-          rec.start()
+          rec = recordAudio(stream, opts.recordingTypes)
         } catch {
           // No recorder for any container this browser admits to supporting.
           // The live transcripts still work; the caller finds out by getting no
@@ -799,6 +816,10 @@ export function useMicTranscribe() {
     // Close the recording first: teardown stops the microphone track, and a
     // recorder whose source ends mid-flush can lose its tail.
     const clipP = finishRecording()
+    // Stop owns the capture cutoff, not the last server response. The model
+    // may spend seconds finishing; it must not hear anything said after Stop.
+    const captureGeneration = generation
+    void clipP.then(() => { if (captureGeneration === generation) releaseCapture() })
     // Stopped before any socket finished opening - there is nothing on the far
     // side to commit to, and sending on a CONNECTING socket throws. Whatever
     // was captured is gone, which is the honest outcome of a click-and-cancel.
@@ -830,11 +851,15 @@ export function useMicTranscribe() {
       // its own turns now, so a stop during a pause has nothing left to close
       // - committing anyway would hand the model the few hundred milliseconds
       // of pre-roll it keeps and file the answer as an utterance.
-      if (l.speaking) socks.value[i].send(commit)
+      if (drainable[i]) {
+        draining.add(l.port)
+        progress(l.port).beginDrain()
+        socks.value[i].send(JSON.stringify({ type: 'input_audio_buffer.drain' }))
+      } else if (l.speaking) socks.value[i].send(commit)
       // Nothing outstanding means every word this lane heard is already an
       // item. Not "no partial text": a short utterance can produce no deltas at
       // all and still be about to answer.
-      else if (!outstanding.get(l.port)) settle(l.port)
+      else if (!progress(l.port).waiting) settle(l.port)
     }
     // A lane that never answers must not hold the session open forever. This
     // is not a decode budget - a closed utterance settles in a second or two -
@@ -846,15 +871,22 @@ export function useMicTranscribe() {
       }
     }, SETTLE_TIMEOUT_MS)
     const [said, clip] = await Promise.all([answered, clipP])
+    if (captureGeneration === generation) {
+      finishing.value = false
+      await teardown()
+    }
     return { lanes: said, clip }
   }
 
   /** Throw the utterance away - the sockets and the microphone go with it. */
   function cancel(): void {
+    ++generation
+    const finish = done
     done = null
     finishing.value = false
     lanes.value = []
     void teardown()
+    finish?.([])
   }
 
   return { lanes, text, listening, finishing, idle, error, levels: meter.levels, start, stop, cancel }

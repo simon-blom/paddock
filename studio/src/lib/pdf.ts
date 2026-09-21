@@ -35,6 +35,16 @@ export function pdfEngine(): Promise<LectorEngine> {
 }
 
 let viewerEnginePromise: Promise<LectorEngine> | null = null
+let viewerOperations: Promise<void> = Promise.resolve()
+
+/** The viewer has one engine-wide active-document signal. Serialize handle
+ * mutation across pane lifetimes, but keep downloads outside this queue so
+ * a cancelled slow fetch never holds the next document behind it. */
+export function withPdfViewerDocuments<T>(operation: () => Promise<T>): Promise<T> {
+  const result = viewerOperations.then(operation)
+  viewerOperations = result.then(() => {}, () => {})
+  return result
+}
 
 /** The document pane's viewer engine - Separate from the raster engine above
  *  deliberately: the LectorViewer juggles the engine-wide active document, and

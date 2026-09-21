@@ -55,6 +55,8 @@ export interface ViewportInstance {
     readonly totalHeight: ReadonlySignal<number>;
     /** Reactive list of visible page indices. */
     readonly visiblePages: ReadonlySignal<number[]>;
+    /** Number of adjacent pages retained by the rendering window. */
+    readonly bufferPages: ReadonlySignal<number>;
     /** Attach this viewport to a DOM container. May only be attached to one container at a time. */
     attach(container: HTMLElement): void;
     /** Detach from its container; cleans up the ResizeObserver and scroll listener. */

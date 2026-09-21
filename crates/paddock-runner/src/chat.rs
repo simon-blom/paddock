@@ -1384,6 +1384,11 @@ fn prepare(
         }
         Some(other) => return Err(format!("invalid tool_choice {other}")),
     }
+    if !model.dialect.supports_tools()
+        && (tools.is_some_and(|t| !t.is_empty()) || forced_tool.is_some())
+    {
+        return Err("this speech checkpoint generates transcripts, not tool calls".into());
+    }
     let tool_syntax =
         match forced_tool {
             None => None,
@@ -2403,6 +2408,7 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
                 }
                 TokenEvent::Done(r, stats) => {
                     reason = r;
+                    completion_tokens += stats.terminal_tokens();
                     meta.scope.phases(&stats);
                     break;
                 }
@@ -2499,6 +2505,7 @@ pub(crate) fn safe_emit_len(s: &str, dialect_markers: &[&str], stops: &[String])
 /// Per-choice streaming state for the merged n-way SSE loop.
 struct ChoiceState {
     ids: Vec<u32>,
+    terminal_tokens: usize,
     /// incremental decode of `ids` - the per-token full re-decode was the
     /// O(n^2) long-stream collapse at high concurrency
     sd: paddock_tokenizer::StreamDecoder,
@@ -2519,6 +2526,7 @@ impl ChoiceState {
     fn new(sd: paddock_tokenizer::StreamDecoder) -> ChoiceState {
         ChoiceState {
             ids: Vec::new(),
+            terminal_tokens: 0,
             sd,
             lps: Vec::new(),
             lp_flushed: 0,
@@ -2669,6 +2677,7 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                 }
                 TokenEvent::Done(r, stats) => {
                     cs.reason = r;
+                    cs.terminal_tokens = stats.terminal_tokens();
                     cs.done = true;
                     open -= 1;
                     meta.scope.phases(&stats);
@@ -2699,7 +2708,7 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
         // (finish at length / stop-token) + the finish chunk
         let mut completion_tokens = 0usize;
         for (i, cs) in states.iter_mut().enumerate() {
-            completion_tokens += cs.ids.len();
+            completion_tokens += cs.ids.len() + cs.terminal_tokens;
             if cs.finish_sent {
                 meta.scope.finish("stop"); // early stop-string hit
                 continue;
@@ -3839,6 +3848,36 @@ mod tests {
         // context ceiling and publishes nothing rather than a made-up number.
         assert_eq!(AudioFrontend::None.max_clip_s(32_768), None);
         assert_eq!(AudioFrontend::Qwen3Asr.max_clip_s(0), None);
+    }
+
+    #[test]
+    fn qwen_asr_metal_caps_frontend_without_changing_cuda() {
+        use crate::serving::AudioFrontend;
+        let metal = AudioFrontend::Qwen3AsrMetal;
+        assert_eq!(metal.max_clip_s(8192), Some(120.));
+        assert!(AudioFrontend::Qwen3Asr.max_clip_s(8192).unwrap() > 120.);
+        let x = vec![0.; 4800];
+        let a = metal.features(&x).unwrap();
+        let b = AudioFrontend::Qwen3Asr.features(&x).unwrap();
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.n_frames, b.n_frames);
+        assert!(metal.features(&vec![0.; 120 * 16000 + 1]).is_err());
+        assert!(metal.max_clip_s(30).unwrap() < 120.);
+    }
+
+    #[test]
+    fn granite_speech_metal_caps_frontend_without_changing_cuda() {
+        use crate::serving::AudioFrontend;
+        let metal = AudioFrontend::GraniteSpeechMetal;
+        assert_eq!(metal.max_clip_s(4096), Some(120.));
+        assert!(AudioFrontend::GraniteSpeech.max_clip_s(4096).unwrap() > 120.);
+        let x = vec![0.; 4800];
+        let a = metal.features(&x).unwrap();
+        let b = AudioFrontend::GraniteSpeech.features(&x).unwrap();
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.n_frames, b.n_frames);
+        assert!(metal.features(&vec![0.; 120 * 16000 + 1]).is_err());
+        assert!(metal.max_clip_s(30).unwrap() < 120.);
     }
 
     /// The legacy translation must produce the exact modern shape, not merely

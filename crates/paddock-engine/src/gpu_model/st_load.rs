@@ -52,7 +52,83 @@ pub(crate) fn bf16_bytes<'a>(
     Ok(bytes)
 }
 
+/// bf16 -> f16, BIT-LEVEL and exact, straight off the checkpoint bytes.
+///
+/// bf16 is `s | 8e | 7m` biased 127; f16 is `s | 5e | 10m` biased 15. Every
+/// bf16 mantissa bit fits (7 <= 10) and the exponent is a rebias, so for any
+/// value inside f16's normal range the conversion is exact - which is what
+/// makes the f16 tensor-core lane the same numbers rather than a precision
+/// trade. Out-of-range is checked, not clamped: overflow refuses the plane,
+/// and the subnormal tail falls back to the rounding convert (values below
+/// 2^-14 contribute less than the f32 accumulator's own rounding, the same
+/// reasoning `narrow_to_f16` records).
+///
+/// The obvious `bf16 -> f32 -> f16` spelling of this costs four minutes of
+/// load on qwen4exp's 3.2G dense elements, which is why it is written out.
+/// Lives here because the second family to want it (dinov3) arrived.
+pub(crate) fn bf16_to_f16_exact(raw: &[u8], what: &str) -> Result<Vec<half::f16>, GpuModelError> {
+    let mut over = 0usize;
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    for b in raw.as_chunks::<2>().0 {
+        let v = u16::from_le_bytes(*b);
+        let sign = v & 0x8000;
+        let e = ((v >> 7) & 0xff) as i32;
+        let m = v & 0x7f;
+        if (113..=142).contains(&e) {
+            // normal in f16: exponent rebias 127 -> 15, mantissa left-aligned
+            out.push(half::f16::from_bits(
+                sign | (((e - 112) as u16) << 10) | (m << 3),
+            ));
+        } else if e == 0 {
+            out.push(half::f16::from_bits(sign)); // +/-0 (bf16 subnormals flush)
+        } else {
+            // over- or underflow: let the rounding convert decide, and count
+            // the overflows so the caller can refuse the plane
+            let f = f32::from_bits((v as u32) << 16);
+            let h = half::f16::from_f32(f);
+            if f.is_finite() && !h.is_finite() {
+                over += 1;
+            }
+            out.push(h);
+        }
+    }
+    if over > 0 {
+        return Err(GpuModelError::Unsupported(format!(
+            "{what}: {over} of {} weights overflow f16 (|w| > 65504) - this plane cannot \
+             carry the f16 tensor-core lane",
+            raw.len() / 2
+        )));
+    }
+    Ok(out)
+}
+
 /// Read a tensor as f32, widening bf16 exactly; f32 passes through.
+/// OCP E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa. 0x7F/0xFF are NaN;
+/// exponent 0 is subnormal with no implicit leading 1.
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let man = (b & 0x07) as f32;
+    if exp == 0x0F && man == 7.0 {
+        return f32::NAN;
+    }
+    if exp == 0 {
+        // subnormal: 2^(1-bias) * man/8
+        sign * (man / 8.0) * (2.0f32).powi(1 - 7)
+    } else {
+        sign * (1.0 + man / 8.0) * (2.0f32).powi(exp - 7)
+    }
+}
+
+/// OCP E8M0 shared scale: a biased exponent byte, 0xFF is NaN.
+fn ue8m0_to_f32(b: u8) -> f32 {
+    if b == 0xFF {
+        f32::NAN
+    } else {
+        (2.0f32).powi(b as i32 - 127)
+    }
+}
+
 pub(crate) fn f32_tensor(
     st: &ShardedSafetensors,
     name: &str,
@@ -69,9 +145,42 @@ pub(crate) fn f32_tensor(
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect(),
+        // MXFP8 dequantized on the host. These are the planes the engine
+        // consumes as f32 (the GDN in_proj_a/b pair the delta_gate_ab layout
+        // fuses, and the norms), not as a weight class - there is no f8 lane
+        // to hand them to, so the only alternatives are dequantize here or
+        // refuse a checkpoint we otherwise serve. They are tiny: in_proj_a is
+        // [48, 2560], 123k values, against the 99 GiB the file carries. The
+        // big planes never reach this function - `dense()` passes their bytes
+        // straight through (see `mxfp8_plane`), so nothing here walks back a
+        // quantization the kernel could have read directly.
+        StDtype::F8E4m3 => {
+            let (ts, sb) = st.bytes(&format!("{name}_scale")).ok_or_else(|| {
+                GpuModelError::Unsupported(format!("{name}: f8e4m3 with no {name}_scale"))
+            })?;
+            if ts.dtype != StDtype::U8 {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{name}_scale: {:?}, want u8 (ue8m0)",
+                    ts.dtype
+                )));
+            }
+            if bytes.len() != sb.len() * 32 {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{name}: {} payload bytes against {} scales - want one ue8m0 per 32 \
+                     (MXFP8 block [1, 32])",
+                    bytes.len(),
+                    sb.len()
+                )));
+            }
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| e4m3_to_f32(b) * ue8m0_to_f32(sb[i / 32]))
+                .collect()
+        }
         other => {
             return Err(GpuModelError::Unsupported(format!(
-                "{name}: expected bf16/f32, got {other:?}"
+                "{name}: expected bf16/f32/f8e4m3, got {other:?}"
             )));
         }
     };

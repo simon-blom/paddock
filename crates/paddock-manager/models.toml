@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # models.toml - the blessed-models manifest this paddock release ships with.
 #
-# This file is the catalog. It is compiled into the binary (include_str!), so a
-# given paddock build only ever offers models it was built to load - compatibility
-# is guaranteed by construction. There is no remote catalog to fetch; the origin
+# This file is the catalog. It is compiled into the binary (include_str!).
+# Artifact/backend contracts determine compatibility; benchmark/test progress
+# is tracked separately and does not gate availability. There is no remote catalog; the origin
 # (models.truespar.io / Cloudflare R2) is a dumb file host, and each `url` is
 # stable and immutable once published.
 #
@@ -29,12 +29,18 @@
 #     default = true    the row-level Download bundle = default weights +
 #                       every default companion
 #     quant             the honest label for weights (drives the quality tag)
+#     runtime           omitted = CUDA only, never implicit Metal support
+#                       backend_overrides narrow capabilities/cache/companions
+#                       for one backend without changing another backend's contract
 #
 # Adding a model (all one release):
 #   1. `powershell -File the publish tool`   # upload bytes + emit
 #      a catalog manifest (url + dest + sha256 + size per file)
 #   2. paste the [[model]] + [[model.artifact]] blocks here; specs from the
 #      vendor's model card - sourced, never guessed
+#      specs.published_at = upstream publication day (YYYY-MM-DD), with a
+#      published_source URL. Not a revision or repository-creation timestamp.
+#      Omit both when the day is unknown; native date sorting puts these last.
 #   3. cut the release
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -54,6 +60,8 @@ revision = "2026-08-01"
   [model.specs]
   params = "21B · 3.6B active"
   context = "128K"
+  published_at = "2025-08-05"
+  published_source = "https://openai.com/index/introducing-gpt-oss/"
   homepage = "https://huggingface.co/openai/gpt-oss-20b"
   # user-facing copy: PLAIN language (- no MTP/MoE/mmproj
   # talk), factual and sourced, both sides - never marketing
@@ -76,6 +84,20 @@ revision = "2026-08-01"
   label = "Native MXFP4"
   quant = "MXFP4"
   default = true
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native Metal MXFP4 text graph; 20B GPU routing, paged attention and lifecycle gates pass. Independent first tokens pass, full reasoning-stream parity remains incomplete. Metal retains full paged KV on sliding layers plus one prefix reserve sequence; context is limited to 32K pending ring-cache and long-context qualification."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 12096558336
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
 
   [model.artifact.shape]
   weight_bytes = 13229950080
@@ -134,6 +156,8 @@ revision = "2026-08-15"
   [model.specs]
   params = "117B · 5.1B active"
   context = "128K"
+  published_at = "2025-08-05"
+  published_source = "https://openai.com/index/introducing-gpt-oss/"
   homepage = "https://huggingface.co/openai/gpt-oss-120b"
   about = "OpenAI's larger open model - the same design as the 20B with far more experts, for stronger reasoning and tool use on a card big enough to hold it."
   strengths = [
@@ -160,6 +184,21 @@ revision = "2026-08-15"
   label = "Native MXFP4"
   quant = "MXFP4"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native Metal 120B MXFP4 text graph; 128-expert GPU routing, grouped projections, paged attention and lifecycle gates pass at 4K/four slots. Independent first tokens pass 18/18; full streams pass 3/5 and c=1/c=4 serving remains slower than llama.cpp. Full paged KV on sliding layers plus one prefix reserve; 32K/64-slot implementation limits are not qualification claims."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 63374323968
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
 
   [model.artifact.shape]
   weight_bytes = 63387346208
@@ -232,6 +271,8 @@ kv_default = "fp8_e4m3"
   [model.specs]
   params = "31B"
   context = "256K"
+  published_at = "2026-04-02"
+  published_source = "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
   homepage = "https://huggingface.co/google/gemma-4-31B-it"
   about = "Google's strongest open model - the best single-answer quality in this catalog, and it reads images."
   strengths = [
@@ -246,6 +287,7 @@ kv_default = "fp8_e4m3"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter"], note = "Metal dense 31B; F16 KV. Vision uses the qualified 70-280 token budget; long-output qualification remains open." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -290,6 +332,7 @@ kv_default = "fp8_e4m3"
 
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal dense 31B; F16 KV. Vision uses the qualified 70-280 token budget; long-output qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -304,6 +347,7 @@ kv_default = "fp8_e4m3"
   # separate 470M gemma4-assistant drafter - gemma4's MTP is not in-file
   [[model.artifact]]
   id = "drafter"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal dense 31B; F16 KV. Vision uses the qualified 70-280 token budget; long-output qualification remains open." } } }
   kind = "drafter"
   format = "gguf"
   label = "Faster generation (470M drafter)"
@@ -314,6 +358,146 @@ kv_default = "fp8_e4m3"
     dest = "gemma-4-31B-it-GGUF/gemma-4-31B-it-mtp.gguf"
     sha256 = "5ae8b0117bed601e8924c6305bd5b0585de361d51f0e77091bcb4252cf1f27de"
     size = 514687104
+
+  # MLX-community export: a named exception to the sourcing rule, mirrored on R2.
+  # Distinct export: never inherit GGUF companions or qualification.
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX-community 4-bit (macOS preview)"
+  quant = "MLX-AFFINE-4-G64"
+  default = false
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "vision", "reasoning"]
+  companions = []
+  checkpoint_dir = true
+  embedded_vision = true
+  kv_cache_dtype = "auto"
+  experimental = false
+  qualification = "qualified"
+  default_max_ctx = 4096
+  default_max_batch = 4
+  note = "Native macOS/Apple Silicon Metal preview; affine 4-bit/group-64 text and projectors with embedded BF16 vision tower. BF16 KV, 4K/four-slot registry envelope. No MTP, DFlash or GGUF companions. Latest capped-32 parity: text 5/6, image 2/2; full-generation and serving performance qualification remain open."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 18461865156
+  nextn_bytes = 0
+  source = "probed"
+  max_ctx = 4096
+  max_batch = 4
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  # Conservative 4K/c4 reserve: native text scratch + additional doubled/ring
+  # KV beyond the logical shape below + 2 GiB vision/transient allowance.
+  # Weight count includes embedded tower and widened norms/positions.
+  # Derived from checkpoint headers/native loader, not a measured fit claim.
+  workspace_bytes = 10831321088
+
+  [model.artifact.shape]
+  weight_bytes = 18461865156
+  kind = "generative"
+  vocab = 262144
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [
+    { k_dim = 4096, v_dim = 4096, window = 1024, count = 50 },
+    { k_dim = 2048, v_dim = 2048, count = 10 },
+  ]
+
+  [model.artifact.source]
+  repo = "mlx-community/gemma-4-31b-it-4bit"
+  revision = "696d436c404745a59f30e4939a658162b0a9e57f"
+  base_model = "google/gemma-4-31B-it"
+  license = "apache-2.0"
+  license_url = "https://ai.google.dev/gemma/docs/gemma_4_license"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/model-00001-of-00004.safetensors"
+    dest = "Gemma-4-31B-IT-MLX-4bit/model-00001-of-00004.safetensors"
+    sha256 = "988e2b1fd41d93b62b8c432f52f632c43b8cb7f86df4b957db36a3cc0dab40ca"
+    size = 5366617512
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/model-00002-of-00004.safetensors"
+    dest = "Gemma-4-31B-IT-MLX-4bit/model-00002-of-00004.safetensors"
+    sha256 = "a496a96fbd39cd11a9871f91d026013d91069dcac15f89ca861b93976f3857cf"
+    size = 5361642573
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/model-00003-of-00004.safetensors"
+    dest = "Gemma-4-31B-IT-MLX-4bit/model-00003-of-00004.safetensors"
+    sha256 = "afa555ff0e1bc458c5b08aeef1f4499dce63e2bfb5d3a2aac716e47c0a5672c1"
+    size = 5367276094
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/model-00004-of-00004.safetensors"
+    dest = "Gemma-4-31B-IT-MLX-4bit/model-00004-of-00004.safetensors"
+    sha256 = "b55567ae065357d047daca926e45619ec0edef994f165356111c95d4d1021587"
+    size = 2316480497
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/.gitattributes"
+    dest = "Gemma-4-31B-IT-MLX-4bit/.gitattributes"
+    sha256 = "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    size = 1570
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/chat_template.jinja"
+    dest = "Gemma-4-31B-IT-MLX-4bit/chat_template.jinja"
+    sha256 = "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0"
+    size = 17466
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/config.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/config.json"
+    sha256 = "a01be3d45e0eb70ae89cef6d3e823dd44de6ec4dfc41b91dc357f97e457915c0"
+    size = 6046
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/generation_config.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/generation_config.json"
+    sha256 = "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+    size = 208
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/LICENSE"
+    dest = "Gemma-4-31B-IT-MLX-4bit/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/model.safetensors.index.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/model.safetensors.index.json"
+    sha256 = "a9ca8373aacc37ab9d7f16ff4bbb392c055e1b51b0fec6258cbfc578056c5fef"
+    size = 205370
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/processor_config.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/processor_config.json"
+    sha256 = "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"
+    size = 1316
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/README.md"
+    dest = "Gemma-4-31B-IT-MLX-4bit/README.md"
+    sha256 = "5d3bbf7f85bf064fa77c4d4ebec0b20875503569284663d5cfda5bbbd28aa6c3"
+    size = 733
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/tokenizer_config.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/tokenizer_config.json"
+    sha256 = "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"
+    size = 2740
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Gemma-4-31B-IT-MLX-4bit/tokenizer.json"
+    dest = "Gemma-4-31B-IT-MLX-4bit/tokenizer.json"
+    sha256 = "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    size = 32169626
 
 # Gemma 4 26B-A4B (Google's MoE sibling: 128 routed experts, top-8, plus a
 # shared expert - ~4B active per token on a 26B checkpoint). Same family
@@ -336,6 +520,8 @@ kv_default = "fp8_e4m3"
   [model.specs]
   params = "26B-A4B"
   context = "256K"
+  published_at = "2026-04-02"
+  published_source = "https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/"
   homepage = "https://huggingface.co/google/gemma-4-26B-A4B-it"
   about = "The mixture-of-experts Gemma - 26 billion parameters of knowledge with only 4 billion doing the work per word, so it answers close to the 31B's class while running noticeably faster."
   strengths = [
@@ -361,6 +547,7 @@ kv_default = "fp8_e4m3"
   # at 32 - the field carries the width the runner defaults to, so narrow
   # envelopes are over-stated by ~2 GiB, which is the safe direction.
   workspace = 6070491580
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision", "drafter"], note = "Native Metal 26B-A4B Q8, own BF16 tower and shared-KV assistant. At 4K: 29/29 first tokens, 15/16 short text/image streams including MTP; one image formatting mismatch remains. Testing notes: broader generation, performance and exact Metal manager admission are open. Native context 32768/batch 64 are implementation ceilings, not qualified capacities." } } }
 
   [model.artifact.shape]
   weight_bytes = 27645605376
@@ -390,6 +577,7 @@ kv_default = "fp8_e4m3"
 
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Exact 26B-A4B gemma4v BF16 companion; native 70-280 image-token budget. Independent short image generations 10/11; tower/chunk-shape numerical qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -405,6 +593,7 @@ kv_default = "fp8_e4m3"
   # in-file for this family
   [[model.artifact]]
   id = "drafter"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Exact 16-query-head 26B-A4B Q-only assistant sharing this target's last SWA/global KV; not the 31B assistant." } } }
   kind = "drafter"
   format = "gguf"
   label = "Faster generation (drafter)"
@@ -437,6 +626,8 @@ revision = "2026-08-01"
   params = "9B"
   context = "256K"
   context_max = "up to 1M with YaRN"
+  published_at = "2026-03-02"
+  published_source = "https://github.com/QwenLM/Qwen3.8#news"
   homepage = "https://huggingface.co/Qwen/Qwen3.5-9B"
   about = "The small, fast all-rounder - reads images, handles very long documents, and leaves the most VRAM free."
   strengths = [
@@ -455,6 +646,7 @@ revision = "2026-08-01"
   label = "Full quality"
   quant = "Q8_0"
   default = true
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision"], note = "Metal dense 9B Q8 with canonical BF16 vision and in-file MTP: short text/image parity passed. Broader reasoning, context and serving qualification remain open." } } }
 
   [model.artifact.shape]
   weight_bytes = 9800257600
@@ -486,6 +678,7 @@ revision = "2026-08-01"
   format = "gguf"
   label = "Compact"
   quant = "UD-Q4_K_XL"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision"], note = "Metal dense 9B Q4 executes text, canonical BF16 vision and in-file MTP, but independent image-generation parity remains incomplete. Q8 is the measured default. Reference half-scale rounding is not emulated." } } }
 
   [model.artifact.shape]
   weight_bytes = 6380851264
@@ -517,6 +710,7 @@ revision = "2026-08-01"
   format = "gguf"
   label = "Vision (image input)"
   default = true
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal dense 9B BF16 tower: short text/image parity passed with Q8, including image-conditioned in-file MTP. Q4 generation parity remains incomplete. No DFlash companion is elected." } } }
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/Qwen3.5-9B-MTP-GGUF/mmproj-BF16.gguf"
@@ -538,6 +732,8 @@ revision = "2026-08-01"
   params = "27B"
   context = "256K"
   context_max = "up to 1M with YaRN"
+  published_at = "2026-04-22"
+  published_source = "https://github.com/QwenLM/Qwen3.8#news"
   homepage = "https://huggingface.co/Qwen/Qwen3.6-27B"
   about = "The quality pick for coding and agent work - reads images and handles very long documents."
   strengths = [
@@ -551,6 +747,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = false, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision"], note = "Metal dense 27B reuse candidate; exact-checkpoint text, vision and MTP qualification is pending." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -583,6 +780,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q4"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = true, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision"], note = "Metal Q4 with canonical vision and in-file MTP: short text/image generation parity passed. Long reasoning and broader serving qualification remain open." } } }
   kind = "weights"
   format = "gguf"
   label = "Compact"
@@ -614,6 +812,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal Qwen 3.6 Q4 vision and image-conditioned MTP passed short-generation and real GPU lifecycle gates. Broader qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -639,6 +838,8 @@ revision = "2026-08-01"
   params = "35B · 3B active"
   context = "256K"
   context_max = "up to 1M with YaRN"
+  published_at = "2026-04-16"
+  published_source = "https://github.com/QwenLM/Qwen3.8#news"
   homepage = "https://huggingface.co/Qwen/Qwen3.6-35B-A3B"
   about = "Near-flagship answers at much higher speed - only a small part of the model runs per token."
   strengths = [
@@ -652,6 +853,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision"], note = "Native Q8 35B-A3B MoE: 29/29 first tokens, 16/16 short text/image streams including MTP-eligible responses at 4K. Broad generation/performance and hybrid unified-memory admission remain under test; testing continues. Native ceilings: 32K context/64 slots, not qualification at those limits." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -715,6 +917,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Qwen 35B-A3B BF16 tower with 2048-wide merger; elected Q8 short image/MTP and GPU lifecycle gates pass. Broad generation/high-resolution serving qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -740,6 +943,8 @@ revision = "2026-08-15"
   params = "27B"
   context = "256K"
   context_max = "up to 1M with YaRN"
+  published_at = "2026-08-14"
+  published_source = "https://github.com/QwenLM/Qwen3.8#news"
   homepage = "https://huggingface.co/Qwen/Qwen3.8-27B"
   about = "The newest Qwen flagship - best coding and agent quality in this catalog, reads images, with tunable reasoning depth."
   strengths = [
@@ -754,6 +959,7 @@ revision = "2026-08-15"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = false, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal graph exists, but this Q8 artifact has not completed the Q4 checkpoint's real-model qualification." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -792,6 +998,7 @@ revision = "2026-08-15"
   # Keeps the nextn block, so spec/MTP survives the quantisation.
   [[model.artifact]]
   id = "q4"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = true, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal GGUF with F16 KV, canonical vision and nextn MTP/DFlash2. Broader qualification remains open." } } }
   kind = "weights"
   format = "gguf"
   label = "Compact"
@@ -866,6 +1073,7 @@ revision = "2026-08-15"
 
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal GGUF with F16 KV, canonical vision and nextn MTP/DFlash2. Broader qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -900,6 +1108,7 @@ revision = "2026-08-15"
   # the loader learns the key, not before.
   [[model.artifact]]
   id = "drafter2"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal GGUF with F16 KV, canonical vision and nextn MTP/DFlash2. Broader qualification remains open." } } }
   kind = "drafter"
   format = "gguf"
   label = "Faster single chats (DFlash2)"
@@ -1006,6 +1215,943 @@ revision = "2026-08-15"
     sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
     size = 6722759
 
+  # A named exception to the sourcing rule: the same MLX-community
+  # checkpoint used for native Metal / SGLang-MLX comparisons. This is not a
+  # Q4_K export. The target remains checkpoint-native affine4/BF16; only
+  # the Qwen DFlash2 companion is shared, through MLX-specific verification.
+  # Preview only: full-generation and long-prompt qualification remain open.
+  # R2 mirror of the pinned HF revision, SHA-256 verified. LICENSE
+  # comes from the original Qwen revision because the conversion omitted it;
+  # it and the conversion README are mandatory members of the weights bundle.
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX-community 4-bit (Metal preview)"
+  quant = "MLX-AFFINE-4-G64"
+  default = false
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "tools", "reasoning", "speculative"]
+  companions = ["drafter2"]
+  checkpoint_dir = true
+  kv_cache_dtype = "auto"
+  experimental = false
+  default_max_batch = 1
+  default_spec = "adaptive"
+  note = "Text only; native BF16 KV with DFlash2 speculative decoding. No in-file MTP or vision. Full-generation parity against other engines remains a separate qualification."
+
+  [model.artifact.source]
+  repo = "mlx-community/Qwen3.8-27B-4bit"
+  revision = "3e6447f082e89cc7f0bc6e5441afd38dfce760ff"
+  base_model = "Qwen/Qwen3.8-27B"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/model-00001-of-00003.safetensors"
+    dest = "Qwen3.8-27B-MLX-4bit/model-00001-of-00003.safetensors"
+    sha256 = "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d"
+    size = 5343268662
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/model-00002-of-00003.safetensors"
+    dest = "Qwen3.8-27B-MLX-4bit/model-00002-of-00003.safetensors"
+    sha256 = "83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670"
+    size = 5354185130
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/model-00003-of-00003.safetensors"
+    dest = "Qwen3.8-27B-MLX-4bit/model-00003-of-00003.safetensors"
+    sha256 = "31b8c91ef899f79efaaa69e3d2c096f6e2ebeb2ff20e29222abbd9ebc79e560a"
+    size = 5357087557
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/.gitattributes"
+    dest = "Qwen3.8-27B-MLX-4bit/.gitattributes"
+    sha256 = "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    size = 1570
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/chat_template.jinja"
+    dest = "Qwen3.8-27B-MLX-4bit/chat_template.jinja"
+    sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    size = 8952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/config.json"
+    sha256 = "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85"
+    size = 4932
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/generation_config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/generation_config.json"
+    sha256 = "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    size = 202
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/LICENSE"
+    dest = "Qwen3.8-27B-MLX-4bit/LICENSE"
+    sha256 = "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    size = 11544
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/model.safetensors.index.json"
+    dest = "Qwen3.8-27B-MLX-4bit/model.safetensors.index.json"
+    sha256 = "13b840162b4cb35c66fef7df072f7dbb4717908204364f5e5d9f9655a2758fa8"
+    size = 218281
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/preprocessor_config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/preprocessor_config.json"
+    sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    size = 390
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/processor_config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/processor_config.json"
+    sha256 = "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040"
+    size = 991
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/README.md"
+    dest = "Qwen3.8-27B-MLX-4bit/README.md"
+    sha256 = "860ff845b4746d0b3e1d1afa4f13aac691ef49c7165054cedfb199371568c4c2"
+    size = 632
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/tokenizer_config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/tokenizer_config.json"
+    sha256 = "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b"
+    size = 1165
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/tokenizer.json"
+    dest = "Qwen3.8-27B-MLX-4bit/tokenizer.json"
+    sha256 = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    size = 19989325
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/video_preprocessor_config.json"
+    dest = "Qwen3.8-27B-MLX-4bit/video_preprocessor_config.json"
+    sha256 = "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    size = 385
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-MLX-4bit/vocab.json"
+    dest = "Qwen3.8-27B-MLX-4bit/vocab.json"
+    sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    size = 6722759
+
+  # User-requested, pinned Splash package. Read natively by Paddock Metal;
+  # no Splash executable, Python server, repacked checkpoint or remote code.
+  [[model.artifact]]
+  id = "splash-4bit"
+  kind = "weights"
+  format = "splash-packed-q4"
+  label = "Splash 4-bit · DFlash2 + Vision"
+  quant = "SPLASH-Q4-G64"
+  default = false
+  workspace = 2147483648
+
+  [model.artifact.shape]
+  weight_bytes = 17389348800
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 16 },
+    { k_dim = 1024, v_dim = 1024, count = 5, window = 2112 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 48
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "vision", "tools", "reasoning", "speculative"]
+  companions = []
+  checkpoint_dir = true
+  embedded_vision = true
+  kv_cache_dtype = "auto"
+  default_max_ctx = 32768
+  default_max_batch = 1
+  default_spec = "adaptive"
+  note = "Native packed Q4 with bundled DFlash2 and BF16 vision. The draft is part of this package, not the GGUF companion."
+
+    [model.artifact.runtime.memory]
+    weight_bytes = 17389348800
+    source = "measured"
+    max_ctx = 262144
+    max_batch = 4
+    full_paged_kv = false
+    kv_reserve_sequences = 3
+    nextn_bytes = 0
+    workspace_bytes = 2147483648
+
+  [model.artifact.source]
+  repo = "incoai/Qwen3.8-27B-Splash"
+  revision = "9d27070b71f7142c6b6025f03ac011d70a73cb48"
+  base_model = "Qwen/Qwen3.8-27B"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/incoai/Qwen3.8-27B-Splash/resolve/9d27070b71f7142c6b6025f03ac011d70a73cb48/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/manifest.json"
+    dest = "Qwen3.8-27B-Splash/manifest.json"
+    sha256 = "40121d0d933fb27a7206248a592451f9ebbd73671f19ce3162cf27a7db0968d5"
+    size = 13915
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/embedding.bin"
+    dest = "Qwen3.8-27B-Splash/target/embedding.bin"
+    sha256 = "cb2dbb02e08e5d063ca92f29ed5b64b0797f1d2226fae0a712289d3a51100238"
+    size = 715177984
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/head.bin"
+    dest = "Qwen3.8-27B-Splash/target/head.bin"
+    sha256 = "65008e2fb6e17fb49ab8076bcdb3ad92b960a227a5641e501241c05867bd7116"
+    size = 715194368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-0.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-0.bin"
+    sha256 = "0c77b05e772f8fa51fd748e7ca4fa4b82a01a70a5b761d4ab11c70bc7999e6f0"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-1.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-1.bin"
+    sha256 = "414d84f3e95e922ab29189f579f1e777c8bef970c99e3b2cb6787c8818ac82c2"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-10.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-10.bin"
+    sha256 = "14a2405dc8828d25d8f6f7adef1d2b8dc09a29bc7fd2a01fe911b3e4b18aa4a7"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-11.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-11.bin"
+    sha256 = "6b04b25e78eccd3faf7d90bef7d81a2f02f6ccd235a59e89f51422d91a710c97"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-12.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-12.bin"
+    sha256 = "2e8c64a7f91c3e03c4e3e23261f4216579c3ea6ec9ef0f6b66eb17c1a26d1bb2"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-13.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-13.bin"
+    sha256 = "beae82c9ba9617453fc8b0e54dff2e71f086fd19443c131b18d746ce180a834d"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-14.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-14.bin"
+    sha256 = "32f34b7029fbf355cbce28e6f5f620736b19715bca6c0737fbc8c5ad9052a792"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-15.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-15.bin"
+    sha256 = "502b86f6070de34e178e2638b18a209ef8ba6f569681cb4eb877746ff410b502"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-16.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-16.bin"
+    sha256 = "36d4566a5ccdd7c53cdc48900cfe20a05578b6e57235fc4f448445f3731e87e5"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-17.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-17.bin"
+    sha256 = "c7ff3a85dc42d8518c247c824be69886cf402c0af75d6a44eb0c10219ee9d6ed"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-18.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-18.bin"
+    sha256 = "1ee08547267e8c90b874070529e72cff727e986dd073b875652a6f734c39dbd7"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-19.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-19.bin"
+    sha256 = "1001b78d7a244a0b2f248903302a621ff64732cdab21b10ece97ac5108703cda"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-2.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-2.bin"
+    sha256 = "33589c6baab909f68c1ad7abd695cc016b109db5c01487755d4e6bda8e7e8fe2"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-20.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-20.bin"
+    sha256 = "de6722faac2374b1e4439ce739d6d407833ac3719ffda1257cf2e740e4c41b96"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-21.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-21.bin"
+    sha256 = "67f55f1cddaca4dffab06ea3a4498365aa235eb46e2c678a62c083d7761773d7"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-22.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-22.bin"
+    sha256 = "9b45223444e51a898a7b4f61910e1ee150e38b0dd11e9603c1ec16f6cd7633d0"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-23.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-23.bin"
+    sha256 = "527c76e84c978dfe4f4b53cb41f3ee57cd3fcddce845e19cc1e7f4a82df8e9b6"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-24.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-24.bin"
+    sha256 = "7b8a67bd528aa8478aaf934a2b64c7661f400f1ea91cd05922811d245de6596e"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-25.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-25.bin"
+    sha256 = "48ce5f33452f9ff6ef40064155183f25c1b1c80acfe6973f02d5d4ab681e3533"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-26.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-26.bin"
+    sha256 = "beefa4f9a330a45a5a7d06cae19a2d5664cf4d5539248251714786e892faf8f8"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-27.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-27.bin"
+    sha256 = "e486137681b011b529ceb6ce6cead718239cf2ed18a098569d2a9c4ba2f98c96"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-28.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-28.bin"
+    sha256 = "2fa858966c363e73b2bb7f823bddd08b55d4c06f15811ea4094e25710fd4afdc"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-29.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-29.bin"
+    sha256 = "561fff2a2ebe39b04f4bdf1915d7bb2f53280271fb4d1fe465035d4b1e665658"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-3.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-3.bin"
+    sha256 = "6a215036c0fb60e8e7574fd916aa1a00d58f6057bff410e6507c7f8d81fc8837"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-30.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-30.bin"
+    sha256 = "20469a88bed27bb76c470003a8b629b873f41e0141df736596267afc70a8e6ab"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-31.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-31.bin"
+    sha256 = "83a6b7dc8e18aa21d3b0fc73ab1b7a3fd2b3fd3d9b21858827adf35a986e73b2"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-32.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-32.bin"
+    sha256 = "34f9fdf0d297f095e8ccd6a449228d1a6ed691f2dd7f033a592453d0c35b2bb0"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-33.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-33.bin"
+    sha256 = "75e099ded2bc87106bfa5c2fb036ed36e8086aeef4d1d7093203d32ec14ac5fe"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-34.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-34.bin"
+    sha256 = "d2f16e264abcda9de468fb79d3f19450b3da3642248668683ee3159a91887bc0"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-35.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-35.bin"
+    sha256 = "0dc30ad0e92e84edc5812c4b87d8ebf13c5950d2df05c1b04dc461d5a1b8f350"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-36.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-36.bin"
+    sha256 = "0100c8bfa980256f9c31e898acaf12bed029f52b9d2ae82d891a03324b361bfb"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-37.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-37.bin"
+    sha256 = "2bf770c5eb85e5daf772208847f6f8e4187462be6669b6fc2d9a1d4b8bef73c3"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-38.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-38.bin"
+    sha256 = "8340167a62a379bfb87908c2ddaa850f2d2d0ae08b9606c656d0995de5c256ba"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-39.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-39.bin"
+    sha256 = "0a412dbbce9d4c6ca0c6ffe45cfc29ef26486379f0072ea9a5aa7c54b769db50"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-4.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-4.bin"
+    sha256 = "f13216afdfd83d55554533df0e8fb3bceb518fd6834e2eb9b115915e4d64400a"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-40.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-40.bin"
+    sha256 = "90324be5406ba39110b1162dab7ed6ef583a9495d90de684197319e042f79a31"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-41.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-41.bin"
+    sha256 = "6babef8325b715c85243be1856f0dde09332fa5d5102bfc8393c4c2f97b376f1"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-42.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-42.bin"
+    sha256 = "5c222782e4a020621a3413bcc4005db49556ba4c4b3b36c8062524cbdfa764b6"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-43.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-43.bin"
+    sha256 = "e6c4431a9e0615d50bf3c279fcbec339a1a90feb5477fe57ab3e0b1c2502e1b2"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-44.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-44.bin"
+    sha256 = "faa6c14404b803f1c7c4b5574302d69733989b8a6b3a43be039d14771d70299d"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-45.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-45.bin"
+    sha256 = "4b3f4303341ee5912d26e3a6062f7f73f4114a76deb15cc8599cb475ba745d9e"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-46.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-46.bin"
+    sha256 = "6130bb288bd55a60513587d739868026b23b05a84d0ab7819ca76b4d21838724"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-47.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-47.bin"
+    sha256 = "0dbd62ef4fd0e2196491a3f10fa53e466cd4dbc62ebf60dbacd0e3f16632e176"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-48.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-48.bin"
+    sha256 = "df23c5127194a19bdc3f0171b6483be647db9946758803842518a7c75eb56353"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-49.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-49.bin"
+    sha256 = "77bbe487587347121f6bc3dbb5fbc681f33f5d5dcb1fcf821f5873ed39ae1cff"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-5.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-5.bin"
+    sha256 = "132548f2b8cabaa6b84ab090db54d1ab72ab12b9774d9a88ec46fcb98bf1792c"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-50.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-50.bin"
+    sha256 = "1604420e9e8ba4b08b19f72756bbdf99210192af3082383b15833dfbb7ec0a46"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-51.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-51.bin"
+    sha256 = "f468e70b460fa9aa029bdfabac0cd5307435dfd14358f7e4b9f4d5c10ecc3595"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-52.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-52.bin"
+    sha256 = "9b0ff237e57e85e91e8fd24f1c89aeac98c1d484a5b273a09b807cb29f930ad2"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-53.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-53.bin"
+    sha256 = "186436268894613daa7987d32cf10f00102fe06d8cd245db1b09cd663e38c1ae"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-54.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-54.bin"
+    sha256 = "006a529bcc6e2d1d8299b29c047ac0cca0b31e749826b9f6df9c37889cd38581"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-55.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-55.bin"
+    sha256 = "fc875daa1fd48aa67bd031bde616ce1cba74ad576990708c637f85c7e6e1bb56"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-56.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-56.bin"
+    sha256 = "d24a09534ead3279e1911a250938b314b65187ca3d02d9c2d75adcb64f9ff459"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-57.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-57.bin"
+    sha256 = "d4b751bd37b69f16bf77afb30f6b7c6c4acbec10694c3a05334902f0a6d923be"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-58.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-58.bin"
+    sha256 = "b8ac0064db80657d2105f284feda5afae2597bd326fb246f24d84fc91a367c78"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-59.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-59.bin"
+    sha256 = "ea13d1991a82029100dd802ff80fa7df6f3c3a9b3db31903007904943ee00eb7"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-6.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-6.bin"
+    sha256 = "e0851f77a362cd56dbf7a036a0cbcd927d9f347ee7612f2dc58610a2117f84c9"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-60.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-60.bin"
+    sha256 = "6913667f53351b329d83915e29f764caa98565ff3a32633cc5558e4a85865c66"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-61.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-61.bin"
+    sha256 = "e17838bc0aff655ba645b1c0472a4efa5f907626130d474206d08d8d1fdbc0db"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-62.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-62.bin"
+    sha256 = "10e1d4e17cf8855fbd9e498cf2aceee8ea2dee231f3f88361a1eac717062289b"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-63.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-63.bin"
+    sha256 = "ca01e9cdfdeacf8ece3471fbdf30643c56678f256eb90165dd2cb70eae6ebec0"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-7.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-7.bin"
+    sha256 = "63bf406807db6e2adb5d6757ea2b76cdc9b27cdd32c45d5f8136659b2bcf5164"
+    size = 209469440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-8.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-8.bin"
+    sha256 = "42082a584cc1f77469809b9a506be264a182664e9c65e2333e976306caf32699"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/target/layer-9.bin"
+    dest = "Qwen3.8-27B-Splash/target/layer-9.bin"
+    sha256 = "a4dc719e2045d1067c2c6c846990024e4e54a024e70984a238438f4615057b13"
+    size = 216203264
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/layer-0.bin"
+    dest = "Qwen3.8-27B-Splash/draft/layer-0.bin"
+    sha256 = "48250072cd0c121ec449b67a53bb98c73d16135d5d9a7d0366b49b7e4573a29b"
+    size = 187449344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/layer-1.bin"
+    dest = "Qwen3.8-27B-Splash/draft/layer-1.bin"
+    sha256 = "b8f1b37e71e25f4cb3ac32d34d4e81be2e0634210cdb64bbee945413e511a664"
+    size = 187449344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/layer-2.bin"
+    dest = "Qwen3.8-27B-Splash/draft/layer-2.bin"
+    sha256 = "f232403c4ef212c6e53abe03f0e48aaac355d3612384dd103e29274b5bbe25db"
+    size = 187449344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/layer-3.bin"
+    dest = "Qwen3.8-27B-Splash/draft/layer-3.bin"
+    sha256 = "12acda893bc646c02b162ddf09a3af45babc73cf45975974ecc007cf14b05127"
+    size = 187449344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/layer-4.bin"
+    dest = "Qwen3.8-27B-Splash/draft/layer-4.bin"
+    sha256 = "db6683f4f30da4639163428fc39e87440e96dc9a3e4dcc617a8ed44ed3701e1f"
+    size = 187449344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/draft/model.bin"
+    dest = "Qwen3.8-27B-Splash/draft/model.bin"
+    sha256 = "5cb77c477c32faab66918fe505c96ba5b9d311e91eb519281f54cb9c5bb3a4f2"
+    size = 328794112
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/vision/model.bin"
+    dest = "Qwen3.8-27B-Splash/vision/model.bin"
+    sha256 = "8973858e75ec3464f626d5f9111dbceda58f3bac5737ea5693767686003c65df"
+    size = 930250752
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/tokenizer/chat_template.jinja"
+    dest = "Qwen3.8-27B-Splash/tokenizer/chat_template.jinja"
+    sha256 = "3b3b38b6ea9eb7df57eb47892dfd15be9f84361722b229b9220654a8cf467f74"
+    size = 8940
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/tokenizer/config.json"
+    dest = "Qwen3.8-27B-Splash/tokenizer/config.json"
+    sha256 = "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85"
+    size = 4932
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/tokenizer/tokenizer.json"
+    dest = "Qwen3.8-27B-Splash/tokenizer/tokenizer.json"
+    sha256 = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    size = 19989325
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/tokenizer/tokenizer_config.json"
+    dest = "Qwen3.8-27B-Splash/tokenizer/tokenizer_config.json"
+    sha256 = "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b"
+    size = 1165
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/tokenizer/vocab.json"
+    dest = "Qwen3.8-27B-Splash/tokenizer/vocab.json"
+    sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    size = 6722759
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/README.md"
+    dest = "Qwen3.8-27B-Splash/README.md"
+    sha256 = "9797ef453650ffec8bf1485870ea758035c34da6ae7ff4ce08a6ad6f11a9c79d"
+    size = 5576
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-Splash/LICENSE"
+    dest = "Qwen3.8-27B-Splash/LICENSE"
+    sha256 = "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    size = 11544
+
+# Bonsai 2 27B sourcing: Prism ML's own repo (huggingface.co/prism-ml), the
+# model's authors - an official source, not a community re-quant. It is
+# Qwen3.8-27B with the architecture unchanged and EVERY linear, the embedding
+# and the head included, in ternary weights: PTQ1_0 packs five trits a byte,
+# 1.75 bits a weight, and the file is served as shipped - 5.95 GB on disk and
+# resident, nothing expanded. sha256 is the upstream LFS oid, re-verified
+# against the bytes at upload (2026-09-20).
+#
+# The file also asks something of the runtime: every linear's input goes
+# through a block-1024 Walsh-Hadamard rotation (`prism.hadamard.*` in its
+# header). Stock llama.cpp cannot read it; the qwen35 engine family applies the
+# rotation and every other family refuses the file.
+#
+# No nextn block in the file and no drafter lane for it yet, so no
+# "speculative".
+#
+# Vision: upstream ships a qwen3vl mmproj beside the weights and it is
+# published here under upstream's own name. It is its own FILE (own sha256,
+# Prism ML's `general.*` identity) around the Qwen 3.8 27B tower: all 334
+# tensors compare byte-identical to that model's mmproj-BF16 and no `clip.*`
+# key differs, so the tower carries no rotation - image rows land in the
+# model-basis residual stream after the embedding inverse. BF16, never the
+# Q8_0 sibling (the tower rule on every row). The macOS MLX package brings its
+# own tower inside the bundle and takes no companion.
+# Apache-2.0; Prism ML's NOTICE rides with the weights.
+[[model]]
+id = "bonsai-2-27b"
+vendor = "Prism ML"
+display = "Bonsai 2 27B"
+family = "bonsai"
+capability = ["chat", "vision", "tools", "reasoning"]
+license = "apache-2.0"
+revision = "2026-09-21"
+
+  [model.specs]
+  params = "27B"
+  context = "256K"
+  homepage = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf"
+  published_at = "2026-09-17"
+  published_source = "https://prismml.com/news/bonsai-2-27b"
+  about = "A 27B reasoning model in ternary weights, created using Bonsai by Prism ML. The 5.9 GB PTQ1 GGUF runs on NVIDIA and macOS with an optional 0.9 GB vision companion. The 8.6 GB macOS MLX package bundles vision."
+  strengths = [
+    "Compact ternary weights: 5.9 GB GGUF or 8.6 GB MLX with bundled vision",
+    "Fast generation for its class: little memory to read per token",
+    "256K context on the Qwen 3.8 hybrid backbone",
+  ]
+  tradeoffs = [
+    "Ternary weights: close to the original, not identical",
+    "GGUF image input requires a separate 0.9 GB download; the macOS MLX package bundles it",
+    "No MTP or draft checkpoint: no speculative decoding",
+  ]
+
+  [[model.artifact]]
+  id = "ptq1"
+  kind = "weights"
+  format = "gguf"
+  label = "Ternary"
+  quant = "PTQ1_0"
+  default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  default = false
+  qualification = "qualified"
+  capability = ["chat", "vision", "tools", "reasoning"]
+  default_max_batch = 1
+  companions = ["vision"]
+  kv_cache_dtype = "f16"
+  note = "Native packed PTQ1_0 with signed Hadamard transforms and optional BF16 vision companion. F16 KV; no compatible speculative companion. Text reference parity passes at c=1/c=4; broad vision, long-context accuracy and rival performance qualification remain separate."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 5935527936
+  nextn_bytes = 0
+  source = "measured"
+  max_ctx = 262144
+  max_batch = 4
+  full_paged_kv = true
+  kv_reserve_sequences = 8
+  # Includes the packed-rotation scratch and ordinary Qwen prefill buffers.
+  workspace_bytes = 805306368
+
+  [model.artifact.shape]
+  weight_bytes = 5982828640
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  source = "measured"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 16 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 48
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+    dest = "Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
+    sha256 = "53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3"
+    size = 5946648928
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-gguf/NOTICE.txt"
+    dest = "Ternary-Bonsai-2-27B-gguf/NOTICE.txt"
+    sha256 = "de0e0c48fb6f691a31e74f338e3ccf93f9ecdfe2866ab769c4bf8b79a7636a30"
+    size = 411
+
+  # Shared CUDA/Metal GGUF companion; the MLX artifact below allows no
+  # companions. sha256 is the upstream LFS oid, re-verified against the bytes
+  # read back from the origin (2026-09-21).
+  [[model.artifact]]
+  id = "vision"
+  kind = "vision"
+  format = "gguf"
+  label = "Vision (image input)"
+  default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Native BF16 Qwen3VL tower for the rotated PTQ1 backbone. Optional: text-only instances do not load this companion."
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf"
+    dest = "Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-mmproj-BF16.gguf"
+    sha256 = "e287342d92332fa3577ed1d42e921dac9370c08da58ba9337fa450f6cc76cfd7"
+    size = 931145856
+
+  # Official Prism ML package, pinned to the downloaded/hashed revision.
+  # Served natively; checkpoint Python is NOT a runtime dependency.
+  # R2 mirror verified by size/SHA-256; source revision remains pinned below.
+  [[model.artifact]]
+  id = "mlx-2bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "Prism ML 2-bit"
+  quant = "MLX-TERNARY-2-G128"
+  default = false
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "tools", "reasoning", "vision"]
+  companions = []
+  checkpoint_dir = true
+  embedded_vision = true
+  kv_cache_dtype = "f32"
+  default_max_ctx = 32768
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native ternary weights with signed Hadamard transforms and F32 decoder/KV. Bundled FP16 vision. No MTP or compatible drafter. Wider accuracy and rival performance qualification are tracked separately."
+
+  [model.artifact.runtime.backend_overrides.metal]
+  default = true
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 8169821120
+  nextn_bytes = 0
+  source = "measured"
+  max_ctx = 262144
+  max_batch = 4
+  full_paged_kv = true
+  # Native no-offload pool retains two additional contexts per live slot.
+  # Eight reserves conservatively price the entire four-slot envelope.
+  kv_reserve_sequences = 8
+  # Conservative text scratch + maximum 65536-row vision wave. Actual c=1,
+  # 4K, 256px image GPU footprint was 10.96 GB; this is a bound, not that fit.
+  workspace_bytes = 5368709120
+
+  [model.artifact.shape]
+  weight_bytes = 8169821120
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [{ k_dim = 1024, v_dim = 1024, count = 16 }]
+
+    [model.artifact.shape.recurrent]
+    layers = 48
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+  [model.artifact.source]
+  repo = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+  revision = "3f926b415992eaa2ae9dd7b573706494d6bbf787"
+  base_model = "Qwen/Qwen3.8-27B"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/resolve/3f926b415992eaa2ae9dd7b573706494d6bbf787/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/model.safetensors"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/model.safetensors"
+    sha256 = "130de5925082c168b7866b2e91b52e44abbafc99017e3ca352b77b5b55a269ed"
+    size = 8595477990
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/config.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/config.json"
+    sha256 = "238de7c512cc56a733421e3fd011d88f8260739e3d00e32c5d65b7943cc9f837"
+    size = 58145
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/hadamard.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/hadamard.json"
+    sha256 = "7132a3ec364f0bdac1f08f905f24f0ad2f14245060f592637a0396826d3b5fe6"
+    size = 297903
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/preprocessor_config.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/preprocessor_config.json"
+    sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    size = 390
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/tokenizer.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/tokenizer.json"
+    sha256 = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    size = 12809320
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/tokenizer_config.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/tokenizer_config.json"
+    sha256 = "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+    size = 17928
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/chat_template.jinja"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/chat_template.jinja"
+    sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    size = 8952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/generation_config.json"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/generation_config.json"
+    sha256 = "cddd0dbd24dbf13229f872b4100c5a0bfe5186eeb09e171b2fc2bac701e98034"
+    size = 85
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/LICENSE"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/LICENSE"
+    sha256 = "69849221bfb90053de2134ef5e6d540287b4b98062326492f1f96f5da685524b"
+    size = 10174
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/NOTICE.txt"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/NOTICE.txt"
+    sha256 = "de0e0c48fb6f691a31e74f338e3ccf93f9ecdfe2866ab769c4bf8b79a7636a30"
+    size = 411
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ternary-Bonsai-2-27B-mlx-2bit/README.md"
+    dest = "Ternary-Bonsai-2-27B-mlx-2bit/README.md"
+    sha256 = "187aca6e2e8d01daa77e6faf64189ba015a5616f1627fdf2f4f2392d592bf5da"
+    size = 22732
+
+
 # Qwen3.8-Flash-Next sourcing: the weights are unsloth's UD export of
 # Qwen/Qwen3.8-Flash-Next (quantiser repo huggingface.co/unsloth, recorded in
 # the file's own general.repo_url); every shard sha256 here is the upstream LFS
@@ -1024,7 +2170,7 @@ revision = "2026-08-15"
 # same GGUF. So it is published here too (2026-09-16): 111.3 GB over four
 # shards, measured at 85.2 GB resident.
 #
-# That measurement is also why it is NOT the default. 85.2 GB of weights before
+# That measurement is also why it is not the default. 85.2 GB of weights before
 # a single KV byte is the same arithmetic that rules NVFP4 out below, so a 96 GB
 # card does not serve this file either - it wants the 128 GB class the prefill
 # campaign runs on, and IQ3 (56.6 GB resident) is the lane that fits a 96 GB
@@ -1034,7 +2180,7 @@ revision = "2026-08-15"
 # NVFP4 is a separate lane and still not published: 84 GB resident before KV
 # does not fit a 96 GB card.
 #
-# The n-gram embedding is 51B of the parameter count and stays HOST-MAPPED -
+# CUDA: the n-gram embedding is 51B of the parameter count and stays HOST-MAPPED -
 # the engine gathers 8 rows a token straight from the file's mmap - so each
 # resident figure below sits ~24 GiB under its own download (76.3 -> 52.7 GiB
 # for IQ3, 103.7 -> 79.4 GiB for the 4-bit), and a cold page cache costs a disk
@@ -1060,6 +2206,8 @@ revision = "2026-09-08"
   [model.specs]
   params = "125B · 6B active (+51B n-gram)"
   context = "256K"
+  published_at = "2026-08-26"
+  published_source = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/commit/34567a4712bc9766c4449e2e98e4468bfa24d915"
   homepage = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"
   about = "Alibaba's preview of the Qwen4 architecture - a very large sparse model that runs only 6B of itself per token, so it answers at small-model speed."
   strengths = [
@@ -1082,6 +2230,31 @@ revision = "2026-09-08"
   label = "Compact (smaller)"
   quant = "UD-IQ3_XXS"
   default = true
+
+  # Metal keeps all compressed planes, including the 28.8GB PLE table,
+  # resident. Do not reuse CUDA's repacked-trunk/host-PLE byte count.
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "tools", "reasoning"]
+  companions = []
+  kv_cache_dtype = "f16"
+  note = "Native Metal full 48-block text graph for this exact mixed-IQ GGUF. Resident compressed PLE; F32 recurrent/indexer state and F16 paged KV. Short and long same-weight generation gates pass; broader reasoning, long-context and performance qualification remain open. No vision/MTP/DFlash or prefix reuse. registry envelope 4K/c4, not the vendor's 256K qualification."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 81950799360
+  nextn_bytes = 0
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 4
+  full_paged_kv = true
+  kv_reserve_sequences = 0
+  # Upper bound within this registry envelope: 174211224 shared scratch +
+  # 26738720 PLE history/QSA pooled-indexer+carry. Ordinary paged KV and
+  # DeltaNet state remain in the shape below, not counted twice here. The
+  # generic estimator's hybrid checkpoint margin is still conservative;
+  # the loader enforces its exact full reservation (83025082040 at 4K/c4).
+  workspace_bytes = 200949944
 
   [model.artifact.shape]
   weight_bytes = 56559859968
@@ -1118,6 +2291,273 @@ revision = "2026-09-08"
     dest = "Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf"
     sha256 = "f1912ba34c79427d2295a58dcb2b732b5931af5bef7a373c60557a57d9ee7250"
     size = 32382955968
+
+
+  # MLX-community export: a named exception to the sourcing rule, mirrored on
+  # R2. The commercial-license review remains deferred. Keep the exact
+  # benchmarked export and Qwen license together; neither the MLX format nor
+  # this experimental entry grants extra rights.
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX-community 4-bit (Metal preview)"
+  quant = "MLX-AFFINE-4-G32"
+  default = false
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "tools", "reasoning"]
+  companions = []
+  checkpoint_dir = true
+  kv_cache_dtype = "auto"
+  experimental = false
+  qualification = "qualified"
+  default_max_ctx = 4096
+  default_max_batch = 4
+  note = "Native Metal text graph; affine 4-bit/group-32 with 8-bit/group-64 router/shared-gate overrides. BF16 KV, F32 recurrent state; resident compressed n-gram table. Registry envelope 4K/four slots. No vision, MTP, DFlash or prefix reuse. Full long-generation parity, broader context and TTFT/streaming tails remain under test. Commercial-license review remains deferred."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 110626145280
+  nextn_bytes = 0
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 4
+  full_paged_kv = true
+  kv_reserve_sequences = 0
+  # Upper bound inside 4K/c4, including the preferred 1024-row workspace:
+  # 1365706456 scratch + 26738720 PLE history/QSA indexer and carry.
+  # Ordinary BF16 paged KV and F32 DeltaNet state are priced by shape below.
+  # Sum at 4K/c4 = 112891923192 native buffer bytes, not OS/driver overhead.
+  workspace_bytes = 1392445176
+
+  [model.artifact.shape]
+  weight_bytes = 110626145280
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, count = 12 },
+  ]
+    [model.artifact.shape.recurrent]
+    layers = 36
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+  [model.artifact.source]
+  repo = "mlx-community/Qwen3.8-Flash-Next-4bit"
+  revision = "07b5dc6c54600a359b87f1e53e7adf6351c72a2c"
+  base_model = "Qwen/Qwen3.8-Flash-Next"
+  license = "qwen-community-1.0"
+  license_url = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/de4b8e4d43b917e7706784d8bb445c9af86a3540/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00001-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00001-of-00022.safetensors"
+    sha256 = "879e2028f98cc983b750ed876a005f1ad125e0cb61fb4f49c93695350eefe45c"
+    size = 5280741020
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00002-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00002-of-00022.safetensors"
+    sha256 = "e4ac7254b17359f728bda19da413278c399b14b5ef849817febc73a223894060"
+    size = 5250035198
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00003-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00003-of-00022.safetensors"
+    sha256 = "bed34392682d6431b612af18438aa7f43091cfa29f71cd78133211302676544d"
+    size = 5250035225
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00004-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00004-of-00022.safetensors"
+    sha256 = "7dc7d7f0887777814665f9b0674788dced9d7263eb42c12e9f44d4cb823c5cf2"
+    size = 5250035223
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00005-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00005-of-00022.safetensors"
+    sha256 = "ac100ce27255aba1f11b09f2ee9b35edd108a307f5699a9dafee878668688abd"
+    size = 5250035221
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00006-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00006-of-00022.safetensors"
+    sha256 = "7b330de2e041d8cee9a03b2b58e4e34b22983692f1e702c19caf58d09ad25aa0"
+    size = 5250035245
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00007-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00007-of-00022.safetensors"
+    sha256 = "51dbb8e92a5be5ad79a8a3ddf7da8f1696a01e093de0045c45e7b67a4d6a355f"
+    size = 5066621630
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00008-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00008-of-00022.safetensors"
+    sha256 = "eece6ac6c12a46c817f0eb4e334437c80eb8d4106bea7618c7b44c40662d5dfb"
+    size = 5333449292
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00009-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00009-of-00022.safetensors"
+    sha256 = "b0f449ff11c75bc0fc092ef306c8b6fdfe07b401d93b52b1557302cc1c9a1b15"
+    size = 5333449234
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00010-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00010-of-00022.safetensors"
+    sha256 = "6b9a74feb7a6aaeaac0d886b6dae312bfdc96eae7122f5b6f923cb9a1ed607f2"
+    size = 4966447785
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00011-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00011-of-00022.safetensors"
+    sha256 = "03bb7d1be20bea990ce2cade373a3725b180a181cbc7f5549d9ba467979c4144"
+    size = 5337575168
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00012-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00012-of-00022.safetensors"
+    sha256 = "21c581028c4ae75a97cd5dadc37fc578f495c6a8229b5f25d35fd7f32b2efea4"
+    size = 4963058775
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00013-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00013-of-00022.safetensors"
+    sha256 = "f14e42d49a1421cd4c1b37719771a55a9c979789d9159ebc8f73a901b196df43"
+    size = 5333449335
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00014-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00014-of-00022.safetensors"
+    sha256 = "c198a9ba1c99f91e54330e34f94ab758c1f2e9f246585f0eedba0f416fd066d1"
+    size = 5333449483
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00015-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00015-of-00022.safetensors"
+    sha256 = "4991656e138e6c80015e0b4b31acd628c97601522c59f3fe94121e991efa74fa"
+    size = 4966447881
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00016-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00016-of-00022.safetensors"
+    sha256 = "0f7b724c1ae85e13443e462878208c9924e5baf47cf56670801384ca1e589cc2"
+    size = 5337575126
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00017-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00017-of-00022.safetensors"
+    sha256 = "55f2f67618487b8eacf8f5e36758281d7d91b5458c260cb8b6665004dbf5ec69"
+    size = 4963058693
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00018-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00018-of-00022.safetensors"
+    sha256 = "67ba9ee0b88bb5961a14992748c021c87f8a59bd2efd9c65509e36076a6e3229"
+    size = 5333449369
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00019-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00019-of-00022.safetensors"
+    sha256 = "65c34375b932fb13ecfb27c2588f326450e54604616bde870b38e1c8e96070a0"
+    size = 5333449485
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00020-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00020-of-00022.safetensors"
+    sha256 = "1a56d13e3ef8c80bfd1f571c93cab708a7b2b6aaa1dd958df4fd51f90d0d1eaf"
+    size = 4966447817
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00021-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00021-of-00022.safetensors"
+    sha256 = "42b36361206e0bfbbbf24dba154d28d4fc46163d22aac3edb90574ee1dd8fb58"
+    size = 5337575118
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model-00022-of-00022.safetensors"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model-00022-of-00022.safetensors"
+    sha256 = "6388ae50b68ffffc8c46e568345ffa95d31d9b647fcc64c2670f15c8549e602a"
+    size = 2083001924
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/chat_template.jinja"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/chat_template.jinja"
+    sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    size = 8952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/config.json"
+    sha256 = "8da41ff81dd216be279dfd4070d3eb2b9b84517c3f892351b32e5680e6e1d6ce"
+    size = 80817
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/generation_config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/generation_config.json"
+    sha256 = "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+    size = 202
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/LICENSE"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/LICENSE"
+    sha256 = "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"
+    size = 3235
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/model.safetensors.index.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/model.safetensors.index.json"
+    sha256 = "3581f8d40a330d40009d0417359f5f75b7cf79e9f8fc48ba0b1461eabd43dd5f"
+    size = 421944
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/preprocessor_config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/preprocessor_config.json"
+    sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    size = 390
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/processor_config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/processor_config.json"
+    sha256 = "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040"
+    size = 991
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/README.md"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/README.md"
+    sha256 = "eb54592ce293006d75d181be8dca197282f3b76148852c9c505fc9242bcef3fe"
+    size = 1671
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/tokenizer_config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/tokenizer_config.json"
+    sha256 = "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b"
+    size = 1165
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/tokenizer.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/tokenizer.json"
+    sha256 = "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    size = 19989325
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/video_preprocessor_config.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/video_preprocessor_config.json"
+    sha256 = "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    size = 385
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-MLX-4bit/vocab.json"
+    dest = "Qwen3.8-Flash-Next-MLX-4bit/vocab.json"
+    sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    size = 6722759
 
   # The 4-bit UD export - four shards, and shard 1 is LISTED first for the same
   # reason it is everywhere else here (the spawn path hands the runner
@@ -1176,6 +2616,411 @@ revision = "2026-09-08"
 
   # the separate MTP head (see the sourcing note above) - this export has no
   # in-file one
+  # local-inference-lab's quantization-aware-DISTILLED NVFP4/MXFP8 export of
+  # Qwen3.8-Flash-Next.
+  #
+  # ATTRIBUTION - READ BEFORE EDITING THIS ROW. The export is
+  # local-inference-lab/Qwen3.8-Flash-Next-NVFP4 and that repo is the SOURCE
+  # OF TRUTH; credit and issues belong there. Paddock re-quantized nothing.
+  # An earlier cut of this row credited a Mia-AiLab MIRROR we had fetched
+  # through, which the mirror's own card disclaims - that was wrong, and it is
+  # why this note exists. Nothing of that mirror survives: the bytes are now
+  # pulled from upstream directly and its R2 prefix was deleted 2026-09-20.
+  #
+  # THE REVISION IS THE POINT, because `main` has meant two different
+  # checkpoints. Until 2026-09-16 this repo held a post-training quant (34
+  # shards, ModelOpt amax* calibration files alongside). Commit b13380df
+  # replaced it with a distilled student: 36 shards, amax* dropped, and every
+  # TRAINED tensor changed while the frozen ones stayed byte-identical (we
+  # sampled both to establish exactly that - attention, vision and MTP planes
+  # matched, routed experts, shared experts, PLE tables and hyper-connection
+  # mixers did not). We serve the distilled one, pinned to the full sha below
+  # and carried in the R2 prefix so a future re-publish cannot silently swap
+  # what this row means. The earlier PTQ export was retired the same day.
+  #
+  # WHAT DISTILLED MEANS HERE: the student trains against the BF16 teacher
+  # with quantized weights in its forward pass, so it learns to absorb
+  # quantization error rather than merely rounding into it. The trained set is
+  # routed experts + PLE tables (NVFP4) and shared experts (MXFP8); attention,
+  # vision and the MTP head are frozen and carry the base checkpoint's values.
+  # Upstream's config declares the architecture as `qwen4_exp` where the PTQ
+  # export said `qwen3_8_flash_next` - the loader accepts both, deliberately.
+  #
+  # THE EXPORT SELF-DESCRIBES, and it corroborates all of the above: the
+  # shipped `export-manifest.json` names `template_revision` ada4da32 - the
+  # very PTQ export this row used to serve - and records 5,833 frozen against
+  # 295,897 replaced tensors (301,730 total, 105,798,973,864 tensor bytes),
+  # every count matching what we measured off the shard headers ourselves. Its
+  # own validation line for the frozen set reads "full selected-tensor byte
+  # equality against PTQ template", which is exactly the split our byte
+  # sampling found. Base is Qwen/Qwen3.8-Flash-Next at de4b8e4d.
+  #
+  # CAVEAT worth carrying: activation calibration is exported
+  # "with_explicit_fallback" - 6 routed experts of 24,576 (0.024%, all in
+  # layer 0) were never observed and take a per-layer max scale instead of a
+  # measured one. Small and disclosed, but it is a static-W4A4 footnote, and
+  # the W4A4 pair is off by default for unrelated reasons (see STATE below).
+  #
+  # SOURCING: neither an official org nor unsloth, so it sits outside the
+  # model-sourcing policy's two usual sources. Listed on an explicit
+  # maintainer decision (2026-09-20), pulled once from HF at the pinned sha and
+  # republished to R2 so the standing rule holds for anyone fetching it.
+  # LICENSE IS NOT APACHE-2.0 - an earlier cut of this row said so and was
+  # wrong. It inherits the base model's qwen-community-1.0 ("other"), which
+  # is what upstream's own card declares; redistribution is permitted under
+  # that licence, not a permissive one. Qwen's LICENSE ships in the bundle.
+  #
+  # WHY IT EARNS ITS OWN ROW: NVIDIA's NVFP4 export quantizes ONLY the routed
+  # experts and leaves 9.22 GB bf16, so 6.79 GB of dense planes plus a 1.18 GB
+  # bf16 lm_head are read every token - a hard ~30 tok/s ceiling on a 273 GB/s
+  # die. This export's `ignore` list is EMPTY: attention, GDN linear_attn,
+  # shared experts and the vision tower are MXFP8 (W8A8, group 32, block
+  # [1, 32]), routed experts NVFP4 W4A4 group 16, the MTP head's NVFP4 W4A16.
+  # 98.5 GiB of tensors against NVIDIA's 124 GB. The published single-Spark
+  # figures for this model are measured on this export line; the distillation
+  # changed weight VALUES but not one dtype, shape or plane layout, so it
+  # reads at the same bytes per token and those figures still describe this
+  # row's serving cost.
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "NVFP4 distilled (fastest)"
+  quant = "NVFP4"
+
+  # The PRODUCING repo, not the mirror the bytes were fetched from.
+  [model.artifact.source]
+  repo = "local-inference-lab/Qwen3.8-Flash-Next-NVFP4"
+  revision = "7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd"
+  base_model = "Qwen/Qwen3.8-Flash-Next"
+  license = "qwen-community-1.0"
+  license_url = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  kv_cache_dtype = "fp8_e4m3"
+  companions = []
+  experimental = true
+  note = "CUDA only, and cc12 in practice: the MXFP8 dense planes ride the e4m3 + ue8m0 block-scale lanes and the routed experts the packed-fp4 mma, which no other die implements. The 26.8 GiB n-gram table stays HOST-MAPPED - on a unified-memory die the mapping IS device memory, so a device copy would hold it twice - and is warmed at load. Measured ON THESE DISTILLED WEIGHTS, DGX Spark (GB10) 2026-09-20, syn 128x128 c1, spec on with the in-file MTP head and a 65536-id draft shortlist, 3 reps, clock-guard satisfied: ITL p50 21.19-22.48 ms (decode 44.5-47.2 tok/s), TTFT p50 463-635 ms, 35.8-38.4 end-to-end out tok/s, speculative acceptance 79.6%. An earlier cut of this row headlined 'decode 47.7 tok/s, TTFT 421 ms' - those were the PTQ export's W4A4-ON legs, and two different runs at that, quoted against a row that ships W4A4 OFF; they are gone rather than re-dressed. NOTE FOR RE-MEASURING: this die sustains ~2535 MHz of its advertised 3003 under this load, so a leg needs PD_CLOCK_GUARD_REF_MHZ or smoke-perf-check voids it as INVALID-CLOCKS. Upstream publishes AA-LCR 79.4, GPQA Diamond 89.9 and Tool Eval Bench 91 for this checkpoint, and reports it answering GPQA in 9% fewer tokens on average (15% median, 26% P99) than the PTQ export - an end-to-end latency win at unchanged tok/s, unverified here. STATE: the W4A4 routed pair (PADDOCK_Q38FN_NVF4_BS_MIN) is OFF by default, and on these weights it BUYS NOTHING measurable - 3 reps on and off sit inside each other's spread (on: ITL p50 21.18-22.48, TTFT 473-732; off: 21.19-22.48, 463-635), where on the retired PTQ export the same flag had looked worth a large TTFT cut. Both legs drafted and accepted identical token counts (1272/1013), which is consistent with the W4A4 arm tracking the W4A16 stream here but is not a correctness proof. Its same-weights greedy gate read 3 of 8 prompts byte-identical against W4A16 with the rest tracking 77-661 characters before parting - the expected signature of a changed activation class, not a clean pass; that gate ran on the PTQ export and has not been re-run here. Long-context, vision and broader reasoning qualification open; registry envelope 4K, not the vendor's 256K."
+
+  [model.artifact.shape]
+  weight_bytes = 76998540708
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 1596720640
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, count = 12 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 36
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00001-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00001-of-00036.safetensors"
+    sha256 = "a786f7bc8721e688f145f654cc0039aa37b906eac56646b2a63e03be99c790a1"
+    size = 4248628952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00002-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00002-of-00036.safetensors"
+    sha256 = "0e4f57c90fa723e5bf81695afe76a77bd4c01dac94ec813ee6d0465ff8a22000"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00003-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00003-of-00036.safetensors"
+    sha256 = "a6fdb45c7e2a846da393df5a1a30d1c4293362fa62684f534394b9b432ceb5f1"
+    size = 1716167248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00004-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00004-of-00036.safetensors"
+    sha256 = "bf3a6e32c3af0d949203c1ff015517e95f63740b1bc738c6aaf85ede43f9df06"
+    size = 4248633272
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00005-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00005-of-00036.safetensors"
+    sha256 = "3a5968598ccd30ff9541af1f2dc6ac399833db3ec141e4a975651efbeacc0fce"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00006-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00006-of-00036.safetensors"
+    sha256 = "cd1d451050a7b4cee18b1a862c70705883a950b1ebdbbc02dcbbea45a58dcea7"
+    size = 4248633272
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00007-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00007-of-00036.safetensors"
+    sha256 = "2cc89ec5c7c7318ad94bde56e206cf2e31faed822200cc43d08f030c9aa6ecd6"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00008-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00008-of-00036.safetensors"
+    sha256 = "185b71a1d00fd1f828c211f925941bdf4ac9497f48786e0760aa5a450aa2ae50"
+    size = 4248645368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00009-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00009-of-00036.safetensors"
+    sha256 = "5c6310e89aad5a48d0514e491ba3a90e70817eeebdbc6ae1ad87f34a9d26606b"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00010-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00010-of-00036.safetensors"
+    sha256 = "e7bd40743d3d03031c2984b92771a2fdd37adb600332222c0f41782c3c7e0861"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00011-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00011-of-00036.safetensors"
+    sha256 = "42b1346f6c66302c2d8eb2355d9aed00aaad6d6d9ca1d78338b363b7939bbfb5"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00012-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00012-of-00036.safetensors"
+    sha256 = "bd5d5f790a27aae66dcf57663ede321835dfbeb470c9607f810dd9f02ca1e08e"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00013-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00013-of-00036.safetensors"
+    sha256 = "78d08c172fff33e143c774ce764e741c98f66b98019c18424e0b82376dad71bb"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00014-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00014-of-00036.safetensors"
+    sha256 = "27816478b50e7566afa7ee4fd2097414a602499e1d901aa8ef2f2629fd01a601"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00015-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00015-of-00036.safetensors"
+    sha256 = "579c34fe21dcd4026719d1d97513470da5a8d71417558933d5a22aec544155af"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00016-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00016-of-00036.safetensors"
+    sha256 = "4e452062ee8ab0c48b1b789fe3f2ea74fa03c2f134d174fb1ab446a715837451"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00017-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00017-of-00036.safetensors"
+    sha256 = "53ab970e36e8ce3506ddf2ac0957f6dc2954d03c892696310c1b5453689c95be"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00018-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00018-of-00036.safetensors"
+    sha256 = "3ea1419ac7bec2b594e5ef40bee541d1dd6b7c4ab51a5812b14c1bbf68e5d3ed"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00019-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00019-of-00036.safetensors"
+    sha256 = "5521c100d92752ad9dacab923a413a46c26eeeb40be25e105ce1c2598b4cb064"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00020-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00020-of-00036.safetensors"
+    sha256 = "8ad9a9d3c23c72ad4c7e266292fb1d5a2020d0f328287d3e88112b21befb968a"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00021-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00021-of-00036.safetensors"
+    sha256 = "fe9c40e5b4c9f5c76f9933942a5e482051eab60e7147ba8a92fc6f83016e789d"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00022-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00022-of-00036.safetensors"
+    sha256 = "a136501dd94d9c331341de7e836c87955e83dacb4068d76fe20f392603c4df86"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00023-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00023-of-00036.safetensors"
+    sha256 = "a721a37b20a38b68dd0407f6e4622e7bb8c53551ee52d54d49bc730f967c8f7b"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00024-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00024-of-00036.safetensors"
+    sha256 = "07bbd539fbab1c1e6f977e56d3673ff293d19242239f85f95ee58f147b7b9fac"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00025-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00025-of-00036.safetensors"
+    sha256 = "38b381c492b36df703cb5f8929b0ae1a57bc1afdc88c2f1f0e1da5350fe0400d"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00026-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00026-of-00036.safetensors"
+    sha256 = "c18ef2cc99412c6698414f254a278f1c8afc68164920d2a77bef62a9aa728112"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00027-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00027-of-00036.safetensors"
+    sha256 = "98abf676fb32d6d613bd9f0300c8806dc31f98a9206e7fa81169117ca36dd3be"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00028-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00028-of-00036.safetensors"
+    sha256 = "9f9160cf3d99ee90f61fc9e602655c403ed00e113d468afc834fd64d20f56eb4"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00029-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00029-of-00036.safetensors"
+    sha256 = "5af1be56451e312babc79f045a7c66cd5d04fc72211b83d8c147f112323393d5"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00030-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00030-of-00036.safetensors"
+    sha256 = "c3d2c1c8c3076630ef3e12ce4b0690e71e44d31e09b220d8f3a083f315efe1d5"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00031-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00031-of-00036.safetensors"
+    sha256 = "0d0939a8064a3503f02cdc5b876a7093d18c7c92243e923ee2b1063a40ee2b67"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00032-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00032-of-00036.safetensors"
+    sha256 = "b05e9a64aad944eab94ae6a2497c6bb053e056c0f9b15d403c8c5ea1ea1d3bd8"
+    size = 4248647096
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00033-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00033-of-00036.safetensors"
+    sha256 = "75fc462c144d9186a74aa983d4298c980410d293d7d5500bbd9b3e1bfc299e0c"
+    size = 1800011248
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00034-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00034-of-00036.safetensors"
+    sha256 = "4ecb48830a06e4d948b4fe2baec34af5dae87908da354582cbf8b1ae83cce2c6"
+    size = 4548275968
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00035-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00035-of-00036.safetensors"
+    sha256 = "94994a8d548461eba44e86805c4e373ec90fd9c6080cb6bbce088a1836a9cb60"
+    size = 2786893032
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00036-of-00036.safetensors"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model-00036-of-00036.safetensors"
+    sha256 = "72c76c2b5249adfeaf9d284a1725aa988b8c87e63dd193faba173900a5d2c849"
+    size = 9669968
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/LICENSE"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/LICENSE"
+    sha256 = "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"
+    size = 3235
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/README.md"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/README.md"
+    sha256 = "38073ec4fabac40c2ed0372a8f74e58e8fa51c38bd0ac671c586958347251477"
+    size = 5068
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/chat_template.jinja"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/chat_template.jinja"
+    sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    size = 8952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/config.json"
+    sha256 = "b1ecb2697178111fb10b73354a681d10884c19ecd830af1073ea93d2a09a5358"
+    size = 109919
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/export-manifest.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/export-manifest.json"
+    sha256 = "8a0b93599e3edb4ab25357e8af16cf1ac2c6a61354fcec9d6aa50ee9fbf94397"
+    size = 78375
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/generation_config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/generation_config.json"
+    sha256 = "735ec63e625c2086fbec18327233a03a7b060fddabfd7915af4e6fdcec3187a2"
+    size = 2097
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/hf_quant_config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/hf_quant_config.json"
+    sha256 = "d60c54caa65317fd8f1338bdeb81b9014512ac8f21ec18da22541cb88c6784b7"
+    size = 99088
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/merges.txt"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/merges.txt"
+    sha256 = "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+    size = 3353259
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model.safetensors.index.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/model.safetensors.index.json"
+    sha256 = "c528e5628a0f448edc52023933c207a8dbded850afdd960d893c9171a7665dde"
+    size = 33295470
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/preprocessor_config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/preprocessor_config.json"
+    sha256 = "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    size = 390
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/tokenizer.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/tokenizer.json"
+    sha256 = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    size = 12809320
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/tokenizer_config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/tokenizer_config.json"
+    sha256 = "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+    size = 17928
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/video_preprocessor_config.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/video_preprocessor_config.json"
+    sha256 = "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+    size = 385
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/vocab.json"
+    dest = "Qwen3.8-Flash-Next-NVFP4-7c4f1bc1/vocab.json"
+    sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    size = 6722759
+
   [[model.artifact]]
   id = "drafter"
   kind = "drafter"
@@ -1208,6 +3053,8 @@ revision = "2026-08-02"
   [model.specs]
   params = "33B · 3B active"
   context = "256K"
+  published_at = "2026-07-02"
+  published_source = "https://poolside.ai/blog/introducing-laguna-xs-2-1"
   homepage = "https://huggingface.co/poolside/Laguna-XS-2.1"
   about = "Poolside's coding-focused open model - strong at code and agent work, and fast because only a small part of the model runs per token."
   strengths = [
@@ -1227,6 +3074,22 @@ revision = "2026-08-02"
   label = "Compact"
   quant = "Q4_K_M"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "tools", "reasoning"]
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native Laguna XS Q4_K_M text graph on Metal; real four-slot/prefix/mixed-request/cancellation GPU tests and native smoke pass. F32 backbone projections avoid the mixed-tick F16 rounding boundary; broader batch-probability invariance remains open. Independent parity is unavailable: b10902 and b10903 produce invalid distributions; no rival speed claim. DFlash is not implemented. Full paged KV on every layer and one prefix reserve sequence are priced separately from CUDA's sliding cache; 32K/64 are implementation ceilings, not qualified capacities."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 20270574592
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
 
   [model.artifact.shape]
   weight_bytes = 21747788800
@@ -1319,6 +3182,8 @@ revision = "2026-08-05"
   [model.specs]
   params = "118B · 8B active"
   context = "1M"
+  published_at = "2026-07-21"
+  published_source = "https://poolside.ai/blog/introducing-laguna-s-2-1"
   homepage = "https://huggingface.co/poolside/Laguna-S-2.1"
   about = "The big Laguna - built for coding and long agent runs, and still quick per token because only a small slice of it runs at a time."
   strengths = [
@@ -1342,6 +3207,22 @@ revision = "2026-08-05"
   label = "Compact"
   quant = "UD-Q4_K_XL"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "tools", "reasoning"]
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native Laguna S three-shard UD-Q4_K_XL text graph on Metal. Real four-slot/prefix/mixed-request/cancellation GPU tests pass; prebuilt b10903 same-weight reference matches 18/18 first tokens and 5/5 complete short generations. c=1/c=4 throughput, TTFT and tails trail llama.cpp; only 23/60 longer capped timing outputs match. Broader qualification remains open; no SOTA claim. DFlash is not implemented. Native compressed weights, full paged F16 KV on all 48 layers and one prefix reserve sequence; 32K/64 are implementation ceilings, not qualified capacities."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 73391436800
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
 
   [model.artifact.shape]
   weight_bytes = 76927235072
@@ -1408,6 +3289,8 @@ revision = "2026-08-04"
   [model.specs]
   params = "8B"
   context = "128K"
+  published_at = "2026-04-29"
+  published_source = "https://research.ibm.com/blog/granite-4-1-ai-foundation-models"
   homepage = "https://huggingface.co/ibm-granite/granite-4.1-8b"
   about = "IBM's open model for business use - tuned for tool calling and following instructions exactly, in twelve languages."
   strengths = [
@@ -1426,6 +3309,7 @@ revision = "2026-08-04"
   # that one has never been loaded - fetch it, serve it, then publish it.
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Metal Q8 text; short-generation gate passed. No audio or speculative companions." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -1461,6 +3345,8 @@ revision = "2026-08-04"
   [model.specs]
   params = "30B"
   context = "128K"
+  published_at = "2026-04-29"
+  published_source = "https://research.ibm.com/blog/granite-4-1-ai-foundation-models"
   homepage = "https://huggingface.co/ibm-granite/granite-4.1-30b"
   about = "The bigger Granite - the same tool calling and instruction following as the 8B, with better answers on harder questions."
   strengths = [
@@ -1482,6 +3368,7 @@ revision = "2026-08-04"
   # every url here is immutable.
   [[model.artifact]]
   id = "q4"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Metal Q4 text; ordinary-reference full-generation gate remains 4/5. No audio or speculative companions." } } }
   kind = "weights"
   format = "gguf"
   label = "Compact"
@@ -1557,6 +3444,8 @@ revision = "2026-08-25"
   [model.specs]
   params = "8B"
   context = "128K"
+  published_at = "2026-08-25"
+  published_source = "https://research.ibm.com/blog/introducing-granite-4-2"
   homepage = "https://huggingface.co/ibm-granite/granite-4.2-8b"
   about = "IBM's open model for business use - now with a step-by-step thinking mode, still tuned for tool calling and following instructions exactly."
   strengths = [
@@ -1573,6 +3462,7 @@ revision = "2026-08-25"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Metal Q8 text; broader reasoning and c=4 tail qualification remains open. No speculative companions." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -1807,6 +3697,8 @@ revision = "2026-08-25"
   [model.specs]
   params = "30B"
   context = "128K"
+  published_at = "2026-08-25"
+  published_source = "https://research.ibm.com/blog/introducing-granite-4-2"
   homepage = "https://huggingface.co/ibm-granite/granite-4.2-30b"
   about = "The bigger Granite 4.2 - the same thinking mode and tool calling as the 8B, with better answers on harder questions."
   strengths = [
@@ -1827,6 +3719,7 @@ revision = "2026-08-25"
   # purely additive - every url here is immutable.
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Metal Q8 text; broader reasoning and c=4 tail qualification remains open. No speculative companions." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -2109,6 +4002,8 @@ revision = "2026-08-05"
   [model.specs]
   params = "4B"
   context = "128K"
+  published_at = "2026-04-29"
+  published_source = "https://research.ibm.com/blog/granite-4-1-ai-foundation-models"
   homepage = "https://huggingface.co/ibm-granite/granite-vision-4.1-4b"
   about = "IBM's document reader - built to pull the numbers out of a chart or a table in an image, rather than to chat about pictures."
   strengths = [
@@ -2124,6 +4019,7 @@ revision = "2026-08-05"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["mmproj"], note = "Metal vision with the canonical tower and IBM task tags; input-aligned diagnostic is not default-reference parity." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -2153,6 +4049,7 @@ revision = "2026-08-05"
   # bundle pulls both, and the estimator charges both.
   [[model.artifact]]
   id = "mmproj"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal vision with the canonical tower and IBM task tags; input-aligned diagnostic is not default-reference parity." } } }
   kind = "vision"
   format = "gguf"
   label = "Image reader"
@@ -2185,6 +4082,8 @@ revision = "2026-08-13"
   [model.specs]
   params = "3B"
   context = "32K"
+  published_at = "2026-06-22"
+  published_source = "https://huggingface.co/baidu/Unlimited-OCR#news"
   homepage = "https://huggingface.co/baidu/Unlimited-OCR"
   about = "Baidu's document reader - turns a scanned page, a photo of a document or a whole PDF into clean text, and can point at where on the page each piece came from."
   strengths = [
@@ -2204,6 +4103,23 @@ revision = "2026-08-13"
   label = "Full quality"
   quant = "Q8_0"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "documents"]
+  kv_cache_dtype = "f16"
+  companions = ["mmproj"]
+  note = "Native Unlimited-OCR Q8 decoder and required SAM/CLIP DeepEncoder. Full-softmax top-six GPU experts, F32 residuals, paged F16 prompt KV plus a 128-token generated-text ring; block-budgeted packed image tiles. Further testing pending independent document parity and serving qualification. No speculative, audio or image-cache support."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 3120896000
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 16
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 136120644
 
   [model.artifact.shape]
   weight_bytes = 3126134688
@@ -2236,6 +4152,20 @@ revision = "2026-08-13"
   required = true
   workspace = 996147200
 
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Required F16/F32 DeepEncoder: SAM ViT-B, convolutional squeeze, CLIP-L and 1280-wide projector. Native Metal bounds four-view workspace and per-slot output; 1024 global/640 tile geometry, up to 32 local tiles. CLIP's unused pixel stem is validated but not uploaded."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 822808576
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 2415919104
+
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/Unlimited-OCR-GGUF/mmproj-Unlimited-OCR-F16.gguf"
     dest = "Unlimited-OCR-GGUF/mmproj-Unlimited-OCR-F16.gguf"
@@ -2265,6 +4195,8 @@ revision = "2026-08-13"
   [model.specs]
   params = "0.9B"
   context = "128K"
+  published_at = "2026-05-28"
+  published_source = "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6#news"
   homepage = "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6"
   about = "Baidu's compact page reader - turns a scanned page or a photo of a document into clean text, with strong coverage of Nordic and other European languages."
   strengths = [
@@ -2284,6 +4216,23 @@ revision = "2026-08-13"
   label = "Full quality"
   quant = "BF16"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "documents"]
+  kv_cache_dtype = "f16"
+  companions = ["mmproj"]
+  note = "Native PaddleOCR-VL 1.6 BF16 decoder and mandatory NaViT tower. GPU-only packed images, three-axis rotary, causal paged F16 KV and block-budgeted image admission. Further testing pending broad document parity and serving qualification; no SOTA claim, no speculative companions. Default OCR budget 144..1280 image tokens, spotting ceiling 2048 per image and aggregate 4096 per request. No image-prefix or encoded-image cache yet."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 933384192
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 16
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 103239744
 
   [model.artifact.shape]
   weight_bytes = 935769056
@@ -2329,6 +4278,20 @@ revision = "2026-08-13"
   required = true
   workspace = 1950351360
 
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Required official PaddleOCR NaViT BF16/F32 companion. Metal prices a conservative GPU wave/input/output bound, not CUDA's workspace; exact graph qualification is recorded separately."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 881744320
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 2860253184
+
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/PaddleOCR-VL-1.6-GGUF/PaddleOCR-VL-1.6-GGUF-mmproj.gguf"
     dest = "PaddleOCR-VL-1.6-GGUF/PaddleOCR-VL-1.6-GGUF-mmproj.gguf"
@@ -2356,6 +4319,8 @@ kv_default = "fp8_e4m3"
   [model.specs]
   params = "30B"
   context = "128K"
+  published_at = "2026-08-10"
+  published_source = "https://huggingface.co/meta-models/Muse-Glimmer-30B/commit/46ac57a4502be771dc743ac85866351c5629ca71"
   homepage = "https://huggingface.co/meta-models/Muse-Glimmer-30B"
   about = "Meta's Apache-2.0 reasoning model - it thinks before every answer, reads images, and ships its own draft model for extra speed."
   strengths = [
@@ -2370,6 +4335,7 @@ kv_default = "fp8_e4m3"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal Q8 with BF16 vision and DFlash2 only; exact-stream and mixed-image TTFT qualification remains open." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -2423,6 +4389,7 @@ kv_default = "fp8_e4m3"
   # attention, erf-GELU MLP, channel-outer pixel shuffle.
   [[model.artifact]]
   id = "vision"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal Q8 with BF16 vision and DFlash2 only; exact-stream and mixed-image TTFT qualification remains open." } } }
   kind = "vision"
   format = "gguf"
   label = "Vision (image input)"
@@ -2454,6 +4421,7 @@ kv_default = "fp8_e4m3"
   # dflash-kquant.gguf already is.
   [[model.artifact]]
   id = "drafter2"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", note = "Metal Q8 with BF16 vision and DFlash2 only; exact-stream and mixed-image TTFT qualification remains open." } } }
   kind = "drafter"
   format = "gguf"
   label = "Faster generation (DFlash2)"
@@ -2477,6 +4445,146 @@ kv_default = "fp8_e4m3"
     dest = "Muse-Glimmer-30B-GGUF/dflash-kquant.gguf"
     sha256 = "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc"
     size = 1631205312
+
+  # MLX-community export: a named exception to the sourcing rule, mirrored on R2.
+  # Distinct export: never inherit GGUF companions or qualification.
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX-community 4-bit (macOS preview)"
+  quant = "MLX-AFFINE-4-G64"
+  default = false
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["chat", "vision", "tools", "reasoning"]
+  companions = []
+  checkpoint_dir = true
+  embedded_vision = true
+  kv_cache_dtype = "auto"
+  experimental = false
+  qualification = "qualified"
+  default_max_ctx = 4096
+  default_max_batch = 4
+  note = "Native macOS/Apple Silicon Metal preview; affine 4-bit/group-64 text and projectors with embedded BF16 vision tower. BF16 KV, 4K/four-slot registry envelope. No MTP, DFlash or GGUF companions. Latest capped-32 parity: text 5/6, image 1/2; full-generation and serving performance qualification remain open."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 19422740900
+  nextn_bytes = 0
+  source = "probed"
+  max_ctx = 4096
+  max_batch = 4
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  # Conservative 4K/c4 reserve: native text scratch + additional doubled/ring
+  # KV beyond the logical shape below + 2 GiB vision/transient allowance.
+  # Weight count includes embedded tower and widened norms/positions.
+  # Derived from checkpoint headers/native loader, not a measured fit claim.
+  workspace_bytes = 4193453056
+
+  [model.artifact.shape]
+  weight_bytes = 19422740900
+  kind = "generative"
+  vocab = 202048
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [
+    { k_dim = 256, v_dim = 256, window = 2048, count = 39 },
+    { k_dim = 256, v_dim = 256, count = 13 },
+  ]
+
+  [model.artifact.source]
+  repo = "mlx-community/Muse-Glimmer-30B-4bit"
+  revision = "3e7677d7a40d348a3daba263a2b1c0aa41910710"
+  base_model = "meta-models/Muse-Glimmer-30B"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/meta-models/Muse-Glimmer-30B/resolve/a4e59da52a7bc87ae7251dd5545c0dd437c44b68/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/model-00001-of-00004.safetensors"
+    dest = "Muse-Glimmer-30B-MLX-4bit/model-00001-of-00004.safetensors"
+    sha256 = "72c99dc670867308f70aab212331e4dd0e19d46bf409a134da1848b9dbe47c91"
+    size = 5310085129
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/model-00002-of-00004.safetensors"
+    dest = "Muse-Glimmer-30B-MLX-4bit/model-00002-of-00004.safetensors"
+    sha256 = "f2af4b82d578cee5eeeef3f0d3f139eae3adfc2fc2a27b52ec2ac5886e131cf4"
+    size = 5366299665
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/model-00003-of-00004.safetensors"
+    dest = "Muse-Glimmer-30B-MLX-4bit/model-00003-of-00004.safetensors"
+    sha256 = "2892bb7971d20a7ecfd84a51404e0ae1f0863580562ccef58fdf444da25bc5a2"
+    size = 5343216475
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/model-00004-of-00004.safetensors"
+    dest = "Muse-Glimmer-30B-MLX-4bit/model-00004-of-00004.safetensors"
+    sha256 = "6496c62ac6a229be31c784835c43077224e80750182c2693e29c08ddae455a31"
+    size = 3395202844
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/.gitattributes"
+    dest = "Muse-Glimmer-30B-MLX-4bit/.gitattributes"
+    sha256 = "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"
+    size = 1570
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/chat_template.jinja"
+    dest = "Muse-Glimmer-30B-MLX-4bit/chat_template.jinja"
+    sha256 = "114f55ebdc1804c1af371197b9fdf2d6bb925966c9dfe46b73782a71bc07965e"
+    size = 7167
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/config.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/config.json"
+    sha256 = "c7f48468db2ef9c3de4cb912be24ecc9fbed36d83f3b8386a0b224ee7ba876ca"
+    size = 6796
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/generation_config.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/generation_config.json"
+    sha256 = "b0e427c998641420eb4091cc85d4e15643fb57f89222834a14ec76430625b6fb"
+    size = 148
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/LICENSE"
+    dest = "Muse-Glimmer-30B-MLX-4bit/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/model.safetensors.index.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/model.safetensors.index.json"
+    sha256 = "10e1f963a4dc827c303594d988c6d44711171eaa70eeb3e810c2ce321d4c0323"
+    size = 218191
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/processor_config.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/processor_config.json"
+    sha256 = "cfa67148d85e40281b4a126253a1476a63b11137e21cb2422b7ccff46a11c1af"
+    size = 395
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/README.md"
+    dest = "Muse-Glimmer-30B-MLX-4bit/README.md"
+    sha256 = "d47ea94025bdd61e5a7d922bd0e6d08e6afa5c6042643c349e494be35db025b5"
+    size = 683
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/tokenizer_config.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/tokenizer_config.json"
+    sha256 = "b2c352bba1d2ee25295aa84e7bdaa15a2b0305b79009926bcea72516ca200d42"
+    size = 79985
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Muse-Glimmer-30B-MLX-4bit/tokenizer.json"
+    dest = "Muse-Glimmer-30B-MLX-4bit/tokenizer.json"
+    sha256 = "c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d"
+    size = 28129897
 
 # ── NVIDIA's hybrid mamba/attention MoE  ──────────────────────────
 #
@@ -2503,6 +4611,8 @@ revision = "2026-08-18"
   [model.specs]
   params = "30B total, 3B active"
   context = "1M"
+  published_at = "2026-08-11"
+  published_source = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
   homepage = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
   about = "NVIDIA's hybrid reasoning model - mostly mamba layers with a few attention layers, so long conversations stay cheap instead of getting slower the further they go."
   strengths = [
@@ -2533,6 +4643,30 @@ revision = "2026-08-18"
   # Same workspace as the NVFP4 arm: the mamba arenas are f32 and sized by SLOT
   # COUNT, not by weight quant, so the figure does not move with the format.
   workspace = 1899342848
+
+  # Native Metal Q8 trunk only. The CUDA Q8/NVFP4/MTP contracts above and
+  # below stay unchanged. Independent testing continues.
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["chat", "tools", "reasoning"]
+  companions = []
+  kv_cache_dtype = "f16"
+  note = "Native Metal Q8: F32 matrix-based Mamba-2 prefill, GPU ReLU² experts and paired state/KV prefixes. Real GPU gates and 18/18 first tokens, 5/5 complete short generations pass, but only 17/60 longer capped outputs match; end-to-end throughput/TTFT trail llama.cpp. No vision, NVFP4 or MTP/DFlash. Broader generation, memory-estimator and performance qualification remain open."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 33577599744
+  nextn_bytes = 0
+  source = "measured"
+  max_ctx = 32768
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  # Upper bound of native scratch across the declared 32K/64-slot ceiling.
+  # The estimator's hybrid checkpoint floor remains conservative; this is
+  # not an exact admission prediction. The loader enforces the actual grant.
+  workspace_bytes = 677817604
+  recurrent = { layers = 23, state_elems = 524288, conv_elems = 18432, conv_dim = 6144, elem_bytes = 4 }
 
   [model.artifact.shape]
   weight_bytes = 34997444864
@@ -3046,6 +5180,8 @@ revision = "2026-08-01"
   params = "0.6B"
   context = "32K"
   dims = "up to 1024 (Matryoshka)"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B"
   about = "Turns text into vectors for search and retrieval - works in 100+ languages."
   strengths = [
@@ -3058,6 +5194,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 retrieval; independent vector gate at 2K context. GPU pooling/L2. Matryoshka dimensions, prefix reuse and broad serving qualification remain open; no block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3094,6 +5231,8 @@ revision = "2026-08-01"
   params = "4B"
   context = "32K"
   dims = "up to 2560 (Matryoshka)"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Embedding-4B"
   about = "Turns text into vectors for search and retrieval - works in 100+ languages."
   strengths = [
@@ -3106,6 +5245,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 retrieval; independent vector gate at 2K context. GPU pooling/L2. Matryoshka dimensions, prefix reuse and broad serving qualification remain open; no block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3142,6 +5282,8 @@ revision = "2026-08-01"
   params = "8B"
   context = "32K"
   dims = "up to 4096 (Matryoshka)"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Embedding-8B"
   about = "Turns text into vectors for search and retrieval - works in 100+ languages."
   strengths = [
@@ -3154,6 +5296,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 retrieval; independent vector gate at 2K context. GPU pooling/L2. Matryoshka dimensions, prefix reuse and broad serving qualification remain open; no block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3191,6 +5334,8 @@ revision = "2026-08-01"
   [model.specs]
   params = "0.6B"
   context = "32K"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B"
   about = "Scores how well each document answers a query - the precision step after a vector search."
   strengths = [
@@ -3203,6 +5348,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 rerank with GPU two-row head and published Qwen template. Same-weight full-vocabulary reference score gate at 2K context; old GGUF lacks llama.cpp optimized classifier/template. No matched rival rerank speed claim, prefix reuse or block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3238,6 +5384,8 @@ revision = "2026-08-01"
   [model.specs]
   params = "4B"
   context = "32K"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Reranker-4B"
   about = "Scores how well each document answers a query - the precision step after a vector search."
   strengths = [
@@ -3249,6 +5397,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 rerank with GPU two-row head and published Qwen template. Same-weight full-vocabulary reference score gate at 2K context; old GGUF lacks llama.cpp optimized classifier/template. No matched rival rerank speed claim, prefix reuse or block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3284,6 +5433,8 @@ revision = "2026-08-01"
   [model.specs]
   params = "8B"
   context = "32K"
+  published_at = "2025-06-05"
+  published_source = "https://qwenlm.github.io/blog/qwen3-embedding/"
   homepage = "https://huggingface.co/Qwen/Qwen3-Reranker-8B"
   about = "Scores how well each document answers a query - the precision step after a vector search."
   strengths = [
@@ -3295,6 +5446,7 @@ revision = "2026-08-01"
 
   [[model.artifact]]
   id = "q8"
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "f16", companions = [], note = "Native Metal Q8 rerank with GPU two-row head and published Qwen template. Same-weight full-vocabulary reference score gate at 2K context; old GGUF lacks llama.cpp optimized classifier/template. No matched rival rerank speed claim, prefix reuse or block-scale calibration." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -3360,6 +5512,8 @@ revision = "2026-08-09"
   [model.specs]
   params = "1.7B"
   context = "64K"
+  published_at = "2026-01-29"
+  published_source = "https://github.com/QwenLM/Qwen3-ASR#news"
   homepage = "https://huggingface.co/Qwen/Qwen3-ASR-1.7B"
   about = "Alibaba's compact speech-to-text model - multilingual transcription that runs comfortably on a small card, and the fastest of the four on this hardware."
   strengths = [
@@ -3379,6 +5533,23 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "Q8_0"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = ["audio"]
+  note = "Native Q8 Qwen3-ASR with mandatory BF16 audio tower. Packed audio windows, GPU convolution, paged F16 KV and chunked prefill. Further testing pending input-aligned reference and serving qualification. No vision, forced alignment or speculation; 120 seconds aggregate audio per request. Context/batch limits are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 2159087616
+  source = "measured"
+  max_ctx = 8192
+  max_batch = 16
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 128258112
 
   [model.artifact.shape]
   weight_bytes = 2165035104
@@ -3407,6 +5578,20 @@ revision = "2026-08-09"
   default = true
   required = true
 
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Exact Qwen3-ASR audio companion: F16 conv stem, BF16 24-layer encoder/projector, F32 norms/positions. Packed 104-token attention domains, original GPU gather and fused QKV; one bounded wave with block-level cancellation. Native 120-second aggregate ceiling; this is not forced alignment or timestamp generation."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 641751104
+  source = "measured"
+  max_ctx = 8192
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 536870912
+
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/Qwen3-ASR-1.7B-GGUF/mmproj-Qwen3-ASR-1.7B-bf16.gguf"
     dest = "Qwen3-ASR-1.7B-GGUF/mmproj-Qwen3-ASR-1.7B-bf16.gguf"
@@ -3420,7 +5605,7 @@ revision = "2026-08-09"
 # directory (same shas as huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf) -
 # no GGUF exists for this arch anywhere, and a Paddock-only GGUF dialect
 # would be lock-in wearing GGUF's clothes. The engine quantizes the text
-# stack to Q8_0 at load (the dflash recipe); decoded timestamps measured
+# stack to Q8_0 at load on CUDA (Metal retains native BF16); decoded timestamps measured
 # exact against the BF16 transformers reference across the en/de/zh battery.
 
 [[model]]
@@ -3435,6 +5620,8 @@ revision = "2026-08-14"
   [model.specs]
   params = "0.6B"
   context = "8K"
+  published_at = "2026-01-29"
+  published_source = "https://github.com/QwenLM/Qwen3-ASR#news"
   homepage = "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf"
   about = "Times every word of a transcript against its audio - pair it with any speech-to-text model to make transcripts follow the playback word by word."
   strengths = [
@@ -3452,9 +5639,27 @@ revision = "2026-08-14"
   id = "bf16"
   kind = "weights"
   format = "safetensors"
-  label = "Official checkpoint (served Q8_0)"
+  label = "Official BF16 checkpoint (CUDA: Q8_0, Metal: BF16)"
   quant = "BF16"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["alignment"]
+  companions = []
+  kv_cache_dtype = "f16"
+  note = "Native BF16 forced alignment, integrated GPU audio tower, packed causal prefill and GPU 5000-bin head. No load-time quantization, generative KV, transcription, vision or speculation. Further testing pending broad timestamp/reference qualification. 120 seconds audio per clip/packed wave, 8192 aggregate text+audio rows, up to four packed requests; implementation ceilings. Japanese/Korean tokenization remains unsupported."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 1836292160
+  source = "measured"
+  max_ctx = 8192
+  max_batch = 4
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 1110904832
+  published_shape = { weight_bytes = 1836292160, kind = "encoder", kv_layers = [], vocab = 5000, max_ctx = 8192, nextn_bytes = 0, source = "measured" }
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/Qwen3-ForcedAligner-0.6B-hf/model.safetensors"
@@ -3526,6 +5731,8 @@ revision = "2026-08-09"
   [model.specs]
   params = "2B"
   context = "4K"
+  published_at = "2026-04-29"
+  published_source = "https://research.ibm.com/blog/granite-4-1-ai-foundation-models"
   homepage = "https://huggingface.co/ibm-granite/granite-speech-4.1-2b"
   about = "IBM's prompt-driven speech model: the instruction picks the task, so the same checkpoint writes a punctuated transcript, translates it, or biases recognition toward a keyword list."
   strengths = [
@@ -3546,6 +5753,23 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "Q8_0"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = ["audio"]
+  note = "Native Q8 Granite Speech with its mandatory exact audio tower and checkpoint chat template. Packed conformer/Q-Former, F32 pointwise weights, paged F16 KV. Further testing pending broad ASR/parity/serving qualification. No vision or speculative companion; 120 seconds aggregate audio per request/wave. Context/batch are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 1952592128
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 16
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 186808384
 
   [model.artifact.shape]
   weight_bytes = 1952592128
@@ -3574,6 +5798,20 @@ revision = "2026-08-09"
   default = true
   required = true
 
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Exact base final-layer speech tower. Original packed GPU block attention with Shaw positions, clip-bounded centered convolution, CTC feedback and window Q-Former. Learned queries normalized on GPU. No audio-content cache or CTC speculative drafting."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 1154200944
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 1073741824
+
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/granite-speech-4.1-2b-GGUF/mmproj-model-f16.gguf"
     dest = "granite-speech-4.1-2b-GGUF/mmproj-model-f16.gguf"
@@ -3592,6 +5830,8 @@ revision = "2026-08-09"
   [model.specs]
   params = "2B"
   context = "4K"
+  published_at = "2026-04-28"
+  published_source = "https://huggingface.co/ibm-granite/granite-speech-4.1-2b-plus#release-date"
   homepage = "https://huggingface.co/ibm-granite/granite-speech-4.1-2b-plus"
   about = "The rich-transcription sibling of Granite Speech 4.1 2B: the same prompt-driven speech model, with speaker labels and word-level timings available by changing the instruction."
   strengths = [
@@ -3612,6 +5852,23 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "Q8_0"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = ["audio"]
+  note = "Native Q8 Granite Speech with its mandatory exact audio tower and checkpoint chat template. Packed conformer/Q-Former, F32 pointwise weights, paged F16 KV. Further testing pending broad ASR/parity/serving qualification. No vision or speculative companion; 120 seconds aggregate audio per request/wave. Context/batch are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 1734224000
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 16
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 186808384
 
   [model.artifact.shape]
   weight_bytes = 1952592128
@@ -3637,6 +5894,20 @@ revision = "2026-08-09"
   label = "Speech encoder (mmproj F16)"
   default = true
   required = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  note = "Exact Plus layer-3/final concatenating speech tower. Original packed GPU block attention with Shaw positions, clip-bounded centered convolution, CTC feedback and window Q-Former. Learned queries normalized on GPU. No audio-content cache or CTC speculative drafting."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 1162589552
+  source = "measured"
+  max_ctx = 4096
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 1073741824
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/granite-speech-4.1-2b-plus-GGUF/mmproj-model-f16.gguf"
@@ -3675,6 +5946,24 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "F16"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native F16 Whisper encoder-decoder. Continuous decode slots with resident cross-attention KV; 30-second windows and long-form transcription. Segment timestamps, language detection and native GPU cross-attention word alignment, including final live-utterance enrichment. Exact R2 artifact; independent word-alignment reference fixtures pass. Broad accuracy and serving-performance coverage remains tracked separately. Context/batch are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 3227136000
+  source = "measured"
+  max_ctx = 448
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  nextn_bytes = 0
+  workspace_bytes = 576716800
 
   [model.artifact.shape]
   weight_bytes = 3359912960
@@ -3732,6 +6021,24 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "F16"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native F16 Whisper encoder-decoder. Continuous decode slots with resident cross-attention KV; 30-second windows and long-form transcription. Segment timestamps, language detection and native GPU cross-attention word alignment, including final live-utterance enrichment. Exact R2 artifact; independent word-alignment reference fixtures pass. Broad accuracy and serving-performance coverage remains tracked separately. Context/batch are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 3094359040
+  source = "measured"
+  max_ctx = 448
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  nextn_bytes = 0
+  workspace_bytes = 576716800
 
   [model.artifact.shape]
   weight_bytes = 3359912960
@@ -3802,6 +6109,24 @@ revision = "2026-08-09"
   label = "Full quality"
   quant = "F16"
   default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  [model.artifact.runtime.backend_overrides.metal]
+  qualification = "qualified"
+  capability = ["transcription"]
+  kv_cache_dtype = "f16"
+  companions = []
+  note = "Native F16 Whisper encoder-decoder. Continuous decode slots with resident cross-attention KV; 30-second windows and long-form transcription. Segment timestamps, language detection and native GPU cross-attention word alignment, including final live-utterance enrichment. Exact R2 artifact; independent word-alignment reference fixtures pass. Broad accuracy and serving-performance coverage remains tracked separately. Context/batch are implementation ceilings."
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 3094359040
+  source = "measured"
+  max_ctx = 448
+  max_batch = 16
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  nextn_bytes = 0
+  workspace_bytes = 576716800
 
   [model.artifact.shape]
   weight_bytes = 3359912960

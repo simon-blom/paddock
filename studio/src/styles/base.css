@@ -1,6 +1,8 @@
 /* Paddock Studio - Base Styles
    Built on the TrueSpar Design System. */
 @import './variables.css';
+@import './viewer-theme.css';
+@import './viewer-overlays.css';
 
 *, *::before, *::after {
   box-sizing: border-box;

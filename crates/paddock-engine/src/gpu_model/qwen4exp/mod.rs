@@ -210,6 +210,32 @@ pub enum DensePlane {
         in_dim: usize,
         out_dim: usize,
     },
+    /// MXFP8 (OCP microscaling) straight off the checkpoint: e4m3 payload
+    /// with one ue8m0 scale per 32 values along K, out-row-major. This is not
+    /// a class we elect - it is what the file is, so it is detected at load
+    /// and there is no bf16 to fall back to.
+    ///
+    /// Byte passthrough, deliberately. `RepackedMxfp4 {data, scale}` is bit
+    /// for bit what a `weight` / `weight_scale` pair holds
+    /// (`weight_block_size [1, 32]` -> scale cols = in_dim/32; measured on
+    /// Mia's export: in_proj_qkv weight [10240, 2560] with scale [10240, 80],
+    /// out_proj [2560, 6144] with [2560, 192]), and `f8_gemv_at_off` already
+    /// documents that layout as "data += row_off*in, scale += row_off*in/32".
+    /// So the checkpoint's own bytes reach the kernel unconverted: no
+    /// dequant, no requant, no precision lost to a round trip through f32,
+    /// and no load-time conversion pass to pay for.
+    ///
+    /// Why this matters for the lane: a recipe that quantizes only the routed
+    /// experts leaves ~6.8 GB of bf16 dense to read per token (NVIDIA's
+    /// export, measured 2026-09-20), which is a hard ~30 tok/s roof on a
+    /// 273 GB/s die. An MX recipe quantizes the attention / GDN / shared
+    /// planes too, which is the whole gap between the published 21.7-29.0 and
+    /// 48.7 tok/s on this family.
+    Mxf8 {
+        plane: crate::gpu::RepackedMxfp4,
+        in_dim: usize,
+        out_dim: usize,
+    },
     /// GGUF k-quant / Q8_0 plane (the Unsloth exports): the repacked
     /// streams the qwen35 dense lanes read - fused GEMV at batch 1, the
     /// int8 dp4a GEMM above it (activations quantized per 32). Exact int
@@ -241,6 +267,12 @@ pub struct DenseStage {
     pub xrow: Option<CudaSlice<f32>>,
     pub yrow: Option<CudaSlice<f32>>,
     pub q: cudarc::driver::CudaSlice<i8>,
+    /// The MXFP8 activation pair: raw e4m3 bytes over an i8 plane plus its
+    /// ue8m0 per-32 scales, which is what the block-scale MMA reads. Only the
+    /// wide arm stages anything - the gemv and its 2..16 twin take f32
+    /// straight in, so a decode tick never touches these.
+    pub xq8: cudarc::driver::CudaSlice<i8>,
+    pub xs8: cudarc::driver::CudaSlice<u8>,
     pub rs: CudaSlice<f32>,
     /// `Kq` class only: per-32 activation scales for `q` (`quantize_q8`),
     /// the per-16 int sums the Q4/Q5 min term reads, and the split-K
@@ -600,6 +632,116 @@ pub(crate) fn moe_grp_enabled() -> bool {
         !matches!(
             std::env::var("PADDOCK_Q38FN_MOE_GRP").ok().as_deref(),
             Some("0") | Some("off")
+        )
+    })
+}
+
+/// A/B arm for the MXFP8 dense decode band: route batch 1 through the K-split
+/// block-scale MMA (`f8_gemm_mma_ks`) instead of the row-per-block GEMV.
+/// `PADDOCK_Q38FN_MXF8_KS=1`.
+///
+/// Asked because the GEMV grids one block per output row, which is the shape
+/// the dense doctrine has already convicted on this die for bf16 (TGV's
+/// 64-row tiles grid 160 CTAs on a 148-SM part and lose two waves of latency
+/// to one wave of work). Measured on Mia's MXFP8 export: the 1-row forward
+/// runs 44.5 ms against a 24.0 ms byte floor - 54% of bus - and the dense
+/// planes are 4.14 GB of the 6.56 GB a token reads, so they are where that
+/// deficit lives if it is a kernel-shape problem at all.
+///
+/// Off until it is elected in serving. The two arms are the same numbers by
+/// construction, so this is a cost question, and this family has burned an
+/// election taken from the wrong harness before (`spec_depth_cap`).
+pub(crate) fn mxf8_ks_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("PADDOCK_Q38FN_MXF8_KS").ok().as_deref(),
+            Some("1") | Some("on")
+        )
+    })
+}
+
+/// Lowest token-batch that takes the NVFP4 W4A4 routed pair (slot 631 + 408)
+/// instead of the W4A16 GEMV. `PADDOCK_Q38FN_NVF4_BS_MIN=<n>`, default 32.
+///
+/// A width gate, not a quality one: the bs pair is BM=32 TOKEN COLUMNS, so a
+/// decode-width routing leaves a 32-wide block ~7.5% live (measured for the
+/// _st arm) and the GEMV keeps that band until the BM=8 tiled twin lands. The
+/// class change it does make is real and deliberate - W4A16 f32 activations
+/// to W4A4 - and it is what modelopt's `group_nvfp4_routed_experts` declares
+/// the export was quantized for.
+pub(crate) fn nvf4_bs_min_rows() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PADDOCK_Q38FN_NVF4_BS_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// Lowest batch that takes the block-scale MMA instead of the batched GEMV.
+/// `PADDOCK_Q38FN_MXF8_MMA_MIN=<n>`, default 17 (i.e. the GEMV owns 2..=16,
+/// which is all it is willing to serve).
+///
+/// This is the band the speculative verify runs in - a depth-3 round walks
+/// n=4 - and the per-phase decode census says it is where this lane's deficit
+/// lives: on Mia's MXFP8 export a 4-row walk spends 19.20 ms in GDN and 7.29
+/// in attention, ~108 and ~82 GB/s against the MoE's 193 and the lm_head's
+/// 234 on the same walk. Those two phases are exactly the MXFP8 dense planes,
+/// so the question is whether the GEMV or the MMA owns 2..=16 - and the first
+/// cut of that A/B answered nothing because it was gated on batch == 1, a
+/// width the verify never uses.
+pub(crate) fn mxf8_mma_min() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PADDOCK_Q38FN_MXF8_MMA_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n >= 2)
+            .unwrap_or(17)
+    })
+}
+
+/// A/B override for the elected speculative depth cap (`spec_depth_cap`),
+/// `PADDOCK_Q38FN_SPEC_DEPTH=<n>`. Exists because that cap can only be elected
+/// in serving on this family - the bare draft+verify harness inverts the
+/// ordering, and an earlier cut of the election shipped depth 1 on the
+/// harness's answer. Unset keeps the elected value.
+pub(crate) fn spec_depth_override() -> Option<usize> {
+    use std::sync::OnceLock;
+    static D: OnceLock<Option<usize>> = OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("PADDOCK_Q38FN_SPEC_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 16)
+    })
+}
+
+/// Opt-in: take the expert-grouped MoE arm at decode widths too, where the
+/// rows are a speculative verify batch (K+1 consecutive positions of one
+/// sentence) rather than unrelated tokens. `PADDOCK_Q38FN_MOE_GRP_DEC=1`.
+///
+/// Off by default until it is elected in serving - the grouped and pair
+/// kernels are bit-identical, so this is purely a cost question, and this
+/// family has already burned one election that was taken from a harness whose
+/// ordering inverts the serving one (see `spec_depth_cap`). What the routing
+/// census measured (2026-09-19, syn_128x128_c1, 23040 launches): the n 2..=8
+/// band routes 35.5 rows to 26.3 distinct experts, so 26.0% of the pair
+/// kernel's weight-window unpacks are repeats against a 2.5% chance baseline.
+/// Whether collecting that beats the grouped arm's launch shape is what the
+/// A/B answers.
+pub(crate) fn moe_grp_decode_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("PADDOCK_Q38FN_MOE_GRP_DEC").ok().as_deref(),
+            Some("1") | Some("on")
         )
     })
 }
@@ -1040,7 +1182,7 @@ impl DensePlane {
 
     /// The > 64-row Q8_0 pipe rung off `yq` rows already in the mmq layout for
     /// the whole walk (one group padded to 128 rows - what
-    /// `q4x_combine_norm_q8mmq` emits for the hyper-connection down), as ONE
+    /// `q4x_combine_norm_q8mmq` emits for the hyper-connection down), as one
     /// launch. On a 320-wide plane the 128x128 pipe tiles do not fill a
     /// 48-SM die, so one launch over every row costs what a 512-row chunk
     /// does (`bench/hcdown_gb10_bench.cu`: 155 us at 512 and at 1024 rows,
@@ -1073,7 +1215,7 @@ impl DensePlane {
         Ok(true)
     }
 
-    /// A hyper-connection UP plane ([lowrank -> hc * hidden] Q8_0) and its
+    /// A hyper-connection up plane ([lowrank -> hc * hidden] Q8_0) and its
     /// gated mix in one launch a chunk (slot 605): `out[rows][hidden]` is what
     /// [`Self::matmul`] into a gate plane followed by `q4x_hc_mix(xn, gate)`
     /// writes, byte for byte, but the [rows][hc * hidden] gate plane never
@@ -1129,9 +1271,9 @@ impl DensePlane {
     }
 
     /// Whether [`Self::matmul_hcmix_rn`] takes this plane at `batch` rows: the
-    /// [`Self::matmul_hcmix`] rung in ONE launch (the rebuild's 1/rms tail is
+    /// [`Self::matmul_hcmix`] rung in one launch (the rebuild's 1/rms tail is
     /// indexed from row 0) with the pack's rebuild slots present. A combine
-    /// reads this BEFORE it decides not to store the normalized state, so a
+    /// reads this before it decides not to store the normalized state, so a
     /// reader that would decline never meets a state that is not there.
     pub fn takes_hcmix_rn(
         &self,
@@ -1218,7 +1360,7 @@ impl DensePlane {
             } => {
                 // low-M cluster arm (slot 543): decode-band widths on the f16
                 // twin; declines by shape and falls through to the ladder.
-                // WINNER SHAPES only (probe round 4b): sh-down class
+                // Winner shapes only (probe round 4b): sh-down class
                 // (in=640) 7.6 vs 10, z class (in=2560, out<=6144) 12.7 vs
                 // 13.5; the wide-out and deep-K planes stay on their bands.
                 let lowm_win = (*in_dim == 640) || (*in_dim == 2560 && *out_dim <= 6144);
@@ -1259,6 +1401,62 @@ impl DensePlane {
                 // a plane read of tens of MB.
                 e.convert_f32_f16(x, &mut stage.x16, batch * *in_dim)?;
                 e.f16_gemm(w, &stage.x16, y, *in_dim, *out_dim, batch, 0.0)
+            }
+            DensePlane::Mxf8 {
+                plane,
+                in_dim,
+                out_dim,
+            } => {
+                dense_site(
+                    site,
+                    *in_dim,
+                    *out_dim,
+                    batch,
+                    if batch == 1 {
+                        "f8_gemv_at(MXFP8)"
+                    } else {
+                        "f8_gemm_w8(MXFP8)"
+                    },
+                );
+                // Both arms eat f32 activations directly, so this class adds
+                // no staging launch at any width - the same property that got
+                // f8row elected first on a launch-sensitive tick.
+                //
+                // The wide-prefill twin (`f8_gemm_w8*`, the block-scale MMA)
+                // is deliberately not wired yet: it wants an e4m3/ue8m0
+                // activation pair and a row-offset scale, and electing it
+                // without measuring which width it wins at is exactly the
+                // mistake the f16 class already paid for here (blanket f16
+                // lost the decode rungs). Measure, then elect.
+                match batch {
+                    1 if mxf8_ks_on() => {
+                        e.quantize_e4m3(x, &mut stage.xq8, &mut stage.xs8, *in_dim)?;
+                        e.f8_gemm_mma_ks(
+                            plane,
+                            &stage.xq8,
+                            &stage.xs8,
+                            &mut stage.sk_part,
+                            y,
+                            *in_dim,
+                            *out_dim,
+                            1,
+                        )
+                    }
+                    1 => e.f8_gemv_at(plane, x, y, 0, *in_dim, *out_dim),
+                    // the batched gemv is a 2..16-row kernel and refuses
+                    // above that (cudaErrorInvalidValue) - a prefill wave is
+                    // hundreds of rows, so the wide arm is not optional here,
+                    // it is the difference between serving and not
+                    b if b < mxf8_mma_min() && b <= 16 => {
+                        e.f8_gemv_batch(plane, x, y, *in_dim, *out_dim, batch)
+                    }
+                    _ => {
+                        e.quantize_e4m3(x, &mut stage.xq8, &mut stage.xs8, batch * *in_dim)?;
+                        e.f8_gemm_w8(
+                            plane, 0, &stage.xq8, &stage.xs8, y, *in_dim, *out_dim, batch,
+                        )
+                    }
+                }
             }
             DensePlane::F8Row {
                 plane,
@@ -1337,8 +1535,13 @@ impl DensePlane {
                 e.bf16_gemm_2seg(w, x, ya, yb, oq, ob, batch)
             }
             // no f16 twin of the segmented store; the caller's two-call
-            // fallback is correct and each half still rides the tc5 GEMM
-            DensePlane::F16 { .. } | DensePlane::F8Row { .. } | DensePlane::Kq { .. } => Ok(false),
+            // fallback is correct and each half still rides the tc5 GEMM.
+            // Same for MXFP8: the 2-segment store has no block-scale twin, and
+            // the two-call fallback costs one extra launch, not a re-read.
+            DensePlane::F16 { .. }
+            | DensePlane::F8Row { .. }
+            | DensePlane::Mxf8 { .. }
+            | DensePlane::Kq { .. } => Ok(false),
         }
     }
 
@@ -1387,9 +1590,19 @@ impl DensePlane {
                 e.convert_f32_f16(x, &mut stage.x16, batch * *in_dim)?;
                 e.f16_gemm_rows(w, first_row, *in_dim, out_dim, &stage.x16, y, batch)
             }
-            DensePlane::F8Row { .. } | DensePlane::Kq { .. } => Err(GpuError::Unsupported(
-                "matmul_rows: the 8-bit and k-quant dense classes hold no folded planes".into(),
-            )),
+            // out-row-major, so a row segment is pointer math on both the
+            // payload and the scale plane (data += row_off*in, scale +=
+            // row_off*in/32) - `f8_gemv_at_off` is exactly that. Only at
+            // batch 1: the batched GEMV takes no row offset, and faking one
+            // by slicing would copy the plane.
+            DensePlane::Mxf8 { plane, in_dim, .. } if batch == 1 => {
+                e.f8_gemv_at_off(plane, first_row, x, y, 0, *in_dim, out_dim)
+            }
+            DensePlane::F8Row { .. } | DensePlane::Mxf8 { .. } | DensePlane::Kq { .. } => {
+                Err(GpuError::Unsupported(
+                    "matmul_rows: the 8-bit and k-quant dense classes hold no folded planes".into(),
+                ))
+            }
         }
     }
 
@@ -1399,7 +1612,10 @@ impl DensePlane {
     pub fn raw_bf16(&self) -> Option<&CudaSlice<u8>> {
         match self {
             DensePlane::Bf16(w) | DensePlane::Dual { w, .. } => Some(&w.bytes),
-            DensePlane::F16 { .. } | DensePlane::F8Row { .. } | DensePlane::Kq { .. } => None,
+            DensePlane::F16 { .. }
+            | DensePlane::F8Row { .. }
+            | DensePlane::Mxf8 { .. }
+            | DensePlane::Kq { .. } => None,
         }
     }
 
@@ -1416,6 +1632,10 @@ impl DensePlane {
             DensePlane::F8Row {
                 in_dim, out_dim, ..
             } => in_dim * out_dim + out_dim * 4,
+            // e4m3 payload + one ue8m0 scale byte per 32 values
+            DensePlane::Mxf8 {
+                in_dim, out_dim, ..
+            } => in_dim * out_dim + in_dim * out_dim / 32,
             DensePlane::Kq { w, .. } => w.bytes() as usize,
         }
     }
@@ -1427,6 +1647,7 @@ impl DensePlane {
             DensePlane::Dual { .. } => "bf16+f16",
             DensePlane::F16 { .. } => "f16",
             DensePlane::F8Row { .. } => "f8row",
+            DensePlane::Mxf8 { .. } => "mxfp8",
             DensePlane::Kq { .. } => "kq",
         }
     }
@@ -1955,7 +2176,11 @@ pub struct AttnW {
     pub q_norm: DeviceTensor,
     pub k_norm: DeviceTensor,
     /// indexer.index_qk_proj [640, hidden] bf16 (rows: q 4x128 | k 1x128)
-    pub idx_qk: QuantTensor,
+    /// The QSA indexer's fused q|k projection. A `DensePlane`, not a raw
+    /// bf16 tensor: it is whatever class the checkpoint ships it in (bf16 on
+    /// the GGUF and NVIDIA exports, MXFP8 on an MX-quantized one), and
+    /// pinning it to bf16 refused a file whose every other plane loads.
+    pub idx_qk: DensePlane,
     /// indexer per-head RMSNorms [128] f32
     pub idx_q_norm: DeviceTensor,
     pub idx_k_norm: DeviceTensor,

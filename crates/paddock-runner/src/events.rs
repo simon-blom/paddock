@@ -251,6 +251,17 @@ impl EventScope {
         });
     }
 
+    /// Public response timing, with no event metadata or credentials. Totals
+    /// span all engine rounds, excluding tool execution and transport flushes.
+    pub fn response_timing(&self) -> Option<serde_json::Value> {
+        let c = self.0.as_ref()?.lock().ok()?;
+        Some(serde_json::json!({
+            "source": "engine", "version": 1,
+            "queue_ms": c.queue_ms?, "prefill_ms": c.prefill_ms?,
+            "decode_ms": c.decode_ms?,
+        }))
+    }
+
     fn take(&self) -> Cells {
         match &self.0 {
             Some(c) => c
@@ -733,6 +744,7 @@ mod tests {
         let scope = EventScope::live();
         // two agent rounds: durations/spec sum, kv_pages keeps the max
         scope.phases(&paddock_engine::service::RunStats {
+            sampled_stop: false,
             queued_ms: 5,
             prefill_ms: 100,
             decode_ms: 900,
@@ -741,6 +753,7 @@ mod tests {
             kv_pages: 12,
         });
         scope.phases(&paddock_engine::service::RunStats {
+            sampled_stop: false,
             queued_ms: 1,
             prefill_ms: 20,
             decode_ms: 400,
@@ -748,6 +761,13 @@ mod tests {
             spec_accepted: 8,
             kv_pages: 9,
         });
+        let timing = scope.response_timing().unwrap();
+        assert_eq!(
+            timing,
+            serde_json::json!({
+                "source":"engine", "version":1, "queue_ms":6, "prefill_ms":120, "decode_ms":1300
+            })
+        );
         let p = Pending {
             ring: ring.clone(),
             metrics: crate::metrics::Metrics::disabled(),
@@ -784,6 +804,7 @@ mod tests {
         let scope = EventScope::live();
         // a request that never rode spec on the serial (non-paged) engine
         scope.phases(&paddock_engine::service::RunStats {
+            sampled_stop: false,
             queued_ms: 0,
             prefill_ms: 10,
             decode_ms: 50,

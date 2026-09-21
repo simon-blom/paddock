@@ -66,6 +66,23 @@ fn plain_chat_renders_with_granite_role_markers() {
 }
 
 #[test]
+fn multimodal_content_does_not_acquire_string_branch_indentation() {
+    // IBM's string branch intentionally emits eight spaces; its content-array
+    // branch does not. Flattening an image message before rendering changes
+    // model inputs even when all image markers and row counts remain intact.
+    let plain = render(json!([{"role": "user", "content": "Hello"}]), None);
+    assert!(plain.contains("<|start_of_role|>user<|end_of_role|>        Hello"));
+    let parts = render(
+        json!([{"role": "user", "content": [
+            {"type": "text", "text": "Hello"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+        ]}]),
+        None,
+    );
+    assert!(parts.contains("<|start_of_role|>user<|end_of_role|>Hello<image>\n"));
+}
+
+#[test]
 fn an_explicit_system_message_replaces_the_default() {
     let out = render(
         json!([

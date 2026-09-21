@@ -117,6 +117,10 @@ export function useLiveTurn() {
       createdAt: Date.now(),
     })
     const gid = uid()
+    // Every lane is a sibling under this user turn. addMessage's default
+    // follows the current tip, which would nest lane 2 under lane 1 and hide
+    // it when the active tree expands the comparison's sibling group.
+    const parent = user.id
     turns = lanes.map((l) =>
       chat.addMessage(c, {
         id: uid(),
@@ -135,7 +139,7 @@ export function useLiveTurn() {
         transcript: {},
         run: { model: l.model, params: { ...c.params, maxTokens: null }, tools: [], at: Date.now() },
         createdAt: Date.now(),
-      }),
+      }, parent),
     )
     return true
   }

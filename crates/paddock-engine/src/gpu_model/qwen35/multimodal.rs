@@ -393,6 +393,7 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let bs_f8ffn_p = &self.bs_f8ffn;
         let bs_f8row_p = &self.bs_f8row_ffn;
         // PROJECTION e4m3 planes. This walk had no w8 arm at all -- every image
@@ -407,7 +408,7 @@ impl GpuQwen35 {
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_mut().expect("decode");
 
-        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r)?;
+        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
         // inject each image's embeddings over its placeholder rows
         for (k, &(off, n)) in splices.iter().enumerate() {
             exec.copy_region(&images[k].embd, 0, &mut sc.d_x, off * embd, n * embd)?;
@@ -421,7 +422,7 @@ impl GpuQwen35 {
             // Without it the e4m3 projections would read an unwritten buffer.
             let lw8 = bs_w8_all.get(li).filter(|_| r > w8_min);
             let keep_xn = matches!(&layer.mixer, Mixer::Linear(_)) || lw8.is_some();
-            prefill_add_norm_quant(
+            prefill_add_norm_quant_rot(
                 &exec,
                 &mut sc.d_x,
                 None,
@@ -435,6 +436,7 @@ impl GpuQwen35 {
                 embd,
                 r,
                 eps,
+                rot,
             )?;
             match &layer.mixer {
                 Mixer::Full(w) => {
@@ -618,6 +620,7 @@ impl GpuQwen35 {
                         )?;
                     } else {
                         super::stub_guard(&w.wo, "multimodal.rs vision wo")?;
+                        rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, r)?;
                         prefill_mm_any(
                             &exec,
                             &w.wo,
@@ -832,6 +835,12 @@ impl GpuQwen35 {
                         )?;
                     } else {
                         super::stub_guard(&w.out_w, "multimodal.rs vision out_w")?;
+                        // rotated-basis model: ssm_out reads the regrouped + rotated rows,
+                        // landed in d_dattn (free once the gated norm has consumed it)
+                        if let Some(rt) = rot {
+                            let vd = n_v_heads * state_size;
+                            rt.rotate_ssm_out(&exec, &sc.d_core, &mut sc.d_dattn, vd, r)?;
+                        }
                         prefill_mm_any(
                             &exec,
                             &w.out_w,
@@ -841,7 +850,11 @@ impl GpuQwen35 {
                             &mut sc.d_xsums,
                             &mut sc.d_ssums,
                             &mut sc.d_skfix,
-                            &sc.d_core,
+                            if rot.is_some() {
+                                &sc.d_dattn
+                            } else {
+                                &sc.d_core
+                            },
                             &mut sc.d_proj,
                             r,
                         )?;
@@ -869,7 +882,7 @@ impl GpuQwen35 {
                             && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
                     });
                     let f8r = bs_f8row_p.get(li).and_then(|o| o.as_ref());
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -883,6 +896,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     if let Some(p) = f8r {
                         super::ops::ffn_f8row_rows(
@@ -1024,7 +1038,7 @@ impl GpuQwen35 {
                             &mut sc.d_ffn_up,
                             r,
                         )?;
-                        prefill_ffn_down_any(
+                        prefill_ffn_down_rot(
                             &exec,
                             down,
                             &mut sc.d_pxq,
@@ -1038,13 +1052,14 @@ impl GpuQwen35 {
                             &mut sc.d_proj,
                             ff,
                             r,
+                            rot,
                         )?;
                     }
                 }
                 Ffn::Nvf4Dense { gu, down } => {
                     // off the f32 xn (write_xn=true; int8 staging unused) -
                     // the chain takes the W4A4 arm above the row band
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -1058,6 +1073,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     nvf4_ffn(
                         &exec,
@@ -1079,7 +1095,7 @@ impl GpuQwen35 {
                 }
                 Ffn::Moe(w) => {
                     // MoE needs the f32 xn (router + shared expert)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -1093,6 +1109,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     moe_ffn(
                         &exec,
@@ -1138,6 +1155,9 @@ impl GpuQwen35 {
 
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
+        // rotated-basis model: the head reads the rotated row; d_h stays in
+        // the model's basis for whoever reads it after the pass
+        rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         if let Some(p) = super::head_f8(self.out_f8.as_ref(), 1) {
             // f8 head - the Q8_0 twin is dropped at load (REPLACE lane)
             super::head_f8_gemm(

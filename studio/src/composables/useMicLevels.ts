@@ -69,6 +69,7 @@ export function createLevelMeter(bandCount: number) {
   // take the SharedArrayBuffer-capable default type.
   let bins: Uint8Array<ArrayBuffer> | null = null
   let raf = 0
+  let frameDriven = true
   /** Precomputed [start, end) bin index and gain per band - the frequency
    *  maths depends only on the context's sample rate, so it is done once per
    *  attach rather than sixty times a second. */
@@ -123,7 +124,7 @@ export function createLevelMeter(bandCount: number) {
       return
     }
     read(now)
-    raf = requestAnimationFrame(pump)
+    raf = frameDriven ? requestAnimationFrame(pump) : 0
   }
 
   const meter = {
@@ -131,6 +132,14 @@ export function createLevelMeter(bandCount: number) {
      *  which is what a caller renders nothing from - an empty meter and a
      *  silent one must not look the same. */
     levels: readonly(bars),
+    /** Native chrome has its own bounded projection clock. It must not depend
+     * on animation frames in a document viewer that can be covered or folded. */
+    sample(): void { read(performance.now()) },
+    setFrameDriven(enabled: boolean): void {
+      frameDriven = enabled
+      if (raf) cancelAnimationFrame(raf)
+      raf = enabled && node ? requestAnimationFrame(pump) : 0
+    },
     /** Tap a live graph. `src` is whatever the caller already built; the
      *  analyser hangs off it and connects to nothing further, so this cannot
      *  route audio anywhere it was not already going.
@@ -155,7 +164,7 @@ export function createLevelMeter(bandCount: number) {
         bins = new Uint8Array(an.frequencyBinCount)
         plan()
         last = 0
-        raf = requestAnimationFrame(pump)
+        raf = frameDriven ? requestAnimationFrame(pump) : 0
       } catch {
         meter.detach()
       }

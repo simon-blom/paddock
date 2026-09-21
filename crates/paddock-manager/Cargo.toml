@@ -23,6 +23,7 @@ name = "paddock"
 path = "src/main.rs"
 
 [dependencies]
+zeroize = "1.9.0"
 axum = { workspace = true, features = ["ws"] }
 # The box's own https identity and the one-port listener that serves both
 # schemes. Its own crate rather than a module here, because the
@@ -98,13 +99,13 @@ schemars = "1"
 paddock-admin = { version = "0.1.0", path = "../paddock-admin" }
 toml_edit = "0.25.13"
 base64.workspace = true
+tempfile = "3"
 
 [dev-dependencies]
 # start_paused tests (graph.rs wedged-tab timeout) need tokio's virtual clock
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
-tempfile = "3"
 
 [target."cfg(windows)".dependencies]
 # Per-runner Job Objects (doc §11.4): create + assign + duplicate-into-runner.
@@ -112,6 +113,11 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Hardware-only readiness probe; no engine/inference dependency in the manager.
+objc2-metal = "0.3.2"
+security-framework = "3.7.0"
 
 [target."cfg(windows)".build-dependencies]
 # VERSIONINFO + the .ico, so the exe says who it is. See build.rs.

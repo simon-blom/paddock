@@ -1,9 +1,7 @@
-//! Encoder serving seam: a dedicated thread owning a `GpuQwen3` dense encoder,
-//! processing embedding / rerank jobs request-response (no streaming, no
-//! continuous batching - the batch is the request's input array, run in one
-//! weight-amortized prefill). Mirrors `Engine::spawn`'s thread-owns-the-CUDA-
-//! context pattern, but the job is a single forward with a oneshot reply, so
-//! an async handler can await it without blocking the runtime.
+//! Shared retrieval scheduler: a dedicated thread owns a native GPU backend.
+//! Same-kind requests coalesce into ragged batches, with bounded enqueue-ahead
+//! and per-request result slicing. Backend events and GPU heads stay behind the
+//! executor contract, so HTTP handlers never depend on CUDA or Metal details.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -11,8 +9,11 @@ use std::sync::mpsc::{Sender, channel};
 
 use tokio::sync::oneshot;
 
-use crate::gpu_model::qwen3::{GpuQwen3, PendingPooled};
+mod backend;
 use crate::metrics::EngineMetrics;
+pub use backend::EncoderBackend;
+#[cfg(test)]
+mod tests;
 
 /// What an encode job asks the model for.
 pub enum EncodeJob {
@@ -64,10 +65,11 @@ pub enum EncodeJob {
     },
 }
 
-/// Handle to an encoder running on its own CUDA thread.
+/// Handle to an encoder running on its own device-owning thread.
 #[derive(Clone)]
 pub struct Encoder {
     tx: Sender<EncodeJob>,
+    block_scale_calibration: bool,
 }
 
 impl Encoder {
@@ -80,19 +82,20 @@ impl Encoder {
     /// memory breakdown was blank. Only the memory counters are meaningful
     /// here: an encoder generates no tokens, so tok/s and phase stay at their
     /// (true) zero.
-    pub fn spawn<F>(build: F, metrics: Option<Arc<EngineMetrics>>) -> Result<Self, String>
+    pub fn spawn<F, B>(build: F, metrics: Option<Arc<EngineMetrics>>) -> Result<Self, String>
     where
-        F: FnOnce() -> Result<GpuQwen3, String> + Send + 'static,
+        F: FnOnce() -> Result<B, String> + Send + 'static,
+        B: EncoderBackend + 'static,
     {
         let (tx, rx) = channel::<EncodeJob>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        let (ready_tx, ready_rx) = channel::<Result<bool, String>>();
 
         std::thread::Builder::new()
             .name("paddock-encoder".into())
             .spawn(move || {
                 let mut model = match build() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(m.block_scale_calibration()));
                         m
                     }
                     Err(e) => {
@@ -103,7 +106,7 @@ impl Encoder {
                 // Re-read after every plane-mutating job, not just after load:
                 // the startup calibration re-quantizes to a different class
                 // and the weight total moves with it.
-                let stamp = |m: &GpuQwen3| {
+                let stamp = |m: &B| {
                     if let Some(mt) = metrics.as_deref() {
                         if let Some(b) = m.weights_mem_bytes() {
                             mt.weights_mem_bytes.store(b, Relaxed);
@@ -157,19 +160,19 @@ impl Encoder {
 
                 // A submitted-but-uncollected batch: the pending GPU work
                 // plus each merged request's sequence count and reply slot.
-                enum Inflight {
+                enum Inflight<P> {
                     Embed(
-                        PendingPooled,
+                        P,
                         Vec<(usize, oneshot::Sender<Result<Vec<Vec<f32>>, String>>)>,
                     ),
                     Rerank(
-                        PendingPooled,
+                        P,
                         u32,
                         u32,
                         Vec<(usize, oneshot::Sender<Result<Vec<f32>, String>>)>,
                     ),
                 }
-                let collect = |model: &mut GpuQwen3, inf: Inflight| match inf {
+                let collect = |model: &mut B, inf: Inflight<B::Pending>| match inf {
                     Inflight::Embed(p, parts) => match model.embed_collect(&p) {
                         Ok(mut vecs) => {
                             for (n, reply) in parts {
@@ -201,7 +204,7 @@ impl Encoder {
                         }
                     }
                 };
-                let ready = |model: &GpuQwen3, inf: &Inflight| match inf {
+                let ready = |model: &B, inf: &Inflight<B::Pending>| match inf {
                     Inflight::Embed(p, _) | Inflight::Rerank(p, _, _, _) => model.pool_ready(p),
                 };
 
@@ -213,9 +216,10 @@ impl Encoder {
                 // uncollected batches per lane, collected FIFO.
                 let lanes = model.lanes();
                 let trace = paddock_models::dev_var_os!("PADDOCK_TRACE_BATCH").is_some();
-                let cap = 2 * lanes;
+                let cap = model.inflight_capacity();
+                assert!(lanes > 0 && cap >= lanes);
                 let mut lane_seq = 0usize;
-                let mut inflight: std::collections::VecDeque<Inflight> =
+                let mut inflight: std::collections::VecDeque<Inflight<B::Pending>> =
                     std::collections::VecDeque::new();
                 loop {
                     // Opportunistically flush finished batches so replies
@@ -260,6 +264,13 @@ impl Encoder {
                     };
                     match job {
                         EncodeJob::Embed { seqs, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(e) = model.validate(&seqs) {
+                                let _ = reply.send(Err(e));
+                                continue;
+                            }
                             let mut parts = vec![(seqs, reply)];
                             let mut rows: usize = parts[0].0.iter().map(Vec::len).sum();
                             // Merge window: with a batch in flight, waiting
@@ -295,6 +306,18 @@ impl Encoder {
                                 };
                                 match got {
                                     Some(EncodeJob::Embed { seqs, reply }) => {
+                                        if reply.is_closed() {
+                                            continue;
+                                        }
+                                        if let Err(e) = model.validate(&seqs) {
+                                            let _ = reply.send(Err(e));
+                                            continue;
+                                        }
+                                        let extra = seqs.iter().map(Vec::len).sum::<usize>();
+                                        if extra > coalesce_row_budget.saturating_sub(rows) {
+                                            pending.push_back(EncodeJob::Embed { seqs, reply });
+                                            break;
+                                        }
                                         rows += seqs.iter().map(Vec::len).sum::<usize>();
                                         parts.push((seqs, reply));
                                     }
@@ -372,6 +395,13 @@ impl Encoder {
                             no,
                             reply,
                         } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(e) = model.validate(&seqs) {
+                                let _ = reply.send(Err(e));
+                                continue;
+                            }
                             let mut parts = vec![(seqs, reply)];
                             let mut rows: usize = parts[0].0.iter().map(Vec::len).sum();
                             // same free-while-busy merge window as the embed arm
@@ -409,6 +439,23 @@ impl Encoder {
                                         no: n2,
                                         reply,
                                     }) if (y2, n2) == (yes, no) => {
+                                        if reply.is_closed() {
+                                            continue;
+                                        }
+                                        if let Err(e) = model.validate(&seqs) {
+                                            let _ = reply.send(Err(e));
+                                            continue;
+                                        }
+                                        let extra = seqs.iter().map(Vec::len).sum::<usize>();
+                                        if extra > coalesce_row_budget.saturating_sub(rows) {
+                                            pending.push_back(EncodeJob::Rerank {
+                                                seqs,
+                                                yes,
+                                                no,
+                                                reply,
+                                            });
+                                            break;
+                                        }
                                         rows += seqs.iter().map(Vec::len).sum::<usize>();
                                         parts.push((seqs, reply));
                                     }
@@ -556,10 +603,18 @@ impl Encoder {
             .map_err(|e| format!("failed to spawn encoder thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Ok(block_scale_calibration)) => Ok(Self {
+                tx,
+                block_scale_calibration,
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("encoder thread died during startup".into()),
         }
+    }
+
+    /// Device-specific quality calibration is not a generic encoder feature.
+    pub fn block_scale_calibration(&self) -> bool {
+        self.block_scale_calibration
     }
 
     /// Embed a batch of tokenized sequences in one weight-amortized pass.

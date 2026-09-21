@@ -1,3 +1,4 @@
 @truespar/traverse-wasm 0.8.5 single-threaded
-traverse f0240c5
-vendored 2026-08-21 by scripts/vendor-traverse-wasm.ps1
+traverse 4d3c722308c07b2ce99035fd6b7907f57148884f
+source SHA256 634d81bfb421962671f65f649ee3702f56af836396dfbdb1f35e51b157968d11
+vendored by scripts/vendor-traverse-wasm.mjs

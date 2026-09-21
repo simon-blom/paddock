@@ -13,8 +13,16 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod connections;
+mod downloads;
+mod integrations;
+mod prompts;
+
 pub struct Store {
     conn: Mutex<Connection>,
+    cloud_credentials: crate::credentials::Session,
+    connector_credentials: crate::credentials::Session,
+    connector_credential_updates: std::sync::Mutex<()>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +31,8 @@ pub enum StoreError {
     Db(#[from] rusqlite::Error),
     #[error("invalid data: {0}")]
     Bad(String),
+    #[error("{0}")]
+    Conflict(String),
 }
 
 /// Default DB path: `<data root>/paddock.db`, alongside the models dir
@@ -779,6 +789,8 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        downloads::migrate(&conn)?;
+        connections::migrate(&conn)?;
         // Hygiene migration: MODEL configuration must never live
         // in this database - it is each endpoint's servers/<port>.toml,
         // entirely. Older schemas kept an mcp_servers table and a
@@ -807,6 +819,7 @@ impl Store {
             "ALTER TABLE connectors ADD COLUMN oauth TEXT NOT NULL DEFAULT ''",
             [],
         );
+        integrations::migrate(&conn)?;
         // cloud_usage.audio_seconds arrived with cloud transcription -
         // same harmless-error ALTER as the ones above.
         let _ = conn.execute("ALTER TABLE cloud_usage ADD COLUMN audio_seconds REAL", []);
@@ -939,6 +952,9 @@ impl Store {
         }
         Ok(Store {
             conn: Mutex::new(conn),
+            cloud_credentials: Default::default(),
+            connector_credentials: Default::default(),
+            connector_credential_updates: Default::default(),
         })
     }
 
@@ -1464,8 +1480,21 @@ impl Store {
         op: &str,
         content: &str,
     ) -> Result<i64, StoreError> {
+        self.append_artifact_version_if_current(id, op, content, None)
+    }
+
+    /// Check the editor's revision and append under one database transaction.
+    /// A model update between the editor's GET and PUT must not be overwritten.
+    pub fn append_artifact_version_if_current(
+        &self,
+        id: &str,
+        op: &str,
+        content: &str,
+        expected: Option<i64>,
+    ) -> Result<i64, StoreError> {
         let now = now_ms();
-        let conn = self.lock();
+        let mut guard = self.lock();
+        let conn = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let cur: Option<(i64, String)> = conn
             .query_row(
                 "SELECT seq, content FROM artifact_versions
@@ -1477,6 +1506,9 @@ impl Store {
         let Some((seq, prev)) = cur else {
             return Err(StoreError::Bad(format!("no such artifact: {id}")));
         };
+        if expected.is_some_and(|expected| expected != seq) {
+            return Err(StoreError::Conflict("The artifact changed while you edited it. Your draft is retained; review the latest version before saving.".into()));
+        }
         if prev == content {
             return Ok(seq);
         }
@@ -1490,6 +1522,7 @@ impl Store {
             "UPDATE artifacts SET updated_at = ?2 WHERE id = ?1",
             params![id, now],
         )?;
+        conn.commit()?;
         Ok(next)
     }
 
@@ -1550,61 +1583,6 @@ impl Store {
             )
             .optional()?;
         Ok(row)
-    }
-
-    // ── prompts ──────────────────────────────────────────────────────────────
-
-    pub fn list_prompts(&self) -> Result<Vec<Value>, StoreError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, body, variables, created_at, updated_at
-             FROM prompts ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let vars: String = r.get(3)?;
-            Ok(json!({
-                "id": r.get::<_, String>(0)?,
-                "name": r.get::<_, String>(1)?,
-                "body": r.get::<_, String>(2)?,
-                "variables": serde_json::from_str::<Value>(&vars).unwrap_or_else(|_| json!([])),
-                "createdAt": r.get::<_, i64>(4)?,
-                "updatedAt": r.get::<_, i64>(5)?,
-            }))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn put_prompt(&self, doc: &Value) -> Result<(), StoreError> {
-        let id = doc
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let name = doc
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("Untitled");
-        let body = doc.get("body").and_then(Value::as_str).unwrap_or("");
-        let vars = doc.get("variables").cloned().unwrap_or_else(|| json!([]));
-        let vars_s = serde_json::to_string(&vars).unwrap_or_else(|_| "[]".into());
-        let created = doc
-            .get("createdAt")
-            .and_then(Value::as_i64)
-            .unwrap_or_else(now_ms);
-        let now = now_ms();
-        self.lock().execute(
-            "INSERT INTO prompts (id, name, body, variables, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(id) DO UPDATE SET name=?2, body=?3, variables=?4, updated_at=?6",
-            params![id, name, body, vars_s, created, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_prompt(&self, id: &str) -> Result<(), StoreError> {
-        self.lock()
-            .execute("DELETE FROM prompts WHERE id = ?1", params![id])?;
-        Ok(())
     }
 
     // ── settings ─────────────────────────────────────────────────────────────
@@ -1726,16 +1704,24 @@ impl Store {
             "models": serde_json::from_str::<Value>(&models).unwrap_or_else(|_| json!([])),
             "hasKey": !r.get::<_, String>(5)?.is_empty(),
             "createdAt": r.get::<_, i64>(6)?,
+            "revision": r.get::<_, i64>(7)?,
+            "allowUnauthenticated": r.get::<_, bool>(8)?,
+            "credentialStorage": if r.get::<_, String>(5)?.starts_with("paddock-keychain:v1:") { "keychain" } else { "database" },
         }))
     }
 
     pub fn list_cloud_endpoints(&self) -> Result<Vec<Value>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, base_url, models, api_key, created_at
+            "SELECT id, name, kind, base_url, models, api_key, created_at, revision, allow_unauthenticated
              FROM cloud_endpoints ORDER BY created_at ASC",
         )?;
-        let rows = stmt.query_map([], Self::cloud_row)?;
+        let rows = stmt.query_map([], |r| {
+            let mut row = Self::cloud_row(r)?;
+            row["credentialReady"] =
+                json!(self.cloud_credentials.available(&r.get::<_, String>(5)?));
+            Ok(row)
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1791,40 +1777,83 @@ impl Store {
     /// (the edit form round-trips without the key, so an untouched field must
     /// not blank the stored one).
     pub fn update_cloud_endpoint(&self, id: &str, doc: &Value) -> Result<(), StoreError> {
-        let conn = self.lock();
-        if let Some(name) = doc.get("name").and_then(Value::as_str) {
-            conn.execute(
-                "UPDATE cloud_endpoints SET name = ?2 WHERE id = ?1",
-                params![id, name.trim()],
-            )?;
+        // One statement is atomic even for the web form's partial patch. Native
+        // reviews also observe this revision, including key-only edits.
+        let name = doc.get("name").and_then(Value::as_str).map(str::trim);
+        let base = doc
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().trim_end_matches('/'));
+        let models = doc
+            .get("models")
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Bad(e.to_string()))?;
+        let key = doc
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let (old, old_base): (String, String) = tx.query_row(
+            "SELECT api_key, base_url FROM cloud_endpoints WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if base.is_some_and(|base| base != old_base) && key.is_none() && !old.is_empty() {
+            return Err(StoreError::Bad(
+                "Enter the key again when changing a connection's destination.".into(),
+            ));
         }
-        if let Some(base) = doc.get("baseUrl").and_then(Value::as_str) {
-            conn.execute(
-                "UPDATE cloud_endpoints SET base_url = ?2 WHERE id = ?1",
-                params![id, base.trim().trim_end_matches('/')],
-            )?;
+        // A later edit in web Studio must not downgrade a native Keychain
+        // credential to plaintext SQLite storage.
+        let protected = key
+            .filter(|_| old.starts_with("paddock-keychain:v1:"))
+            .map(crate::credentials::protect)
+            .transpose()
+            .map_err(StoreError::Bad)?;
+        let result = (|| -> Result<(), StoreError> {
+            tx.execute(
+            "UPDATE cloud_endpoints SET name=coalesce(?2,name),base_url=coalesce(?3,base_url),models=coalesce(?4,models),api_key=coalesce(?5,api_key),revision=revision+1 WHERE id=?1",
+            params![id,name,base,models,protected.as_deref().or(key)])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        drop(conn);
+        if let Err(error) = result {
+            if let Some(protected) = protected {
+                crate::credentials::retire(&protected);
+            }
+            return Err(error);
         }
-        if let Some(models) = doc.get("models") {
-            let s = serde_json::to_string(models).map_err(|e| StoreError::Bad(e.to_string()))?;
-            conn.execute(
-                "UPDATE cloud_endpoints SET models = ?2 WHERE id = ?1",
-                params![id, s],
-            )?;
-        }
-        if let Some(key) = doc.get("apiKey").and_then(Value::as_str)
-            && !key.trim().is_empty()
-        {
-            conn.execute(
-                "UPDATE cloud_endpoints SET api_key = ?2 WHERE id = ?1",
-                params![id, key.trim()],
-            )?;
+        if key.is_some() {
+            if let (Some(protected), Some(key)) = (protected.as_deref(), key) {
+                self.cloud_credentials.remember(protected, key);
+            }
+            self.cloud_credentials.forget(&old);
+            crate::credentials::retire(&old);
         }
         Ok(())
     }
 
     pub fn delete_cloud_endpoint(&self, id: &str) -> Result<(), StoreError> {
-        self.lock()
-            .execute("DELETE FROM cloud_endpoints WHERE id = ?1", params![id])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT api_key FROM cloud_endpoints WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM cloud_endpoints WHERE id=?1", [id])?;
+        tx.commit()?;
+        drop(conn);
+        if let Some(old) = old {
+            self.cloud_credentials.forget(&old);
+            crate::credentials::retire(&old);
+        }
         Ok(())
     }
 
@@ -1838,47 +1867,55 @@ impl Store {
             "id": row.get::<_, String>(0)?,
             "label": row.get::<_, String>(1)?,
             "url": row.get::<_, String>(2)?,
-            "headers": serde_json::from_str::<Value>(&headers).unwrap_or_else(|_| json!({})),
+            "headers": headers,
             "registryKey": row.get::<_, String>(4)?,
             "system": row.get::<_, i64>(5)? != 0,
             "ports": serde_json::from_str::<Value>(&ports).unwrap_or_else(|_| json!([])),
             // INTERNAL: tokens + endpoints; the API layer strips this and
             // exposes only `connected` (+ the bearer merged into headers)
-            "oauth": serde_json::from_str::<Value>(&oauth).unwrap_or(Value::Null),
+            "oauth": oauth,
             "createdAt": row.get::<_, i64>(8)?,
+            "revision": row.get::<_, i64>(9)?,
         }))
     }
 
     pub fn list_connectors(&self) -> Result<Vec<Value>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, label, url, headers, registry_key, system, ports, oauth, created_at
+            "SELECT id, label, url, headers, registry_key, system, ports, oauth, created_at, revision
              FROM connectors ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], Self::connector_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+        rows.into_iter()
+            .map(|row| self.resolve_connector(row))
+            .collect()
     }
 
     pub fn get_connector(&self, id: &str) -> Result<Option<Value>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, label, url, headers, registry_key, system, ports, oauth, created_at
+            "SELECT id, label, url, headers, registry_key, system, ports, oauth, created_at, revision
              FROM connectors WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], Self::connector_row)?;
-        Ok(rows.next().transpose()?)
+        let row = rows.next().transpose()?;
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        row.map(|row| self.resolve_connector(row)).transpose()
     }
 
     /// Store the OAuth state blob ('' clears - disconnect).
     pub fn set_connector_oauth(&self, id: &str, oauth_json: &str) -> Result<(), StoreError> {
-        let n = self.lock().execute(
-            "UPDATE connectors SET oauth = ?2 WHERE id = ?1",
-            params![id, oauth_json],
-        )?;
-        if n == 0 {
-            return Err(StoreError::Bad(format!("no connector with id {id}")));
-        }
-        Ok(())
+        let revision: i64 =
+            self.lock()
+                .query_row("SELECT revision FROM connectors WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        self.set_connector_oauth_checked(id, revision as u64, oauth_json)
     }
 
     /// The scope: `all` = every model incl. future ones (spawn inherits);
@@ -1891,7 +1928,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let ports_s = serde_json::to_string(ports).unwrap_or_else(|_| "[]".into());
         let n = self.lock().execute(
-            "UPDATE connectors SET system = ?2, ports = ?3 WHERE id = ?1",
+            "UPDATE connectors SET system = ?2, ports = ?3, revision = revision + 1 WHERE id = ?1",
             params![id, all as i64, ports_s],
         )?;
         if n == 0 {
@@ -1982,6 +2019,19 @@ impl Store {
     /// Full-row update (the edit form always round-trips every field - headers
     /// included, since the Studio reads them back anyway).
     pub fn update_connector(&self, id: &str, doc: &Value) -> Result<(), StoreError> {
+        if self.connector_uses_keychain(id) {
+            let revision: i64 = self.lock().query_row(
+                "SELECT revision FROM connectors WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            let mut native = doc.clone();
+            native["id"] = json!(id);
+            if native.get("revision").is_none() {
+                native["revision"] = json!(revision);
+            }
+            return self.save_native_connector(&native).map(|_| ());
+        }
         let (label, url, headers_s) = Self::connector_fields(doc)?;
         let conn = self.lock();
         let dup: i64 = conn.query_row(
@@ -1995,8 +2045,16 @@ impl Store {
             )));
         }
         let n = conn.execute(
-            "UPDATE connectors SET label = ?2, url = ?3, headers = ?4 WHERE id = ?1",
-            params![id, label, url, headers_s],
+            "UPDATE connectors SET label = ?2, oauth = CASE WHEN url != ?3 THEN '' ELSE oauth END,
+             url = ?3, headers = ?4, revision = revision + 1 WHERE id = ?1
+             AND (?5 IS NULL OR revision = ?5)",
+            params![
+                id,
+                label,
+                url,
+                headers_s,
+                doc.get("revision").and_then(Value::as_i64)
+            ],
         )?;
         if n == 0 {
             return Err(StoreError::Bad(format!("no connector with id {id}")));
@@ -2005,8 +2063,28 @@ impl Store {
     }
 
     pub fn delete_connector(&self, id: &str) -> Result<(), StoreError> {
-        self.lock()
-            .execute("DELETE FROM connectors WHERE id = ?1", params![id])?;
+        let _publication = self
+            .connector_credential_updates
+            .lock()
+            .expect("connector publication");
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let stored: Option<(String, String)> = tx
+            .query_row(
+                "SELECT headers,oauth FROM connectors WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM connectors WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        drop(conn);
+        if let Some((headers, oauth)) = stored {
+            self.connector_credentials.forget(&headers);
+            self.connector_credentials.forget(&oauth);
+            crate::credentials::retire(&headers);
+            crate::credentials::retire(&oauth);
+        }
         Ok(())
     }
 
@@ -2150,7 +2228,14 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        Ok(row)
+        drop(conn);
+        row.map(|(kind, base, key)| {
+            self.cloud_credentials
+                .resolve(key)
+                .map(|key| (kind, base, key))
+                .map_err(StoreError::Bad)
+        })
+        .transpose()
     }
 
     // ── activity (collected runner event records, doc §8.1) ──────────────────
@@ -2628,7 +2713,7 @@ impl Store {
     }
 
     /// Close one band that nothing is running any more, ending it where the
-    /// evidence ends: its last scrape, else its start. NEVER `now` - the time
+    /// evidence ends: its last scrape, else its start. Never `now` - the time
     /// between the last heartbeat and noticing is exactly what we do not know,
     /// and charging it as uptime is the lie this sweep exists to stop. The
     /// caller journals that stretch as a gap.

@@ -101,6 +101,19 @@ pub struct EstimateQuery {
     budget: Option<u64>,
 }
 
+/// Capabilities served by one forward pass per input with nothing cached
+/// between calls: embedding, rerank and alignment encoders, and dense prediction
+/// (image chips in, rasters out). None of them holds a KV cache, so all of
+/// them are priced as `ModelKind::Encoder` - weights, workspace, context, and
+/// no decode terms. Pricing one as generative is how a 0.6B embedding model
+/// once came out "needing" 124 GB.
+fn is_single_pass(capability: &str) -> bool {
+    matches!(
+        capability,
+        "embeddings" | "rerank" | "alignment" | "segmentation"
+    )
+}
+
 /// `"8.6"` -> `(8, 6)`. Anything unparseable is None, and None never gates -
 /// same fail-open stance as the runner's own device singleton: refusing to
 /// price because a string was malformed helps nobody.
@@ -162,11 +175,7 @@ pub(crate) fn resolve_weights_for(
                 .find(|a| state.registry.is_artifact_installed(a))
         })
         .or_else(|| m.default_weights())?;
-        let kind = if m
-            .capability
-            .iter()
-            .any(|c| c == "embeddings" || c == "rerank")
-        {
+        let kind = if m.capability.iter().any(|c| is_single_pass(c)) {
             ModelKind::Encoder
         } else {
             ModelKind::Generative
@@ -381,14 +390,10 @@ pub async fn handle(
     let models_dir = state.registry.models_dir().to_path_buf();
     let mut rows = serde_json::Map::new();
     for m in &state.registry.catalog().models {
-        // Embedding and rerank models are served by the encoder path - one
-        // forward pass per input, nothing cached between calls. They must not
-        // be priced with a decode cache.
-        let kind = if m
-            .capability
-            .iter()
-            .any(|c| c == "embeddings" || c == "rerank")
-        {
+        // Embedding, rerank, alignment and dense-prediction are single-pass - one
+        // forward per input, nothing cached between calls. They must not be
+        // priced with a decode cache.
+        let kind = if m.capability.iter().any(|c| is_single_pass(c)) {
             ModelKind::Encoder
         } else {
             ModelKind::Generative
@@ -428,6 +433,10 @@ pub async fn handle(
         // because the arch is read from the file rather than declared.
         let mut arch: Option<String> = None;
         for a in m.weights() {
+            let env = Envelope {
+                kv_dtype: a.runtime.estimate_kv_dtype(env.kv_dtype),
+                ..env
+            };
             let weights = a.total_size();
             let published = a.shape.clone();
             // Only an installed file can be probed. Rather than guess geometry
@@ -473,7 +482,7 @@ pub async fn handle(
             // Probe geometry still fills in for an artifact published before
             // this existed, and for a format the generator cannot read.
             let shape_source = published.as_ref().map(|s| s.source);
-            let shape = published
+            let mut shape = published
                 .map(|s| s.into_model_shape(tower, a.workspace.unwrap_or(0)))
                 .or_else(|| {
                     probed.as_ref().map(|r| ModelShape {
@@ -485,6 +494,9 @@ pub async fn handle(
                         ..ModelShape::from_report(r, weights, kind)
                     })
                 });
+            if let (Some(memory), Some(shape)) = (&a.runtime.memory, &mut shape) {
+                memory.apply(shape);
+            }
             // What the row SAYS the weights cost: resident where we know it,
             // the file size otherwise - never a scaled guess. And the same
             // weights term the estimate itself used, which means subtracting
@@ -676,6 +688,76 @@ mod tests {
     // (`paddock_models::sampling::as_written`), against the whole elected
     // table. Both this endpoint and the runner's capability surface publish
     // the same numbers through it, so one test covers both.
+
+    /// A model with no decode loop must never be priced with one. Checked over
+    /// the whole catalog rather than by id, so the next single-pass capability
+    /// someone adds either lands in `is_single_pass` or fails here: every such
+    /// model has to publish an `encoder` shape, and nothing generative may.
+    /// The dense-prediction model is the case that motivated this - priced as
+    /// generative it would have been charged a logits plane, block tables and
+    /// the whole graph margin for a graph it does not have.
+    #[test]
+    fn single_pass_models_are_priced_without_a_decode_cache() {
+        let reg = Registry::new(std::env::temp_dir());
+        let mut seen = 0;
+        for m in &reg.catalog().models {
+            let single = m.capability.iter().any(|c| super::is_single_pass(c));
+            for a in m.weights() {
+                let Some(shape) = &a.shape else { continue };
+                let encoder = shape.kind == paddock_estimator::ModelKind::Encoder;
+                assert_eq!(
+                    encoder, single,
+                    "{}/{}: capability {:?} but shape kind {:?}",
+                    m.id, a.id, m.capability, shape.kind
+                );
+                seen += usize::from(single);
+            }
+        }
+        assert!(
+            seen > 0,
+            "no single-pass model publishes a shape - the test checked nothing"
+        );
+        // Every dense-prediction row, however many there are. The published
+        // catalog may carry none (the first such model is held in the optional
+        // private catalog), so this is a rule about the rows that exist, not
+        // a claim that one does.
+        for seg in reg
+            .catalog()
+            .models
+            .iter()
+            .filter(|m| m.capability.iter().any(|c| c == "segmentation"))
+        {
+            let a = seg.default_weights().expect("it has weights");
+            assert!(
+                a.shape.is_some() && a.workspace.is_some_and(|w| w > 0),
+                "{}: a dense-prediction model's workspace outweighs its weights at any useful \
+                 pass width - a fit estimate that skips it says 'fits' about a start that does not",
+                seg.id
+            );
+        }
+    }
+
+    /// Where the private catalog is compiled in, its rows really are in the
+    /// catalog the manager serves - the merge is a build-time branch, and a
+    /// branch nobody runs is one that rots.
+    #[cfg(private_catalog)]
+    #[test]
+    fn private_rows_join_the_published_catalog() {
+        let reg = crate::registry::Registry::new(std::env::temp_dir());
+        let private: crate::registry::Catalog =
+            toml::from_str(include_str!("../models.private.toml")).expect("it parses");
+        assert!(
+            !private.models.is_empty(),
+            "an empty private catalog is a stray file"
+        );
+        for m in &private.models {
+            assert!(
+                reg.catalog().models.iter().any(|c| c.id == m.id),
+                "{} is in models.private.toml but not in the served catalog",
+                m.id
+            );
+        }
+    }
 
     /// The query field is deserialized by NAME, so a rename or a typo on
     /// either side degrades to "absent" - which is silently the old, wrong

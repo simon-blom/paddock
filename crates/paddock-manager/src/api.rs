@@ -132,8 +132,8 @@ async fn get_prompt(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> R
 
 async fn create_prompt(State(s): State<Arc<AppState>>, Json(doc): Json<Value>) -> Response {
     match s.db.put_prompt(&doc) {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err500(e),
+        Ok(prompt) => Json(json!({ "ok": true, "prompt": prompt })).into_response(),
+        Err(e) => prompt_error(e),
     }
 }
 
@@ -144,15 +144,32 @@ async fn update_prompt(
 ) -> Response {
     doc["id"] = Value::String(id);
     match s.db.put_prompt(&doc) {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err500(e),
+        Ok(prompt) => Json(json!({ "ok": true, "prompt": prompt })).into_response(),
+        Err(e) => prompt_error(e),
     }
 }
 
-async fn delete_prompt(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match s.db.delete_prompt(&id) {
+#[derive(serde::Deserialize)]
+struct PromptRevision {
+    revision: Option<String>,
+}
+
+fn prompt_error(e: crate::store::StoreError) -> Response {
+    match e {
+        crate::store::StoreError::Conflict(m) => errx(StatusCode::CONFLICT, "conflict", m),
+        crate::store::StoreError::Bad(m) => errx(StatusCode::BAD_REQUEST, "invalid_request", m),
+        e => err500(e),
+    }
+}
+
+async fn delete_prompt(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<PromptRevision>,
+) -> Response {
+    match s.db.delete_prompt_checked(&id, q.revision.as_deref()) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => err500(e),
+        Err(e) => prompt_error(e),
     }
 }
 

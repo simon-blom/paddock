@@ -50,7 +50,10 @@ export function ctxCapOf(i: Pick<CtxLadderInput, 'vramCap' | 'modelCap'>): numbe
  *  Falls back to the exact cap when nothing on the ladder does. */
 export function ctxFits(i: Pick<CtxLadderInput, 'vramCap' | 'modelCap'>): number[] {
   const cap = ctxCapOf(i)
-  if (!cap) return [...CTX_STEPS]
+  if (!cap) {
+    const legal = CTX_STEPS.filter(c => !i.modelCap || c <= i.modelCap)
+    return legal.length ? legal : [i.modelCap]
+  }
   const opts = CTX_STEPS.filter((c) => c <= cap)
   return opts.length ? opts : [cap]
 }

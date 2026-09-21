@@ -29,6 +29,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runnerConfigKeys } from './config-fields.mjs'
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const INDEX_HTML = fileURLToPath(new URL('../index.html', import.meta.url))
@@ -252,9 +253,7 @@ const CONFIG_RS = fileURLToPath(
 const SERVER_FORM = join(SRC, 'components/manage/ServerForm.vue')
 try {
   const rs = readFileSync(CONFIG_RS, 'utf8')
-  const start = rs.indexOf('pub struct Config {')
-  const body = rs.slice(start, rs.indexOf('\n}', start))
-  const runnerKeys = new Set([...body.matchAll(/^ {4}pub ([a-z0-9_]+):/gm)].map((m) => m[1]))
+  const runnerKeys = runnerConfigKeys(rs)
 
   const vue = readFileSync(SERVER_FORM, 'utf8')
   const cards = vue.slice(vue.indexOf('const AF_CARDS'), vue.indexOf('const AF_ALL'))

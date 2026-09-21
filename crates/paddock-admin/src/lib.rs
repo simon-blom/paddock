@@ -63,6 +63,15 @@ pub fn data_root_resolved() -> (PathBuf, &'static str) {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(PathBuf::from));
+    // A signed .app is immutable, never a portable data directory. Keep an
+    // existing user library in place; new app installations use Application
+    // Support. Bundled runners resolve identically, including Helpers/ nesting.
+    #[cfg(target_os = "macos")]
+    if let (Some(exe), Some(user_home)) = (&exe_dir, std::env::var_os("HOME"))
+        && let Some(root) = macos_app_data_root(exe, std::path::Path::new(&user_home))
+    {
+        return (root, "macOS application");
+    }
     if let Some(dir) = exe_dir.as_ref().filter(|d| !in_cargo_target(d)) {
         let portable = dir.join("data");
         // is_dir first so the common case costs one stat, then create for the
@@ -86,6 +95,31 @@ pub fn data_root_resolved() -> (PathBuf, &'static str) {
         Some(home) => (PathBuf::from(home).join("paddock"), "home"),
         None => (PathBuf::from("."), "cwd"),
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_app_data_root(exe_dir: &std::path::Path, user_home: &std::path::Path) -> Option<PathBuf> {
+    let is_app = exe_dir.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| name == "Contents")
+            && dir
+                .parent()
+                .and_then(|p| p.extension())
+                .is_some_and(|ext| ext == "app")
+    });
+    if !is_app {
+        return None;
+    }
+    let existing = user_home.join("paddock");
+    let application = user_home.join("Library/Application Support/Paddock");
+    // Once this app has established a library, a later CLI invocation creating
+    // ~/paddock must not silently switch it to a different database on restart.
+    Some(if application.join("paddock.db").is_file() {
+        application
+    } else if existing.is_dir() {
+        existing
+    } else {
+        application
+    })
 }
 
 /// Is this exe a cargo build artifact - `target/{debug,release}/paddock.exe`?
@@ -440,6 +474,36 @@ mod procfs_listener_tests {
 #[cfg(test)]
 mod data_root_tests {
     use super::in_cargo_target;
+
+    #[test]
+    fn macos_bundle_never_becomes_portable_data() {
+        let dir = std::env::temp_dir().join(format!("pd-app-root-{}", std::process::id()));
+        let root = super::macos_app_data_root(
+            std::path::Path::new("/Applications/Paddock.app/Contents/MacOS"),
+            &dir,
+        );
+        assert_eq!(root, Some(dir.join("Library/Application Support/Paddock")));
+        std::fs::create_dir_all(dir.join("paddock")).unwrap();
+        assert_eq!(
+            super::macos_app_data_root(
+                std::path::Path::new("/Applications/Paddock.app/Contents/Helpers/runner"),
+                &dir
+            ),
+            Some(dir.join("paddock"))
+        );
+        assert!(super::macos_app_data_root(std::path::Path::new("/usr/local/bin"), &dir).is_none());
+        let application = dir.join("Library/Application Support/Paddock");
+        std::fs::create_dir_all(&application).unwrap();
+        std::fs::write(application.join("paddock.db"), b"test marker, not a DB").unwrap();
+        assert_eq!(
+            super::macos_app_data_root(
+                std::path::Path::new("/Applications/Paddock.app/Contents/MacOS"),
+                &dir
+            ),
+            Some(application)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The dev carve-out keys on cargo's own CACHEDIR.TAG, so a directory that
     /// merely LOOKS like a build output is not one. This is the difference

@@ -6496,7 +6496,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 609: `pd_q4x_combine_norm_q8mmq_nsi` - slot 606 that also folds
-    /// the NEXT mix's inject ([4][hc * hidden] f32) from its norm pass:
+    /// the next mix's inject ([4][hc * hidden] f32) from its norm pass:
     /// (row, stream) partials into ip [rows][hc][hc], summed over streams into
     /// inj_out [rows][hc] (inj may alias inj_out). hc 4; a class change
     /// against the matvec. (h, block_out, inj, norm_w, nscale, yq, w_inj, ip,
@@ -6516,6 +6516,403 @@ pub struct KernelTableV1 {
             u32,
             u32,
             f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 610: `pd_dp_u8_patch_rows` - the dense-prediction patch stem: u8
+    /// HWC chips of `ch` (<= 4) bands to normalized f16 patch rows in im2row
+    /// order, each chip owning `chip_rows` rows with the tail past the patch
+    /// grid zeroed (the class and register token rows). (pixels, out, m0..m3,
+    /// s0..s3, chips, px, patch, ch, chip_rows, stream).
+    pub dp_u8_patch_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 611: `pd_dp_qkv_split_rope` - fused q|k|v landing to q, k, v with
+    /// the q/v biases folded and a cos/sin TABLE rope ([n_rope][hd/2],
+    /// rotate_half pairs) on the first `n_rope` rows of every `chip_rows`-row
+    /// chip. (qkv, bq, bv, cos, sin, q, k, v, d, hd, rows, chip_rows, n_rope,
+    /// stream).
+    pub dp_qkv_split_rope: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 612: `pd_dp_res_ls_ln_f16` - the LayerScale residual seam:
+    /// `x += ls * (proj + bias)`, then `out = f16(LayerNorm(x))`. (x, proj,
+    /// bias, ls, w, b, out, rows, n, eps, stream).
+    pub dp_res_ls_ln_f16: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 613: `pd_dp_group_norm_gelu_f16` - torch GroupNorm over an NHWC
+    /// plane (the producing conv's bias `xb` folded at the load), then exact
+    /// GELU, then the f16 store. `part` is chips*ceil(P/64)*C f32 scratch and
+    /// `stat` 2*chips*G. (x, xb, w, b, out, part, stat, chips, P, C, G, eps,
+    /// stream).
+    pub dp_group_norm_gelu_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 614: `pd_dp_im2row3_f32` - 3x3 stride-1 zero-pad-1 im2row over an
+    /// f32 NHWC plane into f16 staging, TAP-outer columns; source chips strided
+    /// by `src_chip_rows` rows. (src, out, chips, H, W, C, src_chip_rows,
+    /// stream).
+    pub dp_im2row3_f32: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 615: `pd_dp_im2row3_f16` - slot 614 over an f16 source (a pure
+    /// gather). Same arguments.
+    pub dp_im2row3_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 616: `pd_dp_convt2_skip` - depth-to-space of a 2x2/stride-2
+    /// transposed conv's GEMM landing [chips][h*w][4*C], + bias, + the hs x hs
+    /// skip grid sampled bilinearly (align_corners=False) at the 2h x 2w
+    /// output. (g, bias, skip, out, chips, h, w, C, hs, skip_chip_rows, stream).
+    pub dp_convt2_skip: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 617: `pd_dp_seg_heads` - the stacked class + height 1x1 landing
+    /// [rows][ncls+1] to a u8 argmax raster, an f32 regression raster and
+    /// optional biased f16 logits. (o, bias, cls, height, logits|NULL, rows,
+    /// ncls, stream).
+    pub dp_seg_heads: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 618: `pd_f16_gemm_h` - the f16 x f16 GEMM with the landing narrowed
+    /// to f16: y is [batch][out_dim] halves, beta 0, in_dim a multiple of 8.
+    /// Same ring and K order as `f16_gemm`, so the result is that landing
+    /// rounded to nearest. (w, x, y, in_dim, out_dim, batch, stream).
+    pub f16_gemm_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 619: `pd_f16_gemm_h_elected` - 1 when the half landing is this
+    /// device's elected wide-batch route; 0 where the f32 entry owns an arm the
+    /// landing has no twin of (tcgen05, cc 10.0). Asked once, at load.
+    pub f16_gemm_h_elected: Option<unsafe extern "C" fn() -> i32>,
+    /// Slot 620: `pd_vision_attn_h` - `vision_attn_x` on halves: q (pre-scaled
+    /// by the caller), k, v and out are all f16. (q, k, v, out, nq, nkv,
+    /// n_heads, head_dim, n_batch, stream).
+    pub vision_attn_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 621: `pd_dp_qkv_split_rope_h` - slot 611 off a half qkv landing
+    /// into half q/k/v, with 1/sqrt(hd) folded into q before its round.
+    /// (qkv, bq, bv, cos, sin, q, k, v, d, hd, rows, chip_rows, n_rope,
+    /// qscale, stream).
+    pub dp_qkv_split_rope_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 622: `pd_dp_res_ls_ln_h` - slot 612 off a half projection landing.
+    /// (x, proj, bias, ls, w, b, out, rows, n, eps, stream).
+    pub dp_res_ls_ln_h: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 623: `pd_dp_gelu_bias_h` - bias + exact GELU on halves, in place.
+    /// (x, bias, rows, n, stream).
+    pub dp_gelu_bias_h: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 624: `pd_f16_gemm_h_gelu` - slot 618 with a per-output-row bias
+    /// and the exact GELU folded into the landing before its one round:
+    /// y = f16(gelu(acc + bias[m])). Retires slot 623's pass over the plane.
+    /// (w, x, y, bias, in_dim, out_dim, batch, stream).
+    pub f16_gemm_h_gelu: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 625: capability marker - the i-quant lanes (repack, dequant,
+    /// dense decode, the dp4a lane, the prefill tile, gather) serve PrismML's
+    /// ternary packings PTQ1_0 (GGUF raw id 143) and PQ2_0 (142), the tensor
+    /// types of the Bonsai files. The dtypes ride existing entry points, so
+    /// their slot presence cannot answer; this one can.
+    pub kquant_ternary: Option<unsafe extern "C" fn() -> i32>,
+    /// Slot 626: `pd_hadamard_rows` - the blockwise Walsh-Hadamard rotation a
+    /// rotated-basis checkpoint (`prism.hadamard.*`) asks of its runtime:
+    /// `y = H(s * x)` over each `block`-wide strip of every `width`-wide row,
+    /// or with mode bit 0 set `y = s * H(x)`, a looked-up row of a rotated
+    /// table back in the model's basis. `hd != 0` permutes gated-delta-net
+    /// value heads tiled -> grouped on the way in (forward only, never in
+    /// place). Bit-identical to `reference::hadamard`. (x, y, signs, rows,
+    /// width, block, mode, hd, nk, rep, stream).
+    pub hadamard_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 627: `pd_quantize_q8_b128` - int8 activations with one scale per
+    /// 128, the class slot 628 eats. Coarser than the per-32 lanes, and sound
+    /// only on Hadamard-rotated rows (outlier-poor by construction). (x f32
+    /// [n], q int8 [n], scale f32 [n / 128], n, stream).
+    pub quantize_q8_b128: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 628: `pd_ternary_gemv_b128` - the batch-1 decode lane of PrismML's
+    /// dense ternary packing PTQ1_0: a 256-entry byte -> five-trit table in
+    /// shared memory, activations staged in the weights' own byte order, a
+    /// lane owning whole super-blocks so each weight byte is read once. The
+    /// plane stays 1.75 bpw resident. (data, scales, xq, xs, y, in_dim,
+    /// out_dim, dtype, stream); in_dim a multiple of 256.
+    pub ternary_gemv_b128: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 629: `pd_hadamard_rows_q8_b128` - slot 626's forward rotation and
+    /// slot 627's quantize in one launch (the decode step of a rotated model
+    /// runs ~257 such pairs a token). `y` is nullable: the f32 rotated rows,
+    /// for consumers that are not int8 lanes. Bit-identical to the pair. (x,
+    /// y, signs, xq, xs, rows, width, block, hd, nk, rep, stream).
+    pub hadamard_rows_q8_b128: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 630: `pd_ternary_gemv_b128_multi` - slot 628's walk over up to
+    /// three planes that read the same staged row (q | k | v, in_qkv | gate)
+    /// in one launch, or with `glu` a gate | up pair folded with SwiGLU into
+    /// `y0`. Bit-identical per row to the single-plane launches. (d0, r0, d1,
+    /// r1, d2, r2, xq, xs, y0, y1, y2, in_dim, o0, o1, o2, n_planes, glu,
+    /// stream); out dims multiples of 8.
+    #[allow(clippy::type_complexity)]
+    pub ternary_gemv_b128_multi: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 631: `pd_nvf4_moe_gu_swiglu_bs` - slot 407's twin with a SECOND
+    /// weight plane and `silu(g)*u` where it squares a relu. The qwen4exp
+    /// routed pair's W4A4 arm: that family served its NVFP4 experts on the
+    /// W4A16 dot4 GEMV (slot 619) although modelopt declares the routed
+    /// experts' `input_activations` 4-bit, so the GEMV was paying GEMV cost
+    /// for precision the export was never quantized at. The MTP head's
+    /// experts ARE W4A16 and keep the GEMV. `fq`/`fs` are sorted-position
+    /// indexed - slot 408's direct B input.
+    /// (gdata, gscale, gscale2, udata, uscale, uscale2, sorted_row,
+    ///  block_expert, xq, xs, fq, fs, in_dim, ff, nb, stream).
+    pub nvf4_moe_gu_swiglu_bs: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
             u32,
             *mut core::ffi::c_void,
         ) -> i32,
@@ -7137,7 +7534,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 595;
+pub const KERNEL_TABLE_SLOTS: usize = 617;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

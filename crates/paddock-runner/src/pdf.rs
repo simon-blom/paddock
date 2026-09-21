@@ -19,10 +19,21 @@
 //! already hold - so the mutex lives here, in the one place that calls pdfium.
 //! Both entry points below run under `spawn_blocking`, i.e. on arbitrary
 //! threads, which is exactly why it is not optional.
+//!
+//! macOS uses its native CoreGraphics rasterizer when PDFium is not linked.
+//! Both paths run in-process on the blocking pool; text extraction uses sift.
 
+#[cfg(feature = "pdf")]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+#[cfg(feature = "pdf")]
 use paddock_pdfium::Pdfium;
+
+#[cfg(all(target_os = "macos", not(feature = "pdf")))]
+#[path = "pdf_macos.rs"]
+mod native;
+#[cfg(all(target_os = "macos", not(feature = "pdf")))]
+pub(crate) use native::{render, render_page_rgb};
 
 /// Rasterization knobs (built from [`crate::config::Config`]).
 #[derive(Debug, Clone)]
@@ -167,10 +178,11 @@ pub struct RenderedPdf {
     pub ceiling_clipped: bool,
 }
 
-// pdfium is linked in, so the two failure modes that used to lead this enum -
-// "not configured" and "could not load the library" - are now unrepresentable.
+// Default builds link PDFium in. The Metal bring-up build may omit it.
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
+    #[error("PDF image rendering is not included in this build; text extraction remains available")]
+    Unavailable,
     #[error("could not parse the PDF: {0}")]
     Load(String),
     #[error("{0}")]
@@ -185,12 +197,14 @@ pub enum PdfError {
 // is no library to find and no bind that can fail - `FPDF_InitLibrary` is a
 // call, not a dlopen. Still cached for the process because pdfium's global
 // init must happen exactly once.
+#[cfg(feature = "pdf")]
 static PDFIUM: OnceLock<Mutex<Pdfium>> = OnceLock::new();
 
 /// The one pdfium, locked. A poisoned mutex means a previous render panicked
 /// inside pdfium; every document is loaded and closed within a single lock
 /// hold, so there is nothing of OURS left half-built - recover rather than
 /// poison every later request in the process.
+#[cfg(feature = "pdf")]
 fn bind() -> MutexGuard<'static, Pdfium> {
     PDFIUM
         .get_or_init(|| Mutex::new(Pdfium::new()))
@@ -198,19 +212,34 @@ fn bind() -> MutexGuard<'static, Pdfium> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Is PDF rasterization available? Always - pdfium is part of the binary.
+/// Is PDF rasterization included in this build?
 ///
 /// Kept as a function rather than deleted at every call site: what varies is
 /// whether the MODEL can consume page images, and the callers read better
 /// asking both questions the same way.
 pub fn available(_cfg: &PdfConfig) -> bool {
-    true
+    cfg!(any(feature = "pdf", target_os = "macos"))
+}
+
+#[cfg(not(any(feature = "pdf", target_os = "macos")))]
+pub(crate) fn render(
+    _bytes: &[u8],
+    _cfg: &PdfConfig,
+    _sel: PageSel,
+) -> Result<RenderedPdf, PdfError> {
+    Err(PdfError::Unavailable)
+}
+
+#[cfg(not(any(feature = "pdf", target_os = "macos")))]
+pub(crate) fn render_page_rgb(_bytes: &[u8], _page: u32, _dpi: f32) -> Option<(Vec<u8>, u32, u32)> {
+    None
 }
 
 /// Rasterize `bytes` to per-page RGB8, `sel` picking which pages (the
 /// server's `cfg.max_pages` ceiling still bounds how many - a VRAM/latency
 /// guard, whatever the caller asked for). **CPU-bound and blocking** - call
 /// under `tokio::task::spawn_blocking`, never on an async/inference thread.
+#[cfg(feature = "pdf")]
 pub(crate) fn render(bytes: &[u8], cfg: &PdfConfig, sel: PageSel) -> Result<RenderedPdf, PdfError> {
     let pdfium = bind();
     let doc = pdfium
@@ -263,6 +292,7 @@ pub(crate) fn render(bytes: &[u8], cfg: &PdfConfig, sel: PageSel) -> Result<Rend
 /// forensic render-vs-scan comparison (paddock-forensics `PageRenderer`). Uses
 /// the one process-wide pdfium (`bind`), so it must run under
 /// `spawn_blocking` like [`render`]. `None` on any load/render failure.
+#[cfg(feature = "pdf")]
 pub(crate) fn render_page_rgb(bytes: &[u8], page: u32, dpi: f32) -> Option<(Vec<u8>, u32, u32)> {
     let pdfium = bind();
     let doc = pdfium.load(bytes).ok()?;
@@ -580,6 +610,21 @@ pub(crate) fn expand_in_messages(
 mod tests {
     use super::*;
 
+    #[test]
+    #[cfg(not(any(feature = "pdf", target_os = "macos")))]
+    fn omitted_rasterizer_is_reported_not_silently_accepted() {
+        let cfg = PdfConfig {
+            max_pages: 1,
+            long_edge: 512,
+        };
+        assert!(!available(&cfg));
+        assert!(matches!(
+            render(b"%PDF", &cfg, PageSel::All),
+            Err(PdfError::Unavailable)
+        ));
+        assert!(render_page_rgb(b"%PDF", 0, 72.0).is_none());
+    }
+
     /// A minimal valid multi-page PDF with blank pages of the given size (pts),
     /// xref offsets computed correctly so it needs no pdfium recovery path.
     fn tiny_pdf(n_pages: usize, w: u32, h: u32) -> Vec<u8> {
@@ -615,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn renders_pages_honors_cap_and_reports_truncation() {
         let cfg = PdfConfig {
             max_pages: 2,
@@ -635,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn single_page_no_truncation() {
         let cfg = PdfConfig {
             max_pages: 20,
@@ -664,6 +711,7 @@ mod tests {
     /// rasterizer that silently renders nothing is exactly the failure those
     /// switches could produce.
     #[test]
+    #[cfg(feature = "pdf")]
     fn text_is_really_rendered_not_a_blank_page() {
         let cfg = PdfConfig {
             max_pages: 4,
@@ -716,6 +764,7 @@ mod tests {
     /// proves the statically linked pdfium really is callable, since a truncated
     /// header has to reach pdfium's parser to be rejected.
     #[test]
+    #[cfg(feature = "pdf")]
     fn garbage_bytes_are_a_load_error() {
         let cfg = PdfConfig {
             max_pages: 4,
@@ -763,6 +812,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn expands_pdf_part_into_page_images_with_truncation() {
         let cfg = PdfConfig {
             max_pages: 2,
@@ -812,6 +862,7 @@ mod tests {
     /// string engages), a user page selection is honored quietly, and a
     /// server-ceiling clip is a loud error instead of the disclosure note.
     #[test]
+    #[cfg(feature = "pdf")]
     fn plain_pages_emits_bare_images_and_refuses_the_ceiling_clip() {
         let cfg = PdfConfig {
             max_pages: 4,
@@ -919,6 +970,7 @@ mod tests {
     /// `max_pages` key on the part beats the request-level extension. Runs on
     /// the text route (can_render=false), so no pdfium needed.
     #[test]
+    #[cfg(feature = "pdf")]
     fn part_level_max_pages_overrides_per_file() {
         let cfg = PdfConfig {
             max_pages: 20,
@@ -984,6 +1036,7 @@ mod tests {
     /// A part-level `pages` RANGE beats the caps and keeps real page numbers
     /// on the text route.
     #[test]
+    #[cfg(feature = "pdf")]
     fn part_level_pages_range_slices_the_middle() {
         let cfg = PdfConfig {
             max_pages: 20,

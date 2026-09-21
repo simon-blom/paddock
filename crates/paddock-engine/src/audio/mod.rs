@@ -77,6 +77,11 @@ pub enum MelPolicy {
     /// max(len, 30 s), every real frame is kept, and the emitted plane
     /// extends to the conv stem's 100-frame chunk boundary.
     Qwen3Asr,
+    /// Current official forced-aligner processor defaults to longest-clip
+    /// padding, not ASR's 30-second waveform pad. Reflect at the clip end,
+    /// drop the final STFT column, then zero-pad mel rows to a 100-frame chunk.
+    /// Keep this separate so old GGUF/CUDA ASR contracts do not drift.
+    Qwen3Aligner,
     /// Whisper (transformers `WhisperFeatureExtractor`): the encoder is
     /// FIXED at 30 s, so one call is one window - the clip is truncated or
     /// zero-padded to exactly 480000 samples and always yields 3000 frames.
@@ -159,6 +164,24 @@ pub fn qwen3_asr_features(samples: &[f32]) -> Result<MelFeatures, String> {
     mel_features(samples, MelPolicy::Qwen3Asr)
 }
 
+#[cfg(test)]
+mod aligner_framing_tests {
+    use super::*;
+    #[test]
+    fn aligner_drop_last_and_mel_padding_do_not_change_asr_contract() {
+        let samples = vec![0.; 16161];
+        let align = mel_features(&samples, MelPolicy::Qwen3Aligner).unwrap();
+        let asr = qwen3_asr_features(&samples).unwrap();
+        assert_eq!(align.n_frames, 101);
+        assert_eq!(asr.n_frames, 102);
+        assert_eq!(align.data.len(), 200 * N_MEL);
+        assert!(align.data[101 * N_MEL..].iter().all(|&x| x == 0.));
+        assert!(asr.data[102 * N_MEL..].iter().all(|&x| x == -1.5));
+        let tiny = mel_features(&[0.; 160], MelPolicy::Qwen3Aligner).unwrap();
+        assert_eq!((tiny.n_samples, tiny.n_frames), (8000, 50));
+    }
+}
+
 /// One Whisper encoder window (30 s, always [`WHISPER_FRAMES`] frames) of
 /// normalized log-mel features. Pass at most 30 s of samples per call -
 /// anything longer belongs to the next window and is truncated here.
@@ -175,7 +198,7 @@ pub fn mel_features(samples: &[f32], policy: MelPolicy) -> Result<MelFeatures, S
     }
     let mut owned;
     let signal = match policy {
-        MelPolicy::Qwen3Asr if samples.len() < MIN_SAMPLES => {
+        MelPolicy::Qwen3Asr | MelPolicy::Qwen3Aligner if samples.len() < MIN_SAMPLES => {
             owned = samples.to_vec();
             owned.resize(MIN_SAMPLES, 0.0);
             &owned[..]
@@ -184,14 +207,22 @@ pub fn mel_features(samples: &[f32], policy: MelPolicy) -> Result<MelFeatures, S
         // to the next one, and a short window is zero-padded by the STFT's
         // own boundary rule below
         MelPolicy::Whisper => &samples[..samples.len().min(PAD_SAMPLES)],
-        MelPolicy::Qwen3Asr => samples,
+        MelPolicy::Qwen3Asr | MelPolicy::Qwen3Aligner => samples,
     };
     let l = signal.len();
-    let padded = l.max(PAD_SAMPLES);
+    let padded = if matches!(policy, MelPolicy::Qwen3Aligner) {
+        l
+    } else {
+        l.max(PAD_SAMPLES)
+    };
     let (n_real, enc_frames) = match policy {
         MelPolicy::Qwen3Asr => {
             let r = real_frames(l);
             // the conv stem consumes whole 100-frame chunks
+            (r, r.div_ceil(CHUNK_FRAMES) * CHUNK_FRAMES)
+        }
+        MelPolicy::Qwen3Aligner => {
+            let r = l / HOP;
             (r, r.div_ceil(CHUNK_FRAMES) * CHUNK_FRAMES)
         }
         // fixed-size encoder: all 3000 frames are consumed, silence included

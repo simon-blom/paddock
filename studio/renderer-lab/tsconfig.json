@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "ESNext.Disposable"],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@truespar/scriptor-core": ["./vendor/scriptor/core/src/index.ts"],
+      "@truespar/scriptor-wasm": ["./vendor/scriptor/scriptor-wasm/dist/scriptor_wasm.d.ts"]
+    }
+  },
+  "include": ["./**/*.ts", "./**/*.vue", "../src/env.d.ts"],
+  "exclude": ["./vite.config.ts"]
+}

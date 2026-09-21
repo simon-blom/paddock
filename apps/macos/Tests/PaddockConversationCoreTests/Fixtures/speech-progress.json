@@ -1,0 +1,38 @@
+[
+  {"name":"Stop before delayed speech-start","steps":[
+    {"drain":true,"pending":0,"waiting":true},
+    {"event":{"type":"input_audio_buffer.speech_started","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"input_audio_buffer.committed","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"input_audio_buffer.drained","pending_item_ids":["a"]},"pending":1,"waiting":true},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":0,"waiting":false}
+  ]},
+  {"name":"Old completion cannot end newer speech","steps":[
+    {"event":{"type":"input_audio_buffer.speech_started","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"input_audio_buffer.speech_stopped","item_id":"a"},"pending":1,"waiting":true},
+    {"event":{"type":"input_audio_buffer.speech_started","item_id":"b"},"pending":2,"waiting":true,"speaking":"b"},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":1,"waiting":true,"speaking":"b"},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"b"},"pending":0,"waiting":false}
+  ]},
+  {"name":"Quiet Stop has no fabricated utterance","steps":[
+    {"drain":true,"pending":0,"waiting":true},
+    {"event":{"type":"input_audio_buffer.drained","pending_item_ids":[]},"pending":0,"waiting":false}
+  ]},
+  {"name":"Drain identifies pending manual turn","steps":[
+    {"drain":true,"pending":0,"waiting":true},
+    {"event":{"type":"input_audio_buffer.drained","pending_item_ids":["a"]},"pending":1,"waiting":true},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":0,"waiting":false}
+  ]},
+  {"name":"Completion before drain still awaits barrier","steps":[
+    {"event":{"type":"input_audio_buffer.committed","item_id":"a"},"pending":1,"waiting":true},
+    {"drain":true,"pending":1,"waiting":true},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":0,"waiting":true},
+    {"event":{"type":"input_audio_buffer.drained","pending_item_ids":["a"]},"pending":0,"waiting":false}
+  ]},
+  {"name":"Duplicate events never double-count words","steps":[
+    {"event":{"type":"input_audio_buffer.speech_started","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"input_audio_buffer.speech_started","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"input_audio_buffer.committed","item_id":"a"},"pending":1,"waiting":true,"speaking":"a"},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":0,"waiting":false},
+    {"event":{"type":"conversation.item.input_audio_transcription.completed","item_id":"a"},"pending":0,"waiting":false,"accepted":false}
+  ]}
+]

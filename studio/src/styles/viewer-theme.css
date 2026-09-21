@@ -1,0 +1,62 @@
+/* Host-owned chrome, renderer-owned content. Apply at both token roots:
+   Lector declares defaults directly on its nested .lector-viewer, so setting
+   only .lector-workspace cannot override those through inheritance. The
+   headless file-dialog pane needs the same contract without a workspace.
+   Lector appends its tooltip to body, outside both roots. Theme it directly;
+   CSS inheritance stays live when appearance changes while it is open. */
+.docpane__lector :is(.lector-workspace, .lector-viewer),
+.pv__canvas,
+:root .lector-tooltip {
+  --lector-bg: var(--pk-bg-surface);
+  --lector-bg-alt: var(--pk-bg-base);
+  --lector-bg-hover: var(--pk-bg-hover);
+  --lector-bg-active: var(--pk-bg-hover);
+  --lector-bg-selected: var(--pk-accent-subtle);
+  --lector-bg-input: var(--pk-bg-base);
+  --lector-bg-overlay: var(--pk-bg-overlay);
+  --lector-canvas-bg: var(--pk-document-stage);
+  /* Never invert/recolor a PDF's actual page pixels. White is paper, not UI. */
+  --lector-page-bg: #ffffff;
+  --lector-page-shadow: none;
+  --lector-fg: var(--pk-text-primary);
+  --lector-fg-secondary: var(--pk-text-secondary);
+  --lector-fg-muted: var(--pk-text-muted);
+  --lector-fg-disabled: var(--pk-text-muted);
+  --lector-fg-on-accent: var(--pk-text-inverse);
+  --lector-accent: var(--pk-accent);
+  --lector-accent-hover: var(--pk-accent-hover);
+  --lector-accent-active: var(--pk-accent-active);
+  --lector-accent-light: var(--pk-accent-subtle);
+  --lector-accent-fg: var(--pk-text-inverse);
+  --lector-border: var(--pk-border-default);
+  --lector-border-subtle: var(--pk-border-subtle);
+  --lector-border-strong: var(--pk-border-strong);
+  --lector-danger: var(--pk-status-error);
+  --lector-danger-hover: var(--pk-status-error-hover);
+  --lector-danger-light: var(--pk-status-error-subtle);
+  --lector-danger-light-hover: var(--pk-status-error-subtle);
+  --lector-success: var(--pk-status-success);
+  --lector-success-light: var(--pk-status-success-subtle);
+  --lector-warning: var(--pk-status-warning);
+  --lector-warning-light: var(--pk-status-warning-subtle);
+  --lector-font-family: var(--pk-font-sans);
+  --lector-font-mono: var(--pk-font-mono);
+  --lector-radius-sm: var(--pk-radius-sm);
+  --lector-radius: var(--pk-radius-md);
+  --lector-radius-lg: var(--pk-radius-lg);
+  --lector-radius-xl: var(--pk-radius-xl);
+  --lector-radius-full: var(--pk-radius-full);
+  --lector-shadow-sm: var(--pk-shadow-sm);
+  --lector-shadow: var(--pk-shadow-sm);
+  --lector-shadow-md: var(--pk-shadow-md);
+  --lector-shadow-lg: var(--pk-shadow-lg);
+  --lector-scrollbar-track: var(--pk-document-stage);
+  --lector-scrollbar-thumb: var(--pk-border-default);
+  --lector-scrollbar-thumb-hover: var(--pk-border-strong);
+  --lector-tooltip-bg: var(--pk-bg-popup);
+  --lector-tooltip-fg: var(--pk-text-primary);
+}
+
+/* One page stage for PDF, Word and image previews. Do not target canvas pixels,
+   .scriptor-sheet text, author styles, charts or annotation colors. */
+.pv__canvas { background: var(--pk-document-stage); }

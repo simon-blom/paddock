@@ -35,6 +35,7 @@ pub mod realtime;
 pub mod reasoning;
 pub mod responses;
 pub mod routes;
+pub mod segmentations;
 pub mod service;
 pub mod serving;
 pub mod startup;
@@ -149,6 +150,42 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     resolve_local_model(&mut cfg)?;
 
+    if cfg.device == "metal" {
+        let bonsai = cfg
+            .model
+            .as_ref()
+            .is_some_and(|p| paddock_models::bonsai::BonsaiConfig::read(p).is_ok());
+        let native_f32 = bonsai && cfg.kv_cache_dtype == "f32";
+        if cfg.model.as_ref().is_some_and(|p| p.is_dir())
+            && cfg.kv_cache_dtype != "auto"
+            && !native_f32
+        {
+            return Err(
+                "native MLX Metal uses checkpoint-native KV precision; select kv_cache_dtype = auto"
+                    .into(),
+            );
+        }
+        if !matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16") && !native_f32 {
+            return Err("Metal currently requires F16 KV (kv_cache_dtype = auto or f16)".into());
+        }
+        if cfg.moe_offload.enabled {
+            return Err("Metal MoE expert offload is not implemented".into());
+        }
+        if cfg.kv_offload.enabled
+            && (!cfg.kv_offload.ram_gb.is_finite()
+                || cfg.kv_offload.ram_gb <= 0.0
+                || !cfg.kv_offload.nvme_gb.is_finite()
+                || cfg.kv_offload.nvme_gb < 0.0)
+        {
+            return Err("Metal KV offload requires a positive finite ram_gb transfer budget and nonnegative finite nvme_gb".into());
+        }
+        if !cfg!(any(feature = "pdf", target_os = "macos")) {
+            tracing::warn!(
+                "this development build has no PDF rasterizer; PDF text extraction remains available"
+            );
+        }
+    }
+
     // [kv_offload]: the shipped tier election, armed once before any model
     // loads (families read it at enable_batch). Budgets only, by design.
     //
@@ -231,6 +268,21 @@ pub async fn run(
             .clone()
             .map(|(p, gb)| (p, (gb * (1u64 << 30) as f64) as u64)),
     );
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if cfg.device == "metal" {
+        paddock_metal::configure_kv_offload(ram_armed.then(|| {
+            paddock_metal::KvOffloadConfig {
+                ram_bytes: (kv.ram_gb * (1u64 << 30) as f64) as u64,
+                disk: nvme_armed
+                    .clone()
+                    .map(|(p, gb)| (p, (gb * (1u64 << 30) as f64) as u64)),
+                scope: paddock_metal::KvOffloadConfig::endpoint_scope(
+                    cfg.port,
+                    cfg.api_key.as_deref(),
+                ),
+            }
+        }));
+    }
     // [moe_offload]: armed the same way, read by the MoE families at load
     // (host-map the expert planes) and at enable_batch (seat the slot cache).
     let mo = &cfg.moe_offload;
@@ -307,6 +359,7 @@ pub async fn run(
     // Encoder architectures (qwen3) serve /v1/embeddings + /v1/rerank; the rest
     // are generative and serve chat/completions.
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
+    let mut segmenter = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
     if let Some(path) = &cfg.model {
@@ -339,6 +392,9 @@ pub async fn run(
         // silent no-op for the one family whose KV bytes dominate its wall.
         match cfg.kv_cache_dtype.as_str() {
             "auto" => {}
+            // The Metal preflight above permits this only for Bonsai's exact
+            // F32 checkpoint contract. Never transport it to a CUDA kernel.
+            "f32" if cfg.device == "metal" => {}
             "f16" => unsafe {
                 // gemma4 and both ASR families default to fp8 - this is the
                 // way back to exact f16. G4_KV16 is gemma4's own historical
@@ -354,7 +410,43 @@ pub async fn run(
                 );
             }
         }
-        if let Some(dir) = serving::aligner_dir(path) {
+        if let Some(dir) = serving::segment_dir(path) {
+            // Dense prediction (tic-forestry: DINOv3 + decoder): chips in,
+            // rasters out, /v1/segmentations and nothing else. Like the
+            // aligner it arrives as a checkpoint directory or the
+            // .safetensors entry-point inside one, and like the aligner its
+            // honest id is the DIRECTORY's name - the file is `model`.
+            // max_ctx means nothing here; max_batch is chips per pass.
+            let dir_id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(id);
+            let m = serving::load_segmenter(
+                cfg.served_model_name.clone().unwrap_or(dir_id),
+                &dir,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.max_batch,
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(
+                model = %m.id,
+                chips_per_pass = m.segmenter.info().max_batch,
+                "segmentation model ready"
+            );
+            segmenter = Some(m);
+        } else if let Some(dir) = serving::aligner_dir(path) {
+            if cfg.device == "metal"
+                && (cfg.mmproj.is_some()
+                    || cfg.mtp.is_some()
+                    || cfg.spec.as_deref().is_some_and(|s| s != "off"))
+            {
+                return Err(
+                    "Metal forced alignment has an integrated tower and no speculative companion"
+                        .into(),
+                );
+            }
             // The safetensors-primary route: a checkpoint dir
             // (or its entry-point .safetensors file - the form a catalog
             // spawn hands over) whose config.json names the forced-aligner
@@ -417,7 +509,7 @@ pub async fn run(
             // PADDOCK_BS_* pin, which the engine records) skips it;
             // =force ignores the cache and re-measures.
             let calib_mode = paddock_models::dev_var!("PADDOCK_BS_CALIB").unwrap_or_default();
-            if calib_mode != "off" {
+            if m.encoder.block_scale_calibration() && calib_mode != "off" {
                 let (cache, cached) = serving::CalibCache::probe(path, cfg.kernel_pack.as_deref());
                 let mut applied = false;
                 if calib_mode != "force"
@@ -678,17 +770,14 @@ pub async fn run(
     // it joins the live config view below (control-plane, no-restart).
     let web_search = cfg.web_search();
 
-    // PDF handling: text extraction (sift) and page rendering (pdfium) are both
-    // compiled in, so neither can be missing at runtime. This used to be a
-    // three-way probe over a sidecar library, whose "not found" arm was the
-    // whole of  - a degraded request was the first sign anything was
-    // wrong. Now the only variable is whether the MODEL can read page images,
-    // which the vision capability already answers.
+    // Text extraction is always available. Experimental builds without our
+    // PDFium archive must report image rendering unavailable before requests.
     let pdf_cfg = crate::pdf::PdfConfig::from_config(&cfg);
     tracing::info!(
         max_pages = pdf_cfg.max_pages,
         long_edge = pdf_cfg.long_edge,
-        "PDF input ready: page rendering (pdfium, linked in) for vision models, text extraction (sift) for the rest"
+        rasterization = crate::pdf::available(&pdf_cfg),
+        "PDF processing ready"
     );
 
     // Request filters (doc §13): validated here so a malformed variant/preset
@@ -745,6 +834,7 @@ pub async fn run(
         embedder,
         asr,
         aligner,
+        segmenter,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,
         max_batch: cfg.max_batch,
@@ -798,6 +888,8 @@ pub async fn run(
     // failed admin surface degrades supervision, never serving.
     let admin_state = Arc::new(crate::admin::AdminState {
         app: state.clone(),
+        loaded_file: cfg.loaded_file.clone(),
+        config_path: banner.config_path.clone().map(Into::into),
         port: cfg.port,
         started_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

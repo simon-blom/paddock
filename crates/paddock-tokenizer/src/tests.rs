@@ -60,6 +60,38 @@ fn builds_from_gguf_and_merges_bpe() {
 }
 
 #[test]
+fn hf_preserves_all_terminal_ids_and_rejects_invalid_ids() {
+    let root = std::env::temp_dir().join(format!(
+        "paddock-hf-terminals-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let tiny = GgufTokenizer::from_gguf(&tiny_gguf()).unwrap();
+    tiny.inner.save(root.join("tokenizer.json"), false).unwrap();
+    let path = root.join("generation_config.json");
+    std::fs::write(&path, br#"{"eos_token_id":[8,1,2,8]}"#).unwrap();
+    let tok = GgufTokenizer::from_hf_dir(&root).unwrap();
+    assert_eq!(tok.eos_id, Some(8));
+    assert_eq!(tok.eot_id, Some(1));
+    assert_eq!(tok.stop_ids(), [8, 1, 2]);
+    for value in ["[8,999]", "[8,-1]", "[8,4294967296]", "999", "-1"] {
+        std::fs::write(&path, format!("{{\"eos_token_id\":{value}}}")).unwrap();
+        assert!(
+            GgufTokenizer::from_hf_dir(&root).is_err(),
+            "accepted {value}"
+        );
+    }
+    // Only the two test-owned files in this unique directory are removed.
+    std::fs::remove_file(root.join("tokenizer.json")).unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
 fn control_tokens_survive_as_single_ids() {
     let tok = GgufTokenizer::from_gguf(&tiny_gguf()).expect("builds");
     assert_eq!(tok.token_to_id("<|end|>"), Some(8));
@@ -78,6 +110,75 @@ fn unknown_pre_tokenizer_is_a_hard_error() {
     );
     let err = GgufTokenizer::from_gguf(&f).expect_err("must refuse");
     assert!(matches!(err, crate::TokenizerError::UnknownPreTokenizer(_)));
+}
+
+#[test]
+fn granite_42_disambiguates_docling_without_changing_vision() {
+    let mut f = tiny_gguf();
+    f.metadata.insert(
+        "tokenizer.ggml.pre".into(),
+        Value::Str("granite-docling".into()),
+    );
+    let Value::Array(tokens) = f.metadata.get_mut("tokenizer.ggml.tokens").unwrap() else {
+        unreachable!()
+    };
+    tokens.extend([Value::Str("-".into()), Value::Str("-hello".into())]);
+    let Value::Array(merges) = f.metadata.get_mut("tokenizer.ggml.merges").unwrap() else {
+        unreachable!()
+    };
+    merges.push(Value::Str("- hello".into()));
+    f.metadata.insert(
+        "general.basename".into(),
+        Value::Str("granite-vision-4.1".into()),
+    );
+    assert_eq!(
+        GgufTokenizer::from_gguf(&f)
+            .unwrap()
+            .encode("-hello")
+            .unwrap(),
+        [10]
+    );
+    f.metadata
+        .insert("general.basename".into(), Value::Str("granite-4.2".into()));
+    assert_eq!(
+        GgufTokenizer::from_gguf(&f)
+            .unwrap()
+            .encode("-hello")
+            .unwrap(),
+        [9, 7]
+    );
+    f.metadata.insert(
+        "general.basename".into(),
+        Value::Str("granite-speech-4.1".into()),
+    );
+    assert_eq!(
+        GgufTokenizer::from_gguf(&f)
+            .unwrap()
+            .encode("-hello")
+            .unwrap(),
+        [10]
+    );
+    f.metadata
+        .insert("general.finetune".into(), Value::Str("plus".into()));
+    assert_eq!(
+        GgufTokenizer::from_gguf(&f)
+            .unwrap()
+            .encode("-hello")
+            .unwrap(),
+        [9, 7]
+    );
+    f.metadata.remove("general.finetune");
+    f.metadata.insert(
+        "general.name".into(),
+        Value::Str("Granite Speech 4.1 2b Plus".into()),
+    );
+    assert_eq!(
+        GgufTokenizer::from_gguf(&f)
+            .unwrap()
+            .encode("-hello")
+            .unwrap(),
+        [9, 7]
+    );
 }
 
 /// Whisper-family construction: the GGUF (our own schema -

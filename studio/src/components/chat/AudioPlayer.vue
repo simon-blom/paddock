@@ -74,6 +74,14 @@ const at = ref(0)
 const duration = ref(0)
 /** null = the browser has not committed yet; the element decides on load. */
 const playable = ref<boolean | null>(null)
+const playbackError = ref('')
+function failed() {
+  playable.value = false
+  const code = el.value?.error?.code
+  playbackError.value = code === 2 ? 'The recording could not be loaded. Its saved original is unchanged.'
+    : code === 3 ? 'The recording could not be decoded. It may be incomplete or damaged; its saved original is unchanged.'
+    : 'The recording could not be played. It may be incomplete or use an unsupported format; its saved original is unchanged.'
+}
 /** the Infinity-duration probe runs once per source, not per loadedmetadata */
 let resolving = false
 /** How to call the duration probe off while its forced seek is outstanding.
@@ -100,6 +108,7 @@ watch(
     duration.value = 0
     resolving = false
     playable.value = guess()
+    playbackError.value = ''
   },
   { immediate: true },
 )
@@ -335,11 +344,11 @@ function onHover(e: PointerEvent): void {
       @play="onPlay"
       @pause="playing = false"
       @ended="playing = false"
-      @error="playable = false"
+      @error="failed"
     />
     <template v-if="playable === false">
       <Icon name="eye-off" :size="15" />
-      <span class="ap__dead">This browser cannot play {{ type || 'this format' }}</span>
+      <span class="ap__dead">{{ playbackError || `This browser cannot play ${type || 'this format'}` }}</span>
     </template>
     <template v-else>
       <button

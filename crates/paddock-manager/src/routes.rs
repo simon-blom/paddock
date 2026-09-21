@@ -647,6 +647,7 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                             Some(serde_json::json!({ "state": "error", "message": e }));
                         return;
                     }
+                    pin_envelope(&mut spec, &state.registry);
                     match vram_admission(&state, AdmitReq::for_spec(&spec, freeing)).await {
                         Err(refusal) => {
                             *job.follow_state
@@ -658,7 +659,6 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                         }
                         Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
                     }
-                    pin_envelope(&mut spec);
                     let outcome = if action == "switch" {
                         // honor the edit page's optimistic-concurrency token:
                         // a config file hand-edited DURING the download is
@@ -985,9 +985,10 @@ const RUNNER_DEFAULT_MAX_BATCH: usize = 32;
 ///
 /// Only fills what is absent: an explicit choice (CLI flag, Studio form, or a
 /// hand-edited file on a verbatim start) always wins.
-fn pin_envelope(spec: &mut crate::supervisor::SpawnSpec) {
-    spec.max_ctx.get_or_insert(RUNNER_DEFAULT_MAX_CTX);
-    spec.max_batch.get_or_insert(RUNNER_DEFAULT_MAX_BATCH);
+fn pin_envelope(spec: &mut crate::supervisor::SpawnSpec, registry: &crate::registry::Registry) {
+    let (ctx, batch) = registry.default_envelope(&spec.model, spec.artifact.as_deref());
+    spec.max_ctx.get_or_insert(ctx);
+    spec.max_batch.get_or_insert(batch);
     // `spec` is deliberately not pinned here. The Studio form writes an
     // explicit value for every model that can speculate (its capability
     // gate hides the control - and omits the key - for the rest), so a
@@ -1230,6 +1231,23 @@ async fn vram_admission(
     if let Some(report) = state.probes.get(&path) {
         use paddock_estimator::{Device, Envelope, Fit, KvDtype, ModelShape, estimate};
         let mut shape = ModelShape::from_report(&report, weights, kind);
+        // Match the resolved file, not an implicit default quant. The same
+        // backend layout contract prices both the catalog and actual admission.
+        let runtime = state
+            .registry
+            .catalog()
+            .models
+            .iter()
+            .flat_map(|m| m.weights())
+            .find(|a| {
+                a.files
+                    .first()
+                    .is_some_and(|f| state.registry.models_dir().join(&f.dest) == path)
+            })
+            .map(|a| &a.runtime);
+        if let Some(memory) = runtime.and_then(|r| r.memory.as_ref()) {
+            memory.apply(&mut shape);
+        }
         // Declared serving scratch (MoE staging) is pinned at load, so the
         // grant has to cover it just like the tower below.
         shape.workspace_bytes = workspace;
@@ -1271,7 +1289,7 @@ async fn vram_admission(
                     .find(|a| a.kind == crate::registry::ArtifactKind::Drafter)
             })
             .map_or(0, |a| a.total_size());
-        let env = Envelope {
+        let mut env = Envelope {
             concurrency: req.max_batch.unwrap_or(RUNNER_DEFAULT_MAX_BATCH).max(1) as u64,
             // The width the RUNNER will serve. A card with no FP8 tensor
             // cores has its fp8 request downgraded to f16 at load
@@ -1296,6 +1314,9 @@ async fn vram_admission(
                 .offload_ram_bytes
                 .map(paddock_estimator::OffloadCost::armed),
         };
+        if let Some(runtime) = runtime {
+            env.kv_dtype = runtime.estimate_kv_dtype(env.kv_dtype);
+        }
         // A fixed budget is the endpoint's whole world - price inside it, not
         // inside the card's residual (see bar 2 above).
         let ceiling = req.fixed_need.unwrap_or(residual);
@@ -1445,6 +1466,17 @@ async fn elections_list(State(state): State<Arc<AppState>>) -> Response {
 async fn relay_responses(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    studio_responses(state, port, body).await
+}
+
+/// Shared authenticated client for the browser relay and embedded native Studio.
+/// The native adapter validates endpoint identity before calling; neither host
+/// receives the runner key. No additional management listener is required.
+pub async fn studio_responses(
+    state: Arc<AppState>,
+    port: u16,
     body: axum::body::Bytes,
 ) -> Response {
     relay_v1(state, port, "v1/responses", body).await
@@ -1944,13 +1976,13 @@ async fn runners_spawn(
     if let Err(e) = perform_evictions(&state, &spec.evict).await {
         return relay_err(StatusCode::CONFLICT, e);
     }
+    pin_envelope(&mut spec, &state.registry);
     match vram_admission(&state, AdmitReq::for_spec(&spec, None)).await {
         Err(msg) => return admission_refused(msg),
         // the grant becomes the endpoint's vram_budget (config-file field);
         // an explicit caller value was already admitted verbatim
         Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
     }
-    pin_envelope(&mut spec);
     // every-server connectors join a new endpoint's config at birth (existing
     // configs were rewritten when the checkbox flipped)
     spec.mcp_servers.extend(crate::connectors::system_entries(
@@ -1967,7 +1999,7 @@ async fn runners_spawn(
         Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": {"type": "spawn_failed", "message": e.to_string()}})),
+            Json(serde_json::json!({"error": {"type": "spawn_failed", "reason": e.reason(), "message": e.to_string()}})),
         )
             .into_response(),
     }
@@ -2107,11 +2139,11 @@ async fn runners_switch(
     }
     // a takeover frees its own incumbent - that VRAM counts as available;
     // the edit gets a FRESH grant (its envelope may have changed)
+    pin_envelope(&mut spec, &state.registry);
     match vram_admission(&state, AdmitReq::for_spec(&spec, Some(port))).await {
         Err(msg) => return admission_refused(msg),
         Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
     }
-    pin_envelope(&mut spec);
     let _ = state.db.note_start_cause(port, "manual");
     match state
         .supervisor
@@ -2167,6 +2199,34 @@ struct ConfigFilePut {
     /// which is what this route has always done.
     #[serde(default)]
     apply: Option<String>,
+    /// Native confirmation binds to the process that was reviewed, not just
+    /// the port. Internal-only: web callers retain their existing semantics.
+    #[serde(skip)]
+    expected_pid: Option<u32>,
+}
+
+/// Native callers supply a Rust-prepared, reviewed patch. Reuse the same
+/// admission and apply semantics without serializing credentials through an
+/// internal HTTP request (or exposing a raw-file API to Swift).
+pub(crate) async fn save_endpoint_file(
+    state: Arc<AppState>,
+    port: u16,
+    content: String,
+    expected: String,
+    deferred: bool,
+    expected_pid: Option<u32>,
+) -> Response {
+    servers_file_put(
+        State(state),
+        axum::extract::Path(port),
+        Json(ConfigFilePut {
+            content,
+            expect_hash: Some(expected),
+            apply: deferred.then(|| "defer".into()),
+            expected_pid,
+        }),
+    )
+    .await
 }
 
 /// The Advanced editor's Save: write the file VERBATIM (hash-guarded) and
@@ -2237,7 +2297,13 @@ async fn servers_file_put(
     }
     match state
         .supervisor
-        .write_config_file(port, &body.content, body.expect_hash.as_deref(), 30_000)
+        .write_config_file(
+            port,
+            &body.content,
+            body.expect_hash.as_deref(),
+            30_000,
+            body.expected_pid,
+        )
         .await
     {
         // `applied` tells the Studio which way the save landed: "live" =
@@ -2441,7 +2507,10 @@ async fn servers_start(
     let _ = state.db.note_start_cause(port, "manual");
     match state.supervisor.start_config(port).await {
         Ok(view) => Json(view).into_response(),
-        Err(e) => relay_err(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"type": "spawn_failed", "reason": e.reason(), "message": e.to_string()}})),
+        ).into_response(),
     }
 }
 
@@ -2930,6 +2999,58 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn default_start_envelope_matches_each_metal_artifact_before_admission() {
+        let registry = crate::registry::Registry::new(std::env::temp_dir()).with_backend("metal");
+        for model in &registry.catalog().models {
+            for artifact in model
+                .weights()
+                .filter(|a| a.runtime.supports_backend("metal"))
+            {
+                let mut spec = crate::supervisor::SpawnSpec {
+                    model: model.id.clone(),
+                    artifact: Some(artifact.id.clone()),
+                    ..Default::default()
+                };
+                pin_envelope(&mut spec, &registry);
+                if let Some(memory) = &artifact.runtime.memory {
+                    assert!(
+                        spec.max_ctx.unwrap() as u64 <= memory.max_ctx,
+                        "{} {} context",
+                        model.id,
+                        artifact.id
+                    );
+                    assert!(
+                        spec.max_batch.unwrap() as u64 <= memory.max_batch,
+                        "{} {} batch",
+                        model.id,
+                        artifact.id
+                    );
+                }
+                let priced = AdmitReq::for_spec(&spec, None);
+                assert_eq!(priced.max_ctx, spec.max_ctx);
+                assert_eq!(priced.max_batch, spec.max_batch);
+            }
+        }
+        for model in [
+            "kb-whisper-large",
+            "nb-whisper-large",
+            "roest-v3-whisper-1.5b",
+        ] {
+            let mut spec = crate::supervisor::SpawnSpec {
+                model: model.into(),
+                ..Default::default()
+            };
+            pin_envelope(&mut spec, &registry);
+            assert_eq!((spec.max_ctx, spec.max_batch), (Some(448), Some(16)));
+            // Never silently shrink a deliberate (even invalid) user choice.
+            spec.max_ctx = Some(4096);
+            spec.max_batch = Some(32);
+            pin_envelope(&mut spec, &registry);
+            assert_eq!((spec.max_ctx, spec.max_batch), (Some(4096), Some(32)));
+        }
+    }
 
     async fn body_json(res: Response) -> serde_json::Value {
         let bytes = res.into_body().collect().await.expect("body").to_bytes();

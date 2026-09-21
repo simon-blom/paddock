@@ -155,8 +155,8 @@ export function isAudioFile(f: { type: string; name: string }): boolean {
  *  scrub bar are honest before any model has answered. Returns undefined when
  *  the browser cannot tell (some containers) - the caller must not invent a
  *  number, it simply shows no duration. */
-export async function audioDuration(blob: Blob): Promise<number | undefined> {
-  const url = URL.createObjectURL(blob)
+export async function audioDuration(blob: Blob | string): Promise<number | undefined> {
+  const url = typeof blob === 'string' ? blob : URL.createObjectURL(blob)
   try {
     return await new Promise<number | undefined>((resolve) => {
       const a = new Audio()
@@ -182,7 +182,7 @@ export async function audioDuration(blob: Blob): Promise<number | undefined> {
       a.src = url
     })
   } finally {
-    URL.revokeObjectURL(url)
+    if (typeof blob !== 'string') URL.revokeObjectURL(url)
   }
 }
 

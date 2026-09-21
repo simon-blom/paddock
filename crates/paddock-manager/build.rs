@@ -10,8 +10,24 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("create static/ for rust-embed");
     println!("cargo:rerun-if-changed={}", dir.display());
 
+    private_catalog();
+
     #[cfg(windows)]
     windows_resource();
+}
+
+// Catalog rows that are not published with the source live in an optional
+// `models.private.toml` beside `models.toml`. `include_str!` cannot ask whether
+// a file exists, so this does: the cfg is set only where the file is, and
+// registry.rs merges its rows behind it. A tree without the file builds
+// exactly the catalog `models.toml` describes.
+fn private_catalog() {
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models.private.toml");
+    println!("cargo:rustc-check-cfg=cfg(private_catalog)");
+    println!("cargo:rerun-if-changed={}", file.display());
+    if file.is_file() {
+        println!("cargo:rustc-cfg=private_catalog");
+    }
 }
 
 // Windows VERSIONINFO + the taskbar icon. The consumer binary - it is what

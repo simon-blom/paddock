@@ -22,7 +22,9 @@ use crate::generator::{FinishSample, GenError, Generator, RowSample};
 use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
 use crate::sampler::{Sampler, SamplingParams, TokenConstraint};
 use crate::spec::NgramDraft;
-use crate::spec_policy::{RoundTally, SpecController, SpecPolicy};
+use crate::spec_policy::{RoundTally, SpecController, SpecPolicy, synchronous_draft_budget};
+
+mod timing;
 
 /// Serving spec-decode row budget per round: total rows (1 pending + drafts
 /// per slot) must fit the models' verify-pass cap. Default 32 matches
@@ -211,6 +213,101 @@ fn serve_spec_k_budget(live: usize, block: Option<usize>) -> usize {
         (b / live).saturating_sub(1)
     };
     k.min(serve_spec_max_k())
+}
+
+/// The row budget's depth, as the backend qualifies it.
+///
+/// Narrowed last by whatever depth the backend has measured its drafter to be
+/// worth (`spec_depth_cap`). The row budget is a width argument and knows
+/// nothing about what a verify row costs on this board, so a backend with a
+/// measured depth curve gets the final say downward - never upward, since the
+/// rows still have to fit.
+fn backend_spec_k_budget(generator: &dyn Generator, live: usize) -> usize {
+    if live == 0 || live > generator.spec_live_cap() || generator.spec_deferred() {
+        return 0;
+    }
+    let qualified = generator
+        .spec_fixed_draft_depth()
+        .unwrap_or_else(|| serve_spec_k_budget(live, generator.spec_block_width()));
+    let qualified = generator
+        .spec_depth_cap()
+        .map_or(qualified, |cap| qualified.min(cap));
+    generator
+        .spec_batch_draft_budget(live)
+        .map_or(qualified, |cap| cap.min(qualified))
+}
+
+fn slot_spec_k(requested: usize, budget: usize, fixed_depth: Option<usize>) -> usize {
+    fixed_depth.unwrap_or(requested).min(budget)
+}
+
+#[test]
+fn fixed_block_depth_bypasses_chain_ramp_but_respects_round_budget() {
+    for requested in [0usize, 1, 2, 7, 15, 31] {
+        for budget in [0usize, 3, 7, 15, 31] {
+            assert_eq!(slot_spec_k(requested, budget, None), requested.min(budget));
+            assert_eq!(slot_spec_k(requested, budget, Some(15)), 15.min(budget));
+        }
+    }
+}
+
+/// Per-position draft acceptance, behind `PADDOCK_SPEC_DEBUG`.
+///
+/// The aggregate "N drafted, M accepted" hides the shape, and the shape is
+/// what says which thing is wrong. A head whose weights are off is weak
+/// everywhere (0.50/0.42/0.38); a head whose chaining is off is strong at
+/// position 0 and collapses after (0.80/0.30/0.10), because each further
+/// draft rides state the previous one produced. The published references for
+/// this family quote exactly this curve - Mia's 0.80/0.59/0.41 -> 2.80 of 4 -
+/// so it is also the only form in which our number can be compared to theirs.
+///
+/// A round that drafted `d` and committed a run of `a` accepted drafts means:
+/// positions 0..a were reached and accepted, position `a` was reached and
+/// rejected (when a < d). So position i's rate is
+/// `reached_and_accepted[i] / reached[i]`.
+fn spec_pos_census(drafted: usize, accepted: usize) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some()) {
+        return;
+    }
+    const K: usize = 16;
+    static REACHED: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    static ACCEPT: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    static TOKENS: AtomicU64 = AtomicU64::new(0);
+    static DRAFTED: AtomicU64 = AtomicU64::new(0);
+    for i in 0..drafted.min(K) {
+        REACHED[i].fetch_add(1, Relaxed);
+        if i < accepted {
+            ACCEPT[i].fetch_add(1, Relaxed);
+        }
+    }
+    DRAFTED.fetch_add(drafted as u64, Relaxed);
+    TOKENS.fetch_add(accepted as u64 + 1, Relaxed);
+    let r = ROUNDS.fetch_add(1, Relaxed) + 1;
+    if r.is_multiple_of(200) {
+        let mut curve = String::new();
+        for i in 0..K {
+            let n = REACHED[i].load(Relaxed);
+            if n == 0 {
+                break;
+            }
+            if i > 0 {
+                curve.push('/');
+            }
+            curve.push_str(&format!("{:.2}", ACCEPT[i].load(Relaxed) as f64 / n as f64));
+        }
+        let (d, t) = (DRAFTED.load(Relaxed) as f64, TOKENS.load(Relaxed) as f64);
+        tracing::info!(
+            "[spec-pos] rounds {r} per-position {curve} | overall {:.1}% of drafts, \
+             {:.2} tokens a round ({:.2} drafted)",
+            100.0 * (t - r as f64) / d,
+            t / r as f64,
+            d / r as f64,
+        );
+    }
 }
 
 /// The operator's speculation policy, from the runner's `spec` config key
@@ -545,6 +642,11 @@ pub enum TokenEvent {
 /// `Instant`s and two counters per sequence, read once at completion.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunStats {
+    /// A stop ID was actually sampled and suppressed from the text stream.
+    /// Length/context limits, client stop strings and discarded speculative
+    /// lookahead do not set this. Consumers add it to emitted-token usage;
+    /// a Stop finish reason alone is not evidence of an extra token.
+    pub sampled_stop: bool,
     /// submit -> admission (serial: pickup off the queue): scheduler wait.
     pub queued_ms: u32,
     /// admission -> prompt fully prefilled. Chunked prefill spans count whole -
@@ -560,6 +662,27 @@ pub struct RunStats {
     /// counting this sequence's whole context - shared prefix pages included.
     /// 0 on the serial path (no paged pool).
     pub kv_pages: u32,
+}
+
+impl RunStats {
+    pub fn terminal_tokens(&self) -> usize {
+        usize::from(self.sampled_stop)
+    }
+}
+
+fn finish_sampled_stop(
+    events: &UnboundedSender<TokenEvent>,
+    metrics: &EngineMetrics,
+    stats: RunStats,
+) {
+    metrics.tokens_generated.fetch_add(1, Relaxed);
+    let _ = events.send(TokenEvent::Done(
+        FinishReason::Stop,
+        RunStats {
+            sampled_stop: true,
+            ..stats
+        },
+    ));
 }
 
 fn dur_ms(d: std::time::Duration) -> u32 {
@@ -1174,6 +1297,22 @@ impl Drop for IdleOnDrop<'_> {
     }
 }
 
+/// Encoder-owned and queued slots have no valid decoder cursor yet.
+fn spec_live_slots(
+    slots: &[Option<Slot>],
+    chunking: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(k, s)| {
+            s.as_ref()
+                .filter(|s| s.prefilled && !chunking.contains(&k))
+                .map(|_| k)
+        })
+        .collect()
+}
+
 /// Per-slot spec warmth for one round, in the order the round will see the
 /// slots. Two passes when a RING drafter (DFlash) owns the round at this
 /// width: the cheap ring probe first - a ring-cold slot under a DFlash round
@@ -1364,6 +1503,7 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
 
     let t_prefilled = std::time::Instant::now();
     let stats = |t_prefilled: std::time::Instant| RunStats {
+        sampled_stop: false,
         queued_ms,
         prefill_ms: dur_ms(t_prefilled.saturating_duration_since(t_admit)),
         decode_ms: dur_ms(t_prefilled.elapsed()),
@@ -1406,9 +1546,7 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
             }
         };
         if req.stop_tokens.contains(&next) {
-            let _ = req
-                .events
-                .send(TokenEvent::Done(FinishReason::Stop, stats(t_prefilled)));
+            finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
             return;
         }
         history.push(next);
@@ -1469,9 +1607,7 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
                         if got < enqueued {
                             let _ = generator.decode_pipe_drain();
                         }
-                        let _ = req
-                            .events
-                            .send(TokenEvent::Done(FinishReason::Stop, stats(t_prefilled)));
+                        finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
                         return;
                     }
                     history.push(id);
@@ -1523,9 +1659,7 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
                         }
                     };
                     if req.stop_tokens.contains(&nxt) {
-                        let _ = req
-                            .events
-                            .send(TokenEvent::Done(FinishReason::Stop, stats(t_prefilled)));
+                        finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
                         return;
                     }
                     history.push(nxt);
@@ -1569,9 +1703,7 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
             }
         };
         if req.stop_tokens.contains(&next) {
-            let _ = req
-                .events
-                .send(TokenEvent::Done(FinishReason::Stop, stats(t_prefilled)));
+            finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
             return;
         }
         history.push(next);
@@ -1697,6 +1829,7 @@ impl Slot {
             None => (0, 0),
         };
         RunStats {
+            sampled_stop: false,
             queued_ms,
             prefill_ms,
             decode_ms,
@@ -1718,6 +1851,13 @@ impl Slot {
         self.spec_drafted += drafted as u32;
         self.spec_accepted += accepted as u32;
         tick.book(drafted, accepted);
+        // Here, not at a call site: there are six accept paths (mixed, the
+        // batched plans, the single-slot walks) and which one runs depends on
+        // the batch shape, so a census hung off one of them silently reports
+        // nothing at the width that does not take it. That is exactly what the
+        // first cut did - instrumented the MIXED path and printed no curve at
+        // all at c1.
+        spec_pos_census(drafted, accepted);
     }
 
     /// Repurpose this slot for recompute after its KV was freed under pool
@@ -1745,9 +1885,7 @@ impl Slot {
     /// happened) - the caller then frees the slot.
     fn accept(&mut self, next: u32, logprobs: Option<TokenLogprobs>) -> bool {
         if self.stop_tokens.contains(&next) {
-            let _ = self
-                .events
-                .send(TokenEvent::Done(FinishReason::Stop, self.run_stats()));
+            finish_sampled_stop(&self.events, &self.metrics, self.run_stats());
             return false;
         }
         self.history.push(next);
@@ -2113,6 +2251,7 @@ fn admit(
 ) -> bool {
     if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
         tracing::info!(
+            queued_ms = req.submitted.map(|t| t.elapsed().as_secs_f64() * 1000.),
             "req-trace: admit {} tokens at {}",
             req.prompt.len(),
             trace_us()
@@ -2184,16 +2323,61 @@ const POOL_WATERMARK_BLOCKS: usize = 32;
 /// at most the quiet-gap (2 ms) after the last arrival, only fires when a
 /// burst is already forming (>=2 admitted this tick) with nothing decoding
 /// (a live-decode latecomer takes the cheap chunked join instead), and c1
-/// never pays (admitted stays 1).
+/// never pays (admitted stays 1), unless a qualified backend explicitly opts
+/// an idle multi-slot server into a separate, at-most-2-ms lone grace below.
 ///
 /// DEFAULT on (kill: PADDOCK_NO_COHORT_FUSE). With it off, most synchronized
 /// c32 runs land in the split mode; with it on they run clean. c1 latency is
-/// unchanged (the gate never fires at admitted==1), and the fused-round cost
-/// is just the 2 ms quiet-gap per burst - a rounding error against a c32
-/// round.
+/// unchanged for default backends (the gate never fires at admitted==1), and
+/// the fused-round cost is just the 2 ms quiet-gap per burst - a rounding error
+/// against a c32 round.
 fn cohort_fuse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_COHORT_FUSE").is_none())
+}
+
+fn lone_cohort_grace(
+    active: usize,
+    admitted: u32,
+    text_only: bool,
+    hint: std::time::Duration,
+) -> std::time::Duration {
+    if active == 0 && admitted == 1 && text_only {
+        hint.min(std::time::Duration::from_millis(2))
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+#[cfg(test)]
+mod cohort_grace_tests {
+    use super::lone_cohort_grace;
+    use std::time::Duration;
+
+    #[test]
+    fn only_idle_lone_text_can_opt_in_and_never_exceeds_two_ms() {
+        let hint = Duration::from_millis(100);
+        for active in [0, 1, 4] {
+            for admitted in [0, 1, 2, 4] {
+                for text in [false, true] {
+                    let expected = if active == 0 && admitted == 1 && text {
+                        Duration::from_millis(2)
+                    } else {
+                        Duration::ZERO
+                    };
+                    assert_eq!(lone_cohort_grace(active, admitted, text, hint), expected);
+                }
+            }
+        }
+        assert_eq!(
+            lone_cohort_grace(0, 1, true, Duration::ZERO),
+            Duration::ZERO
+        );
+        assert_eq!(
+            lone_cohort_grace(0, 1, true, Duration::from_micros(350)),
+            Duration::from_micros(350)
+        );
+    }
 }
 
 /// Live-REQUEST floor (slots holding a request, chunking or decoding) for
@@ -2350,6 +2534,38 @@ fn run_batched(
     // (forward_spec_batch -> Ok(None)) or the env pin turns them off.
     let spec_supported =
         paddock_models::dev_var_os!("PADDOCK_NO_SERVE_SPEC").is_none() && !spec_policy.is_off();
+    // Say so when the operator asked for speculation and this serve cannot do
+    // it. Until 2026-09-19 that combination was silent: `--spec on --mtp <head>`
+    // loaded the drafter, held its VRAM (2.74 GiB on Flash-Next) and then
+    // served every token dense, at exactly the no-spec rate. A user reported it
+    // as "we cannot get above 25 tok/s" and the only way to tell from outside
+    // was to scrape paddock_spec_decode_draft_tokens_total and find a zero.
+    // A serving envelope the operator explicitly asked for and did not get is
+    // the definition of a silent failure, so it is a WARN on every serve.
+    if spec_supported && !generator.spec_capable() {
+        tracing::warn!(
+            policy = %spec_policy,
+            "speculation was requested (spec = {spec_policy}) but this serve CANNOT speculate: \
+             no drafter is resident, or the kernel pack lacks an entry the spec path needs. \
+             Every token will decode at the no-spec rate. Check that a drafter is attached \
+             (--mtp for a sideloaded head, or an in-file MTP block) and that the kernel pack \
+             in use ships the sampling entries; `paddock_spec_decode_draft_tokens_total` on \
+             /metrics stays 0 while this holds."
+        );
+    }
+    // Watchdog for the other half of the same failure: capable AND enabled,
+    // and still drafting nothing. Capability is a load-time answer; drafting is
+    // a per-round one, and a drafter that never gets warm (or whose rounds are
+    // all declined) reproduces the exact user-visible symptom with every
+    // startup check passing. Counted over ticks that actually ran a spec round,
+    // and said ONCE - this is a serving-envelope fault, not a per-tick event.
+    let mut spec_rounds_seen = 0u64;
+    let mut spec_drafted_seen = 0u64;
+    let mut spec_silent_warned = false;
+    // ~256 decoding rounds is a few seconds of serving at any width, and far
+    // past the cooldown a legitimately-declining drafter uses (see the Ok(None)
+    // note above), so it cannot fire on a drafter that is merely warming up.
+    const SPEC_SILENT_ROUNDS: u64 = 256;
     // Ok(None) is a COOLDOWN, not a permanent disable: model drafters (MTP)
     // legitimately decline single ticks (stale per-slot state after a dense
     // interlude, non-contiguous live set) and become eligible again at the
@@ -2381,6 +2597,7 @@ fn run_batched(
     // same backend clamp for the host-2a greedy round (its own gate is the
     // row budget, which doesn't know about a VRAM-degraded draft alloc)
     let spec_live_cap = generator.spec_live_cap();
+    let fixed_draft_depth = generator.spec_fixed_draft_depth();
     // Fused device sampling: eligible decode rows come back as bare token ids
     // instead of [B, vocab] logits (25.7 MB/step at B=32) + host sampling.
     // Probed before any per-row uniforms are drawn, so seed streams never pay
@@ -2581,6 +2798,28 @@ fn run_batched(
             if !mixed || spec_book_mixed() {
                 spec_ctl.observe(live, k, t0.elapsed().as_secs_f64(), tick_tally);
             }
+            // The watchdog reads the tick that just closed: k > 0 means this
+            // round asked for drafts, so a round that asked and got none is the
+            // thing being counted. k == 0 is a plain dense tick and proves
+            // nothing about the drafter.
+            if spec_supported && k > 0 {
+                spec_rounds_seen += 1;
+                spec_drafted_seen += tick_tally.drafted as u64;
+                if !spec_silent_warned
+                    && spec_rounds_seen >= SPEC_SILENT_ROUNDS
+                    && spec_drafted_seen == 0
+                {
+                    spec_silent_warned = true;
+                    tracing::warn!(
+                        rounds = spec_rounds_seen,
+                        "speculation is enabled and the backend reports it is capable, but \
+                         {spec_rounds_seen} rounds have drafted ZERO tokens - this serve is \
+                         running at the no-spec rate while paying for a resident drafter. \
+                         The drafter is never reaching a warm slot (PADDOCK_SPEC_DEBUG=1 \
+                         prints the per-round chunk lengths)."
+                    );
+                }
+            }
         }
         tick_tally = RoundTally::default();
         crate::tickseg::maybe_dump();
@@ -2632,18 +2871,19 @@ fn run_batched(
         {
             last_stall_warn = Some(std::time::Instant::now());
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-            tracing::warn!(
-                "tick-stall phases: admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode+sample {:.0} ms",
-                ms(ph_admit),
-                ms(ph_prefill.saturating_sub(ph_admit)),
-                ms(ph_mixed.saturating_sub(ph_prefill)),
-                ms(ph_spec.saturating_sub(ph_mixed)),
-                ms(ph_decode.saturating_sub(ph_spec)),
+            let (phase, early_exit_phase) = timing::spans(
+                tick_wall,
+                [ph_admit, ph_prefill, ph_mixed, ph_spec, ph_decode],
             );
             tracing::warn!(
-                "tick-stall phases: decode {:.0} sample+emit {:.0} ms",
-                ms(ph_decode.saturating_sub(ph_spec)),
-                ms(tick_wall.saturating_sub(ph_decode)),
+                ?early_exit_phase,
+                "tick-stall phases: admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode {:.0} sample+emit {:.0} ms (unfinished branch includes its emit work)",
+                ms(phase[0]),
+                ms(phase[1]),
+                ms(phase[2]),
+                ms(phase[3]),
+                ms(phase[4]),
+                ms(phase[5]),
             );
             tracing::warn!(
                 "tick-stall: {:.0} ms wall (live {active}, chunking {}, preempted {})",
@@ -2870,16 +3110,42 @@ fn run_batched(
         // Cohort-fuse linger - see cohort_fuse() for the trace evidence. Exit
         // after 2 ms of silence or the 8 ms hard cap; every admit here is one
         // the drain above would have taken next round at +~190 ms TTFT.
-        if cohort_fuse() && active == 0 && admitted_now >= 2 {
+        let lone_grace = if active == 0 && admitted_now == 1 && slots.iter().flatten().count() == 1
+        {
+            lone_cohort_grace(
+                active,
+                admitted_now,
+                slots.iter().flatten().all(|s| s.mm.is_none()) && mm_pending.is_none(),
+                slots
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or(std::time::Duration::ZERO, |s| {
+                        generator.idle_admission_grace(&s.prompt)
+                    }),
+            )
+        } else {
+            std::time::Duration::ZERO
+        };
+        if cohort_fuse() && active == 0 && (admitted_now >= 2 || !lone_grace.is_zero()) {
             // caps env-tunable for the c128 cohort-former (defaults = shipped
             // 8ms/2ms): a 128-connection ramp takes ~25ms+ and the 8ms cap
             // splits it into sub-cohorts before any downstream collector runs.
             let hard_ms = static_env_u64("PADDOCK_COHORT_FUSE_HARD_MS", 8);
             let quiet_ms = static_env_u64("PADDOCK_COHORT_FUSE_QUIET_MS", 2);
-            let hard = std::time::Instant::now() + std::time::Duration::from_millis(hard_ms);
+            // A qualified lone admission shares this window; do not stack a
+            // second linger or extend its deadline on repeated arrivals.
+            let hard_budget = std::time::Duration::from_millis(hard_ms);
+            let quiet_budget = std::time::Duration::from_millis(quiet_ms);
+            let (hard_budget, quiet_budget) = if lone_grace.is_zero() {
+                (hard_budget, quiet_budget)
+            } else {
+                (hard_budget.min(lone_grace), quiet_budget.min(lone_grace))
+            };
+            let hard = std::time::Instant::now() + hard_budget;
             let mut quiet = std::time::Instant::now();
             while std::time::Instant::now() < hard
-                && quiet.elapsed() < std::time::Duration::from_millis(quiet_ms)
+                && quiet.elapsed() < quiet_budget
                 && mm_pending.is_none()
                 && slots.iter().any(|s| s.is_none())
                 && admit_budget.is_none_or(|b| b > POOL_WATERMARK_BLOCKS)
@@ -2923,11 +3189,21 @@ fn run_batched(
         // Late admissions after the population thins do warm and join spec.
         {
             let live_now = slots.iter().filter(|s| s.is_some()).count();
-            generator.spec_warm_hint(live_now <= dev_spec_live_max);
+            // ...and only while speculation is actually the plan for this
+            // width. The caps below are structural ("could a round serve this
+            // cohort at all"); they cannot see a controller that has measured
+            // this bucket and decided not to speculate. At 8 live slots
+            // Flash-Next sits inside every cap, picks k=0 - and used to keep
+            // paying a head pass per slot per tick for drafts nobody would
+            // ask for: 19 ms of a 45 ms tick, which is the whole c8 margin
+            // (2026-09-17).
+            let plan_spec = spec_supported
+                && spec_ctl.will_speculate(live_now, backend_spec_k_budget(generator, live_now));
+            generator.spec_warm_hint(plan_spec && live_now <= dev_spec_live_max);
             // Widths above the spec engagement cap take the dense route (the
             // `greedy` gate below tests the same bound), so a drafter fused
             // from every forward would be feeding a ring nothing reads.
-            generator.spec_fuse_hint(live_now <= spec_live_cap);
+            generator.spec_fuse_hint(plan_spec && live_now <= spec_live_cap);
         }
         // Chunked prefill for all text admissions, cold bursts included: the
         // multi-chunk queue packs up to 8 prompts into the same 2048-row
@@ -3016,6 +3292,19 @@ fn run_batched(
             // accepted wave must not be held by a coalescing timer that exists
             // to delay new admissions - that would be a stall of exactly the
             // kind this removes, just moved.
+            // Encoder-owned slots are not in `chunking` yet. Reclaim a
+            // disconnected upload before spending its next encoder budget.
+            let cancelled: Vec<_> = mm_encoding
+                .iter()
+                .copied()
+                .filter(|&k| slots[k].as_ref().is_none_or(|s| s.events.is_closed()))
+                .collect();
+            for k in cancelled {
+                if generator.prefill_abort(k) {
+                    mm_encoding.remove(&k);
+                    slots[k] = None;
+                }
+            }
             if generator.encoding_pending() {
                 metrics.phase.store(PHASE_PREFILL, Relaxed);
                 let seg_t = std::time::Instant::now();
@@ -3376,7 +3665,7 @@ fn run_batched(
             let has_decode = slots
                 .iter()
                 .enumerate()
-                .any(|(k, s)| s.is_some() && !chunking.contains(&k));
+                .any(|(k, s)| s.as_ref().is_some_and(|s| s.prefilled) && !chunking.contains(&k));
             if dpc > 0 && has_decode {
                 dp_count += 1;
                 if dp_count > dpc {
@@ -3435,6 +3724,7 @@ fn run_batched(
             // slots warm via the verify's h re-point in one tick.
             // Kill: PADDOCK_NO_MIXED_SPEC restores fusion-first.
             let spec_mixed_first = samp_supported
+                && !generator.spec_deferred()
                 && paddock_models::dev_var_os!("PADDOCK_NO_MIXED_SPEC").is_none()
                 && generator.spec_live_cap() != usize::MAX // spec actually on
                 && !dec.is_empty()
@@ -3733,6 +4023,7 @@ fn run_batched(
             let no_mixed_spec = paddock_models::dev_var_os!("PADDOCK_NO_MIXED_SPEC").is_some();
             if samp_supported
                 && !no_mixed_spec
+                && !generator.spec_deferred()
                 && !dec.is_empty()
                 && dec.len() <= dev_spec_live_max
                 && dec.iter().all(|&(k, _, _)| {
@@ -3761,8 +4052,7 @@ fn run_batched(
                 let warm: Vec<bool> = spec_warm_vec(generator, &slots, &dec_ks);
                 let k_budget = spec_ctl.pick_k(
                     dec.len(),
-                    serve_spec_k_budget(dec.len(), generator.spec_block_width())
-                        .min(serve_spec_mixed_k_cap()),
+                    backend_spec_k_budget(generator, dec.len()).min(serve_spec_mixed_k_cap()),
                 );
                 if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
                     tracing::info!(
@@ -3825,7 +4115,14 @@ fn run_batched(
                     None
                 };
                 let model_drafts = if want_drafts && async_mk.is_none() {
-                    match generator.spec_draft_batch(&pendings, k_budget) {
+                    let draft_k = synchronous_draft_budget(
+                        k_budget,
+                        generator.spec_block_width(),
+                        pendings
+                            .iter()
+                            .map(|&(k, _)| slots[k].as_ref().expect("warm").k_now),
+                    );
+                    match generator.spec_draft_batch(&pendings, draft_k) {
                         Ok(d) => d,
                         Err(e) => {
                             if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
@@ -3852,11 +4149,12 @@ fn run_batched(
                                 // contract - chain-cold entries stay
                                 // length-1 exactly like the sync path
                                 if kept.get(wi).copied().unwrap_or(false) {
-                                    let cap = slot.k_now.min(k_budget).min(*ke);
+                                    let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth)
+                                        .min(*ke);
                                     chunk.resize(1 + cap, pending);
                                 }
                             } else if let Some(d) = drafts.as_ref() {
-                                let cap = slot.k_now.min(k_budget);
+                                let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth);
                                 chunk.extend(d[wi].iter().copied().take(cap));
                             }
                             wi += 1;
@@ -4434,6 +4732,9 @@ fn run_batched(
                             let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                         }
                     }
+                    for &k in chunking.iter() {
+                        generator.prefill_abort(k);
+                    }
                     chunking.clear();
                 }
             }
@@ -4456,16 +4757,15 @@ fn run_batched(
         // verify pass's own next token - several tokens per weight read.
         // Any sampling slot forces the dense path (it needs full logits).
         spec_ticks += 1;
-        if spec_supported && spec_ticks >= spec_retry_at {
+        if spec_supported && spec_ticks >= spec_retry_at && !generator.spec_deferred() {
             // chunking slots are mid-prefill - Never decodable rows. The
             // original gate made this vacuous (pure-decode only ran with
             // chunking empty); the decode-priority interleave runs this path
             // with chunking slots waiting, so the filter is load-bearing.
-            let live: Vec<usize> = slots
-                .iter()
-                .enumerate()
-                .filter_map(|(k, s)| s.as_ref().filter(|_| !chunking.contains(&k)).map(|_| k))
-                .collect();
+            // The encoder has taken an image slot's chunks but has not
+            // published it into `chunking`: absence from that set alone is
+            // not evidence of a valid decode cursor.
+            let live = spec_live_slots(&slots, &chunking);
             // constrained slots force the dense path too: spec picks are
             // device argmaxes, computed where no mask can apply
             let greedy = !live.is_empty()
@@ -4476,21 +4776,67 @@ fn run_batched(
                     s.sampler.is_pure_greedy()
                         && s.constraint.is_none()
                         && s.logprobs.is_none()
-                        // multimodal slots: image patches advance the KV
-                        // position past the token history, so drafts can't be
-                        // position-synced (history[..pos] would also OOB and
-                        // panic the mmproj path). Dense path.
-                        && s.pos as usize <= s.history.len()
+                        // Token-replay drafts cannot bridge image rows.
+                        // Native KV-space drafters can, without slicing a
+                        // token history at a multimodal KV cursor.
+                        && (s.pos as usize <= s.history.len() || generator.spec_draft_kv_space())
                 });
-            if greedy {
-                let k_budget = spec_ctl.pick_k(
-                    live.len(),
-                    serve_spec_k_budget(live.len(), generator.spec_block_width()),
-                );
+            // Is this cohort eligible for the DEVICE-SAMPLED round (phase
+            // 2b-dev below)? Hoisted out of its `else if` so the controller can
+            // be consulted once per tick, before either branch commits to a
+            // round - see the k=0 arm.
+            let dev_ok = !greedy
+                && !live.is_empty()
+                && live.len() <= dev_spec_live_max
+                && live.len() <= {
+                    // gemma4 caps draft engagement (PADDOCK_G4_SPEC_LIVE_MAX,
+                    // set at attach on cc10). Beyond it every chunk would be
+                    // length-1 - a plain tick that BLOCKS the pipelined phase
+                    // 2 below - so fall through instead.
+                    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                    *CAP.get_or_init(|| {
+                        paddock_models::dev_var!("PADDOCK_G4_SPEC_LIVE_MAX")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(usize::MAX)
+                    })
+                }
+                && live.iter().all(|&k| {
+                    let s = slots[k].as_ref().expect("live");
+                    (s.sampler.is_device_plannable()
+                        || (generator.supports_device_trunc() && s.sampler.is_trunc_plannable()))
+                        && s.constraint.is_none()
+                        && s.logprobs.is_none()
+                });
+            // One decision per tick, and only for a cohort that could actually
+            // ride a round (an ineligible one must not consume a warm-start
+            // anchor it can never measure).
+            let k_budget = if greedy || dev_ok {
+                spec_ctl.pick_k(live.len(), backend_spec_k_budget(generator, live.len()))
+            } else {
+                0
+            };
+            if (greedy || dev_ok) && k_budget == 0 {
+                // K=0 means don't speculate, and that has to be the dense tick
+                // rather than a round with no drafts. A chunk-per-slot of
+                // length 1 still pays the backend's whole round to commit
+                // exactly what a decode tick commits - and on this family a
+                // round copies the GDN state and the PLE ring, then walks a
+                // prefill-shaped wave. Measured at 8 live slots (2026-09-17):
+                // those rows=8/committed=8 rounds booked ~44 ms against the
+                // dense tick's ~26, so a bucket that converged on k=0 ran the
+                // whole serve 40% under its own no-spec throughput, and the
+                // k=0 cell every other K is judged against was itself measured
+                // on the round instead of the tick it names. Booking the tick
+                // here is also what finally makes that cell honest.
+                tick_open = Some((std::time::Instant::now(), live.len(), 0, false));
+            } else if greedy {
                 if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
                     tracing::info!(
                         "[spec-kb] decode live={} k_budget={k_budget} ladder={} max_rows={}",
                         live.len(),
+                        // the row budget's own answer, uncapped - printing the
+                        // capped value here would hide the election doing its job
                         serve_spec_k_budget(live.len(), generator.spec_block_width()),
                         serve_spec_max_rows()
                     );
@@ -4528,7 +4874,14 @@ fn run_batched(
                 // chains still do - a cold slot there desyncs.
                 let per_slot_warm = generator.spec_draft_per_slot_warm();
                 let model_drafts = if k_budget > 0 && (all_warm || per_slot_warm) {
-                    match generator.spec_draft_batch(&pendings, k_budget) {
+                    let draft_k = synchronous_draft_budget(
+                        k_budget,
+                        generator.spec_block_width(),
+                        pendings
+                            .iter()
+                            .map(|&(k, _)| slots[k].as_ref().expect("live").k_now),
+                    );
+                    match generator.spec_draft_batch(&pendings, draft_k) {
                         Ok(d) => d,
                         Err(e) => {
                             if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
@@ -4547,7 +4900,7 @@ fn run_batched(
                     if k_budget > 0 {
                         match model_drafts.as_ref() {
                             Some(d) if !d[i].is_empty() => {
-                                let cap = slot.k_now.min(k_budget);
+                                let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth);
                                 chunk.extend(d[i].iter().copied().take(cap));
                             }
                             // The model drafter declined this slot (cold ring,
@@ -4646,29 +4999,7 @@ fn run_batched(
                         continue;
                     }
                 }
-            } else if !live.is_empty()
-                && live.len() <= dev_spec_live_max
-                && live.len() <= {
-                    // gemma4 caps DRAFT engagement (PADDOCK_G4_SPEC_LIVE_MAX,
-                    // set at attach on cc10). Beyond it every chunk would be
-                    // length-1 - a plain tick that BLOCKS the pipelined phase
-                    // 2 below - so fall through instead.
-                    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                    *CAP.get_or_init(|| {
-                        paddock_models::dev_var!("PADDOCK_G4_SPEC_LIVE_MAX")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(usize::MAX)
-                    })
-                }
-                && live.iter().all(|&k| {
-                    let s = slots[k].as_ref().expect("live");
-                    (s.sampler.is_device_plannable()
-                        || (generator.supports_device_trunc() && s.sampler.is_trunc_plannable()))
-                        && s.constraint.is_none()
-                        && s.logprobs.is_none()
-                })
-            {
+            } else if dev_ok {
                 // Phase 2b-dev: DEVICE-SAMPLED speculative round - every live
                 // slot is greedy or temperature-only, so each verify row is
                 // sampled on device with a pre-drawn plan (the dense
@@ -4699,12 +5030,9 @@ fn run_batched(
                 // chunks; the verify's h re-point warms them for next tick.
                 let t0s = std::time::Instant::now(); // spec bucket: warmth + chain + verify
                 let warm: Vec<bool> = spec_warm_vec(generator, &slots, &live);
-                let k_budget = spec_ctl.pick_k(
-                    live.len(),
-                    serve_spec_k_budget(live.len(), generator.spec_block_width()),
-                );
+                // k_budget was decided before the branch (and is > 0 here)
                 tick_open = Some((std::time::Instant::now(), live.len(), k_budget, false));
-                let any_warm = k_budget > 0 && warm.iter().any(|&w| w);
+                let any_warm = warm.iter().any(|&w| w);
                 let pendings: Vec<(usize, u32)> = if any_warm {
                     live.iter()
                         .zip(&warm)
@@ -4746,7 +5074,14 @@ fn run_batched(
                 let model_drafts = if async_k.is_some() || !any_warm {
                     None
                 } else {
-                    match generator.spec_draft_batch(&pendings, k_budget) {
+                    let draft_k = synchronous_draft_budget(
+                        k_budget,
+                        generator.spec_block_width(),
+                        pendings
+                            .iter()
+                            .map(|&(k, _)| slots[k].as_ref().expect("warm").k_now),
+                    );
+                    match generator.spec_draft_batch(&pendings, draft_k) {
                         Ok(d) => d,
                         Err(e) => {
                             if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
@@ -4770,11 +5105,12 @@ fn run_batched(
                                 // chain-cold entries stay length-1 exactly
                                 // like the sync path (row counts = graph keys)
                                 if kept.get(wi).copied().unwrap_or(false) {
-                                    let cap = slot.k_now.min(k_budget).min(*ke);
+                                    let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth)
+                                        .min(*ke);
                                     chunk.resize(1 + cap, slot.pending);
                                 }
                             } else if let Some(d) = drafts.as_ref() {
-                                let cap = slot.k_now.min(k_budget);
+                                let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth);
                                 chunk.extend(d[wi].iter().copied().take(cap));
                             }
                             wi += 1;
@@ -4861,6 +5197,7 @@ fn run_batched(
                                         chunk_len - 1,
                                         sa.accepted.saturating_sub(1),
                                     );
+
                                     slot.pos += sa.accepted as u32;
                                     slot.pending = sa.pending;
                                     let mut slot_dead = false;
@@ -5227,14 +5564,21 @@ fn run_batched(
                             && s.logprobs.is_none()
                     });
                 if spec_safe {
-                    let k_budget = serve_spec_k_budget(live.len(), generator.spec_block_width());
+                    let k_budget = backend_spec_k_budget(generator, live.len());
                     let pendings: Vec<(usize, u32)> = live
                         .iter()
                         .map(|&k| (k, slots[k].as_ref().expect("live").pending))
                         .collect();
                     let model_drafts = if k_budget > 0 {
+                        let draft_k = synchronous_draft_budget(
+                            k_budget,
+                            generator.spec_block_width(),
+                            pendings
+                                .iter()
+                                .map(|&(k, _)| slots[k].as_ref().expect("live").k_now),
+                        );
                         generator
-                            .spec_draft_batch(&pendings, k_budget)
+                            .spec_draft_batch(&pendings, draft_k)
                             .unwrap_or(None)
                     } else {
                         None
@@ -5247,7 +5591,7 @@ fn run_batched(
                         for (i, &k) in live.iter().enumerate() {
                             let slot = slots[k].as_ref().expect("live");
                             let mut chunk = vec![slot.pending];
-                            let cap = slot.k_now.min(k_budget);
+                            let cap = slot_spec_k(slot.k_now, k_budget, fixed_draft_depth);
                             chunk.extend(drafts[i].iter().copied().take(cap));
                             reqs.push((k, slot.pos as usize, chunk));
                         }
@@ -6038,6 +6382,169 @@ fn sample_slot_row(slot_opt: &mut Option<Slot>, row: &mut [f32]) {
 mod usage_tests {
     use super::*;
 
+    #[test]
+    fn sampled_stop_is_counted_but_never_emitted_or_added_to_history() {
+        for immediate in [false, true] {
+            let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let metrics = Arc::new(EngineMetrics::default());
+            let mut slot = Slot::new(
+                GenRequest {
+                    prompt: vec![7, 8],
+                    max_tokens: 8,
+                    sampler: SamplingParams::default(),
+                    stop_tokens: vec![42],
+                    events,
+                    mm_chunks: None,
+                    constraint: None,
+                    logprobs: None,
+                    submitted: None,
+                },
+                metrics.clone(),
+            );
+            if !immediate {
+                assert!(slot.accept(10, None));
+                assert!(matches!(
+                    rx.try_recv(),
+                    Ok(TokenEvent::Token { id: 10, .. })
+                ));
+            }
+            assert!(!slot.accept(42, None));
+            let TokenEvent::Done(FinishReason::Stop, stats) = rx.try_recv().unwrap() else {
+                panic!("missing stop")
+            };
+            assert_eq!(stats.terminal_tokens(), 1);
+            assert_eq!(
+                metrics.tokens_generated.load(Relaxed),
+                if immediate { 1 } else { 2 }
+            );
+            assert!(!slot.history.contains(&42));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn length_finish_does_not_invent_a_terminal_token() {
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = Arc::new(EngineMetrics::default());
+        let mut slot = Slot::new(
+            GenRequest {
+                prompt: vec![7],
+                max_tokens: 1,
+                sampler: SamplingParams::default(),
+                stop_tokens: vec![42],
+                events,
+                mm_chunks: None,
+                constraint: None,
+                logprobs: None,
+                submitted: None,
+            },
+            metrics.clone(),
+        );
+        assert!(!slot.accept(10, None));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TokenEvent::Token { id: 10, .. })
+        ));
+        let TokenEvent::Done(FinishReason::Length, stats) = rx.try_recv().unwrap() else {
+            panic!("missing length finish")
+        };
+        assert_eq!(stats.terminal_tokens(), 0);
+        assert_eq!(metrics.tokens_generated.load(Relaxed), 1);
+    }
+
+    struct DeferringSpec {
+        deferred: bool,
+        cap: Option<usize>,
+    }
+    impl Generator for DeferringSpec {
+        fn reset(&mut self) {}
+        fn forward(&mut self, _: u32) -> Result<Vec<f32>, GenError> {
+            panic!("policy test performs no inference")
+        }
+        fn vocab(&self) -> usize {
+            2
+        }
+        fn spec_live_cap(&self) -> usize {
+            4
+        }
+        fn spec_fixed_draft_depth(&self) -> Option<usize> {
+            Some(15)
+        }
+        fn spec_deferred(&self) -> bool {
+            self.deferred
+        }
+        fn spec_batch_draft_budget(&self, live: usize) -> Option<usize> {
+            (live == 4).then_some(self.cap).flatten()
+        }
+    }
+
+    #[test]
+    fn backend_spec_budget_defers_and_resumes_without_changing_capacity() {
+        let mut g = DeferringSpec {
+            deferred: false,
+            cap: None,
+        };
+        assert_eq!(backend_spec_k_budget(&g, 0), 0);
+        for live in 1..=4 {
+            assert_eq!(backend_spec_k_budget(&g, live), 15);
+        }
+        assert_eq!(backend_spec_k_budget(&g, 5), 0);
+        g.deferred = true;
+        for live in 0..=5 {
+            assert_eq!(backend_spec_k_budget(&g, live), 0);
+        }
+        assert_eq!(g.spec_live_cap(), 4);
+        g.deferred = false;
+        assert_eq!(backend_spec_k_budget(&g, 3), 15);
+        g.cap = Some(7);
+        assert_eq!(backend_spec_k_budget(&g, 4), 7);
+        assert_eq!(backend_spec_k_budget(&g, 3), 15);
+        g.cap = Some(31);
+        assert_eq!(backend_spec_k_budget(&g, 4), 15);
+        g.cap = Some(0);
+        assert_eq!(backend_spec_k_budget(&g, 4), 0);
+        g.cap = Some(7);
+        g.deferred = true;
+        assert_eq!(backend_spec_k_budget(&g, 4), 0);
+    }
+
+    #[test]
+    fn speculation_waits_for_encoder_and_prefill_publication() {
+        let make = || {
+            let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+            Slot::new(
+                GenRequest {
+                    prompt: vec![1, 2],
+                    max_tokens: 8,
+                    sampler: SamplingParams::default(),
+                    stop_tokens: Vec::new(),
+                    events,
+                    mm_chunks: None,
+                    constraint: None,
+                    logprobs: None,
+                    submitted: None,
+                },
+                Arc::new(EngineMetrics::default()),
+            )
+        };
+        let mut slots = vec![Some(make()), Some(make()), None, Some(make())];
+        let mut chunking = std::collections::HashSet::new();
+        // Encoder has taken mm, but is not yet a chunked prompt. This exact
+        // state incorrectly entered target verification at KV position zero.
+        assert!(spec_live_slots(&slots, &chunking).is_empty());
+        slots[1].as_mut().unwrap().prefilled = true;
+        assert_eq!(spec_live_slots(&slots, &chunking), [1]);
+        chunking.insert(0);
+        assert_eq!(spec_live_slots(&slots, &chunking), [1]);
+        // Publish an image prompt: real KV cursor can exceed token history.
+        let s = slots[0].as_mut().unwrap();
+        s.prefilled = true;
+        s.pos = 576;
+        assert_eq!(spec_live_slots(&slots, &chunking), [1]);
+        chunking.remove(&0);
+        assert_eq!(spec_live_slots(&slots, &chunking), [0, 1]);
+    }
+
     /// A generator whose multimodal prefill runs a row count deliberately
     /// unrelated to the prompt's token count - which is what a picture does:
     /// one `<image>` chunk becomes hundreds or thousands of rows.
@@ -6240,14 +6747,26 @@ mod serial_pipe_tests {
         );
         let mut toks = Vec::new();
         let mut fin = None;
+        let mut terminal_tokens = 0;
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 TokenEvent::Token { id, .. } => toks.push(id),
-                TokenEvent::Done(r, _) => fin = Some(r),
+                TokenEvent::Done(r, stats) => {
+                    fin = Some(r);
+                    terminal_tokens = stats.terminal_tokens();
+                }
                 TokenEvent::Error(e) => panic!("engine error: {e:?}"),
                 _ => {}
             }
         }
+        assert_eq!(
+            metrics.tokens_generated.load(Relaxed) as usize,
+            toks.len() + terminal_tokens
+        );
+        assert_eq!(
+            terminal_tokens,
+            usize::from(fin == Some(FinishReason::Stop))
+        );
         (toks, fin)
     }
 
@@ -6288,6 +6807,16 @@ mod serial_pipe_tests {
         assert_eq!(toks, vec![1, 0, 1]);
         assert_eq!(fin, Some(FinishReason::Length));
         assert_eq!(g.forward_calls, 2); // no trailing wasted forward
+    }
+
+    #[test]
+    fn immediate_and_fallback_stops_are_counted_without_lookahead() {
+        let mut g = PipeStub::new(vec![10], false);
+        assert_eq!(run(&mut g, 5, vec![1]), (vec![], Some(FinishReason::Stop)));
+        assert_eq!(g.enqueued, 0);
+        let mut g = PipeStub::new(vec![], true);
+        assert_eq!(run(&mut g, 5, vec![0]), (vec![1], Some(FinishReason::Stop)));
+        assert_eq!(g.forward_calls, 1);
     }
 }
 
@@ -6377,6 +6906,7 @@ mod error_class_tests {
     /// out-of-memory `DriverError` becomes the typed `GpuError::OutOfMemory`,
     /// and any other code keeps its rendered text under `Driver`.
     #[test]
+    #[cfg(feature = "cuda")]
     fn from_driver_classifies_oom_by_code() {
         use cudarc::driver::{DriverError, sys::CUresult};
         let oom = crate::gpu::from_driver(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY));

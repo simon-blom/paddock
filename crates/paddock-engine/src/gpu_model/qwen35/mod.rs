@@ -36,10 +36,12 @@ mod load;
 mod multimodal;
 mod ops;
 mod prefix;
+mod rotation;
 mod spec;
 pub mod vision;
 
 pub(crate) use ops::*;
+pub(crate) use rotation::{Rotation, rotate_opt};
 
 /// Only resume from a checkpoint at least this deep - below it the state
 /// restore + KV page copies aren't worth skipping the (cheap) short prefill.
@@ -1593,6 +1595,18 @@ pub struct GpuQwen35 {
     /// lm_head, quantized-resident (tied to `token_embd` when `output.weight`
     /// absent). UD k-quant exports ship it Q6_K.
     output: QuantW,
+    /// Rotated-basis checkpoint (PrismML Bonsai, `prism.hadamard.*`): every
+    /// linear's input goes through a Walsh-Hadamard rotation first. None for
+    /// an ordinary file. See `rotation.rs` for where the sites sit.
+    rot: Option<Rotation>,
+    /// The batch-1 decode step rides the dedicated PTQ1_0 lane (pack slots
+    /// 627 / 628: table-decoded trits off per-128 int8 activations). Elected
+    /// per MODEL at load, never per weight: the projections of a layer share
+    /// one staged activation, so they have to share its class. Needs the
+    /// rotation (the coarser scale is only sound on rotated rows) and every
+    /// linear of the file on the lane. `PADDOCK_NO_TERNARY_B128` pins the
+    /// per-32 i-quant lane for A/B.
+    tern_b128: bool,
     /// True when any weight is k-quant resident (UD/Q4_K-class file). Stage-1
     /// serving keeps such models on the serial spine: decode via the fused
     /// k-quant GEMV, prefill via dequant+f32-GEMM; the batched pipe / spec /

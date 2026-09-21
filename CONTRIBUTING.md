@@ -15,11 +15,17 @@ change in.
 - **Kernels** live under `packs/cuda/src/`, hand-written CUDA, no Python in
   the build. `pack.cu`'s include list is the one true order. A kernel change
   is judged by measurement on a named board, never by reasoning alone; see
-  the GPU offer below if you do not have one.
+  the GPU offer below if you do not have one. The Metal kernels for Apple
+  Silicon are in `packs/metal/`, under the same rules; its README says how
+  they are grouped and ordered.
 - **The engine** is `crates/paddock-engine` (scheduler, paged KV, memory,
   model families), the serving edge is `crates/paddock-runner`, and the
   manager plus Studio is `crates/paddock-manager` with the Vue app in
-  `studio/`. Each crate's `Cargo.toml` carries a one-line description.
+  `studio/`. The Metal backend is `crates/paddock-metal`. Each crate's
+  `Cargo.toml` carries a one-line description.
+- **The macOS app** is `apps/macos`, native Swift, with
+  `crates/paddock-desktop` as the bridge to the shared Rust core. Its README
+  has the build and the checks.
 
 Not sure where something belongs, or planning something large? Open an issue
 first and say what you intend to do. It is cheap and it saves a rewrite.
@@ -58,6 +64,21 @@ how a pack and models are found.
 If you touched a kernel or anything on the serving path, say in the pull
 request what you measured, on which GPU and driver, and against what.
 
+A change under `apps/macos`, `crates/paddock-metal` or `packs/metal` can only
+be built and tested on a Mac. Run these there and say so in the pull request:
+
+```sh
+bash apps/macos/scripts/check.sh
+cargo test -p paddock-metal
+cargo clippy --workspace --exclude paddock-pdfium --exclude paddock-forensics \
+  --no-default-features --features paddock-runner/metal --all-targets -- -D warnings
+```
+
+The four commands further up still have to pass on Windows and Linux: the
+workspace builds everywhere, so a macOS-only module stays behind
+`cfg(target_os = "macos")`, and code the engine calls on every platform
+cannot be Unix-only.
+
 ## Rules of the tree
 
 - **No silent failures.** An error is reported, not swallowed. Truncation is an
@@ -72,9 +93,9 @@ request what you measured, on which GPU and driver, and against what.
   comment in the root `Cargo.toml` has the reasoning. `siftx` and `scriptor`
   are git dependencies pinned by revision, so a bump is a deliberate change of
   the rev.
-- **Windows and Linux, x64, CUDA.** There is no CPU path and no macOS build.
-  Contributions for other backends are a conversation to have in an issue
-  before code.
+- **GPU only: CUDA on Windows and Linux, Metal on macOS.** There is no CPU
+  path and there will not be one. Contributions for other backends are a
+  conversation to have in an issue before code.
 
 ## Pull requests
 

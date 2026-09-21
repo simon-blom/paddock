@@ -70,6 +70,8 @@ export declare class PageOverlayManager implements Disposable {
         diff: PageDiff;
         change: ComparisonChange;
     }[];
+    /** Refresh newly mounted pages without rebuilding existing interactive DOM. */
+    refreshVisible(): void;
     rebuildOverlays(): void;
     destroy(): void;
     [Symbol.dispose](): void;

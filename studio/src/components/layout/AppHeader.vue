@@ -2,16 +2,14 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useTheme } from '@/composables/useTheme'
-import { takesTurns, useModelsStore } from '@/stores/models'
-import { useChatStore } from '@/stores/chat'
+import { useModelsStore } from '@/stores/models'
 import { useTelemetryStore } from '@/stores/telemetry'
 import { useDownloadsStore, jobActive, type DownloadJob } from '@/stores/downloads'
 import { useReadinessStore } from '@/stores/readiness'
 import { useFleetStore } from '@/stores/fleet'
 import { useUpdatesStore } from '@/stores/updates'
-import { friendlyModelName, isVisionModel } from '@/lib/model-caps'
-import { fleetLabel, fleetVendor } from '@/lib/model-name'
-import { effectiveModelId, selectStudioModel } from '@/lib/select-model'
+import { selectStudioModel } from '@/lib/select-model'
+import { studioModelHeader } from '@/lib/studio-model-header'
 import { fmtBytes, fmtEta, fmtRate } from '@/lib/format'
 import Icon from '@/components/Icon.vue'
 import FeedbackDialog from '@/components/feedback/FeedbackDialog.vue'
@@ -24,7 +22,6 @@ import VendorLogo from '@/components/manage/VendorLogo.vue'
 
 const { theme, toggleTheme } = useTheme()
 const models = useModelsStore()
-const chat = useChatStore()
 const tele = useTelemetryStore()
 const downloads = useDownloadsStore()
 // No card, no GPU metrics button: an instrument with nothing to sample is a
@@ -108,90 +105,19 @@ function switchArea(to: string): void {
   void router.push({ name: to === 'manage' ? 'servers' : 'home' })
 }
 
-// The model chip is a DROPDOWN: flipping the model -
-// distinct from comparing - happens right where the model shows. Picking one
-// retargets the active chat too (selectStudioModel). While compare is armed
-// the composer's picker owns the lane set, so the chip shows a plain label.
-const comparing = computed(() => (chat.active?.compareModels?.length ?? 0) >= 2)
-// The picker renders only when this has entries: a stale persisted currentId
-// or a mid-refresh state used to flash an empty dropdown (the template gates
-// on modelOptions.length as well as currentId).
-const modelOptions = computed(() =>
-  models.models
-    // takesTurns, not chat-only: a speech model answers a user
-    // turn too, so picking one here is how you transcribe - the composer
-    // switches to audio input and the reply is a transcript.
-    .filter((m) => takesTurns(m.kind) && m.status === 'ok')
-    .map((m) => ({
-      value: m.id,
-      label: m.display ?? friendlyModelName(m.id),
-      // local models are told apart by port; cloud ones by who hosts them
-      hint: m.cloud ? m.cloud.endpointName : String(m.port),
-      vendor: m.vendor,
-      // the technical id lives in the hover, never the headline
-      title: m.cloud ? `${m.id} · ${m.cloud.endpointName}` : `${m.id} · port ${m.port}`,
-    })),
-)
-// The picker shows what the next send will use, not the fleet seat - see
-// effectiveModelId. Reading `models.currentId` here is what let the header
-// announce a model the composer was not going to call.
-const currentModel = computed(() => effectiveModelId())
-// ...and if that model is not in the running list, it still gets a row rather
-// than blanking the dropdown: a conversation pinned to a runner that has since
-// stopped is exactly when you most need to be told which model you are aimed
-// at. Selecting anything else fixes it; saying nothing does not.
-const pickerOptions = computed(() => {
-  const opts = modelOptions.value
-  const id = currentModel.value
-  if (!id || opts.some((o) => o.value === id)) return opts
-  const m = models.models.find((x) => x.id === id)
-  return [
-    {
-      value: id,
-      // fleet first, then the catalog: a stopped model is by definition not
-      // in the running list, so asking the fleet alone dropped the maker's
-      // mark and the proper name exactly on the older chats this row is for
-      label: fleetLabel(id),
-      hint: m?.cloud ? m.cloud.endpointName : 'not running',
-      vendor: fleetVendor(id),
-      title: `${id} - not running`,
-    },
-    ...opts,
-  ]
-})
+// Shared with the native title bar. Compare names are informational here;
+// the composer's Compare picker owns the lane set on both clients.
+const modelHeader = computed(studioModelHeader)
+const currentModel = computed(() => modelHeader.value.currentModel)
+const comparing = computed(() => modelHeader.value.comparing)
+const pickerOptions = computed(() => modelHeader.value.pickerOptions)
+const compareLanes = computed(() => modelHeader.value.compareLanes)
+const specLabel = computed(() => modelHeader.value.specLabel)
+const isVision = computed(() => modelHeader.value.isVision)
+const soleEncoder = computed(() => modelHeader.value.soleEncoder)
 const modelSel = computed<string | number>({
   get: () => currentModel.value,
   set: (v) => selectStudioModel(String(v)),
-})
-/** The armed compare lanes with their marks - the header shows who is being
- *  compared ("Qwen 3.5 9B vs. GPT-OSS 20B"), not just a count. */
-const compareLanes = computed(() =>
-  (chat.active?.compareModels ?? []).map((id) => {
-    const m = models.models.find((x) => x.id === id)
-    // same fallback as the not-running picker row: a compare lane can name a
-    // model that has since stopped
-    return { id, label: fleetLabel(id), vendor: fleetVendor(id), spec: m?.spec }
-  }),
-)
-/** The lane's speculation mechanism, worn beside the name like the vision
- *  eye - "spec on" answering which mechanism (MTP / DFlash1 / off). */
-const specLabel = computed(() => (currentModel.value ? models.specFor(currentModel.value) : undefined))
-// Vision from the server-advertised capability, id-heuristic as fallback. Same
-// id the picker shows: the eye has to describe the model that will read the
-// image, not whichever one holds the fleet seat.
-const isVision = computed(() => {
-  const id = currentModel.value
-  if (!id) return false
-  return models.models.find((m) => m.id === id)?.vision ?? isVisionModel(id)
-})
-
-// Encoder-only fleet: nothing that answers a turn, but something is running -
-// say so and point at the Embeddings page instead of rendering an empty
-// picker. (A speech model is no longer this case: it holds the seat.)
-const soleEncoder = computed(() => {
-  if (models.models.some((m) => takesTurns(m.kind))) return null
-  const e = models.models.find((m) => m.kind === 'encoder')
-  return e ? (e.display ?? friendlyModelName(e.id)) : null
 })
 </script>
 
@@ -338,7 +264,7 @@ const soleEncoder = computed(() => {
     <Tooltip v-if="models.serverVersion" :label="`Paddock ${models.serverBuild}`">
       <span class="header__ver">v{{ models.serverVersion }}</span>
     </Tooltip>
-    <Tooltip v-if="readiness.hasCard" label="GPU metrics">
+    <Tooltip v-if="readiness.hasMetrics" label="GPU metrics">
       <button
         class="pk-icon-btn"
         :class="{ 'header__btn--on': tele.open }"

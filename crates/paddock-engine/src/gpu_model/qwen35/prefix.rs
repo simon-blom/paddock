@@ -779,6 +779,7 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         let bs_f8ffn_p = &self.bs_f8ffn;
         let bs_f8row_p = &self.bs_f8row_ffn;
         let w8_min = w8_min_batch();
@@ -809,7 +810,7 @@ impl GpuQwen35 {
             }
         }
 
-        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r)?;
+        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
         // inject each image's embeddings over its placeholder rows. Pictures
         // wholly below `a` are already in KV; the cut rule means none can
         // straddle the boundary.
@@ -829,7 +830,7 @@ impl GpuQwen35 {
             // the w8 arms quantize from xn, so it must be materialized
             let lw8 = bs_w8_all.get(li).filter(|_| r > w8_min);
             let keep_xn = matches!(&layer.mixer, Mixer::Linear(_)) || lw8.is_some();
-            prefill_add_norm_quant(
+            prefill_add_norm_quant_rot(
                 &exec,
                 &mut sc.d_x,
                 None,
@@ -843,6 +844,7 @@ impl GpuQwen35 {
                 embd,
                 r,
                 eps,
+                rot,
             )?;
             let mixer_b16 = false;
             match &layer.mixer {
@@ -1048,6 +1050,7 @@ impl GpuQwen35 {
                             r,
                         )?;
                     } else {
+                        rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, r)?;
                         prefill_mm_any(
                             &exec,
                             &w.wo,
@@ -1348,6 +1351,12 @@ impl GpuQwen35 {
                             r,
                         )?;
                     } else {
+                        // rotated-basis model: ssm_out reads the regrouped + rotated rows,
+                        // landed in d_dattn (free once the gated norm has consumed it)
+                        if let Some(rt) = rot {
+                            let vd = n_v_heads * state_size;
+                            rt.rotate_ssm_out(&exec, &sc.d_core, &mut sc.d_dattn, vd, r)?;
+                        }
                         prefill_mm_any(
                             &exec,
                             &w.out_w,
@@ -1357,7 +1366,11 @@ impl GpuQwen35 {
                             &mut sc.d_xsums,
                             &mut sc.d_ssums,
                             &mut sc.d_skfix,
-                            &sc.d_core,
+                            if rot.is_some() {
+                                &sc.d_dattn
+                            } else {
+                                &sc.d_core
+                            },
                             &mut sc.d_proj,
                             r,
                         )?;
@@ -1414,7 +1427,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_add_norm_quant(
+                        prefill_add_norm_quant_rot(
                             &exec,
                             &mut sc.d_x,
                             Some(&sc.d_proj),
@@ -1428,6 +1441,7 @@ impl GpuQwen35 {
                             embd,
                             r,
                             eps,
+                            rot,
                         )?;
                     }
                     if let Some(p) = f8r {
@@ -1595,7 +1609,7 @@ impl GpuQwen35 {
                             &mut sc.d_ffn_up,
                             r,
                         )?;
-                        prefill_ffn_down_any(
+                        prefill_ffn_down_rot(
                             &exec,
                             down,
                             &mut sc.d_pxq,
@@ -1609,6 +1623,7 @@ impl GpuQwen35 {
                             &mut sc.d_proj,
                             ff,
                             r,
+                            rot,
                         )?;
                     }
                 }
@@ -1623,7 +1638,7 @@ impl GpuQwen35 {
                             && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
                     });
                     // xn stays written: alpha/beta read it either way.
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -1637,6 +1652,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     if let Some([gu8, d8]) = f8f {
                         proj_is_b16 = prefill_ffn_f8w(
@@ -1673,7 +1689,7 @@ impl GpuQwen35 {
                 }
                 Ffn::Moe(w) => {
                     // MoE needs the f32 xn (router + shared expert)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -1687,6 +1703,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     moe_ffn(
                         &exec,
@@ -1732,6 +1749,9 @@ impl GpuQwen35 {
 
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
+        // rotated-basis model: the head reads the rotated row; d_h stays in
+        // the model's basis for whoever reads it after the pass
+        rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         // f8 head when the floor elects it: this is a ONE-ROW head call on the
         // prefill path, and it was a direct Q8_0 reader - the site the head
         // reclaim's first audit missed (the FFN arms in this file were checked,
@@ -1824,6 +1844,7 @@ impl GpuQwen35 {
         let sinks = &self.sinks;
         let layers = &self.layers;
         let tok_embd = &self.tok_embd;
+        let rot = self.rot.as_ref();
         // b1: fp8 W8A8 dense-proj planes (empty unless PADDOCK_QWEN35_W8). Consulted
         // only above w8_min for large (prefill) batches; else the exact Q8_0 path.
         let bs_w8_all = &self.bs_w8;
@@ -1836,7 +1857,7 @@ impl GpuQwen35 {
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
 
-        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r)?;
+        embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
 
         for (li, layer) in layers.iter().enumerate() {
             // W8 planes for this layer, only when the batch is large enough to win.
@@ -1877,7 +1898,7 @@ impl GpuQwen35 {
                     eps,
                 )?;
             } else {
-                prefill_add_norm_quant(
+                prefill_add_norm_quant_rot(
                     &exec,
                     &mut sc.d_x,
                     None,
@@ -1891,6 +1912,7 @@ impl GpuQwen35 {
                     embd,
                     r,
                     eps,
+                    rot,
                 )?;
             }
             let mut mixer_b16 = false;
@@ -2164,6 +2186,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
+                        rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, r)?;
                         prefill_mm_any(
                             &exec,
                             &w.wo,
@@ -2470,6 +2493,12 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
+                        // rotated-basis model: ssm_out reads the regrouped + rotated rows,
+                        // landed in d_dattn (free once the gated norm has consumed it)
+                        if let Some(rt) = rot {
+                            let vd = n_v_heads * state_size;
+                            rt.rotate_ssm_out(&exec, &sc.d_core, &mut sc.d_dattn, vd, r)?;
+                        }
                         prefill_mm_any(
                             &exec,
                             &w.out_w,
@@ -2479,7 +2508,11 @@ impl GpuQwen35 {
                             &mut sc.d_xsums,
                             &mut sc.d_ssums,
                             &mut sc.d_skfix,
-                            &sc.d_core,
+                            if rot.is_some() {
+                                &sc.d_dattn
+                            } else {
+                                &sc.d_core
+                            },
                             &mut sc.d_proj,
                             r,
                         )?;
@@ -2538,7 +2571,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_add_norm_quant(
+                        prefill_add_norm_quant_rot(
                             &exec,
                             &mut sc.d_x,
                             Some(&sc.d_proj),
@@ -2552,6 +2585,7 @@ impl GpuQwen35 {
                             embd,
                             r,
                             eps,
+                            rot,
                         )?;
                     }
                     if let Some(p) = f8r {
@@ -2719,7 +2753,7 @@ impl GpuQwen35 {
                             &mut sc.d_ffn_up,
                             r,
                         )?;
-                        prefill_ffn_down_any(
+                        prefill_ffn_down_rot(
                             &exec,
                             down,
                             &mut sc.d_pxq,
@@ -2733,6 +2767,7 @@ impl GpuQwen35 {
                             &mut sc.d_proj,
                             ff,
                             r,
+                            rot,
                         )?;
                     }
                 }
@@ -2747,7 +2782,7 @@ impl GpuQwen35 {
                             && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
                     });
                     // xn stays written: alpha/beta read it either way.
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -2761,6 +2796,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     if let Some([gu8, d8]) = f8f {
                         proj_is_b16 = prefill_ffn_f8w(
@@ -2797,7 +2833,7 @@ impl GpuQwen35 {
                 }
                 Ffn::Moe(w) => {
                     // MoE needs the f32 xn (router + shared expert)
-                    prefill_add_norm_quant(
+                    prefill_add_norm_quant_rot(
                         &exec,
                         &mut sc.d_x,
                         Some(&sc.d_proj),
@@ -2811,6 +2847,7 @@ impl GpuQwen35 {
                         embd,
                         r,
                         eps,
+                        rot,
                     )?;
                     moe_ffn(
                         &exec,
@@ -2856,6 +2893,9 @@ impl GpuQwen35 {
 
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
+        // rotated-basis model: the head reads the rotated row; d_h stays in
+        // the model's basis for whoever reads it after the pass
+        rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         // f8 head when the floor elects it: this is a ONE-ROW head call on the
         // prefill path, and it was a direct Q8_0 reader - the site the head
         // reclaim's first audit missed (the FFN arms in this file were checked,

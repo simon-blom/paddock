@@ -833,11 +833,11 @@ extern "C" int pd_q4x_combine_norm_moe(void* h, const void* cdn, const void* ids
     return pd_launch_status();
 }
 
-// NS (slot 606, with Q): the normalized state is NOT stored - `xn` receives the
+// NS (slot 606, with Q): the normalized state is not stored - `xn` receives the
 // per-(row, stream) 1/rms instead ([rows][hc]), which the rebuild consumers
 // (slots 607 / 608) turn back into every normalized value with this pass-2
 // expression. The mmq rows are emitted from the value in hand as before.
-// I (slot 609, with Q and NS): also the NEXT mix's inject, off the values in
+// I (slot 609, with Q and NS): also the next mix's inject, off the values in
 // hand - each thread dots its float4 against the four rows of `w_inj`
 // ([4][hc * hidden] f32), the four accumulators reduce like the sum of
 // squares (a warp butterfly, then the warps in shared) and thread 0 writes
@@ -1028,7 +1028,7 @@ int pd_q4x_combine_norm(void* h, const void* block_out, const void* inj,
     return pd_launch_status();
 }
 
-// slot 602: combine_norm that also emits the NEXT hyper-connection down's mmq
+// slot 602: combine_norm that also emits the next hyper-connection down's mmq
 // activations (pd_quantize_q8_mmq's layout and math) from its own norm pass,
 // so the separate quantize launch and its read of the [rows][hc*hidden]
 // normalized state go. `yq` holds group_rows-row groups, each
@@ -1100,7 +1100,7 @@ __global__ void pd_q4x_hc_inj_fold_kernel(const float* __restrict__ ip, float* _
     }
 }
 
-// slot 609: slot 606 that also produces the NEXT mix's inject logits from its
+// slot 609: slot 606 that also produces the next mix's inject logits from its
 // own norm pass - the combine holds every normalized value in registers, and
 // the inject (a [4][hc * hidden] f32 matvec) was the one reader left walking
 // the residual for them. `ip` is [rows][hc][hc] caller scratch, `inj_out`

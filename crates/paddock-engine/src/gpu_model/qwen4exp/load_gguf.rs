@@ -400,7 +400,10 @@ pub(super) fn load_layer(
                     &format!("{p}.attn_k_norm.weight"),
                     vec![c.head_dim],
                 )?,
-                idx_qk: bf16_concat(
+                // the GGUF export splits the indexer into q_proj/k_proj and
+                // stores both bf16, so the fused plane is a byte concat that
+                // then wears the bf16 class
+                idx_qk: DensePlane::Bf16(bf16_concat(
                     exec,
                     map,
                     &[
@@ -414,7 +417,7 @@ pub(super) fn load_layer(
                         ),
                     ],
                     h,
-                )?,
+                )?),
                 // stored (1+w); the pack's indexer norm adds the 1
                 idx_q_norm: f32_dt_m1(
                     exec,
@@ -673,7 +676,7 @@ pub(super) struct MtpWeights {
     pub eh_e: DensePlane,
     pub eh_h: DensePlane,
     pub enorm: DeviceTensor,
-    /// ONE rms statistic over the whole 4-stream row - ungrouped, unlike
+    /// One rms statistic over the whole 4-stream row - ungrouped, unlike
     /// every hyper-connection norm (ds4 reads it this way)
     pub hnorm: DeviceTensor,
     /// `nextn.hc_head_*`: the final mixer's shape, no inject

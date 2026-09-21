@@ -38,7 +38,9 @@ use axum::response::Response;
 use rmcp::ErrorData;
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ServerCapabilities, ServerConfig as McpServerConfig,
+};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -282,6 +284,15 @@ pub struct GraphTools {
     bridge: Arc<Bridge>,
 }
 
+/// Read the live router so web/native tool pickers cannot drift from execution.
+pub fn tool_list() -> Vec<serde_json::Value> {
+    GraphTools::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| serde_json::json!({"name":t.name,"description":t.description}))
+        .collect()
+}
+
 #[tool_router]
 impl GraphTools {
     pub fn new(bridge: Arc<Bridge>) -> Self {
@@ -327,8 +338,8 @@ impl GraphTools {
 
 #[tool_handler]
 impl ServerHandler for GraphTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> McpServerConfig {
+        McpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
     }
 }

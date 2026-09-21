@@ -61,6 +61,8 @@ export const useSettingsStore = defineStore('settings', () => {
   // Context compaction: summarize older messages when a chat outgrows the
   // window (on by default); off = drop the oldest messages, the old behavior.
   const summarize = ref<boolean>(localStorage.getItem('pk_summarize') !== 'off')
+  const autoTitle = ref<boolean>(localStorage.getItem('pk_auto_title') !== 'off')
+  watch(autoTitle, v => localStorage.setItem('pk_auto_title', v ? 'on' : 'off'), { flush: 'sync' })
   // Mark the words a speech model was least sure of. A VIEWER preference, the
   // way Rev's "show low confidence words" is: the marks help you find what to
   // check, and they are noise once you have. On by default because the Studio
@@ -144,6 +146,7 @@ export const useSettingsStore = defineStore('settings', () => {
     maxTokens,
     maxToolCalls,
     summarize,
+    autoTitle,
     markUnsure,
     dictateWith,
     micDeviceId,

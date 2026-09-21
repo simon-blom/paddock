@@ -8,11 +8,13 @@
 
 pub mod delta_net;
 pub mod dflash;
+pub mod hadamard;
 pub mod iq;
 pub mod iq_grids;
 pub mod ops;
 pub mod qwen35_attn;
 pub mod qwen4exp;
+pub mod ternary;
 
 /// FP4 (E2M1) values as stored in MXFP4 nibbles - DOUBLED relative to the OCP
 /// E2M1 table (0, .5, 1, 1.5, 2, 3, 4, 6), compensated by the halved E8M0

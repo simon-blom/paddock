@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::gpu::{DeviceTensor, GpuError, GpuExecutor, Nvf4MoePlane, QuantTensor};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::st_load::{bf16_bytes, bf16_to_f32, f32_tensor};
+use crate::gpu_model::st_load::{bf16_bytes, bf16_to_f16_exact, bf16_to_f32, f32_tensor};
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::modelopt::nvfp4_view;
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig};
@@ -111,58 +111,79 @@ fn conv_plane(
     })
 }
 
-/// bf16 -> f16, BIT-LEVEL and exact, straight off the checkpoint bytes.
+/// MXFP8 (OCP microscaling) straight off the checkpoint, when the file ships
+/// its dense planes that way: `weight` is e4m3 and `weight_scale` is one
+/// ue8m0 byte per 32 values along K.
 ///
-/// bf16 is `s | 8e | 7m` biased 127; f16 is `s | 5e | 10m` biased 15. Every
-/// bf16 mantissa bit fits (7 <= 10) and the exponent is a rebias, so for any
-/// value inside f16's NORMAL range the conversion is exact - which is what
-/// makes the f16 tensor-core lane the same numbers rather than a precision
-/// trade. Out-of-range is CHECKED, not clamped: overflow refuses the plane,
-/// and the subnormal tail falls back to the rounding convert (values below
-/// 2^-14 contribute less than the f32 accumulator's own rounding, the same
-/// reasoning `narrow_to_f16` records).
+/// Detected, never elected. `DenseClass` picks among representations of a
+/// bf16 source plane (keep it, narrow it to f16, add a twin, squeeze it to
+/// per-row e4m3); MXFP8 is not a representation we choose, it is what the
+/// checkpoint holds, and there is no bf16 underneath to fall back to. So this
+/// runs before the class election and the election never sees these planes.
 ///
-/// The obvious `bf16 -> f32 -> f16` spelling of this costs four MINUTES of
-/// load on this checkpoint's 3.2G dense elements, which is why it is written
-/// out.
-fn bf16_to_f16_exact(raw: &[u8], what: &str) -> Result<Vec<half::f16>, GpuModelError> {
-    let mut over = 0usize;
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    for b in raw.as_chunks::<2>().0 {
-        let v = u16::from_le_bytes(*b);
-        let sign = v & 0x8000;
-        let e = ((v >> 7) & 0xff) as i32;
-        let m = v & 0x7f;
-        if (113..=142).contains(&e) {
-            // normal in f16: exponent rebias 127 -> 15, mantissa left-aligned
-            out.push(half::f16::from_bits(
-                sign | (((e - 112) as u16) << 10) | (m << 3),
-            ));
-        } else if e == 0 {
-            out.push(half::f16::from_bits(sign)); // +/-0 (bf16 subnormals flush)
-        } else {
-            // over- or underflow: let the rounding convert decide, and count
-            // the overflows so the caller can refuse the plane
-            let f = f32::from_bits((v as u32) << 16);
-            let h = half::f16::from_f32(f);
-            if f.is_finite() && !h.is_finite() {
-                over += 1;
-            }
-            out.push(h);
-        }
+/// Byte passthrough: `RepackedMxfp4 {data, scale}` is this pair's layout -
+/// out-row-major payload, scale plane `[out_dim, in_dim/32]` - which
+/// `f8_gemv_at_off` already documents as "data += row_off*in, scale +=
+/// row_off*in/32". Nothing is dequantized, requantized or rounded on the way
+/// in, so the served weights are the checkpoint's own bits.
+fn mxfp8_plane(
+    exec: &GpuExecutor,
+    st: &ShardedSafetensors,
+    name: &str,
+    n: usize,
+    k: usize,
+) -> Option<Result<DensePlane, GpuModelError>> {
+    use paddock_models::safetensors::StDtype;
+    let (t, wb) = st.bytes(name)?;
+    if t.dtype != StDtype::F8E4m3 {
+        return None;
     }
-    if over > 0 {
-        return Err(GpuModelError::Unsupported(format!(
-            "{what}: {over} of {} weights overflow f16 (|w| > 65504) - this plane cannot \
-             carry the f16 tensor-core lane",
-            raw.len() / 2
-        )));
+    // modelopt names the companion `<tensor>_scale`, i.e. `....weight_scale`
+    let scale_name = format!("{name}_scale");
+    let (ts, sb) = st.bytes(&scale_name)?;
+    // k is the input dim; the scale plane is [out, in/32]
+    let want_scale = [n, k / 32];
+    if ts.dtype != StDtype::U8 || !k.is_multiple_of(32) || ts.shape != want_scale {
+        return Some(Err(GpuModelError::Unsupported(format!(
+            "{scale_name}: {:?} {:?} - want u8 {want_scale:?} (MXFP8 block [1, 32])",
+            ts.dtype, ts.shape
+        ))));
     }
-    Ok(out)
+    if wb.len() != n * k || sb.len() != n * k / 32 {
+        return Some(Err(GpuModelError::Unsupported(format!(
+            "{name}: {} payload / {} scale bytes, want {} / {}",
+            wb.len(),
+            sb.len(),
+            n * k,
+            n * k / 32
+        ))));
+    }
+    Some((|| {
+        let data = exec.to_device_u8(wb).map_err(GpuModelError::from)?;
+        let scale = exec.to_device_u8(sb).map_err(GpuModelError::from)?;
+        Ok(DensePlane::Mxf8 {
+            plane: crate::gpu::RepackedMxfp4 { data, scale },
+            in_dim: k,
+            out_dim: n,
+        })
+    })())
+}
+
+/// Whether this plane is MXFP8 in the file. The bf16-only fusions (row
+/// concats, the inject fold) have to ask before they reach for the bytes:
+/// their whole trick is a byte concatenation, which a payload+scale pair
+/// cannot serve.
+fn is_mxfp8(st: &ShardedSafetensors, name: &str) -> bool {
+    use paddock_models::safetensors::StDtype;
+    st.bytes(name)
+        .is_some_and(|(t, _)| t.dtype == StDtype::F8E4m3)
+        && st.bytes(&format!("{name}_scale")).is_some()
 }
 
 /// Load one dense projection in the elected class. bf16 is the parity class
-/// and the default; the 8-bit lane is opt-in (see `DenseClass`).
+/// and the default; the 8-bit lane is opt-in (see `DenseClass`). A checkpoint
+/// that ships MXFP8 dense planes bypasses the election entirely - see
+/// [`mxfp8_plane`].
 fn dense(
     exec: &GpuExecutor,
     st: &ShardedSafetensors,
@@ -170,6 +191,9 @@ fn dense(
     n: usize,
     k: usize,
 ) -> Result<DensePlane, GpuModelError> {
+    if let Some(r) = mxfp8_plane(exec, st, name, n, k) {
+        return r;
+    }
     match dense_class_from_env() {
         DenseClass::Bf16 => Ok(DensePlane::Bf16(bf16_plane(exec, st, name, n, k)?)),
         DenseClass::F16 => {
@@ -469,9 +493,177 @@ pub fn load_layer(
     c: &Qwen4ExpConfig,
     li: usize,
 ) -> Result<Qwen4ExpLayer, GpuModelError> {
-    let p = format!("model.language_model.layers.{li}");
+    load_layer_named(
+        exec,
+        st,
+        c,
+        &format!("model.language_model.layers.{li}"),
+        c.blocks[li],
+    )
+}
+
+/// One routed-expert plane of a 128x128 BLOCK-SCALED FP8 checkpoint, as the
+/// Q8_0 block stream (`[f16 scale | 32 int8]`) that `repack_q8_blocks` takes.
+///
+/// LAYOUT. The checkpoint stores each expert separately as `[out, in]` e4m3
+/// with a BF16 `weight_scale_inv` of `[out/128, in/128]`, and dequant is
+/// `fp8 * scale_inv` (the name is the inverse of the quantize divisor;
+/// verified against this checkpoint - multiply gives trained-weight range,
+/// divide gives 1e6). GGUF expert planes are `[in, out, n_expert]` walked as a
+/// flat stream of `(e * out + o)` rows, and a safetensors expert's row `o` is
+/// already `in` contiguous values, so concatenating experts in order is that
+/// stream. A 32-element Q8_0 block never straddles a 128-column scale block
+/// (128 is a multiple of 32), so every block carries exactly one FP8 scale.
+///
+/// Why a transcode, and what the SOTA target is. The pack has no MoE GEMM for
+/// this format: `f8bs_*` is e4m3 activations over MXFP4 weights and `f8row_*`
+/// is FP8 with PER-ROW scales, neither of which is 128x128-block-scaled FP8
+/// weights. Serving these experts natively means a new kernel. That is the
+/// SOTA answer and it is the follow-up; it is not what this head needs first,
+/// because this head is a drafter - the verify walks every drafted row through
+/// the full-precision target and judges it, so the head's numerics move the
+/// acceptance rate and can never move the emitted text (see the module note on
+/// `base`, same argument). The Q8_0 expert seat this feeds is the one the GGUF
+/// MTP head already rides (`ExpertSeats::Q8`), measured at 74% acceptance on
+/// this family, so it is a proven seat rather than an untested shortcut.
+/// Re-measure acceptance on this lane; if it lands materially under the GGUF
+/// head's, the native-format kernel is what buys it back.
+fn f8bs_experts_to_q8(
+    st: &ShardedSafetensors,
+    pfx: &str,
+    role: &str,
+    n_expert: usize,
+    rows: usize,
+    in_dim: usize,
+) -> Result<Vec<u8>, GpuModelError> {
+    const BS: usize = 128;
+    const QK: usize = 32;
+    if !in_dim.is_multiple_of(QK) {
+        return Err(GpuModelError::Unsupported(format!(
+            "{pfx} {role}: in_dim {in_dim} is not a multiple of the Q8_0 block"
+        )));
+    }
+    let sc_cols = in_dim.div_ceil(BS);
+    let mut out = Vec::with_capacity(n_expert * rows * in_dim / QK * 34);
+    for e in 0..n_expert {
+        let wn = format!("{pfx}.mlp.experts.{e}.{role}.weight");
+        let sn = format!("{wn}_scale_inv");
+        let bad = |what: &str| GpuModelError::Unsupported(format!("{wn}: {what}"));
+        let (wt, wb) = st.bytes(&wn).ok_or_else(|| bad("missing"))?;
+        if wt.dtype != StDtype::F8E4m3 || wt.shape != [rows, in_dim] {
+            return Err(bad(&format!(
+                "want F8E4m3 [{rows}, {in_dim}], got {:?} {:?}",
+                wt.dtype, wt.shape
+            )));
+        }
+        let (stt, sb) = st.bytes(&sn).ok_or_else(|| bad("missing scale_inv"))?;
+        if stt.dtype != StDtype::Bf16 {
+            return Err(bad(&format!("scale_inv is {:?}, want Bf16", stt.dtype)));
+        }
+        let sc = crate::gpu_model::st_load::bf16_to_f32(sb);
+        if sc.len() != rows.div_ceil(BS) * sc_cols {
+            return Err(bad(&format!(
+                "scale_inv has {} entries, want {}",
+                sc.len(),
+                rows.div_ceil(BS) * sc_cols
+            )));
+        }
+        for o in 0..rows {
+            let row = &wb[o * in_dim..(o + 1) * in_dim];
+            let srow = (o / BS) * sc_cols;
+            for b in 0..in_dim / QK {
+                let i0 = b * QK;
+                // one scale for the whole block - see the layout note
+                let s = sc[srow + i0 / BS];
+                let mut v = [0f32; QK];
+                let mut amax = 0f32;
+                for (j, v) in v.iter_mut().enumerate() {
+                    *v = paddock_models::modelopt::e4m3_to_f32(row[i0 + j]) * s;
+                    amax = amax.max(v.abs());
+                }
+                // Q8_0: d = amax/127, qs = round(x/d); an all-zero block keeps
+                // d = 0 and zero quants, which is what ggml writes too
+                let d = amax / 127.0;
+                out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+                for v in v {
+                    out.push(((v * inv).round().clamp(-127.0, 127.0) as i8) as u8);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The IN-FILE MTP head, from the safetensors checkpoint itself.
+///
+/// The GGUF lane sideloads a head (`--mtp`) because unsloth's UD export strips
+/// the block; a safetensors checkpoint that declares `text_config.mtp` ships it
+/// under `mtp.*` and needs no second file. NVIDIA's official NVFP4 export is
+/// the worked case: `mtp` + `mtp_num_hidden_layers` in the config, the weights
+/// in `model-fp8-mtp-ple.safetensors`, and before this the lane loaded them
+/// not at all - `spec_capable()` answered false and every token decoded at the
+/// no-spec rate while the bytes sat in the file (measured 2026-09-19 on a
+/// GB10: 18.58 tok/s with only the n-gram fallback drafting).
+///
+/// The layout is the GGUF's, spelled out instead of packed: `nextn.eh_proj`
+/// arrives pre-split as `fc_embedding` / `fc_hidden`, so the load-time column
+/// split the GGUF path performs has nothing to do here. The head block is one
+/// full-attention decoder layer, which is why it goes through
+/// `load_layer_named` rather than a copy.
+pub fn load_mtp_st(
+    exec: &Arc<GpuExecutor>,
+    st: &ShardedSafetensors,
+    c: &Qwen4ExpConfig,
+) -> Result<super::load_gguf::MtpWeights, GpuModelError> {
     let h = c.hidden;
-    let mixer = match c.blocks[li] {
+    Ok(super::load_gguf::MtpWeights {
+        // always full attention - `mtp` is a block, not an entry in
+        // `layer_types`, so the kind cannot be read from the config's list
+        layer: load_layer_named(exec, st, c, "mtp.layers.0", Qwen4ExpBlock::Attention)?,
+        eh_e: dense(exec, st, "mtp.fc_embedding.weight", h, h)?,
+        eh_h: dense(exec, st, "mtp.fc_hidden.weight", h, h)?,
+        // `1p`, like the attention q/k norms and unlike the hyper-connection
+        // ones. This family's norms are zero-centered: the checkpoint stores
+        // `w` and the scale is `(1 + w)`. The pack adds the 1 itself for the
+        // hyper-connection / PLE / indexer norms, so those load raw - but the
+        // nextn glue's two norms go to a plain `rmsnorm_batch`, which does
+        // not, so raw `w` scales the head's state by ~0 and its logits come
+        // out near-uniform. That is what "128 drafted, 0 accepted, proposals
+        // scattered over the whole 248k vocab" was (2026-09-19). The GGUF head
+        // reads `f32_dt` because llama.cpp's conversion bakes the +1 in.
+        enorm: f32_dt_1p(exec, st, "mtp.pre_fc_norm_embedding.weight", vec![h])?,
+        // One statistic over the whole 4-stream row (hc_width), ungrouped -
+        // the same reading the GGUF head takes
+        hnorm: f32_dt_1p(
+            exec,
+            st,
+            "mtp.pre_fc_norm_hidden.weight",
+            vec![c.hc_width()],
+        )?,
+        // the final mixer's shape, no inject
+        head_mix: hc_weights(exec, st, c, "mtp.hyper_connection_mixer", false)?,
+    })
+}
+
+/// `load_layer` with the tensor prefix and the mixer kind given explicitly.
+///
+/// The decoder's own layers are `model.language_model.layers.{i}` and take
+/// their kind from `layer_types`; the MTP head is the same block shape under
+/// `mtp.layers.0` and is always full attention (`text_config.mtp`), so it
+/// cannot read either from `li`. Splitting the prefix out is what lets the
+/// safetensors MTP reuse this loader instead of growing a second copy of it -
+/// the head is a decoder block, and a divergent copy would drift the moment
+/// one of them gained a seat.
+pub fn load_layer_named(
+    exec: &Arc<GpuExecutor>,
+    st: &ShardedSafetensors,
+    c: &Qwen4ExpConfig,
+    p: &str,
+    kind: Qwen4ExpBlock,
+) -> Result<Qwen4ExpLayer, GpuModelError> {
+    let h = c.hidden;
+    let mixer = match kind {
         Qwen4ExpBlock::Gdn => {
             let g = format!("{p}.linear_attn");
             // a then b, which is delta_gate_ab's fused layout; hoisted so
@@ -498,7 +690,9 @@ pub fn load_layer(
                     c.gdn_z_rows(),
                     h,
                 )?,
-                zqkv: if super::fuse_gdn_zq_on() {
+                // byte concat - refused on MXFP8, see `is_mxfp8`
+                zqkv: if super::fuse_gdn_zq_on() && !is_mxfp8(st, &format!("{g}.in_proj_z.weight"))
+                {
                     Some(bf16_concat_plane(
                         exec,
                         st,
@@ -546,7 +740,9 @@ pub fn load_layer(
                 q: dense(exec, st, &format!("{a}.q_proj.weight"), c.attn_q_rows(), h)?,
                 k: dense(exec, st, &format!("{a}.k_proj.weight"), kv, h)?,
                 v: dense(exec, st, &format!("{a}.v_proj.weight"), kv, h)?,
-                qkv_f: if super::fuse_attn_qkv_on() {
+                // byte concat - refused on MXFP8, see `is_mxfp8`
+                qkv_f: if super::fuse_attn_qkv_on() && !is_mxfp8(st, &format!("{a}.q_proj.weight"))
+                {
                     Some(bf16_concat_plane(
                         exec,
                         st,
@@ -563,7 +759,7 @@ pub fn load_layer(
                 o: dense(exec, st, &format!("{a}.o_proj.weight"), h, c.attn_o_in())?,
                 q_norm: f32_dt_1p(exec, st, &format!("{a}.q_norm.weight"), vec![c.head_dim])?,
                 k_norm: f32_dt_1p(exec, st, &format!("{a}.k_norm.weight"), vec![c.head_dim])?,
-                idx_qk: bf16_plane(
+                idx_qk: dense(
                     exec,
                     st,
                     &format!("{a}.indexer.index_qk_proj.weight"),
@@ -596,16 +792,41 @@ pub fn load_layer(
     // padded to 64 rows so the low-M dense GEMM (slot 566) can take it; the
     // batch-1 gemv reads the real 513 rows by stride.
     let router16 = None;
-    let (gate, up, down) = (
-        moe_plane(exec, st, c, &p, "gate_proj", c.moe_ff, h)?,
-        moe_plane(exec, st, c, &p, "up_proj", c.moe_ff, h)?,
-        moe_plane(exec, st, c, &p, "down_proj", h, c.moe_ff)?,
-    );
+    // The seat follows what the checkpoint actually ships, not what the caller
+    // expects. NVIDIA's NVFP4 export quantizes the DECODER's routed experts to
+    // NVFP4 but leaves the MTP head's at block-scaled FP8 (they live in
+    // `model-fp8-mtp-ple.safetensors`), so one layer loader has to seat both -
+    // and probing beats a parameter, because a future checkpoint that moves
+    // either way then needs no caller change.
+    let e0_dtype = st
+        .bytes(&format!("{p}.mlp.experts.0.gate_proj.weight"))
+        .map(|(t, _)| t.dtype);
+    let seats = if e0_dtype == Some(StDtype::F8E4m3) {
+        // 128x128 block-scaled FP8 -> the Q8_0 expert seat (see
+        // `f8bs_experts_to_q8` for the transcode and why it is one)
+        let q8 = |role: &str, rows: usize, in_dim: usize| {
+            let raw = f8bs_experts_to_q8(st, p, role, c.n_expert, rows, in_dim)?;
+            exec.repack_q8_blocks(&raw, vec![in_dim, rows, c.n_expert])
+                .map_err(GpuModelError::from)
+        };
+        super::ExpertSeats::Q8 {
+            gate: q8("gate_proj", c.moe_ff, h)?,
+            up: q8("up_proj", c.moe_ff, h)?,
+            down: q8("down_proj", h, c.moe_ff)?,
+        }
+    } else {
+        let (gate, up, down) = (
+            moe_plane(exec, st, c, p, "gate_proj", c.moe_ff, h)?,
+            moe_plane(exec, st, c, p, "up_proj", c.moe_ff, h)?,
+            moe_plane(exec, st, c, p, "down_proj", h, c.moe_ff)?,
+        );
+        super::ExpertSeats::Nvf4 { gate, up, down }
+    };
     let moe = MoeW {
         // the shared expert's scalar gate rides as row n_expert
         router: dt(exec, router_v, vec![c.n_expert + 1, h])?,
         router16,
-        seats: super::ExpertSeats::Nvf4 { gate, up, down },
+        seats,
         sh_gate: dense(
             exec,
             st,
@@ -613,7 +834,12 @@ pub fn load_layer(
             c.shared_ff,
             h,
         )?,
-        sh_gu: if super::fuse_sh_on() {
+        // the gate|up row concat is a byte concat of two bf16 planes; an
+        // MXFP8 pair has a scale plane beside each payload, so there is
+        // nothing to concatenate and the two-call path is correct
+        sh_gu: if super::fuse_sh_on()
+            && !is_mxfp8(st, &format!("{p}.mlp.shared_expert.gate_proj.weight"))
+        {
             Some(bf16_concat_plane(
                 exec,
                 st,
@@ -681,18 +907,31 @@ pub fn load_ple_projections(
             .map(|c| i64::from_le_bytes(*c))
             .collect())
     };
-    // table scale: bf16 scalar in this repo (F32 in the FP8 repo) - widen
+    // Table scale. Two shapes in the wild, and which one is present also says
+    // what the table's payload is:
+    //   * `ngram_embedding.weight_scale`, one scalar - the FP8 table (e4m3
+    //     bytes, NVIDIA's export). bf16 in this repo, F32 in the FP8 repo.
+    //   * `ngram_embedding.weight_scale_2`, one f32 - the NVFP4 table
+    //     (e2m1 nibbles with per-16 e4m3 group scales beside each shard;
+    //     Mia-AiLab's export). This is the global factor of a two-level
+    //     scale, so it is not interchangeable with the scalar above - the
+    //     gather multiplies it by the row's own group scale.
+    // The gather branches on the shard dtype, so it needs no flag from here.
     let table_scale = {
-        let name = format!("{emb}.ngram_embedding.weight_scale");
+        let scalar = format!("{emb}.ngram_embedding.weight_scale");
+        let global = format!("{emb}.ngram_embedding.weight_scale_2");
         let (t, b) = st
-            .bytes(&name)
-            .ok_or_else(|| GpuModelError::Unsupported(format!("{name}: missing")))?;
+            .bytes(&scalar)
+            .or_else(|| st.bytes(&global))
+            .ok_or_else(|| {
+                GpuModelError::Unsupported(format!("{scalar} / {global}: neither present"))
+            })?;
         match t.dtype {
             StDtype::Bf16 => bf16_to_f32(b)[0],
             StDtype::F32 => f32::from_le_bytes(b[..4].try_into().expect("f32 scalar")),
             other => {
                 return Err(GpuModelError::Unsupported(format!(
-                    "{name}: dtype {other:?}"
+                    "{scalar} / {global}: dtype {other:?}, want bf16/f32 scalar"
                 )));
             }
         }

@@ -1,7 +1,7 @@
-//! Transcription serving seam: a dedicated thread owning a `GpuWhisper` and
+//! Transcription serving seam: a dedicated thread owning a native Whisper and
 //! scheduling many transcriptions across its decode slots.
 //!
-//! Mirrors `Encoder`'s thread-owns-the-CUDA-context shape - whisper is an
+//! Mirrors `Encoder`'s thread-owns-the-device shape - whisper is an
 //! encoder-DECODER, which does not fit the `Generator` trait the decoder-only
 //! families share: there is no prompt KV to page, no continuous batch to join
 //! in the LLM sense, and the audio is the whole input.
@@ -39,7 +39,7 @@ use tokio::sync::oneshot;
 
 use crate::audio::MelFeatures;
 use crate::audio::guards::{self, Repetition, Stop};
-use crate::gpu_model::whisper::{self, GpuWhisper, LangProb, TimeScale};
+use crate::whisper::{self, LangProb, TimeScale, WhisperBackend};
 
 /// How much probability mass a caller's candidate set carries, as a whole,
 /// before any audio is heard.
@@ -146,6 +146,7 @@ impl LanguageAsk {
 /// checkpoint knows from `/v1/models`, not from a 400 (or worse, from a
 /// transcript in a language it was never able to produce).
 pub struct AsrCard {
+    pub word_times: bool,
     pub time_scale: TimeScale,
     /// bare language codes, in the checkpoint's own order
     pub languages: Vec<String>,
@@ -444,13 +445,14 @@ impl Transcriber {
     /// runner published `"engine": null` before even though the
     /// checkpoint is resident on the card; only the memory rows are filled
     /// (a transcriber's tok/s and phase are not the generative counters).
-    pub fn spawn<F>(
+    pub fn spawn<F, M>(
         build: F,
         slots: usize,
         metrics: Option<std::sync::Arc<crate::metrics::EngineMetrics>>,
     ) -> Result<(Self, AsrCard), String>
     where
-        F: FnOnce() -> Result<GpuWhisper, String> + Send + 'static,
+        F: FnOnce() -> Result<M, String> + Send + 'static,
+        M: WhisperBackend + 'static,
     {
         let (tx, rx) = channel::<TranscribeJob>();
         let (ready_tx, ready_rx) = channel::<Result<AsrCard, String>>();
@@ -465,6 +467,7 @@ impl Transcriber {
                     Ok(m) => {
                         let _ = ready_tx.send(Ok(AsrCard {
                             time_scale: m.time_scale(),
+                            word_times: m.supports_word_times(),
                             languages: m.languages(),
                         }));
                         m
@@ -552,7 +555,7 @@ fn finish(req: &mut Req, lang: String) {
 /// timing is the one thing here that reads the encoder planes after the decode,
 /// so it is the one thing that cares when the slot is recycled.
 fn word_times(
-    model: &mut GpuWhisper,
+    model: &mut dyn WhisperBackend,
     run: &Run,
     req: &Req,
     scale: &TimeScale,
@@ -601,7 +604,11 @@ fn fail_all(reqs: &mut HashMap<u64, Req>, active: &mut Vec<Run>, free: &mut Vec<
     }
 }
 
-fn schedule(model: &mut GpuWhisper, rx: &std::sync::mpsc::Receiver<TranscribeJob>, slots: usize) {
+fn schedule(
+    model: &mut dyn WhisperBackend,
+    rx: &std::sync::mpsc::Receiver<TranscribeJob>,
+    slots: usize,
+) {
     let (sot, eot) = model.contract_tokens();
     let (transcribe, no_ts) = model.prompt_tail();
     let sot_prev = model.sot_prev_token();
@@ -612,6 +619,7 @@ fn schedule(model: &mut GpuWhisper, rx: &std::sync::mpsc::Receiver<TranscribeJob
     let mut free: Vec<usize> = (0..slots).rev().collect();
     let mut active: Vec<Run> = Vec::new();
     let mut next_id = 0u64;
+    let word_times_supported = model.supports_word_times();
 
     let mut take = |job: TranscribeJob, reqs: &mut HashMap<u64, Req>, order: &mut Vec<u64>| {
         // A job with no windows has nothing to admit and nothing to retire, so
@@ -628,6 +636,12 @@ fn schedule(model: &mut GpuWhisper, rx: &std::sync::mpsc::Receiver<TranscribeJob
                 language_probs: Vec::new(),
                 language_prior_moved: None,
             }));
+            return;
+        }
+        if job.words && !word_times_supported {
+            let _ = job.reply.send(Err(
+                "word timestamps are unavailable on this Whisper backend".into(),
+            ));
             return;
         }
         let id = next_id;

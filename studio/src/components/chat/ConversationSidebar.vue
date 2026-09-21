@@ -4,10 +4,12 @@ import { useRouter } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
 import { conversationBusy } from '@/composables/useChatStream'
 import { useModelsStore } from '@/stores/models'
+import { useSettingsStore } from '@/stores/settings'
 import { isDocParserConv } from '@/lib/docrun'
 import { modelCapability } from '@/lib/model-name'
 import type { Conversation } from '@/types/chat'
 import { NEW_CHAT, SEARCH_CHATS, TOGGLE_CHATS } from '@/lib/shortcuts'
+import { copyText } from '@/lib/clipboard'
 import Icon from '@/components/Icon.vue'
 import Menu from '@/components/ui/Menu.vue'
 import MenuTrigger from '@/components/ui/MenuTrigger.vue'
@@ -20,6 +22,33 @@ import Tooltip from '@/components/ui/Tooltip.vue'
 
 const chat = useChatStore()
 const models = useModelsStore()
+const settings = useSettingsStore()
+const actionError = ref('')
+const fullTitle = ref<string | null>(null)
+const titleCopied = ref(false)
+const titleCopyError = ref('')
+function showFullTitle(title: string): void {
+  fullTitle.value = title
+  titleCopied.value = false
+  titleCopyError.value = ''
+}
+async function copyFullTitle(): Promise<void> {
+  const title = fullTitle.value
+  if (title === null) return
+  try {
+    await copyText(title)
+    if (fullTitle.value === title) titleCopied.value = true
+  } catch {
+    if (fullTitle.value === title) titleCopyError.value = 'Could not copy. Select the title and copy it manually.'
+  }
+}
+async function runAction(action: () => Promise<void>): Promise<boolean> {
+  actionError.value = ''
+  try { await action(); return true } catch (e) {
+    actionError.value = e instanceof Error ? e.message : 'The conversation could not be updated'
+    return false
+  }
+}
 const router = useRouter()
 
 // ── what KIND of conversation each row is ───────────────────────────────────
@@ -179,9 +208,10 @@ function startRename(id: string, title: string): void {
     el?.select()
   })
 }
-function commitRename(): void {
-  if (renamingId.value) chat.rename(renamingId.value, renameText.value)
-  renamingId.value = null
+async function commitRename(): Promise<void> {
+  const id = renamingId.value
+  if (!id) return
+  if (await runAction(() => chat.rename(id, renameText.value))) renamingId.value = null
 }
 
 // ── delete (single + bulk), always behind a confirm ─────────────────────────
@@ -193,7 +223,7 @@ async function confirmDelete(): Promise<void> {
   pendingDelete.value = null
   if (!del) return
   const wasActive = del.id === chat.activeId
-  await chat.remove(del.id)
+  await runAction(() => chat.remove(del.id))
   if (wasActive) await followActive()
 }
 
@@ -202,9 +232,9 @@ async function confirmBulkDelete(): Promise<void> {
   const ids = [...selected.value]
   if (!ids.length) return
   const hadActive = !!chat.activeId && selected.value.has(chat.activeId)
-  await chat.removeMany(ids)
-  selected.value = new Set()
-  selectMode.value = false
+  const done = await runAction(() => chat.removeMany(ids))
+  selected.value = new Set([...selected.value].filter(id => chat.conversations.some(c => c.id === id)))
+  if (done) selectMode.value = false
   if (hadActive) await followActive()
 }
 
@@ -291,6 +321,13 @@ function fullWhen(ts: number): string {
             <Icon name="check" :size="14" :style="{ opacity: sortMode === 'oldest' ? 1 : 0 }" />
             <span>Oldest first</span>
           </MenuItem>
+          <MenuSeparator />
+          <MenuItem @select="settings.autoTitle = !settings.autoTitle">
+            <Icon name="check" :size="14" :style="{ opacity: settings.autoTitle ? 1 : 0 }" />
+            <Tooltip label="A short request to the conversation's model after its reply. Provider charges may apply.">
+              <span>Automatically name new chats</span>
+            </Tooltip>
+          </MenuItem>
         </MenuContent>
       </Menu>
 
@@ -317,6 +354,7 @@ function fullWhen(ts: number): string {
       <span class="sidebar__selcount">{{ selected.size }} selected</span>
     </div>
 
+    <p v-if="actionError" class="sidebar__empty" role="alert">{{ actionError }}</p>
     <div class="sidebar__list">
       <div v-if="results.length === 0" class="sidebar__empty">
         {{ query.trim() ? 'No matches' : 'No chats yet' }}
@@ -357,7 +395,11 @@ function fullWhen(ts: number): string {
           <Tooltip v-if="conversationBusy(c.id)" label="Still answering">
             <span class="conv__live" />
           </Tooltip>
-          <span class="conv__title">{{ c.title }}</span>
+          <Tooltip :label="c.title"><span class="conv__title">{{ c.title }}</span></Tooltip>
+          <Tooltip v-if="chat.titleState[c.id]" :label="chat.titleState[c.id] === 'generating' ? 'Naming conversation…' : chat.titleState[c.id]">
+            <span v-if="chat.titleState[c.id] === 'generating'" class="conv__live" />
+            <Icon v-else name="alert-triangle" :size="13" />
+          </Tooltip>
           <span class="conv__right" @click.stop>
             <Tooltip :label="fullWhen(c.updatedAt)">
               <span class="conv__when">{{ formatWhen(c.updatedAt) }}</span>
@@ -373,11 +415,17 @@ function fullWhen(ts: number): string {
                   <MenuItem @select="startRename(c.id, c.title)">
                     <Icon name="edit" :size="14" /> Rename
                   </MenuItem>
-                  <MenuItem @select="chat.togglePin(c.id)">
+                  <MenuItem @select="runAction(() => chat.togglePin(c.id))">
                     <Icon name="pin" :size="14" /> {{ c.pinned ? 'Unpin' : 'Pin' }}
                   </MenuItem>
+                  <MenuItem :disabled="conversationBusy(c.id) || chat.titleState[c.id] === 'generating'" @select="runAction(() => chat.generateTitle(c.id))">
+                    <Icon name="edit" :size="14" /> {{ chat.titleState[c.id] === 'generating' ? 'Generating title…' : 'Generate title' }}
+                  </MenuItem>
+                  <MenuItem @select="showFullTitle(c.title)">
+                    <Icon name="file-text" :size="14" /> Show full title
+                  </MenuItem>
                   <MenuSeparator />
-                  <MenuItem danger @select="pendingDelete = { id: c.id, title: c.title }">
+                  <MenuItem danger :disabled="conversationBusy(c.id)" @select="pendingDelete = { id: c.id, title: c.title }">
                     <Icon name="trash" :size="14" /> Delete
                   </MenuItem>
                 </MenuContent>
@@ -399,6 +447,14 @@ function fullWhen(ts: number): string {
       </button>
     </div>
   </aside>
+
+  <Dialog :open="fullTitle !== null" title="Conversation title" size="sm" @close="fullTitle = null">
+    <p class="sidebar__full-title">{{ fullTitle }}</p>
+    <p v-if="titleCopyError" role="alert">{{ titleCopyError }}</p>
+    <template #footer>
+      <button class="pk-btn" @click="copyFullTitle">{{ titleCopied ? 'Copied' : 'Copy title' }}</button>
+    </template>
+  </Dialog>
 
   <Dialog
     :open="!!pendingDelete"
@@ -440,6 +496,13 @@ function fullWhen(ts: number): string {
 </template>
 
 <style scoped>
+.sidebar__full-title {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow: auto;
+  user-select: text;
+}
 .sidebar {
   width: var(--pk-sidebar-width);
   flex-shrink: 0;

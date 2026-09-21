@@ -32,19 +32,25 @@
 
 pub mod accounting;
 pub mod catalog;
+pub mod cold;
 pub mod cost;
 pub mod digest;
 pub mod fingerprint;
+#[cfg(feature = "cuda")]
 pub mod host;
 pub mod io;
 pub mod nvme_store;
 pub mod payload;
+#[cfg(feature = "cuda")]
 pub mod pool_tier;
+#[cfg(feature = "cuda")]
 pub mod ram_transport;
+#[cfg(feature = "cuda")]
 pub mod restore_flow;
 pub mod transport;
 
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 mod tests;
 
 pub use accounting::{MissReason, TierDecisions, TierReport};
@@ -52,10 +58,30 @@ pub use catalog::{TierCatalog, TierCatalogConfig};
 pub use cost::{CostModel, Election, HitShape};
 pub use digest::{CacheNamespace, Checksum, IdentityDigest, LogicalKey, PrivacyScope};
 pub use payload::{KvPayloadCodec, PayloadManifest, PayloadSchema};
-pub use pool_tier::{PoolTier, RestoreWake, TierHit, TierStats, XferSink};
+#[cfg(feature = "cuda")]
+pub use pool_tier::{PoolTier, RestoreWake, TierHit, XferSink};
+#[cfg(feature = "cuda")]
 pub use ram_transport::{PlaneDesc, RamTransport, XferSpec};
+#[cfg(feature = "cuda")]
 pub use restore_flow::{AuxPlan, FlowStatus, RestoreFlow};
 pub use transport::{FakeTransport, IoCompletion, IoJob, TierTransport};
+
+/// Backend-independent cache-tier telemetry consumed by the serving API.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TierStats {
+    pub resident_runs: u64,
+    pub ready_bytes: u64,
+    pub in_flight_demotes: u64,
+    pub open_tickets: u64,
+    pub tripped: bool,
+    pub single_flight_joins: u64,
+    pub io_failures: u64,
+    pub integrity_failures: u64,
+    pub evictions: u64,
+    pub stale_completions: u64,
+    /// T2 payload bytes written this UTC day (endurance budget).
+    pub t2_written_day_bytes: u64,
+}
 
 /// An off-GPU storage tier. v1 ships exactly these two; remote/cluster tiers
 /// are a non-goal (plan, Non-goals). The catalog is written against this enum

@@ -1,0 +1,12 @@
+{
+  "currentModel": "local-qwen",
+  "pickerOptions": [
+    { "value": "local-qwen", "label": "Qwen 3.8 27B", "hint": "12481", "vendor": "Alibaba", "available": true, "title": "local-qwen · port 12481" },
+    { "value": "cloud-qwen", "label": "Cloud Qwen", "hint": "OpenRouter", "vendor": "Alibaba", "available": true, "title": "cloud-qwen · OpenRouter" }
+  ],
+  "compareLanes": [],
+  "comparing": false,
+  "specLabel": "MTP",
+  "isVision": true,
+  "soleEncoder": null
+}

@@ -3384,6 +3384,8 @@ int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* 
         case PD_KQ_IQ4NL_ID: PD_KWH2_LAUNCH(PD_KQ_IQ4NL_ID); break;
         case PD_KQ_Q2K_ID: PD_KWH2_LAUNCH(PD_KQ_Q2K_ID); break;
         case PD_KQ_Q3K_ID: PD_KWH2_LAUNCH(PD_KQ_Q3K_ID); break;
+        case PD_KQ_PQ2_ID: PD_KWH2_LAUNCH(PD_KQ_PQ2_ID); break;
+        case PD_KQ_PTQ1_ID: PD_KWH2_LAUNCH(PD_KQ_PTQ1_ID); break;
         default: PD_KWH2_LAUNCH(PD_KQ_IQ4XS); break;
     }
     #undef PD_KWH2_LAUNCH

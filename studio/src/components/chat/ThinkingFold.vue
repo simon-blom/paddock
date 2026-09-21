@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import Icon from '@/components/Icon.vue'
 import Markdown from './Markdown.vue'
-import { fmtDuration } from '@/lib/format'
+import { thinkingLabel, thinkingMetrics } from '@/lib/message-presentation'
 
 const props = defineProps<{
   reasoning: string
@@ -31,17 +31,8 @@ watch(
 )
 onBeforeUnmount(() => clearInterval(timer))
 
-const label = computed(() => {
-  if (props.active) return elapsed.value >= 1 ? `Thinking... ${Math.floor(elapsed.value)}s` : 'Thinking...'
-  if (props.ms != null) return `Thought for ${fmtDuration(props.ms)}`
-  return 'Thought for a moment'
-})
-const meta = computed(() => {
-  if (props.active || props.tokens == null) return ''
-  const parts = [`${props.tokens} tokens`]
-  if (props.tps) parts.push(`${Math.round(props.tps)} tok/s`)
-  return parts.join(' · ')
-})
+const label = computed(() => thinkingLabel(props.ms, props.active, elapsed.value))
+const meta = computed(() => thinkingMetrics(props.tokens, props.tps, props.active))
 
 // Open only WHILE actively thinking (a live fixed-height window scrolled to
 // the newest lines), collapsed once done - the Ollama shape.

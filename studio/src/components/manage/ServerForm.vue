@@ -19,6 +19,7 @@ import { useRegistryStore } from '@/stores/registry'
 import { useFleetStore, type DeploySpec } from '@/stores/fleet'
 import { useReadinessStore } from '@/stores/readiness'
 import { archBlockReason } from '@/lib/arch-floor'
+import { artifactCapabilities, artifactContextCap, artifactPlatform, automaticWeights, companionAllowed, embeddedVision } from '@/lib/artifact-runtime'
 import { useConnectorsStore, type Connector } from '@/stores/connectors'
 import { useToastsStore } from '@/stores/toasts'
 import { gpuApi, projectConfig } from '@/lib/api'
@@ -956,7 +957,9 @@ const vramBudgetMib = computed<number | null>(() => {
   if (vramMode.value === 'limit') return Math.max(1, Math.round(vramLimitGb.value * 1024))
   return null
 })
-const kvOptions = computed(() => [
+const kvOptions = computed(() => selectedWeights.value?.runtime?.kv_cache_dtype ? [
+  { value: selectedWeights.value.runtime.kv_cache_dtype, label: 'Backend native', hint: selectedWeights.value.runtime.kv_cache_dtype === 'auto' ? 'BF16 for this MLX export' : 'F16 for this Metal GGUF backend' },
+] : [
   { value: 'f16', label: '16-bit', hint: 'exact' },
   {
     value: 'fp8_e4m3',
@@ -1073,8 +1076,12 @@ const catModel = computed(() => reg.models.find((m) => m.id === model.value))
 const weightChoices = computed(
   () => catModel.value?.artifacts.filter((a) => a.kind === 'weights') ?? [],
 )
+const selectedWeights = computed(() => weightChoices.value.find((a) => a.id === artifactId.value))
+const selectedCapabilities = computed(() =>
+  catModel.value ? artifactCapabilities(catModel.value, selectedWeights.value) : [],
+)
 const fp8Artifact = computed(() =>
-  catModel.value?.artifacts.find((a) => a.kind === 'fp8-snapshot'),
+  catModel.value?.artifacts.find((a) => a.kind === 'fp8-snapshot' && companionAllowed(selectedWeights.value, a)),
 )
 /** The quality choice, as one list.
  *
@@ -1108,7 +1115,7 @@ const qualityCards = computed<QualityCard[]>(() => {
 })
 /** The base a plane artifact rides on: the catalog default, else the first. */
 const planesBase = computed(
-  () => weightChoices.value.find((a) => a.default) ?? weightChoices.value[0],
+  () => automaticWeights(weightChoices.value).find((a) => a.default) ?? automaticWeights(weightChoices.value)[0],
 )
 /** Why this card cannot be picked here, or null. Today only the arch floor -
  *  a format whose kernels this GPU does not have. The rule itself lives in
@@ -1132,11 +1139,12 @@ const qualityKey = computed<string>({
   },
 })
 const visionArtifact = computed(() =>
-  catModel.value?.artifacts.find((a) => a.kind === 'vision'),
+  catModel.value?.artifacts.find((a) => a.kind === 'vision' && companionAllowed(selectedWeights.value, a)),
 )
 // A required tower gets no switch - turning granite-vision's image reader
 // off would leave a text model with the purpose gone (catalog `required`).
-const visionRequired = computed(() => visionArtifact.value?.required ?? false)
+const visionEmbedded = computed(() => embeddedVision(selectedWeights.value))
+const visionRequired = computed(() => visionEmbedded.value || (visionArtifact.value?.required ?? false))
 // Forensics is VLM-coupled: its findings are injected for the vision tower to
 // examine (confirm/contradict pixels, read a receipt's sum/VAT). So the toggle
 // is only usable when this endpoint actually serves vision - a built-in tower,
@@ -1161,7 +1169,7 @@ const forensicsPossible = computed(
 // System tools need TOOL CALLING; a model whose capability doesn't include
 // it gets no web-search/MCP section (same rule as canSpeculate).
 const canTools = computed(
-  () => !catModel.value || catModel.value.capability.includes('tools'),
+  () => !catModel.value || selectedCapabilities.value.includes('tools'),
 )
 // Only offer speculation where this engine actually implements it (in-file MTP
 // or a drafter we load). Showing the control everywhere would make it a setting
@@ -1170,13 +1178,30 @@ const canTools = computed(
 // A hand-typed GGUF path has no catalog entry to ask; leave it visible there and
 // let the runner be the judge.
 const canSpeculate = computed(
-  () => !catModel.value || catModel.value.capability.includes('speculative'),
+  () => !catModel.value || selectedCapabilities.value.includes('speculative'),
 )
+watch(selectedWeights, (weights, previous) => {
+  if (!isEdit.value && weights?.runtime?.memory) {
+    ctx.value = Math.min(ctx.value, weights.runtime.memory.max_ctx)
+    batch.value = Math.min(batch.value, weights.runtime.memory.max_batch)
+  }
+  const kv = weights?.runtime?.kv_cache_dtype
+  if (kv) kvDtype.value = kv
+  else if (previous?.runtime?.kv_cache_dtype) kvDtype.value = catModel.value?.kv_default ?? preferredKv.value
+  // Apply only explicit export restrictions. Legacy artifacts and imported
+  // models keep the existing form's choices, including during hydration.
+  if (weights?.runtime?.capability && !canSpeculate.value) specPolicy.value = 'off'
+  if (weights?.runtime?.companions !== undefined) {
+    if (!visionArtifact.value) withVision.value = visionEmbedded.value
+    if (!fp8Artifact.value) fp8Native.value = false
+  }
+  if (weights?.runtime?.companions?.length === 0) drafterId.value = ''
+})
 /** Every drafter this model catalogues. muse ships two (DFlash1 and DFlash2)
  *  and they are ARTIFACTS of one model, not two models: speculation is
  *  lossless, so both emit identical output and differ only in speed. */
 const drafterChoices = computed(
-  () => catModel.value?.artifacts.filter((a) => a.kind === 'drafter') ?? [],
+  () => catModel.value?.artifacts.filter((a) => a.kind === 'drafter' && companionAllowed(selectedWeights.value, a)) ?? [],
 )
 /** The drafter this endpoint would wire. The manager's election (registry.rs)
  *  only ever returns INSTALLED artifacts - pin, else installed default, else
@@ -1220,7 +1245,7 @@ function defaultSpecChoice(): string {
 // keep the weights choice valid as the model changes: prefer installed, then
 // the catalog default
 watch(model, () => {
-  const ws = weightChoices.value
+  const ws = automaticWeights(weightChoices.value)
   if (!ws.some((a) => a.id === artifactId.value)) {
     artifactId.value = (ws.find((a) => a.installed) ?? ws.find((a) => a.default) ?? ws[0])?.id ?? ''
   }
@@ -1233,7 +1258,7 @@ watch(model, () => {
   if (!isEdit.value) {
     fp8Native.value = false
     specPolicy.value = defaultSpecChoice()
-    kvDtype.value = catModel.value?.kv_default ?? preferredKv.value
+    kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? catModel.value?.kv_default ?? preferredKv.value
   }
 })
 const est = computed(() => reg.estimates[model.value]?.artifacts?.[artifactId.value])
@@ -1256,15 +1281,35 @@ function qualityTitle(a: { label?: string; min_cc?: [number, number] }): string 
  *  choice. Everything cut here was a qualification ("that most work never
  *  notices") that says the same thing on two of the three cards, so it
  *  distinguishes nothing - which is the only job a blurb on a card has. */
-function qualityBlurb(a: { quant?: string }): string {
+function qualityBlurb(a: { quant?: string; source?: { repo: string; base_model: string } }): string {
   const q = (a.quant ?? '').toUpperCase()
   if (q.startsWith('Q8')) return 'Practically identical to the original.'
-  // NVFP4 before the Q4 test: it is four-bit too, but read straight from the
-  // published checkpoint rather than converted from a bigger file.
-  if (q.includes('NVFP4')) return 'Four-bit, straight from the official checkpoint.'
+  // NVFP4 before the Q4 test: it is four-bit too, but read from a published
+  // low-bit checkpoint rather than converted from a bigger file. WHOSE
+  // checkpoint is not something the quant tag knows - this line said "the
+  // official checkpoint" for every NVFP4 row, which became a false claim the
+  // day a community export joined the catalog (qwen3.8-flash-next's NVFP4 is
+  // a third party's conversion of Qwen's weights). `source` names the
+  // producer, so ask it instead of assuming.
+  if (q.includes('NVFP4')) {
+    return thirdPartyExport(a)
+      ? 'Four-bit, from a community build of the official weights.'
+      : 'Four-bit, straight from the official checkpoint.'
+  }
   if (q.includes('Q4')) return 'Half the memory, slight quality cost.'
   if (q.includes('MXFP4')) return 'The format it was trained in - nothing is higher.'
+  // Prism ML's ternary packings: the model ships in nothing else
+  if (q.startsWith('PTQ') || q.startsWith('PQ2')) return 'Ternary weights - the only build it ships in.'
   return 'A smaller build - some quality for memory.'
+}
+/** Somebody else's conversion, rather than a low-bit file the model's own
+ *  authors published. A registry row only carries `source` when the producing
+ *  repo differs from the obvious one, so no `source` reads as "official". */
+function thirdPartyExport(a: { source?: { repo: string; base_model: string } }): boolean {
+  const s = a.source
+  if (!s?.repo || !s?.base_model) return false
+  const org = (r: string) => r.split('/')[0].toLowerCase()
+  return org(s.repo) !== org(s.base_model)
 }
 /** Per-artifact fit verdict, so a card can warn before it is even picked. */
 function artifactVerdict(id: string): string | null {
@@ -1279,7 +1324,8 @@ const ctxVramCap = computed(() => {
   return e.curve?.find((p) => p.at === batch.value)?.ctx ?? e.estimate.max_ctx
 })
 /** What the MODEL itself supports, whatever the card has. */
-const ctxModelCap = computed(() => est.value?.estimate?.model_max_ctx ?? 0)
+const ctxModelCap = computed(() => artifactContextCap(selectedWeights.value, est.value?.estimate?.model_max_ctx))
+const batchModelCap = computed(() => selectedWeights.value?.runtime?.memory?.max_batch ?? Number.MAX_SAFE_INTEGER)
 /** The cap that actually applies - the lower of the two, on a KV page. */
 const ctxCap = computed(() =>
   ctxCapOf({ vramCap: ctxVramCap.value, modelCap: ctxModelCap.value }),
@@ -1458,7 +1504,7 @@ function applySimpleConfig(cfg: SimpleCfg): void {
   // a file with no key (or the legacy "auto") predates this control; resolve
   // it to the value that endpoint actually serves at
   const kv = cfg.kv_cache_dtype as string | undefined
-  kvDtype.value = !kv || kv === 'auto' ? (catModel.value?.kv_default ?? 'f16') : kv
+  kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? (!kv || kv === 'auto' ? (catModel.value?.kv_default ?? 'f16') : kv)
   // an existing file with no `spec` key predates this control; the engine
   // treats that as the tuned ladder, which is "On"
   specPolicy.value = cfg.spec ?? 'on'
@@ -1744,6 +1790,7 @@ const missingPieces = computed<{ ids: string[]; bytes: number }>(() => {
   const need = m.artifacts.filter(
     (a) =>
       !a.installed &&
+      (a.kind === 'weights' || companionAllowed(selectedWeights.value, a)) &&
       (a.id === artifactId.value ||
         (a.kind !== 'weights' &&
           a.kind !== 'fp8-snapshot' &&
@@ -2208,6 +2255,9 @@ function start(): void {
               :disabled="!!archBlock(c.artifact)"
             >
               <span class="sf__qcard-title">{{ qualityTitle(c.artifact) }}</span>
+              <span v-if="artifactPlatform(c.artifact)" class="sf__qcard-note">
+                {{ artifactPlatform(c.artifact) }}
+              </span>
               <span class="sf__qcard-meta">
                 <b class="sf__qcard-size">{{ fmtBytes(c.artifact.total_size) }}</b>
                 <span class="sf__qcard-quant">{{ c.artifact.quant }}</span>
@@ -2246,9 +2296,25 @@ function start(): void {
           </RadioGroup>
         </template>
 
+        <p v-if="selectedWeights && artifactPlatform(selectedWeights)" class="sf__hint">
+          {{ artifactPlatform(selectedWeights) }} · runs on the connected Paddock server.
+        </p>
+        <p v-if="selectedWeights?.runtime?.note" class="sf__hint sf__hint--warn">
+          {{ selectedWeights.runtime.note }}
+        </p>
+        <p v-if="selectedWeights?.source" class="sf__hint">
+          Source:
+          <a :href="`https://huggingface.co/${selectedWeights.source.repo}/tree/${selectedWeights.source.revision}`" target="_blank" rel="noopener noreferrer">{{ selectedWeights.source.repo }}</a>
+          · <a :href="selectedWeights.source.license_url" target="_blank" rel="noopener noreferrer">{{ selectedWeights.source.license }}</a>
+        </p>
+
         <!-- capabilities: what rides along with this composition. The weight
              class is NOT one of these - it is the Quality choice above. -->
-        <template v-if="visionArtifact">
+        <template v-if="visionEmbedded">
+          <label class="sf__lbl">Capabilities</label>
+          <p class="sf__capline"><Icon name="image" :size="14" /> Vision - included in the MLX checkpoint</p>
+        </template>
+        <template v-else-if="visionArtifact">
           <label class="sf__lbl">Capabilities</label>
           <p v-if="visionRequired" class="sf__capline">
             <Icon name="image" :size="14" />
@@ -2273,6 +2339,7 @@ function start(): void {
             v-for="w in WORKLOADS"
             :key="w.id"
             :value="String(w.batch)"
+            :disabled="w.batch > batchModelCap"
             class="sf__wlcard"
           >
             <span class="sf__wlcard-name">{{ w.label }}</span>
@@ -2286,7 +2353,7 @@ function start(): void {
                 <Icon name="minus" :size="12" />
               </button>
               <span class="sf__step-val">{{ batch }}</span>
-              <button type="button" class="sf__step-btn" @click="batch = batch + 1">
+              <button type="button" class="sf__step-btn" :disabled="batch >= batchModelCap" @click="batch = Math.min(batchModelCap, batch + 1)">
                 <Icon name="plus" :size="12" />
               </button>
             </span>

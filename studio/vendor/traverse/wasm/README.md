@@ -25,6 +25,33 @@ browsers (see [Browser support](#browser-support)).
 
 ## Quickstart
 
+### Worker and query resource contract
+
+Operations share a bounded queue (32 active/queued requests and 256 MiB of
+estimated payloads) with one physically active operation. Payloads are captured
+at call time. Queue overflow rejects with `RangeError`; `db.queueStats` exposes
+admission state. Exported byte buffers are transferred back without a second
+worker-to-page copy. OPFS operations and queries run in order.
+
+An `AbortSignal` removes queued work before dispatch. For an active synchronous
+WASM operation, it cancels **the caller only** and reports
+`AbortError.executionMayHaveCompleted === true`; the queue retains that slot
+until the worker replies. It does not kill the database or promise rollback.
+Query deadlines default to 10 seconds, capped at 30 seconds, and are checked
+cooperatively at executor boundaries. Resumable/physically interruptible active
+queries are not implemented.
+
+Browser queries install a 128 MiB *accounted intermediate-allocation* budget;
+this is not a whole-worker/RSS limit. Results return at most 10,000 rows within
+an 8 MiB estimated conversion budget. `total_rows` remains the executor's full
+row count; `truncated` tells callers not to treat the response as exhaustive.
+Hydrated graph entities retain the 1,024-item cap and provenance hydration has
+its own 8 MiB estimate. Execution is not rewritten with an injected `LIMIT`.
+The executor still materializes results before response conversion; bounded
+cursor/paged export is separate, unfinished work.
+
+### Example
+
 ```ts
 import { TraverseDb } from '@truespar/traverse-wasm'
 
@@ -56,6 +83,10 @@ binary format.
 ---
 
 ## Required hosting setup: cross-origin isolation
+
+The **single-threaded build** (`build.sh` without `--threads`) does not need
+cross-origin isolation or SharedArrayBuffer and works in a non-isolated
+WKWebView. The headers below apply only to the threaded build.
 
 The engine uses `SharedArrayBuffer` for multi-threading. Browsers only
 expose `SharedArrayBuffer` on pages that are **cross-origin isolated**,
@@ -353,10 +384,11 @@ The engine streams the WASM module on `TraverseDb.open()`. Subsequent
 
 ## License
 
-Dual-licensed MIT OR Apache-2.0, at your option. See the LICENSE,
-LICENSE-MIT and LICENSE-APACHE files at the root of this vendored drop.
-No license key, no runtime telemetry, no usage limits.
+LicenseRef-Proprietary — but **free for any use**. No license key, no
+runtime telemetry, no usage limits. The published WASM artifact is
+free to redistribute and embed in your own apps and demos.
 
-For server-side Traverse — multi-user, network protocols (Bolt/HTTP/gRPC),
-embedded SDKs for Python/Java/Node/Go/.NET, or production support — see
-the [server docs](https://truespar.com/traverse/docs/v1/getting-started).
+If you want server-side Traverse — multi-user, network protocols
+(Bolt/HTTP/gRPC), embedded SDKs for Python/Java/Node/Go/.NET, or
+production support — see the
+[licensed server](https://truespar.com/traverse/docs/v1/getting-started).

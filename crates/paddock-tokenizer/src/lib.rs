@@ -51,6 +51,8 @@ const TOKEN_TYPE_USER_DEFINED: u64 = 4;
 #[derive(Debug)]
 pub struct GgufTokenizer {
     inner: Tokenizer,
+    // HF permits more terminals than the GGUF eos/eot convenience pair.
+    extra_eos_ids: Vec<u32>,
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
     /// GGUF `tokenizer.ggml.eot_token_id` - the END-OF-TURN token, which is
@@ -68,6 +70,22 @@ pub struct GgufTokenizer {
 }
 
 impl GgufTokenizer {
+    /// Complete checkpoint stop set, preserving upstream order and removing
+    /// duplicates. Gemma 4 uses three ids; never truncate that to eos/eot.
+    pub fn stop_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for id in self
+            .eos_id
+            .into_iter()
+            .chain(self.eot_id)
+            .chain(self.extra_eos_ids.iter().copied())
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
     pub fn from_gguf(f: &GgufFile) -> Result<Self, TokenizerError> {
         // Whisper family: our own GGUF schema (our whisper converter)
         // embeds the HF tokenizer.json whole - whisper's GPT-2 BPE plus its
@@ -142,6 +160,7 @@ impl GgufTokenizer {
             inner,
             bos_id: id_meta("tokenizer.ggml.bos_token_id"),
             eos_id: id_meta("tokenizer.ggml.eos_token_id"),
+            extra_eos_ids: Vec::new(),
             eot_id: id_meta("tokenizer.ggml.eot_token_id"),
             pad_id: id_meta("tokenizer.ggml.padding_token_id"),
             add_bos,
@@ -170,6 +189,7 @@ impl GgufTokenizer {
             inner,
             bos_id: None,
             eos_id,
+            extra_eos_ids: Vec::new(),
             eot_id: None,
             pad_id: None,
             add_bos: false,
@@ -216,6 +236,7 @@ impl GgufTokenizer {
                     inner,
                     bos_id: id_meta("tokenizer.ggml.bos_token_id"),
                     eos_id: id_meta("tokenizer.ggml.eos_token_id"),
+                    extra_eos_ids: Vec::new(),
                     eot_id: id_meta("tokenizer.ggml.eot_token_id"),
                     pad_id: id_meta("tokenizer.ggml.padding_token_id"),
                     add_bos,
@@ -242,9 +263,8 @@ impl GgufTokenizer {
     /// - `tokenizer_config.json` - `add_bos_token` and the bos string.
     /// - `generation_config.json` - the eos SET. Nemotron stops on [2, 11]
     ///   (`</s>` and `<|im_end|>`); the first id lands in `eos_id`, the second
-    ///   in `eot_id` (serving unions both into its stop set, same contract as
-    ///   the GGUF eot). More than two would need a wider contract - error
-    ///   rather than silently dropping a stop token.
+    ///   in `eot_id`. `stop_ids()` returns the complete set, including models
+    ///   such as Gemma 4 which publish more than two terminal ids.
     /// - `chat_template.jinja` - the family template comes from this file
     ///   (tokenizer_config carries none for this family).
     pub fn from_hf_dir(dir: &std::path::Path) -> Result<Self, TokenizerError> {
@@ -285,14 +305,27 @@ impl GgufTokenizer {
                 Some(serde_json::Value::Array(a)) => {
                     eos_ids = a
                         .iter()
-                        .filter_map(|x| x.as_u64())
-                        .filter_map(|x| u32::try_from(x).ok())
-                        .collect();
+                        .map(|x| {
+                            x.as_u64()
+                                .and_then(|x| u32::try_from(x).ok())
+                                .filter(|&x| inner.id_to_token(x).is_some())
+                                .ok_or_else(|| {
+                                    TokenizerError::Library(
+                                        "invalid generation_config terminal id".into(),
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
                 }
                 Some(serde_json::Value::Number(n)) => {
-                    if let Some(x) = n.as_u64().and_then(|x| u32::try_from(x).ok()) {
-                        eos_ids = vec![x];
-                    }
+                    let id = n
+                        .as_u64()
+                        .and_then(|x| u32::try_from(x).ok())
+                        .filter(|&id| inner.id_to_token(id).is_some())
+                        .ok_or_else(|| {
+                            TokenizerError::Library("invalid generation_config terminal id".into())
+                        })?;
+                    eos_ids = vec![id];
                 }
                 _ => {}
             }
@@ -303,12 +336,6 @@ impl GgufTokenizer {
                 tok_str(tc.as_ref().and_then(|t| t.get("eos_token")))
                     .and_then(|s| inner.token_to_id(&s)),
             );
-        }
-        if eos_ids.len() > 2 {
-            return Err(TokenizerError::Library(format!(
-                "generation_config eos set has {} ids; the eos/eot contract holds two",
-                eos_ids.len()
-            )));
         }
 
         let chat_template = std::fs::read_to_string(dir.join("chat_template.jinja"))
@@ -324,6 +351,7 @@ impl GgufTokenizer {
         Ok(Self {
             eos_id: eos_ids.first().copied(),
             eot_id: eos_ids.get(1).copied(),
+            extra_eos_ids: eos_ids.iter().skip(2).copied().collect(),
             inner,
             bos_id,
             pad_id,
@@ -462,6 +490,31 @@ fn build_gpt2_bpe(f: &GgufFile, tokens: &[&str]) -> Result<Tokenizer, TokenizerE
         .get("tokenizer.ggml.pre")
         .and_then(Value::as_str)
         .unwrap_or("default");
+    // The `granite-docling` GGUF label is reused for different published
+    // tokenizers. Granite 4.1 Vision uses the explicit llama3-like split; the
+    // Granite 4.2 text family ships a plain ByteLevel(use_regex=true), i.e.
+    // GPT-2 split. Changing the registry entry globally would break Vision.
+    // Use the checkpoint's canonical basename, never its filename/display
+    // alias, to resolve this converter ambiguity. Verified 2026-09-06 against
+    // https://huggingface.co/ibm-granite/granite-4.2-8b/blob/main/tokenizer.json
+    // and the same-GGUF released llama-tokenize. No weights are rewritten.
+    // Speech 4.1 repeats the ambiguity within the family: base is llama3-like,
+    // Plus is plain ByteLevel(use_regex=true). Verified against both official
+    // tokenizer.json files on 2026-09-11. Resolve from file metadata, never a
+    // user-chosen path. This tokenizer correction is backend-independent.
+    let basename = f.metadata.get("general.basename").and_then(Value::as_str);
+    let speech_plus = basename == Some("granite-speech-4.1")
+        && ["general.finetune", "general.name"].iter().any(|key| {
+            f.metadata
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.to_lowercase().ends_with("plus"))
+        });
+    let pre = if pre == "granite-docling" && (basename == Some("granite-4.2") || speech_plus) {
+        "gpt-2"
+    } else {
+        pre
+    };
 
     let bpe = BPE::builder()
         .vocab_and_merges(build_vocab(tokens), parse_merges(f, false)?)

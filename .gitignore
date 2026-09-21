@@ -36,6 +36,9 @@ dist/
 # Nothing about it is tracked: the reference is always a CURRENT llama.cpp
 # release, so a pinned version in git would only ever be out of date.
 /vendor/llamacpp/*
+# PrismML's llama.cpp fork, the reference for the Bonsai ternary GGUFs that
+# stock llama.cpp cannot read - a prebuilt release, fetched. Same deal.
+/vendor/llamacpp-prism/*
 
 # OS
 .DS_Store

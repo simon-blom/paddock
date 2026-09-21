@@ -43,6 +43,7 @@
 // element, covering the page's content box exactly, and the boxes teleport
 // into it - percentage geometry, so lector's zoom holds for free.
 import { copyText } from '@/lib/clipboard'
+import type { Conversation } from '@/types/chat'
 import { computed, nextTick, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { LectorPdfViewer } from '@truespar/lector-vue'
 import { ScriptorDoc, type TrackDisplay } from '@truespar/scriptor-vue'
@@ -50,17 +51,17 @@ import { DEFAULT_UI_SCHEMA } from '@truespar/lector-core'
 import type {
   DocumentCapability,
   DocumentManagerCapability,
+  DocumentId,
   LectorEngine,
   PageMountedEvent,
 } from '@truespar/lector-core'
 import '@truespar/lector-core/css/tokens.css'
 import '@truespar/lector-core/css/base.css'
-import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
 import { docContext, docContexts, pageRangeBounds } from '@/lib/docrun'
 import { pageRegionBoxes } from '@/lib/ocr'
 import { attachmentsApi } from '@/lib/api'
-import { pdfViewerEngine } from '@/lib/pdf'
+import { pdfViewerEngine, withPdfViewerDocuments } from '@/lib/pdf'
 import DocumentPages from './DocumentPages.vue'
 import FileInfoDialog from './FileInfoDialog.vue'
 import FileMetaPane from './FileMetaPane.vue'
@@ -75,11 +76,14 @@ import Popover from '@/components/ui/Popover.vue'
 import Tabs from '@/components/ui/Tabs.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 
-const chat = useChatStore()
+// Native draft previews use this same viewer without inventing a sent turn or
+// writing a preview document to the conversation store.
+const props = defineProps<{ conversation?: Conversation; embedded?: boolean }>()
+const active = computed(() => props.conversation)
 const settings = useSettingsStore()
-const emit = defineEmits<{ fold: [] }>()
-const all = computed(() => docContexts(chat.active))
-const ctx = computed(() => docContext(chat.active))
+const emit = defineEmits<{ fold: []; selection: [conversation: Conversation] }>()
+const all = computed(() => docContexts(active.value))
+const ctx = computed(() => docContext(active.value))
 const runPages = computed(() => ctx.value?.run?.docRun?.pages)
 const regions = computed(() => ctx.value?.run?.ocr?.regions)
 // The pane's document switcher - one strip for every document the
@@ -131,10 +135,10 @@ const ctxName = computed(() => {
 })
 
 function select(id: string): void {
-  const c = chat.active
+  const c = active.value
   if (!c || c.activeDocId === id) return
   c.activeDocId = id
-  chat.persist(c)
+  emit('selection', c)
 }
 
 // ── the lector viewer (PDF documents) ───────────────────────────────────────
@@ -161,6 +165,10 @@ const hasPdf = computed(() => all.value.some(usesLector))
 const showViewer = computed(() => !!ctx.value && usesLector(ctx.value))
 const viewerEngine = shallowRef<LectorEngine>()
 const viewerReady = ref(false)
+let disposed = false
+let documentEpoch = 0
+const pdfErrors = reactive(new Map<string, string>())
+const engineError = ref('')
 
 // ── the views a NON-lector document offers, as tabs ─────────────────────────
 // A photo has no viewer chrome of its own, so its honesty panel became a tab
@@ -227,7 +235,8 @@ watch(
   hasPdf,
   (want) => {
     if (want && !viewerEngine.value) {
-      void pdfViewerEngine().then((e) => (viewerEngine.value = e))
+      void pdfViewerEngine().then((e) => { if (!disposed) viewerEngine.value = e })
+        .catch(e => { if (!disposed) engineError.value = String(e) })
     }
   },
   { immediate: true },
@@ -322,7 +331,7 @@ const toolbarExtras = [
     disabled: () => !ctx.value,
     onSelect: () => download(),
   },
-]
+].filter(action => !props.embedded || action.id !== 'pk-fold')
 
 // ── multi-doc: every PDF opens as a lector tab; selection syncs both ways ──
 const lectorDocBySource = reactive(new Map<string, string>())
@@ -330,6 +339,19 @@ const sourceByLectorDoc = reactive(new Map<string, string>())
 const pageCountBySource = reactive(new Map<string, number>())
 const opening = new Set<string>()
 const offs: (() => void)[] = []
+const ownedDocuments = new Set<DocumentId>()
+const downloads = new Set<AbortController>()
+
+// The engine is shared across pane opens. A stale pane must close only its
+// own handles, not closeAll() after the next pane has already opened a file.
+function releaseDocuments(): void {
+  documentEpoch++
+  for (const download of downloads) download.abort()
+  downloads.clear()
+  const dm = docManager()
+  for (const id of ownedDocuments) void withPdfViewerDocuments(async () => { await dm?.close(id) }).catch(() => {})
+  ownedDocuments.clear()
+}
 
 function docManager(): DocumentManagerCapability | undefined {
   try {
@@ -348,27 +370,41 @@ function docCap(): DocumentCapability | undefined {
 
 async function openMissingDocs(): Promise<void> {
   const dm = docManager()
-  if (!dm || !viewerReady.value) return
+  if (!dm || !viewerReady.value || disposed) return
+  const epoch = documentEpoch
   for (const [i, c] of all.value.entries()) {
+    if (disposed || epoch !== documentEpoch) return
     const att = usesLector(c) ? c.pdf?.attachmentId : undefined
     const sid = c.source.id
     if (!att || lectorDocBySource.has(sid) || opening.has(sid)) continue
     opening.add(sid)
+    pdfErrors.delete(sid)
+    const download = new AbortController()
+    downloads.add(download)
     try {
-      const od = await dm.openFromUrl(attachmentsApi.url(att), {
-        name: docName(c, i),
-        skipRecent: true,
+      const response = await fetch(attachmentsApi.url(att), { signal: download.signal })
+      if (!response.ok) throw new Error(`Could not open the PDF (HTTP ${response.status})`)
+      const bytes = await response.arrayBuffer()
+      await withPdfViewerDocuments(async () => {
+        if (disposed || epoch !== documentEpoch) return
+        const od = await dm.openFromBuffer(bytes, { name: docName(c, i), skipRecent: true })
+        if (disposed || epoch !== documentEpoch) {
+          await dm.close(od.id)
+          return
+        }
+        ownedDocuments.add(od.id)
+        lectorDocBySource.set(sid, String(od.id))
+        sourceByLectorDoc.set(String(od.id), sid)
+        pageCountBySource.set(sid, od.handle.pageCount)
       })
-      lectorDocBySource.set(sid, String(od.id))
-      sourceByLectorDoc.set(String(od.id), sid)
-      pageCountBySource.set(sid, od.handle.pageCount)
-    } catch {
-      /* a doc that fails to open simply has no tab; its run still shows */
+    } catch (error) {
+      if (!disposed && epoch === documentEpoch) pdfErrors.set(sid, error instanceof Error ? error.message : 'The PDF could not be opened')
     } finally {
+      downloads.delete(download)
       opening.delete(sid)
     }
   }
-  syncActiveToLector()
+  if (!disposed && epoch === documentEpoch) syncActiveToLector()
 }
 
 // conv -> lector: the selected document's tab activates
@@ -418,19 +454,20 @@ watch(
 )
 // a conversation switch resets the viewer's document set
 watch(
-  () => chat.active?.id,
+  () => active.value?.id,
   () => {
+    releaseDocuments()
     lectorDocBySource.clear()
     sourceByLectorDoc.clear()
     pageCountBySource.clear()
     pageHosts.clear()
     viewerReady.value = false
-    void docManager()?.closeAll()
   },
 )
 onBeforeUnmount(() => {
+  disposed = true
   for (const off of offs) off()
-  void docManager()?.closeAll()
+  releaseDocuments()
 })
 
 // ── the OCR overlay on lector's pages ───────────────────────────────────────
@@ -932,11 +969,18 @@ function download(): void {
     a.click()
   }
 }
+// Swift's document header owns these actions in embedded mode. Both still
+// execute the shared metadata/download paths, including native save mediation.
+defineExpose({ info: openInfo, download })
 </script>
 
 <template>
   <aside class="docpane">
-    <nav v-if="all.length" class="docpane__tabs">
+    <div v-if="engineError || (ctx && pdfErrors.get(ctx.source.id))" class="docpane__load-error" role="alert">
+      <span>{{ engineError || (ctx && pdfErrors.get(ctx.source.id)) }}</span>
+      <button v-if="!engineError" class="pk-btn pk-btn--sm" @click="openMissingDocs">Try again</button>
+    </div>
+    <nav v-if="all.length && !embedded" class="docpane__tabs">
       <Tooltip v-for="(c, i) in all" :key="c.source.id" :label="docName(c, i)">
         <button
           type="button"
@@ -953,7 +997,7 @@ function download(): void {
     <div v-if="hasPdf" v-show="ctx && showViewer" class="docpane__lector">
       <LectorPdfViewer
         v-if="viewerEngine"
-        :key="chat.active?.id"
+        :key="active?.id"
         :engine="viewerEngine"
         :theme="settings.theme"
         :panels="['thumbnails']"
@@ -962,6 +1006,7 @@ function download(): void {
         :toolbar-extras="toolbarExtras"
         :ui-schema="studioSchema"
         @ready="onViewerReady"
+        @error="engineError = $event.message"
       />
       <template v-for="[idx, host] of pageHosts" :key="idx">
         <Teleport :to="host">
@@ -998,7 +1043,7 @@ function download(): void {
 
     <template v-if="ctx && !showViewer">
       <header class="docpane__bar">
-        <div class="docpane__grp">
+        <div v-if="!embedded" class="docpane__grp">
           <Tooltip label="Hide the document">
             <button
               class="docpane__btn"
@@ -1169,8 +1214,8 @@ function download(): void {
         <InsightPane
           v-if="insightFile"
           :file="insightFile"
-          :with-meta="chat.active?.fileMetadataEnabled ?? true"
-          :model="chat.active?.model"
+          :with-meta="active?.fileMetadataEnabled ?? true"
+          :model="active?.model"
         />
         <div v-else-if="insightError" class="pv__overlay-msg pv__overlay-msg--err">
           <Icon name="file-text" :size="28" />
@@ -1194,14 +1239,15 @@ function download(): void {
       :file="insightFile"
       :file-error="insightError"
       :title="ctxName"
-      :with-meta="chat.active?.fileMetadataEnabled ?? true"
-      :model="chat.active?.model"
+      :with-meta="active?.fileMetadataEnabled ?? true"
+      :model="active?.model"
       @close="insightOpen = false"
     />
   </aside>
 </template>
 
 <style scoped>
+.docpane__load-error { display: flex; align-items: center; gap: 12px; padding: 12px; font-size: 12px; color: var(--pk-status-error); }
 .docpane {
   display: flex;
   flex-direction: column;
@@ -1393,7 +1439,7 @@ function download(): void {
    should not change how it looks. */
 .docpane__body--docx {
   padding: 16px 0;
-  background: var(--pk-bg-inset);
+  background: var(--pk-document-stage);
 }
 /* ScriptorDoc's root is a plain div holding an inline-block .scriptor-sheet;
    max-content + auto margins centre it while it fits and fall back to the left
@@ -1443,78 +1489,7 @@ function download(): void {
      layers, which carry no Vue scope hash. All classes are docpane-ov
      prefixed. -->
 <style>
-/* lector, wearing paddock's theme.
-   The viewer ships its own ~40-token palette, and in DARK it is a different
-   world: ground #1f2937 against our #121C26, a cool #f9fafb text ramp against
-   our warm #ECE8E0, blue-500 against our sky, and a system-ui stack against
-   Inter. In LIGHT the two agree almost everywhere (both grounds are #ffffff),
-   which is why this only ever showed up in dark.
-   Bridging the ground alone was worse than bridging nothing: lector picked its
-   hover (#374151) to sit on ITS ground, so on ours the same hover became a
-   bigger jump than lector ever intended. Moving the floor means moving the
-   furniture.
-   Tokens are lector's documented theming API - "override on .lector-workspace"
-   - and since lector wraps its own defaults in :where() (specificity 0) this
-   single-class rule wins outright, in both themes, with no doubled-class or
-   !important escalation.
-   Not bridged, deliberately: --lector-canvas-bg, the ground BEHIND the pages.
-   That is a reading decision, not a consistency one - our --pk-bg-inset is
-   near-black, which makes a white page pop and also glare - so it stays
-   lector's until someone decides it on its own merits. */
-.docpane__lector .lector-workspace {
-  /* surfaces */
-  --lector-bg: var(--pk-bg-surface);
-  /* the doctabs strip: recessed against the toolbar in both themes, which is
-     paddock's convention - lector raises it in dark and recesses it in light */
-  --lector-bg-alt: var(--pk-bg-base);
-  --lector-bg-hover: var(--pk-bg-hover);
-  --lector-bg-active: var(--pk-bg-hover);
-  --lector-bg-selected: var(--pk-accent-subtle);
-  --lector-bg-input: var(--pk-bg-base);
-  --lector-bg-overlay: var(--pk-bg-overlay);
-
-  /* text */
-  --lector-fg: var(--pk-text-primary);
-  --lector-fg-secondary: var(--pk-text-secondary);
-  --lector-fg-muted: var(--pk-text-muted);
-  --lector-fg-disabled: var(--pk-text-muted);
-  --lector-fg-on-accent: var(--pk-text-inverse);
-
-  /* one accent per screen */
-  --lector-accent: var(--pk-accent);
-  --lector-accent-hover: var(--pk-accent-hover);
-  --lector-accent-active: var(--pk-accent-active);
-  --lector-accent-light: var(--pk-accent-subtle);
-  --lector-accent-fg: var(--pk-text-inverse);
-
-  /* borders */
-  --lector-border: var(--pk-border-default);
-  --lector-border-subtle: var(--pk-border-subtle);
-  --lector-border-strong: var(--pk-border-strong);
-
-  /* state */
-  --lector-danger: var(--pk-status-error);
-  --lector-danger-hover: var(--pk-status-error-hover);
-  --lector-success: var(--pk-status-success);
-  --lector-warning: var(--pk-status-warning);
-
-  /* type: the viewer's chrome is part of the Studio, so it reads in the
-     Studio's face rather than the OS default */
-  --lector-font-family: var(--pk-font-sans);
-  --lector-font-mono: var(--pk-font-mono);
-
-  /* shadows + scrollbars, so a floating menu inside the viewer lands with the
-     same weight as one outside it */
-  --lector-shadow-lg: var(--pk-shadow-lg);
-  --lector-scrollbar-track: var(--pk-bg-base);
-  --lector-scrollbar-thumb: var(--pk-border-default);
-  --lector-scrollbar-thumb-hover: var(--pk-border-strong);
-
-  /* a tooltip is inverted in both products; keep lector's own inversion but in
-     our colours */
-  --lector-tooltip-bg: var(--pk-text-primary);
-  --lector-tooltip-fg: var(--pk-bg-base);
-}
+/* Viewer tokens are shared with the file-dialog lane in viewer-theme.css. */
 
 .docpane-ov__box {
   position: absolute;

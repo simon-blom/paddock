@@ -22,11 +22,14 @@ mod basic_ops;
 mod batch_ops;
 mod bf16;
 mod deltanet;
+mod dense_pred;
 mod error;
 mod fp4;
 mod fp8;
 mod fused_gemv;
 mod graph;
+mod hadamard;
+pub use hadamard::HadamardGdnHeads;
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
@@ -43,6 +46,7 @@ mod moe_q8;
 mod q8_gemm;
 mod qwen4exp;
 mod sampling;
+mod ternary;
 mod tier_xfer;
 mod transfer;
 mod unified_mem;
@@ -86,6 +90,12 @@ pub struct GpuExecutor {
     /// over-64-row producers must keep the row-major int8 pair even on a pack
     /// that carries the i-quant tile marker.
     dense_iq_flat_seen: std::sync::atomic::AtomicBool,
+    /// The family loading through this executor applies the activation
+    /// rotation a `prism.hadamard.*` file asks for. Every GGUF weight loader
+    /// refuses such a file until this is set (`rotated_basis_guard`): the
+    /// tensor directory of a rotated-basis file looks ordinary, so a family
+    /// that never heard of the contract would load it and compute noise.
+    rotated_basis_ok: std::sync::atomic::AtomicBool,
     /// The forked branch's completion event, recorded by `side_end` and
     /// stream-waited by `side_join` before the joint consumer launches.
     /// Parked here so the event outlives graph capture.
@@ -157,6 +167,18 @@ pub struct GpuExecutor {
 }
 impl GpuExecutor {
     /// See the `dense_iq_seen` field.
+    /// Unified-memory (integrated) die: the GPU has no memory of its own, so
+    /// a "device" allocation and a host mapping are the same physical DRAM.
+    /// Read from CU_DEVICE_ATTRIBUTE_INTEGRATED at construction.
+    ///
+    /// Callers use this to decide whether copying a host-resident table into
+    /// device memory buys anything. On a discrete card it does - the copy
+    /// turns PCIe round trips into local reads. On GB10/Jetson it buys
+    /// nothing and costs the table twice.
+    pub fn is_integrated(&self) -> bool {
+        self.integrated
+    }
+
     pub fn dense_iq_seen(&self) -> bool {
         self.dense_iq_seen
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -173,6 +195,37 @@ impl GpuExecutor {
     pub(crate) fn note_dense_iq_flat(&self) {
         self.dense_iq_flat_seen
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A family that read and validated the file's `prism.hadamard.*`
+    /// contract, and routes every listed weight through a rotating site,
+    /// says so before it loads the first tensor. See `rotated_basis_ok`.
+    pub(crate) fn acknowledge_rotated_basis(&self) {
+        self.rotated_basis_ok
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Refuse to load `name` out of a rotated-basis file the loading family
+    /// has not acknowledged. Called by every GGUF weight loader.
+    pub(crate) fn rotated_basis_guard(
+        &self,
+        map: &paddock_models::mapped::MappedGguf,
+        name: &str,
+    ) -> Result<(), GpuError> {
+        if self
+            .rotated_basis_ok
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || !map
+                .gguf()
+                .metadata
+                .keys()
+                .any(|k| k.starts_with("prism.hadamard."))
+        {
+            return Ok(());
+        }
+        Err(GpuError::Unsupported(format!(
+            "{name}: this file stores its weights in a rotated basis (prism.hadamard.*) and \n             this model family does not apply the rotation - refusing rather than compute noise"
+        )))
     }
 
     /// Load a pack from a path. The bring-up/bench/example entry point, and
@@ -316,6 +369,7 @@ impl GpuExecutor {
             side_armed: std::sync::atomic::AtomicBool::new(false),
             dense_iq_seen: std::sync::atomic::AtomicBool::new(false),
             dense_iq_flat_seen: std::sync::atomic::AtomicBool::new(false),
+            rotated_basis_ok: std::sync::atomic::AtomicBool::new(false),
             side_pending: std::sync::Mutex::new(None),
             pack,
             kernels,
@@ -496,7 +550,7 @@ impl GpuExecutor {
     /// Still pessimistic right after a large CUDA process exits: the pooled
     /// pages sit in no /proc/meminfo category, so MemAvailable does not see
     /// them until the kernel's shrinker runs (memory pressure, or
-    /// drop_caches=2). This stays the plain OS reading on purpose - the load
+    /// drop_caches=2). This stays the plain OS reading deliberately - the load
     /// gate proves its own case with a trial allocation, and `vram_headroom`
     /// adds the measured pool (`unified_mem`), which is where the sizers read.
     pub fn device_mem_info(&self) -> Option<(u64, u64)> {
@@ -868,6 +922,7 @@ impl GpuExecutor {
             side_armed: std::sync::atomic::AtomicBool::new(false),
             dense_iq_seen: std::sync::atomic::AtomicBool::new(false),
             dense_iq_flat_seen: std::sync::atomic::AtomicBool::new(false),
+            rotated_basis_ok: std::sync::atomic::AtomicBool::new(false),
             side_pending: std::sync::Mutex::new(None),
             pack: self.pack.clone(),
             kernels: self.kernels,

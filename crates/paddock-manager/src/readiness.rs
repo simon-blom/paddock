@@ -12,6 +12,8 @@
 //! written and rewritten without a rebuild, and where the rule that the
 //! Manager speaks no jargon is enforceable by reading it.
 
+#[cfg(target_os = "macos")]
+use objc2_metal::MTLDevice;
 use paddock_models::gpu_support::{self, Arch};
 use serde::Serialize;
 
@@ -109,6 +111,8 @@ pub fn card_sheet() -> Vec<CardRow> {
 /// Everything the Studio needs to say something true and act on it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Readiness {
+    /// Configured runner backend, independent of the browser's platform.
+    pub backend: String,
     pub state: State,
     /// The card we looked at, as the driver names it ("NVIDIA RTX A6000").
     /// Present whenever there was one to look at, including when it is too
@@ -188,7 +192,12 @@ fn cuda_parts(v: i32) -> (u32, u32) {
 /// Look once. Never fails: "we could not tell" is an answer here, and it is
 /// the same answer as "there is nothing to tell about".
 pub fn probe() -> Readiness {
+    probe_for_backend(&crate::config::Config::default().device)
+}
+
+pub fn probe_for_backend(backend: &str) -> Readiness {
     let base = |state: State| Readiness {
+        backend: backend.into(),
         state,
         card: None,
         generation: None,
@@ -199,6 +208,71 @@ pub fn probe() -> Readiness {
         os: os_name(),
         supported: supported_gens(),
     };
+
+    if backend == "metal" {
+        let mut result = base(State::NoCard);
+        result.cuda_needed.clear();
+        // Newest first, like the CUDA list. M5 is where the pack is qualified;
+        // the older families load the same pack on its shader-core path.
+        let gens: [(&str, &[&str]); 4] = [
+            (
+                "Apple10 (M5)",
+                &["Apple M5", "Apple M5 Pro", "Apple M5 Max"],
+            ),
+            (
+                "Apple9 (M3, M4)",
+                &[
+                    "Apple M4",
+                    "Apple M4 Pro",
+                    "Apple M4 Max",
+                    "Apple M3",
+                    "Apple M3 Pro",
+                    "Apple M3 Max",
+                    "Apple M3 Ultra",
+                ],
+            ),
+            (
+                "Apple8 (M2)",
+                &["Apple M2", "Apple M2 Pro", "Apple M2 Max", "Apple M2 Ultra"],
+            ),
+            (
+                "Apple7 (M1)",
+                &["Apple M1", "Apple M1 Pro", "Apple M1 Max", "Apple M1 Ultra"],
+            ),
+        ];
+        result.supported = gens
+            .iter()
+            .map(|(name, cards)| SupportedGen {
+                name: (*name).into(),
+                cards: cards.iter().map(|card| (*card).into()).collect(),
+            })
+            .collect();
+        #[cfg(target_os = "macos")]
+        if let Some(device) = objc2_metal::MTLCreateSystemDefaultDevice() {
+            use objc2_metal::MTLGPUFamily;
+            // Same hard requirement as paddock-metal::MetalDevice::new: unified
+            // memory and Apple7 or newer. Merely having Metal (an Intel Mac)
+            // does not make this pack load.
+            let family = [
+                MTLGPUFamily::Apple10,
+                MTLGPUFamily::Apple9,
+                MTLGPUFamily::Apple8,
+                MTLGPUFamily::Apple7,
+            ]
+            .into_iter()
+            .position(|family| device.supportsFamily(family));
+            if let (true, Some(newest)) = (device.hasUnifiedMemory(), family) {
+                result.card = Some(device.name().to_string());
+                result.generation = Some(gens[newest].0.into());
+                // Can serve previews; this is not whole-product qualification.
+                result.state = State::Untested;
+            }
+        }
+        return result;
+    }
+    if backend != "cuda" {
+        return base(State::NoCard);
+    }
 
     // No NVML means no NVIDIA driver to ask. That is the same user-visible
     // situation as no NVIDIA card, and we deliberately do not guess which:
@@ -295,13 +369,39 @@ mod tests {
         let r = probe();
         assert!(!r.supported.is_empty(), "the sheet must never be empty");
         assert!(r.supported.iter().all(|g| !g.cards.is_empty()));
-        assert_eq!(r.cuda_needed, "13.0");
+        assert_eq!(
+            r.cuda_needed,
+            if r.backend == "metal" { "" } else { "13.0" }
+        );
         assert!(matches!(r.os, "windows" | "linux" | "macos"));
         // Whatever the machine is, the state and the card agree about whether
         // there was anything to look at.
         if r.state == State::NoCard {
             assert!(r.card.is_none());
         }
+    }
+
+    #[test]
+    fn backend_election_is_native_and_explicit_overrides_stay_explicit() {
+        assert_eq!(
+            crate::config::Config::default().device,
+            if cfg!(target_os = "macos") {
+                "metal"
+            } else {
+                "cuda"
+            }
+        );
+        let cuda = probe_for_backend("cuda");
+        assert_eq!(cuda.backend, "cuda");
+        assert_eq!(cuda.cuda_needed, "13.0");
+        let metal = probe_for_backend("metal");
+        assert_eq!(metal.backend, "metal");
+        assert!(metal.cuda.is_none() && metal.cuda_needed.is_empty() && metal.cc.is_none());
+        assert_eq!(metal.supported[0].name, "Apple10 (M5)");
+        // The floor is the device gate's: Apple7, and nothing below it.
+        assert_eq!(metal.supported.last().unwrap().name, "Apple7 (M1)");
+        assert!(matches!(metal.state, State::Untested | State::NoCard));
+        assert_eq!(probe_for_backend("unknown").state, State::NoCard);
     }
 
     /// Whatever this box is, the verdict has to hang together: a state that
@@ -341,6 +441,7 @@ mod tests {
     #[test]
     fn only_a_ready_verdict_can_serve() {
         let base = Readiness {
+            backend: "cuda".into(),
             state: State::Ready,
             card: Some("NVIDIA RTX A6000".to_owned()),
             generation: Some("Ampere".to_owned()),

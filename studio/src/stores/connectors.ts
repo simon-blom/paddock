@@ -7,6 +7,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { useModelsStore } from '@/stores/models'
+import { useMcpToolsStore } from '@/stores/mcpTools'
 
 export interface Connector {
   id: string
@@ -65,12 +66,14 @@ export const useConnectorsStore = defineStore('connectors', () => {
     // /api/server answers are stale (a connector scoped to every model was
     // invisible in the tool picker until a hard refresh)
     useModelsStore().invalidateCaps()
+    useMcpToolsStore().invalidate()
   }
 
   async function remove(id: string): Promise<void> {
     await fetch(`/api/connectors/${id}`, { method: 'DELETE' })
     await refresh()
     useModelsStore().invalidateCaps()
+    useMcpToolsStore().invalidate()
   }
 
   async function setScope(id: string, all: boolean, ports: number[]): Promise<void> {
@@ -87,6 +90,7 @@ export const useConnectorsStore = defineStore('connectors', () => {
     }
     await refresh()
     useModelsStore().invalidateCaps()
+    useMcpToolsStore().invalidate()
   }
 
   function byId(id: string): Connector | undefined {

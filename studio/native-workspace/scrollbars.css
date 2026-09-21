@@ -1,0 +1,37 @@
+/* Native viewer chrome only. Ten-pixel hit area, four-pixel painted thumb;
+   no track, corner box or hover widening. Includes portalled viewer dialogs. */
+:root[data-native-theme] {
+  --native-scroll-thumb: rgb(0 0 0 / 28%);
+}
+:root[data-native-theme][data-theme="dark"] {
+  --native-scroll-thumb: rgb(255 255 255 / 28%);
+}
+:root[data-native-theme], :root[data-native-theme] * {
+  scrollbar-width: auto !important;
+  scrollbar-color: auto !important;
+}
+:root[data-native-theme]::-webkit-scrollbar,
+:root[data-native-theme] *::-webkit-scrollbar {
+  width: 10px !important;
+  height: 10px !important;
+  background: transparent !important;
+}
+:root[data-native-theme]::-webkit-scrollbar-thumb,
+:root[data-native-theme] *::-webkit-scrollbar-thumb {
+  background: var(--native-scroll-thumb) !important;
+  background-clip: padding-box !important;
+  border: 3px solid transparent !important;
+  border-radius: 8px !important;
+}
+:root[data-native-theme]::-webkit-scrollbar-track,
+:root[data-native-theme] *::-webkit-scrollbar-track,
+:root[data-native-theme]::-webkit-scrollbar-corner,
+:root[data-native-theme] *::-webkit-scrollbar-corner {
+  background: transparent !important;
+}
+:root[data-native-theme]::-webkit-scrollbar-button,
+:root[data-native-theme] *::-webkit-scrollbar-button { display: none !important; }
+@media (prefers-contrast: more) {
+  :root[data-native-theme] { --native-scroll-thumb: rgb(0 0 0 / 65%); }
+  :root[data-native-theme][data-theme="dark"] { --native-scroll-thumb: rgb(255 255 255 / 65%); }
+}

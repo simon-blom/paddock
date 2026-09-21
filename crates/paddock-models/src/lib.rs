@@ -8,19 +8,24 @@
 //! (`models/<repo>/<file>.gguf`, the unsloth *-MTP-GGUF convention) list
 //! without flattening; mmproj companions and hidden dirs are skipped.
 
+pub mod bonsai;
+pub mod dinov3;
 pub mod ggml_type;
 pub mod gguf;
 pub mod gpu_support;
 pub mod granite;
+pub mod hadamard;
 pub mod hardening;
 pub mod kv_tier_geom;
 pub mod mapped;
+pub mod mlx;
 pub mod modelopt;
 pub mod nemotron;
 pub mod probe;
 pub mod qwen4exp;
 pub mod safetensors;
 pub mod sampling;
+pub mod splash;
 pub mod split;
 #[cfg(test)]
 pub(crate) mod testutil;

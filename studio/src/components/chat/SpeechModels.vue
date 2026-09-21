@@ -11,7 +11,7 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useFleetStore } from '@/stores/fleet'
 import { useModelsStore } from '@/stores/models'
-import { friendlyModelName } from '@/lib/model-caps'
+import { speechModelRows } from '@/lib/speech-models'
 import Icon from '@/components/Icon.vue'
 import VendorLogo from '@/components/manage/VendorLogo.vue'
 import MenuItem from '@/components/ui/MenuItem.vue'
@@ -21,7 +21,7 @@ const fleet = useFleetStore()
 const models = useModelsStore()
 const router = useRouter()
 
-const rows = computed(() => fleet.speechEndpoints)
+const rows = computed(() => speechModelRows(fleet.speechEndpoints, pending.value))
 /** The port this menu is waiting on. The store's own `busy` covers a start
  *  begun anywhere; this is what keeps the button labelled while our own call
  *  is still in the air, before the store has caught up. */
@@ -47,16 +47,16 @@ async function act(port: number, model: string | null, start: boolean): Promise<
     <VendorLogo v-if="r.vendor" :vendor="r.vendor" :size="14" class="spm__mark" />
     <Icon v-else name="microphone" :size="14" class="spm__mark" />
     <span class="spm__id">
-      <span class="spm__name">{{ r.display ?? friendlyModelName(r.model ?? '') }}</span>
+      <span class="spm__name">{{ r.title }}</span>
       <span class="spm__sub">
-        {{ pending === r.port || r.busy ? 'working...' : r.running ? `running · port ${r.port}` : `port ${r.port}` }}
+        {{ r.status }}
       </span>
     </span>
     <span class="spm__acts">
       <button
         class="pk-btn pk-btn--sm"
         type="button"
-        :disabled="r.running || r.busy || pending !== null"
+        :disabled="!r.canStart"
         @click="act(r.port, r.model, true)"
       >
         Start
@@ -64,7 +64,7 @@ async function act(port: number, model: string | null, start: boolean): Promise<
       <button
         class="pk-btn pk-btn--sm"
         type="button"
-        :disabled="!r.running || r.busy || pending !== null"
+        :disabled="!r.canStop"
         @click="act(r.port, r.model, false)"
       >
         Stop

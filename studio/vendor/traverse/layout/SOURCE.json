@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/truespar/traverse",
+  "commit": "4d3c722308c07b2ce99035fd6b7907f57148884f",
+  "branch": "main",
+  "dirty": false,
+  "sourceSHA256": "cd809b178c3d4b881d2befcde70974a309c573913738245db4deae271b74980b",
+  "files": [
+    "package.json",
+    "index.js",
+    "index.d.ts",
+    "worker.js",
+    "engine.js",
+    "fa2.js",
+    "hierarchy.js",
+    "collision.js",
+    "components.js"
+  ]
+}

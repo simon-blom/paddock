@@ -1,0 +1,1 @@
+{"extends":"../tsconfig.json","compilerOptions":{"lib":["ES2023","DOM","DOM.Iterable","ESNext.Disposable"]},"include":["./**/*.ts","./**/*.vue","../src/**/*.d.ts"],"exclude":["./vite.config.ts"]}

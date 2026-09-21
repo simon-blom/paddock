@@ -34,7 +34,7 @@
 //! -> the same, with the campaign named; validated -> listed below, with the
 //! campaign that closed it.
 
-// The lists themselves live in ONE place: the `ALL` table in
+// The lists themselves live in one place: the `ALL` table in
 // paddock-models' gpu_support.rs, read here and by the manager alike. They
 // used to be consts in this file, which meant the same fact also lived in the
 // manager and in the Studio's prose - and all three managed to disagree at

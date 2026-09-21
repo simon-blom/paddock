@@ -1,0 +1,240 @@
+[
+  {
+    "name": "reported Qwen compare footer uses compact web wording with measured decode in details",
+    "usage": { "completionTokens": 1743, "reasoningTokens": 118, "promptTokens": 2719, "decodeMs": 60262, "ms": 68471.581416, "prefillMs": 8100, "queueMs": 0, "timingSource": "engine", "ttftMs": 4441 },
+    "footer": "1861 tokens · 31 tok/s · 68s",
+    "hint": "Total time from send to done · 4.4s to the first token · 31 tok/s decode",
+    "sections": [{ "id": "metrics", "title": "Metrics", "rows": [
+      { "label": "Tokens", "value": "2719 in · 1861 out · 118 reasoning" },
+      { "label": "Speed", "value": "31 tok/s decode · TTFT 4.4s · 68s total" },
+      { "label": "Engine timing", "value": "0ms queued · 8.1s prefill · 60s decode (all rounds)" }
+    ] }]
+  },
+  {
+    "name": "reported OpenRouter compare footer uses compact web wording without fabricating decode timing",
+    "usage": { "completionTokens": 2760, "promptTokens": 12713, "costUsd": 0.08956204999999999, "ms": 56713.84170900001, "timingSource": "end-to-end", "ttftMs": 3648 },
+    "footer": "2760 tokens · 49 tok/s · 57s · $0.090",
+    "hint": "Total time from send to done · 3.6s to the first token · 49 tok/s end-to-end",
+    "sections": [{ "id": "metrics", "title": "Metrics", "rows": [
+      { "label": "Tokens", "value": "12713 in · 2760 out" },
+      { "label": "Speed", "value": "49 tok/s end-to-end · TTFT 3.6s · 57s total" },
+      { "label": "Cost", "value": "$0.090" }
+    ] }]
+  },
+  {
+    "name": "reasoning response with complete run details",
+    "usage": {
+      "promptTokens": 80,
+      "completionTokens": 120,
+      "tps": 59.8,
+      "ms": 5600,
+      "ttftMs": 350,
+      "answerMs": 2000,
+      "reasoningMs": 3000,
+      "reasoningTokens": 200,
+      "reasoningTps": 66.6,
+      "provider": "Example host",
+      "costUsd": 0.012
+    },
+    "run": {
+      "model": "model-at-send",
+      "spec": "MTP+DFlash2",
+      "systemPrompt": "System text",
+      "systemPromptName": "Writing",
+      "params": {
+        "temperature": 0.8,
+        "topP": 0.9,
+        "topK": 0,
+        "maxTokens": 320,
+        "thinking": true,
+        "reasoningEffort": "high",
+        "seed": 42
+      },
+      "tools": [
+        "artifacts",
+        "github:create_issue"
+      ],
+      "contended": true,
+      "at": 1,
+      "gpu": {
+        "device": "Apple M5 Pro",
+        "memUsedPeak": 17179869184,
+        "powerPeakW": 40.4,
+        "batchPeak": 4,
+        "kvPeak": 12,
+        "kvTotal": 64,
+        "tokSPeak": 119.8
+      },
+      "authorization": "NEVER_PROJECT"
+    },
+    "footer": "320 tokens · 57 tok/s · 5.6s · $0.012",
+    "hint": "Total time from send to done · 350ms to the first token · served by Example host · 57 tok/s end-to-end",
+    "sections": [
+      {
+        "id": "provenance",
+        "title": "Provenance",
+        "rows": [
+          {
+            "label": "Model",
+            "value": "model-at-send"
+          },
+          {
+            "label": "Speculation",
+            "value": "MTP+DFlash2"
+          },
+          {
+            "label": "System prompt",
+            "value": "Writing"
+          },
+          {
+            "label": "Sampling",
+            "value": "temp 0.8 · top-p 0.9 · top-k off"
+          },
+          {
+            "label": "Reasoning",
+            "value": "high"
+          },
+          {
+            "label": "Max tokens",
+            "value": "320 · seed 42"
+          },
+          {
+            "label": "Tools",
+            "value": "artifacts, github:create_issue"
+          },
+          {
+            "label": "Concurrency",
+            "value": "Other compare lanes shared the GPU during this run"
+          }
+        ]
+      },
+      {
+        "id": "metrics",
+        "title": "Metrics",
+        "rows": [
+          {
+            "label": "Tokens",
+            "value": "80 in · 320 out · 200 reasoning"
+          },
+          {
+            "label": "Speed",
+            "value": "57 tok/s end-to-end · TTFT 350ms · 5.6s total"
+          },
+          {
+            "label": "Served by",
+            "value": "Example host"
+          },
+          {
+            "label": "Cost",
+            "value": "$0.012"
+          }
+        ]
+      },
+      {
+        "id": "gpu",
+        "title": "GPU environment (peak)",
+        "rows": [
+          {
+            "label": "Device",
+            "value": "Apple M5 Pro"
+          },
+          {
+            "label": "Load",
+            "value": "16 GB VRAM · 40 W"
+          },
+          {
+            "label": "Engine",
+            "value": "batch 4 · KV 12/64 · 120 tok/s peak"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "cost without output",
+    "usage": {
+      "promptTokens": 5,
+      "completionTokens": 0,
+      "costUsd": 0.004
+    },
+    "footer": "$0.004",
+    "hint": "",
+    "sections": [
+      {
+        "id": "metrics",
+        "title": "Metrics",
+        "rows": [
+          {
+            "label": "Tokens",
+            "value": "5 in · 0 out"
+          },
+          {
+            "label": "Speed",
+            "value": "-"
+          },
+          {
+            "label": "Cost",
+            "value": "$0.004"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "timing without token usage does not invent throughput",
+    "usage": {
+      "ms": 3200
+    },
+    "footer": "",
+    "hint": "Total time from send to done",
+    "sections": [
+      {
+        "id": "metrics",
+        "title": "Metrics",
+        "rows": [
+          {
+            "label": "Tokens",
+            "value": "- in · - out"
+          },
+          {
+            "label": "Speed",
+            "value": "3.2s total"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "missing measurements remain absent",
+    "footer": "",
+    "hint": "",
+    "sections": []
+  },
+  {
+    "name": "speech uses realtime speed",
+    "usage": {
+      "completionTokens": 120,
+      "ms": 5600,
+      "tps": 59.8
+    },
+    "realtime": 2.35,
+    "footer": "120 tokens · 5.6s (2.4× realtime)",
+    "hint": "Total time from send to done · 21 tok/s end-to-end",
+    "sections": [
+      {
+        "id": "metrics",
+        "title": "Metrics",
+        "rows": [
+          {
+            "label": "Tokens",
+            "value": "- in · 120 out"
+          },
+          {
+            "label": "Speed",
+            "value": "21 tok/s end-to-end · 5.6s total"
+          }
+        ]
+      }
+    ]
+  }
+]

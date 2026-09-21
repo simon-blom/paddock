@@ -34,6 +34,7 @@ impl GpuExecutor {
 
     /// Upload a tensor fully dequanted to f32 on device.
     pub fn upload(&self, map: &MappedGguf, name: &str) -> Result<DeviceTensor, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         let n = info.element_count() as usize;
@@ -134,6 +135,7 @@ impl GpuExecutor {
     /// k-quant plane wants the quant-aware GEMM, and silently widening it to
     /// f16 here would hide that the caller picked the wrong lane.
     pub fn upload_f16(&self, map: &MappedGguf, name: &str) -> Result<HalfTensor, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         let host: Vec<f16> = match info.ggml_type {
@@ -179,6 +181,7 @@ impl GpuExecutor {
 
     /// Upload a tensor keeping its quantized bytes on device (dequant per use).
     pub fn upload_raw(&self, map: &MappedGguf, name: &str) -> Result<QuantTensor, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         // Q4_0 lands as its exact Q8_0 transcode (see repack_q8): the raw-
         // layout consumers (dequant_slice, the embed gathers) speak Q8_0,
@@ -300,6 +303,7 @@ impl GpuExecutor {
     /// Upload a Q8_0 weight and repack it into the aligned data + f16-scale streams
     /// the vectorized decode GEMV reads. The staged upload is freed on return.
     pub fn repack_q8(&self, map: &MappedGguf, name: &str) -> Result<RepackedQ8, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         // Q4_0 (the QAT lineage) rides the Q8 lane through the exact host
@@ -358,6 +362,7 @@ impl GpuExecutor {
         name_a: &str,
         name_b: &str,
     ) -> Result<RepackedQ8, GpuError> {
+        self.rotated_basis_guard(map, name_a)?;
         let (ia, ba) = map.tensor_bytes(name_a)?;
         let (ib, bb) = map.tensor_bytes(name_b)?;
         for (i, n) in [(&ia, name_a), (&ib, name_b)] {

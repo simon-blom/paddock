@@ -109,6 +109,24 @@ pub trait Generator: Send {
         None
     }
 
+    /// Per-slot draft-depth ceiling this backend's drafter is worth, when the
+    /// row budget alone elects a depth it cannot repay.
+    ///
+    /// The ladder's depth is a ROW argument - `k = rows/live - 1`, capped by
+    /// `serve_spec_max_k` - so at one live slot it asks for the cap whatever
+    /// the round actually costs. That is right where an extra verify row is
+    /// nearly free and wrong where it is not: a wide verify re-streams the
+    /// touched routed experts, so on a bandwidth-bound board the deep round
+    /// can cost more than it returns while the row budget still allows it.
+    /// A backend that has measured its own depth curve says so here; the
+    /// service takes the smaller of this and the row budget's answer.
+    ///
+    /// None = no measured opinion, the row budget decides (the default, and
+    /// what every backend did before this existed).
+    fn spec_depth_cap(&self) -> Option<usize> {
+        None
+    }
+
     /// The block width of an attached BLOCK drafter (DFlash: every round
     /// drafts `block - 1` positions in one forward, so the round's natural
     /// verify width is `live * block`).
@@ -118,6 +136,32 @@ pub trait Generator: Send {
     /// block. None = no block drafter.
     fn spec_block_width(&self) -> Option<usize> {
         None
+    }
+
+    /// A qualified backend-owned block depth, instead of the legacy
+    /// seven-draft ceiling and per-slot chain ramp. The backend guarantees
+    /// `(depth + 1) * spec_live_cap()` verification capacity. Admission and
+    /// the operator's speculation policy still apply; None preserves every
+    /// existing model's elected scheduler. This is not an environment knob.
+    fn spec_fixed_draft_depth(&self) -> Option<usize> {
+        None
+    }
+
+    /// Backend-owned runtime cap, rechecked every scheduling tick. May only
+    /// narrow the qualified fixed/legacy budget, never widen it. A backend
+    /// can use completed acceptance history to elect a cheaper verify shape
+    /// without changing the block drafter's trained input width.
+    fn spec_batch_draft_budget(&self, _live: usize) -> Option<usize> {
+        None
+    }
+
+    /// Transient scheduling deferral, not loss of drafter capability. A
+    /// backend can reserve this tick for bounded encoder work + ordinary
+    /// decoding without entering a failed-spec cooldown or drawing unused
+    /// sampling uniforms. Rechecked every tick; draft conditioning must stay
+    /// current through the dense interlude if the backend resumes afterward.
+    fn spec_deferred(&self) -> bool {
+        false
     }
 
     /// True when this backend may receive `Device(Greedy)` plans for rows
@@ -613,6 +657,15 @@ pub trait Generator: Send {
         false
     }
 
+    /// Optional idle text-burst grace before committing the first GPU wave.
+    /// Only consulted with no in-flight requests and exactly one new admission;
+    /// the service bounds it to 2 ms and reuses its existing cohort window.
+    /// Never delays live decoding or waits for a cohort to become full. Default
+    /// zero preserves all backends which have not qualified this policy.
+    fn idle_admission_grace(&self, _prompt: &[u32]) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     /// Begin a chunked prefill on `slot` (only when `supports_chunked_prefill`).
     /// The backend matches + loads any cached prefix immediately; the rest of
     /// the prompt advances via `forward_mixed`. Several may be in flight
@@ -655,7 +708,8 @@ pub trait Generator: Send {
 
     /// One mixed decode+prefill tick: decode rows `decodes[i] = (slot, token,
     /// pos)` plus up to `budget` rows spread over every in-flight chunked
-    /// prompt (FIFO) in one weight-amortized pass. Returns the decode logits
+    /// prompt in one weight-amortized pass. Admission stays FIFO; backends
+    /// may share the row grant across an admitted cohort. Returns the decode logits
     /// (flat [decodes.len(), vocab], input order) and one `(slot, last-token
     /// logits, prompt KV rows)` per prompt that finished this tick.
     fn forward_mixed(
@@ -1070,6 +1124,7 @@ pub enum GenError {
 
 /// Map a GPU backend error to the scheduler error, preserving the pool-exhaustion
 /// signal so the scheduler can preempt (P5b-3) instead of failing every sequence.
+#[cfg(feature = "cuda")]
 fn to_gen_err(e: crate::gpu_model::gpt_oss::GpuModelError) -> GenError {
     use crate::gpu_model::gpt_oss::GpuModelError;
     match e {
@@ -1084,6 +1139,7 @@ fn to_gen_err(e: crate::gpu_model::gpt_oss::GpuModelError) -> GenError {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn tier_prefix_loading(&mut self, slot: usize, tokens: &[u32]) -> bool {
         crate::gpu_model::qwen35::GpuQwen35::tier_consult_impl(self, slot, tokens)
@@ -1490,6 +1546,7 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Generator for crate::gpu_model::gpt_oss::GpuGptOss {
     fn reset(&mut self) {
         crate::gpu_model::gpt_oss::GpuGptOss::reset(self);

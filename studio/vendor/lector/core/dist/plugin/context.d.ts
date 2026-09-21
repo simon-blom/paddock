@@ -42,6 +42,8 @@ export interface CreatePluginContextOptions<TState> {
     readonly state: TState;
     /** The plugin's ID (for error messages). */
     readonly pluginId: string;
+    /** Registry-owned teardown for effects/listeners created through this context. */
+    readonly cleanups?: Unsubscribe[];
 }
 /**
  * Create a PluginContext instance for a specific plugin.

@@ -3,6 +3,7 @@ import type { DocumentId } from '../types/handle-id.js';
 import type { PageSize, RenderOptions, RenderPriority } from '../types/render.js';
 import type { PdfiumWorkerApi } from '../types/worker-api.js';
 import { PluginRegistry } from '../plugin/registry.js';
+import { RenderScheduler, type RenderSchedulingOptions, type RenderSchedulerOptions } from './render-scheduler.js';
 import { RenderPool } from './render-pool.js';
 import { PageRotationCache } from './page-rotation-cache.js';
 /** User identity injected by the consumer application. */
@@ -170,6 +171,8 @@ export interface LectorEngineOptions {
      * Higher values give faster concurrent render but use more memory.
      */
     readonly renderPoolSize?: number;
+    /** Admission limits shared by page and tile renders. Does not include document/WASM heap overhead. */
+    readonly renderAdmission?: RenderSchedulerOptions;
 }
 /**
  * A handle to an open PDF document.
@@ -317,19 +320,18 @@ export declare class LectorEngine implements Disposable {
      * @param options Render options including flags, rotation, DPI, and scheduling hints.
      * @returns The rendered page as an ImageBitmap.
      */
-    renderPage(docId: DocumentId, pageIndex: number, width: number, height: number, options?: RenderOptions & {
-        signal?: AbortSignal;
-        priority?: RenderPriority;
-    }): Promise<ImageBitmap>;
+    renderPage(docId: DocumentId, pageIndex: number, width: number, height: number, options?: RenderOptions & RenderSchedulingOptions): Promise<ImageBitmap>;
     /**
      * Render a rectangular tile of a PDF page. Used by the tile-based
      * rendering system for large pages at high zoom where allocating a
      * full-page bitmap would exceed memory limits.
      *
-     * Bypasses the render scheduler (tiles have their own dedup/cancel
-     * logic in TileManager) and calls the worker directly.
+     * Uses the same admission queue as full pages; tiles cannot flood the worker
+     * or bypass transient-memory limits during a fast scroll/zoom sequence.
      */
-    renderPageTile(docId: DocumentId, pageIndex: number, tileX: number, tileY: number, tileW: number, tileH: number, fullW: number, fullH: number, options?: RenderOptions): Promise<ImageBitmap>;
+    renderPageTile(docId: DocumentId, pageIndex: number, tileX: number, tileY: number, tileW: number, tileH: number, fullW: number, fullH: number, options?: RenderOptions & RenderSchedulingOptions): Promise<ImageBitmap>;
+    /** Scheduler-accounted pixels, not total process memory. */
+    get renderStats(): RenderScheduler['stats'] | null;
     /**
      * Access the Comlink proxy to the pdfium worker.
      *

@@ -35,6 +35,12 @@
   --pk-radius-lg:   8px;
   --pk-radius-xl:   12px;
   --pk-radius-full: 999px;
+  /* Page-stage chrome shared by Lector, Scriptor and image previews. */
+  --pk-document-stage: var(--pk-bg-inset);
+  /* Detached reader chrome has its own surface role. The native entry maps
+     this to Swift's popup color, not the document stage's recessed gray. */
+  --pk-bg-popup: var(--pk-bg-surface);
+  --pk-popup-font-size: var(--pk-font-size-sm);
 
   /* ── Layout ─────────────────────────────────────────────── */
   /* The activity bar's width IS the header's height, expressed as one fact so

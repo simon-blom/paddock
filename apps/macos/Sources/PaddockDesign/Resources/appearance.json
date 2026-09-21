@@ -1,0 +1,31 @@
+{
+  "colors": {
+    "canvas": { "light": "#ffffff", "dark": "#1b1b1b", "web": ["bg-base"] },
+    "sidebar": { "light": "#f5f5f5", "dark": "#151515", "web": ["bg-inset"] },
+    "surface": { "light": "#f5f5f5", "dark": "#242424", "web": ["bg-surface", "document-stage"] },
+    "popup": { "light": "#ffffff", "dark": "#242424", "web": ["bg-popup"] },
+    "elevated": { "light": "#e9e9e9", "dark": "#2e2e2e", "web": ["bg-elevated", "bg-hover"] },
+    "overlay": { "light": "#00000059", "dark": "#00000099", "web": ["bg-overlay"] },
+    "primary": { "light": "#202020", "dark": "#ededed", "web": ["text-primary"] },
+    "secondary": { "light": "#646464", "dark": "#a2a2a2", "web": ["text-secondary"] },
+    "muted": { "light": "#737373", "dark": "#969696", "web": ["text-muted"] },
+    "accent": { "light": "#202020", "dark": "#f0f0f0", "web": ["accent", "accent-text"] },
+    "accentHover": { "light": "#000000", "dark": "#ffffff", "web": ["accent-hover"] },
+    "accentActive": { "light": "#383838", "dark": "#dadada", "web": ["accent-active"] },
+    "selection": { "light": "#00000012", "dark": "#ffffff18", "web": ["accent-subtle", "accent-light"] },
+    "actionForeground": { "light": "#ffffff", "dark": "#171717", "web": ["text-inverse"] },
+    "border": { "light": "#dadada", "dark": "#383838", "web": ["border-default"] },
+    "borderSubtle": { "light": "#00000012", "dark": "#ffffff12", "web": ["border-subtle"] },
+    "borderStrong": { "light": "#c0c0c0", "dark": "#505050", "web": ["border-strong"] },
+    "focus": { "light": "#777777", "dark": "#a0a0a0", "web": ["border-focus"] },
+    "caution": { "light": "#965000", "dark": "#e5ae61", "web": ["status-warning"] },
+    "cautionSubtle": { "light": "#96500014", "dark": "#e5ae611f", "web": ["status-warning-subtle"] },
+    "error": { "light": "#b83030", "dark": "#e05652", "web": ["status-error"] },
+    "errorHover": { "light": "#9a2828", "dark": "#c43e3a", "web": ["status-error-hover"] },
+    "errorSubtle": { "light": "#b8303014", "dark": "#e056521f", "web": ["status-error-subtle"] },
+    "success": { "light": "#15803d", "dark": "#22c55e", "web": ["status-success"] },
+    "successSubtle": { "light": "#15803d14", "dark": "#22c55e1f", "web": ["status-success-subtle"] },
+    "info": { "light": "#646464", "dark": "#a2a2a2", "web": ["status-info"] }
+  },
+  "radii": { "sm": 4, "md": 6, "lg": 8, "xl": 12, "composer": 24 }
+}

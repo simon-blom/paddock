@@ -4,6 +4,11 @@
 //! (GGML_TYPE_COUNT = 42; MXFP4 = 39, NVFP4 = 40). Unknown IDs are carried as
 //! data, not errors - a newer file must not brick the parser, but anything we
 //! can't size gets flagged instead of guessed.
+//!
+//! Two ids sit far outside that range on purpose: PrismML's ternary packings
+//! (142, 143), private to their llama.cpp fork and numbered clear of upstream's
+//! counter so the two can never collide. Layouts verified against the fork's
+//! `ggml-common.h` (branch `prism`).
 
 /// A tensor's storage type. `Unknown` keeps forward-compat: we can list and
 /// route around tensors we can't execute yet.
@@ -43,6 +48,10 @@ pub enum GgmlType {
     Mxfp4,
     Nvfp4,
     Q1_0,
+    /// PrismML: one trit in a 2-bit slot, one f16 scale per 128 weights.
+    Pq2_0,
+    /// PrismML: five trits a byte (base 3), one f16 scale per 128 weights.
+    Ptq1_0,
     Unknown(u32),
 }
 
@@ -84,6 +93,8 @@ impl GgmlType {
             39 => Mxfp4,
             40 => Nvfp4,
             41 => Q1_0,
+            142 => Pq2_0,
+            143 => Ptq1_0,
             other => Unknown(other),
         }
     }
@@ -129,6 +140,8 @@ impl GgmlType {
             Mxfp4 => 39,
             Nvfp4 => 40,
             Q1_0 => 41,
+            Pq2_0 => 142,
+            Ptq1_0 => 143,
             Unknown(other) => other,
         }
     }
@@ -166,6 +179,10 @@ impl GgmlType {
             Iq1M => (256, 56),
             // 32 elems: 1-byte shared E8M0 scale + 16 bytes of packed FP4
             Mxfp4 => (32, 17),
+            // 128 elems: f16 d + 32 bytes of 2-bit slots (code - 1 = the trit)
+            Pq2_0 => (128, 34),
+            // 128 elems: qs[24] (5 trits a byte) + qh[2] (4 trits a byte) + f16 d
+            Ptq1_0 => (128, 28),
             // iq1/iq2/iq3/tq/nvfp4/q1_0 layouts not yet verified against ggml -
             // fill in when a model in our matrix actually needs them
             _ => return None,
@@ -192,6 +209,19 @@ mod tests {
     fn mxfp4_sizing_matches_gpt_oss_expectations() {
         // one 32-elem block = 17 bytes; a 2880-wide row = 90 blocks = 1530 bytes
         assert_eq!(GgmlType::Mxfp4.byte_size(2880), Some(1530));
+    }
+
+    #[test]
+    fn prism_ternary_sizing_matches_the_bonsai_27b_file() {
+        assert_eq!(GgmlType::from_raw(143), GgmlType::Ptq1_0);
+        assert_eq!(GgmlType::Ptq1_0.raw(), 143);
+        assert_eq!(GgmlType::from_raw(142), GgmlType::Pq2_0);
+        // ffn_down of Ternary-Bonsai-2-27B: 17408 x 5120 weights at 28 B / 128
+        assert_eq!(GgmlType::Ptq1_0.byte_size(17408 * 5120), Some(19_496_960));
+        assert_eq!(GgmlType::Pq2_0.byte_size(17408 * 5120), Some(23_674_880));
+        // 1.75 and 2.125 bits a weight, scale included
+        assert_eq!(GgmlType::Ptq1_0.byte_size(128), Some(28));
+        assert_eq!(GgmlType::Pq2_0.byte_size(128), Some(34));
     }
 
     #[test]

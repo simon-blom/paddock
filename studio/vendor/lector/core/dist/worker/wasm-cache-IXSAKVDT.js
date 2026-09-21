@@ -52,3 +52,4 @@ export {
   createInstantiateWasmHook,
   loadWasmCached
 };
+//# sourceMappingURL=wasm-cache-IXSAKVDT.js.map

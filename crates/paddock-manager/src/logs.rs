@@ -15,7 +15,6 @@
 //!   as they are created.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,85 +39,7 @@ enum Target {
     Runner(u16),
     All,
 }
-
-/// One followed file: read offset + partial-line carry (only complete lines
-/// are emitted, so prefixes never land mid-line).
-struct Tail {
-    path: PathBuf,
-    prefix: Option<String>,
-    offset: u64,
-    carry: String,
-}
-
-impl Tail {
-    fn new(path: PathBuf, prefix: Option<String>) -> Self {
-        Self {
-            path,
-            prefix,
-            offset: 0,
-            carry: String::new(),
-        }
-    }
-
-    /// Last `n` lines as one prefixed chunk, positioning the offset at EOF.
-    fn history(&mut self, n: usize) -> Option<String> {
-        let s = std::fs::read_to_string(&self.path).ok()?;
-        self.offset = s.len() as u64;
-        let lines: Vec<&str> = s.lines().collect();
-        let start = lines.len().saturating_sub(n);
-        if lines[start..].is_empty() {
-            return None;
-        }
-        let mut out = String::new();
-        for l in &lines[start..] {
-            self.push_line(&mut out, l);
-        }
-        Some(out)
-    }
-
-    /// New complete lines since the last poll (empty when nothing landed).
-    fn advance(&mut self) -> String {
-        let mut out = String::new();
-        let Ok(md) = std::fs::metadata(&self.path) else {
-            return out; // vanished (runner stopped) - keep polling, it may return
-        };
-        if md.len() < self.offset {
-            // truncated or rotated: start over rather than misread the tail
-            self.offset = 0;
-            self.carry.clear();
-        }
-        if md.len() == self.offset {
-            return out;
-        }
-        let Ok(mut f) = std::fs::File::open(&self.path) else {
-            return out;
-        };
-        if f.seek(SeekFrom::Start(self.offset)).is_err() {
-            return out;
-        }
-        let mut buf = String::new();
-        if f.read_to_string(&mut buf).is_err() {
-            return out; // partial UTF-8 at the boundary - retry next poll
-        }
-        self.offset += buf.len() as u64;
-        let whole = format!("{}{buf}", std::mem::take(&mut self.carry));
-        let mut rest = whole.as_str();
-        while let Some(nl) = rest.find('\n') {
-            self.push_line(&mut out, rest[..nl].trim_end_matches('\r'));
-            rest = &rest[nl + 1..];
-        }
-        self.carry = rest.to_owned();
-        out
-    }
-
-    fn push_line(&self, out: &mut String, line: &str) {
-        if let Some(p) = &self.prefix {
-            out.push_str(p);
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-}
+use crate::log_tail::Tail;
 
 /// Runner log files currently present: (port, path). The naming contract is
 /// the supervisor's `logs/runner-<port>.log` (§11.3).
@@ -186,7 +107,7 @@ pub async fn handle(
             }
         }
     }
-    if !follow && tails.values().all(|t| !t.path.exists()) {
+    if !follow && tails.values().all(|t| !t.path().exists()) {
         return (
             axum::http::StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"error": {"type": "not_found_error",
@@ -199,12 +120,21 @@ pub async fn handle(
         tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
     tokio::spawn(async move {
         // History first (unless opted out) - stable order: manager, then ports.
-        let mut ordered: Vec<&mut Tail> = tails.values_mut().collect();
-        ordered.sort_by(|a, b| a.path.cmp(&b.path));
-        for t in ordered {
+        let mut ordered: Vec<Tail> = tails.into_values().collect();
+        tails = HashMap::new();
+        ordered.sort_by(|a, b| a.path().cmp(b.path()));
+        for mut t in ordered {
             // history=false still calls history(0): it positions the offset
             // at EOF so the follow phase emits only new lines.
-            let chunk = t.history(if history { tail } else { 0 });
+            let Ok((t, chunk)) = tokio::task::spawn_blocking(move || {
+                let chunk = t.history(if history { tail } else { 0 });
+                (t, chunk)
+            })
+            .await
+            else {
+                return;
+            };
+            tails.insert(t.path().to_path_buf(), t);
             if let Some(c) = chunk
                 && tx.send(Ok(c.into())).await.is_err()
             {
@@ -221,16 +151,29 @@ pub async fn handle(
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             if merged && rescan.elapsed() >= std::time::Duration::from_secs(2) {
                 rescan = tokio::time::Instant::now();
-                for (port, path) in runner_logs(&logs_dir) {
+                let root = logs_dir.clone();
+                let Ok(found) = tokio::task::spawn_blocking(move || runner_logs(&root)).await
+                else {
+                    return;
+                };
+                for (port, path) in found {
                     tails
                         .entry(path.clone())
                         .or_insert_with(|| Tail::new(path, Some(format!("[{port}] "))));
                 }
             }
-            let mut chunk = String::new();
-            for t in tails.values_mut() {
-                chunk.push_str(&t.advance());
-            }
+            let Ok((next, chunk)) = tokio::task::spawn_blocking(move || {
+                let mut chunk = String::new();
+                for t in tails.values_mut() {
+                    chunk.push_str(&t.advance());
+                }
+                (tails, chunk)
+            })
+            .await
+            else {
+                return;
+            };
+            tails = next;
             if !chunk.is_empty() && tx.send(Ok(chunk.into())).await.is_err() {
                 return; // client hung up
             }
@@ -282,7 +225,10 @@ mod tests {
 
         // truncation restarts from the top instead of misreading
         std::fs::write(&path, "fresh\n").unwrap();
-        assert_eq!(t.advance(), "[11540] fresh\n");
+        assert_eq!(
+            t.advance(),
+            "[11540] [Log rotated or truncated]\n[11540] fresh\n"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

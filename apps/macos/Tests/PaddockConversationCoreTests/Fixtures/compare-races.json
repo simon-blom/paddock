@@ -1,0 +1,177 @@
+[
+  {
+    "name": "speech winner exceeds ten percent",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 1200
+        }
+      }
+    ],
+    "expected": "a"
+  },
+  {
+    "name": "near tie gets no badge",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 1050
+        }
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "one unfinished lane blocks award",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 1500
+        }
+      },
+      {
+        "id": "c",
+        "transcript": {},
+        "usage": {
+          "ms": 2000
+        },
+        "streaming": true
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "shared GPU blocks award",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        },
+        "run": {
+          "contended": true
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 1600
+        }
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "chat brevity is not a speed race",
+    "messages": [
+      {
+        "id": "a",
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "usage": {
+          "ms": 4000
+        }
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "failed lane blocks award",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 2000
+        },
+        "error": "Failed"
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "stopped lane blocks award",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 2000
+        },
+        "stopped": true
+      }
+    ],
+    "expected": null
+  },
+  {
+    "name": "missing timing is not a loss",
+    "messages": [
+      {
+        "id": "a",
+        "transcript": {},
+        "usage": {
+          "ms": 1000
+        }
+      },
+      {
+        "id": "b",
+        "transcript": {},
+        "usage": {
+          "ms": 2000
+        }
+      },
+      {
+        "id": "c",
+        "transcript": {}
+      }
+    ],
+    "expected": null
+  }
+]

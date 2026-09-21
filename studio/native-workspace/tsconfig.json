@@ -1,0 +1,6 @@
+{
+  "extends": "../tsconfig.json",
+  "include": ["../src/**/*.ts", "../src/**/*.vue", "./**/*.ts"],
+  "exclude": ["./vite.config.ts"],
+  "compilerOptions": { "tsBuildInfoFile": "../node_modules/.tmp/native-workspace.tsbuildinfo" }
+}

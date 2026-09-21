@@ -11,7 +11,8 @@
 //! speak it, so conforming costs nothing and inventing costs everyone.
 //!
 //! Client -> server: `session.update`, `input_audio_buffer.append`,
-//! `input_audio_buffer.commit`, `input_audio_buffer.clear`.
+//! `input_audio_buffer.commit`, `input_audio_buffer.clear`, and Paddock's
+//! ordered Stop barrier `input_audio_buffer.drain` (advertised in capabilities).
 //! Server -> client: `session.created` / `session.updated`,
 //! `conversation.item.input_audio_transcription.delta` / `.completed`,
 //! `input_audio_buffer.committed` / `.cleared`, and `error`.
@@ -63,6 +64,14 @@
 //! note in the decode loop - the live answer keeps what it already showed
 //! rather than rewriting it. Never retracting a word is what a delta stream
 //! buys, and this is what it costs.
+//!
+//! Revision-aware clients may explicitly request `paddock_final_revision`
+//! (advertised as `realtime_transcription.final_revision`). Their terminal
+//! `transcript` is the final utterance hypothesis, with `paddock_revised` true
+//! when it corrects the provisional deltas. Native/web Studio negotiate this
+//! mode so stored text and final word timestamps describe the same decode.
+//! The existing final pass is reused; no whole-recording second transcription.
+//! Other clients retain the original append-only contract by default.
 //!
 //! ## The utterance is the unit of finality
 //!
@@ -190,6 +199,21 @@ const MIN_CHUNK_S: f32 = 1.0;
 /// past any dictation and far short of a problem.
 const MAX_BUFFER_S: f32 = 600.0;
 
+/// File word timestamps do not imply live enrichment (Granite Plus emits
+/// them under a different instruction). Both clients consume this explicit
+/// contract instead of inferring it from the file endpoint's granularities.
+pub(crate) fn capabilities(audio: bool, whisper: bool, max_clip_s: Option<f64>) -> Value {
+    json!({
+        "supported": audio,
+        "enrichment": audio && whisper,
+        "drain": audio,
+        "final_revision": audio,
+        "utterance_max_s": if audio { Some(max_clip_s.unwrap_or(MAX_BUFFER_S as f64).min(MAX_BUFFER_S as f64)) } else { None },
+        "sample_rates": [16000, 24000, 44100, 48000],
+        "turn_detection": ["server_vad"],
+    })
+}
+
 /// Whisper's encoder window, from the engine's own mel geometry rather than
 /// the usual hardcoded 30. Buffer trimming turns on this number: windows do
 /// not attend across each other, so a COMPLETE one is finished forever.
@@ -254,6 +278,7 @@ pub async fn handle(
                 max_tokens: asr.max_tokens,
             },
             model: asr.id.clone(),
+            word_times: asr.word_times,
         },
         // A generative ASR model runs the same policy on the ordinary engine
         // It is not the whisper lane wearing a hat: the pass is a
@@ -264,6 +289,7 @@ pub async fn handle(
                 state: state.clone(),
             },
             model: m.id.clone(),
+            word_times: false,
         },
         (None, Some(_)) => {
             return err(
@@ -292,6 +318,7 @@ pub async fn handle(
 struct Lane {
     kind: LaneKind,
     model: String,
+    word_times: bool,
 }
 
 /// The two shapes of ASR behind one session.
@@ -359,6 +386,18 @@ struct Times {
     /// forward pass per window, and re-running it every second on a growing
     /// buffer is the waste this file was written to avoid.
     words: bool,
+    /// Return final-pass metadata even when this backend cannot align words.
+    verbose: bool,
+}
+
+impl Times {
+    fn for_pass(verbose: bool, final_pass: bool, word_times: bool) -> Self {
+        Self {
+            segments: verbose,
+            words: verbose && final_pass && word_times,
+            verbose: verbose && final_pass,
+        }
+    }
 }
 
 /// A pass's answer.
@@ -469,7 +508,7 @@ async fn pass(
             // The enriched object describes this pass - see `live_verbose` on
             // why it is built from the final pass's own join rather than from
             // the transcript the deltas assembled.
-            let verbose = times.words.then(|| {
+            let verbose = times.verbose.then(|| {
                 let text = paddock_engine::gpu_model::whisper::join_windows(&parts, &out.language);
                 crate::transcriptions::live_verbose(
                     &tok,
@@ -543,6 +582,16 @@ struct Agreement {
 }
 
 impl Agreement {
+    /// Revision-capable clients replace provisional words with the final
+    /// hypothesis whose timestamps we return. Retired windows remain intact.
+    fn final_text(&self, words: &[String]) -> String {
+        self.retired
+            .iter()
+            .chain(words)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
     /// Feed one pass's full hypothesis; returns the newly committed words.
     ///
     /// Indexing is POSITIONAL: `committed` is treated as a prefix of every
@@ -785,6 +834,9 @@ struct Live {
     /// how much of `buf` the last pass saw; the `MIN_CHUNK_S` throttle
     seen: usize,
     inflight: bool,
+    /// `commit` is consumed when its pass starts; retain whether that pass
+    /// still owes a completed item for the ordered drain acknowledgement.
+    final_inflight: bool,
     /// set when a turn has ended: the utterance is `buf[..n]`, and the next
     /// pass over it is the final one
     commit: Option<usize>,
@@ -805,6 +857,7 @@ impl Live {
             origin: 0,
             seen: 0,
             inflight: false,
+            final_inflight: false,
             commit: None,
             agreed: Agreement::default(),
             item: id("item"),
@@ -816,6 +869,14 @@ impl Live {
     /// Absolute index one past the last buffered sample.
     fn head(&self) -> usize {
         self.origin + self.buf.len()
+    }
+
+    fn pending_items(&self) -> Vec<String> {
+        if self.commit.is_some() || self.final_inflight {
+            vec![self.item.clone()]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Drop `n` samples off the front, keeping every absolute index honest.
@@ -831,6 +892,7 @@ impl Live {
     fn restart(&mut self) {
         self.seen = 0;
         self.commit = None;
+        self.final_inflight = false;
         self.agreed = Agreement::default();
         self.sent_since_commit = 0;
         self.item = id("item");
@@ -847,6 +909,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
     let mut asked = String::new();
     // whether a closed utterance comes back enriched
     let mut verbose = false;
+    let mut final_revision = false;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Pass>();
 
@@ -861,6 +924,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
             det.as_ref(),
             &asked,
             verbose,
+            final_revision,
         ),
     )
     .await
@@ -876,6 +940,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
             // and a client that is still uploading must not starve them
             Some(p) = rx.recv() => {
                 live.inflight = false;
+                live.final_inflight = false;
                 if p.epoch != live.epoch {
                     // the audio this pass was about has been thrown away; its
                     // `cut` would drain samples belonging to the next utterance
@@ -910,7 +975,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                             // language it is reading
                             let up = session_event(
                                 "session.updated", &session_id, &lane, rate, &language,
-                                det.as_ref(), &asked, verbose,
+                                det.as_ref(), &asked, verbose, final_revision,
                             );
                             if send(&mut socket, up).await.is_err() {
                                 return;
@@ -945,12 +1010,15 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                                 (false, true) => head,
                                 (false, false) => format!("{head} {rest}"),
                             };
+                            let canonical = live.agreed.final_text(&words);
+                            let revised = final_revision && canonical != full;
                             let mut done = json!({
                                 "type": "conversation.item.input_audio_transcription.completed",
                                 "event_id": id("event"),
                                 "item_id": live.item,
                                 "content_index": 0,
-                                "transcript": full,
+                                "transcript": if final_revision { canonical } else { full },
+                                "paddock_revised": revised,
                                 // the duration variant, which is the honest one
                                 // for a model billed by nothing: this is how
                                 // much audio was heard, not a token price. The
@@ -1088,11 +1156,20 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                             continue;
                         }
                         let mut vad = det.as_ref().map(|d| d.cfg);
+                        let next_revision = match ev.pointer("/session/audio/input/transcription/paddock_final_revision") {
+                            Some(Value::Bool(value)) => *value,
+                            None | Some(Value::Null) => final_revision,
+                            Some(_) => {
+                                if send(&mut socket, error_event("invalid_request_error", "`paddock_final_revision` must be a boolean")).await.is_err() { return; }
+                                continue;
+                            }
+                        };
                         match apply_update(
                             ev.get("session"), &mut rate, &mut language, &mut vad, &mut asked,
                             &mut verbose,
                         ) {
                             Ok(()) => {
+                                final_revision = next_revision;
                                 // both the rate and the thresholds change what
                                 // a frame is, so the detector is rebuilt rather
                                 // than adjusted - starting from here, not from
@@ -1100,7 +1177,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                                 det = vad.map(|cfg| Detector::new(cfg, rate, live.head()));
                                 let up = session_event(
                                     "session.updated", &session_id, &lane, rate, &language,
-                                    det.as_ref(), &asked, verbose,
+                                    det.as_ref(), &asked, verbose, final_revision,
                                 );
                                 if send(&mut socket, up).await.is_err() {
                                     return;
@@ -1230,6 +1307,26 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                         }
                         kick(&lane, &mut live, rate, &language, &asked, &tx, hold(&det), verbose);
                     }
+                    "input_audio_buffer.drain" => {
+                        // Ordered input barrier: every earlier append has
+                        // reached VAD. Close active speech, not silence/pre-roll,
+                        // and acknowledge before the client waits for remaining
+                        // completed events. This removes Stop's race against
+                        // delayed speech_started without retranscribing a file.
+                        let speaking = det.as_ref().is_none_or(|d| d.turns.speaking);
+                        if speaking && !live.buf.is_empty() {
+                            if send(&mut socket, committed_event(&live.item)).await.is_err() { return; }
+                            live.commit = Some(live.buf.len());
+                            if let Some(d) = det.as_mut() { d.turns.yield_to_client(live.head()); }
+                            kick(&lane, &mut live, rate, &language, &asked, &tx, hold(&det), verbose);
+                        }
+                        if send(&mut socket, json!({
+                            "type": "input_audio_buffer.drained",
+                            "event_id": id("event"),
+                            "audio_end_ms": ms(live.head(), rate),
+                            "pending_item_ids": live.pending_items(),
+                        })).await.is_err() { return; }
+                    }
                     "input_audio_buffer.commit" => {
                         if live.buf.is_empty() {
                             if send(&mut socket, error_event(
@@ -1338,6 +1435,7 @@ fn kick(
     }
     live.seen = live.buf.len();
     live.inflight = true;
+    live.final_inflight = cut.is_some();
     // The context is rebuilt from the session's own state every pass rather
     // than cached: `retired` only changes on a trim, and joining a few hundred
     // words once a second is not worth a second copy that can go stale.
@@ -1345,12 +1443,10 @@ fn kick(
         asked: asked.to_owned(),
         carried: live.agreed.retired.join(" "),
     };
-    let times = Times {
-        // every pass, so LocalAgreement compares like with like
-        segments: verbose,
-        // this one only, because it is the one that is authoritative
-        words: verbose && cut.is_some(),
-    };
+    // Keep timestamp decoding constant across hypotheses, but only run final
+    // alignment when the loaded backend supports it. Metal Whisper otherwise
+    // fails exactly when finalizing an utterance, stranding its partial text.
+    let times = Times::for_pass(verbose, cut.is_some(), lane.word_times);
     let origin = live.origin;
     let (lane, pcm, language, tx, epoch) = (
         lane.clone(),
@@ -1410,6 +1506,7 @@ fn session_event(
     det: Option<&Detector>,
     prompt: &str,
     verbose: bool,
+    final_revision: bool,
 ) -> Value {
     json!({
         "type": kind,
@@ -1441,6 +1538,7 @@ fn session_event(
                         // this and reads it back missing cannot tell a refusal
                         // from an old build
                         "paddock_verbose": verbose,
+                        "paddock_final_revision": final_revision,
                     },
                 },
             },
@@ -1472,6 +1570,26 @@ fn error_event(kind: &str, message: &str) -> Value {
 /// Apply a `session.update`'s transcription settings, refusing by name what
 /// this session does not serve.
 fn apply_update(
+    session: Option<&Value>,
+    rate: &mut u32,
+    language: &mut Option<String>,
+    vad: &mut Option<VadConfig>,
+    asked: &mut String,
+    verbose: &mut bool,
+) -> Result<(), String> {
+    // A refused update must not change sample rate/language/VAD halfway.
+    let (mut r, mut l, mut v, mut a, mut b) =
+        (*rate, language.clone(), *vad, asked.clone(), *verbose);
+    apply_update_inner(session, &mut r, &mut l, &mut v, &mut a, &mut b)?;
+    *rate = r;
+    *language = l;
+    *vad = v;
+    *asked = a;
+    *verbose = b;
+    Ok(())
+}
+
+fn apply_update_inner(
     session: Option<&Value>,
     rate: &mut u32,
     language: &mut Option<String>,
@@ -1618,6 +1736,84 @@ fn decode_pcm16(b64: &str) -> Result<Vec<f32>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn final_revision_replaces_stale_prefix_and_keeps_retired_windows() {
+        let agreement = super::Agreement {
+            retired: vec!["Earlier.".into()],
+            committed: vec!["Wrong".into(), "extra".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agreement.final_text(&["Correct.".into()]),
+            "Earlier. Correct."
+        );
+        assert_eq!(
+            agreement.text(),
+            "Earlier. Wrong extra",
+            "legacy append-only text remains unchanged"
+        );
+        assert_eq!(agreement.final_text(&[]), "Earlier.");
+    }
+    #[test]
+    fn rejected_update_does_not_half_change_the_audio_format() {
+        let mut rate = 16000;
+        let mut language = Some("sv".to_owned());
+        let mut vad = None;
+        let mut asked = String::new();
+        let mut verbose = false;
+        let update = serde_json::json!({"audio":{"input":{
+            "format":{"type":"audio/pcm","rate":48000},
+            "transcription":{"language":"en","paddock_verbose":"invalid"}
+        }}});
+        assert!(
+            super::apply_update(
+                Some(&update),
+                &mut rate,
+                &mut language,
+                &mut vad,
+                &mut asked,
+                &mut verbose
+            )
+            .is_err()
+        );
+        assert_eq!(rate, 16000);
+        assert_eq!(language.as_deref(), Some("sv"));
+        assert!(!verbose);
+    }
+    #[test]
+    fn drain_tracks_pending_final_pass_but_not_probe_or_cleared_audio() {
+        let mut live = super::Live::new();
+        assert!(live.pending_items().is_empty());
+        live.inflight = true;
+        assert!(
+            live.pending_items().is_empty(),
+            "a probe alone owes no completed item"
+        );
+        live.commit = Some(123);
+        assert_eq!(live.pending_items(), [live.item.clone()]);
+        live.commit = None;
+        live.final_inflight = true;
+        assert_eq!(live.pending_items(), [live.item.clone()]);
+        live.restart();
+        assert!(
+            live.pending_items().is_empty(),
+            "clear invalidates the old final pass"
+        );
+    }
+    #[test]
+    fn realtime_capabilities_are_not_file_timestamp_capabilities() {
+        let whisper = super::capabilities(true, true, None);
+        assert_eq!(whisper["enrichment"], true);
+        assert_eq!(whisper["drain"], true);
+        assert_eq!(whisper["utterance_max_s"], 600.0);
+        // Granite Plus file word times cannot opt a generative live lane into
+        // the Whisper-specific pass. Qwen/Granite enforce the tower ceiling.
+        let generative = super::capabilities(true, false, Some(120.0));
+        assert_eq!(generative["enrichment"], false);
+        assert_eq!(generative["supported"], true);
+        assert_eq!(generative["utterance_max_s"], 120.0);
+        assert_eq!(super::capabilities(false, false, None)["supported"], false);
+    }
     use super::*;
 
     fn words(s: &str) -> Vec<String> {
@@ -1879,10 +2075,8 @@ mod tests {
         // pass only, while the timestamp prompt is constant for the session so
         // LocalAgreement never compares one prompt's hypothesis against
         // another's.
-        let times = |verbose: bool, cut: Option<usize>| Times {
-            segments: verbose,
-            words: verbose && cut.is_some(),
-        };
+        let times =
+            |verbose: bool, cut: Option<usize>| Times::for_pass(verbose, cut.is_some(), true);
         let off = times(false, Some(16000));
         assert!(
             !off.segments && !off.words,
@@ -1898,6 +2092,14 @@ mod tests {
             fin.segments && fin.words,
             "the closed utterance is where it is paid"
         );
+        assert!(fin.verbose);
+        let metal = Times::for_pass(true, true, false);
+        assert!(
+            metal.segments && metal.verbose && !metal.words,
+            "a segment-only backend must finalize without unavailable alignment"
+        );
+        let metal_hypothesis = Times::for_pass(true, false, false);
+        assert!(metal_hypothesis.segments && !metal_hypothesis.verbose && !metal_hypothesis.words);
     }
 
     /// Frames at 20 ms, `n` of them, all speech or all not.

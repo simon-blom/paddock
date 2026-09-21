@@ -220,7 +220,7 @@ pub struct Cli {
     /// time-derived seed, the OpenAI semantics)
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
-    /// KV cache dtype: auto | f16 | fp8_e4m3 (auto = per-family default)
+    /// KV cache dtype: auto | f16 | fp8_e4m3; f32 only for native Bonsai Metal
     #[arg(long = "kv-cache-dtype", value_name = "DTYPE")]
     pub kv_cache_dtype: Option<String>,
     /// Serve the model under this id in /v1/models (vLLM flag)
@@ -995,20 +995,20 @@ pub fn print_startup_banner(cfg: &Config, banner: &Banner) {
             "  {dim}Config{reset}      {dim}built-in defaults (see paddock.example.toml){reset}"
         ),
     }
-    if let Some(key) = &banner.auth_key {
+    if banner.auth_key.is_some() {
         let scope = if cfg.trusted_proxy {
             "required from everyone (trusted_proxy)"
         } else {
             "required from the network, loopback callers exempt"
         };
-        println!("  {dim}API key{reset}     {cyan}{key}{reset}  {dim}{scope}{reset}");
+        println!("  {dim}Auth{reset}        {dim}API key configured; {scope}{reset}");
     } else if cfg.no_auth {
         println!("  {dim}Auth{reset}        {dim}none (--no-auth){reset}");
     } else {
         println!("  {dim}Auth{reset}        {dim}none (loopback bind){reset}");
     }
     println!(
-        "  {dim}Studio{reset}      {dim}runners are headless - run `paddock` (the manager) for the Studio{reset}"
+        "  {dim}Studio{reset}      {dim}open Studio in the Paddock app or manager; this runner serves the API{reset}"
     );
     #[cfg(windows)]
     println!(

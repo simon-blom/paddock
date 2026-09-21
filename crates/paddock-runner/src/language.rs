@@ -678,7 +678,10 @@ pub fn caps_json(
     // granite-speech detects the input language and reports nothing at all.
     // Neither exposes a distribution, and neither has anything a prior could
     // weight - `languages` is refused on both rather than accepted and dropped.
-    let names_it = matches!(s.audio_frontend, AudioFrontend::Qwen3Asr);
+    let names_it = matches!(
+        s.audio_frontend,
+        AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal
+    );
     Some(serde_json::json!({
         "supported": names_it,
         "probabilities": false,

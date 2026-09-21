@@ -7,6 +7,7 @@ import {
   MeasurementUnit,
   NoteIcon,
   PageOverlayManager,
+  PageRenderer,
   PageViewport,
   RenderPriority,
   TOOL_TO_SUBTYPE,
@@ -27,9 +28,10 @@ import {
   isToolOutputTool,
   isUserAnnotation,
   measurementPlugin,
+  rasterBudgetFor,
   resolveIcon,
   uuid
-} from "./chunk-TZBNFEF3.js";
+} from "./chunk-ARW2XA5Q.js";
 
 // src/engine/lector-engine.ts
 import * as Comlink2 from "comlink";
@@ -356,13 +358,17 @@ function createPluginContext(options) {
     },
     state,
     on(event, handler) {
-      return events.on(event, handler);
+      const stop = events.on(event, handler);
+      options.cleanups?.push(stop);
+      return stop;
     },
     emit(event, ...args) {
       events.emit(event, ...args);
     },
     effect(fn) {
-      return effect(fn);
+      const stop = effect(fn);
+      options.cleanups?.push(stop);
+      return stop;
     },
     engine,
     registerCommand(command) {
@@ -434,13 +440,19 @@ var PluginRegistry = class {
     for (const pluginId of order) {
       const definition = definitionById.get(pluginId);
       const state = definition.state !== void 0 ? definition.state() : {};
+      const cleanups = [];
+      this.#disposeCallbacks.push(() => {
+        for (const stop of cleanups) stop();
+        cleanups.length = 0;
+      });
       const ctx = createPluginContext({
         capabilities: this.#capabilities,
         events: this.events,
         engine: this.#engine,
         commands: this.commands,
         state,
-        pluginId
+        pluginId,
+        cleanups
       });
       const capability = await definition.setup(ctx);
       for (const cap of definition.provides) {
@@ -501,311 +513,238 @@ var PluginRegistry = class {
   }
 };
 
-// src/engine/abort-tracker.ts
-var AbortTracker = class {
-  #listeners = /* @__PURE__ */ new Map();
-  /**
-   * Register an abort listener for a task.
-   *
-   * If the signal is already aborted, `onAbort` is called synchronously
-   * and the task is not stored.
-   */
-  track(taskId, signal25, onAbort) {
-    if (signal25.aborted) {
-      onAbort();
-      return;
-    }
-    const handler = () => {
-      this.#listeners.delete(taskId);
-      onAbort();
-    };
-    signal25.addEventListener("abort", handler, { once: true });
-    this.#listeners.set(taskId, { signal: signal25, handler });
-  }
-  /** Remove the abort listener for a task. No-op if the task is not tracked. */
-  untrack(taskId) {
-    const entry = this.#listeners.get(taskId);
-    if (entry !== void 0) {
-      entry.signal.removeEventListener("abort", entry.handler);
-      this.#listeners.delete(taskId);
-    }
-  }
-  /** Remove all abort listeners. */
-  [Symbol.dispose]() {
-    for (const [, entry] of this.#listeners) {
-      entry.signal.removeEventListener("abort", entry.handler);
-    }
-    this.#listeners.clear();
-  }
-};
-
 // src/engine/render-scheduler.ts
-function deduplicationKey(docId, pageIndex, width, height) {
-  return `${docId}:${pageIndex}:${width}:${height}`;
-}
-function coalesceKey(docId, pageIndex, priority) {
-  return `${docId}:${pageIndex}:${priority}`;
+var abortError = () => new DOMException("Render cancelled", "AbortError");
+function renderKey(r) {
+  const o = { ...DEFAULT_RENDER_OPTIONS, ...r.options };
+  return JSON.stringify([
+    r.docId,
+    r.pageIndex,
+    r.width,
+    r.height,
+    o.flags,
+    o.rotation,
+    o.backgroundColor,
+    o.devicePixelRatio,
+    r.tile?.x,
+    r.tile?.y,
+    r.tile?.fullW,
+    r.tile?.fullH,
+    r.generation
+  ]);
 }
 var RenderScheduler = class {
-  #queue = [];
-  #active = null;
-  #insertionCounter = 0;
-  #taskCounter = 0;
-  #disposed = false;
-  #abortTracker = new AbortTracker();
   #proxy;
-  #pool = null;
-  /** Number of concurrent renders allowed (1 = serial, >1 = parallel via pool). */
-  #concurrency = 1;
-  /** Currently active renders (dispatched but not yet resolved). */
-  #activeCount = 0;
-  /** Maps deduplication keys to pending promises for identical requests. */
+  #pool;
+  #concurrency;
+  #budget;
+  #queueLimit;
+  #tasks = /* @__PURE__ */ new Map();
   #pending = /* @__PURE__ */ new Map();
-  /**
-   * Maps `${docId}:${pageIndex}` to the currently-pending task for that
-   * page. When a new render arrives for the same page at different
-   * dimensions, the older one is cancelled — only the latest dimensions
-   * matter to the user. Without this, sidebar/zoom drags flood the
-   * queue with hundreds of stale requests and the worker never catches
-   * up.
-   */
-  #pendingByPage = /* @__PURE__ */ new Map();
-  constructor(proxy, pool) {
+  #slots = /* @__PURE__ */ new Map();
+  #counter = 0;
+  #active = 0;
+  #bytes = 0;
+  #peakBytes = 0;
+  #disposed = false;
+  constructor(proxy, pool, options = {}) {
     this.#proxy = proxy;
-    if (pool && pool.size > 0) {
-      this.#pool = pool;
-      this.#concurrency = pool.size + 1;
+    this.#pool = pool;
+    this.#concurrency = pool && pool.size > 0 ? pool.size + 1 : 1;
+    this.#budget = options.maxInFlightBytes ?? 128 * 1024 * 1024;
+    this.#queueLimit = options.maxQueuedTasks ?? 256;
+    if (!Number.isSafeInteger(this.#budget) || this.#budget < 16 || !Number.isSafeInteger(this.#queueLimit) || this.#queueLimit < 1) {
+      throw new RangeError("Invalid render admission budget");
     }
   }
-  /**
-   * Enqueue a page render request.
-   *
-   * Returns a promise that resolves with the rendered ImageBitmap.
-   * If an identical request is already pending, returns the existing promise.
-   */
+  get stats() {
+    return {
+      active: this.#active,
+      queued: [...this.#tasks.values()].filter((t) => t.state === "queued").length,
+      reservedBytes: this.#bytes,
+      peakReservedBytes: this.#peakBytes,
+      budgetBytes: this.#budget
+    };
+  }
   enqueue(request) {
-    if (this.#disposed) {
-      return Promise.reject(new DOMException("RenderScheduler is disposed", "AbortError"));
+    if (this.#disposed || request.signal?.aborted) return Promise.reject(abortError());
+    const dimensions = [
+      request.width,
+      request.height,
+      ...request.tile ? [request.tile.fullW, request.tile.fullH] : []
+    ];
+    if (dimensions.some((n) => !Number.isSafeInteger(n) || n < 1 || n > 2147483647) || !Number.isSafeInteger(request.pageIndex) || request.pageIndex < 0 || request.tile && ([request.tile.x, request.tile.y].some((n) => !Number.isSafeInteger(n) || n < 0) || request.tile.x + request.width > request.tile.fullW || request.tile.y + request.height > request.tile.fullH)) {
+      return Promise.reject(new RangeError("Invalid raster dimensions"));
     }
-    const priority = request.priority ?? 0;
-    const dedupKey = deduplicationKey(request.docId, request.pageIndex, request.width, request.height);
-    const coalKey = coalesceKey(request.docId, request.pageIndex, priority);
-    const existing = this.#pending.get(dedupKey);
-    if (existing !== void 0) {
-      return existing.promise;
+    const baseBytes = request.width * request.height * 4;
+    if (baseBytes * 4 > this.#budget) {
+      return Promise.reject(
+        new RangeError("Raster exceeds admission budget; render viewport tiles instead")
+      );
     }
-    const stalePageTaskId = this.#pendingByPage.get(coalKey);
-    if (stalePageTaskId !== void 0) {
-      this.#cancelTask(stalePageTaskId);
+    if (request.consumerKey) {
+      const previous = this.#slots.get(request.consumerKey);
+      if (previous) this.#cancelConsumer(previous.task, previous.consumer, false);
     }
-    const taskId = `task_${this.#taskCounter++}`;
-    const insertionOrder = this.#insertionCounter++;
-    const promise = new Promise((resolve, reject) => {
-      const task = {
-        taskId,
+    const key = renderKey(request);
+    let task = this.#pending.get(key);
+    if (task && (task.consumers.size >= 32 || (task.state === "running" ? this.#bytes + baseBytes : task.reserved + baseBytes) > this.#budget))
+      task = void 0;
+    if (!task) {
+      if (this.stats.queued >= this.#queueLimit)
+        return Promise.reject(new Error("Render queue capacity exceeded"));
+      const order = this.#counter++;
+      task = {
+        id: `task_${order}`,
+        key,
         request,
-        priority,
-        insertionOrder,
-        resolve,
-        reject
+        order,
+        consumers: /* @__PURE__ */ new Set(),
+        state: "queued",
+        reserved: baseBytes * 3
       };
-      let insertIdx = this.#queue.length;
-      for (let i = 0; i < this.#queue.length; i++) {
-        const queued = this.#queue[i];
-        if (priority < queued.priority || priority === queued.priority && insertionOrder < queued.insertionOrder) {
-          insertIdx = i;
-          break;
+      this.#tasks.set(task.id, task);
+      this.#pending.set(key, task);
+    }
+    const target = task;
+    target.reserved += baseBytes;
+    if (target.state === "running") {
+      this.#bytes += baseBytes;
+      this.#peakBytes = Math.max(this.#peakBytes, this.#bytes);
+    }
+    const promise = new Promise((resolve, reject) => {
+      const consumer = {
+        request,
+        priority: request.priority ?? 0,
+        resolve,
+        reject,
+        unlisten: () => {
         }
-      }
-      this.#queue.splice(insertIdx, 0, task);
-      if (request.signal !== void 0) {
-        this.#abortTracker.track(taskId, request.signal, () => {
-          this.#cancelTask(taskId, dedupKey);
-        });
+      };
+      target.consumers.add(consumer);
+      if (request.consumerKey) this.#slots.set(request.consumerKey, { task: target, consumer });
+      if (request.signal) {
+        const onAbort = () => this.#cancelConsumer(target, consumer);
+        request.signal.addEventListener("abort", onAbort, { once: true });
+        consumer.unlisten = () => request.signal.removeEventListener("abort", onAbort);
       }
     });
-    this.#pending.set(dedupKey, { promise, taskId });
-    this.#pendingByPage.set(coalKey, taskId);
     this.#dispatch();
     return promise;
   }
-  /** Cancel a task by ID. Removes it from the queue or discards the active result. */
+  #removeConsumer(task, consumer) {
+    consumer.unlisten();
+    task.consumers.delete(consumer);
+    const slot = consumer.request.consumerKey;
+    if (slot && this.#slots.get(slot)?.consumer === consumer) this.#slots.delete(slot);
+  }
+  #forget(task) {
+    if (this.#pending.get(task.key) === task) this.#pending.delete(task.key);
+    if (task.state === "queued") this.#tasks.delete(task.id);
+  }
+  #cancelConsumer(task, consumer, dispatch = true) {
+    if (!task.consumers.has(consumer)) return;
+    this.#removeConsumer(task, consumer);
+    consumer.reject(abortError());
+    if (task.consumers.size === 0) this.#forget(task);
+    if (dispatch) this.#dispatch();
+  }
   cancel(taskId) {
-    this.#cancelTask(taskId);
+    const task = this.#tasks.get(taskId);
+    if (task) for (const c of [...task.consumers]) this.#cancelConsumer(task, c, false);
+    this.#dispatch();
   }
-  /**
-   * Cancel every queued and in-flight render for a document. Call this when a
-   * document is closing so outstanding renders don't resolve against a closed
-   * document: their promises reject with AbortError, and any late-arriving
-   * pool bitmap is dropped and closed by the success guard (no leak).
-   */
   cancelDocument(docId) {
-    const ids = [];
-    for (const task of this.#queue) {
-      if (task.request.docId === docId) ids.push(task.taskId);
+    for (const task of [...this.#tasks.values()]) {
+      if (task.request.docId === docId) {
+        for (const c of [...task.consumers]) this.#cancelConsumer(task, c, false);
+      }
     }
-    for (const [taskId, task] of this.#activeTasks) {
-      if (task.request.docId === docId) ids.push(taskId);
-    }
-    for (const id of ids) this.#cancelTask(id);
+    this.#dispatch();
   }
-  /**
-   * Change the priority of all pending tasks matching a specific document and page.
-   * Tasks that are already actively rendering are not affected.
-   */
-  reprioritize(docId, pageIndex, newPriority) {
-    const updated = [];
-    const unchanged = [];
-    for (const task of this.#queue) {
+  reprioritize(docId, pageIndex, priority) {
+    for (const task of this.#tasks.values()) {
       if (task.request.docId === docId && task.request.pageIndex === pageIndex) {
-        updated.push({
-          ...task,
-          priority: newPriority
-        });
-      } else {
-        unchanged.push(task);
+        for (const c of task.consumers) c.priority = priority;
       }
-    }
-    if (updated.length === 0) {
-      return;
-    }
-    const merged = [...unchanged, ...updated];
-    merged.sort((a, b) => {
-      if (a.priority !== b.priority) {
-        return a.priority - b.priority;
-      }
-      return a.insertionOrder - b.insertionOrder;
-    });
-    this.#queue = merged;
-  }
-  /** Dispose the scheduler, rejecting all pending tasks. */
-  [Symbol.dispose]() {
-    if (this.#disposed) {
-      return;
-    }
-    this.#disposed = true;
-    const abortError = new DOMException("RenderScheduler disposed", "AbortError");
-    for (const task of this.#queue) {
-      task.reject(abortError);
-    }
-    this.#queue = [];
-    this.#pending.clear();
-    this.#pendingByPage.clear();
-    this.#abortTracker[Symbol.dispose]();
-  }
-  #cancelTask(taskId, dedupKey) {
-    const queueIdx = this.#queue.findIndex((t) => t.taskId === taskId);
-    if (queueIdx !== -1) {
-      const task = this.#queue[queueIdx];
-      this.#queue.splice(queueIdx, 1);
-      this.#abortTracker.untrack(taskId);
-      if (dedupKey !== void 0) {
-        this.#pending.delete(dedupKey);
-      } else {
-        const key = deduplicationKey(
-          task.request.docId,
-          task.request.pageIndex,
-          task.request.width,
-          task.request.height
-        );
-        this.#pending.delete(key);
-      }
-      const coalKey = coalesceKey(task.request.docId, task.request.pageIndex, task.priority);
-      if (this.#pendingByPage.get(coalKey) === taskId) {
-        this.#pendingByPage.delete(coalKey);
-      }
-      task.reject(new DOMException("Render cancelled", "AbortError"));
-      return;
-    }
-    const activeTask = this.#activeTasks.get(taskId);
-    if (activeTask) {
-      this.#activeTasks.delete(taskId);
-      this.#activeCount--;
-      this.#abortTracker.untrack(taskId);
-      if (this.#active?.taskId === taskId) this.#active = null;
-      activeTask.reject(new DOMException("Render cancelled", "AbortError"));
     }
   }
-  /** Tasks currently being rendered, by ID (for cancellation + settle). */
-  #activeTasks = /* @__PURE__ */ new Map();
   #dispatch() {
-    while (!this.#disposed && this.#activeCount < this.#concurrency && this.#queue.length > 0) {
-      const task = this.#queue.shift();
-      this.#activeCount++;
-      this.#activeTasks.set(task.taskId, task);
-      if (this.#concurrency === 1) this.#active = task;
-      this.#runTask(task);
+    if (this.#disposed) return;
+    const priority = (t) => Math.min(...[...t.consumers].map((c) => c.priority));
+    const queue = [...this.#tasks.values()].filter((t) => t.state === "queued" && t.consumers.size > 0).sort((a, b) => priority(a) - priority(b) || a.order - b.order);
+    for (const task of queue) {
+      if (this.#active >= this.#concurrency) break;
+      if (this.#bytes + task.reserved > this.#budget) continue;
+      task.state = "running";
+      this.#active++;
+      this.#bytes += task.reserved;
+      this.#peakBytes = Math.max(this.#peakBytes, this.#bytes);
+      void this.#run(task);
     }
   }
-  /**
-   * Dispatch one task to a render target. The pool is a best-effort
-   * optimization: if a pool render REJECTS (worker lacks the doc, isn't ready
-   * yet, a transient error), we fall back to the authoritative primary worker
-   * before giving up, so a desynced or failing pool worker can never break a
-   * render. When the pool returns null (no worker holds the doc) we go
-   * straight to the primary.
-   */
-  #runTask(task) {
-    const { request } = task;
-    const poolPromise = this.#pool?.renderPage(
-      request.docId,
-      request.pageIndex,
-      request.width,
-      request.height,
-      request.options
-    );
-    const renderOnPrimary = () => this.#proxy.renderPage(
-      request.docId,
-      request.pageIndex,
-      request.width,
-      request.height,
-      request.options
-    );
-    if (poolPromise) {
-      poolPromise.then(
-        (bitmap) => this.#onRenderSuccess(task, bitmap),
-        () => {
-          if (!this.#activeTasks.has(task.taskId)) return;
-          renderOnPrimary().then(
-            (bitmap) => this.#onRenderSuccess(task, bitmap),
-            (err) => this.#onRenderError(task, err)
-          );
+  async #run(task) {
+    let bitmap;
+    const r = task.request;
+    const options = {
+      flags: r.options?.flags ?? DEFAULT_RENDER_OPTIONS.flags,
+      rotation: r.options?.rotation ?? DEFAULT_RENDER_OPTIONS.rotation,
+      backgroundColor: r.options?.backgroundColor ?? DEFAULT_RENDER_OPTIONS.backgroundColor,
+      devicePixelRatio: r.options?.devicePixelRatio ?? DEFAULT_RENDER_OPTIONS.devicePixelRatio
+    };
+    try {
+      const primary = () => r.tile ? this.#proxy.renderPageTile(
+        r.docId,
+        r.pageIndex,
+        r.tile.x,
+        r.tile.y,
+        r.width,
+        r.height,
+        r.tile.fullW,
+        r.tile.fullH,
+        options
+      ) : this.#proxy.renderPage(r.docId, r.pageIndex, r.width, r.height, options);
+      const pool = !r.tile ? this.#pool?.renderPage(r.docId, r.pageIndex, r.width, r.height, options) : null;
+      if (pool) {
+        try {
+          bitmap = await pool;
+        } catch (error) {
+          if (!task.consumers.size) throw error;
+          bitmap = await primary();
         }
-      );
-    } else {
-      renderOnPrimary().then(
-        (bitmap) => this.#onRenderSuccess(task, bitmap),
-        (err) => this.#onRenderError(task, err)
-      );
+      } else bitmap = await primary();
+      this.#forget(task);
+      for (const consumer of [...task.consumers]) {
+        if (!task.consumers.has(consumer)) continue;
+        const owned = task.consumers.size === 1 ? bitmap : await createImageBitmap(bitmap);
+        if (owned === bitmap) bitmap = void 0;
+        if (!task.consumers.has(consumer)) {
+          owned.close();
+          continue;
+        }
+        this.#removeConsumer(task, consumer);
+        consumer.resolve(owned);
+      }
+    } catch (error) {
+      for (const consumer of [...task.consumers]) {
+        this.#removeConsumer(task, consumer);
+        consumer.reject(error);
+      }
+    } finally {
+      bitmap?.close();
+      this.#forget(task);
+      this.#tasks.delete(task.id);
+      this.#active--;
+      this.#bytes -= task.reserved;
+      this.#dispatch();
     }
   }
-  #settleBookkeeping(task) {
-    this.#activeCount--;
-    this.#activeTasks.delete(task.taskId);
-    if (this.#active?.taskId === task.taskId) this.#active = null;
-    this.#abortTracker.untrack(task.taskId);
-    const { request } = task;
-    const key = deduplicationKey(request.docId, request.pageIndex, request.width, request.height);
-    this.#pending.delete(key);
-    const coalKey = coalesceKey(request.docId, request.pageIndex, task.priority);
-    if (this.#pendingByPage.get(coalKey) === task.taskId) {
-      this.#pendingByPage.delete(coalKey);
-    }
-  }
-  #onRenderSuccess(task, bitmap) {
-    if (!this.#activeTasks.has(task.taskId)) {
-      bitmap.close();
-      return;
-    }
-    this.#settleBookkeeping(task);
-    task.resolve(bitmap);
-    this.#dispatch();
-  }
-  #onRenderError(task, err) {
-    if (!this.#activeTasks.has(task.taskId)) return;
-    this.#settleBookkeeping(task);
-    task.reject(err);
-    this.#dispatch();
+  [Symbol.dispose]() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    for (const task of [...this.#tasks.values()]) this.cancel(task.id);
+    this.#pending.clear();
+    this.#slots.clear();
   }
 };
 
@@ -1158,7 +1097,7 @@ var LectorEngine = class {
           wasmJsUrl
         );
       }
-      this.#scheduler = new RenderScheduler(this.#proxy, this.#renderPool ?? void 0);
+      this.#scheduler = new RenderScheduler(this.#proxy, this.#renderPool ?? void 0, this.#options.renderAdmission);
       const events = this.plugins.events;
       const offRotated = events.on("page-ops:page-rotated", (...args) => {
         this.#pageRotation.invalidate(args[0], args[1]);
@@ -1174,6 +1113,8 @@ var LectorEngine = class {
       this.#initialized = true;
       this.plugins.events.emit("engine:ready");
     } catch (err) {
+      this.plugins[Symbol.dispose]();
+      this.#scheduler?.[Symbol.dispose]();
       this.#scheduler = null;
       this.#renderPool?.[Symbol.dispose]();
       this.#renderPool = null;
@@ -1292,7 +1233,9 @@ var LectorEngine = class {
         height,
         options,
         priority: options?.priority,
-        signal: options?.signal
+        signal: options?.signal,
+        consumerKey: options?.consumerKey,
+        generation: options?.generation
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -1306,22 +1249,27 @@ var LectorEngine = class {
    * rendering system for large pages at high zoom where allocating a
    * full-page bitmap would exceed memory limits.
    *
-   * Bypasses the render scheduler (tiles have their own dedup/cancel
-   * logic in TileManager) and calls the worker directly.
+   * Uses the same admission queue as full pages; tiles cannot flood the worker
+   * or bypass transient-memory limits during a fast scroll/zoom sequence.
    */
   async renderPageTile(docId, pageIndex, tileX, tileY, tileW, tileH, fullW, fullH, options) {
     this.#assertReady();
-    return this.#proxy.renderPageTile(
+    return this.#scheduler.enqueue({
       docId,
       pageIndex,
-      tileX,
-      tileY,
-      tileW,
-      tileH,
-      fullW,
-      fullH,
-      options
-    );
+      width: tileW,
+      height: tileH,
+      tile: { x: tileX, y: tileY, fullW, fullH },
+      options,
+      priority: options?.priority,
+      signal: options?.signal,
+      consumerKey: options?.consumerKey,
+      generation: options?.generation
+    });
+  }
+  /** Scheduler-accounted pixels, not total process memory. */
+  get renderStats() {
+    return this.#scheduler?.stats ?? null;
   }
   /**
    * Access the Comlink proxy to the pdfium worker.
@@ -1377,11 +1325,15 @@ var LectorEngine = class {
   [Symbol.dispose]() {
     if (!this.#destroyed) {
       this.#destroyed = true;
+      this.plugins.events.emit("engine:destroying");
+      this.plugins[Symbol.dispose]();
       this.#rotationUnsubscribe?.();
       this.#rotationUnsubscribe = null;
       this.#pageRotation[Symbol.dispose]();
       this.#scheduler?.[Symbol.dispose]();
       this.#scheduler = null;
+      this.#renderPool?.[Symbol.dispose]();
+      this.#renderPool = null;
       void this.#proxy?.destroy();
       this.#proxy = null;
       this.#worker?.terminate();
@@ -1396,6 +1348,8 @@ var LectorEngine = class {
   async destroy() {
     if (!this.#destroyed) {
       this.#destroyed = true;
+      this.plugins.events.emit("engine:destroying");
+      this.plugins[Symbol.dispose]();
       this.#rotationUnsubscribe?.();
       this.#rotationUnsubscribe = null;
       this.#pageRotation[Symbol.dispose]();
@@ -1669,6 +1623,7 @@ var ViewportInstanceImpl = class {
   #destroyed = false;
   /** True while a programmatic scrollToPage is in progress. */
   #programmaticScroll = false;
+  #scrollFrame = 0;
   // ── Derived ──
   #docId$;
   #handle$;
@@ -1766,6 +1721,9 @@ var ViewportInstanceImpl = class {
   get visiblePages() {
     return this.#visiblePages$;
   }
+  get bufferPages() {
+    return this.#bufferSize$;
+  }
   // ── Mutating methods ──
   attach(container) {
     if (this.#destroyed) throw new Error(`Viewport ${this.id} has been destroyed`);
@@ -1800,6 +1758,9 @@ var ViewportInstanceImpl = class {
     };
   }
   detach() {
+    cancelAnimationFrame(this.#scrollFrame);
+    this.#scrollFrame = 0;
+    this.#programmaticScroll = false;
     if (this.#resizeObserver !== null) {
       this.#resizeObserver.disconnect();
       this.#resizeObserver = null;
@@ -1813,6 +1774,9 @@ var ViewportInstanceImpl = class {
     this.#scrollOffset$.value = { x: 0, y: 0 };
   }
   setDocument(docId) {
+    cancelAnimationFrame(this.#scrollFrame);
+    this.#scrollFrame = 0;
+    this.#programmaticScroll = false;
     this.#pinnedDocId$.value = docId;
     this.#scrollOffset$.value = { x: 0, y: 0 };
     if (this.#attachedContainer !== null) {
@@ -1831,25 +1795,20 @@ var ViewportInstanceImpl = class {
     const target = positions.find((p) => p.pageIndex === pageIndex);
     if (target === void 0) return;
     const scrollY = Math.max(0, target.y - this.#pageGap);
+    cancelAnimationFrame(this.#scrollFrame);
     this.#programmaticScroll = true;
-    if (this.#attachedContainer !== null) {
-      this.#attachedContainer.scrollTo({
+    if (!smooth) this.#scrollOffset$.value = { x: 0, y: scrollY };
+    this.#scrollFrame = requestAnimationFrame(() => {
+      this.#scrollFrame = 0;
+      const container = this.#attachedContainer;
+      container?.scrollTo({
         top: scrollY,
         left: 0,
         behavior: smooth ? "smooth" : "instant"
       });
-    }
-    this.#scrollOffset$.value = { x: 0, y: scrollY };
-    const delay = smooth ? 600 : 0;
-    if (delay === 0) {
-      queueMicrotask(() => {
-        this.#programmaticScroll = false;
-      });
-    } else {
-      setTimeout(() => {
-        this.#programmaticScroll = false;
-      }, delay);
-    }
+      if (container) this.#scrollOffset$.value = { x: container.scrollLeft, y: container.scrollTop };
+      this.#programmaticScroll = false;
+    });
   }
   setResizeObserverPaused(paused) {
     if (this.#resizeObserverPaused === paused) return;
@@ -1864,6 +1823,9 @@ var ViewportInstanceImpl = class {
     this.detach();
     this.#destroyed = true;
     this.#ctx.onDestroy(this.id);
+    for (const derived of [this.#docId$, this.#handle$, this.#pagePositions$, this.#totalHeight$, this.#visiblePages$]) {
+      derived[Symbol.dispose]();
+    }
   }
   /** Internal: read the current buffer size. */
   getBufferSize() {
@@ -10245,18 +10207,19 @@ var TileManager = class {
     };
     renderFn(req).then(
       (bitmap) => {
-        this.#inflight.delete(key);
         const current = this.#cache.get(key);
-        if (current === void 0) {
+        if (current !== entry) {
           bitmap.close();
           return;
         }
+        this.#inflight.delete(key);
         current.status = "ready";
         current.bitmap = bitmap;
         current.lastAccess = this.#accessCounter++;
         this.onTileReady?.();
       },
       (_err) => {
+        if (this.#cache.get(key) !== entry) return;
         this.#inflight.delete(key);
         this.#cache.delete(key);
       }
@@ -11261,6 +11224,110 @@ var uiPlugin = definePlugin({
 
 // src/ui/lector-viewer.ts
 import { effect as effect2, signal as signal24 } from "@truespar/lector-utils";
+
+// src/ui/thumbnail-renderer.ts
+var ThumbnailRenderer = class {
+  constructor(engine, document2, root) {
+    this.engine = engine;
+    this.document = document2;
+    this.#budget = rasterBudgetFor(engine);
+    this.#observer = new IntersectionObserver(
+      (entries) => {
+        if (this.#destroyed) return;
+        for (const entry of entries) {
+          const item = this.#items.get(entry.target);
+          if (!item) continue;
+          item.visible = entry.isIntersecting;
+          if (item.visible) this.#render(item);
+          else this.#release(item);
+        }
+      },
+      { root, rootMargin: "300px 0px" }
+    );
+  }
+  engine;
+  document;
+  #items = /* @__PURE__ */ new Map();
+  #observer;
+  #budget;
+  #destroyed = false;
+  #revision = 0;
+  observe(canvas, page, width, height) {
+    canvas.width = 0;
+    canvas.height = 0;
+    this.#items.set(canvas, {
+      canvas,
+      page,
+      width,
+      height,
+      visible: false,
+      controller: null,
+      presentation: null
+    });
+    this.#observer.observe(canvas);
+  }
+  invalidate(page) {
+    this.#revision++;
+    for (const item of this.#items.values())
+      if (item.page === page) {
+        this.#release(item);
+        if (item.visible) this.#render(item);
+      }
+  }
+  #release(item) {
+    item.controller?.abort();
+    item.controller = null;
+    item.presentation?.transferFromImageBitmap(null);
+    item.canvas.width = 0;
+    item.canvas.height = 0;
+    this.#budget.release(item);
+  }
+  #render(item) {
+    if (this.#destroyed || item.controller) return;
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(item.width * dpr));
+    const height = Math.max(1, Math.round(item.height * dpr));
+    if (!this.#budget.reserve(item, width * height * 4, false, () => this.#release(item))) return;
+    const controller = new AbortController();
+    item.controller = controller;
+    void this.engine.renderPage(this.document.id, item.page, width, height, {
+      signal: controller.signal,
+      priority: RenderPriority.LOW,
+      generation: `thumbnail:${this.#revision}`
+    }).then((bitmap) => {
+      try {
+        if (this.#destroyed || item.controller !== controller || controller.signal.aborted)
+          return;
+        item.canvas.width = width;
+        item.canvas.height = height;
+        item.presentation = item.canvas.getContext("bitmaprenderer");
+        if (item.presentation) item.presentation.transferFromImageBitmap(bitmap);
+        else {
+          const context = item.canvas.getContext("2d");
+          if (!context) throw new Error("No canvas presentation context");
+          context.drawImage(bitmap, 0, 0);
+        }
+        delete item.canvas.dataset.renderError;
+      } finally {
+        bitmap.close();
+      }
+    }).catch((error) => {
+      if (item.controller !== controller) return;
+      this.#release(item);
+      if (!(error instanceof DOMException && error.name === "AbortError"))
+        item.canvas.dataset.renderError = String(error);
+    });
+  }
+  destroy() {
+    if (this.#destroyed) return;
+    this.#destroyed = true;
+    this.#observer.disconnect();
+    for (const item of this.#items.values()) this.#release(item);
+    this.#items.clear();
+  }
+};
+
+// src/ui/lector-viewer.ts
 var LectorViewer = class _LectorViewer {
   #engine;
   #root;
@@ -11332,11 +11399,6 @@ var LectorViewer = class _LectorViewer {
   #i18n = null;
   #formatting = null;
   #capture = null;
-  /** The text layer owns SELECTION — its own model, built by hit-testing
-   *  pdfium char boxes, not a DOM Selection. The viewer had no reference to
-   *  it at all, which is why two of its own features reached for
-   *  `window.getSelection()` and always found nothing (2026-08-14). */
-  #textLayer = null;
   #captureActionBar = null;
   #docManager = null;
   // DOM
@@ -11360,12 +11422,8 @@ var LectorViewer = class _LectorViewer {
   /** ID of the annotation the popover is currently shown for (for scroll tracking). */
   #annotPopoverAnnotId = null;
   #pageElements = /* @__PURE__ */ new Map();
-  #pageCanvases = /* @__PURE__ */ new Map();
-  #renderedPages = /* @__PURE__ */ new Set();
-  /** Debounce timer for pixel-buffer resizes during zoom. */
-  #pixelResizeTimer = null;
-  /** Pending pixel-buffer resizes, keyed by page index. */
-  #pendingResizes = /* @__PURE__ */ new Map();
+  #renderer;
+  #destroyed = false;
   /**
    * Additional `LectorPane`s mounted alongside the main canvas in
    * split-pane mode. Each pane has its own viewport instance, render
@@ -11474,17 +11532,11 @@ var LectorViewer = class _LectorViewer {
    */
   #activeTabSide = "left";
   #allowLocalOpen;
-  #documentTabs;
-  #toolbarExtras;
   #pendingInitialZoom;
-  #tileManager = new TileManager();
-  #tileRepaintScheduled = false;
   constructor(options) {
     this.#engine = options.engine;
     this.#root = options.container;
     this.#allowLocalOpen = options.allowLocalOpen ?? false;
-    this.#documentTabs = options.documentTabs ?? true;
-    this.#toolbarExtras = options.toolbarExtras ?? [];
     const p = this.#engine.plugins;
     this.#ui = p.get("ui");
     this.#viewport = p.get("viewport");
@@ -11505,19 +11557,17 @@ var LectorViewer = class _LectorViewer {
     this.#i18n = p.tryGet("i18n");
     this.#formatting = p.tryGet("formatting");
     this.#capture = p.tryGet("capture");
-    this.#textLayer = p.tryGet("text-layer");
     this.#docManager = p.tryGet("document-manager");
     this.#buildDOM();
+    this.#renderer = new PageRenderer({
+      engine: this.#engine,
+      viewport: this.#viewportInstance,
+      scrollArea: this.#scrollArea,
+      overlays: this.#overlays,
+      pageElements: this.#pageElements
+    });
     this.#wireEffects();
-    this.#tileManager.onTileReady = () => {
-      if (this.#tileRepaintScheduled) return;
-      this.#tileRepaintScheduled = true;
-      requestAnimationFrame(() => {
-        this.#tileRepaintScheduled = false;
-        const vis = this.#viewportInstance.visiblePages.peek();
-        if (vis.length > 0) void this.#renderVisiblePages(vis);
-      });
-    };
+    this.#pushCleanup(this.#engine.plugins.events.on("engine:destroying", () => this.destroy()));
     this.#applyInitialOptions(options);
   }
   #applyInitialOptions(opts) {
@@ -11598,7 +11648,7 @@ var LectorViewer = class _LectorViewer {
     });
     ws.appendChild(skip);
     this.#docTabs = this.#el("div", "lector-doctabs");
-    if (this.#documentTabs) ws.appendChild(this.#docTabs);
+    ws.appendChild(this.#docTabs);
     this.#viewerEl = this.#el("div", "lector-viewer");
     ws.appendChild(this.#viewerEl);
     this.#toolbar = this.#el("div", "lector-toolbar");
@@ -11991,25 +12041,6 @@ var LectorViewer = class _LectorViewer {
       return true;
     }
   }
-  /**
-   * The icon the SCHEMA asks for, falling back to the builder's own default.
-   *
-   * `ToolbarItem.icon` has always been part of the schema and the builder has
-   * always ignored it — every glyph was hardcoded at its call site. So an
-   * embedder passing `uiSchema` could drop an item but not re-skin one, and
-   * the type advertised a knob that did nothing. Found 2026-08-14 by paddock,
-   * whose document pane contributes a collapse button that collided with the
-   * sidebar toggle's own glyph and had nowhere to say so.
-   */
-  #tbIcon(id, fallback) {
-    try {
-      const item = this.#ui.schema.toolbar?.items?.find((i) => i.id === id);
-      const icon = item && "icon" in item ? item.icon : void 0;
-      return typeof icon === "string" && icon.length > 0 ? icon : fallback;
-    } catch {
-      return fallback;
-    }
-  }
   /** Drop leading/trailing/doubled dividers left behind by hidden items. */
   #pruneDividers(group) {
     const isDiv = (el) => !!el && el.classList.contains("lector-toolbar__divider");
@@ -12022,55 +12053,50 @@ var LectorViewer = class _LectorViewer {
   #buildToolbarImpl() {
     this.#toolbar.innerHTML = "";
     const left = this.#el("div", "lector-toolbar__group");
-    this.#addExtras(left, "left", "start");
     if (this.#tbHas("tb-hamburger")) {
-      this.#addToolbarBtn(left, this.#tbIcon("tb-hamburger", "menu"), this.#t("toolbar.menu"), "dropdown-hamburger");
+      this.#addToolbarBtn(left, "menu", this.#t("toolbar.menu"), "dropdown-hamburger");
     }
     this.#addDivider(left);
     if (this.#tbHas("tb-sidebar-toggle")) {
       this.#addToolbarBtn(
         left,
-        this.#tbIcon("tb-sidebar-toggle", "sidebar"),
+        "sidebar",
         this.#t("toolbar.sidebar"),
         "ui.toggle-sidebar",
         { active: () => !this.#ui.state.sidebar.collapsed.peek() }
       );
     }
-    this.#addExtras(left, "left", "end");
     this.#pruneDividers(left);
     this.#toolbar.appendChild(left);
     this.#toolbar.appendChild(this.#el("div", "lector-toolbar__spacer"));
     const center = this.#el("div", "lector-toolbar__group");
-    this.#addExtras(center, "center", "start");
     if (this.#tbHas("tb-zoom")) {
       center.appendChild(this.#buildZoomControl());
     }
     this.#addDivider(center);
     if (this.#tbHas("tb-fit-page")) {
-      this.#addToolbarBtn(center, this.#tbIcon("tb-fit-page", "fit-page"), this.#t("toolbar.fitPage"), "zoom.fit-page");
+      this.#addToolbarBtn(center, "fit-page", this.#t("toolbar.fitPage"), "zoom.fit-page");
     }
     if (this.#tbHas("tb-fit-width")) {
-      this.#addToolbarBtn(center, this.#tbIcon("tb-fit-width", "fit-width"), this.#t("toolbar.fitWidth"), "zoom.fit-width");
+      this.#addToolbarBtn(center, "fit-width", this.#t("toolbar.fitWidth"), "zoom.fit-width");
     }
     this.#addDivider(center);
     if (this.#tbHas("tb-pan-mode")) {
-      this.#addToolbarBtn(center, this.#tbIcon("tb-pan-mode", "hand"), this.#t("tool.hand"), "interaction.pan-mode", { tool: "pan" });
+      this.#addToolbarBtn(center, "hand", this.#t("tool.hand"), "interaction.pan-mode", { tool: "pan" });
     }
     if (this.#tbHas("tb-pointer-mode")) {
-      this.#addToolbarBtn(center, this.#tbIcon("tb-pointer-mode", "cursor"), this.#t("tool.pointer"), "interaction.pointer-mode", { tool: "pointer" });
+      this.#addToolbarBtn(center, "cursor", this.#t("tool.pointer"), "interaction.pointer-mode", { tool: "pointer" });
     }
     if (this.#tbHas("tb-text-select-mode")) {
-      this.#addToolbarBtn(center, this.#tbIcon("tb-text-select-mode", "text-select"), this.#t("tool.textSelect"), "interaction.text-select-mode", { tool: "text-select" });
+      this.#addToolbarBtn(center, "text-select", this.#t("tool.textSelect"), "interaction.text-select-mode", { tool: "text-select" });
     }
     if (this.#capture) {
       this.#addToolbarBtn(center, "crop", this.#t("tool.capture"), "capture.toggle-marquee", { tool: "marquee" });
     }
-    this.#addExtras(center, "center", "end");
     this.#pruneDividers(center);
     this.#toolbar.appendChild(center);
     this.#toolbar.appendChild(this.#el("div", "lector-toolbar__spacer"));
     const right = this.#el("div", "lector-toolbar__group");
-    this.#addExtras(right, "right", "start");
     if (this.#tbHas("tb-annotate") && this.#isCommandAllowed("annotation.mode-highlight")) {
       const annotBtn = this.#btn("lector-btn");
       annotBtn.appendChild(this.#icon("annotation"));
@@ -12091,14 +12117,14 @@ var LectorViewer = class _LectorViewer {
     }
     this.#addDivider(right);
     if (this.#tbHas("tb-undo")) {
-      this.#addToolbarBtn(right, this.#tbIcon("tb-undo", "undo"), this.#t("toolbar.undoShortcut"), "history.undo");
+      this.#addToolbarBtn(right, "undo", this.#t("toolbar.undoShortcut"), "history.undo");
     }
     if (this.#tbHas("tb-redo")) {
-      this.#addToolbarBtn(right, this.#tbIcon("tb-redo", "redo"), this.#t("toolbar.redoShortcut"), "history.redo");
+      this.#addToolbarBtn(right, "redo", this.#t("toolbar.redoShortcut"), "history.redo");
     }
     this.#addDivider(right);
     if (this.#tbHas("tb-search")) {
-      this.#addToolbarBtn(right, this.#tbIcon("tb-search", "search"), this.#t("toolbar.search"), "search.open");
+      this.#addToolbarBtn(right, "search", this.#t("toolbar.search"), "search.open");
     }
     if (this.#comparison) {
       const cmpBtn = this.#btn("lector-btn");
@@ -12139,9 +12165,8 @@ var LectorViewer = class _LectorViewer {
     });
     right.appendChild(this.#sigStatusBtn);
     if (this.#tbHas("tb-more")) {
-      this.#addToolbarBtn(right, this.#tbIcon("tb-more", "more-vertical"), this.#t("toolbar.more"), "dropdown-more");
+      this.#addToolbarBtn(right, "more-vertical", this.#t("toolbar.more"), "dropdown-more");
     }
-    this.#addExtras(right, "right", "end");
     this.#pruneDividers(right);
     this.#toolbar.appendChild(right);
     this.#updateSignatureStatusBadge();
@@ -12354,37 +12379,6 @@ var LectorViewer = class _LectorViewer {
   }
   #addDivider(parent) {
     parent.appendChild(this.#el("div", "lector-toolbar__divider"));
-  }
-  /** Host-contributed buttons for one group, built with lector's own button
-   *  so they match its metrics exactly. A leading divider separates them from
-   *  the viewer's own controls; `#pruneDividers` removes it when the section
-   *  contributed nothing. */
-  #addExtras(parent, section, where) {
-    const mine = this.#toolbarExtras.filter(
-      (e) => (e.section ?? "right") === section && (e.placement ?? "end") === where
-    );
-    if (mine.length === 0) return;
-    if (where === "end") this.#addDivider(parent);
-    for (const e of mine) {
-      const btn = this.#btn("lector-btn");
-      btn.appendChild(this.#icon(e.icon));
-      this.#tip(btn, e.tooltip);
-      btn.dataset["action"] = e.id;
-      const off = e.disabled?.() ?? false;
-      if (off) {
-        btn.setAttribute("disabled", "");
-        btn.setAttribute("aria-disabled", "true");
-      }
-      btn.addEventListener("click", () => {
-        if (e.disabled?.()) return;
-        try {
-          e.onSelect();
-        } catch {
-        }
-      });
-      parent.appendChild(btn);
-    }
-    if (where === "start") this.#addDivider(parent);
   }
   #addDropdown(parent, icon, tooltip, dropdownId) {
     const wrapper = this.#el("div", "lector-dropdown");
@@ -13896,12 +13890,19 @@ var LectorViewer = class _LectorViewer {
     });
   }
   // ─── Thumbnails ────────────────────────────────────────
+  #thumbnailRenderer = null;
   #buildThumbnails(container) {
     const handle = this.#document.activeDocument.peek();
     if (!handle) return;
     const tc = this.#el("div", "lector-thumbnails");
     container.appendChild(tc);
     const TW = 150;
+    const renderer = new ThumbnailRenderer(this.#engine, handle, container);
+    this.#thumbnailRenderer = renderer;
+    this.#pushCleanup(() => {
+      renderer.destroy();
+      if (this.#thumbnailRenderer === renderer) this.#thumbnailRenderer = null;
+    });
     for (let i = 0; i < handle.pageCount; i++) {
       const ps = handle.pageSizes[i];
       const th = Math.round(TW * (ps.height / ps.width));
@@ -13910,9 +13911,6 @@ var LectorViewer = class _LectorViewer {
       const cw = this.#el("div", "lector-thumbnail__canvas-wrap");
       const canvas = document.createElement("canvas");
       canvas.className = "lector-thumbnail__canvas";
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.round(TW * dpr);
-      canvas.height = Math.round(th * dpr);
       canvas.style.width = `${TW}px`;
       canvas.style.height = `${th}px`;
       cw.appendChild(canvas);
@@ -13961,7 +13959,7 @@ var LectorViewer = class _LectorViewer {
         });
       }
       tc.appendChild(wrap3);
-      this.#renderThumbnail(handle, i, canvas);
+      renderer.observe(canvas, i, TW, th);
     }
     const unsub = this.#viewportInstance.visiblePages.subscribe((pages) => {
       for (const t of tc.querySelectorAll(".lector-thumbnail")) {
@@ -13970,17 +13968,6 @@ var LectorViewer = class _LectorViewer {
       }
     });
     this.#pushCleanup(unsub);
-  }
-  async #renderThumbnail(handle, idx, canvas) {
-    try {
-      const bmp = await this.#engine.renderPage(handle.id, idx, canvas.width, canvas.height, {
-        priority: RenderPriority.LOW
-      });
-      const ctx = canvas.getContext("2d");
-      if (ctx) ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-      bmp.close();
-    } catch {
-    }
   }
   /**
    * Re-render the thumbnail for a single page after its content changed
@@ -13992,10 +13979,7 @@ var LectorViewer = class _LectorViewer {
   #refreshThumbnail(docId, pageIndex) {
     const handle = this.#document.activeDocument.peek();
     if (!handle || handle.id !== docId) return;
-    const canvas = this.#root.querySelector(
-      `.lector-thumbnail[data-page-index="${pageIndex}"] .lector-thumbnail__canvas`
-    );
-    if (canvas) void this.#renderThumbnail(handle, pageIndex, canvas);
+    this.#thumbnailRenderer?.invalidate(pageIndex);
   }
   #rerenderScheduled = false;
   /**
@@ -16890,7 +16874,6 @@ var LectorViewer = class _LectorViewer {
       }
     }
     if (items.length === 0) return;
-    if (items.length === 0) return;
     for (const item of items) {
       const btn = this.#btn("lector-context-menu__item" + (item.danger ? " lector-context-menu__item--danger" : ""));
       btn.setAttribute("role", "menuitem");
@@ -17240,10 +17223,10 @@ var LectorViewer = class _LectorViewer {
     menu.style.left = `${e.clientX}px`;
     menu.style.top = `${e.clientY}px`;
     const items = [];
-    const picked = this.#textLayer?.selection.peek()?.text?.trim();
-    if (picked) {
+    const sel = window.getSelection();
+    if (sel && sel.toString().trim()) {
       items.push({ label: this.#t("contextMenu.copyText"), icon: "copy", action: () => {
-        void copyText(picked);
+        void copyText(sel.toString());
         this.#showToast(this.#t("capture.copiedToClipboard"));
       } });
     }
@@ -17290,7 +17273,6 @@ var LectorViewer = class _LectorViewer {
         } }
       );
     }
-    if (items.length === 0) return;
     for (const item of items) {
       const btn = this.#btn("lector-context-menu__item" + (item.danger ? " lector-context-menu__item--danger" : ""));
       btn.setAttribute("role", "menuitem");
@@ -17462,20 +17444,14 @@ var LectorViewer = class _LectorViewer {
   // ─── Text Selection Toolbar ───────────────────────────
   #textSelToolbar = null;
   #showTextSelectionToolbar() {
-    const sel = this.#textLayer?.selection.peek();
-    const text = sel?.text?.trim();
-    if (!sel || !text) {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.toString().trim()) {
       this.#hideTextSelectionToolbar();
       return;
     }
+    const range = sel.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
     const canvasWrap = this.#canvasWrap;
-    const marks = canvasWrap.querySelectorAll(".lector-text-highlight");
-    const anchor = marks[marks.length - 1];
-    if (!anchor) {
-      this.#hideTextSelectionToolbar();
-      return;
-    }
-    const rect = anchor.getBoundingClientRect();
     const wrapRect = canvasWrap.getBoundingClientRect();
     if (!this.#textSelToolbar) {
       this.#textSelToolbar = this.#el("div", "lector-text-sel-toolbar");
@@ -17485,7 +17461,7 @@ var LectorViewer = class _LectorViewer {
     tb.innerHTML = "";
     const tools = [
       { icon: "copy", tooltip: "Copy", action: () => {
-        void copyText(text);
+        void copyText(sel.toString());
         this.#showToast(this.#t("toast.copied"));
         this.#hideTextSelectionToolbar();
       } }
@@ -17792,7 +17768,6 @@ var LectorViewer = class _LectorViewer {
       this.#updatePages(pos, h);
       if (newScale !== lastScale) {
         lastScale = newScale;
-        this.#renderedPages.clear();
         this.#overlays.rebuildOverlays();
       }
     }));
@@ -17804,7 +17779,7 @@ var LectorViewer = class _LectorViewer {
     }));
     const events = this.#engine.plugins.events;
     this.#pushCleanup(events.on("layer:visibility-changed", () => {
-      this.#renderedPages.clear();
+      this.#renderer?.invalidate();
       const vis = this.#viewportInstance.visiblePages.peek();
       void this.#renderVisiblePages(vis);
     }));
@@ -17858,8 +17833,7 @@ var LectorViewer = class _LectorViewer {
       this.#sigInfoCache.delete(closedId);
     }));
     this.#pushCleanup(events.on("page-ops:pages-changed", () => {
-      this.#renderedPages.clear();
-      this.#tileManager.clearAll();
+      this.#renderer?.invalidate();
       const pos = this.#viewportInstance.pagePositions.peek();
       const h = this.#viewportInstance.totalHeight.peek();
       this.#updatePages(pos, h);
@@ -17873,8 +17847,7 @@ var LectorViewer = class _LectorViewer {
       const pageIndex = args[1];
       const active = this.#document.activeDocument.peek();
       if (!active || active.id !== docId) return;
-      this.#renderedPages.delete(pageIndex);
-      this.#tileManager.clearPage(pageIndex);
+      this.#renderer?.invalidate(pageIndex);
       this.#refreshThumbnail(docId, pageIndex);
       this.#scheduleVisibleRerender();
     }));
@@ -18042,18 +18015,11 @@ var LectorViewer = class _LectorViewer {
     };
     this.#canvas.addEventListener("keydown", kbContextHandler);
     this.#pushCleanup(() => this.#canvas.removeEventListener("keydown", kbContextHandler));
-    if (this.#textLayer) {
-      this.#pushCleanup(
-        effect2(() => {
-          const sel = this.#textLayer.selection.value;
-          if (!sel) {
-            this.#hideTextSelectionToolbar();
-            return;
-          }
-          setTimeout(() => this.#showTextSelectionToolbar(), 100);
-        })
-      );
-    }
+    const selHandler = () => {
+      setTimeout(() => this.#showTextSelectionToolbar(), 100);
+    };
+    document.addEventListener("selectionchange", selHandler);
+    this.#pushCleanup(() => document.removeEventListener("selectionchange", selHandler));
     this.#canvas.addEventListener("scroll", () => {
       this.#hideTextSelectionToolbar();
       this.#repositionAnnotPopover();
@@ -18161,191 +18127,11 @@ var LectorViewer = class _LectorViewer {
     if (eKey === wantKey) return true;
     return false;
   }
-  #resolveCanvasDoc() {
-    const pinnedId = this.#viewportInstance.docId.peek();
-    if (pinnedId !== null) {
-      return this.#document.getHandle(pinnedId) ?? null;
-    }
-    return this.#document.activeDocument.peek();
+  #updatePages(_positions, _totalHeight) {
+    this.#renderer?.update();
   }
-  #updatePages(positions, totalHeight) {
-    this.#scrollArea.style.height = `${totalHeight}px`;
-    const active = new Set(positions.map((p) => p.pageIndex));
-    for (const [idx, el] of this.#pageElements) {
-      if (!active.has(idx)) {
-        this.#overlays.detachPage(idx);
-        el.remove();
-        this.#pageElements.delete(idx);
-        this.#pageCanvases.delete(idx);
-        this.#renderedPages.delete(idx);
-        this.#tileManager.clearPage(idx);
-        this.#pendingResizes.delete(idx);
-      }
-    }
-    for (const pos of positions) {
-      let pe = this.#pageElements.get(pos.pageIndex);
-      let cv = this.#pageCanvases.get(pos.pageIndex);
-      if (!pe) {
-        pe = this.#el("div", "lector-page lector-page--loading");
-        cv = document.createElement("canvas");
-        cv.className = "lector-page__canvas";
-        pe.appendChild(cv);
-        this.#scrollArea.appendChild(pe);
-        this.#pageElements.set(pos.pageIndex, pe);
-        this.#pageCanvases.set(pos.pageIndex, cv);
-      }
-      const doc = this.#resolveCanvasDoc();
-      if (doc) {
-        const ps = doc.pageSizes[pos.pageIndex];
-        if (ps) this.#overlays.attachPage(pos.pageIndex, pe, ps.width, ps.height);
-      }
-      pe.style.left = `${pos.x}px`;
-      pe.style.top = `${pos.y}px`;
-      pe.style.width = `${pos.width}px`;
-      pe.style.height = `${pos.height}px`;
-      if (cv) {
-        const dpr = window.devicePixelRatio || 1;
-        let cw = Math.round(pos.width * dpr);
-        let ch = Math.round(pos.height * dpr);
-        cv.style.width = `${pos.width}px`;
-        cv.style.height = `${pos.height}px`;
-        const MAX_CANVAS_DIM = 16384;
-        if (cw > MAX_CANVAS_DIM || ch > MAX_CANVAS_DIM) {
-          const scale = Math.min(MAX_CANVAS_DIM / cw, MAX_CANVAS_DIM / ch);
-          cw = Math.round(cw * scale);
-          ch = Math.round(ch * scale);
-        }
-        if (cv.width !== cw || cv.height !== ch) {
-          this.#schedulePixelResize(pos.pageIndex, cv, cw, ch, pe);
-        }
-      }
-    }
-  }
-  /**
-   * Schedule a debounced canvas pixel-buffer resize. During rapid zoom,
-   * only CSS dimensions change (instant GPU scaling). When zoom settles
-   * (~150ms idle), all pending resizes fire and sharp re-renders start.
-   */
-  #schedulePixelResize(pageIndex, cv, w, h, pe) {
-    this.#pendingResizes.set(pageIndex, { cv, w, h, pe });
-    if (this.#pixelResizeTimer) clearTimeout(this.#pixelResizeTimer);
-    this.#pixelResizeTimer = setTimeout(() => {
-      this.#pixelResizeTimer = null;
-      this.#flushPixelResizes();
-    }, 150);
-  }
-  /** Flush all pending pixel-buffer resizes and trigger re-render. */
-  #flushPixelResizes() {
-    for (const [pageIndex, { cv, w, h }] of this.#pendingResizes) {
-      if (cv.width !== w || cv.height !== h) {
-        cv.width = w;
-        cv.height = h;
-        this.#renderedPages.delete(pageIndex);
-      }
-    }
-    this.#pendingResizes.clear();
-    const vis = this.#viewportInstance.visiblePages.peek();
-    if (vis.length > 0) void this.#renderVisiblePages(vis);
-  }
-  /** The docId that #renderedPages belongs to. When it changes, the set is stale. */
-  #renderedForDoc = null;
-  async #renderVisiblePages(visible) {
-    const doc = this.#resolveCanvasDoc();
-    if (!doc) return;
-    if (this.#renderedForDoc !== doc.id) {
-      this.#renderedPages.clear();
-      this.#tileManager.clearAll();
-      this.#renderedForDoc = doc.id;
-    }
-    for (const idx of visible) {
-      const cv = this.#pageCanvases.get(idx);
-      if (!cv) continue;
-      const fullW = cv.width;
-      const fullH = cv.height;
-      if (fullW === 0 || fullH === 0) continue;
-      if (this.#tileManager.shouldTile(fullW, fullH)) {
-        const pe = this.#pageElements.get(idx);
-        if (!pe) continue;
-        const scrollEl = this.#canvas;
-        const dpr = window.devicePixelRatio || 1;
-        const scale = this.#viewportInstance.scale.peek();
-        const pageRect = pe.getBoundingClientRect();
-        const scrollRect = scrollEl.getBoundingClientRect();
-        const vpLeft = Math.max(0, scrollRect.left - pageRect.left) * dpr;
-        const vpTop = Math.max(0, scrollRect.top - pageRect.top) * dpr;
-        const vpRight = Math.min(pageRect.width, scrollRect.right - pageRect.left) * dpr;
-        const vpBottom = Math.min(pageRect.height, scrollRect.bottom - pageRect.top) * dpr;
-        const viewportRect = {
-          x: vpLeft,
-          y: vpTop,
-          w: Math.max(0, vpRight - vpLeft),
-          h: Math.max(0, vpBottom - vpTop)
-        };
-        const capturedDocId = doc.id;
-        const renderFn = async (req) => {
-          const currentDoc = this.#resolveCanvasDoc();
-          if (!currentDoc || currentDoc.id !== capturedDocId) {
-            throw new Error("Document changed \u2014 tile stale");
-          }
-          return this.#engine.renderPageTile(
-            capturedDocId,
-            req.pageIndex,
-            req.tileX,
-            req.tileY,
-            req.tileW,
-            req.tileH,
-            req.fullW,
-            req.fullH
-          );
-        };
-        const tiles = this.#tileManager.updateVisibleTiles(
-          doc.id,
-          idx,
-          fullW,
-          fullH,
-          viewportRect,
-          scale,
-          renderFn
-        );
-        const ctx = cv.getContext("2d");
-        if (ctx) {
-          for (const tile of tiles) {
-            if (tile.status === "ready" && tile.bitmap) {
-              ctx.drawImage(tile.bitmap, tile.x, tile.y, tile.w, tile.h);
-            }
-          }
-        }
-        const allReady = tiles.every((t) => t.status === "ready");
-        if (allReady && tiles.length > 0) {
-          this.#renderedPages.add(idx);
-          if (pe) pe.classList.remove("lector-page--loading");
-        } else {
-          this.#renderedPages.delete(idx);
-        }
-        continue;
-      }
-      if (this.#renderedPages.has(idx)) continue;
-      this.#renderedPages.add(idx);
-      try {
-        const capturedDocId = doc.id;
-        const bmp = await this.#engine.renderPage(doc.id, idx, fullW, fullH, { priority: RenderPriority.VISIBLE });
-        const currentDoc = this.#resolveCanvasDoc();
-        if (!currentDoc || currentDoc.id !== capturedDocId) {
-          bmp.close();
-          this.#renderedPages.delete(idx);
-          continue;
-        }
-        const stale = cv.width !== fullW || cv.height !== fullH;
-        const ctx = cv.getContext("2d");
-        if (ctx) ctx.drawImage(bmp, 0, 0, cv.width, cv.height);
-        bmp.close();
-        const pe = this.#pageElements.get(idx);
-        if (pe) pe.classList.remove("lector-page--loading");
-        if (stale) this.#renderedPages.delete(idx);
-      } catch {
-        this.#renderedPages.delete(idx);
-      }
-    }
+  async #renderVisiblePages(_visible) {
+    this.#renderer?.update();
   }
   // ─── Tab + split machinery ─────────────────────────────
   //
@@ -18475,8 +18261,7 @@ var LectorViewer = class _LectorViewer {
         "lector-canvas-wrap--horizontal",
         "lector-canvas-wrap--vertical"
       );
-      this.#renderedPages.clear();
-      this.#tileManager.clearAll();
+      this.#renderer?.invalidate();
       this.#viewportInstance.setDocument(tab.docId);
       this.#document.setActive(tab.docId);
       this.#viewport.setActiveViewport(this.#viewportInstance.id);
@@ -18498,8 +18283,7 @@ var LectorViewer = class _LectorViewer {
       "lector-canvas-wrap--vertical",
       tab.orientation === "vertical"
     );
-    this.#renderedPages.clear();
-    this.#tileManager.clearAll();
+    this.#renderer?.invalidate();
     this.#viewportInstance.setDocument(tab.left.docId);
     const divider = this.#el(
       "div",
@@ -18531,7 +18315,7 @@ var LectorViewer = class _LectorViewer {
       });
       return;
     }
-    void import("./lector-pane-CHK6NFAQ.js").then(({ LectorPane: LectorPane2 }) => {
+    void import("./lector-pane-5YKOJ6YZ.js").then(({ LectorPane: LectorPane2 }) => {
       const pane = new LectorPane2({
         engine: this.#engine,
         container: host,
@@ -19129,6 +18913,13 @@ var LectorViewer = class _LectorViewer {
   get engine() {
     return this.#engine;
   }
+  /** Shared renderer accounting; browser/WASM overhead is measured separately. */
+  get renderStats() {
+    return this.#renderer.stats;
+  }
+  isPageReady(pageIndex) {
+    return this.#renderer.isPageReady(pageIndex);
+  }
   /** The UI capability for programmatic sidebar / theme / schema control. */
   get ui() {
     return this.#ui;
@@ -19139,7 +18930,9 @@ var LectorViewer = class _LectorViewer {
    * and may attach another viewer or call `engine.destroy()` separately.
    */
   destroy() {
-    this.#tileManager.destroy();
+    if (this.#destroyed) return;
+    this.#destroyed = true;
+    this.#renderer.destroy();
     this.#overlays.destroy();
     for (const u of this.#cleanups) u();
     this.#cleanups.length = 0;
@@ -19153,7 +18946,6 @@ var LectorViewer = class _LectorViewer {
     }
     this.#sections.clear();
     if (this.#tooltipTimer) clearTimeout(this.#tooltipTimer);
-    if (this.#pixelResizeTimer) clearTimeout(this.#pixelResizeTimer);
     if (this.#commentsRefreshTimer) {
       clearTimeout(this.#commentsRefreshTimer);
       this.#commentsRefreshTimer = null;
@@ -19164,8 +18956,7 @@ var LectorViewer = class _LectorViewer {
     this.#extraPanes.clear();
     this.#viewportInstance.destroy();
     this.#pageElements.clear();
-    this.#pageCanvases.clear();
-    this.#renderedPages.clear();
+    this.#renderer?.invalidate();
     this.#root.innerHTML = "";
     const allDocIds = [];
     for (const tab of this.#tabs) {
@@ -19275,3 +19066,4 @@ export {
   viewportPlugin,
   zoomPlugin
 };
+//# sourceMappingURL=index.js.map

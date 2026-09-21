@@ -599,6 +599,28 @@ extern "C" int pd_q4x_combine_norm_q8mmq_ns(void*, const void*, const void*, con
 extern "C" int pd_q4x_hc_inject_rn(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q8_0_gemm_mmq_pipe_hcmix_rn(const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_combine_norm_q8mmq_nsi(void*, const void*, const void*, const void*, void*, void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_dp_u8_patch_rows(const void*, void*, float, float, float, float, float, float, float, float, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_qkv_split_rope(const void*, const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_res_ls_ln_f16(void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+extern "C" int pd_dp_group_norm_gelu_f16(const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+extern "C" int pd_dp_im2row3_f32(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_im2row3_f16(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_convt2_skip(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_seg_heads(const void*, const void*, void*, void*, void*, uint32_t, uint32_t, void*);
+extern "C" int pd_f16_gemm_h(const void*, const void*, void*, unsigned int, unsigned int, unsigned int, void*);
+extern "C" int pd_f16_gemm_h_elected(void);
+extern "C" int pd_vision_attn_h(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_dp_qkv_split_rope_h(const void*, const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+extern "C" int pd_dp_res_ls_ln_h(void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+extern "C" int pd_dp_gelu_bias_h(void*, const void*, uint32_t, uint32_t, void*);
+extern "C" int pd_f16_gemm_h_gelu(const void*, const void*, void*, const void*, unsigned int, unsigned int, unsigned int, void*);
+extern "C" int pd_kquant_ternary(void);
+extern "C" int pd_hadamard_rows(const void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_quantize_q8_b128(const void*, void*, void*, uint32_t, void*);
+extern "C" int pd_ternary_gemv_b128(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_hadamard_rows_q8_b128(const void*, void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_ternary_gemv_b128_multi(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_nvf4_moe_gu_swiglu_bs(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_gated_delta_recurrent_runs_slots(const void*, const void*, const void*, const void*, const void*, void*, void*, const void*, const void*, const void*, const void*, const void*, float, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_bf16_hc_perm_pad(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_moe_gu_swiglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
@@ -1562,6 +1584,43 @@ static const KernelTableV1 PD_KERNELS = {
     pd_q8_0_gemm_mmq_pipe_hcmix_rn,
     // 609: slot 606 with the next mix's inject folded into its norm pass
     pd_q4x_combine_norm_q8mmq_nsi,
+    // 610-617: dense prediction (DINOv3 backbone + conv decoder), plain CUDA -
+    // patch stem, qkv split + table rope, LayerScale seam, group norm + GELU,
+    // 3x3 im2row (f32 / f16 source), transposed-conv seam, the output heads
+    pd_dp_u8_patch_rows,
+    pd_dp_qkv_split_rope,
+    pd_dp_res_ls_ln_f16,
+    pd_dp_group_norm_gelu_f16,
+    pd_dp_im2row3_f32,
+    pd_dp_im2row3_f16,
+    pd_dp_convt2_skip,
+    pd_dp_seg_heads,
+    pd_f16_gemm_h,
+    pd_f16_gemm_h_elected,
+    pd_vision_attn_h,
+    pd_dp_qkv_split_rope_h,
+    pd_dp_res_ls_ln_h,
+    pd_dp_gelu_bias_h,
+    pd_f16_gemm_h_gelu,
+    // 625: PrismML ternary (PTQ1_0 / PQ2_0) on the i-quant lanes - capability
+    // marker, plain CUDA
+    pd_kquant_ternary,
+    // 626: blockwise Walsh-Hadamard rotation (rotated-basis checkpoints), plain CUDA
+    pd_hadamard_rows,
+    // 627: per-128 int8 activation quantizer (the ternary decode lane's class)
+    pd_quantize_q8_b128,
+    // 628: batch-1 PTQ1_0 GEMV, table-decoded, off slot 627's activations
+    pd_ternary_gemv_b128,
+    // 629: rotation + per-128 int8 quantize in one launch
+    pd_hadamard_rows_q8_b128,
+    // 630: several PTQ1_0 planes off one staged row / gate|up + SwiGLU
+    pd_ternary_gemv_b128_multi,
+    // 631: sorted-tile NVFP4 routed gate+up+SwiGLU (the qwen4exp W4A4 arm)
+#if PD_BS_HOST
+    pd_nvf4_moe_gu_swiglu_bs,
+#else
+    nullptr,
+#endif
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

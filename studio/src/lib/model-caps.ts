@@ -28,8 +28,9 @@ export function friendlyModelName(id: string): string {
     return colon >= 0 ? rest.slice(colon + 1) : rest
   }
   const parts = id.split('-')
-  // Trailing quant/format tokens: Q8_0, Q4_K_M, F16, BF16, FP8, IQ4_XS, GGUF, ...
-  const quant = /^(iq?\d|q\d|f16|bf16|fp\d|gguf|gptq|awq|int\d)/i
+  // Trailing quant/format tokens: Q8_0, Q4_K_M, F16, BF16, FP8, IQ4_XS, GGUF,
+  // PTQ1_0 / PQ2_0 (Prism ML's ternary packings), ...
+  const quant = /^(iq?\d|q\d|p?tq\d|pq\d|f16|bf16|fp\d|gguf|gptq|awq|int\d)/i
   while (parts.length > 1 && quant.test(parts[parts.length - 1])) parts.pop()
   return parts.join(' ')
 }

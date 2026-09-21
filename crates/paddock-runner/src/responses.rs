@@ -1311,6 +1311,11 @@ fn response_object(
         "truncation": if meta.ex.truncation_auto { "auto" } else { "disabled" },
         "usage": usage,
     });
+    if !body["usage"].is_null()
+        && let Some(timing) = meta.scope.response_timing()
+    {
+        body["paddock_timing"] = timing;
+    }
     if meta.ex.dropped > 0 {
         body["truncation_dropped_items"] = json!(meta.ex.dropped);
     }
@@ -1342,6 +1347,7 @@ fn terminal(finish: Option<FinishReason>) -> (&'static str, &'static str) {
 
 async fn collect_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
     let mut ids = Vec::new();
+    let mut terminal_tokens = 0;
     let mut finish = None;
     let mut cached = 0usize;
     let mut lps: Vec<Value> = Vec::new();
@@ -1364,6 +1370,7 @@ async fn collect_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>)
             }
             TokenEvent::Done(r, stats) => {
                 finish = Some(r);
+                terminal_tokens = stats.terminal_tokens();
                 meta.scope.phases(&stats);
                 break;
             }
@@ -1385,10 +1392,17 @@ async fn collect_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>)
     }
     let rt = reasoning_tokens(&meta, &parsed);
     let (status, _) = terminal(finish);
-    meta.scope.usage(meta.prompt_len, ids.len());
+    let output_tokens = ids.len() + terminal_tokens;
+    meta.scope.usage(meta.prompt_len, output_tokens);
     meta.scope.cached(cached);
     meta.scope.finish(finish.map_or("stop", |f| f.as_str()));
-    let mut body = response_object(&meta, status, output, Some((ids.len(), rt, cached)), finish);
+    let mut body = response_object(
+        &meta,
+        status,
+        output,
+        Some((output_tokens, rt, cached)),
+        finish,
+    );
     meta.attach_ocr_regions(&mut body, &ids);
     Json(body).into_response()
 }
@@ -1442,6 +1456,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         let mut rs_emitted = 0usize;
         let mut emitted = 0usize;
         let mut ids: Vec<u32> = Vec::new();
+        let mut terminal_tokens = 0;
         // incremental decode of `ids` (the O(n^2) per-token full re-decode
         // was the long-stream collapse under concurrency)
         let mut sd = meta.tokenizer.stream_decoder(false);
@@ -1517,7 +1532,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
                             "delta":delta,"logprobs":std::mem::take(&mut lp_pending)}));
                     }
                 }
-                Some(TokenEvent::Done(r, stats)) => { finish = Some(r); meta.scope.phases(&stats); break }
+                Some(TokenEvent::Done(r, stats)) => { finish = Some(r); terminal_tokens = stats.terminal_tokens(); meta.scope.phases(&stats); break }
                 None => break,
                 Some(TokenEvent::Error(e)) => {
                     // honest terminal event; the SDK surfaces response.failed
@@ -1596,10 +1611,11 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         }
         let rt = reasoning_tokens(&meta, &parsed);
         let (status, event_name) = terminal(finish);
-        meta.scope.usage(meta.prompt_len, ids.len());
+        let output_tokens = ids.len() + terminal_tokens;
+        meta.scope.usage(meta.prompt_len, output_tokens);
         meta.scope.cached(cached);
         meta.scope.finish(finish.map_or("stop", |f| f.as_str()));
-        let mut full = response_object(&meta, status, output, Some((ids.len(), rt, cached)), finish);
+        let mut full = response_object(&meta, status, output, Some((output_tokens, rt, cached)), finish);
         meta.attach_ocr_regions(&mut full, &ids);
         yield ev(event_name, json!({
             "type":event_name,"sequence_number":next(),"response":full}));
@@ -1769,6 +1785,7 @@ async fn summary_pass(
     let mut ids: Vec<u32> = Vec::new();
     let mut cached = 0usize;
     let mut p_len = prepared.prompt_ids.len();
+    let mut terminal_tokens = 0;
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::Prefilled { cached: c, rows } => {
@@ -1777,6 +1794,7 @@ async fn summary_pass(
             }
             TokenEvent::Token { id: t, .. } => ids.push(t),
             TokenEvent::Done(_, stats) => {
+                terminal_tokens = stats.terminal_tokens();
                 scope.phases(&stats);
                 break;
             }
@@ -1791,7 +1809,7 @@ async fn summary_pass(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    Ok((summary, p_len, cached, ids.len()))
+    Ok((summary, p_len, cached, ids.len() + terminal_tokens))
 }
 
 /// Round-0 context management for the agent loop. The
@@ -3575,6 +3593,7 @@ async fn run_agent(
                 TokenEvent::Token { id, .. } => ids.push(id),
                 TokenEvent::Done(r, stats) => {
                     finish = Some(r);
+                    total_out += stats.terminal_tokens();
                     scope.phases(&stats);
                     break;
                 }
@@ -4373,6 +4392,7 @@ fn stream_agent(
                     }
                     Some(TokenEvent::Done(r, stats)) => {
                         finish = Some(r);
+                        total_out += stats.terminal_tokens();
                         meta.scope.phases(&stats);
                         break;
                     }

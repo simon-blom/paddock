@@ -19,8 +19,6 @@ export interface MapBlock {
   label: string
 }
 
-export type MdSegment = { kind: 'md'; text: string } | { kind: 'map'; map: MapBlock }
-
 /** Body -> coordinates, forgiving deliberately.
  *
  *  A 9B model writing JSON gets it right most of the time, and "most" is not a
@@ -70,56 +68,4 @@ function valid(lat: number, lon: number): boolean {
     // looks like. A real photo taken there is a loss we accept.
     !(lat === 0 && lon === 0)
   )
-}
-
-/** Markdown split around its map blocks, in order.
- *
- *  An UNCLOSED trailing block is dropped rather than shown: mid-stream it is
- *  three tokens of coordinates the reader does not want to watch arrive, and
- *  it becomes the map a moment later when the fence closes.
- */
-export function splitMapBlocks(content: string): MdSegment[] {
-  // The overwhelmingly common case, and it must cost nothing: this runs on
-  // every streamed chunk.
-  if (!content.includes('```map')) return [{ kind: 'md', text: content }]
-
-  const out: MdSegment[] = []
-  const lines = content.split('\n')
-  let md: string[] = []
-  let i = 0
-  const flush = () => {
-    if (md.length) out.push({ kind: 'md', text: md.join('\n') })
-    md = []
-  }
-  while (i < lines.length) {
-    const line = lines[i] ?? ''
-    if (line.trim() !== '```map') {
-      md.push(line)
-      i++
-      continue
-    }
-    // collect to the closing fence
-    let j = i + 1
-    const body: string[] = []
-    while (j < lines.length && (lines[j] ?? '').trim() !== '```') {
-      body.push(lines[j] ?? '')
-      j++
-    }
-    if (j >= lines.length) {
-      // still streaming - hide the half-written block, keep the text above it
-      flush()
-      return out
-    }
-    const map = parseMapBody(body.join('\n'))
-    if (map) {
-      flush()
-      out.push({ kind: 'map', map })
-    } else {
-      // unparseable: leave it exactly as the model wrote it
-      md.push(line, ...body, '```')
-    }
-    i = j + 1
-  }
-  flush()
-  return out
 }

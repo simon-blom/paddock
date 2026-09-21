@@ -152,15 +152,15 @@ export interface DatabaseListEntry {
 }
 
 export interface CallOptions {
-  /** Abort signal — propagates to the worker's cancellation token. */
+  /** Cancels queued work before dispatch. For active synchronous WASM, only
+   * the caller is cancelled; AbortError.executionMayHaveCompleted is true.
+   * This is not a rollback or a physical interruption guarantee. */
   signal?: AbortSignal
 }
 
 export interface QueryOptions extends CallOptions {
-  /** Per-query timeout in milliseconds. Installs a thread-local
-   *  deadline the executor checks at iteration boundaries. Pair with
-   *  `signal` for end-to-end cancellation (deadline aborts the
-   *  worker side; the signal rejects the promise on the main thread). */
+  /** Cooperative execution deadline, checked at executor boundaries.
+   * Defaults to 10,000 ms; capped at 30,000 ms. Not a hard wall-clock limit. */
   timeoutMs?: number
   /** Query dialect. `'gql'` routes through the ISO/IEC 39075 parser
    *  (lowered onto the same engine); default is openCypher. */
@@ -172,6 +172,9 @@ export interface QueryOptions extends CallOptions {
  * the main thread never blocks on Cypher execution.
  */
 export class TraverseDb {
+  /** Bounded admission: 32 requests / 256 MiB estimated payloads, one active.
+   * Includes a caller-cancelled active request until its worker reply. */
+  readonly queueStats: { active: number; queued: number; bytes: number; closed: boolean }
   /** Library version reported by the worker post-init. */
   readonly version: string | null
 

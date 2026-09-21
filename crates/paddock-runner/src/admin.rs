@@ -22,6 +22,8 @@ use paddock_admin::types::{
 pub struct AdminState {
     pub app: Arc<crate::routes::AppState>,
     pub port: u16,
+    pub loaded_file: Option<toml::Value>,
+    pub config_path: Option<std::path::PathBuf>,
     pub started_at_unix: u64,
     pub started: std::time::Instant,
 }
@@ -30,6 +32,7 @@ pub fn router(state: Arc<AdminState>) -> axum::Router {
     axum::Router::new()
         .route("/v1/identify", get(identify))
         .route("/v1/health", get(health))
+        .route("/v1/config-status", get(config_status))
         .route("/v1/drain", post(drain))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/stats", get(stats))
@@ -88,6 +91,82 @@ async fn health(State(s): State<Arc<AdminState>>) -> Response {
         uptime_s: s.started.elapsed().as_secs(),
     })
     .into_response()
+}
+
+fn changed_restart_fields(before: &toml::Value, after: &toml::Value) -> Vec<String> {
+    let (Some(a), Some(b)) = (before.as_table(), after.as_table()) else {
+        return vec!["Configuration".into()];
+    };
+    a.keys()
+        .chain(b.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|k| {
+            !["mcp_servers", "web_search_provider", "web_search_api_key"].contains(&k.as_str())
+                && a.get(*k) != b.get(*k)
+        })
+        .map(|k| {
+            match k.as_str() {
+                "max_ctx" => "Context",
+                "max_batch" => "Workload",
+                "model" | "catalog" => "Model",
+                "kv_offload" => "KV offloading",
+                "kv_cache_dtype" => "KV format",
+                "vram_budget" => "Memory budget",
+                "spec" | "no_spec" | "mtp" => "Speculation",
+                "mmproj" => "Vision",
+                "host" | "port" => "Network",
+                "api_key" => "API key",
+                _ => "Runtime settings",
+            }
+            .to_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+async fn config_status(State(s): State<Arc<AdminState>>) -> Response {
+    // No original TOML, paths, unknown key names, hashes or secret values leave
+    // this process. The baseline lives with the runner, surviving app restarts.
+    let current = s
+        .config_path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok());
+    let changes = s
+        .loaded_file
+        .as_ref()
+        .zip(current.as_ref())
+        .map(|(a, b)| changed_restart_fields(a, b));
+    Json(paddock_admin::types::ConfigStatus {
+        pid: std::process::id(),
+        restart_required: changes.as_ref().map(|v| !v.is_empty()),
+        changed: changes.unwrap_or_default(),
+        max_ctx: s.app.max_ctx,
+        max_batch: s.app.max_batch,
+    })
+    .into_response()
+}
+
+#[cfg(test)]
+mod config_status_tests {
+    use super::*;
+    #[test]
+    fn pending_changes_survive_live_edits_and_clear_on_revert() {
+        let a: toml::Value =
+            toml::from_str("max_batch=1\nmax_ctx=4096\napi_key='private'").unwrap();
+        let b: toml::Value = toml::from_str(
+            "max_batch=1\nmax_ctx=32768\napi_key='new-secret'\nweb_search_provider='brave'",
+        )
+        .unwrap();
+        assert_eq!(changed_restart_fields(&a, &b), ["API key", "Context"]);
+        let c: toml::Value = toml::from_str(
+            "max_batch=1\nmax_ctx=4096\napi_key='private'\nweb_search_provider='brave'",
+        )
+        .unwrap();
+        assert!(changed_restart_fields(&a, &c).is_empty());
+    }
 }
 
 const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 30_000;

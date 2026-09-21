@@ -35,6 +35,8 @@ body:
       options:
         - Windows 10/11 x64
         - Linux x64
+        - Linux arm64 (DGX Spark)
+        - macOS, Apple Silicon
         - Other (say which below)
     validations:
       required: true
@@ -42,7 +44,7 @@ body:
     id: gpu
     attributes:
       label: GPU and driver
-      description: The card and the driver version, as the first lines of `nvidia-smi` print them.
+      description: The card and the driver version, as the first lines of `nvidia-smi` print them. On a Mac, the chip and the macOS version.
       placeholder: RTX 5090, driver 580.xx
     validations:
       required: true

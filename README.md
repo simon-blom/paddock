@@ -12,11 +12,11 @@ issues, where the templates ask for what makes a report actionable.
 
 ## What it is
 
-AI inference server written in Rust, currently for NVIDIA GPUs, with an OpenAI and Anthropic compatible API
-and a Studio for exploring and comparing models, with artifact support.
+AI inference server written in Rust, for NVIDIA GPUs and for Apple Silicon, with an OpenAI and
+Anthropic compatible API and a Studio for exploring and comparing models, with artifact support.
 
 It is a native engine and NOT A WRAPPER - the scheduler, the paged KV cache, the memory
-management and the CUDA kernels are all part of this repo.
+management and the kernels, CUDA and Metal, are all part of this repo.
 
 Two binaries, paddock-runner is what runs models and is really the only thing needed but we made
 paddock (manager) as a simpler way to get started running models quickly and we added the built-in Studio
@@ -25,6 +25,9 @@ or other endpoints. Paddock (manager) will bundle the Studio to just make it so 
 to download, just two binaries and that's all.
 
 User only needs the NVIDIA driver.
+
+On a Mac there is a native app as well: Paddock for macOS, written in Swift, with the manager
+and the Studio in one window and our Metal backend running the models. It lives in `apps/macos`.
 
 ## Our aim is being the fastest most modern inference platform
 
@@ -133,10 +136,13 @@ endpoint, same prompt, same view.
 
 Paddock is young and under active development.
 
-- **Backend:** CUDA only. The release kernel pack carries SASS for sm_86, sm_89,
-  sm_100 and sm_120; the build script can target more. There is no Vulkan,
-  Metal or ROCm backend.
-- **Platforms:** Windows and Linux, x64. macOS is out of scope for now.
+- **Backends:** CUDA and Metal. The CUDA release kernel pack carries SASS for
+  sm_86, sm_89, sm_100 and sm_120; the build script can target more. The Metal
+  backend (`crates/paddock-metal`, shaders in `packs/metal`) runs on Apple
+  Silicon. There is no Vulkan or ROCm backend.
+- **Platforms:** Windows and Linux on x64, Linux arm64 on the NVIDIA DGX Spark,
+  and macOS on Apple Silicon with a native Swift app. Release downloads are
+  Windows and Linux; the macOS app is built from source, see below.
 - **Models:** most modern families are supported, feel free to add support.
 
 ## What is pdfium doing in the project ?
@@ -225,11 +231,25 @@ bash packs/cuda/build.sh                           # Linux
 
 Kernels are hand-written CUDA, with no Triton, no DSL and no Python anywhere in
 the build. The sources are organised by domain under `packs/cuda/src/`, and
-`pack.cu`'s include list is the one true order. The single exception is
-`gemm/cutgemm.cu`, a CUTLASS-based fp8 GEMM for sm_100 kept in its own
-translation unit so those headers never reach the main compile. It is built
-only when you point `PD_CUTLASS_INC` at a CUTLASS checkout, and compiles to an
-unsupported stub otherwise.
+`pack.cu`'s include list is the one true order.
+
+The Metal kernels in `packs/metal` are hand-written too and have no build step
+of their own: their source is embedded in the Metal runner and compiled by the
+system at startup. `packs/metal/README.md` says how the files are grouped.
+
+### macOS
+
+On Apple Silicon the app, the Rust library it embeds and the Metal runner build
+together. From `apps/macos`:
+
+```sh
+bash ./scripts/check.sh        # format, tests, an optimized build
+bash ./scripts/build-app.sh    # .build/Paddock.app
+open .build/Paddock.app
+```
+
+`apps/macos/README.md` has the toolchain it needs, the supported chips and what
+each check covers.
 
 ## Benchmarking
 

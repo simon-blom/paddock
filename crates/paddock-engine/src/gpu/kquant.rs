@@ -66,6 +66,12 @@ impl GpuExecutor {
         self.kernels.kquant_iq.is_some()
     }
 
+    /// The pack's i-quant lanes serve PrismML's ternary packings PTQ1_0 and
+    /// PQ2_0 (slot 625) - same reason as the Q4_0 marker.
+    pub fn has_kquant_ternary(&self) -> bool {
+        self.kernels.kquant_ternary.is_some()
+    }
+
     /// The pack serves the i-quant family on the DENSE lanes too (slot 578).
     pub fn has_kquant_iq_dense(&self) -> bool {
         self.kernels.kquant_iq_dense.is_some()
@@ -114,6 +120,7 @@ impl GpuExecutor {
     /// k-quant streams. Anything else is a load error (dequant-to-f32 for a
     /// big matmul weight would silently blow the VRAM story).
     pub fn load_quantw(&self, map: &MappedGguf, name: &str) -> Result<QuantW, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, _) = map.tensor_bytes(name)?;
         match info.ggml_type {
             GgmlType::Q8_0 => Ok(QuantW::Q8(self.repack_q8(map, name)?)),
@@ -135,6 +142,12 @@ impl GpuExecutor {
             }
             // the i-quant family on the dense lanes needs both markers: the
             // repack/dequant (577) and the dense entry points (578)
+            ty if kq_is_ternary(ty) && !self.has_kquant_ternary() => {
+                Err(GpuError::Unsupported(format!(
+                    "{name} is {ty:?} but the kernel pack has no ternary lanes \
+                     (slot 625) - rebuild packs/cuda"
+                )))
+            }
             ty if kq_is_iq(ty) => {
                 if !self.has_kquant_iq() || !self.has_kquant_iq_dense() {
                     return Err(GpuError::Unsupported(format!(
@@ -173,11 +186,14 @@ impl GpuExecutor {
         map: &MappedGguf,
         name: &str,
     ) -> Result<Option<RepackedKQ>, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, _) = map.tensor_bytes(name)?;
         if kq_params(info.ggml_type).is_none() {
             return Ok(None);
         }
-        if kq_is_iq(info.ggml_type) && !self.has_kquant_iq() {
+        if (kq_is_iq(info.ggml_type) && !self.has_kquant_iq())
+            || (kq_is_ternary(info.ggml_type) && !self.has_kquant_ternary())
+        {
             return Err(GpuError::NoKernel {
                 name: name.to_owned(),
                 ty: info.ggml_type,
@@ -190,6 +206,7 @@ impl GpuExecutor {
     /// scale-record streams the fused k-quant GEMV reads. The staged upload
     /// is freed on return - the tensor stays 4/5/6-bit resident.
     pub fn repack_kquant(&self, map: &MappedGguf, name: &str) -> Result<RepackedKQ, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         self.repack_kquant_raw(bytes, dims, info.ggml_type, name)
@@ -293,6 +310,7 @@ impl GpuExecutor {
         name: &str,
         n_bands: usize,
     ) -> Result<Vec<RepackedKQ>, GpuError> {
+        self.rotated_basis_guard(map, name)?;
         let (info, bytes) = map.tensor_bytes(name)?;
         let (_, raw_b, _) = kq_params(info.ggml_type).ok_or(GpuError::NoKernel {
             name: name.to_owned(),
@@ -333,6 +351,7 @@ impl GpuExecutor {
         names: &[&str],
     ) -> Result<RepackedKQ, GpuError> {
         assert!(!names.is_empty(), "concat of zero tensors");
+        self.rotated_basis_guard(map, names[0])?;
         let mut ty: Option<GgmlType> = None;
         let mut in_dim = 0usize;
         let mut out_dim = 0usize;

@@ -1,0 +1,27 @@
+[package]
+name = "paddock-desktop"
+description = "Native-app bridge and private Studio host for Paddock's shared Rust core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+paddock-admin = { path = "../paddock-admin" }
+paddock-manager = { path = "../paddock-manager" }
+axum.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tower = { workspace = true, features = ["util"] }
+uuid.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

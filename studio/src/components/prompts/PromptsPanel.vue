@@ -26,33 +26,46 @@ const editId = ref<string | undefined>(undefined)
 const editName = ref('')
 const editBody = ref('')
 const editorOpen = ref(false)
+const revision = ref<string | undefined>()
+const saving = ref(false)
+const mutationError = ref('')
 const editorTitle = computed(() => (editId.value ? 'Edit preset' : 'New preset'))
 const canSaveEdit = computed(() => !!editName.value.trim() && !!editBody.value.trim())
 
 function create(): void {
+  mutationError.value = ''; revision.value = ''
   editId.value = undefined
   editName.value = ''
   editBody.value = ''
   editorOpen.value = true
 }
 function edit(p: SavedPrompt): void {
+  mutationError.value = ''; revision.value = p.revision
   editId.value = p.id
   editName.value = p.name
   editBody.value = p.body
   editorOpen.value = true
 }
 async function saveEdit(): Promise<void> {
-  if (!canSaveEdit.value) return
-  await prompts.save(editName.value, editBody.value, editId.value)
-  editorOpen.value = false
+  if (!canSaveEdit.value || saving.value) return
+  saving.value = true; mutationError.value = ''
+  try {
+    await prompts.save(editName.value, editBody.value, editId.value, revision.value)
+    editorOpen.value = false
+  } catch (e) { mutationError.value = e instanceof Error ? e.message : String(e) }
+  finally { saving.value = false }
 }
 
 // ── delete confirm ──────────────────────────────────────────────────────────
 const pendingDelete = ref<SavedPrompt | null>(null)
 async function confirmDelete(): Promise<void> {
+  if (saving.value) return
   const p = pendingDelete.value
-  pendingDelete.value = null
-  if (p) await prompts.remove(p.id)
+  if (!p) return
+  saving.value = true; mutationError.value = ''
+  try { await prompts.remove(p.id, p.revision); pendingDelete.value = null }
+  catch (e) { mutationError.value = e instanceof Error ? e.message : String(e) }
+  finally { saving.value = false }
 }
 </script>
 
@@ -69,6 +82,8 @@ async function confirmDelete(): Promise<void> {
         <Icon name="plus" :size="15" /> New preset
       </button>
     </header>
+
+    <p v-if="prompts.error" role="alert">{{ prompts.error }} <button class="pk-btn" @click="prompts.refresh()">Retry</button></p>
 
     <div v-if="prompts.prompts.length > 4" class="prompts__search">
       <Icon name="search" :size="15" class="prompts__search-icon" />
@@ -105,16 +120,18 @@ async function confirmDelete(): Promise<void> {
   </div>
 
   <!-- create / edit -->
-  <Dialog :open="editorOpen" :title="editorTitle" icon="file-text" size="lg" @close="editorOpen = false">
+  <Dialog :open="editorOpen" :title="editorTitle" icon="file-text" size="lg" @close="!saving && (editorOpen = false)">
     <div class="pedit">
+      <p v-if="mutationError" role="alert">{{ mutationError }}</p>
       <label class="pedit__field">
         <span class="pedit__label">Name</span>
-        <input v-model="editName" class="pk-input" placeholder="e.g. Terse coder" />
+        <input v-model="editName" :disabled="saving" class="pk-input" placeholder="e.g. Terse coder" />
       </label>
       <label class="pedit__field">
         <span class="pedit__label">Prompt</span>
         <textarea
           v-model="editBody"
+          :disabled="saving"
           class="pk-input pedit__ta"
           rows="10"
           placeholder="Instructions the model should follow..."
@@ -122,8 +139,8 @@ async function confirmDelete(): Promise<void> {
       </label>
     </div>
     <template #footer>
-      <button class="pk-btn pk-btn--ghost" @click="editorOpen = false">Cancel</button>
-      <button class="pk-btn pk-btn--primary" :disabled="!canSaveEdit" @click="saveEdit">Save</button>
+      <button class="pk-btn pk-btn--ghost" :disabled="saving" @click="editorOpen = false">Cancel</button>
+      <button class="pk-btn pk-btn--primary" :disabled="!canSaveEdit || saving" @click="saveEdit">{{ saving ? 'Saving…' : 'Save' }}</button>
     </template>
   </Dialog>
 
@@ -135,15 +152,16 @@ async function confirmDelete(): Promise<void> {
     icon="alert-triangle"
     title="Delete preset?"
     size="sm"
-    @close="pendingDelete = null"
+    @close="!saving && (pendingDelete = null)"
   >
+    <p v-if="mutationError" role="alert">{{ mutationError }}</p>
     <p class="pedit__confirm">
       <strong>{{ pendingDelete?.name }}</strong> will be removed from your library. Chats already
       using it keep their copy.
     </p>
     <template #footer>
-      <button class="pk-btn pk-btn--ghost" @click="pendingDelete = null">Cancel</button>
-      <button class="pk-btn pk-btn--danger" @click="confirmDelete">Delete</button>
+      <button class="pk-btn pk-btn--ghost" :disabled="saving" @click="pendingDelete = null">Cancel</button>
+      <button class="pk-btn pk-btn--danger" :disabled="saving" @click="confirmDelete">Delete</button>
     </template>
   </Dialog>
 </template>

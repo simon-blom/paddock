@@ -204,6 +204,33 @@ fn round_ceiling(
     original.is_none_or(|v| cap < v)
 }
 
+/// We compose several upstream responses and local tool events into one
+/// downstream turn. Provider sequence numbers are round-local; exposing them
+/// verbatim makes a valid second round look like a replay. Own the downstream
+/// sequence, including local items, and serialize assignment + enqueue together.
+struct TurnStream {
+    tx: futures::channel::mpsc::UnboundedSender<String>,
+    next: StdMutex<u64>,
+}
+impl TurnStream {
+    fn new(tx: futures::channel::mpsc::UnboundedSender<String>) -> Self {
+        Self {
+            tx,
+            next: StdMutex::new(0),
+        }
+    }
+    fn send(&self, event: &Value) {
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut event = event.clone();
+        event["sequence_number"] = json!(*next);
+        *next += 1;
+        let _ = self.tx.unbounded_send(sse(&event));
+    }
+}
+
 fn sse(v: &Value) -> String {
     format!(
         "event: {}\ndata: {}\n\n",
@@ -230,7 +257,7 @@ fn mcp_call_item(
 async fn gather(
     specs: &[Spec],
     shape: fn(&str, &str, &Value) -> Value,
-    send: &impl Fn(String),
+    send: &impl Fn(&Value),
 ) -> (
     HashMap<String, paddock_mcp::McpClient>,
     // Defs kept per SERVER (label, defs): disclosure is decided one server at
@@ -286,11 +313,11 @@ async fn gather(
                             .is_none_or(|a| a.iter().any(|n| n == &t.name))
                     })
                     .collect();
-                send(sse(&json!({"type":"response.output_item.added","item":{
+                send(&json!({"type":"response.output_item.added","item":{
                     "type":"mcp_list_tools","id":format!("mcpl_{}", uuid::Uuid::new_v4().simple()),
                     "server_label":spec.label,
                     "tools":kept.iter().map(|t| json!({"name":t.name,"description":t.description,"input_schema":t.input_schema})).collect::<Vec<_>>(),
-                }})));
+                }}));
                 let mut declared: Vec<String> = Vec::new();
                 let mut server_defs: Vec<Value> = Vec::new();
                 for t in kept {
@@ -322,9 +349,9 @@ Call this server's tools by these exact names: {}.",
                 }
             }
             Err(e) => {
-                send(sse(&json!({"type":"response.output_item.added","item":{
+                send(&json!({"type":"response.output_item.added","item":{
                     "type":"mcp_list_tools","id":format!("mcpl_{}", uuid::Uuid::new_v4().simple()),
-                    "server_label":spec.label,"tools":[],"error":e}})));
+                    "server_label":spec.label,"tools":[],"error":e}}));
             }
         }
     }
@@ -383,12 +410,12 @@ async fn execute(
     args: Result<Value, String>,
     routing: &HashMap<String, (String, String, bool)>,
     clients: &HashMap<String, paddock_mcp::McpClient>,
-    send: &impl Fn(String),
+    send: &impl Fn(&Value),
 ) -> (String, bool) {
     let Some((label, real, gated)) = routing.get(ns).cloned() else {
         let m = format!("unknown tool {ns:?}");
-        send(sse(&json!({"type":"response.output_item.done","item":
-            mcp_call_item(call_id, "mcp", ns, args_text, None, Some(&m), "failed")})));
+        send(&json!({"type":"response.output_item.done","item":
+            mcp_call_item(call_id, "mcp", ns, args_text, None, Some(&m), "failed")}));
         return (m, true);
     };
     if gated {
@@ -398,9 +425,9 @@ async fn execute(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(approval_id.clone(), atx);
-        send(sse(&json!({"type":"response.output_item.added","item":{
+        send(&json!({"type":"response.output_item.added","item":{
             "type":"mcp_approval_request","id":approval_id,"call_id":call_id,
-            "server_label":label,"name":real,"arguments":args_text}})));
+            "server_label":label,"name":real,"arguments":args_text}}));
         let approved = matches!(
             tokio::time::timeout(APPROVAL_TIMEOUT, arx).await,
             Ok(Ok(true))
@@ -409,16 +436,16 @@ async fn execute(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&approval_id);
-        send(sse(&json!({"type":"response.output_item.done","item":{
+        send(&json!({"type":"response.output_item.done","item":{
             "type":"mcp_approval_request","id":approval_id,"call_id":call_id,
             "server_label":label,"name":real,"arguments":args_text,
-            "status": if approved {"approved"} else {"denied"}}})));
+            "status": if approved {"approved"} else {"denied"}}}));
         if !approved {
             return ("the user denied this tool call".to_owned(), true);
         }
     }
-    send(sse(&json!({"type":"response.output_item.added","item":
-        mcp_call_item(call_id, &label, &real, args_text, None, None, "in_progress")})));
+    send(&json!({"type":"response.output_item.added","item":
+        mcp_call_item(call_id, &label, &real, args_text, None, None, "in_progress")}));
     let (output, error) = match args {
         Err(e) => (None, Some(e)),
         Ok(a) => match clients.get(&label) {
@@ -441,8 +468,8 @@ async fn execute(
     } else {
         "failed"
     };
-    send(sse(&json!({"type":"response.output_item.done","item":
-        mcp_call_item(call_id, &label, &real, args_text, output.as_deref(), error.as_deref(), status)})));
+    send(&json!({"type":"response.output_item.done","item":
+        mcp_call_item(call_id, &label, &real, args_text, output.as_deref(), error.as_deref(), status)}));
     let is_err = error.is_some();
     (output.or(error).unwrap_or_default(), is_err)
 }
@@ -463,9 +490,8 @@ pub async fn run_anthropic(
     post: impl Fn(Value) -> reqwest::RequestBuilder,
     tx: futures::channel::mpsc::UnboundedSender<String>,
 ) {
-    let send = |s: String| {
-        let _ = tx.unbounded_send(s);
-    };
+    let output = TurnStream::new(tx);
+    let send = |event: &Value| output.send(event);
     let (clients, per_server, routing, mut instructions) = gather(
         &specs,
         |ns, desc, schema| json!({"name":ns,"description":desc,"input_schema":schema}),
@@ -527,8 +553,8 @@ pub async fn run_anthropic(
             // history uses tools but declares none as malformed. "none" is
             // their documented way to say this.
             body["tool_choice"] = json!({"type": "none"});
-            send(sse(&json!({"type":"response.output_text.delta",
-                "delta":format!("\n\n{}\n\n", stop.expect("answering means stopped").notice())})));
+            send(&json!({"type":"response.output_text.delta",
+                "delta":format!("\n\n{}\n\n", stop.expect("answering means stopped").notice())}));
             if let Some(msgs) = body["messages"].as_array_mut() {
                 append_user_text(msgs, loop_budget::ANSWER_ONLY_NUDGE);
             }
@@ -543,18 +569,18 @@ pub async fn run_anthropic(
         let res = match post(body.clone()).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                let detail = r.text().await.unwrap_or_default();
-                send(sse(
+                let error = crate::provider_error::response(r).await;
+                send(
                     &json!({"type":"response.failed","response":{"status":"failed",
-                    "error":{"message":detail.chars().take(400).collect::<String>()}}}),
-                ));
+                    "error":error}}),
+                );
                 return;
             }
             Err(e) => {
-                send(sse(
+                send(
                     &json!({"type":"response.failed","response":{"status":"failed",
                     "error":{"message":format!("provider not answering: {e}")}}}),
-                ));
+                );
                 return;
             }
         };
@@ -594,9 +620,7 @@ pub async fn run_anthropic(
                         match d["type"].as_str().unwrap_or("") {
                             "thinking_delta" => {
                                 let t = d["thinking"].as_str().unwrap_or("");
-                                send(sse(
-                                    &json!({"type":"response.reasoning_text.delta","delta":t}),
-                                ));
+                                send(&json!({"type":"response.reasoning_text.delta","delta":t}));
                                 if let Some(b) = content.get_mut(idx) {
                                     let cur = b["thinking"].as_str().unwrap_or("").to_owned();
                                     b["thinking"] = json!(cur + t);
@@ -604,7 +628,7 @@ pub async fn run_anthropic(
                             }
                             "text_delta" => {
                                 let t = d["text"].as_str().unwrap_or("");
-                                send(sse(&json!({"type":"response.output_text.delta","delta":t})));
+                                send(&json!({"type":"response.output_text.delta","delta":t}));
                                 if let Some(b) = content.get_mut(idx) {
                                     let cur = b["text"].as_str().unwrap_or("").to_owned();
                                     b["text"] = json!(cur + t);
@@ -644,10 +668,10 @@ pub async fn run_anthropic(
                         }
                     }
                     "error" => {
-                        send(sse(
+                        send(
                             &json!({"type":"response.failed","response":{"status":"failed",
                             "error":{"message":v["error"]["message"].clone()}}}),
-                        ));
+                        );
                         return;
                     }
                     _ => {}
@@ -668,10 +692,10 @@ pub async fn run_anthropic(
         // The answer round ends the turn whatever it said, and nothing it may
         // have emitted as a tool runs.
         if answering || stop_reason != "tool_use" || tool_uses.is_empty() {
-            send(sse(
+            send(
                 &json!({"type":"response.completed","response":{"status":"completed",
                 "usage":{"input_tokens":total_in,"output_tokens":total_out}}}),
-            ));
+            );
             return;
         }
         // the assistant turn goes back VERBATIM - thinking blocks included
@@ -747,9 +771,8 @@ pub async fn run(
     post: impl Fn(Value) -> reqwest::RequestBuilder,
     tx: futures::channel::mpsc::UnboundedSender<String>,
 ) {
-    let send = |s: String| {
-        let _ = tx.unbounded_send(s);
-    };
+    let output = TurnStream::new(tx);
+    let send = |event: &Value| output.send(event);
     // 1) connect + list every connector (shared gather: a dead one becomes a
     // failed listing item and the rest carry on; a cold-starting one gets the
     // 60s budget) - defs land in the Responses flat function shape.
@@ -800,7 +823,7 @@ pub async fn run(
         body["input"] = json!([{"type":"message","role":"user","content": s}]);
     }
 
-    // 2) rounds. Provider events stream through verbatim EXCEPT the terminal
+    // 2) rounds. Provider payloads pass through with a turn-local sequence except the terminal
     // response.completed, which we swallow between rounds (it would end the
     // Studio's read) and forward only from the final round.
     let out_cap = out_token_cap(&body, "max_output_tokens");
@@ -841,8 +864,8 @@ pub async fn run(
             // A text DELTA, not a bare message item: a reader accumulating
             // output_text never looks inside an item, so the old item-only
             // "[tool loop stopped]" notice was invisible in the Studio.
-            send(sse(&json!({"type":"response.output_text.delta",
-                "delta":format!("{}\n\n", stop.expect("answering means stopped").notice())})));
+            send(&json!({"type":"response.output_text.delta",
+                "delta":format!("{}\n\n", stop.expect("answering means stopped").notice())}));
             if let Some(items) = body["input"].as_array_mut() {
                 items.push(json!({"type":"message","role":"user",
                     "content": loop_budget::ANSWER_ONLY_NUDGE}));
@@ -858,18 +881,18 @@ pub async fn run(
         let res = match post(body.clone()).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                let detail = r.text().await.unwrap_or_default();
-                send(sse(
+                let error = crate::provider_error::response(r).await;
+                send(
                     &json!({"type":"response.failed","response":{"status":"failed",
-                    "error":{"message":format!("provider error: {}", detail.chars().take(400).collect::<String>())}}}),
-                ));
+                    "error":error}}),
+                );
                 return;
             }
             Err(e) => {
-                send(sse(
+                send(
                     &json!({"type":"response.failed","response":{"status":"failed",
                     "error":{"message":format!("provider not answering: {e}")}}}),
-                ));
+                );
                 return;
             }
         };
@@ -912,18 +935,18 @@ pub async fn run(
                         terminal = Some(v);
                     }
                     "response.failed" => {
-                        send(sse(&v));
+                        send(&v);
                         return;
                     }
-                    _ => send(sse(&v)),
+                    _ => send(&v),
                 }
             }
         }
         let Some(mut terminal) = terminal else {
-            send(sse(
+            send(
                 &json!({"type":"response.failed","response":{"status":"failed",
                 "error":{"message":"provider stream ended without a terminal event"}}}),
-            ));
+            );
             return;
         };
         {
@@ -960,7 +983,7 @@ pub async fn run(
                     u["cost"] = json!(c);
                 }
             }
-            send(sse(&terminal));
+            send(&terminal);
             return;
         }
         // 3) execute this round's calls: local meta-tools (search mode)
@@ -1156,28 +1179,28 @@ async fn run_planned(
     catalog: &[tool_search::CatalogTool],
     routing: &HashMap<String, (String, String, bool)>,
     clients: &HashMap<String, paddock_mcp::McpClient>,
-    send: &impl Fn(String),
+    send: &impl Fn(&Value),
 ) -> (String, bool) {
     let (call_id, raw) = (plan.call_id.as_str(), plan.raw_args.as_str());
     match &plan.planned {
         Planned::Search { query, limit } => {
             let hits = tool_search::search(catalog, query, *limit);
             let result = tool_search::search_result(query, &hits, catalog);
-            send(sse(&json!({"type":"response.output_item.done","item":
-                mcp_call_item(call_id, "mcp", tool_search::SEARCH_TOOL, raw, Some(&result), None, "completed")})));
+            send(&json!({"type":"response.output_item.done","item":
+                mcp_call_item(call_id, "mcp", tool_search::SEARCH_TOOL, raw, Some(&result), None, "completed")}));
             (result, false)
         }
         Planned::Clock => {
             let spec = clock_spec.expect("clock spec");
             let (content, output, error, status) = clock::run(spec, raw);
-            send(sse(&json!({"type":"response.output_item.done","item":
-                mcp_call_item(call_id, "time", clock::TOOL_NAME, raw, output.as_deref(), error.as_deref(), status)})));
+            send(&json!({"type":"response.output_item.done","item":
+                mcp_call_item(call_id, "time", clock::TOOL_NAME, raw, output.as_deref(), error.as_deref(), status)}));
             let is_err = error.is_some();
             (content, is_err)
         }
         Planned::Refuse { name, message } => {
-            send(sse(&json!({"type":"response.output_item.done","item":
-                mcp_call_item(call_id, "mcp", name, raw, None, Some(message), "failed")})));
+            send(&json!({"type":"response.output_item.done","item":
+                mcp_call_item(call_id, "mcp", name, raw, None, Some(message), "failed")}));
             (message.clone(), true)
         }
         // Nothing was touched; the card carries the server a live call would
@@ -1192,8 +1215,8 @@ async fn run_planned(
             let real = routing
                 .get(name)
                 .map_or(name.as_str(), |(_, r, _)| r.as_str());
-            send(sse(&json!({"type":"response.output_item.done","item":
-                mcp_call_item(call_id, label, real, raw, Some(output), None, "completed")})));
+            send(&json!({"type":"response.output_item.done","item":
+                mcp_call_item(call_id, label, real, raw, Some(output), None, "completed")}));
             (output.clone(), false)
         }
         Planned::Invoke { ns, args } => {
@@ -1207,6 +1230,81 @@ async fn run_planned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tool_rounds_share_one_downstream_sequence() {
+        use axum::{Json, Router, routing::post};
+        use futures::StreamExt;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = Router::new().route("/responses", post(move |Json(body): Json<Value>| {
+            let round = seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert!(round < 2, "The turn must not retry or repeat the tool");
+                if round == 1 {
+                    assert!(body["input"].as_array().unwrap().iter().any(|i| i["type"] == "function_call_output"));
+                }
+                let output = if round == 0 {
+                    json!([{"type":"function_call", "call_id":"fixture-clock", "name":clock::TOOL_NAME,"arguments":"{}"}])
+                } else {
+                    json!([{"type":"message","content":[{"type":"output_text","text":"Artifact created; final answer."}]}])
+                };
+                let mut events = vec![json!({"type":"response.created","sequence_number":0}),
+                    json!({"type":"response.in_progress","sequence_number":1})];
+                if round == 1 { events.push(json!({"type":"response.output_text.delta","sequence_number":2,"delta":"Artifact created; "})); }
+                events.push(json!({"type":"response.completed","sequence_number":3,"response":{"status":"completed","output":output,"usage":{"input_tokens":10,"output_tokens":5}}}));
+                ([("content-type", "text/event-stream")], events.iter().map(sse).collect::<String>())
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        run(
+            vec![],
+            Some(clock::parse_spec(&json!({"type":"current_time"})).unwrap()),
+            json!({"input":"Make an artifact", "stream":true, "max_output_tokens":4096}),
+            None,
+            |body| client.post(&url).json(&body),
+            tx,
+        )
+        .await;
+        server.abort();
+        let events: Vec<Value> = rx
+            .map(|s| {
+                serde_json::from_str(s.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())
+                    .unwrap()
+            })
+            .collect()
+            .await;
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event["sequence_number"], i as u64);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["item"]["type"] == "mcp_call" && e["item"]["status"] == "completed")
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "response.completed")
+                .count(),
+            1
+        );
+        let final_response = &events.last().unwrap()["response"];
+        assert_eq!(
+            final_response["output"][0]["content"][0]["text"],
+            "Artifact created; final answer."
+        );
+        assert_eq!(final_response["usage"]["output_tokens"], 10);
+    }
 
     fn one_tool() -> (
         Vec<tool_search::CatalogTool>,

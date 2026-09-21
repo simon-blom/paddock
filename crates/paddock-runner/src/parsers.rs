@@ -74,6 +74,9 @@ pub enum Dialect {
     JsonToolCall,
     /// No known structure: the whole text is content.
     Plain,
+    /// Transcript text is not chat framing. Preserve generated whitespace
+    /// and literal markup; speaker/timestamp tags are part of this output.
+    Transcript,
 }
 
 impl Dialect {
@@ -83,7 +86,7 @@ impl Dialect {
             // nemotron_h_moe's template speaks the same XML tool dialect and
             // `<think>` region as qwen3.5 (the card's own parser election is
             // vLLM's `qwen3_coder`)
-            "qwen35" | "qwen35moe" | "nemotron" | "nemotron_h_moe" => Dialect::QwenXml,
+            "qwen35" | "qwen35moe" | "qwen4exp" | "nemotron" | "nemotron_h_moe" => Dialect::QwenXml,
             "gemma4" => Dialect::GemmaChannel,
             "laguna" => Dialect::Laguna,
             "muse-glimmer" => Dialect::MuseChannel,
@@ -125,7 +128,7 @@ impl Dialect {
     /// is the parser it needs. No `<think>` requirement here - `thinking_open`
     /// already reads the prompt's own suffix, so a qwen3-coder-shaped template
     /// without a reasoning region parses correctly on the same dialect.
-    /// Every arch that HAS a row keeps it: laguna and granite 4.1 carry
+    /// Every arch that has a row keeps it: laguna and granite 4.1 carry
     /// `<tool_call>` but neither of the other two markers.
     pub fn for_arch_and_template(arch: &str, template: Option<&str>) -> Dialect {
         if arch == "granite"
@@ -147,6 +150,12 @@ impl Dialect {
         }
     }
 
+    /// Speech checkpoints generate transcripts, not tool-call framing. This
+    /// is distinct from whether a chat dialect has a forced-call grammar.
+    pub fn supports_tools(self) -> bool {
+        !matches!(self, Dialect::Transcript)
+    }
+
     /// Did the rendered generation prompt leave the model inside an open
     /// thinking region? Dialect-shaped, one definition for all three routes
     /// (chat, messages, responses): qwen3.5 pre-opens `<think>\n`; laguna
@@ -160,7 +169,7 @@ impl Dialect {
             Dialect::Laguna => prompt.ends_with("<think>"),
             // granite 4.1's template has no thinking region to open - say so
             // rather than leaning on a `<think>\n` probe that can't match
-            Dialect::JsonToolCall => false,
+            Dialect::JsonToolCall | Dialect::Transcript => false,
             // muse-glimmer's generation prompt is a bare `<|start|>assistant`
             // and the model types its own ` to=self<|message|>` - Unless the
             // render pre-opened it (crate::muse::PREOPEN, the g4_preopen
@@ -347,6 +356,10 @@ pub fn parse(
                 ..Parsed::default()
             }
         }
+        Dialect::Transcript => Parsed {
+            content: (!text.is_empty()).then(|| text.to_owned()),
+            ..Parsed::default()
+        },
     }
 }
 
@@ -398,6 +411,10 @@ pub(crate) fn g4_preopen() -> bool {
 /// pre-opened the thought channel, so the text starts inside it (a
 /// model-generated opener is still stripped - the kill-env path keeps it).
 fn gemma_parse(text: &str, thinking_open: bool) -> Parsed {
+    // Tail whitespace is generated output, not channel framing. Trimming it
+    // here buffers whitespace-only tokens until the next word and doubles
+    // many SSE gaps; trimming a closed thought also retracts emitted bytes.
+    // Preserve the established leading-framing cleanup on both channels.
     let trimmed = text.trim_start();
     // a proper prefix of the thought marker ("<|chan", "<|channel>thought")
     // is still AMBIGUOUS mid-stream - emit nothing rather than misfile the
@@ -413,8 +430,8 @@ fn gemma_parse(text: &str, thinking_open: bool) -> Parsed {
     if let Some(after) = after {
         match after.find(G_CLOSE) {
             Some(end) => {
-                let reasoning = after[..end].trim();
-                let content = after[end + G_CLOSE.len()..].trim();
+                let reasoning = after[..end].trim_start();
+                let content = after[end + G_CLOSE.len()..].trim_start();
                 Parsed {
                     reasoning: (!reasoning.is_empty()).then(|| reasoning.to_owned()),
                     content: (!content.is_empty()).then(|| content.to_owned()),
@@ -423,14 +440,14 @@ fn gemma_parse(text: &str, thinking_open: bool) -> Parsed {
             }
             None => Parsed {
                 reasoning: {
-                    let r = after.trim();
+                    let r = after.trim_start();
                     (!r.is_empty()).then(|| r.to_owned())
                 },
                 ..Parsed::default()
             },
         }
     } else {
-        let t = trimmed.trim_end();
+        let t = trimmed;
         Parsed {
             content: (!t.is_empty()).then(|| t.to_owned()),
             ..Parsed::default()
@@ -454,6 +471,11 @@ const TOOL_CALL_END: &str = "</tool_call>";
 fn qwen_parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Parsed {
     let mut out = Parsed::default();
 
+    // Parsing runs on every streaming token AND on the final response. A trailing
+    // space/newline is model output, not framing: trimming it delays that token
+    // until the next word and can retract already-emitted reasoning at </think>.
+    // Keep the established leading-framing cleanup, but preserve the output tail.
+
     // Blocks are calls wherever they appear, including inside the reasoning
     // region: qwen sometimes writes its tool call inside a still-open <think>
     // and ends the turn without ever closing it (seen live - a
@@ -470,20 +492,20 @@ fn qwen_parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Par
 
     // 1) split off the reasoning block
     let rest = if let Some(i) = text.find(THINK_END) {
-        let r = text[..i].trim();
+        let r = text[..i].trim_start();
         let r = r.strip_prefix(THINK).unwrap_or(r);
         let r = scan(r, &mut out);
-        let r = r.trim();
+        let r = r.trim_start();
         if !r.is_empty() {
             out.reasoning = Some(r.to_owned());
         }
         &text[i + THINK_END.len()..]
     } else if thinking_open || text.trim_start().starts_with(THINK) {
         // still inside the think block (streaming, or max_tokens mid-thought)
-        let r = text.trim();
+        let r = text.trim_start();
         let r = r.strip_prefix(THINK).unwrap_or(r);
         let r = scan(r, &mut out);
-        let r = r.trim();
+        let r = r.trim_start();
         if !r.is_empty() {
             out.reasoning = Some(r.to_owned());
         }
@@ -494,7 +516,7 @@ fn qwen_parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Par
 
     // 2) tool_call blocks; content is everything outside them
     let content = scan(rest, &mut out);
-    let content = content.trim();
+    let content = content.trim_start();
     if !content.is_empty() {
         out.content = Some(content.to_owned());
     }
@@ -696,7 +718,10 @@ fn json_tool_parse(text: &str, hints: Option<&ToolHints>) -> Parsed {
     // No tools declared -> no extraction: the syntax is just text the model
     // produced (a bench corpus full of fake tool markup must stay visible).
     let Some(hints) = hints else {
-        let t = text.trim();
+        // Whitespace after generated content is data, not framing. Trimming
+        // it buffers standalone space/newline tokens until the next word and
+        // creates multi-token SSE gaps. Retain the existing leading cleanup.
+        let t = text.trim_start();
         out.content = (!t.is_empty()).then(|| t.to_owned());
         return out;
     };
@@ -744,7 +769,7 @@ fn json_tool_parse(text: &str, hints: Option<&ToolHints>) -> Parsed {
         cur = next;
     }
     content.push_str(cur);
-    let content = content.trim();
+    let content = content.trim_start();
     if !content.is_empty() {
         out.content = Some(content.to_owned());
     }
@@ -859,6 +884,18 @@ pub(crate) fn coerce(val: &str, declared_string: Option<bool>) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn flash_next_uses_its_checkpoint_xml_and_thinking_dialect() {
+        // The elected GGUF template contains <function=>/<parameter=> calls
+        // and pre-opens <think>. Plain text would leak reasoning/tool markup.
+        assert_eq!(Dialect::for_arch("qwen4exp"), Dialect::QwenXml);
+        assert!(Dialect::for_arch("qwen4exp").thinking_open("<|im_start|>assistant\n<think>\n"));
+        assert!(
+            !Dialect::for_arch("qwen4exp")
+                .thinking_open("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
+    }
+
     /// One arch string, two dialects. The marker pair is the whole test:
     /// granite 4.1 carries neither `<function=` nor `<think>`, granite 4.2
     /// carries both, and picking by `arch` alone sent 4.2's reasoning to the
@@ -900,22 +937,22 @@ mod tests {
         );
     }
 
-    /// Qwen3.8-Flash-Next's GGUF says `qwen4exp`, which the arch table never
-    /// named, and its tool calls reached the client as XML text with
-    /// `finish_reason: "stop"`. The template it carries is the qwen38 fixture
-    /// byte for byte (unsloth's UD export), so that fixture is the witness.
+    /// Unknown architecture names must still honor the template's complete
+    /// tool syntax. Flash-Next now has its own arch row, so use an actually
+    /// unlisted name to keep testing the fallback rather than that row.
     #[test]
     fn an_unlisted_arch_takes_its_dialect_from_the_template() {
         const QWEN38: &str = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
-        assert_eq!(Dialect::for_arch("qwen4exp"), Dialect::Plain);
+        const UNKNOWN: &str = "unlisted-qwen-shaped-model";
+        assert_eq!(Dialect::for_arch(UNKNOWN), Dialect::Plain);
         assert_eq!(
-            Dialect::for_arch_and_template("qwen4exp", Some(QWEN38)),
+            Dialect::for_arch_and_template(UNKNOWN, Some(QWEN38)),
             Dialect::QwenXml
         );
         // and the dialect then does the job end to end: a call is a call
         let t = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
         let p = parse(
-            Dialect::for_arch_and_template("qwen4exp", Some(QWEN38)),
+            Dialect::for_arch_and_template(UNKNOWN, Some(QWEN38)),
             t,
             false,
             hints_weather().as_ref(),
@@ -924,11 +961,11 @@ mod tests {
         assert_eq!(p.tool_calls[0].name, "get_weather");
         // no template, or a template with only part of the syntax, stays Plain
         assert_eq!(
-            Dialect::for_arch_and_template("qwen4exp", None),
+            Dialect::for_arch_and_template(UNKNOWN, None),
             Dialect::Plain
         );
         assert_eq!(
-            Dialect::for_arch_and_template("qwen4exp", Some("<tool_call><function=")),
+            Dialect::for_arch_and_template(UNKNOWN, Some("<tool_call><function=")),
             Dialect::Plain
         );
         // listed arches keep their row: every fixture that is not qwen-shaped
@@ -968,6 +1005,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn flash_next_retains_its_explicit_tool_dialect() {
+        for template in [None, Some("<tool_call><function=")] {
+            assert_eq!(
+                Dialect::for_arch_and_template("qwen4exp", template),
+                Dialect::QwenXml
+            );
+        }
+    }
+
     /// granite 4.2's prompt ends inside an open think region, so `thinking_open`
     /// must say so on the dialect the template selects - the QwenXml arm.
     #[test]
@@ -998,7 +1045,7 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(p.reasoning.as_deref(), Some("the user wants brevity"));
+        assert_eq!(p.reasoning.as_deref(), Some("the user wants brevity\n"));
         assert_eq!(p.content.as_deref(), Some("Paris."));
         assert_eq!(p.finish_reason(), "stop");
     }
@@ -1025,8 +1072,66 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(p.reasoning.as_deref(), Some("hmm"));
+        assert_eq!(p.reasoning.as_deref(), Some("hmm\n"));
         assert_eq!(p.content.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn qwen_trailing_whitespace_is_visible_without_waiting_for_the_next_word() {
+        for tail in [" ", "\n", "\t", "\n\n"] {
+            let raw = format!("A sentence.{tail}");
+            let content = parse(Dialect::QwenXml, &raw, false, None);
+            assert_eq!(content.content.as_deref(), Some(raw.as_str()));
+            let reasoning = parse(Dialect::QwenXml, &raw, true, None);
+            assert_eq!(reasoning.reasoning.as_deref(), Some(raw.as_str()));
+            let closed = parse(
+                Dialect::QwenXml,
+                &format!("{raw}</think>\nAnswer. "),
+                true,
+                None,
+            );
+            assert_eq!(closed.reasoning, reasoning.reasoning);
+            assert_eq!(closed.content.as_deref(), Some("Answer. "));
+        }
+    }
+
+    #[test]
+    fn qwen_streamed_prose_is_prefix_stable_across_reasoning_and_tool_boundaries() {
+        let raw = "Checking café. \n</think>\n\nOne moment. \n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\nDone. \n";
+        let hints = hints_weather();
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let dialect = Dialect::QwenXml;
+        for end in raw.char_indices().map(|(i, c)| i + c.len_utf8()) {
+            let parsed = parse(dialect, &raw[..end], true, hints.as_ref());
+            for (text, emitted, markers) in [
+                (
+                    parsed.content.as_deref(),
+                    &mut content,
+                    dialect.content_markers(),
+                ),
+                (
+                    parsed.reasoning.as_deref(),
+                    &mut reasoning,
+                    dialect.reasoning_markers(),
+                ),
+            ] {
+                if let Some(text) = text {
+                    let safe = text.len() - holdback(text, markers);
+                    assert!(
+                        text[..safe].starts_with(emitted.as_str()),
+                        "retracted at {end}"
+                    );
+                    emitted.push_str(&text[emitted.len()..safe]);
+                }
+            }
+        }
+        let final_parse = parse(dialect, raw, true, hints.as_ref());
+        assert_eq!(final_parse.content.as_deref(), Some(content.as_str()));
+        assert_eq!(final_parse.reasoning.as_deref(), Some(reasoning.as_str()));
+        assert_eq!(content, "One moment. \n\nDone. \n");
+        assert_eq!(reasoning, "Checking café. \n");
+        assert_eq!(final_parse.complete_calls, 1);
     }
 
     #[test]
@@ -1054,7 +1159,7 @@ mod tests {
         assert_eq!(p.tool_calls.len(), 1);
         assert_eq!(p.tool_calls[0].name, "get_weather");
         assert_eq!(p.complete_calls, 1);
-        assert_eq!(p.reasoning.as_deref(), Some("I should look this up."));
+        assert_eq!(p.reasoning.as_deref(), Some("I should look this up.\n\n"));
         assert!(p.content.is_none());
         assert_eq!(p.finish_reason(), "tool_calls");
     }
@@ -1068,7 +1173,7 @@ mod tests {
                  Paris\n</parameter>\n</function>\n</tool_call>\n</think>\n\nHere you go.";
         let p = parse(Dialect::QwenXml, t, true, hints_weather().as_ref());
         assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.reasoning.as_deref(), Some("Deciding."));
+        assert_eq!(p.reasoning.as_deref(), Some("Deciding.\n\n"));
         assert_eq!(p.content.as_deref(), Some("Here you go."));
     }
 
@@ -1108,7 +1213,7 @@ mod tests {
                  <tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call>";
         let p = parse(Dialect::QwenXml, t, false, hints_weather().as_ref());
         assert_eq!(p.tool_calls.len(), 2);
-        assert_eq!(p.content.as_deref(), Some("I'll check both cities."));
+        assert_eq!(p.content.as_deref(), Some("I'll check both cities.\n\n\n"));
         let b: Value = serde_json::from_str(&p.tool_calls[1].arguments).unwrap();
         assert_eq!(b["city"], "Berlin");
     }
@@ -1118,7 +1223,7 @@ mod tests {
         let t = "need the weather tool\n</think>\n\n\
                  <tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>";
         let p = parse(Dialect::QwenXml, t, true, hints_weather().as_ref());
-        assert_eq!(p.reasoning.as_deref(), Some("need the weather tool"));
+        assert_eq!(p.reasoning.as_deref(), Some("need the weather tool\n"));
         assert_eq!(p.tool_calls.len(), 1);
         assert!(p.content.is_none());
     }
@@ -1161,6 +1266,27 @@ mod tests {
     }
 
     #[test]
+    fn transcript_preserves_whitespace_and_literal_markers() {
+        for text in [
+            " ",
+            " for timothy  ",
+            "[Speaker 1]: hello [T:45]",
+            "<think> spoken words",
+            "<tool_call>literal</tool_call>",
+        ] {
+            let p = parse(Dialect::Transcript, text, false, None);
+            assert_eq!(p.content.as_deref(), Some(text));
+            assert!(p.reasoning.is_none());
+            assert!(p.tool_calls.is_empty());
+        }
+        assert!(!Dialect::Transcript.thinking_open("<think>\n"));
+        assert!(Dialect::Transcript.content_markers().is_empty());
+        assert!(Dialect::Transcript.tool_syntax().is_none());
+        assert!(!Dialect::Transcript.supports_tools());
+        assert!(Dialect::JsonToolCall.supports_tools());
+    }
+
+    #[test]
     fn no_tools_declared_keeps_tool_syntax_as_content() {
         // the benchmark regression this pins: a tools-free request whose model
         // imitates tool markup (synthetic coding corpora are full of it) must
@@ -1193,7 +1319,7 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(p.reasoning.as_deref(), Some("let me think"));
+        assert_eq!(p.reasoning.as_deref(), Some("let me think\n"));
         assert_eq!(p.content.as_deref(), Some("Stockholm"));
     }
 
@@ -1244,8 +1370,78 @@ mod tests {
             true,
             None,
         );
-        assert_eq!(p.reasoning.as_deref(), Some("let me think"));
+        assert_eq!(p.reasoning.as_deref(), Some("let me think\n"));
         assert_eq!(p.content.as_deref(), Some("Stockholm"));
+    }
+
+    #[test]
+    fn gemma_whitespace_tokens_emit_without_waiting_for_the_next_word() {
+        for tail in [" ", "\n", "\n\n", "\t", "\u{2003}"] {
+            let raw = format!("café{tail}");
+            let content = parse(Dialect::GemmaChannel, &raw, false, None);
+            assert_eq!(content.content.as_deref(), Some(raw.as_str()));
+            let thought = parse(Dialect::GemmaChannel, &raw, true, None);
+            assert_eq!(thought.reasoning.as_deref(), Some(raw.as_str()));
+            let closed = parse(
+                Dialect::GemmaChannel,
+                &format!("{raw}<channel|>Done{tail}"),
+                true,
+                None,
+            );
+            assert_eq!(closed.reasoning, thought.reasoning);
+            assert_eq!(closed.content, Some(format!("Done{tail}")));
+        }
+    }
+
+    #[test]
+    fn gemma_incremental_channels_preserve_whitespace_and_never_retract() {
+        let dialect = Dialect::GemmaChannel;
+        for (raw, open, want_reasoning, want_content) in [
+            ("  café \n\t", false, "", "café \n\t"),
+            (
+                "Checking café. \n<channel|>\nDone. \n",
+                true,
+                "Checking café. \n",
+                "Done. \n",
+            ),
+            (
+                "<|channel>thought\nChecking café. \n<channel|>\nDone. \n",
+                false,
+                "Checking café. \n",
+                "Done. \n",
+            ),
+        ] {
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for end in 1..=raw.len() {
+                if !raw.is_char_boundary(end) {
+                    continue;
+                }
+                let parsed = parse(dialect, &raw[..end], open, None);
+                for (text, emitted, markers) in [
+                    (
+                        parsed.reasoning.as_deref(),
+                        &mut reasoning,
+                        dialect.reasoning_markers(),
+                    ),
+                    (
+                        parsed.content.as_deref(),
+                        &mut content,
+                        dialect.content_markers(),
+                    ),
+                ] {
+                    if let Some(text) = text {
+                        let safe = crate::chat::safe_emit_len(text, markers, &[]);
+                        assert!(
+                            text[..safe].starts_with(emitted.as_str()),
+                            "retracted at {end}"
+                        );
+                        emitted.push_str(&text[emitted.len()..safe]);
+                    }
+                }
+            }
+            assert_eq!(reasoning, want_reasoning);
+            assert_eq!(content, want_content);
+        }
     }
 
     #[test]
@@ -1366,6 +1562,22 @@ mod tests {
         assert_eq!(p.finish_reason(), "stop");
     }
 
+    #[test]
+    fn json_tool_whitespace_updates_are_immediate_and_prefix_stable() {
+        for hints in [None, hints_weather()] {
+            let mut text = String::new();
+            let mut previous = String::new();
+            for token in ["one", " ", "two", "\n", "\n", "three", " ", "\t"] {
+                text.push_str(token);
+                let p = parse(Dialect::JsonToolCall, &text, false, hints.as_ref());
+                let content = p.content.expect("generated content");
+                assert!(content.starts_with(&previous));
+                assert_eq!(content, text, "do not hold back whitespace tokens");
+                previous = content;
+            }
+        }
+    }
+
     // ------------------------------ the unwrapped call, read back --
 
     /// The measured granite-vision output: a whole, correct call with no
@@ -1472,7 +1684,7 @@ mod tests {
         let p = parse(Dialect::JsonToolCall, t, false, hints_weather().as_ref());
         assert_eq!(p.tool_calls.len(), 2);
         assert_eq!(p.complete_calls, 2);
-        assert_eq!(p.content.as_deref(), Some("and Berlin:"));
+        assert_eq!(p.content.as_deref(), Some("and Berlin:\n"));
     }
 
     #[test]
@@ -1498,7 +1710,7 @@ mod tests {
                  <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n\
                  <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}\n</tool_call>";
         let p = parse(Dialect::JsonToolCall, t, false, hints_weather().as_ref());
-        assert_eq!(p.content.as_deref(), Some("Checking both."));
+        assert_eq!(p.content.as_deref(), Some("Checking both.\n\n"));
         assert_eq!((p.tool_calls.len(), p.complete_calls), (2, 2));
         let b: Value = serde_json::from_str(&p.tool_calls[1].arguments).unwrap();
         assert_eq!(b["city"], "Berlin");

@@ -4,13 +4,13 @@
 // writes back to the conversation while the user keeps using it. Two facts make
 // that a race rather than a detail:
 //
-//  1. The model selection is MUTABLE and reachable for the whole time the
+//  1. The model selection is mutable and reachable for the whole time the
 //     summary request is out - the header dropdown goes through
 //     lib/select-model.ts `selectStudioModel` into the chat store's `edit`,
 //     which is awaited machinery of its own.
 //  2. The transcript is OWN-HISTORY-ONLY. `renderTranscript` filters a compare
 //     group's lanes against whichever model is asking, so the body sent for
-//     model A is a DIFFERENT document from the body that would be sent for
+//     model A is a different document from the body that would be sent for
 //     model B, and the summary that comes back is only an answer about A's
 //     history.
 //
@@ -20,7 +20,7 @@
 // (useChatStream.ts `previewPlan` -> `by`) and smuggles it into B's context on
 // the next send.
 //
-// Every request below is DEFERRED: the transport promise is resolved by hand
+// Every request below is deferred: the transport promise is resolved by hand
 // after the mutation under test, so the mutation provably happens while the
 // request is in flight rather than before it was ever built.
 
@@ -51,7 +51,7 @@ vi.mock('@/stores/models', () => ({
 
 vi.mock('@/lib/api', () => ({
   store: boundary.api,
-  // never reached: nothing here hydrates the conversation LIST
+  // never reached: nothing here hydrates the conversation list
   stubFromSummary: vi.fn(),
 }))
 
@@ -116,8 +116,8 @@ interface Fixture {
   q4: Message
 }
 
-/** A thread long enough to compact, whose covered prefix contains a COMPARE
- *  GROUP - one question answered by both models. That group is what makes the
+/** A thread long enough to compact, whose covered prefix contains a compare
+ *  group - one question answered by both models. That group is what makes the
  *  request body model-specific, so it is the part of the fixture that actually
  *  carries the bug.
  *
@@ -130,7 +130,7 @@ function fixture(): Fixture {
   const q1 = msg('user', 'MARK-Q1', null)
   const laneA = msg('assistant', 'MARK-LANE-A', q1.id, { group: 'g1', model: MODEL_A })
   const laneB = msg('assistant', 'MARK-LANE-B', q1.id, { group: 'g1', model: MODEL_B })
-  // the next turn hangs off the group's ANCHOR, which is lane 1
+  // the next turn hangs off the group's anchor, which is lane 1
   const q2 = msg('user', 'MARK-Q2', laneA.id)
   const a2 = msg('assistant', 'MARK-A2', q2.id, { model: MODEL_A })
   const q3 = msg('user', 'MARK-Q3', a2.id)
@@ -231,7 +231,7 @@ function persistSpy(then?: (c: Conversation) => void) {
 
 /** Start a compaction and assert its request is already on the wire. Returns a
  *  handle whose `settled` stays false until the compaction actually finishes,
- *  which is what proves a later mutation happened DURING the request, plus
+ *  which is what proves a later mutation happened during the request, plus
  *  `req`/`sent`: this launch's own entry in `pending`, so a retry after an
  *  earlier request reads without index arithmetic. */
 function launch(conv: Conversation, persist: ReturnType<typeof persistSpy> = persistSpy()) {

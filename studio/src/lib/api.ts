@@ -515,6 +515,9 @@ export interface CatalogFile {
 }
 /** Vendor-sourced spec sheet, shown when a model row is expanded. */
 export interface ModelSpecs {
+  /** Upstream publication (YYYY-MM-DD), never the registry/export revision. */
+  published_at?: string
+  published_source?: string
   params?: string
   context?: string
   context_max?: string
@@ -533,6 +536,29 @@ export interface CatalogArtifact {
   kind: 'weights' | 'vision' | 'drafter' | 'fp8-snapshot'
   format: 'gguf' | 'safetensors'
   label: string
+  /** Export-specific loader contract; absent preserves older managers. */
+  runtime?: {
+    backends?: string[]
+    capability?: string[]
+    companions?: string[]
+    checkpoint_dir?: boolean
+    embedded_vision?: boolean
+    kv_cache_dtype?: string
+    experimental?: boolean
+    qualification?: 'unqualified' | 'experimental' | 'qualified'
+    default_max_ctx?: number
+    default_max_batch?: number
+    memory?: { max_ctx: number; max_batch: number }
+    note?: string
+  }
+  source?: {
+    repo: string
+    revision: string
+    base_model: string
+    license: string
+    license_url: string
+  }
+  backend_supported?: boolean
   /** the honest quant tag for weights ("Q8_0", "UD-Q4_K_XL", "MXFP4"). */
   quant?: string
   /** part of the row-level Download bundle. */
@@ -668,13 +694,14 @@ export interface SavedPrompt {
   body: string
   createdAt?: number
   updatedAt?: number
+  revision?: string
 }
 
 export const promptsApi = {
   list: () => jget<SavedPrompt[]>('/api/prompts'),
   // POST upserts (the store's put_prompt is INSERT ... On CONFLICT(id) UPDATE).
-  save: (p: SavedPrompt) => jbody<{ ok: boolean }>('/api/prompts', 'POST', p),
-  remove: (id: string) => jsend(`/api/prompts/${id}`, 'DELETE'),
+  save: (p: SavedPrompt) => jbody<{ ok: boolean; prompt?: SavedPrompt }>('/api/prompts', 'POST', p),
+  remove: (id: string, revision?: string) => jbody(`/api/prompts/${encodeURIComponent(id)}${revision === undefined ? '' : `?revision=${encodeURIComponent(revision)}`}`, 'DELETE'),
 }
 
 // ── MCP tool approvals ──────────────────────────────────────────────────────
@@ -687,8 +714,8 @@ export const approvalsApi = {
   /** The approval id lives in exactly one registry - the current runner's,
    *  or the manager's cloud agent loop. The card doesn't know which lane
    *  parked it, so post to both; the wrong one answers 404 harmlessly. */
-  approve: async (approvalId: string, approve: boolean) => {
-    const port = useModelsStore().portFor()
+  approve: async (approvalId: string, approve: boolean, modelId?: string) => {
+    const port = useModelsStore().portFor(modelId)
     const paths = [
       ...(port ? [`/api/runners/${port}/mcp-approvals/${approvalId}`] : []),
       `/api/cloud/mcp-approvals/${approvalId}`,

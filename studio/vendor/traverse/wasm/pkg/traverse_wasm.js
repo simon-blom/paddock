@@ -173,7 +173,8 @@ export class TraverseDb {
      * optional JSON-stringified parameter map; pass `null` if no
      * parameters. `timeout_ms` (optional, > 0) installs a thread-
      * local deadline the executor honors at iteration boundaries;
-     * pass 0 / null for no timeout.
+     * defaults to 10 seconds, capped at 30 seconds. This is cooperative,
+     * not a hard wall-clock deadline or a mutation rollback guarantee.
      *
      * Returns a JS object matching the HTTP `QueryResponse` shape
      * — columns, rows, hydrated nodes/edges, mutation stats,
@@ -577,10 +578,6 @@ function __wbg_get_imports() {
         __wbg_static_accessor_WINDOW_e0db14a0eba6a812: function() {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addHeapObject(ret);
-        },
-        __wbg_timeOrigin_f3d5cb4f4a06c2b7: function(arg0) {
-            const ret = getObject(arg0).timeOrigin;
-            return ret;
         },
         __wbg_value_1e2369fab29b420e: function(arg0) {
             const ret = getObject(arg0).value;

@@ -13,23 +13,31 @@
 pub mod align;
 pub mod audio;
 pub mod backend;
+#[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod encoder;
 pub mod envset;
 pub mod generator;
+#[cfg(feature = "cuda")]
 pub mod gpu;
+#[cfg(feature = "cuda")]
 pub mod gpu_model;
+pub mod granite_layout;
 pub mod kv_plan;
 pub mod kv_pool;
 pub mod kv_tier;
 pub mod metrics;
 pub mod paged_radix;
+#[cfg(feature = "cuda")]
 pub mod reference;
 pub mod sampler;
+#[cfg(feature = "cuda")]
+pub mod segment;
 pub mod service;
 pub mod spec;
 pub mod spec_policy;
 pub mod tickseg;
 pub mod transcriber;
+pub mod whisper;
 
 pub use backend::{Backend, BackendInfo};

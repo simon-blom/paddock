@@ -63,6 +63,10 @@ const CAP_META = [
   // Word timing for an existing transcript (the karaoke enrichment) - like
   // transcription, the chip is the whole of what an aligner does.
   { key: 'alignment', icon: 'clock', label: 'Word timing' },
+  // Aerial photographs in, maps out (what the ground is, how tall the trees
+  // are). It reads images but it is no vision chat - it answers with rasters,
+  // so it gets its own chip rather than borrowing 'Vision'.
+  { key: 'segmentation', icon: 'map', label: 'Image to map' },
 ] as const
 
 interface VendorGroup {
@@ -125,6 +129,9 @@ function sectionOf(m: CatalogModel): string {
   // An aligner cannot chat either - it times the words of a transcript some
   // other model produced, so it files with the speech tools.
   if (m.capability.includes('alignment')) return 'Speech to text'
+  // Chips in, rasters out - it has no text surface at all, so filing it under
+  // 'Chat' would promise the one thing it refuses.
+  if (m.capability.includes('segmentation')) return 'Maps from imagery'
   return 'Chat'
 }
 const rows = computed<Row[]>(() => {
@@ -165,7 +172,6 @@ interface FitLine {
 function fitOf(m: CatalogModel): FitLine {
   const free = reg.estDevice?.free ?? 0
   const total = reg.estDevice?.total ?? 0
-  if (!total) return { tone: 'dim', label: 'No GPU', full: 'No GPU detected - nothing can serve here yet' }
   // Screen out builds whose KERNELS this GPU does not have before pricing
   // VRAM against them. A model whose only weights artifact carries a floor
   // (nemotron ships NVFP4 alone) otherwise gets a green "Should fit" here and
@@ -184,6 +190,9 @@ function fitOf(m: CatalogModel): FitLine {
         full: `${why} - no build of this model runs on your GPU`,
       }
   }
+  if (!total && ready.info?.backend === 'metal' && !ready.blocked)
+    return { tone: 'dim', label: 'Checked at load', full: 'Apple GPU memory telemetry is not available here. The Metal runner enforces its allocation budget when loading.' }
+  if (!total) return { tone: 'dim', label: 'No GPU', full: 'No GPU detected - nothing can serve here yet' }
   const rows_ = weights.map((a) => ({
     a,
     est: reg.estimates[m.id]?.artifacts?.[a.id]?.estimate,

@@ -1,6 +1,7 @@
 # Line endings are a correctness matter here, not a style one.
 #
-# Paddock is developed on Windows and shipped on Windows and Linux. A shell script
+# Paddock is developed on Windows and on a Mac, and its shell scripts run on
+# Linux and macOS (`apps/macos/scripts` included). A shell script
 # that picks up CRLF fails at the shebang with "bad interpreter: /usr/bin/env
 # bash^M", which reads as a missing interpreter rather than a mangled file - and
 # it happens silently, because an editor on Windows hands you CRLF without

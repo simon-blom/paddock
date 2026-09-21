@@ -1629,6 +1629,7 @@ fn finish_blocks(
 
 async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
     let mut ids = Vec::new();
+    let mut terminal_tokens = 0;
     let mut finish = None;
     let mut cached = 0usize;
     while let Some(ev) = rx.recv().await {
@@ -1654,6 +1655,7 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
             }
             TokenEvent::Done(r, stats) => {
                 finish = Some(r);
+                terminal_tokens = stats.terminal_tokens();
                 ctx.scope.phases(&stats);
                 break;
             }
@@ -1664,10 +1666,11 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
     }
     let parsed = ctx.parse(&ids);
     let (mut content, stop_reason, stop_seq) = finish_blocks(&ctx, &parsed, finish);
-    ctx.scope.usage(ctx.prompt_len, ids.len());
+    let output_tokens = ids.len() + terminal_tokens;
+    ctx.scope.usage(ctx.prompt_len, output_tokens);
     ctx.scope.cached(cached);
     ctx.scope.finish(stop_reason);
-    let mut usage = json!({"input_tokens": ctx.prompt_len, "output_tokens": ids.len()});
+    let mut usage = json!({"input_tokens": ctx.prompt_len, "output_tokens": output_tokens});
     if cached > 0 {
         // truthful: those prompt tokens were served from the prefix cache
         // (Paddock's caching is implicit - no cache_control needed)
@@ -1679,7 +1682,7 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
         content.insert(0, compaction_block(&c.summary));
         usage["iterations"] = json!([c.usage, {
             "type": "message", "model": ctx.model_id,
-            "input_tokens": ctx.prompt_len, "output_tokens": ids.len(),
+            "input_tokens": ctx.prompt_len, "output_tokens": output_tokens,
             "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
         }]);
     }
@@ -1736,6 +1739,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
         let mut think_emitted = 0usize;
         let mut text_emitted = 0usize;
         let mut ids: Vec<u32> = Vec::new();
+        let mut terminal_tokens = 0;
         // incremental decode of `ids` (the O(n^2) per-token full re-decode
         // was the long-stream collapse under concurrency)
         let mut sd = ctx.tokenizer.stream_decoder(false);
@@ -1807,7 +1811,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
                         }
                     }
                 }
-                Some(TokenEvent::Done(r, stats)) => { finish = Some(r); ctx.scope.phases(&stats); break }
+                Some(TokenEvent::Done(r, stats)) => { finish = Some(r); terminal_tokens = stats.terminal_tokens(); ctx.scope.phases(&stats); break }
                 None => break,
                 Some(TokenEvent::Error(e)) => {
                     yield ev("error", json!({"type": "error",
@@ -1843,10 +1847,11 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
             index += 1;
         }
 
-        ctx.scope.usage(ctx.prompt_len, ids.len());
+        let output_tokens = ids.len() + terminal_tokens;
+        ctx.scope.usage(ctx.prompt_len, output_tokens);
         ctx.scope.cached(cached);
         ctx.scope.finish(stop_reason);
-        let mut usage = json!({"output_tokens": ids.len()});
+        let mut usage = json!({"output_tokens": output_tokens});
         if cached > 0 {
             usage["cache_read_input_tokens"] = json!(cached);
         }
@@ -1862,7 +1867,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
         if let Some(c) = &ctx.compaction {
             usage["iterations"] = json!([c.usage, {
                 "type": "message", "model": ctx.model_id,
-                "input_tokens": ctx.prompt_len, "output_tokens": ids.len(),
+                "input_tokens": ctx.prompt_len, "output_tokens": output_tokens,
                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
             }]);
         }
@@ -1997,6 +2002,7 @@ async fn anth_summary_pass(
     let mut ids1: Vec<u32> = Vec::new();
     let mut cached1 = 0usize;
     let mut p1_len = p1_ids.len();
+    let mut terminal_tokens = 0;
     while let Some(evt) = rx.recv().await {
         match evt {
             TokenEvent::Prefilled { cached: c, rows } => {
@@ -2005,6 +2011,7 @@ async fn anth_summary_pass(
             }
             TokenEvent::Token { id: t, .. } => ids1.push(t),
             TokenEvent::Done(_, stats) => {
+                terminal_tokens = stats.terminal_tokens();
                 scope.phases(&stats);
                 break;
             }
@@ -2024,14 +2031,14 @@ async fn anth_summary_pass(
         .map(str::to_owned);
     let usage = json!({
         "type": "compaction",
-        "input_tokens": p1_len, "output_tokens": ids1.len(),
+        "input_tokens": p1_len, "output_tokens": ids1.len() + terminal_tokens,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached1,
     });
     Ok(SummaryPass {
         summary,
         usage,
         input_tokens: p1_len,
-        output_tokens: ids1.len(),
+        output_tokens: ids1.len() + terminal_tokens,
         cached: cached1,
     })
 }
@@ -3092,6 +3099,7 @@ async fn run_mcp_agent(
                 TokenEvent::Token { id: t, .. } => ids.push(t),
                 TokenEvent::Done(r, stats) => {
                     finish = Some(r);
+                    out_tokens += stats.terminal_tokens();
                     scope.phases(&stats);
                     break;
                 }
@@ -3651,7 +3659,7 @@ fn stream_mcp_agent(
                             if hit { break; }
                         }
                     }
-                    Some(TokenEvent::Done(r, stats)) => { finish = Some(r); scope.phases(&stats); break; }
+                    Some(TokenEvent::Done(r, stats)) => { finish = Some(r); out_tokens += stats.terminal_tokens(); scope.phases(&stats); break; }
                     None => break,
                     Some(TokenEvent::Error(e)) => {
                         yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(e.class),"message":e.message}}));

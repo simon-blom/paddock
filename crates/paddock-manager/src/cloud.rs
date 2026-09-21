@@ -38,6 +38,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("TLS backend available")
 });
@@ -238,7 +239,7 @@ pub async fn browse_endpoints(
                             .and_then(|p| p.get(k))
                             .and_then(Value::as_str)
                             .and_then(|s| s.parse::<f64>().ok())
-                            .filter(|v| *v >= 0.0)
+                            .filter(|v| v.is_finite() && *v >= 0.0)
                     };
                     let mut out = json!({ "name": name });
                     // the tag is the endpoint's UNIQUE identity - the same
@@ -286,8 +287,9 @@ pub async fn browse_endpoints(
 /// order is last-week popularity, so the Studio may label it "Trending").
 /// Doubles as the key check: a bad key surfaces as the provider's 401 message.
 pub async fn models(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some((kind, base, key)) = load_secret(&state, &id) else {
-        return err(StatusCode::NOT_FOUND, format!("no cloud endpoint \"{id}\""));
+    let (kind, base, key) = match load_secret(&state, &id).await {
+        Ok(secret) => secret,
+        Err(response) => return response,
     };
     // The key is optional here, unlike the chat relay: OpenRouter's list
     // endpoint is public (browse-before-you-paste-a-key is the intended
@@ -448,17 +450,17 @@ fn stamp_native_reasoning(kind: &str, m: &mut Value) {
 /// OpenRouter gets special treatment its official API invites: the documented
 /// `sort=most-popular` param ("most tokens processed in the last week") turns
 /// the picker's default view into real trending data. A plain substring check
-/// is enough - a false positive only adds a query param another server
-/// ignores or rejects visibly.
+/// must not be used for routing or credential checks: only the canonical
+/// API base receives OpenRouter-specific behavior.
 fn is_openrouter(base: &str) -> bool {
-    base.contains("openrouter.ai")
+    crate::connections::is_openrouter(base)
 }
 
 /// One provider model row -> the normalized picker shape. OpenRouter carries
 /// the richest metadata (name, pricing, context, modalities, reasoning);
 /// OpenAI has bare ids + created; Anthropic has display_name. Everything
 /// beyond `id` is optional and the picker degrades per field.
-fn normalize_model(m: &Value) -> Option<Value> {
+pub(crate) fn normalize_model(m: &Value) -> Option<Value> {
     let id = m.get("id").and_then(Value::as_str)?;
     let display = m
         .get("name")
@@ -511,7 +513,7 @@ fn normalize_model(m: &Value) -> Option<Value> {
             .and_then(|p| p.get(k))
             .and_then(Value::as_str)
             .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| *v >= 0.0)
+            .filter(|v| v.is_finite() && *v >= 0.0)
     };
     let prompt_price = price("prompt");
     let completion_price = price("completion");
@@ -556,6 +558,9 @@ fn normalize_model(m: &Value) -> Option<Value> {
     if reasoning {
         out["reasoning"] = json!(true);
     }
+    if let Some(parameters) = m.get("supported_parameters").and_then(Value::as_array) {
+        out["tools"] = json!(parameters.iter().any(|p| p.as_str() == Some("tools")));
+    }
     if let Some(c) = created {
         out["created"] = json!(c);
     }
@@ -568,6 +573,21 @@ fn normalize_model(m: &Value) -> Option<Value> {
     Some(out)
 }
 
+pub(crate) fn normalize_provider_model(kind: &str, m: &Value) -> Option<Value> {
+    if kind == "openai"
+        && !m
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(openai_chat_model)
+    {
+        return None;
+    }
+    let mut value = normalize_model(m)?;
+    stamp_native_reasoning(kind, &mut value);
+    stamp_native_asr(kind, &mut value);
+    Some(value)
+}
+
 /// `POST /api/cloud/{id}/check` - does the saved key actually authenticate,
 /// and does an OpenAI/Anthropic-shaped API answer at the base URL? Runs after
 /// every key save and from the endpoint menu. OpenRouter needs its own probe
@@ -575,8 +595,9 @@ fn normalize_model(m: &Value) -> Option<Value> {
 /// is public and answers 200 to any key. Returns `{ok, message}` - the
 /// message is the provider's own words on failure.
 pub async fn check(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some((kind, base, key)) = load_secret(&state, &id) else {
-        return err(StatusCode::NOT_FOUND, format!("no cloud endpoint \"{id}\""));
+    let (kind, base, key) = match load_secret(&state, &id).await {
+        Ok(secret) => secret,
+        Err(response) => return response,
     };
     let client = &*HTTP;
     let openrouter = is_openrouter(&base);
@@ -688,8 +709,9 @@ pub async fn transcriptions(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let Some((kind, base, key)) = load_secret(&state, &id) else {
-        return err(StatusCode::NOT_FOUND, format!("no cloud endpoint \"{id}\""));
+    let (kind, base, key) = match load_secret(&state, &id).await {
+        Ok(secret) => secret,
+        Err(response) => return response,
     };
     if kind == "anthropic" {
         return err(
@@ -699,7 +721,7 @@ pub async fn transcriptions(
                 .into(),
         );
     }
-    if key.is_empty() {
+    if key.is_empty() && !state.db.connection_allows_unauthenticated(&id) {
         return err(
             StatusCode::BAD_REQUEST,
             "no API key saved for this endpoint".into(),
@@ -710,14 +732,16 @@ pub async fn transcriptions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    let res = match HTTP
+    let request = HTTP
         .post(format!("{base}/audio/transcriptions"))
-        .bearer_auth(&key)
         .header(axum::http::header::CONTENT_TYPE, ct)
-        .body(body)
-        .send()
-        .await
-    {
+        .body(body);
+    let request = if key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(&key)
+    };
+    let res = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             return err(
@@ -782,10 +806,11 @@ pub async fn responses(
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let Some((kind, base, key)) = load_secret(&state, &id) else {
-        return err(StatusCode::NOT_FOUND, format!("no cloud endpoint \"{id}\""));
+    let (kind, base, key) = match load_secret(&state, &id).await {
+        Ok(secret) => secret,
+        Err(response) => return response,
     };
-    if key.is_empty() {
+    if key.is_empty() && !state.db.connection_allows_unauthenticated(&id) {
         return err(
             StatusCode::BAD_REQUEST,
             "no API key saved for this endpoint".into(),
@@ -867,7 +892,13 @@ pub async fn responses(
             let anthropic = path == "messages";
             let post = move |b: Value| {
                 let r = HTTP.post(&url).json(&b);
-                if anthropic {
+                if key2.is_empty() {
+                    if anthropic {
+                        r.header("anthropic-version", ANTHROPIC_VERSION)
+                    } else {
+                        r
+                    }
+                } else if anthropic {
                     r.header("x-api-key", &key2)
                         .header("anthropic-version", ANTHROPIC_VERSION)
                 } else {
@@ -924,6 +955,8 @@ pub async fn responses(
     // chat send's TTFT.
     let mut req = HTTP.post(format!("{base}/{path}")).json(&out_body);
     req = match kind.as_str() {
+        "anthropic" if key.is_empty() => req.header("anthropic-version", ANTHROPIC_VERSION),
+        _ if key.is_empty() => req,
         "anthropic" => req
             .header("x-api-key", &key)
             .header("anthropic-version", ANTHROPIC_VERSION),
@@ -952,16 +985,8 @@ pub async fn responses(
         // OpenRouter's outer message can be a useless wrapper, so the real
         // detail is hoisted into it when present.
         let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let bytes = res.bytes().await.unwrap_or_default();
-        let body = match serde_json::from_slice::<Value>(&bytes) {
-            Ok(mut v) => {
-                if let Some(detail) = v.get("error").and_then(provider_error_detail) {
-                    v["error"]["message"] = json!(detail);
-                }
-                axum::body::Body::from(v.to_string())
-            }
-            Err(_) => axum::body::Body::from(bytes),
-        };
+        let error = crate::provider_error::response(res).await;
+        let body = axum::body::Body::from(json!({"error":error}).to_string());
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -1007,8 +1032,17 @@ pub async fn responses(
     out
 }
 
-fn load_secret(state: &AppState, id: &str) -> Option<(String, String, String)> {
-    state.db.cloud_endpoint_secret(id).ok().flatten()
+#[allow(clippy::result_large_err)]
+async fn load_secret(state: &AppState, id: &str) -> Result<(String, String, String), Response> {
+    // Keychain may block on OS access control. Never run it on a Tokio I/O
+    // worker, and never misreport a locked/unavailable key as a deleted model.
+    let db = state.db.clone();
+    let id = id.to_owned();
+    match tokio::task::spawn_blocking(move || db.cloud_endpoint_secret(&id)).await {
+        Ok(Ok(Some(value))) => Ok(value),
+        Ok(Ok(None)) => Err(err(StatusCode::NOT_FOUND, "The saved connection no longer exists.".into())),
+        _ => Err(err(StatusCode::SERVICE_UNAVAILABLE, "The saved credential is unavailable. Unlock Keychain or check the connection in Manager.".into())),
+    }
 }
 
 // ── cloud usage ledger tap  ──────────────────────────────────────
@@ -1800,43 +1834,6 @@ fn failed_event(msg: &str) -> String {
     json!({"type": "response.failed", "response": {"error": {"message": msg}}}).to_string()
 }
 
-/// OpenRouter wraps upstream failures as {"message": "Provider returned
-/// error", "metadata": {"raw": "<the actual reason>", "provider_name": ...}}.
-/// The outer message says nothing - "Provider returned error" was all the
-/// lane showed while google-ai-studio was rate-limiting. Hoist
-/// the raw detail, bounded, and name the provider when known.
-fn provider_error_detail(e: &Value) -> Option<String> {
-    let meta = e.get("metadata")?;
-    let raw = meta
-        .get("raw")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())?;
-    let mut detail = raw.trim();
-    // Upstream messages like to end in an upsell clause carrying a URL
-    // ("... or add your own key to accumulate your rate limits: https://...").
-    // A red error line is no place for a link dump: cut at the URL, then
-    // drop the dangling clause back to the last finished thought.
-    if let Some(pos) = detail.find("http://").or_else(|| detail.find("https://")) {
-        detail = detail[..pos].trim_end();
-        if let Some(cut) = detail.rfind(['.', '!', '?', ',']) {
-            detail = detail[..=cut].trim_end_matches(',');
-        }
-    }
-    let detail = detail.trim();
-    if detail.is_empty() {
-        return None;
-    }
-    let mut msg: String = detail.chars().take(300).collect();
-    if let Some(p) = meta
-        .get("provider_name")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        msg = format!("{p}: {msg}");
-    }
-    Some(msg)
-}
-
 /// chat.completions SSE -> Responses events. Reasoning arrives as
 /// `delta.reasoning` (OpenRouter's normalized field) or `delta.reasoning_content`
 /// (the DeepSeek-style field vLLM/SGLang serve); both map to reasoning_text.
@@ -1870,13 +1867,11 @@ impl CompatStream {
         }
         if let Some(e) = v.get("error") {
             self.done = true;
-            let msg = provider_error_detail(e).unwrap_or_else(|| {
-                e.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the provider reported an error")
-                    .to_string()
-            });
-            return vec![failed_event(&msg)];
+            let error = crate::provider_error::normalize(e, None);
+            return vec![
+                json!({"type":"response.failed","response":{"status":"failed","error":error}})
+                    .to_string(),
+            ];
         }
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(json!({
@@ -2171,12 +2166,14 @@ mod tests {
         assert_eq!(out["vision"], true);
         assert_eq!(out["promptPrice"], 0.0);
         assert_eq!(out["reasoning"], true);
+        assert_eq!(out["tools"], true);
         assert_eq!(out["free"], true);
         assert!(out["blurb"].as_str().unwrap().chars().count() <= 200);
         // a bare OpenAI-style row degrades to id + created, nothing invented
         let out = normalize_model(&json!({"id": "gpt-5.2", "created": 5})).unwrap();
         assert_eq!(out["created"], 5);
         assert!(out.get("display").is_none());
+        assert!(out.get("tools").is_none());
         assert!(
             out.get("maxOut").is_none(),
             "no output ceiling is honest; a guessed one is not"
@@ -2225,6 +2222,21 @@ mod tests {
         }))
         .unwrap();
         assert!(out.get("asr").is_none());
+    }
+
+    #[test]
+    fn normalized_prices_reject_nonfinite_and_dynamic_values() {
+        for price in ["-1", "NaN", "inf", "1e999"] {
+            let value = normalize_model(&json!({
+                "id": "a/b", "pricing": {"prompt": price, "completion": price},
+                "supported_parameters": []
+            }))
+            .unwrap();
+            assert!(value.get("promptPrice").is_none());
+            assert!(value.get("completionPrice").is_none());
+            assert!(value.get("free").is_none());
+            assert_eq!(value["tools"], false);
+        }
     }
 
     /// A NATIVE OpenAI list states no modalities at all, so the speech models
@@ -2606,7 +2618,8 @@ mod tests {
             "message": "Provider returned error", "code": 429,
             "metadata": {"raw": "google/gemma-4-31b-it:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations", "provider_name": "Google AI Studio"},
         });
-        let msg = provider_error_detail(&e).unwrap();
+        let normalized = crate::provider_error::normalize(&e, None);
+        let msg = normalized["message"].as_str().unwrap();
         assert!(msg.starts_with("Google AI Studio: "));
         assert!(
             msg.contains("retry shortly"),
@@ -2616,10 +2629,16 @@ mod tests {
             !msg.contains("http") && !msg.contains("add your own key"),
             "drops the link dump: {msg}"
         );
-        // no metadata -> None, callers fall back to the outer message
-        assert!(provider_error_detail(&json!({"message": "boom"})).is_none());
-        // a raw that is only a URL degrades to the outer message too
-        assert!(provider_error_detail(&json!({"metadata": {"raw": "https://x.ai"}})).is_none());
+        // Missing detail and a raw containing only a URL use the outer message.
+        for e in [
+            json!({"message": "boom"}),
+            json!({"message": "boom", "metadata": {"raw": "https://x.ai"}}),
+        ] {
+            assert_eq!(
+                crate::provider_error::normalize(&e, None)["message"],
+                "boom"
+            );
+        }
         // the streaming error path prefers the detail too
         let mut s = CompatStream::default();
         let out = s.on_data(r#"{"error":{"message":"Provider returned error","metadata":{"raw":"model is overloaded"}}}"#);

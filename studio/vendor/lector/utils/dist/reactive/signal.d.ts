@@ -24,7 +24,7 @@ export declare function _setActiveEffect(fn: (() => void) | null): void;
 /** Create a writable reactive signal. */
 export declare function signal<T>(initial: T): Signal<T>;
 /** Create a read-only computed signal derived from other signals. */
-export declare function computed<T>(fn: () => T): ReadonlySignal<T>;
+export declare function computed<T>(fn: () => T): ReadonlySignal<T> & Disposable;
 /**
  * Run a function that auto-tracks signal dependencies. Re-runs whenever
  * any tracked signal changes. Returns a dispose function to stop the effect.

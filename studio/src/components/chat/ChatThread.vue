@@ -7,6 +7,7 @@ import { useChatStore } from '@/stores/chat'
 import { useStickyScroll } from '@/composables/useStickyScroll'
 import { previewPlan } from '@/composables/useChatStream'
 import { fleetLabel, fleetVendor } from '@/lib/model-name'
+import { fastestCompareLane } from '@/lib/compare-presentation'
 import MessageBubble from './MessageBubble.vue'
 import SiblingSwitch from './SiblingSwitch.vue'
 import Icon from '@/components/Icon.vue'
@@ -122,15 +123,11 @@ const fastestLane = computed(() => {
   const out = new Set<string>()
   for (const b of blocks.value) {
     if (b.kind !== 'group' || b.ms.length < 2) continue
-    if (b.ms.some((m) => m.run?.contended)) continue
-    const raced = b.ms.filter((m) => m.transcript && !m.streaming && (m.usage?.ms ?? 0) > 0)
-    if (raced.length < 2) continue
-    const best = raced.reduce((a, m) => (m.usage!.ms! < a.usage!.ms! ? m : a))
     // A dead heat is not a win. Two lanes within a few percent of each other
     // would otherwise hand the badge to whichever the network jittered in
     // front, and it would flip between runs of the same pair.
-    const rest = raced.filter((m) => m !== best)
-    if (rest.every((m) => m.usage!.ms! > best.usage!.ms! * 1.1)) out.add(best.id)
+    const best = fastestCompareLane(b.ms)
+    if (best) out.add(best)
   }
   return out
 })

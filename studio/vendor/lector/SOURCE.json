@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/truespar/lector",
+  "commit": "c5c7c7bb062b43ab266336f149f60327d8f38e16",
+  "branch": "feat/bounded-renderer",
+  "dirty": false,
+  "sourceTreeSHA256": "d0f0ea94c580dd6cfeb5c18e1568186e2e1d981c1ec11b8c80a6d340905fffd9",
+  "generatedPackages": [
+    "core",
+    "utils",
+    "vue"
+  ],
+  "pdfiumWasmChanged": false,
+  "note": "Source tree hash includes tracked and nonignored untracked files. No source maps or test artifacts shipped."
+}

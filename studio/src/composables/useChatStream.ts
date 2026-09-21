@@ -6,8 +6,11 @@
 // `type`. Delta application is throttled to one animation frame so a fast
 // stream never re-renders Markdown per token (an O(n^2) freeze).
 
-import { computed, shallowReactive } from 'vue'
+import { computed } from 'vue'
+import { measuredUsage, engineFields, type EngineTiming } from '@/lib/response-metrics'
+import { activeChatControllers as aborts, isConversationRunning } from '@/lib/chat-activity'
 import { uuid } from '@/lib/uuid'
+import { titleGenerator } from '@/lib/chat-title'
 import type {
   AudioPart,
   ContentPart,
@@ -38,8 +41,13 @@ import { fleetLabel } from '@/lib/model-name'
 import { isHarmony } from '@/lib/model-caps'
 import { isTaskTurn } from '@/lib/tasks'
 import {
+  MIN_USEFUL_REPLY,
+  parseContextOverflow,
   planContext,
+  localOutputMaximum,
+  promptShape,
   promptTokensFrom,
+  replyPrompt,
   replyReserve,
   serverCompactThreshold,
   serverCompactionValid,
@@ -87,9 +95,9 @@ import { useConnectorsStore, type Connector } from '@/stores/connectors'
 // Sets, and the only thing in them is an AbortController: a host object whose
 // methods object to being called through a proxy. Nothing needs that, so it
 // does not happen.
-const aborts = shallowReactive(new Map<string, Set<AbortController>>())
 
 function beginStream(convId: string, c: AbortController): void {
+  titleGenerator.setForeground(true) // Real responses preempt optional label work.
   const live = aborts.get(convId)
   if (live) live.add(c)
   // `set` and not a mutation: the entry appearing is the busy edge, and a
@@ -106,6 +114,7 @@ function endStream(convId: string, c: AbortController): void {
   live.delete(c)
   if (live.size) return
   aborts.delete(convId)
+  titleGenerator.setForeground(aborts.size > 0)
   holdReload('stream', aborts.size > 0)
   // Last stream of a chat you are not looking at: say so, because otherwise
   // the only way to learn a background answer landed is to go and check.
@@ -126,7 +135,17 @@ function endStream(convId: string, c: AbortController): void {
 /** Is this conversation mid-answer - the one question every caller actually
  *  has. Exported because the sidebar asks it of rows that are not open. */
 export function conversationBusy(id: string | null | undefined): boolean {
-  return !!id && (aborts.get(id)?.size ?? 0) > 0
+  return isConversationRunning(id)
+}
+
+/** Native app shutdown drains the same terminal/save paths as the web Stop
+ * action before destroying the content workspace and embedded core. */
+export async function stopAllStreams(): Promise<void> {
+  titleGenerator.cancel()
+  for (const controllers of aborts.values()) for (const controller of controllers) controller.abort()
+  const until = performance.now() + 5000
+  while (aborts.size && performance.now() < until) await new Promise(resolve => setTimeout(resolve, 20))
+  if (aborts.size) throw new Error('Studio responses have not stopped yet')
 }
 
 function uid(): string {
@@ -860,6 +879,7 @@ interface ResponseEvent {
   delta?: string
   item?: McpItem
   response?: {
+    paddock_timing?: EngineTiming
     usage?: {
       input_tokens?: number
       output_tokens?: number
@@ -1283,7 +1303,7 @@ export function useChatStream() {
     lane = false,
     sharedGpu = false,
   ): Promise<void> {
-    const modelId = assistant.model ?? conv.model
+    const modelId = assistant.model ?? (append ? assistant.run?.model : undefined) ?? conv.model
     // Audio in the turn = transcription, whatever the model is.
     const clip = append ? undefined : clipFor(conv, assistant)
     if (clip) {
@@ -1321,25 +1341,64 @@ export function useChatStream() {
       settings.summarize,
       !isCloud && !lane && !append,
     )
-    // Resolve "model maximum" once, here: the window minus the planned prompt.
+    // Provenance: exactly the tool sources that rode - a narrowed server
+    // shows per-tool ("github:create_issue"), a whole one just its label.
+    const toolLabels = toolSpecs.flatMap((s) =>
+      s.allowed?.length ? s.allowed.map((t) => `${s.label}:${t}`) : [s.label],
+    )
+    // What this request carries besides its messages. Stored on the run record
+    // below, and compared against the last answered turn's to decide whether
+    // that turn's server-counted prompt is an exact count of this one's prefix.
+    const shape = promptShape(
+      conv,
+      plan,
+      [...toolLabels].sort().join('|') +
+        `#${webSearch ? 'w' : ''}${forensicsTool ? 'f' : ''}${clockTool ? 'c' : ''}`,
+    )
+    // Local admission clamps exact remaining context; clouds need a number and
+    // their separate published output ceiling. Never elect the 1024 API default.
     // Both the wire and the run record use this number - the run record must
     // show what actually rode (same rule as the maxTokens note below).
     //
-    // `plan.summary` rides too: buildBody puts it in `instructions`, so the
-    // prompt this cap is estimated against must include that known text too.
-    const replyCap =
+    // For a cloud lane the number is anchored on the last turn the provider
+    // counted (`replyPrompt`) and only what is newer is estimated. A compare
+    // lane's history is filtered per model, so it keeps the full estimate;
+    // `plan.summary` rides in `instructions` and is charged there.
+    const outCap = models.outCapFor(modelId)
+    const prompt = lane
+      ? { exact: 0, estimated: promptTokensFrom(conv, plan.from, plan.summary) }
+      : replyPrompt(conv, plan, { model: modelId, shape, pending: assistant.id })
+    let replyCap =
       settings.maxTokens ??
-      windowRemaining(
-        window,
-        promptTokensFrom(conv, plan.from, plan.summary),
-        models.outCapFor(modelId),
-      )
+      (isCloud
+        ? windowRemaining(window, prompt.estimated, outCap, prompt.exact)
+        : localOutputMaximum(window))
+    // No room: refuse here rather than send. buildBody leaves a nonpositive cap
+    // off the wire, which would ask the provider for its default instead, and
+    // the provider's own refusal reads worse than this one. Nothing about the
+    // turn is touched, so a Continue keeps its cut-off marker and can be tried
+    // again once the conversation is shorter.
+    if (replyCap <= 0) {
+      assistant.error =
+        `No room left for a reply: this conversation fills ${fleetLabel(modelId)}'s ` +
+        `${window}-token context window. Start a new chat, or shorten this one.`
+      assistant.streaming = false
+      chat.persistNow(conv)
+      return
+    }
+    // A Continue clears the cut-off state only now that a request will go out,
+    // and any error a refused attempt left, so the partial answer is sent.
+    if (append) {
+      assistant.incomplete = undefined
+      assistant.stopped = false
+      assistant.error = undefined
+    }
     const controller = new AbortController()
     beginStream(conv.id, controller)
     const started = performance.now()
     // split timing: reasoning phase vs. answer phase
-    let reasoningStartAt = 0
-    let contentStartAt = 0
+    let terminalAt = 0
+    let engineTiming: EngineTiming | undefined
     let firstTokenAt = 0 // send -> first token (TTFT)
 
     // Record this turn as a "run" (provenance): exactly what produced the answer.
@@ -1356,11 +1415,8 @@ export function useChatStream() {
         // record must show what actually rode the wire (a 4096-slider send
         // was recorded as 8192, hiding why thinking hit the ceiling).
         params: { ...conv.params, maxTokens: replyCap },
-        // Provenance: exactly the tool sources that rode - a narrowed server
-        // shows per-tool ("github:create_issue"), a whole one just its label.
-        tools: toolSpecs.flatMap((s) =>
-          s.allowed?.length ? s.allowed.map((t) => `${s.label}:${t}`) : [s.label],
-        ),
+        tools: toolLabels,
+        shape,
         contended: sharedGpu || undefined,
         at: Date.now(),
       }
@@ -1397,30 +1453,49 @@ export function useChatStream() {
         assistant.error = `No running model serves "${modelId}" - start one in the Manager first.`
         return
       }
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(
-          buildBody(
-            conv,
-            modelId,
-            assistant,
-            append,
-            replyCap,
-            settings.maxToolCalls,
-            plan,
-            toolSpecs,
-            webSearch,
-            forensicsTool,
-            clockTool,
-            fileData,
+      const post = (cap: number) =>
+        fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            buildBody(
+              conv,
+              modelId,
+              assistant,
+              append,
+              cap,
+              settings.maxToolCalls,
+              plan,
+              toolSpecs,
+              webSearch,
+              forensicsTool,
+              clockTool,
+              fileData,
+            ),
           ),
-        ),
-        signal: controller.signal,
-      })
+          signal: controller.signal,
+        })
+      let res = await post(replyCap)
       if (!res.ok || !res.body) {
-        assistant.error = await friendlyHttpError(res)
-        return
+        const message = await friendlyHttpError(res)
+        // The backstop for whatever the estimate still missed. A provider that
+        // refuses on size and states its numbers has counted the prompt with
+        // its own tokenizer, so `limit - input` is the exact reply that fits.
+        // One resend, only for a cap we derived (a cap the user set is theirs),
+        // and only when what fits is worth having.
+        const over = isCloud && settings.maxTokens == null ? parseContextOverflow(message) : null
+        const fits = over ? Math.floor(Math.min(over.limit - over.input, outCap || Infinity)) : 0
+        if (!over || fits < MIN_USEFUL_REPLY || fits >= replyCap) {
+          assistant.error = message
+          return
+        }
+        replyCap = fits
+        if (assistant.run && !append) assistant.run.params.maxTokens = fits
+        res = await post(fits)
+        if (!res.ok || !res.body) {
+          assistant.error = await friendlyHttpError(res)
+          return
+        }
       }
 
       let usage:
@@ -1447,20 +1522,6 @@ export function useChatStream() {
         switch (ev.type) {
           case 'response.output_text.delta':
             if (!firstTokenAt) firstTokenAt = performance.now()
-            if (!contentStartAt) {
-              contentStartAt = performance.now()
-              // reasoning just ended - surface its duration immediately, so the
-              // fold shows "Thought for Xs" as the answer starts (tokens/tps
-              // fill in at the terminal usage event).
-              if (reasoningStartAt) {
-                assistant.usage = {
-                  promptTokens: 0,
-                  completionTokens: 0,
-                  ...(assistant.usage ?? {}),
-                  reasoningMs: contentStartAt - reasoningStartAt,
-                }
-              }
-            }
             rawText += ev.delta ?? ''
             schedule()
             break
@@ -1471,7 +1532,6 @@ export function useChatStream() {
           case 'response.reasoning_summary_text.delta':
           case 'response.reasoning.delta':
             if (!firstTokenAt) firstTokenAt = performance.now()
-            if (!reasoningStartAt) reasoningStartAt = performance.now()
             reasoningBuf += ev.delta ?? ''
             schedule()
             break
@@ -1509,6 +1569,8 @@ export function useChatStream() {
             }
             break
           case 'response.completed':
+            terminalAt = performance.now()
+            engineTiming = ev.response?.paddock_timing
             usage = ev.response?.usage
             servedBy = ev.response?.provider
             dropped = ev.response?.truncation_dropped_items ?? 0
@@ -1517,6 +1579,8 @@ export function useChatStream() {
             if (ev.response?.ocr) assistant.ocr = ocrMetaFromWire(ev.response.ocr)
             break
           case 'response.incomplete':
+            terminalAt = performance.now()
+            engineTiming = ev.response?.paddock_timing
             usage = ev.response?.usage
             servedBy = ev.response?.provider
             dropped = ev.response?.truncation_dropped_items ?? 0
@@ -1570,25 +1634,14 @@ export function useChatStream() {
         console.warn(`server dropped ${dropped} leading input item(s) to fit the context window`)
       }
       if (usage) {
-        const end = performance.now()
+        const end = terminalAt || performance.now()
         const outTokens = usage.output_tokens ?? 0
         const rTokens = usage.output_tokens_details?.reasoning_tokens ?? 0
         const answerTokens = Math.max(0, outTokens - rTokens)
 
-        // reasoning phase: first reasoning token -> first content token (or end)
-        const reasoningMs = reasoningStartAt
-          ? (contentStartAt || end) - reasoningStartAt
-          : undefined
-        // answer phase: first content token -> done
-        const answerMs = contentStartAt ? end - contentStartAt : undefined
-
-        // Continue accumulates onto the truncated reply's totals (a fresh reply
-        // has no prior to add to; the content-start partial is recomputed here).
         const prev = append ? assistant.usage : undefined
         const tAnswerTokens = (prev?.completionTokens ?? 0) + answerTokens
-        const tAnswerMs = (prev?.answerMs ?? 0) + (answerMs ?? 0)
         const tReasonTokens = (prev?.reasoningTokens ?? 0) + rTokens
-        const tReasonMs = (prev?.reasoningMs ?? 0) + (reasoningMs ?? 0)
         // cost accumulates like tokens on Continue; stays undefined when the
         // provider never reported money (never a fake $0)
         const tCost =
@@ -1596,20 +1649,16 @@ export function useChatStream() {
             ? (prev?.costUsd ?? 0) + (usage.cost ?? 0)
             : undefined
 
-        assistant.usage = {
+        assistant.usage = measuredUsage({
+          ...engineFields(engineTiming, prev),
           promptTokens: usage.input_tokens ?? prev?.promptTokens ?? 0,
           completionTokens: tAnswerTokens,
           ms: (prev?.ms ?? 0) + (end - started),
           ttftMs: firstTokenAt ? Math.round(firstTokenAt - started) : prev?.ttftMs,
-          answerMs: tAnswerMs || undefined,
-          tps: tAnswerTokens > 0 && tAnswerMs > 0 ? tAnswerTokens / (tAnswerMs / 1000) : undefined,
           reasoningTokens: tReasonTokens || undefined,
-          reasoningMs: tReasonMs || undefined,
-          reasoningTps:
-            tReasonTokens > 0 && tReasonMs > 0 ? tReasonTokens / (tReasonMs / 1000) : undefined,
           provider: servedBy ?? prev?.provider,
           costUsd: tCost,
-        }
+        })
       }
     } catch (e) {
       apply()
@@ -1645,6 +1694,9 @@ export function useChatStream() {
         void maybeCompact(conv, models.maxCtx, replyReserve(settings.maxTokens), (c) =>
           chat.persistNow(c),
         )
+      }
+      if (!lane && !assistant.error && !assistant.stopped && !controller.signal.aborted) {
+        void chat.generateTitle(conv.id, true).catch(e => console.warn('Automatic title was not saved', e))
       }
     }
   }
@@ -2084,17 +2136,24 @@ export function useChatStream() {
 
   async function send(
     parts: ContentPart[],
-    opts?: { lane?: string; auto?: boolean },
+    opts?: { lane?: string; auto?: boolean; accepted?: () => void; beforeRun?: () => void },
   ): Promise<void> {
     const conv = chat.active
-    if (!conv || isStreaming.value || parts.length === 0) return
+    if (!conv || isStreaming.value || parts.length === 0) {
+      if (opts?.accepted) throw new Error('The conversation is not ready to accept this message')
+      return
+    }
     // A laned send in compare runs only the owning lane; the message itself
     // is stamped so the other lanes never see it in their history either.
     const lane = opts?.lane
     const lanes = laneModels(conv)
     const targeted = lane && lanes.length >= 2 ? lanes.filter((l) => l === lane) : null
-    if (targeted && !targeted.length) return // owner not armed - nothing to run
-    chat.addMessage(conv, {
+    if (targeted && !targeted.length) {
+      if (opts?.accepted) throw new Error('The selected compare lane is not available')
+      return
+    }
+    const previous = { leafId: conv.leafId, title: conv.title, updatedAt: conv.updatedAt }
+    const user = chat.addMessage(conv, {
       id: uid(),
       role: 'user',
       content: parts,
@@ -2103,6 +2162,22 @@ export function useChatStream() {
       createdAt: Date.now(),
     })
     chat.maybeTitle(conv)
+    // A native composer clears its independent draft only after this receipt.
+    // Existing web callers retain their usual debounced persistence behavior.
+    if (opts?.accepted) {
+      try {
+        await chat.persistNow(conv, true)
+      } catch (error) {
+        // Swift keeps its draft on a failed durable receipt. Remove this
+        // unaccepted turn locally so retry does not append the same input twice.
+        const index = conv.messages.findIndex(m => m.id === user.id)
+        if (index >= 0) conv.messages.splice(index, 1)
+        Object.assign(conv, previous)
+        throw error
+      }
+      opts.accepted()
+    }
+    opts?.beforeRun?.()
     if (lanes.length >= 2) {
       await fanOut(conv, targeted ?? lanes)
       return
@@ -2129,24 +2204,26 @@ export function useChatStream() {
    *
    *  This used to `splice` the old answer out of the array, which is why a
    *  regenerate you did not like used to be unrecoverable. */
-  async function regenerate(): Promise<void> {
+  async function regenerate(opts?: { accepted: () => void; beforeRun: () => void }): Promise<void> {
     const conv = chat.active
-    if (!conv || isStreaming.value) return
+    if (!conv || isStreaming.value) { if (opts) throw new Error('The conversation is busy'); return }
     // The tail STEP of the branch on screen, which for a compare block is all
     // of its lanes at once.
     const steps = activeSteps(conv)
     const tail = steps[steps.length - 1]
-    if (!tail || stepAnchor(tail).role !== 'assistant') return
+    if (!tail || stepAnchor(tail).role !== 'assistant') { if (opts) throw new Error('No answer to retry'); return }
     // Every re-roll hangs where the answer it replaces hangs: from the
     // question, not from the answer.
     const at = stepAnchor(tail).parentId ?? null
     const lanes = laneModels(conv)
+    if (opts && lanes.length >= 2) throw new Error('Use shared Studio for compare retries')
     if (lanes.length >= 2) {
       await fanOut(conv, lanes, at)
       return
     }
     // a document parser regenerates the same way it sent: per page
-    if (await maybeDocRun(conv, at)) return
+    if (!opts && await maybeDocRun(conv, at)) return
+    const previous = { leafId: conv.leafId, updatedAt: conv.updatedAt }
     const assistant = chat.addMessage(
       conv,
       {
@@ -2159,6 +2236,15 @@ export function useChatStream() {
       },
       at,
     )
+    if (opts) {
+      try { await chat.persistNow(conv, true) } catch (e) {
+        conv.messages = conv.messages.filter(m => m.id !== assistant.id)
+        Object.assign(conv, previous)
+        throw e
+      }
+      opts.accepted()
+      opts.beforeRun()
+    }
     await run(conv, assistant)
   }
 
@@ -2168,11 +2254,12 @@ export function useChatStream() {
    *
    *  Everything downstream of the original - its answer and everything that
    *  followed - stays exactly where it is, on the branch it belongs to. */
-  async function editAndResend(messageId: string, parts: ContentPart[]): Promise<void> {
+  async function editAndResend(messageId: string, parts: ContentPart[], opts?: { accepted: () => void; beforeRun: () => void }): Promise<void> {
     const conv = chat.active
-    if (!conv || isStreaming.value || parts.length === 0) return
+    if (!conv || isStreaming.value || parts.length === 0) { if (opts) throw new Error('The conversation is busy'); return }
     const original = conv.messages.find((m) => m.id === messageId)
-    if (!original || original.role !== 'user') return
+    if (!original || original.role !== 'user') { if (opts) throw new Error('No question to edit'); return }
+    const previous = { leafId: conv.leafId, title: conv.title, updatedAt: conv.updatedAt }
 
     const edited = chat.addMessage(
       conv,
@@ -2188,6 +2275,15 @@ export function useChatStream() {
       original.parentId ?? null,
     )
     chat.maybeTitle(conv)
+    if (opts) {
+      try { await chat.persistNow(conv, true) } catch (e) {
+        conv.messages = conv.messages.filter(m => m.id !== edited.id)
+        Object.assign(conv, previous)
+        throw e
+      }
+      opts.accepted()
+      opts.beforeRun()
+    }
 
     const lanes = laneModels(conv)
     const targeted = edited.lane && lanes.length >= 2 ? lanes.filter((l) => l === edited.lane) : null
@@ -2208,9 +2304,9 @@ export function useChatStream() {
   }
 
   /** Continue a reply that hit the max-tokens cap, appending to the same turn. */
-  async function continueLast(): Promise<void> {
+  async function continueLast(opts?: { accepted: () => void; beforeRun: () => void }): Promise<void> {
     const conv = chat.active
-    if (!conv || isStreaming.value) return
+    if (!conv || isStreaming.value) { if (opts) throw new Error('The conversation is busy'); return }
     // The newest assistant turn on this BRANCH - a longer answer sitting on a
     // branch you switched away from is not the one the button is offering to
     // finish.
@@ -2222,11 +2318,15 @@ export function useChatStream() {
         break
       }
     }
-    if (!live) return
-    if (live.incomplete !== 'length') return
+    if (!live || live.incomplete !== 'length') { if (opts) throw new Error('No truncated reply to continue'); return }
+    if (opts) {
+      // Admission never clears the cutoff flag or touches existing text on a
+      // failed save. The same turn is extended only after a durable receipt.
+      await chat.persistNow(conv, true)
+      opts.accepted()
+      opts.beforeRun()
+    }
     live.streaming = true
-    live.incomplete = undefined
-    live.stopped = false
     await run(conv, live, true)
   }
 

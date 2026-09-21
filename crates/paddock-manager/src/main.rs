@@ -630,7 +630,8 @@ fn main() -> std::process::ExitCode {
                 }
             };
             let registry = paddock_manager::registry::Registry::new(models_dir.clone())
-                .with_cc(paddock_manager::readiness::probe().cc);
+                .with_cc(paddock_manager::readiness::probe_for_backend(&cfg.device).cc)
+                .with_backend(&cfg.device);
             println!("pulling {id} into {} ...", models_dir.display());
             match rt.block_on(registry.resolve(&id, None, true, None)) {
                 Ok(Some(r)) => {

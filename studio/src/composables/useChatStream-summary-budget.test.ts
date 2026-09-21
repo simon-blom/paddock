@@ -6,8 +6,8 @@
 // estimate does not know about the injected block, the request asks for a
 // reply the window cannot hold beside its own prompt.
 //
-// These tests drive the PUBLIC path (`send` / `continueLast`), mock only the
-// transport and the peripherals around it, and read the budget off the REAL
+// These tests drive the public path (`send` / `continueLast`), mock only the
+// transport and the peripherals around it, and read the budget off the real
 // JSON that would have gone on the wire. The estimator (lib/tokens.ts) and the
 // body builder (useChatStream.ts) are both under test here, so neither is
 // mocked.
@@ -30,7 +30,7 @@ const ENDPOINT = 'http://127.0.0.1:11540/v1/responses'
 //
 // Stores that only read the browser (localStorage, sockets, window.location)
 // and the background compaction pass (its own HTTP call, fired after the turn).
-// The conversation store is NOT mocked - the thread, its tree and the send
+// The conversation store is not mocked - the thread, its tree and the send
 // plan's indices are exactly what this is about.
 
 const mock = vi.hoisted(() => ({
@@ -165,10 +165,10 @@ beforeEach(() => {
   mock.settings = { maxTokens: null, maxToolCalls: null, summarize: true, markUnsure: false }
   mock.window = WINDOW
   mock.outCap = 0
-  // A CLOUD lane by default: the client summary is what a cloud lane sends,
+  // A cloud lane by default: the client summary is what a cloud lane sends,
   // because a local single-model lane hands context to the runner instead
   // (`context_management`, exact tokens - see the last test in this file). The
-  // continue path below is the other client-plan caller, and it is local.
+  // continue path below is the other client-plan caller, on a cloud lane too.
   mock.cloud = true
   captured = []
   fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
@@ -218,7 +218,7 @@ describe('send: a compacted prompt pays for its summary', () => {
     const instructions = req.instructions as string
     expect(instructions).toBe(`${instructions.split('\n\n')[0]}\n\n${SYS}\n\n${WRAPPER}${SUMMARY}`)
     expect(instructions.split(WRAPPER)).toHaveLength(2)
-    // ...and the cap is the window minus the prompt INCLUDING that block
+    // ...and the cap is the window minus the prompt including that block
     expect(req.max_output_tokens).toBe(SEND_CAP - BLOCK_TOKENS)
     expect(req.max_output_tokens).toBe(4813)
     // far above the 512 floor: this is about the charge, not about clamping
@@ -360,7 +360,9 @@ describe('send: a compacted prompt pays for its summary', () => {
     // 70% of the 10880-token prompt budget, in the runner's own tokens
     expect(req.context_management).toEqual([{ type: 'compaction', compact_threshold: 7615 }])
     expect(req.instructions).not.toContain(WRAPPER)
-    expect(req.max_output_tokens).toBe(SEND_CAP)
+    // A local lane asks for the whole window: the runner clamps against exact
+    // prompt tokens at admission, so no client estimate rides (localOutputMaximum).
+    expect(req.max_output_tokens).toBe(WINDOW)
   })
 })
 
@@ -370,17 +372,18 @@ describe('send: a compacted prompt pays for its summary', () => {
 // the thread and appends. The window keeps five turns (from index 3) and the
 // summary covers three, so again the raw transcript does not move.
 //
-// This runs on a LOCAL lane: a continue is excluded from the runner's
-// server-side compaction (its synthetic trailing user item would corrupt the
-// tail anchor), so it is on the client plan and carries the summary itself.
+// This runs on a cloud lane, like the send cases above. A continue is on the
+// client plan on either kind of lane (it is excluded from the runner's
+// server-side compaction, whose tail anchor its synthetic trailing user item
+// would corrupt), so it carries the summary itself - but only a cloud lane
+// budgets from the client estimate. A local one asks for the whole window and
+// lets the runner clamp, so there is no reply cap there for the summary to
+// come out of.
 /** 14 system + 5 x 2004 (no placeholder: the turn being continued is real). */
 const CONT_PROMPT = SYS_TOKENS + 5 * MSG_TOKENS
 const CONT_CAP = WINDOW - CONT_PROMPT - SLACK
 
 describe('continue: the resumed turn pays for the summary too', () => {
-  beforeEach(() => {
-    mock.cloud = false
-  })
 
   it('takes the block out of the budget it asks for', async () => {
     const conv = seed(8, { incomplete: 'length' })

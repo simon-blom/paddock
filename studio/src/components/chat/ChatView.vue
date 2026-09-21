@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { NATIVE_CONTENT } from '@/lib/native-content'
 import { useRoute, useRouter } from 'vue-router'
 import { useWindowSize } from '@vueuse/core'
 import { useChatStore } from '@/stores/chat'
@@ -13,7 +14,11 @@ import { isAudioFile } from '@/lib/transcribe'
 import { askedLanguage } from '@/lib/languages'
 import ConversationSidebar from './ConversationSidebar.vue'
 import ChatThread from './ChatThread.vue'
-import Composer from './Composer.vue'
+import AudioPlayer from './AudioPlayer.vue'
+import { attachmentsApi } from '@/lib/api'
+// The native workspace supplies its own composer. Do not even initialize
+// Tiptap/audio controls in that surface; web keeps the same component on demand.
+const Composer = defineAsyncComponent(() => import('./Composer.vue'))
 import ArtifactPanel from './ArtifactPanel.vue'
 // Async: the graph panel drags sigma + the traverse wasm glue with it.
 const GraphPane = defineAsyncComponent(() => import('@/components/chat/graph/GraphPane.vue'))
@@ -27,8 +32,14 @@ import ResizeHandle from '@/components/ui/ResizeHandle.vue'
 import { useArtifactsStore } from '@/stores/artifacts'
 import { useReadinessStore } from '@/stores/readiness'
 import { activeMessages } from '@/lib/tree'
+import { useConversationEffects } from '@/composables/useConversationEffects'
 
 const chat = useChatStore()
+useConversationEffects()
+const native = inject(NATIVE_CONTENT, null)
+const nativeDocumentEl = ref<InstanceType<typeof DocumentPane> | null>(null)
+watch(nativeDocumentEl, pane => native?.documentActions?.(pane), { flush: 'post' })
+onBeforeUnmount(() => native?.documentActions?.(null))
 const graphs = useGraphsStore()
 // A machine with no usable card must not be told to go start a model - the
 // Manager has nothing to start.
@@ -47,37 +58,6 @@ const { isStreaming, send, regenerate, editAndResend, continueLast, stop } = use
 // labeled user turn - after the streaming turn ends, never into it - so the
 // model repairs with artifact_update. The store caps it at two repairs per
 // artifact; past that the panel's error display is the human fallback.
-watch(
-  [() => artifacts.graphImportFailure, isStreaming],
-  ([failure, busy]) => {
-    if (!failure || busy || !chat.active) return
-    const f = artifacts.consumeGraphImportFailure()
-    if (!f) return
-    // The report names its artifact and goes only to the lane whose model
-    // wrote it - the first live compare run sent it to both lanes, and the
-    // healthy lane started redoing a working graph.
-    const meta = artifacts.list.find((a) => a.id === f.artifactId)
-    void send(
-      [
-        {
-          type: 'text',
-          text:
-            `[automatic import report] Your graph artifact ${f.artifactId}` +
-            `${meta?.title ? ` ("${meta.title}")` : ''} failed to import - ` +
-            'the app runs the script when it renders, and it did not execute ' +
-            `cleanly. ${f.summary}\n` +
-            `Fix ${f.artifactId} IN PLACE with artifact_update or ` +
-            'artifact_rewrite, following every rule in the graph ' +
-            'instructions. Do NOT create a new artifact - a fresh ' +
-            'artifact_create is the wrong answer. Do not describe the fix - ' +
-            'apply it.',
-        },
-      ],
-      { lane: meta?.model || undefined, auto: true },
-    )
-  },
-  { immediate: true },
-)
 
 initMarkstream()
 
@@ -102,7 +82,7 @@ const CHAT_MIN = 300
 const RAIL = 44
 const HANDLE = 7
 const SIDEBAR_DEFAULT = 260
-const sidebarWidth = ref(storedWidth('pk_sidebar_width', SIDEBAR_DEFAULT))
+const sidebarWidth = ref(native ? 0 : storedWidth('pk_sidebar_width', SIDEBAR_DEFAULT))
 // Where expanding puts it back. `pk_sidebar_width` is 0 while collapsed, so
 // the width you had chosen has to be remembered separately or every re-open
 // lands on 260 and quietly discards a dragged layout. Seeded from the CURRENT
@@ -229,6 +209,7 @@ const docOpen = computed(() => docAvailable.value && (chat.active?.docPaneOpen ?
 // have opened the document, the chip in the thread is the way in.
 const docRail = computed(() => docAvailable.value && chat.active?.docPaneOpen === false)
 function toggleDocPane(): void {
+  if (native?.preview.value) { native.preview.value = null; return }
   chat.setDocPane(!docOpen.value)
 }
 // How wide the artifacts may get is whatever is left once the chat keeps a
@@ -241,7 +222,7 @@ const { width: winWidth } = useWindowSize()
  *  (a panel or its rail), the document rail when the document is folded, and
  *  every divider standing between them. */
 function othersWidth(otherPanes: number): number {
-  const history = sidebarOpen.value ? sidebarWidth.value : RAIL
+  const history = native ? 0 : sidebarOpen.value ? sidebarWidth.value : RAIL
   const up = graphUp.value
   const handles =
     HANDLE * (1 + (docOpen.value ? 1 : 0) + (artifactsOpen.value ? 1 : 0) + (up ? 1 : 0))
@@ -302,13 +283,6 @@ watch(
 watch(docMax, (m) => {
   if (docPaneWidth.value > m) docPaneWidth.value = m
 })
-watch(
-  () => [chat.activeId, isStreaming.value] as const,
-  ([id, streaming]) => {
-    if (!streaming) void artifacts.refresh(id ?? '')
-  },
-  { immediate: true },
-)
 // The moment a compare turn gives a second (or third, or fourth) model an
 // artifact, widen the panel enough to actually sit them next to each other -
 // that is the whole point of comparing, and a 420px panel silently falls back
@@ -335,12 +309,25 @@ const sidebarRef = ref<InstanceType<typeof ConversationSidebar> | null>(null)
 // the hint line and the tool row folding - so it is measured off the
 // composer's own root and published as a var the thread reads.
 const mainEl = ref<HTMLElement | null>(null)
+const nativeColumnEl = ref<HTMLElement | null>(null)
 let composerRo: ResizeObserver | undefined
+let observedThread: HTMLElement | null = null
+let observedColumn: HTMLElement | null = null
+const observedWidths = new WeakMap<Element, number>()
 function composerEl(): HTMLElement | null {
   const el = composerRef.value?.$el
   return el instanceof HTMLElement ? el : null
 }
 function measureComposer(): void {
+  if (native && mainEl.value) {
+    // Publish the actual content box, including scrollbar/panel/compare
+    // geometry. Swift must not independently cap or inset this a second time.
+    const column = mainEl.value.querySelector<HTMLElement>('.thread__inner') ?? nativeColumnEl.value
+    if (!column) return
+    const bounds = column.getBoundingClientRect()
+    native.viewport(bounds.left, bounds.width)
+    return
+  }
   const el = composerEl()
   if (el && mainEl.value) mainEl.value.style.setProperty('--pk-composer-h', `${el.offsetHeight}px`)
 }
@@ -382,48 +369,11 @@ const isDraft = computed(() => isHome.value || isNew.value)
 // into the Studio means to use it. A draft has no history to protect, so it
 // adopts the seat. A committed conversation never does - its model is a
 // decision, and a runner coming up is not a reason to overrule it.
-watch(
-  () => models.currentId,
-  (id) => {
-    const c = chat.active
-    if (!id || !c || !chat.isDraft(c) || c.messages.length) return
-    // Compare arms the lane set explicitly; the seat has no business in it.
-    if (c.compareModels?.length) return
-    c.model = id
-  },
-)
 
 // The attached graph follows the conversation on screen: reopening a chat
 // that carries a .tvdb re-establishes its session (OPFS makes that cheap);
 // switching to one that doesn't releases the worker - a 100 MB graph is not
 // something to keep resident for a background chat.
-watch(
-  // Messages load asynchronously after the id is set, so keying on the id
-  // alone scanned an empty list and never looked again - a reopened graph
-  // conversation showed nothing (the maintainer, first live session). The length makes
-  // the scan re-run when the doc actually arrives; ensure() is idempotent so
-  // the extra fires are free.
-  () => [chat.active?.id, chat.active?.messages.length, chat.active?.leafId] as const,
-  ([id]) => {
-    const conv = chat.active
-    if (!id || !conv) {
-      graphs.release()
-      return
-    }
-    let g: { attachmentId: string; name: string } | undefined
-    // The branch on screen: a graph on a branch the user switched away from
-    // must not keep driving the pane.
-    for (const m of activeMessages(conv)) {
-      for (const part of m.content) if (part.type === 'graph') g = part
-    }
-    if (g) void graphs.ensure(id, g.attachmentId, g.name)
-    // Only a different conversation's session is stale - "no graph part in
-    // sight" also happens while this conversation's messages are still
-    // loading, and releasing then would kill a session we are about to want.
-    else if (graphs.conversationId && graphs.conversationId !== id) graphs.release()
-  },
-  { immediate: true },
-)
 
 /** Called on send - the only place a conversation comes into being. On a draft
  *  surface the draft becomes real here; in a chat we're appending to the one
@@ -496,15 +446,28 @@ onMounted(async () => {
   window.addEventListener('dragover', preventNav)
   window.addEventListener('drop', preventNav)
   window.addEventListener('keydown', onKey)
-  composerRo = new ResizeObserver(() => {
+  composerRo = new ResizeObserver(entries => {
+    if (native) {
+      // Streaming changes the inner column's height; it must not turn layout
+      // measurement into per-token work. Only inline-size changes matter here.
+      let changed = false
+      for (const entry of entries) {
+        if (observedWidths.get(entry.target) !== entry.contentRect.width) changed = true
+        observedWidths.set(entry.target, entry.contentRect.width)
+      }
+      if (!changed) return
+    }
     measureComposer()
     const t = threadEl()
     if (t) measureGutter(t)
   })
   const el = composerEl()
   if (el) composerRo.observe(el)
+  if (native && mainEl.value) composerRo.observe(mainEl.value)
+  if (nativeColumnEl.value) composerRo.observe(nativeColumnEl.value)
   watchThread()
   measureComposer()
+  native?.mounted()
 })
 /** The thread lives inside ChatThread, so it is found rather than passed -
  *  observing it is what catches the scrollbar APPEARING (the content box
@@ -514,13 +477,30 @@ function threadEl(): HTMLElement | null {
   return mainEl.value?.querySelector('.thread') ?? null
 }
 function watchThread(): void {
+  if (observedThread) composerRo?.unobserve(observedThread)
+  if (observedColumn) composerRo?.unobserve(observedColumn)
   const t = threadEl()
+  observedThread = t
+  observedColumn = native ? mainEl.value?.querySelector<HTMLElement>('.thread__inner') ?? null : null
   if (t && composerRo) {
     composerRo.observe(t)
     measureGutter(t)
   }
+  if (observedColumn) composerRo?.observe(observedColumn)
+  if (native) measureComposer()
 }
-watch(isHome, () => void nextTick(watchThread))
+watch([isHome, () => chat.activeLoading], () => void nextTick(watchThread))
+// Native document-only mode has no web chat column. Rebind when the shared
+// renderer returns; observers attached just at mount would keep reporting the
+// old width (or zero) after a native -> shared transition.
+watch([mainEl, nativeColumnEl], ([main, column], [oldMain, oldColumn]) => {
+  if (!native) return
+  if (oldMain) composerRo?.unobserve(oldMain)
+  if (oldColumn) composerRo?.unobserve(oldColumn)
+  if (main) composerRo?.observe(main)
+  if (column) composerRo?.observe(column)
+  watchThread()
+}, { flush: 'post' })
 // Back/forward + sidebar clicks change the URL; follow it. Watch the route NAME
 // too, not just the id: `/` ⇄ `/chat/:id` is a name change, and going home has
 // to mint a fresh draft.
@@ -539,6 +519,7 @@ function preventNav(e: DragEvent): void {
  *  kind of friction that makes a shortcut go unused. Silent on the start page,
  *  which has no history sidebar to fold. */
 function onKey(e: KeyboardEvent): void {
+  if (native) return // AppKit owns application shortcuts.
   if (isHome.value) return
   if (isToggleChats(e)) {
     e.preventDefault()
@@ -593,6 +574,7 @@ function onDrop(e: DragEvent): void {
   e.preventDefault()
   dragDepth = 0
   dragging.value = false
+  if (native) return // Native file grants/upload; never navigate to a file URL.
   const dropped = Array.from(e.dataTransfer?.files ?? [])
   if (dropped.length) void composerRef.value?.addFiles(dropped)
 }
@@ -628,7 +610,7 @@ async function onSubmit(text: string): Promise<void> {
         const part = await readGraphPart(f, chat.active?.id)
         parts.push(part)
         const bytes = new Uint8Array(await f.arrayBuffer())
-        if (chat.active) await graphs.ensure(chat.active.id, part.attachmentId, part.name, bytes)
+        if (chat.active) await graphs.ensure(chat.active.id, part.attachmentId, part.name, bytes, chat.active.messages)
       } else if (isImageFile(f)) {
         // the per-image size the composer's menu set (defaults to 'auto');
         // a multi-page TIFF carries its own page range
@@ -680,12 +662,29 @@ function newChat(): void {
 <template>
   <div
     class="chatview"
+    :class="{ 'chatview--native': native }"
     :style="{ '--pk-sidebar-width': `${sidebarWidth}px` }"
     @dragenter="onDragEnter"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
     @drop="onDrop"
   >
+    <!-- Swift owns both columns in native transcript mode. Keep the same
+         authenticated workspace/orchestrator, mounting only the selected
+         document here. Closing unmounts its canvases and viewer resources. -->
+    <section v-if="native?.audioPreview?.value && !native?.nativeMarkdown?.value" class="native-audio-preview">
+      <header>
+        <span>{{ native.audioPreview.value.name || 'Audio clip' }}</span>
+        <button class="pk-icon-btn" type="button" aria-label="Close audio preview" @click="native.audioPreview.value = null"><Icon name="x" :size="16" /></button>
+      </header>
+      <AudioPlayer :src="attachmentsApi.url(native.audioPreview.value.attachmentId)" :type="native.audioPreview.value.mime"
+        :clip="native.audioPreview.value.attachmentId" :fallback="native.audioPreview.value.durationS" />
+    </section>
+    <template v-else-if="native?.nativeMarkdown?.value">
+      <DocumentPane v-if="native.document?.value" ref="nativeDocumentEl" :key="native.document.value.id"
+        :conversation="native.document.value" embedded class="native-document-surface" />
+    </template>
+    <template v-else>
     <!-- The start page is a clean landing: no history sidebar, nothing lit in
          the activity bar. Both appear once you're in a chat. -->
     <!-- The history is foldable two ways: the control in its own header, and
@@ -693,7 +692,7 @@ function newChat(): void {
          screen wants when the artifacts deserve the room. Folded, it comes
          back from the button over the thread, the same shortcut, or dragging
          the divider back out. -->
-    <template v-if="!isHome">
+    <template v-if="!native && !isHome">
       <ConversationSidebar
         v-if="sidebarOpen"
         ref="sidebarRef"
@@ -730,8 +729,10 @@ function newChat(): void {
         :collapse-at="110"
       />
     </template>
-    <template v-if="!isDraft && docOpen">
+    <template v-if="native?.preview.value || (!isDraft && docOpen)">
       <DocumentPane
+        :conversation="native?.preview.value ?? chat.active ?? undefined"
+        @selection="c => { if (!native?.preview.value) chat.persist(c) }"
         :style="{ '--pk-docpane-width': `${docPaneWidth}px` }"
         @fold="toggleDocPane"
       />
@@ -753,6 +754,7 @@ function newChat(): void {
       </Tooltip>
     </aside>
     <div ref="mainEl" class="chatview__main" :class="{ 'chatview__main--home': isHome }">
+      <div v-if="native" ref="nativeColumnEl" class="native-content-column" aria-hidden="true" />
       <div v-if="!isHome && chat.activeLoading" class="chatview__msg" role="status">
         <Icon name="spinner" :size="20" class="chatview__spin" />
         <span>Opening...</span>
@@ -762,12 +764,12 @@ function newChat(): void {
         <button class="pk-btn pk-btn--sm" type="button" @click="retryOpen">Try again</button>
       </div>
       <ChatThread
-        v-else-if="!isHome"
+        v-else-if="!isHome && !native?.nativeMarkdown?.value"
         @regenerate="regenerate"
         @continue-reply="continueLast"
         @edit="editAndResend"
       />
-      <div v-if="isHome && !models.loading && !hasTurnModel" class="home__noservers">
+      <div v-if="!native && isHome && !models.loading && !hasTurnModel" class="home__noservers">
         <Icon name="server" :size="15" />
         <span v-if="soleEncoderName">
           <RouterLink :to="{ name: 'embeddings' }"
@@ -789,6 +791,7 @@ function newChat(): void {
       <!-- One Composer either way: on `/` it's the centred hero, in a chat it
            docks at the bottom. Same instance = same toolbar, same file tray. -->
       <Composer
+        v-if="!native"
         ref="composerRef"
         v-model:files="files"
         :busy="isStreaming"
@@ -852,6 +855,7 @@ function newChat(): void {
         </div>
       </div>
     </Transition>
+    </template>
   </div>
 </template>
 

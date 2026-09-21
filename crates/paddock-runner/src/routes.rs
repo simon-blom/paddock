@@ -279,6 +279,9 @@ pub struct AppState {
     /// The loaded forced-alignment model (Qwen3-ForcedAligner), if one was
     /// configured - serves `/v1/audio/alignments` only.
     pub aligner: Option<crate::serving::AlignModel>,
+    /// The loaded dense-prediction model (tic-forestry: DINOv3 + decoder), if
+    /// one was configured - serves `/v1/segmentations` only.
+    pub segmenter: Option<crate::serving::SegmentModel>,
     /// Served context window (`--max-ctx`) - the hard ceiling for a reply's
     /// tokens; clients can read it from /api/server.
     pub max_ctx: usize,
@@ -368,6 +371,7 @@ impl AppState {
             embedder: None,
             asr: None,
             aligner: None,
+            segmenter: None,
             max_ctx: 8192,
             vad_gate: false,
             max_batch: 8,
@@ -463,6 +467,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(crate::transcriptions::handle),
         )
         .route("/v1/audio/alignments", post(crate::alignments::handle))
+        .route("/v1/segmentations", post(crate::segmentations::handle))
         .fallback(not_found)
         // Axum's default body limit is 2 MB, which is below what a single
         // legitimate request carries here: a data-URI image inflates 4/3 in
@@ -781,6 +786,11 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // model loaded at all - so this is a plain bool, not the serving
         // model's own flag.
         "audio": state.serving.as_ref().is_some_and(|s| s.supports_audio) || state.asr.is_some(),
+        "realtime_transcription": crate::realtime::capabilities(
+            state.asr.is_some() || state.serving.as_ref().is_some_and(|s| s.supports_audio),
+            state.asr.is_some(),
+            state.serving.as_ref().filter(|s| s.supports_audio).and_then(|s| s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
+        ),
         "asr": state.asr.as_ref().map(|a| a.id.clone()),
         // Forced-alignment model id: POST /v1/audio/alignments works iff this
         // is set. Same one-call model-card rule as `asr` - an aligner-only
@@ -791,6 +801,33 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // budget) - surfaced so a client can split-or-skip before sending
         // bytes instead of learning the cap from a 400.
         "alignment_max_clip_s": state.aligner.as_ref().map(|a| a.max_clip_s),
+        // Dense-prediction model id: POST /v1/segmentations works iff this is
+        // set. Same one-call model-card rule - a segmentation-only runner has
+        // none of the keys above. `segmentation` is everything a client needs
+        // to build a valid request without probing: the chip it must send and
+        // the rasters it will get back.
+        "segmenter": state.segmenter.as_ref().map(|s| s.id.clone()),
+        "segmentation": state.segmenter.as_ref().map(|s| {
+            let i = s.segmenter.info();
+            let c = &i.config;
+            serde_json::json!({
+                "input": {
+                    "size": c.image_size,
+                    "bands": c.band_names,
+                    "dtype": "uint8",
+                    "pixel_size_m": c.pixel_size_m,
+                    "chip_bytes": c.image_size * c.image_size * c.channels,
+                },
+                "output": {
+                    "size": c.out_size,
+                    "pixel_size_m": c.out_pixel_size_m,
+                    "class_names": c.class_names,
+                    "regression": c.regression_name,
+                },
+                "epsg": c.epsg,
+                "chips_per_pass": i.max_batch,
+            })
+        }),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
         // as the alignment cap above. Null means no ceiling worth
         // publishing: whisper windows a clip into 30 s pieces, so length costs
@@ -821,8 +858,8 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // that mode emits no punctuation, so there are no sentence boundaries
         // to cut segments on. Whisper first, because the handler picks the
         // whisper lane when a runner carries both.
-        "timestamp_granularities": if state.asr.is_some() {
-            serde_json::json!(["segment", "word"])
+        "timestamp_granularities": if let Some(asr) = &state.asr {
+            asr.timestamp_granularities()
         } else if state.serving.as_ref().is_some_and(|s| s.audio_word_times) {
             serde_json::json!(["word"])
         } else {
@@ -1061,19 +1098,20 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             "output_modalities": ["text"],
             "modality": format!("{}->text", input_modalities.join("+")),
         });
-        // Tool calling is a dialect feature every served chat model has (the
-        // parser is selected from the architecture); vision/transcription only
+        // Tool calling is a chat-dialect feature, not a transcript feature;
+        // vision/transcription only
         // when the matching mmproj is actually attached. `transcription` is the
         // functional truth for POST /v1/audio/transcriptions - same computed-
         // never-declared rule as everything else in this listing.
         let mut capabilities = serde_json::json!({
-            "function_calling": true,
+            "function_calling": s.dialect.supports_tools(),
             "vision": s.supports_vision,
             // A document parser reads pages and nothing else: text-only chat
             // is refused with a 400 (its decoder free-runs noise on a bare
             // prompt), so a client should gate its composer on this.
             "document_parser": s.document_parser,
             "transcription": s.supports_audio,
+            "realtime_transcription": crate::realtime::capabilities(s.supports_audio, false, s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
             // Usually empty even when transcription works: Qwen3-ASR and the
             // base granite-speech emit a bare transcript with no timestamp
             // vocabulary at all, so there is no granularity they can answer,
@@ -1120,6 +1158,10 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         ]
         .map(str::to_owned)
         .into();
+        if !s.dialect.supports_tools() {
+            params
+                .retain(|p| !matches!(p.as_str(), "tools" | "tool_choice" | "parallel_tool_calls"));
+        }
         if s.reasoning.reasons() {
             params.push("reasoning_effort".to_owned());
             params.sort();
@@ -1210,6 +1252,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                 }),
                 serde_json::json!({
                     "transcription": true,
+                    "realtime_transcription": crate::realtime::capabilities(true, true, None),
                     // Which `timestamp_granularities[]` this model can actually
                     // answer, so a UI knows what to offer instead of discovering
                     // it from a 400. Two mechanisms, both real on this family:
@@ -1217,7 +1260,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                     // `word` from cross-attention DTW over a second,
                     // teacher-forced pass. A model with neither says
                     // so with an empty list, never with a silently-empty array.
-                    "timestamp_granularities": ["segment", "word"],
+                    "timestamp_granularities": a.timestamp_granularities(),
                     // The trained language-detection pass, its posterior, and the
                     // exact language set this checkpoint declares  -
                     // read out of the file's own map, so a converted checkpoint
@@ -1250,11 +1293,33 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                 }),
                 serde_json::json!({
                     "alignment": true,
-                    // seconds one call can address: the head's bin budget
+                    // Effective backend limit, which may be below the bin budget.
                     "alignment_max_clip_s": al.max_clip_s,
                 }),
                 vec!["language".to_owned(), "text".to_owned()],
                 al.max_ctx,
+            ),
+        );
+    }
+    if let Some(sg) = &state.segmenter {
+        // dense prediction only: image chips in, rasters out -
+        // /v1/segmentations and nothing else. No context window: the listing
+        // slot carries the chip side instead of inventing a token count.
+        let c = &sg.segmenter.info().config;
+        data.push(
+            ModelObject::new(sg.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["image"],
+                    "output_modalities": ["raster"],
+                    "modality": "image->raster",
+                }),
+                serde_json::json!({
+                    "segmentation": true,
+                    "segmentation_classes": c.class_names,
+                    "segmentation_regression": c.regression_name,
+                }),
+                vec!["response_format".to_owned(), "logits".to_owned()],
+                0,
             ),
         );
     }

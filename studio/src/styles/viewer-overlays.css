@@ -1,0 +1,83 @@
+/* Reader chrome only. Enumerate surface classes instead of recoloring every
+   descendant: annotation swatches, signature ink, PDF forms and search marks
+   are content or meaningful feedback, not a second application theme.
+   :root gives these host rules precedence over the bundled viewer CSS even
+   when its stylesheet is loaded later. It also covers body-level portals. */
+:root :is(
+  .lector-dropdown__menu, .lector-context-menu, .lector-tool-group__panel,
+  .lector-annot-popover, .lector-sig-status-popover,
+  .lector-cmt-thread__props-dropdown, .lector-cmt-mention-dropdown,
+  .lector-modal, .lector-tooltip, .lector-poly-tooltip, .lector-toast,
+  .lector-capture-action-bar, .lector-text-sel-toolbar,
+  .lector-multi-select-bar, .lector-search-bar
+) {
+  background: var(--pk-bg-popup);
+  color: var(--pk-text-primary);
+  border: 1px solid var(--pk-border-default);
+  border-radius: var(--pk-radius-lg);
+  box-shadow: var(--pk-shadow-md);
+  font-family: var(--pk-font-sans);
+  font-size: var(--pk-popup-font-size);
+  /* Menus declare sizes on their children; match those as well. */
+  --lector-font-size-sm: var(--pk-popup-font-size);
+}
+
+:root :is(.lector-modal-overlay, .lector-sidebar-backdrop) {
+  background: var(--pk-bg-overlay);
+}
+
+:root :is(.lector-tooltip, .lector-poly-tooltip) {
+  padding: 6px 10px;
+}
+
+/* The selection toolbar used an inverse surface; its buttons must move with
+   the surface, not retain the old paper-colored foreground. */
+:root .lector-text-sel-toolbar__btn {
+  color: var(--pk-text-primary);
+  border-radius: var(--pk-radius-md);
+}
+:root .lector-text-sel-toolbar__btn:hover {
+  background: var(--pk-bg-hover);
+}
+
+:root :is(.lector-modal__input, .lector-cal-dialog__input, .lector-cal-dialog__select) {
+  background: var(--pk-bg-base);
+  border-radius: var(--pk-radius-md);
+  font-family: var(--pk-font-sans);
+  accent-color: var(--pk-accent);
+}
+
+:root .lector-modal__btn {
+  border-radius: var(--pk-radius-md);
+  font-family: var(--pk-font-sans);
+}
+
+/* A monochrome dark theme has a light primary fill. White is not an
+   on-accent color. Do not apply this rule to red danger buttons. */
+:root .lector-modal__btn--primary {
+  color: var(--lector-fg-on-accent);
+}
+
+:root .lector-modal :is(input, select, textarea) {
+  accent-color: var(--pk-accent);
+}
+
+:root .lector-modal :is(input, select, textarea, button):focus-visible {
+  outline: 2px solid var(--pk-border-focus);
+  outline-offset: 2px;
+}
+
+/* Preserve the destructive meaning, but use the host's semantic tint. */
+:root .lector-context-menu__item--danger:hover {
+  background: var(--pk-status-error-subtle);
+}
+
+/* The metadata/preview dialogs are Reka portals, not Lector modals. They
+   still share the same host surface, edge and elevation contract. */
+:root .pv__content {
+  background: var(--pk-bg-popup);
+  color: var(--pk-text-primary);
+  border: 1px solid var(--pk-border-default);
+  border-radius: var(--pk-radius-lg);
+  box-shadow: var(--pk-shadow-md);
+}

@@ -93,6 +93,7 @@ pub struct ManagerInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuInfo {
+    pub backend: String,
     /// The readiness verdict ("ready" | "untested" | "driver-too-old" |
     /// "needs-setup" | "no-card"). Half of every "it won't start" report is
     /// answered by this line alone.
@@ -195,6 +196,7 @@ fn context_from(state: &AppState, fleet: Vec<crate::supervisor::RunnerView>) -> 
             arch: std::env::consts::ARCH,
         },
         gpu: GpuInfo {
+            backend: state.readiness.backend.clone(),
             state: readiness.state,
             card: readiness.card.clone(),
             generation: readiness.generation.clone(),
@@ -391,7 +393,7 @@ mod tests {
         let blob = context_from(&state, Vec::new());
         assert!(blob.runners.is_empty());
         assert_eq!(blob.manager.version, paddock_admin::version::SEMVER);
-        assert!(!blob.gpu.cuda_needed.is_empty());
+        assert_eq!(blob.gpu.cuda_needed.is_empty(), blob.gpu.backend == "metal");
     }
 
     #[test]

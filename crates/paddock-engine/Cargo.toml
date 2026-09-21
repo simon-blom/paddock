@@ -7,10 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+default = ["cuda"]
+# The scheduler, generation contract and logical caches also serve Metal.
+# Device-specific model graphs and offload transports are CUDA-only.
+cuda = ["dep:cudarc"]
 # Weld the CUDA kernels into the binary instead of dlopen'ing a pack.
 # Off by default: dev keeps --kernel-pack and the fast rebuild loop,
 # GPU-less CI keeps building. Release turns it on.
-static-pack = ["paddock-kernels/static-pack"]
+static-pack = ["cuda", "paddock-kernels/static-pack"]
 # The shipped-binary flavour: every development switch compiled
 # out, so the elected route is the only route. See paddock-models/hardening.rs
 # for the four env populations and why the engine->pack transport names stay.
@@ -19,7 +23,7 @@ hardened = ["paddock-models/hardened"]
 [dependencies]
 tracing = { workspace = true }
 thiserror = { workspace = true }
-cudarc = { workspace = true }
+cudarc = { workspace = true, optional = true }
 half = { workspace = true }
 tokio = { workspace = true }
 # No `rand` - the only thing the engine wanted from it was `SeedableRng`, which

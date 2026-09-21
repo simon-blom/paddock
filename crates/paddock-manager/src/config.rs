@@ -33,8 +33,7 @@ pub struct Config {
     /// `paddock-runner` beside this executable; runners/<version>/ election
     /// lands with the artifact scheme (doc §11.1).
     pub runner_bin: Option<PathBuf>,
-    /// Device passed to spawned runners. Only "cuda" exists; there is no
-    /// CPU path and no auto-fallback.
+    /// Device passed to spawned runners. Native platform default; no CPU fallback.
     pub device: String,
     /// Kernel pack passed to spawned runners (PADDOCK_KERNEL_PACK).
     pub kernel_pack: Option<PathBuf>,
@@ -82,7 +81,12 @@ impl Default for Config {
             api_key: None,
             trusted_proxy: false,
             runner_bin: None,
-            device: "cuda".to_owned(),
+            device: if cfg!(target_os = "macos") {
+                "metal"
+            } else {
+                "cuda"
+            }
+            .to_owned(),
             kernel_pack: None,
             runner_base_port: 11540,
             spawn_timeout_s: 300,

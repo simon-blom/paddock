@@ -6,6 +6,10 @@ import { DEFAULT_PARAMS, messageText } from '@/types/chat'
 import { activeMessages, deleteSubtree, migrate, stepSibling, tipId } from '@/lib/tree'
 import { taskLabel } from '@/lib/tasks'
 import { store, stubFromSummary } from '@/lib/api'
+import { titleGenerator, titleTranscript } from '@/lib/chat-title'
+import { useModelsStore } from './models'
+import { useSettingsStore } from './settings'
+import { isConversationRunning } from '@/lib/chat-activity'
 
 function uid(): string {
   return uuid()
@@ -23,6 +27,10 @@ export const useChatStore = defineStore('chat', () => {
   // One fetch per document however many callers ask at once - hydrate and the
   // route sync both open the resumed chat.
   const inflight = new Map<string, Promise<void>>()
+  const metadataEdits = new Map<string, Promise<void>>()
+  const deleting = new Set<string>()
+  const titleState = ref<Record<string, string>>({})
+  const titleJobs = new Map<string, symbol>()
 
   // The start page's conversation-in-waiting. It is deliberately not in
   // `conversations` and not on the server: the sidebar lists committed chats
@@ -140,26 +148,37 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  /** Change a conversation that may not be loaded yet - a sidebar rename or
-   *  pin on a chat nobody has opened, or a model picked while the document is
-   *  still on its way. The change shows at once on whatever object is there,
-   *  then is applied again to the real document once it lands, and only that
-   *  is saved: the stub is thrown away by the load, so an edit made only to
-   *  it would silently vanish, and saving the stub itself would replace the
-   *  stored conversation with an empty one. */
+  /** Generic settings/model edits also apply to in-memory drafts. Keep this
+   * separate from acknowledged history metadata operations: a draft has no
+   * stored document to hydrate yet. */
   async function edit(id: string, apply: (c: Conversation) => void): Promise<void> {
-    const now = conversations.value.find((x) => x.id === id) ?? (draft.value?.id === id ? draft.value : null)
+    const now = conversations.value.find(x => x.id === id) ?? (draft.value?.id === id ? draft.value : null)
     if (!now) return
     apply(now)
-    if (isDraft(now)) return persist(now)
+    if (isDraft(now)) return
     await ensureLoaded(id)
-    const live = conversations.value.find((x) => x.id === id)
+    const live = conversations.value.find(x => x.id === id)
     if (!live || !loadedIds.value.has(id)) return
-    // re-apply only when the load swapped the object; an already-loaded chat
-    // got the change above, and `apply` need not be idempotent
     if (toRaw(live) !== toRaw(now)) apply(live)
-    // awaited, so a caller's `await rename(...)` means the rename is stored
     await persistNow(live)
+  }
+
+  /** Hydrate before editing metadata; never save a summary stub over the full
+   * document. Serialize metadata edits and roll back only their fields on a
+   * failed durable save, leaving newly streamed message content untouched. */
+  function editMetadata(id: string, apply: (c: Conversation) => void): Promise<void> {
+    const run = (metadataEdits.get(id) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      if (deleting.has(id)) throw new Error('This conversation is being deleted')
+      await ensureLoaded(id)
+      const live = conversations.value.find(x => x.id === id)
+      if (!live || !loadedIds.value.has(id) || deleting.has(id)) throw new Error('The conversation could not be opened')
+      const before = { title: live.title, pinned: live.pinned, titleSource: live.titleSource, titleModel: live.titleModel, titleCostUsd: live.titleCostUsd }
+      apply(live)
+      try { await persistNow(live, true) } catch (e) { Object.assign(live, before); throw e }
+    })
+    metadataEdits.set(id, run)
+    void run.catch(() => {}).finally(() => { if (metadataEdits.get(id) === run) metadataEdits.delete(id) })
+    return run
   }
 
   function makeConversation(model: string, params?: Partial<SamplingParams>): Conversation {
@@ -243,17 +262,29 @@ export const useChatStore = defineStore('chat', () => {
 
   /** Save now, cancelling any pending debounced save. The promise settles
    *  when the write has landed - fire-and-forget callers can ignore it. */
-  function persistNow(c: Conversation): Promise<void> {
+  function persistNow(c: Conversation, strict = false): Promise<void> {
     if (isDraft(c)) return Promise.resolve() // see persist(): drafts are in-memory until sent
     const prev = timers.get(c.id)
     if (prev) {
       clearTimeout(prev)
       timers.delete(c.id)
     }
-    return save(c)
+    return save(c, strict)
   }
 
-  async function save(c: Conversation): Promise<void> {
+  const writes = new Map<string, Promise<void>>()
+  function save(c: Conversation, strict = false): Promise<void> {
+    // Serialize whole-document replacements per conversation. In particular,
+    // committing a draft must not finish its empty save after the first turn's
+    // durable receipt. Independent chats still save concurrently.
+    const write = (writes.get(c.id) ?? Promise.resolve()).then(() => writeDocument(c, strict))
+    const settled = write.catch(() => {})
+    writes.set(c.id, settled)
+    void settled.then(() => { if (writes.get(c.id) === settled) writes.delete(c.id) })
+    return write
+  }
+
+  async function writeDocument(c: Conversation, strict: boolean): Promise<void> {
     // The server REPLACES the stored document with whatever is sent. A list
     // stub has no messages, so saving one wipes the conversation's history -
     // and roughly thirty call sites persist whatever conversation they hold.
@@ -264,7 +295,8 @@ export const useChatStore = defineStore('chat', () => {
     // here too, and must not bring it back.
     if (!isDraft(c)) {
       const live = conversations.value.find((x) => x.id === c.id)
-      if (!live || !loadedIds.value.has(c.id) || toRaw(live) !== toRaw(c)) {
+      if (deleting.has(c.id) || !live || !loadedIds.value.has(c.id) || toRaw(live) !== toRaw(c)) {
+        if (strict) throw new Error('The conversation changed before it could be saved')
         console.warn('not saving conversation', c.id, '- its document is not the loaded one')
         return
       }
@@ -272,6 +304,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       await store.putConversation(c)
     } catch (e) {
+      if (strict) throw e
       console.error('failed to save conversation', c.id, e)
     }
   }
@@ -279,9 +312,14 @@ export const useChatStore = defineStore('chat', () => {
   // Rename is metadata, not activity: don't bump updatedAt or re-sort (renaming
   // used to yank the chat to the top of the list - jarring). Persist in place.
   function rename(id: string, title: string): Promise<void> {
+    titleGenerator.cancel(id)
+    delete titleState.value[id]
     const t = title.trim() || 'Untitled'
-    return edit(id, (c) => {
+    return editMetadata(id, (c) => {
       c.title = t
+      c.titleSource = 'manual'
+      c.titleModel = undefined
+      c.titleCostUsd = undefined
     })
   }
 
@@ -299,34 +337,36 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function remove(id: string): Promise<void> {
-    const i = conversations.value.findIndex((x) => x.id === id)
-    if (i < 0) return
-    conversations.value.splice(i, 1)
-    loadedIds.value.delete(id)
+    const c = conversations.value.find(x => x.id === id)
+    if (!c) return
+    if (deleting.has(id)) throw new Error('This conversation is already being deleted')
+    if (isConversationRunning(id)) throw new Error('Stop the response before deleting this conversation')
+    titleGenerator.cancel(id)
+    deleting.add(id)
+    const timer = timers.get(id)
+    if (timer) clearTimeout(timer)
+    timers.delete(id)
     try {
+      // Drain a PUT already on the wire before DELETE, preventing resurrection.
+      await metadataEdits.get(id)?.catch(() => {})
+      await writes.get(id)
       await store.deleteConversation(id)
-    } catch (e) {
-      console.error('failed to delete conversation', id, e)
-    }
-    if (activeId.value === id) repointActive()
+      conversations.value = conversations.value.filter(x => x.id !== id)
+      loadedIds.value.delete(id)
+      failedIds.value.delete(id)
+      delete titleState.value[id]
+      if (activeId.value === id) repointActive()
+    } finally { deleting.delete(id) }
   }
 
   /** Delete several chats at once (multi-select). Re-points the active chat once
    *  if it was among them. */
   async function removeMany(ids: string[]): Promise<void> {
-    const doomed = new Set(ids)
-    if (doomed.size === 0) return
-    const hadActive = !!activeId.value && doomed.has(activeId.value)
-    conversations.value = conversations.value.filter((c) => !doomed.has(c.id))
-    for (const id of doomed) {
-      loadedIds.value.delete(id)
-      try {
-        await store.deleteConversation(id)
-      } catch (e) {
-        console.error('failed to delete conversation', id, e)
-      }
+    const failures: string[] = []
+    for (const id of new Set(ids)) {
+      try { await remove(id) } catch { failures.push(id) }
     }
-    if (hadActive) repointActive()
+    if (failures.length) throw new Error(`${failures.length} conversation(s) could not be deleted and remain in your library`)
   }
 
   // Pinning is metadata too - persist without a reorder/updatedAt bump; the
@@ -337,7 +377,7 @@ export const useChatStore = defineStore('chat', () => {
     // decided once, from what the user saw - re-reading it off the loaded
     // document would flip it back
     const pinned = !c.pinned
-    return edit(id, (x) => {
+    return editMetadata(id, (x) => {
       x.pinned = pinned
     })
   }
@@ -351,7 +391,7 @@ export const useChatStore = defineStore('chat', () => {
    *  a fallback: a microphone recording has no name at all, which is exactly
    *  why the transcript leads. */
   function maybeTitle(c: Conversation): void {
-    if (c.title !== 'New chat') return
+    if (c.title !== 'New chat' || c.titleSource === 'manual') return
     // The branch on screen: if the opening question was edited before a
     // title existed, the title should come from the question being asked, not
     // from the one that was replaced.
@@ -361,27 +401,77 @@ export const useChatStore = defineStore('chat', () => {
     let raw = messageText(first).replace(/\s+/g, ' ').trim()
     if (!raw) {
       const clip = first.content.find((p): p is AudioPart => p.type === 'audio')
-      if (!clip) return
-      // The answers to this turn: one per compare lane. Wait for them all to
-      // settle, then take the first lane that actually produced words - a
-      // lane that failed must not decide the title while a sibling succeeded.
-      const answers: Message[] = []
-      for (let i = path.indexOf(first) + 1; i < path.length; i++) {
-        if (path[i].role !== 'assistant') break
-        answers.push(path[i])
+      if (!clip) {
+        const attachment = first.content.find(p => 'name' in p && p.name)
+        if (attachment && 'name' in attachment) raw = attachment.name
+        if (!raw) return
+      } else {
+        // Wait for all lanes, then prefer the first successful transcript.
+        const answers: Message[] = []
+        for (let i = path.indexOf(first) + 1; i < path.length; i++) {
+          if (path[i].role !== 'assistant') break
+          answers.push(path[i])
+        }
+        if (!answers.length || answers.some((m) => m.streaming)) return
+        raw = answers.map(m => messageText(m).replace(/\s+/g, ' ').trim()).find(Boolean) ?? clip.name
+        if (!raw) return
       }
-      if (!answers.length || answers.some((m) => m.streaming)) return
-      raw =
-        answers.map((m) => messageText(m).replace(/\s+/g, ' ').trim()).find(Boolean) ?? clip.name
-      if (!raw) return
     }
     // A chat opened with a task action is titled by the action's plain name -
     // the sidebar must not be the one place a markup token leaks into view.
     const t = (taskLabel(raw) ?? raw).slice(0, 48)
     if (t) {
       c.title = t
+      c.titleSource = 'fallback'
       persistNow(c)
     }
+  }
+
+  /** Only new fallback labels are automatic. Legacy and manually named chats
+   * require the explicit Generate title action. Names never mutate context. */
+  async function generateTitle(id: string, automatic = false): Promise<void> {
+    if (automatic && !useSettingsStore().autoTitle) return
+    if (!titleGenerator.available) {
+      if (automatic) return
+      throw new Error('Wait for active responses before generating a title')
+    }
+    await ensureLoaded(id)
+    const c = conversations.value.find(x => x.id === id)
+    if (!c || deleting.has(id) || !loadedIds.value.has(id)) return
+    if (automatic && (c.titleSource !== 'fallback' || titleState.value[id])) return
+    if (isConversationRunning(id)) throw new Error('Wait for the response before generating a title')
+    const models = useModelsStore(), target = models.models.find(m => m.id === c.model && m.status === 'ok')
+    if (!target || !models.canChat(c.model)) {
+      if (automatic) return
+      throw new Error("Start this conversation's text model to generate its title")
+    }
+    const endpoint = models.responsesUrl(c.model)
+    if (!endpoint) throw new Error("The conversation's model is not reachable")
+    const input = titleTranscript(c)
+    if (!input) return
+    const previous = { title: c.title, source: c.titleSource, leaf: c.leafId }
+    const job = Symbol(id)
+    titleJobs.set(id, job)
+    const ladder = models.reasoningLadderFor(c.model), style = models.reasoningStyleFor(c.model)
+    titleState.value[id] = 'generating'
+    try {
+      const result = await titleGenerator.generate(id, input, { model: c.model, endpoint,
+        ...(style === 'effort' ? { reasoning: { effort: ladder.off ? 'none' : ladder.levels[0] || 'low' } } : {}),
+        ...(style === 'toggle' && !target.cloud ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+      })
+      await editMetadata(id, live => {
+        if (toRaw(live) !== toRaw(c) || live.title !== previous.title || live.titleSource !== previous.source || live.leafId !== previous.leaf) {
+          throw new Error('The conversation changed; the generated title was not applied')
+        }
+        live.title = result.title; live.titleSource = 'generated'; live.titleModel = c.model; live.titleCostUsd = result.cost
+      })
+      if (titleJobs.get(id) === job) delete titleState.value[id]
+    } catch (e) {
+      if (titleJobs.get(id) !== job) return
+      if (e instanceof DOMException && e.name === 'AbortError') { delete titleState.value[id]; return }
+      titleState.value[id] = e instanceof Error ? e.message : 'Title generation failed'
+      if (!automatic) throw e
+    } finally { if (titleJobs.get(id) === job) titleJobs.delete(id) }
   }
 
   /** Add a turn to the tree; returns the REACTIVE element the array now holds
@@ -486,6 +576,8 @@ export const useChatStore = defineStore('chat', () => {
     remove,
     removeMany,
     togglePin,
+    generateTitle,
+    titleState,
     maybeTitle,
     addMessage,
     selectSibling,

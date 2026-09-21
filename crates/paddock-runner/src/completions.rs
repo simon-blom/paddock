@@ -365,6 +365,9 @@ async fn collect_response(
     }
 
     let mut cands: Vec<Cand> = Vec::with_capacity(rxs.len());
+    // Bill every generated candidate, including sampled stop IDs and the
+    // candidates subsequently discarded by best_of ranking.
+    let mut generated = 0usize;
     let mut cached = 0usize;
     for mut rx in rxs {
         let mut ids = Vec::new();
@@ -387,6 +390,7 @@ async fn collect_response(
                 }
                 TokenEvent::Done(reason, stats) => {
                     finish = reason.as_str().to_owned();
+                    generated += stats.terminal_tokens();
                     meta.scope.phases(&stats);
                     break;
                 }
@@ -395,6 +399,7 @@ async fn collect_response(
                 }
             }
         }
+        generated += ids.len();
         cands.push(Cand { ids, lps, finish });
     }
 
@@ -443,7 +448,6 @@ async fn collect_response(
     // Usage counts what was GENERATED, which under best_of includes the
     // candidates that lost - the caller paid for those too, and OpenAI bills
     // them the same way.
-    let generated: usize = cands.iter().map(|c| c.ids.len()).sum();
     let _ = completion_tokens;
     meta.scope.finish(
         choices
@@ -562,6 +566,7 @@ fn stream_response(
                     }
                 }
                 TokenEvent::Done(reason, stats) => {
+                    cs[i].ids += stats.terminal_tokens();
                     let f = match reason {
                         FinishReason::Stop => "stop",
                         FinishReason::Length => "length",

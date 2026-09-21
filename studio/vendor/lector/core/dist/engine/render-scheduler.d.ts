@@ -1,53 +1,57 @@
 import type * as Comlink from 'comlink';
 import type { DocumentId, TaskId } from '../types/handle-id.js';
-import type { RenderOptions, RenderPriority } from '../types/render.js';
+import { type RenderOptions, type RenderPriority } from '../types/render.js';
 import type { PdfiumWorkerApi } from '../types/worker-api.js';
 import type { RenderPool } from './render-pool.js';
-/** A request to render a single page at specific pixel dimensions. */
-export interface RenderRequest {
+export interface RenderSchedulingOptions {
+    readonly priority?: RenderPriority;
+    readonly signal?: AbortSignal;
+    /** Explicit consumer slot, e.g. viewport/page/tile. Never inferred from page number. */
+    readonly consumerKey?: string;
+    /** Content generation. A render from before an edit must never satisfy one after it. */
+    readonly generation?: string;
+}
+export interface RenderRequest extends RenderSchedulingOptions {
     readonly docId: DocumentId;
     readonly pageIndex: number;
     readonly width: number;
     readonly height: number;
     readonly options?: RenderOptions;
-    readonly priority?: RenderPriority;
-    readonly signal?: AbortSignal;
+    readonly tile?: {
+        readonly x: number;
+        readonly y: number;
+        readonly fullW: number;
+        readonly fullH: number;
+    };
+}
+/** Nominal transient raster bytes; PDF parsing/font caches and browser overhead are separate. */
+export interface RenderSchedulerOptions {
+    readonly maxInFlightBytes?: number;
+    readonly maxQueuedTasks?: number;
 }
 /**
- * Priority queue with cancellation for background page rendering.
+ * Admission queue shared by full pages and detail tiles. Worker concurrency and
+ * transient pixel reservations remain occupied until physical work completes,
+ * even when all consumers abort. JS cancellation cannot interrupt PDFium.
  *
- * Renders are dispatched one at a time to the worker. The queue is sorted by
- * priority (lower = higher priority), then by insertion order (FIFO within
- * the same priority level).
- *
- * Identical requests (same doc + page + dimensions) are deduplicated: the
- * existing promise is returned instead of enqueueing a duplicate.
+ * Identical work is shared, ownership is not: every consumer receives an
+ * independently closeable bitmap. Coalescing requires an explicit consumer slot;
+ * different panes never cancel each other implicitly.
  */
 export declare class RenderScheduler implements Disposable {
     #private;
-    constructor(proxy: Comlink.Remote<PdfiumWorkerApi>, pool?: RenderPool);
-    /**
-     * Enqueue a page render request.
-     *
-     * Returns a promise that resolves with the rendered ImageBitmap.
-     * If an identical request is already pending, returns the existing promise.
-     */
+    constructor(proxy: Comlink.Remote<PdfiumWorkerApi>, pool?: RenderPool, options?: RenderSchedulerOptions);
+    get stats(): {
+        active: number;
+        queued: number;
+        reservedBytes: number;
+        peakReservedBytes: number;
+        budgetBytes: number;
+    };
     enqueue(request: RenderRequest): Promise<ImageBitmap>;
-    /** Cancel a task by ID. Removes it from the queue or discards the active result. */
     cancel(taskId: TaskId): void;
-    /**
-     * Cancel every queued and in-flight render for a document. Call this when a
-     * document is closing so outstanding renders don't resolve against a closed
-     * document: their promises reject with AbortError, and any late-arriving
-     * pool bitmap is dropped and closed by the success guard (no leak).
-     */
     cancelDocument(docId: DocumentId): void;
-    /**
-     * Change the priority of all pending tasks matching a specific document and page.
-     * Tasks that are already actively rendering are not affected.
-     */
-    reprioritize(docId: DocumentId, pageIndex: number, newPriority: RenderPriority): void;
-    /** Dispose the scheduler, rejecting all pending tasks. */
+    reprioritize(docId: DocumentId, pageIndex: number, priority: RenderPriority): void;
     [Symbol.dispose](): void;
 }
 //# sourceMappingURL=render-scheduler.d.ts.map

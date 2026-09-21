@@ -8,7 +8,7 @@
 // HTTP response held open by the manager, lines pushed as they are written.
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useStickyScroll } from '@/composables/useStickyScroll'
-import { fmtClock } from '@/lib/format'
+import { clean, parse, filterLogLines, type Level, type Line } from '@/lib/log-lines'
 import Icon from '@/components/Icon.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 
@@ -29,63 +29,8 @@ const props = withDefaults(
   { height: '60vh', fill: false, fillOffset: 20, compact: false },
 )
 
-type Level = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-interface Line {
-  raw: string
-  /** merged-mode source prefix: "manager" / "11540" */
-  source?: string
-  time?: string
-  level?: Level
-  /** filter-effective level for an unparsed line: inherited from the line
-   *  above (continuations), so filtering to Warn+ hides banner art instead
-   *  of showing it. Panic/backtrace text is promoted to a real ERROR. */
-  eff?: Level
-  module?: string
-  msg?: string
-}
-
-// tracing's default format, with the merged stream's optional [source] prefix:
-//   [11540] 2026-08-02T09:58:54.631489Z  INFO paddock_runner::drain: message
-const RE =
-  /^(?:\[([^\]]+)\]\s+)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z?)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+([\w:.-]+):\s?(.*)$/
-
-// A runner's stdout is its log file - the manager opens runner-<port>.log and
-// hands over the handle at spawn - and tracing's terminal layer used to colour
-// it regardless, so runner lines arrive wrapped in SGR escapes. The engine now
-// only colours a real terminal, but every log already on disk carries them and
-// .prev.log is never rewritten, so clean here as well. Without this the ESC
-// bytes draw as missing-glyph boxes AND the line never matches RE at all: no
-// clock, no level chip, and nothing for the level filter to select on.
-// CSI (what tracing emits), then OSC, then the two-character escapes.
-const ANSI = /\u001b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-Z\\-_])/g
-// Anything that survives - a bare ESC, a stray C0 from a crashing child - is
-// still an unprintable box. Tab stays; it is the only one that means something.
-const CTRL = /[\u0000-\u0008\u000b-\u001f\u007f]/g
-function clean(raw: string): string {
-  return raw.replace(ANSI, '').replace(CTRL, '')
-}
-
-// the log file speaks UTC; the viewer speaks the user's LOCAL clock, in
-// fixed ISO 24h form (browser locales can't see the OS format preference)
-function localTime(iso: string): string {
-  const d = new Date(iso.endsWith('Z') ? iso : `${iso}Z`)
-  return Number.isNaN(d.getTime()) ? iso.slice(11, 19) : fmtClock(d)
-}
-
-const PANIC = /panicked at|RUST_BACKTRACE|stack backtrace|^thread '/i
-
-/** `lastLevel` threads the previous parsed line's level into continuations. */
-function parse(raw: string, lastLevel: Level | undefined): Line {
-  const m = RE.exec(raw)
-  if (!m) {
-    if (PANIC.test(raw)) return { raw, level: 'ERROR' }
-    return { raw, eff: lastLevel }
-  }
-  return { raw, source: m[1], time: localTime(m[2]), level: m[3] as Level, module: m[4], msg: m[5] }
-}
 
 const MAX_LINES = 4000 // retained in memory
-const MAX_SHOWN = 1500 // rendered rows (newest matching)
 const lines = ref<Line[]>([])
 const connected = ref(false)
 
@@ -97,22 +42,7 @@ const LEVELS = [
   { id: 'warn', label: 'Warn+' },
   { id: 'error', label: 'Errors' },
 ] as const
-const RANK: Record<string, number> = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 }
-const MIN: Record<string, number> = { all: 0, info: 2, warn: 3, error: 4 }
-
-const visible = computed(() => {
-  const min = MIN[minLevel.value]
-  const q = search.value.trim().toLowerCase()
-  let out = lines.value
-  if (min > 0)
-    out = out.filter((l) => {
-      const lv = l.level ?? l.eff
-      // no level anywhere (banner art, blank noise): only the All view
-      return lv !== undefined && RANK[lv] >= min
-    })
-  if (q) out = out.filter((l) => l.raw.toLowerCase().includes(q))
-  return out.length > MAX_SHOWN ? out.slice(-MAX_SHOWN) : out
-})
+const visible = computed(() => filterLogLines(lines.value, minLevel.value, search.value))
 
 const box = ref<HTMLElement | null>(null)
 const content = ref<HTMLElement | null>(null)

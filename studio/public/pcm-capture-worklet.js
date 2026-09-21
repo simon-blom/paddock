@@ -18,7 +18,10 @@ class PcmCapture extends AudioWorkletProcessor {
     // A disconnected or silent-by-routing input hands us nothing; returning
     // true keeps the node alive so unmuting resumes rather than needing a
     // rebuild.
-    if (block && block.length) this.port.postMessage(new Float32Array(block))
+    if (block && block.length) {
+      const copy = new Float32Array(block)
+      this.port.postMessage(copy, [copy.buffer])
+    }
     return true
   }
 }

@@ -437,7 +437,7 @@ pub fn fp8_kv_blocked(cc: (u32, u32)) -> Option<&'static str> {
     (!fp8_kv(cc)).then_some("this GPU cannot store an fp8 KV cache")
 }
 
-/// The generations THIS build's shipped kernel pack compiles SASS for - the
+/// The generations this build's shipped kernel pack compiles SASS for - the
 /// supported dies of its host plus any unvalidated die we carry kernels for.
 ///
 /// Read, never restated: a second copy of this in a build script is how the

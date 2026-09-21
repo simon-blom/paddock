@@ -54,7 +54,8 @@ export class TraverseDb {
      * optional JSON-stringified parameter map; pass `null` if no
      * parameters. `timeout_ms` (optional, > 0) installs a thread-
      * local deadline the executor honors at iteration boundaries;
-     * pass 0 / null for no timeout.
+     * defaults to 10 seconds, capped at 30 seconds. This is cooperative,
+     * not a hard wall-clock deadline or a mutation rollback guarantee.
      *
      * Returns a JS object matching the HTTP `QueryResponse` shape
      * — columns, rows, hydrated nodes/edges, mutation stats,

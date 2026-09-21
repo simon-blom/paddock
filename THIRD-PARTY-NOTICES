@@ -29,7 +29,7 @@ components it covers.
 
 ===============================================================================
 
-RUST CRATES (549)
+RUST CRATES (558)
 -------------------------------------------------------------------------------
 
 Name                              Version                        Licence
@@ -81,6 +81,7 @@ blake3                            1.8.7                          CC0-1.0 OR Apac
 block-buffer                      0.10.4                         MIT OR Apache-2.0
 block-buffer                      0.12.1                         MIT OR Apache-2.0
 block-padding                     0.4.2                          MIT OR Apache-2.0
+block2                            0.6.2                          MIT
 bumpalo                           3.20.3                         MIT OR Apache-2.0
 byte-slice-cast                   1.2.3                          MIT
 bytemuck                          1.25.2                         Zlib OR Apache-2.0 OR MIT
@@ -144,6 +145,7 @@ derive_builder_macro              0.20.2                         MIT OR Apache-2
 diff                              0.1.13                         MIT OR Apache-2.0
 digest                            0.10.7                         MIT OR Apache-2.0
 digest                            0.11.3                         MIT OR Apache-2.0
+dispatch2                         0.3.1                          Zlib OR Apache-2.0 OR MIT
 displaydoc                        0.2.7                          MIT OR Apache-2.0
 dyn-clone                         1.0.20                         MIT OR Apache-2.0
 either                            1.18.0                         MIT OR Apache-2.0
@@ -163,6 +165,7 @@ fallible-streaming-iterator       0.1.9                          MIT/Apache-2.0
 fallible_collections              0.5.2                          MIT OR Apache-2.0
 fancy-regex                       0.17.0                         MIT
 fast-float2                       0.2.4                          MIT OR Apache-2.0
+fastrand                          2.5.0                          Apache-2.0 OR MIT
 fax                               0.2.7                          MIT
 fdeflate                          0.3.7                          MIT OR Apache-2.0
 flate2                            1.1.9                          MIT OR Apache-2.0
@@ -301,6 +304,11 @@ num-traits                        0.2.19                         MIT OR Apache-2
 nvml-wrapper                      0.12.1                         MIT OR Apache-2.0
 nvml-wrapper-sys                  0.9.1                          MIT OR Apache-2.0
 oauth2                            5.0.0                          MIT OR Apache-2.0
+objc2                             0.6.4                          MIT
+objc2-core-foundation             0.3.2                          Zlib OR Apache-2.0 OR MIT
+objc2-encode                      4.1.0                          MIT
+objc2-foundation                  0.3.2                          MIT
+objc2-metal                       0.3.2                          Zlib OR Apache-2.0 OR MIT
 oid-registry                      0.8.1                          MIT OR Apache-2.0
 once_cell                         1.21.4                         MIT OR Apache-2.0
 once_cell_polyfill                1.70.2                         MIT OR Apache-2.0
@@ -329,7 +337,7 @@ ppv-lite86                        0.2.21                         MIT OR Apache-2
 pretty_assertions                 1.4.1                          MIT OR Apache-2.0
 primal-check                      0.3.4                          MIT OR Apache-2.0
 proc-macro2                       1.0.107                        MIT OR Apache-2.0
-process-wrap                      9.1.0                          Apache-2.0 OR MIT
+process-wrap                      10.0.0                         Apache-2.0 OR MIT
 pxfm                              0.1.30                         BSD-3-Clause OR Apache-2.0
 quick-error                       2.0.1                          MIT/Apache-2.0
 quick-xml                         0.41.0                         MIT
@@ -366,10 +374,10 @@ regex                             1.13.1                         MIT OR Apache-2
 regex-automata                    0.4.18                         MIT OR Apache-2.0
 regex-lite                        0.1.9                          MIT OR Apache-2.0
 regex-syntax                      0.8.11                         MIT OR Apache-2.0
-reqwest                           0.13.4                         MIT OR Apache-2.0
+reqwest                           0.13.5                         MIT OR Apache-2.0
 ring                              0.17.14                        Apache-2.0 AND ISC
-rmcp                              3.1.4                          Apache-2.0
-rmcp-macros                       3.1.4                          Apache-2.0
+rmcp                              3.4.0                          Apache-2.0
+rmcp-macros                       3.4.0                          Apache-2.0
 rsqlite-vfs                       0.1.1                          MIT
 rusqlite                          0.40.2                         MIT
 rust-embed                        8.12.0                         MIT
@@ -454,6 +462,7 @@ syn                               2.0.119                        MIT OR Apache-2
 syn                               3.0.3                          MIT OR Apache-2.0
 sync_wrapper                      1.0.2                          Apache-2.0
 synstructure                      0.13.2                         MIT
+tempfile                          3.27.0                         MIT OR Apache-2.0
 thiserror                         1.0.69                         MIT OR Apache-2.0
 thiserror                         2.0.20                         MIT OR Apache-2.0
 thiserror-impl                    1.0.69                         MIT OR Apache-2.0
@@ -710,6 +719,7 @@ tslib                                2.8.1      0BSD
 @types/web-bluetooth                 0.0.21     MIT
 @ungap/structured-clone              1.3.3      ISC
 @upsetjs/venn.js                     2.0.0      MIT
+@vue-macros/common                   3.1.4      MIT
 @vue/compiler-core                   3.5.41     MIT
 entities                             7.0.1      BSD-2-Clause
 @vue/compiler-dom                    3.5.41     MIT
@@ -723,7 +733,6 @@ entities                             7.0.1      BSD-2-Clause
 @vue/runtime-dom                     3.5.41     MIT
 @vue/server-renderer                 3.5.41     MIT
 @vue/shared                          3.5.41     MIT
-@vue-macros/common                   3.1.4      MIT
 @vueuse/core                         14.4.0     MIT
 @vueuse/metadata                     14.4.0     MIT
 @vueuse/shared                       14.4.0     MIT
@@ -793,7 +802,7 @@ devlop                               1.1.0      MIT
 dompurify                            3.4.14     (MPL-2.0 OR Apache-2.0)
 earcut                               3.2.3      ISC
 echarts                              6.1.0      Apache-2.0
-entities                             8.0.0      BSD-2-Clause
+entities                             8.1.0      BSD-2-Clause
 es-toolkit                           1.51.0     MIT
 estree-walker                        2.0.2      MIT
 events                               3.3.0      MIT
@@ -835,10 +844,10 @@ markdown-it-ins                      4.0.0      MIT
 markdown-it-mark                     4.0.0      MIT
 markdown-it-sup                      2.0.0      MIT
 markdown-it-task-checkbox            1.0.6      ISC
-markdown-it-ts                       1.1.0      MIT
+markdown-it-ts                       1.1.2      MIT
 marked                               16.4.2     MIT
-markstream-core                      2.0.2      MIT
-markstream-vue                       2.0.2      MIT
+markstream-core                      2.0.11     MIT
+markstream-vue                       2.0.11     MIT
 mdast-util-to-hast                   13.2.1     MIT
 mdurl                                2.1.0      MIT
 mermaid                              11.17.0    MIT
@@ -911,7 +920,7 @@ simple-icons                         16.28.0    CC0-1.0
 smol-toml                            1.8.0      BSD-3-Clause
 source-map-js                        1.2.1      BSD-3-Clause
 space-separated-tokens               2.0.2      MIT
-stream-markdown-parser               1.2.10     MIT
+stream-markdown-parser               1.2.16     MIT
 strictdom                            1.0.1      MIT
 stringify-entities                   4.0.4      MIT
 stylis                               4.4.0      MIT
@@ -4113,7 +4122,8 @@ Copyright notice:
 --- ggml i-quant codebooks (ggml / llama.cpp, MIT) ---
 
 The i-quant codebooks in iq_grids.cuh and in
-crates/paddock-kernels/src/reference/iq_grids.rs (the IQ1_S, IQ2_XXS,
+crates/paddock-kernels/src/reference/iq_grids.rs (also the exact IQ2_S/IQ3_S
+subset in packs/metal/iquant_tables.metal; the IQ1_S, IQ2_XXS,
 IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S grids and the IQ4_NL value table) are the
 format definition of ggml's i-quant types, transcribed from ggml-common.h
 in ggml / llama.cpp. They are used under ggml's licence, reproduced below.
@@ -4140,6 +4150,28 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--- Splash traversal helpers in the Metal pack (Inco AI, Apache-2.0) ---
+
+# Splash Metal attribution
+
+The validated cooperative-fragment traversal in `splash.metal` is adapted
+from Inco AI's Splash, `runtime/metal/kernels/common/q4_mpp_tiles.h`. The
+BF16 prefill store and conditional attention-rescaling work also drew on
+`runtime/metal/kernels/prefill/linear_q4.metal` and
+`runtime/metal/kernels/common/q8_attention_tile.h`, respectively. Revision:
+`f58d36ddb046726adc8937ab67d07bdde015c0d6`:
+https://github.com/incoai/splash
+
+Copyright Inco AI. Licensed under Apache License 2.0; the full license is
+included in the repository's `LICENSE-APACHE`.
+
+Paddock modifications: compact traversal integrated into independently
+partitioned quantization-group projections with shared input conversions,
+multi-plane epilogues and arbitrary ragged output dimensions. BF16 attention
+retains Paddock's page format, fixed interleaved partitions and cache arithmetic;
+it does not adopt the reference's INT8 KV representation. This is not
+a dependency on or a subprocess invocation of the Splash runtime.
 
 GeoNames (geonames.org) - CC BY 4.0. A packed extract of the cities1000
 dataset (populated places over ~1,000 people, with their administrative
@@ -4233,34 +4265,41 @@ licence. Listed explicitly so the omission is visible rather than assumed.
   arref 0.1.0 (MIT)
   asn1-rs-impl 0.2.0 (MIT/Apache-2.0)
   atomig-macro 0.4.0 (MIT/Apache-2.0)
+  block2 0.6.2 (MIT)
+  dispatch2 0.3.1 (Zlib OR Apache-2.0 OR MIT)
   fastdom 1.0.12 (MIT)
   generic-btree 0.10.7 (MIT)
   jni 0.22.4 (MIT OR Apache-2.0)
   jni-macros 0.22.4 (MIT OR Apache-2.0)
   jni-sys-macros 0.4.1 (MIT OR Apache-2.0)
   loro-internal 1.13.9 (MIT)
-  markstream-core 2.0.2 (MIT)
+  markstream-core 2.0.11 (MIT)
   murmurhash-js 1.0.0 (MIT)
+  objc2 0.6.4 (MIT)
+  objc2-core-foundation 0.3.2 (Zlib OR Apache-2.0 OR MIT)
+  objc2-encode 4.1.0 (MIT)
+  objc2-foundation 0.3.2 (MIT)
+  objc2-metal 0.3.2 (Zlib OR Apache-2.0 OR MIT)
   r-efi 5.3.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later)
   r-efi 6.0.0 (MIT OR Apache-2.0 OR LGPL-2.1-or-later)
-  rmcp 3.1.4 (Apache-2.0)
-  rmcp-macros 3.1.4 (Apache-2.0)
+  rmcp 3.4.0 (Apache-2.0)
+  rmcp-macros 3.4.0 (Apache-2.0)
   rsqlite-vfs 0.1.1 (MIT)
   rustls-platform-verifier-android 0.1.1 (MIT OR Apache-2.0)
   scriptor-crdt 0.1.0 (MIT OR Apache-2.0)
   scriptor-ooxml 0.1.0 (MIT OR Apache-2.0)
   serde_columnar 0.3.14 (MIT OR Apache-2.0)
   serde_columnar_derive 0.3.7 (MIT OR Apache-2.0)
-  stream-markdown-parser 1.2.10 (MIT)
+  stream-markdown-parser 1.2.16 (MIT)
   strictdom 1.0.1 (MIT)
   valuable 0.1.1 (MIT)
   whatlang 0.18.0 (MIT)
 
-LICENCE TEXTS (483 distinct)
+LICENCE TEXTS (484 distinct)
 ===============================================================================
 
 -------------------------------------------------------------------------------
-Applies to: @chevrotain/types 11.1.2, aes 0.9.3, ahash 0.8.12, arbitrary 1.4.2, arrayvec 0.7.8, asn1-rs 0.7.2, asn1-rs-derive 0.6.0, assert_matches 1.5.0, atomic-polyfill 1.0.3, atomic-waker 1.1.2, atomig 0.4.3, base64 0.13.1, base64 0.22.1, base64 0.23.1, bit-set 0.8.0, bit-vec 0.8.0, bit-vec 0.9.1, bitflags 2.13.1, bitreader 0.3.11, block-buffer 0.10.4, block-buffer 0.12.1, block-padding 0.4.2, bumpalo 3.20.3, bytemuck 1.25.2, cbc 0.2.1, cfg-if 1.0.4, chacha20 0.10.1, chardetng 1.0.0, ciborium 0.2.2, ciborium-io 0.2.2, ciborium-ll 0.2.2, cipher 0.5.2, codepage 0.1.2, const-oid 0.10.2, core-foundation 0.10.1, core-foundation-sys 0.8.7, cpubits 0.1.1, cpufeatures 0.2.17, cpufeatures 0.3.0, critical-section 1.2.0, crossbeam-deque 0.8.7, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.22, crypto-common 0.1.7, crypto-common 0.2.2, der-parser 10.0.0, derive_arbitrary 1.4.2, digest 0.10.7, digest 0.11.3, displaydoc 0.2.7, dompurify 3.4.14, either 1.18.0, embedded-io 0.4.0, embedded-io 0.6.1, encoding_rs 0.8.35, equivalent 1.0.2, errno 0.3.14, esaxx-rs 0.1.10, fallible_collections 0.5.2, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, fs4 1.1.0, gif 0.14.2, hash32 0.2.1, hash32 0.3.1, hashbrown 0.15.5, hashbrown 0.16.1, hashbrown 0.17.1, hashlink 0.12.1, heapless 0.7.17, heapless 0.8.0, heapless 0.9.3, heck 0.4.1, heck 0.5.0, httparse 1.10.1, httpdate 1.0.3, hybrid-array 0.4.14, hyper-rustls 0.27.9, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, inout 0.2.2, itertools 0.11.0, itertools 0.12.1, itertools 0.14.0, js-sys 0.3.104, lazy_static 1.5.0, leb128 0.2.7, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, lru-slab 0.1.2, matrixmultiply 0.3.11, md-5 0.11.0, memo-map 0.3.3, mime 0.3.17, minijinja 2.24.0, minijinja-contrib 2.24.0, minimal-lexical 0.2.1, ndarray 0.17.2, num 0.4.3, num-bigint 0.4.8, num-complex 0.4.6, num-derive 0.4.2, num-integer 0.1.47, num-iter 0.1.46, num-rational 0.4.2, num-traits 0.2.19, oauth2 5.0.0, oid-registry 0.8.1, once_cell 1.21.4, openssl-probe 0.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, png 0.18.1, postcard 1.1.3, primal-check 0.3.4, quinn 0.11.11, quinn-proto 0.11.17, quinn-udp 0.5.15, rand_xoshiro 0.6.0, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rusticata-macros 4.1.0, rustix 1.1.4, rustls 0.23.43, rustls-native-certs 0.8.4, rustls-platform-verifier 0.7.0, scoped-tls 1.0.1, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, sha1 0.10.7, sha1 0.11.0, sha2 0.10.9, sha2 0.11.0, signal-hook-registry 1.4.8, simd_cesu8 1.2.0, smallvec 1.15.2, socket2 0.6.5, spm_precompiled 0.1.4, sse-stream 0.2.5, stable_deref_trait 1.2.1, static_assertions 1.1.0, symphonia-adapter-libopus 0.3.0, syn 1.0.109, thread_local 1.1.10, tinyvec 1.12.0, tokenizers 0.23.1, tungstenite 0.29.0, tungstenite 0.30.0, ucd-trie 0.1.7, unicase 2.9.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, ureq 3.4.0, ureq-proto 0.6.1, url 2.5.8, utf8_iter 1.0.4, uuid 1.25.0, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.127, wasm-bindgen-futures 0.4.77, wasm-bindgen-macro 0.2.127, wasm-bindgen-macro-support 0.2.127, wasm-bindgen-shared 0.2.127, web-sys 0.3.104, weezl 0.1.12, wit-bindgen 0.57.1, x509-parser 0.18.1, yasna 0.6.0, zeroize 1.9.0, zune-core 0.5.3, zune-jpeg 0.5.15
+Applies to: @chevrotain/types 11.1.2, aes 0.9.3, ahash 0.8.12, arbitrary 1.4.2, arrayvec 0.7.8, asn1-rs 0.7.2, asn1-rs-derive 0.6.0, assert_matches 1.5.0, atomic-polyfill 1.0.3, atomic-waker 1.1.2, atomig 0.4.3, base64 0.13.1, base64 0.22.1, base64 0.23.1, bit-set 0.8.0, bit-vec 0.8.0, bit-vec 0.9.1, bitflags 2.13.1, bitreader 0.3.11, block-buffer 0.10.4, block-buffer 0.12.1, block-padding 0.4.2, bumpalo 3.20.3, bytemuck 1.25.2, cbc 0.2.1, cfg-if 1.0.4, chacha20 0.10.1, chardetng 1.0.0, ciborium 0.2.2, ciborium-io 0.2.2, ciborium-ll 0.2.2, cipher 0.5.2, codepage 0.1.2, const-oid 0.10.2, core-foundation 0.10.1, core-foundation-sys 0.8.7, cpubits 0.1.1, cpufeatures 0.2.17, cpufeatures 0.3.0, critical-section 1.2.0, crossbeam-deque 0.8.7, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.22, crypto-common 0.1.7, crypto-common 0.2.2, der-parser 10.0.0, derive_arbitrary 1.4.2, digest 0.10.7, digest 0.11.3, displaydoc 0.2.7, dompurify 3.4.14, either 1.18.0, embedded-io 0.4.0, embedded-io 0.6.1, encoding_rs 0.8.35, equivalent 1.0.2, errno 0.3.14, esaxx-rs 0.1.10, fallible_collections 0.5.2, fastrand 2.5.0, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, fs4 1.1.0, gif 0.14.2, hash32 0.2.1, hash32 0.3.1, hashbrown 0.15.5, hashbrown 0.16.1, hashbrown 0.17.1, hashlink 0.12.1, heapless 0.7.17, heapless 0.8.0, heapless 0.9.3, heck 0.4.1, heck 0.5.0, httparse 1.10.1, httpdate 1.0.3, hybrid-array 0.4.14, hyper-rustls 0.27.9, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, inout 0.2.2, itertools 0.11.0, itertools 0.12.1, itertools 0.14.0, js-sys 0.3.104, lazy_static 1.5.0, leb128 0.2.7, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, lru-slab 0.1.2, matrixmultiply 0.3.11, md-5 0.11.0, memo-map 0.3.3, mime 0.3.17, minijinja 2.24.0, minijinja-contrib 2.24.0, minimal-lexical 0.2.1, ndarray 0.17.2, num 0.4.3, num-bigint 0.4.8, num-complex 0.4.6, num-derive 0.4.2, num-integer 0.1.47, num-iter 0.1.46, num-rational 0.4.2, num-traits 0.2.19, oauth2 5.0.0, oid-registry 0.8.1, once_cell 1.21.4, openssl-probe 0.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, png 0.18.1, postcard 1.1.3, primal-check 0.3.4, quinn 0.11.11, quinn-proto 0.11.17, quinn-udp 0.5.15, rand_xoshiro 0.6.0, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rusticata-macros 4.1.0, rustix 1.1.4, rustls 0.23.43, rustls-native-certs 0.8.4, rustls-platform-verifier 0.7.0, scoped-tls 1.0.1, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, sha1 0.10.7, sha1 0.11.0, sha2 0.10.9, sha2 0.11.0, signal-hook-registry 1.4.8, simd_cesu8 1.2.0, smallvec 1.15.2, socket2 0.6.5, spm_precompiled 0.1.4, sse-stream 0.2.5, stable_deref_trait 1.2.1, static_assertions 1.1.0, symphonia-adapter-libopus 0.3.0, syn 1.0.109, tempfile 3.27.0, thread_local 1.1.10, tinyvec 1.12.0, tokenizers 0.23.1, tungstenite 0.29.0, tungstenite 0.30.0, ucd-trie 0.1.7, unicase 2.9.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, ureq 3.4.0, ureq-proto 0.6.1, url 2.5.8, utf8_iter 1.0.4, uuid 1.25.0, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.127, wasm-bindgen-futures 0.4.77, wasm-bindgen-macro 0.2.127, wasm-bindgen-macro-support 0.2.127, wasm-bindgen-shared 0.2.127, web-sys 0.3.104, weezl 0.1.12, wit-bindgen 0.57.1, x509-parser 0.18.1, yasna 0.6.0, zeroize 1.9.0, zune-core 0.5.3, zune-jpeg 0.5.15
 -------------------------------------------------------------------------------
 
 Apache License
@@ -4466,33 +4505,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 -------------------------------------------------------------------------------
-Applies to: @types/d3 7.4.3, @types/d3-array 3.2.2, @types/d3-axis 3.0.6, @types/d3-brush 3.0.6, @types/d3-chord 3.0.6, @types/d3-color 3.1.3, @types/d3-contour 3.0.6, @types/d3-delaunay 6.0.4, @types/d3-dispatch 3.0.7, @types/d3-drag 3.0.7, @types/d3-dsv 3.0.7, @types/d3-ease 3.0.2, @types/d3-fetch 3.0.7, @types/d3-force 3.0.10, @types/d3-format 3.0.4, @types/d3-geo 3.1.1, @types/d3-hierarchy 3.1.7, @types/d3-interpolate 3.0.4, @types/d3-path 3.1.1, @types/d3-polygon 3.0.2, @types/d3-quadtree 3.0.6, @types/d3-random 3.0.4, @types/d3-scale 4.0.9, @types/d3-scale-chromatic 3.1.0, @types/d3-selection 3.0.11, @types/d3-shape 3.2.0, @types/d3-time 3.0.4, @types/d3-time-format 4.0.3, @types/d3-timer 3.0.2, @types/d3-transition 3.0.9, @types/d3-zoom 3.0.8, @types/geojson 7946.0.16, @types/hast 3.0.5, @types/jsesc 2.5.1, @types/mdast 4.0.4, @types/unist 3.0.3, @types/web-bluetooth 0.0.21, windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows-threading 0.2.1, windows_aarch64_gnullvm 0.52.6, windows_aarch64_msvc 0.52.6, windows_i686_gnu 0.52.6, windows_i686_gnullvm 0.52.6, windows_i686_msvc 0.52.6, windows_x86_64_gnu 0.52.6, windows_x86_64_gnullvm 0.52.6, windows_x86_64_msvc 0.52.6
--------------------------------------------------------------------------------
-
-MIT License
-
-    Copyright (c) Microsoft Corporation.
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the "Software"), to deal
-    in the Software without restriction, including without limitation the rights
-    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-    copies of the Software, and to permit persons to whom the Software is
-    furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in all
-    copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-    SOFTWARE
-
--------------------------------------------------------------------------------
-Applies to: adler2 2.0.1, allocator-api2 0.2.21, anyhow 1.0.104, async-trait 0.1.92, atomic-waker 1.1.2, cudarc 0.19.9, daachorse 1.0.1, dary_heap 0.3.9, displaydoc 0.2.7, dyn-clone 1.0.20, fast-float2 0.2.4, itoa 1.0.18, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, monostate 0.1.18, monostate-impl 0.1.18, once_cell 1.21.4, paste 1.0.15, pastey 0.2.3, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.7, proc-macro2 1.0.107, process-wrap 9.1.0, quote 1.0.47, ref-cast 1.0.27, ref-cast-impl 1.0.27, rustc-hash 2.1.3, rustix 1.1.4, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_derive_internals 0.30.0, serde_json 1.0.151, serde_path_to_error 0.1.20, simd_cesu8 1.2.0, syn 1.0.109, syn 2.0.119, syn 3.0.3, thiserror 1.0.69, thiserror 2.0.20, thiserror-impl 1.0.69, thiserror-impl 2.0.20, tinyvec 1.12.0, typed-path 0.12.3, unicode-ident 1.0.24, utf8-zero 0.8.1, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-streams 0.5.0, winnow 1.0.4, wit-bindgen 0.57.1, zmij 1.0.23
+Applies to: adler2 2.0.1, allocator-api2 0.2.21, anyhow 1.0.104, async-trait 0.1.92, atomic-waker 1.1.2, cudarc 0.19.9, daachorse 1.0.1, dary_heap 0.3.9, displaydoc 0.2.7, dyn-clone 1.0.20, fast-float2 0.2.4, fastrand 2.5.0, itoa 1.0.18, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, monostate 0.1.18, monostate-impl 0.1.18, once_cell 1.21.4, paste 1.0.15, pastey 0.2.3, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.7, proc-macro2 1.0.107, process-wrap 10.0.0, quote 1.0.47, ref-cast 1.0.27, ref-cast-impl 1.0.27, rustc-hash 2.1.3, rustix 1.1.4, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_derive_internals 0.30.0, serde_json 1.0.151, serde_path_to_error 0.1.20, simd_cesu8 1.2.0, syn 1.0.109, syn 2.0.119, syn 3.0.3, thiserror 1.0.69, thiserror 2.0.20, thiserror-impl 1.0.69, thiserror-impl 2.0.20, tinyvec 1.12.0, typed-path 0.12.3, unicode-ident 1.0.24, utf8-zero 0.8.1, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-streams 0.5.0, winnow 1.0.4, wit-bindgen 0.57.1, zmij 1.0.23
 -------------------------------------------------------------------------------
 
 Permission is hereby granted, free of charge, to any
@@ -4520,7 +4533,33 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: allocator-api2 0.2.21, anyhow 1.0.104, async-trait 0.1.92, constant_time_eq 0.4.2, cudarc 0.19.9, daachorse 1.0.1, dary_heap 0.3.9, dyn-clone 1.0.20, fdeflate 0.3.7, half 2.7.1, image 0.25.10, image-webp 0.2.4, itoa 1.0.18, libc 0.2.189, miniz_oxide 0.8.9, miniz_oxide 0.9.1, monostate 0.1.18, monostate-impl 0.1.18, num-conv 0.2.2, paste 1.0.15, pastey 0.2.3, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.7, proc-macro2 1.0.107, process-wrap 9.1.0, quote 1.0.47, ref-cast 1.0.27, ref-cast-impl 1.0.27, rustc-hash 2.1.3, rustversion 1.0.23, ryu 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_derive_internals 0.30.0, serde_json 1.0.151, serde_path_to_error 0.1.20, serde_urlencoded 0.7.1, simdutf8 0.1.5, syn 2.0.119, syn 3.0.3, sync_wrapper 1.0.2, thiserror 1.0.69, thiserror 2.0.20, thiserror-impl 1.0.69, thiserror-impl 2.0.20, time 0.3.55, time-core 0.1.9, time-macros 0.2.32, typed-path 0.12.3, unicode-ident 1.0.24, utf8-zero 0.8.1, utf8parse 0.2.2, wasm-streams 0.5.0, widestring 1.2.1, zstd-safe 7.2.4, zstd-sys 2.0.16+zstd.1.5.7
+Applies to: @types/d3 7.4.3, @types/d3-array 3.2.2, @types/d3-axis 3.0.6, @types/d3-brush 3.0.6, @types/d3-chord 3.0.6, @types/d3-color 3.1.3, @types/d3-contour 3.0.6, @types/d3-delaunay 6.0.4, @types/d3-dispatch 3.0.7, @types/d3-drag 3.0.7, @types/d3-dsv 3.0.7, @types/d3-ease 3.0.2, @types/d3-fetch 3.0.7, @types/d3-force 3.0.10, @types/d3-format 3.0.4, @types/d3-geo 3.1.1, @types/d3-hierarchy 3.1.7, @types/d3-interpolate 3.0.4, @types/d3-path 3.1.1, @types/d3-polygon 3.0.2, @types/d3-quadtree 3.0.6, @types/d3-random 3.0.4, @types/d3-scale 4.0.9, @types/d3-scale-chromatic 3.1.0, @types/d3-selection 3.0.11, @types/d3-shape 3.2.0, @types/d3-time 3.0.4, @types/d3-time-format 4.0.3, @types/d3-timer 3.0.2, @types/d3-transition 3.0.9, @types/d3-zoom 3.0.8, @types/geojson 7946.0.16, @types/hast 3.0.5, @types/jsesc 2.5.1, @types/mdast 4.0.4, @types/unist 3.0.3, @types/web-bluetooth 0.0.21, windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows-threading 0.2.1, windows_aarch64_gnullvm 0.52.6, windows_aarch64_msvc 0.52.6, windows_i686_gnu 0.52.6, windows_i686_gnullvm 0.52.6, windows_i686_msvc 0.52.6, windows_x86_64_gnu 0.52.6, windows_x86_64_gnullvm 0.52.6, windows_x86_64_msvc 0.52.6
+-------------------------------------------------------------------------------
+
+MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE
+
+-------------------------------------------------------------------------------
+Applies to: allocator-api2 0.2.21, anyhow 1.0.104, async-trait 0.1.92, constant_time_eq 0.4.2, cudarc 0.19.9, daachorse 1.0.1, dary_heap 0.3.9, dyn-clone 1.0.20, fdeflate 0.3.7, half 2.7.1, image 0.25.10, image-webp 0.2.4, itoa 1.0.18, libc 0.2.189, miniz_oxide 0.8.9, miniz_oxide 0.9.1, monostate 0.1.18, monostate-impl 0.1.18, num-conv 0.2.2, paste 1.0.15, pastey 0.2.3, pin-project-lite 0.2.17, portable-atomic 1.15.0, portable-atomic-util 0.2.7, proc-macro2 1.0.107, process-wrap 10.0.0, quote 1.0.47, ref-cast 1.0.27, ref-cast-impl 1.0.27, rustc-hash 2.1.3, rustversion 1.0.23, ryu 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_derive_internals 0.30.0, serde_json 1.0.151, serde_path_to_error 0.1.20, serde_urlencoded 0.7.1, simdutf8 0.1.5, syn 2.0.119, syn 3.0.3, sync_wrapper 1.0.2, thiserror 1.0.69, thiserror 2.0.20, thiserror-impl 1.0.69, thiserror-impl 2.0.20, time 0.3.55, time-core 0.1.9, time-macros 0.2.32, typed-path 0.12.3, unicode-ident 1.0.24, utf8-zero 0.8.1, utf8parse 0.2.2, wasm-streams 0.5.0, widestring 1.2.1, zstd-safe 7.2.4, zstd-sys 2.0.16+zstd.1.5.7
 -------------------------------------------------------------------------------
 
 Apache License
@@ -9417,7 +9456,7 @@ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: entities 7.0.1, entities 8.0.0
+Applies to: entities 7.0.1, entities 8.1.0
 -------------------------------------------------------------------------------
 
 Copyright (c) Felix Böhm
@@ -21034,7 +21073,7 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: markdown-it-ts 1.1.0
+Applies to: markdown-it-ts 1.1.2
 -------------------------------------------------------------------------------
 
 Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.
@@ -21061,7 +21100,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: markstream-vue 2.0.2
+Applies to: markstream-vue 2.0.11
 -------------------------------------------------------------------------------
 
 MIT License
@@ -22881,7 +22920,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: process-wrap 9.1.0
+Applies to: process-wrap 10.0.0
 -------------------------------------------------------------------------------
 
 Short version for non-lawyers:
@@ -23630,7 +23669,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
-Applies to: reqwest 0.13.4
+Applies to: reqwest 0.13.5
 -------------------------------------------------------------------------------
 
 Apache License
@@ -23836,7 +23875,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 -------------------------------------------------------------------------------
-Applies to: reqwest 0.13.4
+Applies to: reqwest 0.13.5
 -------------------------------------------------------------------------------
 
 Copyright (c) 2016-2026 Sean McArthur
@@ -25153,6 +25192,36 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+Applies to: tempfile 3.27.0
+-------------------------------------------------------------------------------
+
+Copyright (c) 2015 Steven Allen
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 Applies to: tiff 0.11.3

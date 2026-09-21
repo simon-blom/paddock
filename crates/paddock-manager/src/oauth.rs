@@ -34,6 +34,7 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         // Dead hosts still fail fast on connect; only a
         // warming server actually spends the budget.
         .timeout(std::time::Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("TLS backend available")
 });
@@ -50,6 +51,9 @@ struct Pending {
     redirect_uri: String,
     resource: String,
     created: std::time::Instant,
+    revision: u64,
+    issuer: String,
+    require_issuer: bool,
 }
 static FLOWS: LazyLock<Mutex<HashMap<String, Pending>>> = LazyLock::new(Mutex::default);
 
@@ -65,8 +69,10 @@ fn err(status: StatusCode, msg: String) -> Response {
         .into_response()
 }
 
-async fn get_json(url: &str) -> Option<Value> {
-    let res = HTTP
+async fn get_json(url: &str, resource: &str) -> Option<Value> {
+    let res = crate::oauth_http::client(url, resource)
+        .await
+        .ok()?
         .get(url)
         .header("Accept", "application/json")
         .send()
@@ -75,7 +81,7 @@ async fn get_json(url: &str) -> Option<Value> {
     if !res.status().is_success() {
         return None;
     }
-    res.json::<Value>().await.ok()
+    crate::oauth_http::json(res).await.ok()
 }
 
 const INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"paddock","version":"0.1"}}}"#;
@@ -117,12 +123,14 @@ struct Discovered {
     token_endpoint: String,
     registration_endpoint: Option<String>,
     scopes: Option<String>,
+    issuer: String,
+    require_issuer: bool,
 }
 
 /// Tiered discovery, the way real MCP clients do it: the 401's
 /// `WWW-Authenticate: ... resource_metadata="..."` pointer first, then the
-/// RFC 9728 well-known locations at the server origin, then - for servers
-/// that self-issue - authorization-server metadata at the origin itself.
+/// RFC 9728 well-known locations at the server origin. The selected issuer's
+/// RFC 8414 / OIDC metadata must match exactly and advertise PKCE S256.
 async fn discover(server_url: &str) -> Result<Discovered, String> {
     let parsed = reqwest::Url::parse(server_url).map_err(|e| format!("bad server url: {e}"))?;
     let origin = format!("{}://{}", parsed.scheme(), parsed.authority());
@@ -130,7 +138,9 @@ async fn discover(server_url: &str) -> Result<Discovered, String> {
 
     // 1. provoke a 401 and read its pointer
     let mut prm_urls: Vec<String> = Vec::new();
-    if let Ok(res) = HTTP
+    let mut challenged_scope = None;
+    if let Ok(res) = crate::oauth_http::client(server_url, server_url)
+        .await?
         .post(server_url)
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -144,6 +154,12 @@ async fn discover(server_url: &str) -> Result<Discovered, String> {
             .and_then(|v| v.to_str().ok())
         && let Some(idx) = www.find("resource_metadata=")
     {
+        challenged_scope = www
+            .split("scope=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .filter(|s| s.len() <= 4096)
+            .map(str::to_owned);
         let rest = &www[idx + "resource_metadata=".len()..];
         let url = rest
             .trim_start_matches('"')
@@ -166,14 +182,20 @@ async fn discover(server_url: &str) -> Result<Discovered, String> {
     let mut issuer: Option<String> = None;
     let mut scopes: Option<String> = None;
     for u in &prm_urls {
-        if let Some(prm) = get_json(u).await {
+        if let Some(prm) = get_json(u, server_url).await {
+            if prm.get("resource").and_then(Value::as_str).is_none_or(|r| {
+                crate::integrations::safe_url(r).ok()
+                    != crate::integrations::safe_url(server_url).ok()
+            }) {
+                continue;
+            }
             if let Some(a) = prm
                 .get("authorization_servers")
                 .and_then(Value::as_array)
                 .and_then(|a| a.first())
                 .and_then(Value::as_str)
             {
-                issuer = Some(a.trim_end_matches('/').to_string());
+                issuer = Some(a.to_string());
             }
             scopes = prm
                 .get("scopes_supported")
@@ -189,19 +211,48 @@ async fn discover(server_url: &str) -> Result<Discovered, String> {
             }
         }
     }
-    // 3. self-issuing fallback: the MCP origin is the authorization server
-    let issuer = issuer.unwrap_or_else(|| origin.clone());
+    // Never guess that the resource server is also its authorization server.
+    let issuer = issuer.ok_or("The server did not provide valid protected-resource metadata.")?;
+    let issuer_url = reqwest::Url::parse(&issuer).map_err(|_| "Invalid authorization issuer.")?;
 
     for meta_url in [
-        format!("{issuer}/.well-known/oauth-authorization-server"),
-        format!("{issuer}/.well-known/openid-configuration"),
+        format!(
+            "{}://{}/.well-known/oauth-authorization-server{}",
+            issuer_url.scheme(),
+            issuer_url.authority(),
+            issuer_url.path().trim_end_matches('/')
+        ),
+        format!(
+            "{}://{}/.well-known/openid-configuration{}",
+            issuer_url.scheme(),
+            issuer_url.authority(),
+            issuer_url.path().trim_end_matches('/')
+        ),
+        format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        ),
     ] {
-        if let Some(meta) = get_json(&meta_url).await
+        if let Some(meta) = get_json(&meta_url, server_url).await
             && let (Some(auth), Some(token)) = (
                 meta.get("authorization_endpoint").and_then(Value::as_str),
                 meta.get("token_endpoint").and_then(Value::as_str),
             )
         {
+            if meta["issuer"].as_str() != Some(issuer.as_str()) {
+                continue;
+            }
+            if !meta["code_challenge_methods_supported"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "S256"))
+            {
+                return Err(
+                    "The authorization server does not advertise required PKCE S256 support."
+                        .into(),
+                );
+            }
+            crate::integrations::safe_url(auth)?;
+            crate::integrations::safe_url(token)?;
             return Ok(Discovered {
                 authorization_endpoint: auth.to_string(),
                 token_endpoint: token.to_string(),
@@ -209,7 +260,9 @@ async fn discover(server_url: &str) -> Result<Discovered, String> {
                     .get("registration_endpoint")
                     .and_then(Value::as_str)
                     .map(String::from),
-                scopes,
+                scopes: challenged_scope.or(scopes),
+                issuer: issuer.clone(),
+                require_issuer: meta["authorization_response_iss_parameter_supported"] == true,
             });
         }
     }
@@ -228,7 +281,12 @@ pub async fn start(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let row = match state.db.get_connector(&id) {
+    // Starting/replacing sign-in only needs identity and revision. Do not
+    // unlock an old credential merely to let the user reconnect.
+    let row = match state.db.native_connectors().map(|rows| {
+        rows.into_iter()
+            .find(|row| row["id"].as_str() == Some(id.as_str()))
+    }) {
         Ok(Some(r)) => r,
         Ok(None) => {
             return err(
@@ -267,7 +325,11 @@ pub async fn start(
                     .into(),
             );
         };
-        let reg_res = HTTP
+        let reg_client = match crate::oauth_http::client(reg, &server_url).await {
+            Ok(c) => c,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, e),
+        };
+        let reg_res = reg_client
             .post(reg)
             .json(&json!({
                 "client_name": "Paddock",
@@ -275,12 +337,13 @@ pub async fn start(
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
                 "token_endpoint_auth_method": "none",
+                "application_type": "native",
             }))
             .send()
             .await;
         match reg_res {
             Ok(r) if r.status().is_success() => {
-                let v = r.json::<Value>().await.unwrap_or(Value::Null);
+                let v = crate::oauth_http::json(r).await.unwrap_or(Value::Null);
                 client_id = v
                     .get("client_id")
                     .and_then(Value::as_str)
@@ -321,6 +384,13 @@ pub async fn start(
     {
         let mut flows = FLOWS.lock().unwrap_or_else(|e| e.into_inner());
         flows.retain(|_, p| p.created.elapsed() < std::time::Duration::from_secs(600));
+        flows.retain(|_, p| p.connector_id != id);
+        if flows.len() >= 32 {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many sign-in flows. Wait for an existing flow to expire.".into(),
+            );
+        }
         flows.insert(
             flow_state.clone(),
             Pending {
@@ -332,6 +402,9 @@ pub async fn start(
                 redirect_uri: redirect_uri.clone(),
                 resource: server_url.clone(),
                 created: std::time::Instant::now(),
+                revision: row["revision"].as_u64().unwrap_or(0),
+                issuer: d.issuer.clone(),
+                require_issuer: d.require_issuer,
             },
         );
     }
@@ -369,6 +442,11 @@ pub async fn callback(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let page = |title: &str, body: &str| {
+        let body = body
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
         Html(format!(
             "<!doctype html><meta charset=utf-8><title>{title}</title>\
              <body style=\"font-family:system-ui;display:grid;place-items:center;height:90vh\">\
@@ -376,14 +454,7 @@ pub async fn callback(
         ))
         .into_response()
     };
-    if let Some(e) = q.get("error") {
-        let detail = q.get("error_description").map(String::as_str).unwrap_or("");
-        return page(
-            "Sign-in failed",
-            &format!("{e} {detail} - you can close this tab and try again."),
-        );
-    }
-    let (Some(code), Some(st)) = (q.get("code"), q.get("state")) else {
+    let Some(st) = q.get("state") else {
         return page(
             "Sign-in failed",
             "the provider sent no code - close this tab and try again.",
@@ -395,6 +466,40 @@ pub async fn callback(
             "this window is stale - close it and press Connect again.",
         );
     };
+    if p.created.elapsed() > std::time::Duration::from_secs(600)
+        || q.get("iss").is_some_and(|issuer| issuer != &p.issuer)
+        || p.require_issuer && !q.contains_key("iss")
+    {
+        return page(
+            "Sign-in refused",
+            "The sign-in expired or the authorization issuer did not match.",
+        );
+    }
+    if q.contains_key("error") {
+        return page(
+            "Sign-in cancelled",
+            "The authorization server did not grant access. You can close this tab.",
+        );
+    }
+    let Some(code) = q.get("code").filter(|s| !s.is_empty() && s.len() <= 8192) else {
+        return page(
+            "Sign-in failed",
+            "The provider returned no valid authorization code.",
+        );
+    };
+    if state
+        .db
+        .native_connectors()
+        .ok()
+        .and_then(|rows| rows.into_iter().find(|r| r["id"] == p.connector_id))
+        .and_then(|r| r["revision"].as_u64())
+        != Some(p.revision)
+    {
+        return page(
+            "Sign-in expired",
+            "The connector changed. Start sign-in again.",
+        );
+    }
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
         ("code", code.clone()),
@@ -406,14 +511,17 @@ pub async fn callback(
     if let Some(sec) = &p.client_secret {
         form.push(("client_secret", sec.clone()));
     }
-    let res = HTTP.post(&p.token_endpoint).form(&form).send().await;
+    let client = match crate::oauth_http::client(&p.token_endpoint, &p.resource).await {
+        Ok(c) => c,
+        Err(_) => return page("Sign-in refused", "Invalid authorization destination."),
+    };
+    let res = client.post(&p.token_endpoint).form(&form).send().await;
     let tokens = match res {
-        Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or(Value::Null),
-        Ok(r) => {
-            let body = r.text().await.unwrap_or_default();
+        Ok(r) if r.status().is_success() => crate::oauth_http::json(r).await.unwrap_or(Value::Null),
+        Ok(_) => {
             return page(
                 "Sign-in failed",
-                &format!("token exchange refused: {}", &body[..body.len().min(200)]),
+                "The authorization server refused the token exchange.",
             );
         }
         Err(e) => return page("Sign-in failed", &format!("token exchange: {e}")),
@@ -424,7 +532,7 @@ pub async fn callback(
     let expires_at = tokens
         .get("expires_in")
         .and_then(Value::as_u64)
-        .map(|s| now_ms() + (s.saturating_sub(60)) * 1000);
+        .map(|s| now_ms().saturating_add(s.saturating_sub(60).saturating_mul(1000)));
     let blob = json!({
         "access_token": access,
         "refresh_token": tokens.get("refresh_token"),
@@ -434,11 +542,22 @@ pub async fn callback(
         "client_secret": p.client_secret,
         "resource": p.resource,
     });
-    if let Err(e) = state
-        .db
-        .set_connector_oauth(&p.connector_id, &blob.to_string())
+    let _guard = crate::connectors::MUTATIONS.lock().await;
+    let db_state = state.clone();
+    let id = p.connector_id.clone();
+    if crate::integrations::blocking(move || {
+        db_state
+            .db
+            .set_connector_oauth_checked(&id, p.revision, &blob.to_string())
+            .map_err(|_| "Could not save OAuth credentials.".into())
+    })
+    .await
+    .is_err()
     {
-        return page("Sign-in failed", &format!("could not store the token: {e}"));
+        return page(
+            "Sign-in failed",
+            "The connector changed or Keychain could not save the credentials. Try again.",
+        );
     }
     crate::connectors::rematerialize(&state, &p.connector_id);
     page(
@@ -450,6 +569,8 @@ pub async fn callback(
 /// `POST /api/connectors/{id}/oauth/disconnect` - drop the tokens (and the
 /// bearer from any materialized entries).
 pub async fn disconnect(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let _guard = crate::connectors::MUTATIONS.lock().await;
+    cancel(&id);
     match state.db.set_connector_oauth(&id, "") {
         Ok(()) => {
             crate::connectors::rematerialize(&state, &id);
@@ -457,6 +578,15 @@ pub async fn disconnect(State(state): State<Arc<AppState>>, Path(id): Path<Strin
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Cancellation is a backend operation: closing native UI cannot leave an
+/// abandoned browser callback able to publish credentials later.
+pub fn cancel(id: &str) {
+    FLOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, p| p.connector_id != id);
 }
 
 fn now_ms() -> u64 {
@@ -501,14 +631,18 @@ pub async fn ensure_fresh(state: &Arc<AppState>, row: Value) -> Value {
     if let Some(sec) = oauth.get("client_secret").and_then(Value::as_str) {
         form.push(("client_secret", sec.to_string()));
     }
-    let Ok(res) = HTTP.post(endpoint).form(&form).send().await else {
+    let resource = row["url"].as_str().unwrap_or("");
+    let Ok(client) = crate::oauth_http::client(endpoint, resource).await else {
+        return row;
+    };
+    let Ok(res) = client.post(endpoint).form(&form).send().await else {
         return row;
     };
     if !res.status().is_success() {
         tracing::warn!(connector = %row["label"], status = %res.status(), "token refresh refused - reconnect needed");
         return row;
     }
-    let tokens = res.json::<Value>().await.unwrap_or(Value::Null);
+    let tokens = crate::oauth_http::json(res).await.unwrap_or(Value::Null);
     let Some(access) = tokens.get("access_token").and_then(Value::as_str) else {
         return row;
     };
@@ -520,10 +654,27 @@ pub async fn ensure_fresh(state: &Arc<AppState>, row: Value) -> Value {
     blob["expires_at"] = tokens
         .get("expires_in")
         .and_then(Value::as_u64)
-        .map(|s| json!(now_ms() + (s.saturating_sub(60)) * 1000))
+        .map(|s| json!(now_ms().saturating_add(s.saturating_sub(60).saturating_mul(1000))))
         .unwrap_or(Value::Null);
     let id = row["id"].as_str().unwrap_or("");
-    let _ = state.db.set_connector_oauth(id, &blob.to_string());
+    let _guard = crate::connectors::MUTATIONS.lock().await;
+    let saved = id.to_owned();
+    let revision = row["revision"].as_u64().unwrap_or(0);
+    let db_state = state.clone();
+    let text = blob.to_string();
+    if crate::integrations::blocking(move || {
+        db_state
+            .db
+            .set_connector_oauth_checked(&saved, revision, &text)
+            .map_err(|_| "OAuth refresh could not be saved.".into())
+    })
+    .await
+    .is_err()
+    {
+        // Another refresh may have won, or the user may have disconnected.
+        // Never return newly obtained credentials after a failed publication.
+        return state.db.get_connector(id).ok().flatten().unwrap_or(row);
+    }
     crate::connectors::rematerialize(state, id);
     let mut out = row;
     out["oauth"] = blob;

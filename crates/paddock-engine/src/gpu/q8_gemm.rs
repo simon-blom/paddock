@@ -1335,7 +1335,7 @@ impl GpuExecutor {
 
     /// Slot 608: [`Self::q8_0_gemm_mmq_pipe_hcmix_rows`] over the normalized
     /// state rebuilt from the residual `h` and `aux` = [norm_w (4 * hidden) |
-    /// 1/rms (batch * 4)], as ONE launch over `batch` rows (the 1/rms tail is
+    /// 1/rms (batch * 4)], as one launch over `batch` rows (the 1/rms tail is
     /// indexed from row 0, so there is no row offset to carry).
     /// Byte-identical to slot 605 over the stored state.
     #[allow(clippy::too_many_arguments)]

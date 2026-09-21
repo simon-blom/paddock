@@ -7,6 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+default = ["pdf"]
+# Windows/Linux use our static PDFium build. macOS uses CoreGraphics when
+# this feature is omitted; PDF rendering remains available in-process.
+pdf = ["dep:paddock-pdfium"]
+metal = ["dep:paddock-metal"]
 # See paddock-engine's note. This is the crate a release actually builds with
 # the feature on, since paddock-runner is the only binary that serves.
 static-pack = ["paddock-engine/static-pack"]
@@ -16,6 +21,7 @@ static-pack = ["paddock-engine/static-pack"]
 # (hardening_chained!) or the leakage scanner would catch it.
 hardened = [
     "paddock-engine/hardened",
+    "paddock-metal?/hardened",
     "paddock-models/hardened",
     "paddock-websearch/hardened",
 ]
@@ -71,7 +77,7 @@ tiff = { workspace = true }
 #
 # The library is wired up by this crate's build.rs, which picks the per-OS path
 # out of packs/pdfium/.
-paddock-pdfium = { workspace = true }
+paddock-pdfium = { workspace = true, optional = true }
 # PDF text + metadata extraction (text path - any model reads a PDF's text
 # layer, no vision needed) and document metadata injection. Pure Rust, ours.
 sift = { workspace = true }
@@ -114,6 +120,9 @@ mimalloc = "0.1.52"
 # server the OS supervises, no manager and no wrapper (NSSM/WinSW) needed.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+paddock-metal = { path = "../paddock-metal", optional = true }
 
 [dev-dependencies]
 # builds in-memory .docx fixtures for the extraction tests

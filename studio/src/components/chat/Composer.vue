@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import { useRouter } from 'vue-router'
+import { reasoningOptions as buildReasoningOptions, reasoningChoice as chooseReasoning, reasoningLabel as reasoningItemLabel, samplerIsSet } from '@/lib/composer-policy'
 import { EditorContent, useEditor } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import { Placeholder } from '@tiptap/extensions'
@@ -19,13 +20,15 @@ import {
 import { activeMessages } from '@/lib/tree'
 import { ARTIFACTS_LABEL, toolSelection } from '@/composables/useChatStream'
 import { DICTATION_IDLE_MS, useMicTranscribe } from '@/composables/useMicTranscribe'
+import { audioPolicy, type MicMode } from '@/lib/audio-policy'
 import { useAudioDevices } from '@/composables/useAudioDevices'
 import { useLiveTurn } from '@/composables/useLiveTurn'
 import { RECORD_MAX_S, useRecorder } from '@/composables/useRecorder'
 import { Dictation, appendDictated, setGhost } from '@/lib/dictation'
 import { audioDuration, isAudioFile } from '@/lib/transcribe'
 import { holdReload } from '@/lib/reload'
-import type { ToolPick, ToolSelection } from '@/types/chat'
+import type { ToolSelection } from '@/types/chat'
+import { changeToolPicker, pickerGroupState, pickerToolChecked, toolTermHits, type PickerAction } from '@/lib/tool-picker'
 import { friendlyModelName } from '@/lib/model-caps'
 import {
   type DocOpts,
@@ -69,6 +72,7 @@ import MenuLabel from '@/components/ui/MenuLabel.vue'
 import MenuSeparator from '@/components/ui/MenuSeparator.vue'
 import NumberField from '@/components/ui/NumberField.vue'
 import SpeechModels from './SpeechModels.vue'
+import { DICTATION_SETUP, microphoneMenu } from '@/lib/speech-models'
 import SystemPromptPanel from './SystemPromptPanel.vue'
 import SamplerMenu from './SamplerMenu.vue'
 import AudioPlayer from './AudioPlayer.vue'
@@ -213,22 +217,8 @@ watch(pickerOpen, async (open) => {
   }
 })
 
-/** Light fuzzy match: the term must be a substring of the name (separators
- *  ignored), a substring of the description, or an in-order subsequence of
- *  the name ("crisu" hits create_issue). */
-function termHits(term: string, name: string, desc?: string): boolean {
-  const n = name.toLowerCase().replace(/[-_.\s]/g, '')
-  const t = term.replace(/[-_.\s]/g, '')
-  if (!t) return true
-  if (n.includes(t)) return true
-  if (desc && desc.toLowerCase().includes(term)) return true
-  let i = 0
-  for (const ch of n) {
-    if (ch === t[i]) i++
-    if (i === t.length) return true
-  }
-  return false
-}
+// Search matching lives in the shared web/native picker policy.
+const termHits = toolTermHits
 
 interface PickerRow {
   group: PickerGroup
@@ -260,107 +250,28 @@ const pickerRows = computed<PickerRow[]>(() => {
   return rows
 })
 
-function writeSelection(sel: ToolSelection): void {
+function pickerState() { return { selection: selection.value, connectorIds: [...chatConnectorIds.value] } }
+function policyGroup(g: PickerGroup) {
+  return { label: g.label, connectorId: g.connector?.id, tools: mcpTools.get(g.key)?.status === 'ok' ? mcpTools.get(g.key)!.tools.map(t => t.name) : undefined }
+}
+function chooseTools(action: PickerAction, g?: PickerGroup): void {
   const c = chat.active
   if (!c) return
-  c.toolSelection = sel
+  const next = changeToolPicker(pickerState(), g && policyGroup(g),
+    personalConnectors.value.map(c => ({ label: c.label, connectorId: c.id })), action)
+  c.toolSelection = next.selection
+  c.connectorIds = next.connectorIds
   chat.persist(c)
 }
-
-/** What a click builds on: the existing picks, or - when leaving All - only
- *  the armed connectors (theirs are the only row checkmarks All shows, and
- *  a click must keep every other visible checkmark as it was). */
-function baselinePicks(): ToolPick[] {
-  const sel = selection.value
-  if (sel.mode === 'custom') return sel.picks.map((p) => ({ ...p }))
-  const picks: ToolPick[] = []
-  for (const c of personalConnectors.value) {
-    if (chatConnectorIds.value.includes(c.id)) picks.push({ label: c.label })
-  }
-  return picks
-}
-
-/** A group's check state: whole pick = 'all', some tools = 'some'. Under
- *  All-tools mode the All row alone carries the servers' coverage - a
- *  server group shows unchecked; a connector reads its per-chat arming. */
-/** The same three states Reka's checkbox speaks, so the picker's partial pick
- *  is announced instead of only being drawn at 45% opacity. */
+function groupState(g: PickerGroup): 'all' | 'some' | 'none' { return pickerGroupState(pickerState(), policyGroup(g)) }
 function groupChecked(g: PickerGroup): boolean | 'indeterminate' {
   const s = groupState(g)
   return s === 'all' ? true : s === 'some' ? 'indeterminate' : false
 }
-function groupState(g: PickerGroup): 'all' | 'some' | 'none' {
-  const sel = selection.value
-  if (sel.mode === 'all') {
-    if (!g.connector) return 'none'
-    return chatConnectorIds.value.includes(g.connector.id) ? 'all' : 'none'
-  }
-  if (sel.picks.some((p) => p.label === g.label && p.tool == null)) return 'all'
-  return sel.picks.some((p) => p.label === g.label) ? 'some' : 'none'
-}
-
-function toolChecked(g: PickerGroup, name: string): boolean {
-  const sel = selection.value
-  if (sel.mode === 'all') {
-    return g.connector ? chatConnectorIds.value.includes(g.connector.id) : false
-  }
-  return sel.picks.some((p) => p.label === g.label && (p.tool == null || p.tool === name))
-}
-
-function selectAllTools(): void {
-  writeSelection({ mode: 'all' })
-}
-
-function toggleGroup(g: PickerGroup): void {
-  const sel = selection.value
-  // a connector under All keeps its plain per-chat arming - the chat stays
-  // in All-tools mode, nothing else changes
-  if (sel.mode === 'all' && g.connector) {
-    const c = chat.active
-    if (!c) return
-    const cur = new Set(c.connectorIds ?? [])
-    if (cur.has(g.connector.id)) cur.delete(g.connector.id)
-    else cur.add(g.connector.id)
-    c.connectorIds = [...cur]
-    chat.persist(c)
-    return
-  }
-  const state = groupState(g)
-  let picks = baselinePicks().filter((p) => p.label !== g.label)
-  if (state !== 'all') picks.push({ label: g.label })
-  writeSelection({ mode: 'custom', picks })
-}
-
-function toggleTool(g: PickerGroup, name: string): void {
-  let picks = baselinePicks()
-  const whole = picks.some((p) => p.label === g.label && p.tool == null)
-  if (whole) {
-    // unchecking one tool of a whole-picked server: materialize the listing
-    // into per-tool picks minus this one (tool rows only exist when the
-    // listing is loaded)
-    const listing = mcpTools.get(g.key)
-    picks = picks.filter((p) => p.label !== g.label)
-    if (listing?.status === 'ok') {
-      for (const t of listing.tools) {
-        if (t.name !== name) picks.push({ label: g.label, tool: t.name })
-      }
-    }
-  } else if (picks.some((p) => p.label === g.label && p.tool === name)) {
-    picks = picks.filter((p) => !(p.label === g.label && p.tool === name))
-  } else {
-    picks.push({ label: g.label, tool: name })
-    // every tool picked = the whole server again (future tools included)
-    const listing = mcpTools.get(g.key)
-    if (
-      listing?.status === 'ok' &&
-      listing.tools.every((t) => picks.some((p) => p.label === g.label && p.tool === t.name))
-    ) {
-      picks = picks.filter((p) => p.label !== g.label)
-      picks.push({ label: g.label })
-    }
-  }
-  writeSelection({ mode: 'custom', picks })
-}
+function toolChecked(g: PickerGroup, name: string): boolean { return pickerToolChecked(pickerState(), policyGroup(g), name) }
+function selectAllTools(): void { chooseTools({ kind: 'all' }) }
+function toggleGroup(g: PickerGroup): void { chooseTools({ kind: 'group', label: g.label }, g) }
+function toggleTool(g: PickerGroup, name: string): void { chooseTools({ kind: 'tool', label: g.label, tool: name }, g) }
 
 function openConnectorsPage(): void {
   pickerOpen.value = false
@@ -637,7 +548,7 @@ const audioMode = computed(() => {
   // makes the clip the only possible input. A panel where everything can also
   // chat (Qwen3-ASR on its own, or beside another chat model) stays in text
   // mode and simply accepts an audio attachment.
-  return ids.every((id) => models.canTranscribe(id)) && !ids.every((id) => models.canChat(id))
+  return audioPolicy(ids.map(id => ({ chat: models.canChat(id), audio: models.canTranscribe(id), live: models.canLiveTranscribe(id) })), 0).audioMode
 })
 /** Whether a clip can be attached at all: every lane must be able to read it,
  *  or the send would go to a model that answers with a refusal. */
@@ -811,24 +722,7 @@ const armedStyles = computed<Set<string> | null>(() => {
 // silently leveled down.
 const reasoningOptions = computed<string[]>(() => {
   const ids = armedStyles.value ? (chat.active?.compareModels ?? []) : [activeModelId.value]
-  const levels: string[] = []
-  let off = false
-  for (const id of ids) {
-    if (!id) continue
-    const l = models.reasoningLadderFor(id)
-    off = off || l.off
-    for (const rung of l.levels) if (!levels.includes(rung)) levels.push(rung)
-  }
-  if (!off && !levels.length) return []
-  // The two-item picker the switch-only families (qwen3.5, gemma4, laguna)
-  // were PROMISED above and never got: zero rungs collapsed their options to
-  // ['off'], the length>1 gate then hid the menu entirely, and the Studio
-  // sent enable_thinking:true with no control in sight (-
-  // "the 9B has a thinking icon? I can't recall I have seen it"). 'on' is a
-  // UI-only entry: the request builder keys the wire shape off ladder.levels,
-  // so it can never leak out as an effort rung.
-  if (off && !levels.length) return ['off', 'on']
-  return off ? ['off', ...levels] : levels
+  return buildReasoningOptions(ids.filter(Boolean).map(id => models.reasoningLadderFor(id)))
 })
 // Only worth drawing when there is a choice: a model whose whole surface is
 // "it reasons" has nothing to pick.
@@ -843,10 +737,7 @@ const reasoningMismatch = computed(() => {
 })
 
 // Lights the sampler tool when any dial left "model defaults" behind.
-const samplerSet = computed(() => {
-  const p = chat.active?.params
-  return !!p && (p.temperature != null || p.topP != null || p.topK != null || p.seed != null)
-})
+const samplerSet = computed(() => samplerIsSet(chat.active?.params))
 
 // The picker's value is 'off' or a rung name. It writes both stored params -
 // `thinking` is the off switch and `reasoningEffort` the rung - so a stored
@@ -859,17 +750,8 @@ const samplerSet = computed(() => {
 // opening the picker on anything else would show a level the model is not at.
 const reasoningChoice = computed<string>({
   get: () => {
-    const p = chat.active?.params
-    if (p && p.thinking === false && reasoningOptions.value.includes('off')) return 'off'
-    const want = p?.reasoningEffort
-    if (want && reasoningOptions.value.includes(want)) return want
-    // The model's LOWEST rung, not its published default: a fresh chat should
-    // answer fast and cheap, and someone who wants more reasoning can say so
-    // `opens` is per-model, so it can never name a level
-    // this checkpoint does not grade.
     const opens = activeModelId.value ? models.reasoningLadderFor(activeModelId.value).opens : ''
-    // a switch-only lane has no opens rung - its not-off state is the 'on' item
-    return opens || reasoningOptions.value.find((o) => o !== 'off') || ''
+    return chooseReasoning(reasoningOptions.value, chat.active?.params, opens)
   },
   set: (v) => {
     const c = chat.active
@@ -893,19 +775,6 @@ const reasoningChoice = computed<string>({
  *  high, Qwen3.8 offers low/medium/xhigh with `high` folded into `xhigh` by its
  *  own template - so this table names every rung any family we serve can have
  *  and shows nobody a level their model does not grade. */
-const REASONING_LABELS: Record<string, string> = {
-  off: 'None',
-  on: 'Thinking',
-  minimal: 'Minimal',
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
-  xhigh: 'Extra High',
-  max: 'Max',
-}
-function reasoningItemLabel(o: string): string {
-  return REASONING_LABELS[o] ?? o.charAt(0).toUpperCase() + o.slice(1)
-}
 
 /** Does the lane's own template let a caller decide what happens to earlier
  *  turns' thinking? Measured per template by the runner (`reasoning_preserve`),
@@ -1414,7 +1283,7 @@ const live = useLiveTurn()
  *  running, right next to a mic that could have used it. Caps are fetched for
  *  every local runner on fleet refresh, so this settles on its own. */
 const transcribers = computed(() =>
-  models.models.filter((m) => m.status === 'ok' && m.port && models.canTranscribe(m.id)),
+  models.models.filter((m) => m.status === 'ok' && m.port && models.canLiveTranscribe(m.id)),
 )
 // ── Speech models, started and stopped from the mic  ──────────
 // The mic used to send you to the pick-a-new-model page whether or not you
@@ -1462,7 +1331,7 @@ const micPorts = computed<number[]>(() => {
 const liveOnlyByFile = computed(() =>
   audioMode.value
     ? sendTo.value
-        .filter((id) => !models.transcribeStreams(id))
+        .filter((id) => !models.canLiveTranscribe(id))
         .map((id) => models.models.find((m) => m.id === id)?.display ?? id)
     : [],
 )
@@ -1501,7 +1370,6 @@ const micBlocked = computed(() => liveOnlyByFile.value.length > 0)
 // read the lanes' CAPABILITY instead of the arming's shape and so withheld live
 // from every comparison containing a generative ASR model - the exact
 // comparison the feature is best at. See `liveApplies`.
-type MicMode = 'live' | 'record' | 'dictate'
 const recorder = useRecorder()
 const micMode = ref<MicMode>('live')
 /** Live is impossible for this arming - every case is a lane that hears a
@@ -1532,12 +1400,9 @@ const liveApplies = computed(() => audioMode.value)
 /** The jobs this arming can actually do, the one that should be default first. */
 const micJobs = computed<MicMode[]>(() => {
   // a document parser takes no dictation and no clips - nothing to say to it
-  if (docParser.value) return []
   // no lane takes a clip, so the mic can only type for you - and only if some
   // transcriber is running to hear it (row 3)
-  if (!audioOk.value) return transcribers.value.length ? ['dictate'] : []
-  if (liveApplies.value) return liveImpossible.value ? ['record'] : ['live', 'record']
-  return sendTo.value.length > 1 ? ['record'] : ['record', 'dictate']
+  return audioPolicy(sendTo.value.map(id => ({ chat: models.canChat(id), audio: models.canTranscribe(id), live: models.canLiveTranscribe(id) })), transcribers.value.length, docParser.value).jobs
 })
 /** The mic is OFFERED when it has a job at all. When it has none, the "nothing
  *  running" fallback button takes the slot instead - a mic-shaped empty state
@@ -1549,7 +1414,7 @@ const micOffered = computed(() => micJobs.value.length > 0)
  *  cannot run stays as a disabled item that says why, which beats dropping it
  *  silently. */
 const micJobChoice = computed(
-  () => micJobs.value.length > 1 || (liveApplies.value && liveImpossible.value),
+  () => micMenuPresentation.value.jobChoice,
 )
 
 // ── which microphone ────────────────────────────────────────────────────────
@@ -1580,7 +1445,7 @@ const micChoices = computed(() => {
   return list
 })
 /** One input is not a choice - the system default is that input. */
-const micDeviceChoice = computed(() => audioDevices.named() && micChoices.value.length > 1)
+const micDeviceChoice = computed(() => micMenuPresentation.value.deviceChoice)
 function setMicDevice(id: string, label: string): void {
   settings.micDeviceId = id
   settings.micDeviceLabel = label
@@ -1597,7 +1462,7 @@ const micDeviceNote = computed(() =>
 /** A choice of EARS to make: only in dictation, where exactly one
  *  model hears you and nothing else on screen says which. */
 const micEarChoice = computed(
-  () => micModeNow.value === 'dictate' && !docParser.value && transcribers.value.length > 1,
+  () => micMenuPresentation.value.earChoice,
 )
 /** One menu behind one chevron, in three groups: what the button does, which
  *  microphone it opens, which model hears it. They were separate menus, which
@@ -1621,6 +1486,9 @@ const micMenu = computed(
 const micModeNow = computed<MicMode>(
   () => (micJobs.value.includes(micMode.value) ? micMode.value : micJobs.value[0]) ?? 'record',
 )
+const micMenuPresentation = computed(() => microphoneMenu({ jobs: micJobs.value, mode: micModeNow.value,
+  audioMode: audioMode.value, liveImpossible: liveImpossible.value, namedDevices: audioDevices.named(),
+  devices: micChoices.value.length, ears: transcribers.value.length, speech: fleet.speechEndpoints.length, docParser: docParser.value }))
 const micBusy = computed(() => mic.listening.value || recorder.recording.value)
 
 // ── How long a clip may be, recorded or attached  ─────────────
@@ -1813,7 +1681,15 @@ async function toggleMic(): Promise<void> {
     detail: micPorts.value.map((p) => {
       if (!audioMode.value) return false
       const id = models.models.find((m) => m.port === p)?.id
-      return !!id && models.canTimeWords(id)
+      return !!id && models.canEnrichLive(id)
+    }),
+    drain: micPorts.value.map(p => {
+      const id = models.models.find(m => m.port === p)?.id
+      return !!id && models.caps[id]?.realtimeTranscription?.drain === true
+    }),
+    finalRevision: micPorts.value.map(p => {
+      const id = models.models.find(m => m.port === p)?.id
+      return !!id && models.caps[id]?.realtimeTranscription?.final_revision === true
     }),
     // Dictation asks to hear about a quiet room much sooner, because there it
     // ends the session (see the watcher below). A comparison keeps the long
@@ -2442,10 +2318,7 @@ onBeforeUnmount(() => {
               </button>
             </MenuTrigger>
             <MenuContent side="top" align="start" min-width="320px">
-              <p class="composer__ear-none">
-                Dictation needs a speech model running. Start one and the mic will
-                type what you say straight into the composer.
-              </p>
+              <p class="composer__ear-none">{{ DICTATION_SETUP }}</p>
               <!-- Already set up, just not running: no heading, because the
                    lead above already says what these are and every row wears
                    its own verb. SpeechModels carries its
