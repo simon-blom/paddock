@@ -115,6 +115,10 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2-foundation = "0.3.2"
 # Hardware-only readiness probe; no engine/inference dependency in the manager.
 objc2-metal = "0.3.2"
 security-framework = "3.7.0"

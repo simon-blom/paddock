@@ -21,7 +21,7 @@ describe('web/native information placement contract', () => {
       expect(source).not.toContain('arrow.clockwise')
       expect(source).not.toMatch(/Button\("Refresh/)
     }
-    expect(nativeToolbar).not.toContain('placement: .primaryAction')
+    expect(nativeToolbar).toContain('.accessibilityLabel("GPU metrics")')
   })
   it('uses the same ordered sections as the actual web settings template', () => {
     const headings = [...settingsSource.matchAll(/<h2>([^<]+)<\/h2>/g)].map(m => m[1])

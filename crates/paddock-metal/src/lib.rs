@@ -13,6 +13,10 @@ mod affine_tests;
 #[cfg(target_os = "macos")]
 mod device;
 #[cfg(target_os = "macos")]
+mod telemetry;
+#[cfg(target_os = "macos")]
+pub use telemetry::telemetry_snapshot;
+#[cfg(target_os = "macos")]
 mod offload;
 #[cfg(target_os = "macos")]
 mod paged_offload;

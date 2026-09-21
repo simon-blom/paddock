@@ -38,22 +38,3 @@ pub fn value(doc: &toml::Value, v: &Settings) -> Result<toml::Value, String> {
     table.insert("nvme_gb".into(), toml::Value::Float(v.nvme_gb));
     Ok(toml::Value::Table(table))
 }
-pub fn supported(doc: &toml::Value) -> bool {
-    let Some(path) = doc
-        .get("model")
-        .and_then(toml::Value::as_str)
-        .map(std::path::Path::new)
-    else {
-        return false;
-    };
-    if path.is_dir() {
-        return paddock_models::mlx::QwenConfig::read(path).is_ok()
-            || paddock_models::bonsai::BonsaiConfig::read(path).is_ok();
-    }
-    paddock_models::probe::probe_path(path).is_ok_and(|p| {
-        matches!(
-            p.architecture.as_deref(),
-            Some("qwen35" | "qwen35moe" | "granite" | "gpt-oss" | "laguna")
-        )
-    })
-}

@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod artifacts;
+pub mod backend_contract;
 pub mod cloud;
 pub mod cloud_loop;
 pub mod collector;
@@ -25,6 +26,7 @@ pub mod inspect;
 pub mod integrations;
 pub mod log_tail;
 pub mod logs;
+pub mod metal_memory;
 pub mod native_endpoints;
 pub mod nvml;
 pub mod oauth;
@@ -174,10 +176,12 @@ pub async fn initialize(
     // logged as if something had gone wrong, one line above the line that
     // calmly explains there is no NVIDIA card. Nothing went
     // wrong. It is a computer without an NVIDIA GPU.
-    let gpu = if cfg.device != "cuda" || readiness.state == readiness::State::NoCard {
+    // Diagnostic full-pipeline A/B switch. Defaults on; never a UI setting.
+    let telemetry_disabled = std::env::var("PADDOCK_TELEMETRY").as_deref() == Ok("0");
+    let gpu = if readiness.state == readiness::State::NoCard || telemetry_disabled {
         telemetry::Telemetry::disabled()
     } else {
-        telemetry::start()
+        telemetry::start(&cfg.device)
     };
 
     // Runner supervision (doc §3): spawn/stop/takeover + §6.1 reconciliation.
@@ -215,30 +219,8 @@ pub async fn initialize(
     // elected port is left alone. A failed respawn keeps its election (the
     // operator sees the error; next boot retries) - silently dropping desired
     // state would be a silent failure.
-    if mode == HostMode::Web {
-        let sup = supervisor.clone();
-        let el = elections.clone();
-        let causes = db.clone();
-        tokio::spawn(async move {
-            for e in el.list() {
-                if sup.is_serving(e.port).await {
-                    tracing::info!(port = e.port, model = %e.model, "election already serving (reconcile reclaimed it) - left alone");
-                    continue;
-                }
-                tracing::info!(port = e.port, model = %e.model, "respawning elected runner");
-                // The collector will see the new generation and consume this
-                // note into its lifecycle band's start_cause.
-                let _ = causes.note_start_cause(e.port, "boot-election");
-                // Launch the FILE verbatim (servers/<port>.toml - the truth):
-                // a respawn never re-renders the config, so hand-edits -
-                // including fields the manager's editor doesn't know - are
-                // honored exactly as written.
-                if let Err(err) = sup.start_config(e.port).await {
-                    tracing::error!(port = e.port, model = %e.model, %err, "elected runner failed to respawn (election kept; will retry next boot)");
-                }
-            }
-        });
-    }
+    // Boot restoration is started after AppState exists below, so it cannot
+    // bypass the same validation/admission used by an interactive start.
 
     // Reconciliation is the SOLE owner of the record map, so it cannot be a
     // boot-only pass. It used to be, and `list()` - a read path, called every
@@ -274,7 +256,7 @@ pub async fn initialize(
 
     // §9 reconciliation gauge: NVML outside view vs runner allocator ledgers.
     // Nothing to compare on a box with no card, so nothing wakes up to try.
-    let recon = if readiness.state == readiness::State::NoCard {
+    let recon = if readiness.state == readiness::State::NoCard || telemetry_disabled {
         telemetry::no_reconciler()
     } else {
         telemetry::start_reconciler(gpu.clone(), supervisor.clone())
@@ -352,6 +334,23 @@ pub async fn initialize(
     // server-push watcher: sweeps fleet state only while a Studio tab holds
     // the /api/events stream open, publishing on change (crate::push)
     crate::push::spawn_watcher(state.clone());
+
+    if mode == HostMode::Web {
+        let startup = state.clone();
+        tokio::spawn(async move {
+            if let Some(elections) = &startup.elections {
+                for e in elections.list() {
+                    if startup.supervisor.is_serving(e.port).await {
+                        continue;
+                    }
+                    let response = routes::resume_elected(startup.clone(), e.port).await;
+                    if !response.status().is_success() {
+                        tracing::error!(port = e.port, status = %response.status(), "elected runner refused; election kept for next boot");
+                    }
+                }
+            }
+        });
+    }
 
     Ok(ManagerCore {
         state,

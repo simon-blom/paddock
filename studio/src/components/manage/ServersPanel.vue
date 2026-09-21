@@ -11,7 +11,7 @@ import { useFleetStore, type FleetRow } from '@/stores/fleet'
 import { useDownloadsStore, jobActive, type DownloadJob } from '@/stores/downloads'
 import { useRegistryStore } from '@/stores/registry'
 import { fmtVram as gb, fmtBytes, fmtEtaShort, fmtRate } from '@/lib/format'
-import { modelLabel } from '@/lib/model-name'
+import { modelLabel, speculationBadge } from '@/lib/model-name'
 import { ROW_BUDGET, reasonOf } from '@/lib/error-text'
 import Icon from '@/components/Icon.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
@@ -454,7 +454,7 @@ async function stop(r: FleetRow): Promise<void> {
                   <span class="c-model__name">
                     <VendorLogo v-if="en.r.vendor" :vendor="en.r.vendor" :size="16" class="c-model__logo" />
                     <span class="c-model__id">{{ en.r.display ?? en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? '-' }}</span>
-                    <span v-if="en.r.spec" class="c-model__spec">{{ en.r.spec }}</span>
+                    <span v-if="speculationBadge(en.r.spec)" class="c-model__spec">{{ speculationBadge(en.r.spec) }}</span>
                   </span>
                 </Tooltip>
                 <span v-if="en.r.embedder && en.r.model" class="c-model__extra">+ {{ en.r.embedder }}</span>
@@ -544,7 +544,7 @@ async function stop(r: FleetRow): Promise<void> {
                   <span class="c-model__name">
                     <VendorLogo v-if="en.c.vendor" :vendor="en.c.vendor" :size="16" class="c-model__logo" />
                     <span class="c-model__id">{{ stoppedName(en.c) }}</span>
-                    <span v-if="en.c.spec" class="c-model__spec">{{ en.c.spec }}</span>
+                    <span v-if="speculationBadge(en.c.spec)" class="c-model__spec">{{ speculationBadge(en.c.spec) }}</span>
                   </span>
                 </Tooltip>
               </td>

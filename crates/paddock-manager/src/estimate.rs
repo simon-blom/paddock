@@ -53,6 +53,8 @@ impl ProbeCache {
 
 #[derive(Debug, Deserialize)]
 pub struct EstimateQuery {
+    /// Edit/switch preview: this instance releases its own allocation first.
+    freeing_port: Option<u16>,
     /// Concurrent sequences to price. Defaults to the configured `max_batch`.
     /// There is deliberately no `ctx` parameter - context is derived from what
     /// the card can back at this concurrency, capped by the model's own
@@ -187,15 +189,31 @@ pub(crate) fn resolve_weights_for(
     if let Ok(models) = store.list()
         && let Some(m) = models.into_iter().find(|m| m.id == model)
     {
-        let bytes = std::fs::metadata(&m.path).ok()?.len();
+        let bytes = checkpoint_file_bytes(&m.path)?;
         return Some((m.path, bytes, ModelKind::Generative, 0));
     }
     let p = Path::new(model);
-    if p.is_file() {
-        let bytes = std::fs::metadata(p).ok()?.len();
+    if p.exists() {
+        let bytes = checkpoint_file_bytes(p)?;
         return Some((p.to_path_buf(), bytes, ModelKind::Generative, 0));
     }
     None
+}
+
+/// Imported checkpoints need a bounded grant too. For a local MLX folder,
+/// charge every safetensors shard, never the directory inode's byte length.
+fn checkpoint_file_bytes(path: &Path) -> Option<u64> {
+    if path.is_file() {
+        return Some(std::fs::metadata(path).ok()?.len());
+    }
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(path).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_some_and(|ext| ext == "safetensors") {
+            bytes = bytes.checked_add(std::fs::metadata(path).ok()?.len())?;
+        }
+    }
+    (bytes > 0).then_some(bytes)
 }
 
 /// Resident bytes of the vision tower this model would serve with, 0 for a
@@ -228,6 +246,14 @@ pub(crate) fn tower_bytes(
     m: &crate::registry::CatalogModel,
     reg: &crate::registry::Registry,
 ) -> u64 {
+    tower_bytes_for(m, reg, None)
+}
+
+pub(crate) fn tower_bytes_for(
+    m: &crate::registry::CatalogModel,
+    reg: &crate::registry::Registry,
+    weights: Option<&crate::registry::CatalogArtifact>,
+) -> u64 {
     use crate::registry::ArtifactKind;
     // Vision and Audio towers are the same KIND of cost - an mmproj companion
     // held from startup to shutdown - so they are charged by one rule. Only
@@ -236,6 +262,7 @@ pub(crate) fn tower_bytes(
     let tower = || {
         m.artifacts
             .iter()
+            .filter(|a| weights.is_none_or(|w| w.runtime.allows_companion(&a.id)))
             .filter(|a| matches!(a.kind, ArtifactKind::Vision | ArtifactKind::Audio))
     };
     tower()
@@ -249,11 +276,190 @@ pub(crate) fn tower_bytes(
         .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
 }
 
+/// Shared geometry for fit and admission, including directory checkpoints.
+pub(crate) fn artifact_shape(
+    state: &crate::routes::AppState,
+    model: &crate::registry::CatalogModel,
+    artifact: &crate::registry::CatalogArtifact,
+    vision: bool,
+) -> Option<ModelShape> {
+    let tower = if vision {
+        tower_bytes_for(model, &state.registry, Some(artifact))
+    } else {
+        0
+    };
+    let path = artifact.entry_path(state.registry.models_dir())?;
+    let published = artifact.shape.clone().or_else(|| {
+        // Validate the dense Qwen architecture before borrowing its GGUF
+        // geometry; NEVER borrow that format's resident weight-byte count.
+        if model.id != "qwen3.8-27b"
+            || !artifact.runtime.checkpoint_dir
+            || paddock_models::mlx::QwenConfig::read(&path).is_err()
+        {
+            return None;
+        }
+        let mut shape = model.weights().find_map(|a| a.shape.clone())?;
+        shape.weight_bytes = artifact.total_size();
+        shape.nextn_bytes = 0;
+        Some(shape)
+    });
+    let mut shape = published
+        .map(|s| s.into_model_shape(tower, artifact.workspace.unwrap_or(0)))
+        .or_else(|| {
+            state.probes.get(&path).map(|p| {
+                let kind = if artifact
+                    .capabilities(model)
+                    .iter()
+                    .any(|c| is_single_pass(c))
+                {
+                    ModelKind::Encoder
+                } else {
+                    ModelKind::Generative
+                };
+                ModelShape {
+                    tower_bytes: tower,
+                    workspace_bytes: artifact.workspace.unwrap_or(0),
+                    ..ModelShape::from_report(&p, artifact.total_size(), kind)
+                }
+            })
+        })?;
+    if let Some(memory) = &artifact.runtime.memory {
+        memory.apply(&mut shape);
+    }
+    Some(shape)
+}
+
+/// Qwen's Metal pool has three context slots per live slot without a tier,
+/// and live slots + one restore context + two staging blocks per slot with
+/// a tier (paddock-metal/qwen35/load.rs). Scale the catalog's maximum-envelope
+/// reservation for the concurrency actually requested.
+pub(crate) fn metal_cache_shape(
+    shape: &mut ModelShape,
+    model: &crate::registry::CatalogModel,
+    env: &Envelope,
+) {
+    if matches!(
+        model.family.as_deref(),
+        Some("qwen3.5" | "qwen3.6" | "qwen3.8" | "bonsai")
+    ) && model.id != "qwen3.8-flash-next"
+    {
+        shape.kv_reserve_sequences = if env.offload.is_some() {
+            1 + (64 * env.concurrency).div_ceil(shape.max_ctx.max(1))
+        } else {
+            2 * env.concurrency
+        };
+    }
+}
+
+/// Metal uses fixed context reservations, not CUDA's dynamically sized pool
+/// or its 40%-of-VRAM cap. Keep the conservative resident/workspace allowance,
+/// but invert the actual cache geometry against the remaining unified budget.
+pub(crate) fn backend_estimate(
+    backend: &str,
+    shape: &ModelShape,
+    env: &Envelope,
+    device: &Device,
+) -> paddock_estimator::Estimate {
+    let mut result = paddock_estimator::estimate(shape, env, device);
+    if backend != "metal" || shape.kind == ModelKind::Encoder {
+        return result;
+    }
+    let sequences = env
+        .concurrency
+        .max(1)
+        .saturating_add(shape.kv_reserve_sequences);
+    // Qwen retains three recurrent/conv slots per live slot. The shared
+    // estimator already charged live state and checkpoint allowances; top
+    // that up if a larger batch exceeds that allowance.
+    if let Some(r) = &shape.recurrent {
+        let held = result
+            .state
+            .saturating_add(result.overhead_parts.prefix_checkpoints);
+        let required = 3
+            * env.concurrency.max(1)
+            * r.layers
+            * (r.state_elems + 3 * r.conv_elems)
+            * r.elem_bytes;
+        let extra = required.saturating_sub(held);
+        result.state += extra;
+        result.resident += extra;
+    }
+    result.overhead_parts.prefix_pool_extra = 0;
+    let headroom = device.free_bytes.saturating_sub(result.resident);
+    let cost = |ctx: u64| {
+        shape
+            .kv_per_sequence(ctx.div_ceil(32) * 32, env.kv_dtype)
+            .saturating_mul(sequences)
+    };
+    let (mut low, mut high) = (0, shape.max_ctx);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if cost(mid) <= headroom {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    result.max_ctx = low;
+    result.kv_pool = cost(low);
+    result.limited_by = if low == shape.max_ctx {
+        paddock_estimator::LimitedBy::Model
+    } else {
+        paddock_estimator::LimitedBy::Vram
+    };
+    result.fit = if result.resident > device.free_bytes {
+        paddock_estimator::Fit::DoesNotFit {
+            short_by_bytes: result.resident - device.free_bytes,
+        }
+    } else if low < 4096.min(shape.max_ctx) {
+        paddock_estimator::Fit::Tight {
+            headroom_bytes: headroom,
+        }
+    } else {
+        paddock_estimator::Fit::Fits {
+            headroom_bytes: headroom,
+        }
+    };
+    result
+}
+
+pub(crate) fn artifact_spec(
+    model: &crate::registry::CatalogModel,
+    artifact: &crate::registry::CatalogArtifact,
+    requested: bool,
+) -> Option<paddock_estimator::SpecCost> {
+    (requested
+        && artifact
+            .capabilities(model)
+            .iter()
+            .any(|c| c == "speculative"))
+    .then(|| {
+        let drafter = model
+            .artifacts
+            .iter()
+            .filter(|a| {
+                a.kind == crate::registry::ArtifactKind::Drafter
+                    && artifact.runtime.allows_companion(&a.id)
+                    && a.runtime
+                        .backends
+                        .iter()
+                        .any(|b| artifact.runtime.backends.contains(b))
+            })
+            .max_by_key(|a| a.total_size())
+            .map_or(0, |a| a.total_size());
+        paddock_estimator::SpecCost {
+            drafter_bytes: drafter,
+            ..Default::default()
+        }
+    })
+}
+
 pub async fn handle(
     State(state): State<Arc<crate::routes::AppState>>,
     Query(q): Query<EstimateQuery>,
 ) -> Response {
     let asked_kv = match q.kv.as_deref() {
+        Some("f32") => KvDtype::F32,
         Some("fp8_e4m3" | "fp8") => KvDtype::Fp8E4m3,
         _ => KvDtype::F16,
     };
@@ -267,7 +473,14 @@ pub async fn handle(
     let kv_blocked = cc.and_then(paddock_models::gpu_support::fp8_kv_blocked);
     let kv_downgraded = asked_kv == KvDtype::Fp8E4m3 && kv_blocked.is_some();
     let env = Envelope {
-        concurrency: q.batch.unwrap_or(state.max_batch as u64).max(1),
+        concurrency: q
+            .batch
+            .unwrap_or(if state.readiness.backend == "metal" {
+                1
+            } else {
+                state.max_batch as u64
+            })
+            .max(1),
         kv_dtype: if kv_downgraded {
             KvDtype::F16
         } else {
@@ -376,16 +589,36 @@ pub async fn handle(
         others_raw
     };
     let budget_bytes = q.budget.map(|mib| mib << 20);
-    let device = gpu.and_then(|g| g.mem_total).map(|t| Device {
-        // The ceiling caps what is on offer; it never invents room that is not
-        // there, so it is a min() against real free VRAM rather than a
-        // replacement for it.
-        free_bytes: {
-            let free = t.saturating_sub(in_use_by_others);
-            budget_bytes.map_or(free, |b| free.min(b))
-        },
-        total_bytes: t,
-    });
+    let metal = if state.readiness.backend == "metal" {
+        crate::metal_memory::available(&state, q.freeing_port).await
+    } else {
+        None
+    };
+    let device = metal
+        .as_ref()
+        .map(|(s, free)| Device {
+            total_bytes: s.limit,
+            free_bytes: {
+                let free = free.saturating_sub(
+                    q.offload_ram_gb
+                        .filter(|g| g.is_finite() && *g > 0.0)
+                        .map_or(0, |g| (g * (1u64 << 30) as f64) as u64),
+                );
+                budget_bytes.map_or(free, |b| free.min(b))
+            },
+        })
+        .or_else(|| {
+            gpu.and_then(|g| g.mem_total).map(|t| Device {
+                // The ceiling caps what is on offer; it never invents room that is not
+                // there, so it is a min() against real free VRAM rather than a
+                // replacement for it.
+                free_bytes: {
+                    let free = t.saturating_sub(in_use_by_others);
+                    budget_bytes.map_or(free, |b| free.min(b))
+                },
+                total_bytes: t,
+            })
+        });
 
     let models_dir = state.registry.models_dir().to_path_buf();
     let mut rows = serde_json::Map::new();
@@ -419,11 +652,6 @@ pub async fn handle(
         // The vision tower is shared across the weights alternatives - one
         // mmproj serves the Q8 and the Q4 alike - so its bytes belong in every
         // artifact row, not in one of them.
-        let tower = if want_vision {
-            tower_bytes(m, &state.registry)
-        } else {
-            0
-        };
         // One row per WEIGHTS ARTIFACT (schema 3): Q8 and Q4 are different
         // footprints of one model, and the picker's fit verdicts need both.
         let mut art_rows = serde_json::Map::new();
@@ -435,7 +663,13 @@ pub async fn handle(
         for a in m.weights() {
             let env = Envelope {
                 kv_dtype: a.runtime.estimate_kv_dtype(env.kv_dtype),
+                spec: artifact_spec(m, a, want_spec),
                 ..env
+            };
+            let tower = if want_vision {
+                tower_bytes_for(m, &state.registry, Some(a))
+            } else {
+                0
             };
             let weights = a.total_size();
             let published = a.shape.clone();
@@ -482,20 +716,11 @@ pub async fn handle(
             // Probe geometry still fills in for an artifact published before
             // this existed, and for a format the generator cannot read.
             let shape_source = published.as_ref().map(|s| s.source);
-            let mut shape = published
-                .map(|s| s.into_model_shape(tower, a.workspace.unwrap_or(0)))
-                .or_else(|| {
-                    probed.as_ref().map(|r| ModelShape {
-                        tower_bytes: tower,
-                        // The artifact's declared workspace (MoE serving
-                        // scratch, measured per release) is resident from load,
-                        // same as the tower - see CatalogArtifact::workspace.
-                        workspace_bytes: a.workspace.unwrap_or(0),
-                        ..ModelShape::from_report(r, weights, kind)
-                    })
-                });
-            if let (Some(memory), Some(shape)) = (&a.runtime.memory, &mut shape) {
-                memory.apply(shape);
+            let mut shape = artifact_shape(&state, m, a, want_vision);
+            if state.readiness.backend == "metal"
+                && let Some(shape) = &mut shape
+            {
+                metal_cache_shape(shape, m, &env);
             }
             // What the row SAYS the weights cost: resident where we know it,
             // the file size otherwise - never a scaled guess. And the same
@@ -518,14 +743,27 @@ pub async fn handle(
                 None => "file",
             };
 
-            let row = match (shape, device) {
+            let mut row = match (shape, device) {
                 (Some(shape), Some(dev)) => {
-                    let est = paddock_estimator::estimate(&shape, &env, &dev);
+                    let est = backend_estimate(&state.readiness.backend, &shape, &env, &dev);
                     // the whole trade-off in one payload: how the window shrinks as
                     // sessions are added, so the UI never has to guess or re-ask
-                    let curve: Vec<_> = paddock_estimator::ctx_curve(&shape, &dev, &env, &CURVE)
-                        .into_iter()
-                        .map(|(n, ctx)| serde_json::json!({ "at": n, "ctx": ctx }))
+                    let curve: Vec<_> = CURVE
+                        .iter()
+                        .map(|&n| {
+                            let env = Envelope {
+                                concurrency: n,
+                                ..env
+                            };
+                            let mut shape = shape.clone();
+                            if state.readiness.backend == "metal" {
+                                metal_cache_shape(&mut shape, m, &env);
+                            }
+                            let ctx =
+                                backend_estimate(&state.readiness.backend, &shape, &env, &dev)
+                                    .max_ctx;
+                            serde_json::json!({ "at": n, "ctx": ctx })
+                        })
                         .collect();
                     serde_json::json!({
                         "known": true, "kind": kind, "weights": shown,
@@ -557,6 +795,8 @@ pub async fn handle(
                     "reason": "VRAM for this format is measured from a load, not guessed",
                 }),
             };
+            row["kv_dtype"] = serde_json::json!(env.kv_dtype);
+            row["backend"] = serde_json::json!(state.readiness.backend);
             art_rows.insert(a.id.clone(), row);
         }
         // The decoding parameters this checkpoint's own authors published
@@ -627,6 +867,7 @@ pub async fn handle(
         // commitment without a denominator rather than inventing one.
         "host": {
             "total": crate::hostmem::total_bytes(),
+            "available": metal.as_ref().map(|(_, free)| *free),
             // ceilings other endpoints have already promised their caches;
             // every one is reachable at once, so it is what to subtract
             "committed": crate::hostmem::committed_bytes(
@@ -655,11 +896,14 @@ pub async fn handle(
             // `free_now` is what is unallocated at this instant. The UI must
             // label which it is showing.
             "free": d.free_bytes,
-            "free_now": d.total_bytes.saturating_sub(gpu.and_then(|g| g.mem_used).unwrap_or(0)),
+            "free_now": metal.as_ref().map_or_else(|| d.total_bytes.saturating_sub(gpu.and_then(|g| g.mem_used).unwrap_or(0)), |(_, free)| *free),
             "total": d.total_bytes,
-            "name": gpu.map(|g| g.name.clone()),
-            "held_by_loaded_model": reclaimable,
-            "used_by_others": in_use_by_others,
+            "name": metal.as_ref().map(|(s, _)| s.name.clone()).or_else(|| gpu.map(|g| g.name.clone())),
+            "unified": metal.is_some(),
+            "physical": metal.as_ref().map(|(s, _)| s.physical),
+            "planning_basis": if metal.is_some() { "conservative unified-memory budget; runtime rechecks allocations" } else { "NVML" },
+            "held_by_loaded_model": if metal.is_some() { 0 } else { reclaimable },
+            "used_by_others": if metal.is_some() { d.total_bytes.saturating_sub(d.free_bytes) } else { in_use_by_others },
             // §10.1 pinned runners: resident by policy, so their VRAM is part
             // of used_by_others for the fit math - this labels the subset so
             // the UI can say "of which pinned: X" instead of "other apps".
@@ -673,7 +917,7 @@ pub async fn handle(
             // line so total - others - runtime - model == free_now actually
             // balances; folding it into "other apps" left a ~2 GB hole in a
             // tooltip whose entire job is to reconcile against nvidia-smi.
-            "paddock_runtime": if reclaimable > 0 { paddock_estimator::GRAPH_MARGIN } else { 0 },
+            "paddock_runtime": if metal.is_none() && reclaimable > 0 { paddock_estimator::GRAPH_MARGIN } else { 0 },
         })),
         "models": rows,
     }))
@@ -683,6 +927,69 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use crate::registry::{ArtifactKind, Registry};
+
+    #[test]
+    fn imported_checkpoint_counts_weight_shards_not_directory_size() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::checkpoint_file_bytes(dir.path()), None);
+        std::fs::write(dir.path().join("part-1.safetensors"), [0; 7]).unwrap();
+        std::fs::write(dir.path().join("part-2.safetensors"), [0; 11]).unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        assert_eq!(super::checkpoint_file_bytes(dir.path()), Some(18));
+        assert_eq!(
+            super::checkpoint_file_bytes(&dir.path().join("part-1.safetensors")),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn metal_fixed_pool_is_batch_scaled_and_does_not_inherit_cuda_pool_cap() {
+        use paddock_estimator::{Device, Envelope, KvDtype};
+        let reg = Registry::new(std::env::temp_dir()).with_backend("metal");
+        let model = reg.catalog_of("bonsai-2-27b").unwrap();
+        let artifact = model.artifact("mlx-2bit").unwrap();
+        for batch in [1, 4] {
+            let mut shape = artifact.shape.clone().unwrap().into_model_shape(0, 0);
+            artifact.runtime.memory.as_ref().unwrap().apply(&mut shape);
+            shape.max_ctx = 32768;
+            let env = Envelope {
+                concurrency: batch,
+                kv_dtype: KvDtype::F32,
+                spec: None,
+                offload: None,
+            };
+            super::metal_cache_shape(&mut shape, model, &env);
+            assert_eq!(shape.kv_reserve_sequences, batch * 2);
+            let device = Device {
+                free_bytes: 100 << 30,
+                total_bytes: 100 << 30,
+            };
+            let ample = super::backend_estimate("metal", &shape, &env, &device);
+            assert_eq!(ample.max_ctx, 32768);
+            assert_eq!(
+                ample.kv_pool,
+                shape.kv_per_sequence(32768, KvDtype::F32) * batch * 3
+            );
+            let exact = Device {
+                free_bytes: ample.resident + ample.kv_pool,
+                ..device
+            };
+            assert_eq!(
+                super::backend_estimate("metal", &shape, &env, &exact).max_ctx,
+                32768
+            );
+            let too_small = Device {
+                free_bytes: exact.free_bytes - 1,
+                ..device
+            };
+            assert!(super::backend_estimate("metal", &shape, &env, &too_small).max_ctx < 32768);
+            let cuda = super::backend_estimate("cuda", &shape, &env, &device);
+            assert_eq!(
+                serde_json::to_value(cuda).unwrap(),
+                serde_json::to_value(paddock_estimator::estimate(&shape, &env, &device)).unwrap()
+            );
+        }
+    }
 
     // NOTE: the float-noise invariant is tested where the helper lives
     // (`paddock_models::sampling::as_written`), against the whole elected

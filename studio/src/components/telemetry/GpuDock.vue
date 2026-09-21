@@ -10,6 +10,7 @@ import Tooltip from '@/components/ui/Tooltip.vue'
 import GaugeBar from './GaugeBar.vue'
 import HistoryChart from './HistoryChart.vue'
 import { fmtVram } from '@/lib/format'
+import { gpuMetrics, metalAllocated, type MetricKey } from '@/lib/gpu-metrics'
 
 const tele = useTelemetryStore()
 
@@ -23,27 +24,23 @@ function memPct(g: GpuInfo): number {
 const gpus = computed(() => tele.gpus)
 
 // ── history chart: metric selector over the retained window ──────────────────
-type MetricKey = 'util' | 'mem' | 'power' | 'temp' | 'tok'
-const METRICS: { key: MetricKey; label: string; unit: string; max: number }[] = [
-  { key: 'util', label: 'Util', unit: '%', max: 100 },
-  { key: 'mem', label: 'VRAM', unit: '%', max: 100 },
-  { key: 'power', label: 'Power', unit: 'W', max: 0 },
-  { key: 'temp', label: 'Temp', unit: '°C', max: 100 },
-  { key: 'tok', label: 'tok/s', unit: 'tok/s', max: 0 },
-]
+const METRICS = computed(() => gpuMetrics(gpus.value[0], !!tele.engine))
 const metric = ref<MetricKey>('util')
-const activeMetric = computed(() => METRICS.find((m) => m.key === metric.value) ?? METRICS[0])
+const activeMetric = computed(() => METRICS.value.find((m) => m.key === metric.value) ?? METRICS.value[0])
+const allocated = computed(() => tele.snapshot ? metalAllocated(tele.snapshot) : null)
+const runners = computed(() => tele.snapshot?.reconciliation?.runners ?? [])
 // The GPU whose series we chart: the first (per-runner GPU pinning is a
 // multi-GPU follow-up).
 const chartIndex = computed(() => gpus.value[0]?.index ?? 0)
-const chartValues = computed<number[]>(() => {
-  if (metric.value === 'tok') return tele.tokHistory
+const chartValues = computed<(number | null)[]>(() => {
+  const key = activeMetric.value?.key
+  if (key === 'tok') return tele.tokHistory
   const h = tele.history[chartIndex.value] ?? { util: [], memPct: [], power: [], temp: [] }
-  return metric.value === 'util'
+  return key === 'util'
     ? h.util
-    : metric.value === 'mem'
+    : key === 'mem'
       ? h.memPct
-      : metric.value === 'power'
+      : key === 'power'
         ? h.power
         : h.temp
 })
@@ -97,7 +94,7 @@ const chartValues = computed<number[]>(() => {
       <div v-if="!tele.available && !tele.engine" class="gpudock__empty">
         <Icon name="graphics-card" :size="24" />
         <p v-if="!tele.connected">Connecting to the server...</p>
-        <p v-else>No NVIDIA GPU detected on the server.</p>
+        <p v-else>GPU measurements are unavailable on this server.</p>
       </div>
       <!-- NVML absent but a model is loaded (e.g. a container without the mgmt
            lib): engine metrics still stream; note that device metrics are off. -->
@@ -113,11 +110,33 @@ const chartValues = computed<number[]>(() => {
         </div>
         <!-- The running models' own allocator ledgers (summed across the
              fleet) - works where NVML can't attribute per-process VRAM. -->
-        <div v-if="g.index === chartIndex && tele.modelMem" class="gcard__paddockmem">
+        <div v-if="!g.metal && g.index === chartIndex && tele.modelMem" class="gcard__paddockmem">
           Models use {{ gb(tele.modelMem) }}
         </div>
 
         <!-- Utilization -->
+        <template v-if="g.metal">
+          <div class="metric">
+            <div class="metric__top"><span class="metric__label">Thermal pressure</span><span class="metric__val">{{ g.metal.thermal_pressure ?? 'Unavailable' }}</span></div>
+            <Tooltip label="macOS reports memory-pressure changes. No reading is assumed before the first OS event."><div class="metric__top"><span class="metric__label">Memory pressure</span><span class="metric__val">{{ g.metal.memory_pressure ?? 'Not reported' }}</span></div></Tooltip>
+          </div>
+          <div class="metric">
+            <div class="metric__top"><span class="metric__label">Unified memory</span><span class="metric__val">{{ gb(g.metal.unified_memory_total) }}</span></div>
+            <Tooltip label="Apple’s recommended working-set size; shared with other applications, not dedicated VRAM."><div class="metric__top"><span class="metric__label">Metal working set</span><span class="metric__val">{{ gb(g.metal.recommended_working_set) }}</span></div></Tooltip>
+          </div>
+          <div v-if="allocated != null" class="metric">
+            <div class="metric__top"><span class="metric__label">Paddock allocations</span><span class="metric__val">{{ gb(allocated) }}</span></div>
+            <GaugeBar :value="allocated" :max="g.metal.recommended_working_set" />
+          </div>
+          <div v-for="r in runners" :key="`${r.port}:${r.pid}`" class="metric">
+            <div class="metric__top"><span class="metric__label">Runner · {{ r.port }}</span><span class="metric__val">{{ gb(r.metal?.allocated_bytes) }}</span></div>
+            <template v-if="r.metal">
+              <Tooltip label="Sum of completed command-buffer GPU spans since runner start. Spans may overlap; this is not device utilization."><div class="metric__top"><span class="metric__label">GPU time · cumulative</span><span class="metric__val">{{ r.metal.gpu_seconds_total.toFixed(2) }} s</span></div></Tooltip>
+              <div v-if="r.metal.last_command_ms != null" class="metric__top"><span class="metric__label">Last GPU command</span><span class="metric__val">{{ r.metal.last_command_ms.toFixed(2) }} ms</span></div>
+            </template>
+            <span v-else class="metric__label">Measurements unavailable · restart with the updated runner</span>
+          </div>
+        </template>
         <div v-if="g.util_gpu != null" class="metric">
           <div class="metric__top">
             <span class="metric__label">Utilization</span>
@@ -171,13 +190,13 @@ const chartValues = computed<number[]>(() => {
       </div>
 
       <!-- History: ECharts area chart over the retained window, metric-selectable -->
-      <div v-if="tele.available || tele.engine" class="hist">
+      <div v-if="activeMetric" class="hist">
         <div class="hist__tabs">
           <button
             v-for="m in METRICS"
             :key="m.key"
             class="hist__tab"
-            :class="{ 'hist__tab--on': metric === m.key }"
+            :class="{ 'hist__tab--on': activeMetric.key === m.key }"
             type="button"
             @click="metric = m.key"
           >

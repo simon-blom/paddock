@@ -19,6 +19,7 @@ import Popover from '@/components/ui/Popover.vue'
 import ToggleGroup from '@/components/ui/ToggleGroup.vue'
 import ToggleGroupItem from '@/components/ui/ToggleGroupItem.vue'
 import VendorLogo from '@/components/manage/VendorLogo.vue'
+import BackendStatus from '@/components/layout/BackendStatus.vue'
 
 const { theme, toggleTheme } = useTheme()
 const models = useModelsStore()
@@ -261,6 +262,7 @@ const modelSel = computed<string | number>({
         <span>{{ updateReady }} available</span>
       </RouterLink>
     </Tooltip>
+    <BackendStatus />
     <Tooltip v-if="models.serverVersion" :label="`Paddock ${models.serverBuild}`">
       <span class="header__ver">v{{ models.serverVersion }}</span>
     </Tooltip>

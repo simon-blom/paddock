@@ -1141,7 +1141,7 @@ impl Supervisor {
     ) -> Result<(RunnerView, bool), String> {
         // Syntax gate here; SEMANTIC errors surface from the runner's own
         // parse at start (deny_unknown_fields), with the log tail attached.
-        toml::from_str::<toml::Value>(content).map_err(|e| format!("not valid TOML: {e}"))?;
+        self.validate_backend_config(content)?;
         if let Some(expect) = expect_hash {
             let now = self.config_file_hash(port);
             if now.as_deref() != Some(expect) {
@@ -1229,17 +1229,35 @@ impl Supervisor {
         Ok(())
     }
 
-    /// `write_config_file`'s save-without-applying twin, for the raw-TOML tabs:
-    /// same syntax gate and same hash guard, then the write and nothing else.
-    /// A running model keeps serving what it loaded; a stopped one stays
-    /// stopped (the applying path would have STARTED it).
+    /// Shared backend contract for previews, saved files and starts.
+    pub fn validate_backend_config(&self, content: &str) -> Result<(), String> {
+        let doc = toml::from_str(content).map_err(|e| format!("not valid TOML: {e}"))?;
+        crate::backend_contract::validate(&self.registry, &self.defaults.device, &doc)
+    }
+
+    pub fn kv_offload_supported(&self, doc: &toml::Value) -> bool {
+        let path = Path::new(doc.get("model").and_then(toml::Value::as_str).unwrap_or(""));
+        self.registry
+            .identify_weights(path)
+            .and_then(|(m, a)| {
+                let model = self.registry.catalog_of(&m)?;
+                Some(crate::backend_contract::metal_kv_offload(
+                    model,
+                    model.artifact(&a)?,
+                ))
+            })
+            .unwrap_or_else(|| crate::backend_contract::path_kv_offload(path))
+    }
+
+    /// Save without applying: syntax/backend checks and a hash guard, then
+    /// the write and nothing else. A stopped instance stays stopped.
     pub fn write_config_file_deferred(
         &self,
         port: u16,
         content: &str,
         expect_hash: Option<&str>,
     ) -> Result<(), String> {
-        toml::from_str::<toml::Value>(content).map_err(|e| format!("not valid TOML: {e}"))?;
+        self.validate_backend_config(content)?;
         if let Some(expect) = expect_hash
             && self.config_file_hash(port).as_deref() != Some(expect)
         {
@@ -1263,6 +1281,7 @@ impl Supervisor {
         content: &str,
     ) -> Result<u16, String> {
         use std::io::Write;
+        self.validate_backend_config(content)?;
         let _allocation = self.port_allocation.lock().await;
         let port = match requested {
             Some(port) if port >= 1024 => {
@@ -2191,7 +2210,8 @@ impl Supervisor {
     ///   failure with a performance bug for a symptom;
     /// - explicit `off`: never wire one, which is what actually returns the
     ///   VRAM (the runtime policy alone cannot - the weights are resident);
-    /// - unset: only a drafter the catalog marks `default`, so a non-default
+    /// - unset: apply the selected artifact's default policy first; if it has
+    ///   none, only a drafter the catalog marks `default`, so a non-default
     ///   companion (laguna's DFlash) stays opt-in.
     ///
     /// Models with in-file MTP declare no drafter artifact, so all three arms
@@ -2204,16 +2224,6 @@ impl Supervisor {
         want_spec: Option<&str>,
         drafter: Option<&str>,
     ) -> Result<Resolution, SpawnError> {
-        // "off" is the only value that suppresses a default drafter; an
-        // unparseable one is caught by the runner at startup, so treat anything
-        // else as "on" here rather than guessing.
-        let spec_off = want_spec.is_some_and(|s| {
-            matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "off" | "false" | "no" | "none" | "0"
-            )
-        });
-        let spec_on = want_spec.is_some() && !spec_off;
         match self.registry.resolve(name, artifact, pull, drafter).await {
             Ok(Some(r)) => {
                 let default_policy = self
@@ -2224,10 +2234,21 @@ impl Supervisor {
                     })
                     .and_then(|a| a.runtime.default_spec.as_deref());
                 let effective_policy = want_spec.or(default_policy);
-                let default_on = want_spec.is_none() && default_policy.is_some();
+                // A catalog default is a policy, not an enable flag: Bonsai
+                // explicitly defaults to "off" without offering speculation
+                // in the UI. Interpret the inherited value exactly as an
+                // explicit one before validating or electing any drafter.
+                // Unknown policies still reach the runner's strict parser.
+                let spec_off = effective_policy.is_some_and(|s| {
+                    matches!(
+                        s.trim().to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "none" | "0"
+                    )
+                });
+                let spec_on = effective_policy.is_some() && !spec_off;
                 let mtp = if spec_off {
                     None
-                } else if spec_on || default_on {
+                } else if spec_on {
                     if !r.speculative {
                         // Plain "on" was every endpoint's form default before the
                         // capability gate existed, so a legacy granite-class toml
@@ -2767,7 +2788,10 @@ impl Supervisor {
             })?;
             t.insert("kv_offload".into(), kvv);
         }
-        let body = toml::to_string_pretty(&toml::Value::Table(t))
+        let doc = toml::Value::Table(t);
+        crate::backend_contract::validate(&self.registry, &self.defaults.device, &doc)
+            .map_err(SpawnError::Unsupported)?;
+        let body = toml::to_string_pretty(&doc)
             .map_err(|e| SpawnError::Io(std::io::Error::other(e.to_string())))?;
         Ok(format!("{CONFIG_HEADER}{body}"))
     }
@@ -3151,6 +3175,8 @@ impl Supervisor {
                 cfg_path.display().to_string(),
             ));
         }
+        self.validate_backend_config(&std::fs::read_to_string(&cfg_path)?)
+            .map_err(SpawnError::Unsupported)?;
         if let Some(why) = self.port_blocker(port).await {
             return Err(SpawnError::PortTaken(port, why));
         }
@@ -3859,6 +3885,139 @@ pub enum StopOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the installed-model resolver, not preview's missing-download
+    /// fallback. These tiny files satisfy catalog presence checks only; no
+    /// weights are downloaded or loaded by these control-plane tests.
+    fn installed_model_supervisor(
+        dir: &Path,
+        model_id: &str,
+        default_spec: Option<&str>,
+    ) -> Supervisor {
+        let models = dir.join("models");
+        let source = crate::registry::Registry::new(models.clone()).with_backend("metal");
+        let mut model = source.catalog_of(model_id).unwrap().clone();
+        for artifact in &mut model.artifacts {
+            if let Some(policy) = default_spec {
+                artifact.runtime.default_spec = Some(policy.into());
+            }
+            for file in &mut artifact.files {
+                file.size = 1;
+                let path = models.join(&file.dest);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"x").unwrap();
+            }
+        }
+        let registry = crate::registry::Registry::from_catalog(
+            crate::registry::Catalog {
+                schema: 3,
+                models: vec![model],
+            },
+            models.clone(),
+        )
+        .with_backend("metal");
+        Supervisor::new(
+            SpawnDefaults {
+                runner_bin: None,
+                runners_dir: dir.join("runners"),
+                device: "metal".into(),
+                kernel_pack: None,
+                models_dirs: vec![models],
+                logs_dir: dir.join("logs"),
+                work_dir: dir.into(),
+                base_port: 18100,
+                health_timeout: Duration::from_secs(1),
+            },
+            Arc::new(registry),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn invalid_metal_edits_never_replace_saved_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = installed_model_supervisor(dir.path(), "gemma-4-31b", None);
+        let valid = sup
+            .preview_config(SpawnSpec {
+                model: "gemma-4-31b".into(),
+                artifact: Some("mlx-4bit".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let port = 18100;
+        sup.write_config_file_deferred(port, &valid, None).unwrap();
+        let bad = format!("{valid}\n[kv_offload]\nenabled = true\nram_gb = 8\nnvme_gb = 0\n");
+        assert!(sup.write_config_file_deferred(port, &bad, None).is_err());
+        assert!(
+            sup.write_config_file(port, &bad, None, 100, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(sup.read_config_file(port).unwrap().0, valid);
+        assert!(!sup.is_serving(port).await);
+    }
+
+    #[tokio::test]
+    async fn installed_non_speculative_models_honor_catalog_off() {
+        for (model, artifact) in [
+            ("bonsai-2-27b", "mlx-2bit"),
+            ("gemma-4-31b", "mlx-4bit"),
+            ("muse-glimmer-30b", "mlx-4bit"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let sup = installed_model_supervisor(dir.path(), model, None);
+            let resolved = sup
+                .resolve_model(model, Some(artifact), false, None, None)
+                .await
+                .unwrap();
+            assert!(resolved.mtp.is_none(), "{model}");
+            assert!(resolved.drafter.is_none(), "{model}");
+            assert!(resolved.spec_desc.is_none(), "{model}");
+            let request = SpawnSpec {
+                model: model.into(),
+                artifact: Some(artifact.into()),
+                ..Default::default()
+            };
+            let preview = sup.preview_config(request.clone()).await.unwrap();
+            let config: toml::Value = toml::from_str(&preview).unwrap();
+            assert_eq!(config["spec"].as_str(), Some("off"), "{model}");
+            assert!(config.get("mtp").is_none(), "{model}");
+            sup.render_spec_config(18100, request).await.unwrap();
+            // Deliberately enabling an unsupported mechanism must still fail.
+            for policy in ["adaptive", "4"] {
+                assert!(matches!(
+                    sup.resolve_model(model, Some(artifact), false, Some(policy), None)
+                        .await,
+                    Err(SpawnError::Unsupported(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_speculative_model_default_off_does_not_load_a_drafter() {
+        for policy in ["off", " OFF ", "false", "no", "none", "0"] {
+            let dir = tempfile::tempdir().unwrap();
+            let sup = installed_model_supervisor(dir.path(), "qwen3.8-27b", Some(policy));
+            let resolve =
+                |want| sup.resolve_model("qwen3.8-27b", Some("mlx-4bit"), false, want, None);
+            let inherited = resolve(None).await.unwrap();
+            assert!(inherited.mtp.is_none(), "{policy}");
+            assert!(inherited.drafter.is_none(), "{policy}");
+            assert_eq!(inherited.spec_desc.as_deref(), Some("off"), "{policy}");
+
+            let enabled = resolve(Some("adaptive")).await.unwrap();
+            assert!(enabled.mtp.is_some(), "explicit policy overrides {policy}");
+            assert!(enabled.drafter.is_some());
+            assert!(enabled.spec_desc.unwrap().contains("adaptive"));
+
+            let disabled = resolve(Some("off")).await.unwrap();
+            assert!(disabled.mtp.is_none());
+            assert_eq!(disabled.spec_desc.as_deref(), Some("off"));
+        }
+    }
 
     #[tokio::test]
     async fn automatic_port_skips_saved_loading_and_unrelated_listeners() {

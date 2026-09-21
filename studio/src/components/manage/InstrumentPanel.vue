@@ -12,6 +12,7 @@ import { useRoute, useRouter } from 'vue-router'
 import Fuse from 'fuse.js'
 import { useFleetStore } from '@/stores/fleet'
 import { gpuApi, type GpuSnapshot } from '@/lib/api'
+import { metalAllocated } from '@/lib/gpu-metrics'
 import { fmtVram as gb, fmtClock, fmtStamp } from '@/lib/format'
 import Icon from '@/components/Icon.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
@@ -513,11 +514,18 @@ watch(
         <div v-for="(g, i) in snap.gpus" :key="i" class="gpu__card">
           <p class="gpu__name">{{ g.name ?? `GPU ${i}` }}</p>
           <div class="gpu__stats">
-            <div class="gpu__stat">
+            <template v-if="g.metal">
+              <div class="gpu__stat"><span class="gpu__k">Thermal pressure</span><span class="gpu__v">{{ g.metal.thermal_pressure ?? 'Unavailable' }}</span></div>
+              <div class="gpu__stat"><span class="gpu__k">Memory pressure</span><span class="gpu__v">{{ g.metal.memory_pressure ?? 'Not reported' }}</span></div>
+              <div class="gpu__stat"><span class="gpu__k">Unified memory</span><span class="gpu__v">{{ g.metal.unified_memory_total != null ? gb(g.metal.unified_memory_total) : '—' }}</span></div>
+              <div class="gpu__stat"><span class="gpu__k">Metal working set</span><span class="gpu__v">{{ gb(g.metal.recommended_working_set) }}</span></div>
+              <div v-if="metalAllocated(snap) != null" class="gpu__stat"><span class="gpu__k">Paddock allocations</span><span class="gpu__v">{{ gb(metalAllocated(snap)!) }}</span></div>
+            </template>
+            <div v-if="g.util_gpu != null" class="gpu__stat">
               <span class="gpu__k">Utilization</span>
               <span class="gpu__v">{{ g.util_gpu ?? '-' }}%</span>
             </div>
-            <div class="gpu__stat gpu__stat--wide">
+            <div v-if="g.mem_total != null" class="gpu__stat gpu__stat--wide">
               <span class="gpu__k">VRAM</span>
               <Progress
                 class="gpu__bar"
@@ -528,18 +536,29 @@ watch(
               />
               <span class="gpu__v">{{ g.mem_used ? gb(g.mem_used) : '-' }} / {{ g.mem_total ? gb(g.mem_total) : '-' }}</span>
             </div>
-            <div class="gpu__stat">
+            <div v-if="g.power_w != null" class="gpu__stat">
               <span class="gpu__k">Power</span>
               <span class="gpu__v">{{ g.power_w ? `${Math.round(g.power_w)} W` : '-' }}</span>
             </div>
-            <div class="gpu__stat">
+            <div v-if="g.temp_c != null" class="gpu__stat">
               <span class="gpu__k">Temp</span>
               <span class="gpu__v">{{ g.temp_c ? `${g.temp_c}°C` : '-' }}</span>
             </div>
           </div>
         </div>
 
-        <template v-if="runnersVram.length">
+        <template v-if="snap.gpus.some(g => g.metal)">
+          <div v-for="r in snap.reconciliation?.runners ?? []" :key="`${r.port}:${r.pid}`" class="gpu__card">
+            <p class="gpu__name">Runner · {{ r.port }}</p>
+            <div v-if="r.metal" class="gpu__stats">
+              <div class="gpu__stat"><span class="gpu__k">Metal allocations</span><span class="gpu__v">{{ gb(r.metal.allocated_bytes) }}</span></div>
+              <div class="gpu__stat"><span class="gpu__k">GPU time · cumulative</span><span class="gpu__v">{{ r.metal.gpu_seconds_total.toFixed(2) }} s</span></div>
+              <div v-if="r.metal.last_command_ms != null" class="gpu__stat"><span class="gpu__k">Last GPU command</span><span class="gpu__v">{{ r.metal.last_command_ms.toFixed(2) }} ms</span></div>
+            </div>
+            <p v-else>Measurements unavailable · restart with the updated runner</p>
+          </div>
+        </template>
+        <template v-else-if="runnersVram.length">
           <p class="gpu__hd">Per-server VRAM - what the engine counts vs what the OS attributes to it</p>
           <div class="ins__tablewrap">
             <table class="ins__table">
@@ -573,7 +592,7 @@ watch(
           </div>
         </template>
       </div>
-      <p v-else class="ins__empty">No GPU telemetry (NVML is not available on this machine).</p>
+      <p v-else class="ins__empty">GPU measurements are unavailable on this machine.</p>
     </section>
 
     <section v-else-if="tab === 'cache'">

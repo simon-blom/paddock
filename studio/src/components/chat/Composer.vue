@@ -30,6 +30,7 @@ import { holdReload } from '@/lib/reload'
 import type { ToolSelection } from '@/types/chat'
 import { changeToolPicker, pickerGroupState, pickerToolChecked, toolTermHits, type PickerAction } from '@/lib/tool-picker'
 import { friendlyModelName } from '@/lib/model-caps'
+import { speculationBadge } from '@/lib/model-name'
 import {
   type DocOpts,
   isAttachableFile,
@@ -2553,8 +2554,8 @@ onBeforeUnmount(() => {
                   <Tooltip v-if="models.caps[m.id]?.mcpServers.length" label="Has MCP tools">
                     <span class="composer__cap"><Icon name="plug" :size="12" /></span>
                   </Tooltip>
-                  <Tooltip v-if="models.specFor(m.id)" :label="`Speculative decode: ${models.specFor(m.id)}`">
-                    <span class="composer__cap composer__cap--spec">{{ models.specFor(m.id) }}</span>
+                  <Tooltip v-if="speculationBadge(models.specFor(m.id))" :label="`Speculative decode: ${speculationBadge(models.specFor(m.id))}`">
+                    <span class="composer__cap composer__cap--spec">{{ speculationBadge(models.specFor(m.id)) }}</span>
                   </Tooltip>
                 </span>
               </MenuItem>

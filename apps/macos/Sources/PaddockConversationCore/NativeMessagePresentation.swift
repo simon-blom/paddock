@@ -191,8 +191,8 @@ enum NativeMessagePresentation {
 
 extension NativeStudioRuntime {
   static func recordedSpec(_ run: O?) -> String {
-    let value = run?["spec"]?.string ?? ""
-    return ["off", "none", "disabled"].contains(value.lowercased()) ? "" : value
+    let value = (run?["spec"]?.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    return ["off", "false", "no", "none", "0", "disabled"].contains(value.lowercased()) ? "" : value
   }
   static func tokenLimitNote(_ usage: O) -> String {
     guard let reasoning = usage["reasoningTokens"]?.integer, reasoning > 0,

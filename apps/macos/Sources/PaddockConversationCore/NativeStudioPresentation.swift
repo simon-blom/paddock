@@ -119,7 +119,7 @@ extension NativeStudioRuntime {
       let model = models.first { $0["id"]?.string == id }
       return .object([
         "id": .string(id), "label": model?["title"] ?? .string(id),
-        "vendor": model?["vendor"] ?? .string(""), "spec": model?["spec"] ?? .string(""),
+        "vendor": model?["vendor"] ?? .string(""), "spec": .string(Self.recordedSpec(model)),
       ])
     }
     var settings = fields.filter {

@@ -161,10 +161,18 @@ pub fn projection(supervisor: &Supervisor, port: u16) -> Result<Value, String> {
         .read_config_file(port)
         .map_err(|_| "Saved endpoint settings are unavailable.")?;
     let doc = parse(&raw, port)?;
-    Ok(settings_projection(&doc, Some(&revision)))
+    Ok(settings_projection(
+        &doc,
+        Some(&revision),
+        supervisor.kv_offload_supported(&doc),
+    ))
 }
 
-fn settings_projection(doc: &toml::Value, revision: Option<&str>) -> Value {
+fn settings_projection(
+    doc: &toml::Value,
+    revision: Option<&str>,
+    offload_supported: bool,
+) -> Value {
     let host = doc
         .get("host")
         .and_then(toml::Value::as_str)
@@ -181,7 +189,7 @@ fn settings_projection(doc: &toml::Value, revision: Option<&str>) -> Value {
             "no_spec":doc.get("no_spec").and_then(toml::Value::as_bool).unwrap_or(false),
             "runtime_options": options::projection(doc),
             "kv_offload": offload::projection(doc),
-            "kv_offload_supported": offload::supported(doc),
+            "kv_offload_supported": offload_supported,
             "kv_cache_dtype":doc.get("kv_cache_dtype").and_then(toml::Value::as_str),
             "has_api_key":doc.get("api_key").and_then(toml::Value::as_str).is_some_and(|v|!v.is_empty()),
             "vision":doc.get("mmproj").is_some(),
@@ -232,7 +240,7 @@ async fn initial_config(state: &AppState, model: &str, artifact: &str) -> Result
 pub async fn prepare(state: &AppState, model: &str, artifact: &str) -> Result<Value, String> {
     let text = initial_config(state, model, artifact).await?;
     let doc = parse(&text, 0)?;
-    let mut value = settings_projection(&doc, None);
+    let mut value = settings_projection(&doc, None, state.supervisor.kv_offload_supported(&doc));
     let object = value
         .as_object_mut()
         .expect("the settings projection is a JSON object");
@@ -506,7 +514,7 @@ async fn resolve_changes(
         .and_then(|v| v.get("enabled"))
         .and_then(toml::Value::as_bool)
         == Some(true)
-        && !offload::supported(&updated)
+        && !state.supervisor.kv_offload_supported(&updated)
     {
         return Err("This model's Metal graph does not support KV offloading. Disable it before changing to this model family.".into());
     }

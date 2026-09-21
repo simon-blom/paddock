@@ -49,15 +49,23 @@ export const useReadinessStore = defineStore('readiness', () => {
   const blocked = computed(
     () => info.value?.state === 'no-card' || info.value?.state === 'driver-too-old',
   )
-  /** Whether there is any NVIDIA card to sample metrics from. True until the
+  /** Whether there is a GPU to sample metrics from. True until the
    *  probe answers: a machine that has one must not watch its GPU button
    *  appear a moment after the page does. */
   const hasCard = computed(() => !info.value || info.value.state !== 'no-card')
-  // The current metrics sampler is NVML-only. Do not present empty NVIDIA
-  // instruments as Apple GPU measurements; runner allocation stats still work.
-  const hasMetrics = computed(() => hasCard.value && info.value?.backend !== 'metal')
-  /** Nothing to say when everything is fine; silence is the goal state. */
-  const notice = computed(() => (info.value && info.value.state !== 'ready' ? info.value : null))
+  // Device capabilities determine which measurements the panel presents.
+  const hasMetrics = computed(() => hasCard.value)
+  // Usable Metal is background information, not an actionable warning card.
+  // Keep its qualification in a compact header tooltip; blockers stay visible.
+  const headerStatus = computed(() => {
+    const r = info.value
+    if (r?.backend !== 'metal' || (r.state !== 'ready' && r.state !== 'untested')) return null
+    return {
+      label: 'Metal',
+      detail: `${r.card || 'Apple Silicon'} · Metal${r.state === 'untested' ? ' preview' : ''}. Compatibility and qualification are listed on each macOS model variant.`,
+    }
+  })
+  const notice = computed(() => (info.value && info.value.state !== 'ready' && !headerStatus.value ? info.value : null))
 
   /** The probe's answer, fetched at most once however many callers ask.
    *
@@ -83,5 +91,5 @@ export const useReadinessStore = defineStore('readiness', () => {
     }
   }
 
-  return { info, blocked, hasCard, hasMetrics, notice, load, ensureLoaded }
+  return { info, blocked, hasCard, hasMetrics, headerStatus, notice, load, ensureLoaded }
 })

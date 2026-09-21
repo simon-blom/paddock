@@ -49,7 +49,7 @@ const props = defineProps<{
 
 const { theme } = useTheme()
 
-const kvWidth = computed(() => (props.kv === 'fp8_e4m3' ? '8-bit' : '16-bit'))
+const kvWidth = computed(() => (props.kv === 'f32' ? '32-bit' : props.kv === 'fp8_e4m3' ? '8-bit' : '16-bit'))
 
 /** The card's maker, for its mark - read off the reported NAME rather than
  *  assumed, so an AMD or Intel box shows no NVIDIA badge. `VendorLogo` already
@@ -205,10 +205,10 @@ const CAPPED = 'Outside your limit'
 const overheadDesc = computed(() => {
   const o = props.est.overhead_parts
   const fallback =
-    'the fixed cost of serving besides the weights: CUDA runtime, the decode graph, and per-conversation working state'
+    'the planning allowance for runtime, workspaces and per-conversation state'
   if (!o) return fallback
   const terms: [string, number][] = [
-    ['CUDA runtime + decode graph', o.fixed],
+    [props.device.unified ? 'Runtime planning allowance' : 'CUDA runtime + decode graph', o.fixed],
     ['prefix checkpoints', o.prefix_checkpoints],
     ['allocator rounding', o.allocator_slack],
     ['speculation state', o.spec_state],
@@ -240,7 +240,7 @@ const rows = computed(() => {
   if (other) {
     const pinned = props.device.held_by_pinned ?? 0
     out.push({
-      name: other.name,
+      name: props.device.unified ? 'Unavailable or reserved' : other.name,
       bytes: other.bytes,
       color: other.color,
       // the split belongs in the tooltip, where someone who wonders can look,
@@ -311,7 +311,7 @@ const parts = computed<{ segs: Seg[]; free: number }>(() => {
       name: FOREIGN,
       bytes: occupied,
       color: muted,
-      desc: 'held by your other models and by other programs - this model cannot have it',
+      desc: d.unified ? 'unified memory excluded by OS availability, other model reservations, RAM caches or this instance’s budget' : 'held by your other models and by other programs - this model cannot have it',
     },
     {
       name: CAPPED,
@@ -342,7 +342,7 @@ const parts = computed<{ segs: Seg[]; free: number }>(() => {
       name: 'Model working memory',
       bytes: e.workspace ?? 0,
       color: cWorkspace,
-      desc: 'working memory this model pins for serving beyond its weights (expert staging on mixture-of-experts models) - measured, and held for as long as it runs',
+      desc: d.unified ? 'checkpoint-specific workspace allowance, including declared vision and expert staging bounds' : 'working memory this model pins for serving beyond its weights (expert staging on mixture-of-experts models) - measured, and held for as long as it runs',
     },
     // state + scratch + CUDA context, lumped: the rest of the must-fit floor.
     // One bar, but its tooltip names every term - "how can a 17GB model have
@@ -365,7 +365,7 @@ const parts = computed<{ segs: Seg[]; free: number }>(() => {
       name: 'Conversation memory',
       bytes: e.kv_pool,
       color: green,
-      desc: 'the KV pool, allocated in full when the server starts and unavailable to anything else from that moment - it holds the conversations in flight',
+      desc: d.unified ? 'cache capacity within this planning budget; the runner reserves the configured context and its reuse/restore slots at startup' : 'the KV pool, allocated in full when the server starts and unavailable to anything else from that moment - it holds the conversations in flight',
     },
   ].filter((s) => s.bytes > 0)
   const free = Math.max(0, d.total - unavailable - e.resident - e.kv_pool)

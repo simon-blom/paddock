@@ -1,5 +1,6 @@
-//! Device telemetry via **NVML** (`nvml-wrapper`, an in-process binding to the
-//! driver's management library - Not `nvidia-smi`, no process is ever spawned).
+//! Device telemetry via NVML or public Metal APIs. No helper processes or
+//! elevated privileges. Metal capacity and runner-local observations stay
+//! separate from NVML's machine-wide GPU usage and process attribution.
 //!
 //! NVML runs in exactly one process per box: the manager (doc §9). Runners link
 //! no NVML - their inside view (allocator ledger, engine counters) comes from
@@ -25,8 +26,11 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+
+#[cfg(target_os = "macos")]
+mod pressure;
 
 /// One process holding memory on a device (NVML's outside view). `mem` is
 /// None when the driver hides per-process bytes (some WDDM configurations).
@@ -60,9 +64,33 @@ pub struct GpuInfo {
     /// Processes holding memory on this device (per-PID attribution input).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub procs: Vec<GpuProc>,
+    /// Apple unified-memory capacity, not dedicated VRAM or GPU usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metal: Option<MetalHardware>,
 }
 
-/// A full-fleet sample. `available: false` means NVML could not be initialized.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetalHardware {
+    pub unified_memory_total: Option<u64>,
+    pub recommended_working_set: u64,
+    /// System thermal pressure, not GPU temperature.
+    pub thermal_pressure: Option<&'static str>,
+    /// Last public dispatch memory-pressure event; unknown before first event.
+    pub memory_pressure: Option<&'static str>,
+    /// Runtime capability discovery, not a claim of device utilization.
+    pub counter_sets: Vec<String>,
+}
+
+/// A runner's process-local measurements, never NVML-equivalent attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetalRunnerMetrics {
+    pub allocated_bytes: u64,
+    pub completed_commands: u64,
+    pub gpu_seconds_total: f64,
+    pub last_command_ms: Option<f64>,
+}
+
+/// A full-fleet sample. `available: false` means no device sampler is available.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuSnapshot {
     pub available: bool,
@@ -111,14 +139,67 @@ impl Telemetry {
 /// Spawn the sampler on a dedicated thread and return a handle. Sampling is
 /// entirely independent of request handling - the returned receiver only ever
 /// *reads* the latest published snapshot.
-pub fn start() -> Telemetry {
+pub fn start(backend: &str) -> Telemetry {
     let (tx, rx) = watch::channel(Arc::new(GpuSnapshot::unavailable()));
     let builder = std::thread::Builder::new().name("gpu-telemetry".to_owned());
-    if let Err(e) = builder.spawn(move || run(tx)) {
+    let metal = backend == "metal";
+    if let Err(e) = builder.spawn(move || {
+        if metal {
+            run_metal(tx);
+        } else {
+            run(tx);
+        }
+    }) {
         tracing::warn!(%e, "could not spawn GPU telemetry thread; metrics disabled");
     }
     Telemetry { rx }
 }
+
+#[cfg(target_os = "macos")]
+fn run_metal(tx: watch::Sender<Arc<GpuSnapshot>>) {
+    use objc2_metal::{MTLCounterSet, MTLDevice};
+    let Some(device) = objc2_metal::MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    if !device.hasUnifiedMemory() {
+        return;
+    }
+    let pressure = pressure::Pressure::new();
+    let counter_sets: Vec<String> = device
+        .counterSets()
+        .map(|sets| sets.iter().map(|s| s.name().to_string()).collect())
+        .unwrap_or_default();
+    loop {
+        let snap = GpuSnapshot {
+            available: true,
+            ts: now_secs(),
+            gpus: vec![GpuInfo {
+                name: device.name().to_string(),
+                metal: Some(MetalHardware {
+                    unified_memory_total: crate::metal_memory::physical_bytes(),
+                    recommended_working_set: device.recommendedMaxWorkingSetSize(),
+                    thermal_pressure: pressure::thermal(),
+                    memory_pressure: pressure.memory(),
+                    counter_sets: counter_sets.clone(),
+                }),
+                // Never pass the manager's currentAllocatedSize off as the
+                // fleet's memory, or unified RAM capacity off as VRAM.
+                ..GpuInfo::default()
+            }],
+        };
+        if tx.send(Arc::new(snap)).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(if tx.receiver_count() > 1 {
+            400
+        } else {
+            2000
+        }));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_metal(_tx: watch::Sender<Arc<GpuSnapshot>>) {}
 
 fn run(tx: watch::Sender<Arc<GpuSnapshot>>) {
     // NVML is optional. If it's missing (a container without the management
@@ -200,6 +281,7 @@ fn sample(nvml: &nvml_wrapper::Nvml) -> GpuSnapshot {
             mem_clock_mhz: d.clock_info(Clock::Memory).ok(),
             fan_pct: d.fan_speed(0).ok(),
             procs,
+            metal: None,
         });
     }
     GpuSnapshot {
@@ -214,6 +296,52 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_sample_exposes_capacity_without_inventing_device_usage() {
+        let (tx, rx) = watch::channel(Arc::new(GpuSnapshot::unavailable()));
+        let worker = std::thread::spawn(move || run_metal(tx));
+        for _ in 0..100 {
+            if rx.borrow().available {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let value = serde_json::to_value(&*rx.borrow().clone()).unwrap();
+        drop(rx);
+        worker.join().unwrap();
+        assert_eq!(value["available"], true);
+        let gpu = &value["gpus"][0];
+        assert!(gpu["metal"]["recommended_working_set"].as_u64().unwrap() > 0);
+        for field in [
+            "util_gpu",
+            "util_mem",
+            "mem_used",
+            "mem_total",
+            "temp_c",
+            "power_w",
+        ] {
+            assert!(gpu[field].is_null(), "{field} is not a Metal sensor");
+        }
+    }
+
+    #[test]
+    fn old_runners_and_missing_timings_do_not_become_zero_measurements() {
+        assert!(serde_json::from_value::<MetalRunnerMetrics>(serde_json::json!({})).is_err());
+        let value: MetalRunnerMetrics = serde_json::from_value(serde_json::json!({
+            "allocated_bytes": 1024, "completed_commands": 0,
+            "gpu_seconds_total": 0.0, "last_command_ms": null
+        }))
+        .unwrap();
+        assert_eq!(value.last_command_ms, None);
+        assert_eq!(value.allocated_bytes, 1024);
+    }
 }
 
 // ── §9 reconciliation: inside view vs outside view vs device ────────────────
@@ -245,6 +373,8 @@ pub struct RunnerVram {
     /// Studio's GPU dock reads its engine strip from this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metal: Option<MetalRunnerMetrics>,
 }
 
 /// The manager's alertable gauge (doc §9): sum(self-reports) ≈ NVML per-PID ≈
@@ -320,7 +450,7 @@ pub fn start_reconciler(
                     return;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
     rx
@@ -330,6 +460,7 @@ async fn reconcile(
     snap: &GpuSnapshot,
     supervisor: &crate::supervisor::Supervisor,
 ) -> Reconciliation {
+    use futures::{StreamExt, stream};
     // NVML per-PID, summed across devices (a runner is single-GPU today, but
     // the join shouldn't silently break when that changes). Alongside the sum,
     // remember which device holds the most of each pid's bytes - that is the
@@ -351,22 +482,40 @@ async fn reconcile(
     let mut runners = Vec::new();
     let mut paddock_mem = 0u64;
     let mut anomaly = false;
-    for view in supervisor.list().await {
+    let mut samples = stream::iter(supervisor.list().await)
+        .map(|view| async move {
+            // Inside view over the admin pipe: the runner's engine self-report
+            // (kept whole for the Studio; model_mem drives the drift math).
+            let stats = if view.status == "unreachable" {
+                None
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    paddock_admin::client::AdminClient::new(view.port).stats(),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                // Don't attach a replacement process's counters to an old PID.
+                .filter(|v| {
+                    v.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(view.pid))
+                        && v.get("ts")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some_and(|ts| now_secs().abs_diff(ts) <= 10)
+                })
+            };
+            (view, stats)
+        })
+        .buffer_unordered(8);
+    while let Some((view, stats)) = samples.next().await {
         let nvml_mem = by_pid.get(&view.pid).copied();
-        // Inside view over the admin pipe: the runner's engine self-report
-        // (kept whole for the Studio; model_mem drives the drift math).
-        let engine = if view.status == "unreachable" {
-            None
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                paddock_admin::client::AdminClient::new(view.port).stats(),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|v| v.get("engine").filter(|e| !e.is_null()).cloned())
-        };
+        let engine = stats
+            .as_ref()
+            .and_then(|v| v.get("engine").filter(|e| !e.is_null()).cloned());
+        let metal = stats
+            .as_ref()
+            .and_then(|v| v.get("metal"))
+            .and_then(|m| serde_json::from_value::<MetalRunnerMetrics>(m.clone()).ok());
         let self_mem = engine.as_ref().and_then(|e| e.get("model_mem")?.as_u64());
         let drift = match (nvml_mem, self_mem) {
             (Some(n), Some(s)) => Some(n as i64 - s as i64),
@@ -394,15 +543,18 @@ async fn reconcile(
             drift,
             anomaly: flagged,
             engine,
+            metal,
         });
     }
 
     let device_used: u64 = snap.gpus.iter().filter_map(|g| g.mem_used).sum();
+    runners.sort_by_key(|r| (r.port, r.pid));
     let device_total: u64 = snap.gpus.iter().filter_map(|g| g.mem_total).sum();
     // Attribution holds when NVML reported bytes for at least one runner (or
     // there are no runners to attribute). All-None with live runners = the
     // WDDM blind spot - report absence, not zeros.
-    let attribution = runners.is_empty() || runners.iter().any(|r| r.nvml_mem.is_some());
+    let attribution = !snap.gpus.iter().any(|g| g.metal.is_some())
+        && (runners.is_empty() || runners.iter().any(|r| r.nvml_mem.is_some()));
     // ledger sum vs the card: > total means WDDM is paging VRAM to system RAM
     let committed: u64 = runners.iter().filter_map(|r| r.self_mem).sum();
     let overcommit = (device_total > 0 && committed > device_total).then(|| {

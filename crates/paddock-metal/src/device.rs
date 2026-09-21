@@ -230,6 +230,7 @@ impl MetalDevice {
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
+        crate::telemetry::completed(&cmd);
         if let Some(e) = cmd.error() {
             self.healthy.store(false, Ordering::Release);
             return Err(MetalError::Device(e.to_string()));
@@ -334,6 +335,7 @@ impl MetalDevice {
         let queue = raw
             .newCommandQueue()
             .ok_or_else(|| MetalError::Device("cannot create command queue".into()))?;
+        crate::telemetry::activate();
         let opts = MTLCompileOptions::new();
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
         // Permit contraction/reassociation, but preserve the infinities used
@@ -1364,8 +1366,13 @@ impl<'a> Commands<'a> {
 
 /// A retained, submitted command. Dropping a cancelled result still fences its
 /// resources before their allocation-ledger entries can be released.
-pub(crate) struct Completion(Obj<dyn MTLCommandBuffer>);
+pub(crate) struct Completion(Obj<dyn MTLCommandBuffer>, AtomicBool);
 impl Completion {
+    fn record(&self) {
+        if !self.1.swap(true, Ordering::Relaxed) {
+            crate::telemetry::completed(&self.0);
+        }
+    }
     pub fn ready(&self) -> bool {
         matches!(
             self.0.status(),
@@ -1374,6 +1381,7 @@ impl Completion {
     }
     pub fn wait(&self) -> Result<()> {
         self.0.waitUntilCompleted();
+        self.record();
         self.0
             .error()
             .map_or(Ok(()), |e| Err(MetalError::Device(e.to_string())))
@@ -1382,6 +1390,7 @@ impl Completion {
 impl Drop for Completion {
     fn drop(&mut self) {
         self.0.waitUntilCompleted();
+        self.record();
     }
 }
 impl Commands<'_> {
@@ -1395,7 +1404,7 @@ impl Commands<'_> {
             enc.endEncoding();
         }
         self.cmd.commit();
-        Ok(Completion(self.cmd))
+        Ok(Completion(self.cmd, AtomicBool::new(false)))
     }
     /// Parameters are fixed-width words, with floats passed as IEEE bit patterns.
     /// All buffers are retained by the default command-buffer resource policy.
@@ -1542,6 +1551,7 @@ impl Commands<'_> {
         }
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
+        crate::telemetry::completed(&self.cmd);
         if let Some(e) = self.cmd.error() {
             self.device.healthy.store(false, Ordering::Relaxed);
             return Err(MetalError::Device(e.to_string()));
@@ -1585,6 +1595,37 @@ impl Commands<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_async_completion_records_once_even_after_repeated_wait_and_drop() {
+        let raw = MTLCreateSystemDefaultDevice().expect("Apple GPU");
+        let queue = raw.newCommandQueue().unwrap();
+        let buffer = raw
+            .newBufferWithLength_options(1 << 20, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        crate::telemetry::activate();
+        let before = crate::telemetry::telemetry_snapshot().unwrap();
+        let cmd = queue.commandBuffer().unwrap();
+        let enc = cmd.blitCommandEncoder().unwrap();
+        enc.fillBuffer_range_value(&buffer, NSRange::new(0, 1 << 20), 7);
+        enc.endEncoding();
+        cmd.commit();
+        let completion = Completion(cmd, AtomicBool::new(false));
+        completion.wait().unwrap();
+        completion.wait().unwrap();
+        drop(completion);
+        let after = crate::telemetry::telemetry_snapshot().unwrap();
+        assert_eq!(
+            after["completed_commands"].as_u64().unwrap(),
+            before["completed_commands"].as_u64().unwrap() + 1
+        );
+        assert!(
+            after["gpu_seconds_total"].as_f64().unwrap()
+                > before["gpu_seconds_total"].as_f64().unwrap()
+        );
+        assert!(after["allocated_bytes"].as_u64().unwrap() >= 1 << 20);
+        assert!(after["last_command_ms"].as_f64().unwrap() > 0.0);
+    }
 
     #[test]
     fn bf16_gpu_rounding_preserves_ties_range_and_special_values() {

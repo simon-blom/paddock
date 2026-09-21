@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { backendAdvancedFields, defaultSpeculation, nativeKvOption } from '@/lib/backend-settings'
 // Configure / edit - one full page, two modes (route-decided):
 //
 //   /manage/models/start/:model  the workload step: the model was picked on
@@ -168,7 +169,7 @@ const hostRam = computed(() => {
   const own = (savedOffloadRamGb.value || 0) * 1024 ** 3
   const others = Math.max(0, h.committed - own)
   const want = cacheRam.value * 1024 ** 3
-  return { total: h.total, others, want, free: h.total === null ? null : h.total - others }
+  return { total: h.total, others, want, free: h.available ?? (h.total === null ? null : h.total - others) }
 })
 const hostRamOver = computed(() => {
   const h = hostRam.value
@@ -478,6 +479,10 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
   },
 ]
 const AF_ALL = AF_CARDS.flatMap((c) => c.fields)
+const backend = computed(() => ready.info?.backend ?? 'cuda')
+const advancedCards = computed(() => AF_CARDS.map(c => ({
+  ...c, fields: backendAdvancedFields(c.fields, backend.value, kvOptions.value.map(k => k.value)),
+})))
 const afS = reactive<Record<string, string>>({})
 const afB = reactive<Record<string, boolean>>({})
 for (const f of AF_ALL) {
@@ -910,6 +915,7 @@ const gpuAdvOptions = computed(() => {
 // threshold is Ada, and the engine does not serve Ada, so "get an Ada card"
 // would send someone shopping for silicon we refuse.
 const fp8KvBlocked = computed<string | null>(() => {
+  if (backend.value === 'metal') return 'Metal uses checkpoint-native KV precision'
   const cc = ready.info?.cc
   // unrecognised silicon makes no claim - the engine already warns on an
   // unvalidated arch, so a guess here would be noise
@@ -958,8 +964,8 @@ const vramBudgetMib = computed<number | null>(() => {
   return null
 })
 const kvOptions = computed(() => selectedWeights.value?.runtime?.kv_cache_dtype ? [
-  { value: selectedWeights.value.runtime.kv_cache_dtype, label: 'Backend native', hint: selectedWeights.value.runtime.kv_cache_dtype === 'auto' ? 'BF16 for this MLX export' : 'F16 for this Metal GGUF backend' },
-] : [
+  nativeKvOption(selectedWeights.value.runtime.kv_cache_dtype),
+] : backend.value === 'metal' ? [nativeKvOption('auto')] : [
   { value: 'f16', label: '16-bit', hint: 'exact' },
   {
     value: 'fp8_e4m3',
@@ -1180,7 +1186,14 @@ const canTools = computed(
 const canSpeculate = computed(
   () => !catModel.value || selectedCapabilities.value.includes('speculative'),
 )
+const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
 watch(selectedWeights, (weights, previous) => {
+  if (!isEdit.value && weights !== previous) {
+    specPolicy.value = defaultSpecChoice()
+    if (weights?.runtime?.default_max_batch) batch.value = weights.runtime.default_max_batch
+    if (!userTouchedCtx.value && weights?.runtime?.default_max_ctx) ctx.value = weights.runtime.default_max_ctx
+  }
+  if (!isEdit.value && !canOffload.value) kvOn.value = false
   if (!isEdit.value && weights?.runtime?.memory) {
     ctx.value = Math.min(ctx.value, weights.runtime.memory.max_ctx)
     batch.value = Math.min(batch.value, weights.runtime.memory.max_batch)
@@ -1239,8 +1252,7 @@ const drafterSummary = computed(() => {
  *  AND extra resident VRAM for the life of the endpoint, so it is not ours to
  *  enable on someone's behalf. They can still pick On or Adaptive. */
 function defaultSpecChoice(): string {
-  const d = drafterArtifact.value
-  return d && !d.default ? 'off' : 'on'
+  return defaultSpeculation(catModel.value, selectedWeights.value, drafterArtifact.value)
 }
 // keep the weights choice valid as the model changes: prefer installed, then
 // the catalog default
@@ -1258,7 +1270,7 @@ watch(model, () => {
   if (!isEdit.value) {
     fp8Native.value = false
     specPolicy.value = defaultSpecChoice()
-    kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? catModel.value?.kv_default ?? preferredKv.value
+    kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? (backend.value === 'metal' ? 'auto' : catModel.value?.kv_default ?? preferredKv.value)
   }
 })
 const est = computed(() => reg.estimates[model.value]?.artifacts?.[artifactId.value])
@@ -1385,7 +1397,7 @@ const ctxCustomHint = computed(() => {
 const userTouchedCtx = ref(false)
 function proposeCtx(): void {
   const opts = ctxOptions.value
-  const pref = opts.filter((c) => c <= 32768)
+  const pref = opts.filter((c) => c <= (selectedWeights.value?.runtime?.default_max_ctx ?? 32768))
   ctx.value = (pref.length ? pref[pref.length - 1] : opts[opts.length - 1]) ?? 32768
 }
 watch([model, batch], () => {
@@ -1426,8 +1438,9 @@ watch(ctxCap, (cap) => {
 // estimate by the whole tower (0.9 GB on qwen3.8-27b). `cc` rides
 // along so the server can price the KV width this CARD will serve rather than
 // the one the control asked for.
-watch([batch, kvDtype, specPolicy, withVision, vramBudgetMib, gpuIndex], () =>
+watch([batch, kvDtype, specPolicy, withVision, vramBudgetMib, gpuIndex, kvOn, cacheRam, editPort, selectedWeights], () =>
   void reg.estimate({
+    freeingPort: editPort.value,
     batch: batch.value,
     kv: kvDtype.value,
     spec: canSpeculate.value && specPolicy.value !== 'off',
@@ -1504,11 +1517,9 @@ function applySimpleConfig(cfg: SimpleCfg): void {
   // a file with no key (or the legacy "auto") predates this control; resolve
   // it to the value that endpoint actually serves at
   const kv = cfg.kv_cache_dtype as string | undefined
-  kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? (!kv || kv === 'auto' ? (catModel.value?.kv_default ?? 'f16') : kv)
-  // an existing file with no `spec` key predates this control; the engine
-  // treats that as the tuned ladder, which is "On"
-  specPolicy.value = cfg.spec ?? 'on'
+  kvDtype.value = selectedWeights.value?.runtime?.kv_cache_dtype ?? (!kv || kv === 'auto' ? (backend.value === 'metal' ? 'auto' : catModel.value?.kv_default ?? 'f16') : kv)
   drafterId.value = cfg.drafter ?? ''
+  specPolicy.value = cfg.spec ?? defaultSpecChoice()
   // the key is shown, not masked - the operator's own box
   apiKey.value = cfg.api_key ?? ''
   wsProvider.value = cfg.web_search_provider ?? ''
@@ -2422,9 +2433,10 @@ function start(): void {
         <div class="sf__card">
         <p class="sf__card-hd">KV offloading</p>
         <label class="sf__check">
-          <Switch v-model="kvOn" label="KV offloading" />
-          Keep KV cache outside VRAM
+          <Switch v-model="kvOn" :disabled="!canOffload && !kvOn" label="KV offloading" />
+          {{ backend === 'metal' ? 'Cache reusable prefixes in RAM / on disk' : 'Keep KV cache outside VRAM' }}
         </label>
+        <p v-if="!canOffload" class="sf__hint">KV offloading is not supported by this model's backend.</p>
         <template v-if="kvOn">
           <FieldLabel label="In RAM (GB)" />
           <NumberField v-model="cacheRam" :min="1" :max="1024" :step="1" />
@@ -2713,7 +2725,7 @@ function start(): void {
             <div><button type="button" class="pk-btn pk-btn--sm" @click="retryFile">Retry</button></div>
           </div>
           <template v-else>
-          <div v-for="card in AF_CARDS" :key="card.hd" class="sf__card">
+          <div v-for="card in advancedCards" :key="card.hd" class="sf__card">
             <p class="sf__card-hd">{{ card.hd }}</p>
             <div v-for="f in card.fields" :key="f.key" class="sf__afrow">
               <div class="sf__aflbl">
@@ -2874,7 +2886,7 @@ function start(): void {
             :device="fitData.d"
             :ctx="ctx"
             :batch="batch"
-            :kv="reg.envelope?.kv_dtype"
+            :kv="est?.kv_dtype ?? reg.envelope?.kv_dtype"
             :kv-downgraded="reg.envelope?.kv_downgraded"
             :budget-bytes="reg.envelope?.budget ?? null"
             :forensics="fitForensics"

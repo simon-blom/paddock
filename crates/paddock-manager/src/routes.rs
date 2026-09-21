@@ -57,10 +57,9 @@ pub struct AppState {
     /// Server-push fan-out to open Studio tabs (`/api/events`, SSE): fleet
     /// and update state on CHANGE, replacing the per-tab poll loops.
     pub push: crate::push::Hub,
-    /// Serializes VRAM admissions: two concurrent starts must not both price
-    /// themselves against the same residual and both pass. (The residual gap
-    /// between an admission and its config file landing on disk is accepted
-    /// and documented.)
+    /// Held from admission through launch/restart, closing the reservation
+    /// gap before a config/runner appears in fleet accounting. Read paths and
+    /// inference never take this lock.
     pub admission: tokio::sync::Mutex<()>,
     /// Last "is there a newer paddock" answer, so a UI that polls does not turn
     /// into an outbound request per poll.
@@ -648,6 +647,7 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                         return;
                     }
                     pin_envelope(&mut spec, &state.registry);
+                    let _admission = state.admission.lock().await;
                     match vram_admission(&state, AdmitReq::for_spec(&spec, freeing)).await {
                         Err(refusal) => {
                             *job.follow_state
@@ -1054,7 +1054,10 @@ async fn vram_admission(
     }
     // one admission at a time: two concurrent starts must not both price
     // themselves against the same residual
-    let _gate = state.admission.lock().await;
+    // Caller holds admission until its launch finishes (including failures).
+    if state.readiness.backend == "metal" {
+        return metal_admission(state, req).await;
+    }
     let snap = state.gpu.latest();
     if !snap.available || snap.gpus.is_empty() {
         return Ok(None); // no NVML view - nothing honest to refuse on
@@ -1419,6 +1422,132 @@ async fn vram_admission(
         });
     }
     Ok(None)
+}
+
+fn pin_budget_text(text: &str, grant: u64) -> String {
+    // Only the automatic (absent) Metal budget is filled; explicit user
+    // ceilings and every other key/comment retain their identity.
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return text.into();
+    };
+    if doc.get("vram_budget").is_none() {
+        doc["vram_budget"] = toml_edit::value(grant as i64);
+    }
+    doc.to_string()
+}
+
+async fn metal_admission(
+    state: &Arc<AppState>,
+    req: AdmitReq<'_>,
+) -> Result<Option<u64>, AdmissionRefusal> {
+    use paddock_estimator::{Device, Envelope, KvDtype};
+    let refuse = |message| AdmissionRefusal {
+        message,
+        eviction: None,
+    };
+    let (snapshot, free) = crate::metal_memory::available(state, req.freeing_port)
+        .await
+        .ok_or_else(|| {
+            refuse("Cannot read Apple unified-memory availability; no model was started.".into())
+        })?;
+    let host = req.offload_ram_bytes.unwrap_or(0);
+    let free = free.saturating_sub(host);
+    if req.fixed_need.is_some_and(|need| need > free) {
+        return Err(refuse(format!(
+            "The configured memory budget exceeds the {:.1} GiB available after other models and RAM caches. Lower the budget or stop another instance.",
+            free as f64 / (1u64 << 30) as f64
+        )));
+    }
+    let identified = state
+        .registry
+        .identify_weights(std::path::Path::new(req.model));
+    let model = state.registry.catalog_of(req.model).or_else(|| {
+        identified
+            .as_ref()
+            .and_then(|(m, _)| state.registry.catalog_of(m))
+    });
+    let artifact = model.and_then(|m| {
+        req.artifact
+            .or_else(|| identified.as_ref().map(|(_, a)| a.as_str()))
+            .and_then(|a| m.artifact(a))
+            .or_else(|| m.default_weights_for_backend("metal", None))
+    });
+    let (mut shape, env) = if let (Some(model), Some(artifact)) = (model, artifact) {
+        let shape = crate::estimate::artifact_shape(state, model, artifact, req.vision);
+        (
+            shape,
+            Envelope {
+                concurrency: req.max_batch.unwrap_or(1).max(1) as u64,
+                kv_dtype: artifact.runtime.estimate_kv_dtype(KvDtype::F16),
+                spec: crate::estimate::artifact_spec(model, artifact, req.spec),
+                offload: req
+                    .offload_ram_bytes
+                    .map(paddock_estimator::OffloadCost::armed),
+            },
+        )
+    } else {
+        (
+            None,
+            Envelope {
+                concurrency: req.max_batch.unwrap_or(1).max(1) as u64,
+                kv_dtype: KvDtype::F16,
+                spec: None,
+                offload: None,
+            },
+        )
+    };
+    let ceiling = req.fixed_need.unwrap_or(free);
+    let required = if let Some(shape) = &mut shape {
+        shape.max_ctx = shape.max_ctx.min(req.max_ctx.unwrap_or(32768) as u64);
+        if let Some(model) = model {
+            crate::estimate::metal_cache_shape(shape, model, &env);
+        }
+        let estimate = crate::estimate::backend_estimate(
+            "metal",
+            shape,
+            &env,
+            &Device {
+                free_bytes: ceiling,
+                total_bytes: snapshot.limit,
+            },
+        );
+        if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. })
+            || (shape.kind != paddock_estimator::ModelKind::Encoder
+                && estimate.max_ctx < shape.max_ctx)
+        {
+            return Err(refuse(format!(
+                "This model does not fit the available unified-memory budget at {} tokens and {} concurrent requests. Lower context/concurrency or stop another instance.",
+                shape.max_ctx, env.concurrency
+            )));
+        }
+        (estimate.resident + estimate.kv_pool).max(shape.weight_bytes + (1 << 30))
+    } else {
+        // Unknown/imported layouts get a real hard ceiling, never an unbounded
+        // load. The runner validates the layout inside that reserved budget.
+        let weights = artifact
+            .map(|a| a.total_size())
+            .or_else(|| crate::estimate::resolve_weight_bytes_for(state, req.model, req.artifact))
+            .ok_or_else(|| {
+                refuse(
+                    "Cannot determine checkpoint weight size. Select an installed checkpoint path or a catalog export."
+                        .into(),
+                )
+            })?;
+        if weights.saturating_add(3 << 30) > ceiling {
+            return Err(refuse(
+                "The checkpoint weights and runtime allowance exceed available unified memory."
+                    .into(),
+            ));
+        }
+        ceiling
+    };
+    if required > ceiling || ceiling < 1 << 20 {
+        return Err(refuse("Insufficient unified memory for this model.".into()));
+    }
+    Ok(req
+        .fixed_need
+        .is_none()
+        .then_some(required.div_ceil(1 << 20).min(free >> 20)))
 }
 
 // ── runner supervision (doc §3, §5) ─────────────────────────────────────────
@@ -1962,6 +2091,9 @@ async fn servers_preview(
         },
         None => toml,
     };
+    if let Err(error) = state.supervisor.validate_backend_config(&toml) {
+        return relay_err(StatusCode::BAD_REQUEST, error);
+    }
     Json(serde_json::json!({ "toml": toml })).into_response()
 }
 
@@ -1972,6 +2104,7 @@ async fn runners_spawn(
     State(state): State<Arc<AppState>>,
     Json(mut spec): Json<crate::supervisor::SpawnSpec>,
 ) -> Response {
+    let _admission = state.admission.lock().await;
     // caller-approved evictions first (the confirmed 507 offer)
     if let Err(e) = perform_evictions(&state, &spec.evict).await {
         return relay_err(StatusCode::CONFLICT, e);
@@ -2113,6 +2246,7 @@ async fn runners_switch(
         Err(e) => return relay_err(StatusCode::BAD_REQUEST, format!("bad spec: {e}")),
     };
     if defer {
+        let _admission = state.admission.lock().await;
         return match state
             .supervisor
             .write_spec_config(port, spec, expect_hash)
@@ -2140,6 +2274,7 @@ async fn runners_switch(
     // a takeover frees its own incumbent - that VRAM counts as available;
     // the edit gets a FRESH grant (its envelope may have changed)
     pin_envelope(&mut spec, &state.registry);
+    let _admission = state.admission.lock().await;
     match vram_admission(&state, AdmitReq::for_spec(&spec, Some(port))).await {
         Err(msg) => return admission_refused(msg),
         Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
@@ -2235,11 +2370,12 @@ pub(crate) async fn save_endpoint_file(
 async fn servers_file_put(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
-    Json(body): Json<ConfigFilePut>,
+    Json(mut body): Json<ConfigFilePut>,
 ) -> Response {
     // "Save without restarting": the file lands, nothing starts or stops, and
     // no admission runs - saving a configuration is not loading it.
     if body.apply.as_deref() == Some("defer") {
+        let _admission = state.admission.lock().await;
         return match state.supervisor.write_config_file_deferred(
             port,
             &body.content,
@@ -2255,8 +2391,12 @@ async fn servers_file_put(
     }
     // the edited file restarts this port - price it (freeing the incumbent)
     // before writing anything. The file's own vram_budget, when present, is
-    // the ask (this path is verbatim - nothing is ever injected into it);
-    // without one, the file's envelope prices a plain admission check.
+    // the ask. Metal fills an absent ceiling with its automatic reservation;
+    // every other key and comment is preserved.
+    let _admission = state.admission.lock().await;
+    if let Err(error) = state.supervisor.validate_backend_config(&body.content) {
+        return relay_err(StatusCode::BAD_REQUEST, error);
+    }
     if let Ok(doc) = toml::from_str::<toml::Value>(&body.content)
         && let Some(model) = doc.get("model").and_then(toml::Value::as_str)
     {
@@ -2282,7 +2422,7 @@ async fn servers_file_put(
                     .unwrap_or(false);
                 let gb = k
                     .get("ram_gb")
-                    .and_then(toml::Value::as_float)
+                    .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|n| n as f64)))
                     .unwrap_or(0.0);
                 (on && gb > 0.0).then_some((gb * (1u64 << 30) as f64) as u64)
             }),
@@ -2291,8 +2431,12 @@ async fn servers_file_put(
             // so on this verbatim path the file's own key is the answer.
             vision: doc.get("mmproj").is_some(),
         };
-        if let Err(msg) = vram_admission(&state, req).await {
-            return admission_refused(msg);
+        match vram_admission(&state, req).await {
+            Err(msg) => return admission_refused(msg),
+            Ok(Some(grant)) if state.readiness.backend == "metal" => {
+                body.content = pin_budget_text(&body.content, grant);
+            }
+            _ => {}
         }
     }
     match state
@@ -2479,6 +2623,10 @@ struct StartBody {
 
 /// Start an already-configured endpoint from its file, verbatim (`paddock
 /// start <port>`; a stopped endpoint's file outlives its election).
+pub(crate) async fn resume_elected(state: Arc<AppState>, port: u16) -> Response {
+    start_saved(state, port, vec![], "boot-election").await
+}
+
 async fn servers_start(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
@@ -2490,21 +2638,49 @@ async fn servers_start(
         .into_iter()
         .filter(|p| *p != port)
         .collect();
+    start_saved(state, port, evict, "manual").await
+}
+
+async fn start_saved(state: Arc<AppState>, port: u16, evict: Vec<u16>, cause: &str) -> Response {
+    let _admission = state.admission.lock().await;
+    if state.supervisor.is_serving(port).await {
+        return relay_err(
+            StatusCode::CONFLICT,
+            "This instance is already running.".into(),
+        );
+    }
     if let Err(e) = perform_evictions(&state, &evict).await {
         return relay_err(StatusCode::CONFLICT, e);
     }
     // price the file before the verbatim start: its own vram_budget is the
     // ask when present; otherwise its envelope prices a plain check. The
-    // file itself is launched untouched either way.
+    // Metal fills an absent ceiling before launching the saved configuration.
     if let Ok(spec) = state
         .supervisor
         .spec_from_config_file(&state.supervisor.server_config_path(port))
         && !spec.model.is_empty()
-        && let Err(msg) = vram_admission(&state, AdmitReq::for_spec(&spec, None)).await
     {
-        return admission_refused(msg);
+        match vram_admission(&state, AdmitReq::for_spec(&spec, None)).await {
+            Err(msg) => return admission_refused(msg),
+            Ok(Some(grant)) if state.readiness.backend == "metal" => {
+                let Ok((text, hash)) = state.supervisor.read_config_file(port) else {
+                    return relay_err(
+                        StatusCode::BAD_REQUEST,
+                        "Cannot read the saved configuration".into(),
+                    );
+                };
+                if let Err(error) = state.supervisor.write_config_file_deferred(
+                    port,
+                    &pin_budget_text(&text, grant),
+                    Some(&hash),
+                ) {
+                    return relay_err(StatusCode::BAD_REQUEST, error);
+                }
+            }
+            _ => {}
+        }
     }
-    let _ = state.db.note_start_cause(port, "manual");
+    let _ = state.db.note_start_cause(port, cause);
     match state.supervisor.start_config(port).await {
         Ok(view) => Json(view).into_response(),
         Err(e) => (
@@ -2709,7 +2885,7 @@ async fn gpu_info(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// Device snapshot + the §9 reconciliation section in one payload. Every fact
-/// keeps its one authoritative producer: `gpus` is NVML, `reconciliation`
+/// keeps its authoritative producer: `gpus` is NVML or Metal capacity, `reconciliation`
 /// joins it with runner self-reports; nothing is re-labeled.
 fn gpu_payload(
     snap: &crate::telemetry::GpuSnapshot,
@@ -2858,7 +3034,14 @@ async fn gpu_ws(
             }
             msg = socket.recv() => {
                 match msg {
-                    None | Some(Ok(Message::Close(_))) | Some(Err(_)) => return,
+                    Some(Ok(Message::Close(_))) => {
+                        // Flush tungstenite's queued close reply before dropping
+                        // the transport; normal panel closes aren't WS errors.
+                        use futures::SinkExt;
+                        let _ = socket.flush().await;
+                        return;
+                    }
+                    None | Some(Err(_)) => return,
                     _ => {}
                 }
             }
@@ -2999,6 +3182,26 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn automatic_budget_preserves_configuration_and_explicit_ceiling() {
+        let original = "# operator settings\nmodel = 'local'\napi_key = 'fixture-only'\n[custom]\nkeep = true\n";
+        let pinned = pin_budget_text(original, 12345);
+        let before: toml::Value = toml::from_str(original).unwrap();
+        let mut after: toml::Value = toml::from_str(&pinned).unwrap();
+        assert_eq!(
+            after
+                .as_table_mut()
+                .unwrap()
+                .remove("vram_budget")
+                .unwrap()
+                .as_integer(),
+            Some(12345)
+        );
+        assert_eq!(before, after);
+        assert!(pinned.starts_with("# operator settings"));
+        assert_eq!(pin_budget_text(&pinned, 99999), pinned);
+    }
 
     #[test]
     fn default_start_envelope_matches_each_metal_artifact_before_admission() {

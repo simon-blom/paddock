@@ -7,6 +7,18 @@ struct ResponsePresentationTests {
   typealias V = ConversationValue
   typealias O = [String: V]
 
+  @Test func badgesOnlyShowActiveSpeculationAndLeaveProvenanceUnchanged() {
+    #expect(NativeStudioRuntime.recordedSpec(nil).isEmpty)
+    for value in ["", "off", " OFF ", "false", "no", "none", "0", "disabled", " DISABLED "] {
+      let run: O = ["spec": .string(value)]
+      #expect(NativeStudioRuntime.recordedSpec(run).isEmpty)
+      #expect(run["spec"]?.string == value)
+    }
+    for value in ["MTP", "DFlash1", "DFlash2", "MTP+DFlash2", "MTP (adaptive)"] {
+      #expect(NativeStudioRuntime.recordedSpec(["spec": .string(" \(value) ")]) == value)
+    }
+  }
+
   @Test func actualArtifactTurnNeverDividesToolTokensByFinalAnswerTime() throws {
     let legacy: O = [
       "promptTokens": .number(2719), "completionTokens": .number(1386),

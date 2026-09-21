@@ -36,10 +36,13 @@ pub fn total_bytes() -> Option<u64> {
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kb * 1024)
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     {
-        // macOS would take a sysctl; until the fit surface is wanted there,
-        // reporting nothing beats reporting a guess.
+        crate::metal_memory::physical_bytes()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        // Unsupported platforms report absence rather than a fabricated total.
         None
     }
 }
@@ -62,9 +65,9 @@ mod tests {
 
     #[test]
     fn this_box_reports_a_plausible_total() {
-        // The two platforms we serve on must answer; a wrong answer here is
+        // Supported platforms must answer; a wrong answer here is
         // worse than none, so sanity-bound it rather than just unwrapping.
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             let t = total_bytes().expect("a supported platform must report its RAM");
             assert!(t >= 1 << 30, "implausibly small: {t}");

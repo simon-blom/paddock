@@ -2,7 +2,8 @@
 //!
 //! Reads the engine's lock-free counters (tok/s, phase, batch, KV pool,
 //! allocator-ledger VRAM split) on a dedicated low-cadence thread and publishes
-//! snapshots over a watch channel. Deliberately **no NVML and no CUDA**: device
+//! snapshots over a watch channel. Metal adds process-local device allocation
+//! and completed-command counters on this thread. **No NVML and no CUDA**: device
 //! telemetry (temps, power, per-PID memory from outside) belongs to the manager
 //! - the inside and outside views must come from different processes or the
 //!   reconciliation cross-check is worthless. Reading the atomics never perturbs
@@ -176,6 +177,9 @@ pub struct StatsSnapshot {
     pub ts: u64,
     pub pid: u32,
     pub engine: Option<EngineSnapshot>,
+    /// Process-local Metal allocations and command timing, including non-LLMs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metal: Option<serde_json::Value>,
 }
 
 impl StatsSnapshot {
@@ -184,6 +188,7 @@ impl StatsSnapshot {
             ts: now_secs(),
             pid: std::process::id(),
             engine: None,
+            metal: None,
         }
     }
 }
@@ -233,6 +238,17 @@ pub fn start(engine: Option<Arc<EngineMetrics>>) -> Stats {
         tracing::warn!(%e, "could not spawn engine stats thread; self-report disabled");
     }
     Stats { rx }
+}
+
+fn metal_snapshot() -> Option<serde_json::Value> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        paddock_metal::telemetry_snapshot()
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn run(tx: watch::Sender<Arc<StatsSnapshot>>, engine: Option<Arc<EngineMetrics>>) {
@@ -285,6 +301,7 @@ fn run(tx: watch::Sender<Arc<StatsSnapshot>>, engine: Option<Arc<EngineMetrics>>
             ts: now_secs(),
             pid: std::process::id(),
             engine: eng,
+            metal: metal_snapshot(),
         });
         // Err only when every receiver has dropped (server shutting down).
         if tx.send(snap).is_err() {

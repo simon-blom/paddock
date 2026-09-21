@@ -36,9 +36,7 @@ extension NativeStudioRuntime {
       {
         caps[id] = nil
       }
-      if ["off", "none", "disabled"].contains(value["spec"]?.string?.lowercased() ?? "") {
-        value["spec"] = .string("")
-      }
+      value["spec"] = .string(Self.recordedSpec(value))
       next.append(value)
     }
     if let endpoints = try? await cloud.array {

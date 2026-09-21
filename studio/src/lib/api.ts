@@ -59,6 +59,8 @@ async function jbody<T>(url: string, method: string, body?: unknown): Promise<T>
 // given card/driver may not expose a sensor (fan on passive cards, per-process
 // util on Windows WDDM, etc.). Values are null (not omitted) when unsupported.
 export interface GpuInfo {
+  metal?: { unified_memory_total: number | null; recommended_working_set: number;
+    thermal_pressure?: string | null; memory_pressure?: string | null; counter_sets?: string[] }
   index: number
   name: string
   uuid?: string | null
@@ -103,6 +105,14 @@ export interface RunnerVram {
   drift?: number | null
   anomaly: boolean
   engine?: EngineSnapshot | null
+  metal?: MetalRunnerMetrics | null
+}
+
+export interface MetalRunnerMetrics {
+  allocated_bytes: number
+  completed_commands: number
+  gpu_seconds_total: number
+  last_command_ms: number | null
 }
 
 export interface Reconciliation {
@@ -119,7 +129,7 @@ export interface Reconciliation {
 }
 
 export interface GpuSnapshot {
-  /** false when NVML couldn't init (CPU-only host / no driver). */
+  /** false when the platform's device sampler is unavailable. */
   available: boolean
   ts: number
   gpus: GpuInfo[]
@@ -548,6 +558,7 @@ export interface CatalogArtifact {
     qualification?: 'unqualified' | 'experimental' | 'qualified'
     default_max_ctx?: number
     default_max_batch?: number
+    default_spec?: string
     memory?: { max_ctx: number; max_batch: number }
     note?: string
   }
@@ -559,6 +570,7 @@ export interface CatalogArtifact {
     license_url: string
   }
   backend_supported?: boolean
+  kv_offload_supported?: boolean
   /** the honest quant tag for weights ("Q8_0", "UD-Q4_K_XL", "MXFP4"). */
   quant?: string
   /** part of the row-level Download bundle. */

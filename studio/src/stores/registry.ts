@@ -13,9 +13,9 @@ export interface Envelope {
    *  serve, not necessarily what was asked. Label the KV row from here, never
    *  from the form control, or the panel can say "8-bit" over bytes counted
    *  at 16. */
-  kv_dtype: 'f16' | 'fp8_e4m3'
+  kv_dtype: 'f16' | 'fp8_e4m3' | 'f32'
   /** What the form asked for, when it differs from `kv_dtype`. */
-  kv_asked?: 'f16' | 'fp8_e4m3'
+  kv_asked?: 'f16' | 'fp8_e4m3' | 'f32'
   /** Why the ask was not honoured, in words ("this GPU has no FP8 tensor
    *  cores"). Absent when nothing was overridden. */
   kv_downgraded?: string | null
@@ -33,6 +33,7 @@ export interface Envelope {
  *  every VRAM figure deliberately: prefix-cache offload spends system RAM, and
  *  folding the two together is the mistake this type exists to prevent. */
 export interface HostMem {
+  available?: number | null
   /** null where the manager cannot read it (see hostmem.rs). */
   total: number | null
   /** ceilings the configured fleet has already promised its caches. */
@@ -109,6 +110,7 @@ export interface Estimate {
  *  `kind: 'encoder'` = embeddings/rerank: one forward pass per call, no cache
  *  held between them, so context and concurrency cost nothing. */
 export interface ModelEstimate {
+  kv_dtype?: string
   known: boolean
   kind?: 'generative' | 'encoder'
   weights: number
@@ -149,6 +151,9 @@ export interface ModelFit {
  *  currently-loaded model would hand back, since paddock releases one before
  *  loading another. */
 export interface EstimateDevice {
+  unified?: boolean
+  physical?: number
+  planning_basis?: string
   /** What a model would get: `free_now` plus whatever the loaded model
    *  releases when it is swapped out. This is the one the fit is judged on. */
   free: number
@@ -249,7 +254,9 @@ export const useRegistryStore = defineStore('registry', () => {
    *  hybrids where only ~1/4 of blocks cache anything; gemma4 and gpt-oss cap
    *  most blocks at a sliding window), and only the GGUF header knows.
    */
+  let estimateSequence = 0
   async function estimate(over?: {
+    freeingPort?: number | null
     batch?: number
     kv?: string
     spec?: boolean
@@ -274,7 +281,9 @@ export const useRegistryStore = defineStore('registry', () => {
      *  and it is what the host-RAM readout is priced from. */
     offloadRamGb?: number
   }): Promise<void> {
+    const sequence = ++estimateSequence
     const q = new URLSearchParams()
+    if (over?.freeingPort) q.set('freeing_port', String(over.freeingPort))
     const batch = over?.batch ?? envelope.value?.batch
     if (batch) q.set('batch', String(batch))
     // KV precision and speculation move the answer as much as concurrency does:
@@ -295,7 +304,10 @@ export const useRegistryStore = defineStore('registry', () => {
     if (over?.offloadRamGb) q.set('offload_ram_gb', String(over.offloadRamGb))
     estimating.value = true
     try {
-      const r = await fetch(`/api/models/estimate?${q}`).then((x) => x.json())
+      const response = await fetch(`/api/models/estimate?${q}`)
+      if (!response.ok) throw new Error(`Estimate failed: ${response.status}`)
+      const r = await response.json()
+      if (sequence !== estimateSequence) return
       envelope.value = r.envelope
       estDevice.value = r.device
       estHost.value = r.host ?? null
@@ -303,7 +315,7 @@ export const useRegistryStore = defineStore('registry', () => {
     } catch {
       // leave the previous answer standing rather than flashing a wrong one
     } finally {
-      estimating.value = false
+      if (sequence === estimateSequence) estimating.value = false
     }
   }
 

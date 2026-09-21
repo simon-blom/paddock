@@ -330,7 +330,9 @@ fn offload_edits_preserve_private_paths_and_validate_budgets() {
     assert_eq!(doc["api_key"].as_str(), Some("synthetic-runner-secret"));
     assert_eq!(doc["kv_offload"]["ram_gb"].as_float(), Some(2.0));
     assert!(!offload::projection(&doc).to_string().contains("private"));
-    assert!(!offload::supported(&doc));
+    assert!(!crate::backend_contract::path_kv_offload(
+        std::path::Path::new(doc["model"].as_str().unwrap())
+    ));
     for ram in [f64::NAN, f64::INFINITY, -1., 0., 0.25, 1025.] {
         assert!(
             patch(

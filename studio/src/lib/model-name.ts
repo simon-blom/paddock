@@ -84,11 +84,11 @@ export function fleetVendor(id: string | null | undefined): string | undefined {
   return modelVendor(bare) ?? cloudVendor(bare)
 }
 
-/** Header badges describe active speculation only. Keep the raw mode in run
+/** All UI badges describe active speculation only. Keep the raw mode in run
  * details/configuration, where an explicit disabled state is useful. */
 export function speculationBadge(spec: string | null | undefined): string {
   const label = spec?.trim() ?? ''
-  return label.toLowerCase() === 'off' ? '' : label
+  return ['off', 'false', 'no', 'none', '0', 'disabled'].includes(label.toLowerCase()) ? '' : label
 }
 
 /** The author of this particular reply, not the model selected in the composer.

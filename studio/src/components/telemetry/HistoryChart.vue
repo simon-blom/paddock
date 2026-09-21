@@ -14,7 +14,7 @@ import { useTheme } from '@/composables/useTheme'
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent])
 
 const props = withDefaults(
-  defineProps<{ times: number[]; values: number[]; unit: string; max?: number }>(),
+  defineProps<{ times: number[]; values: (number | null)[]; unit: string; max?: number }>(),
   { max: 0 },
 )
 
@@ -46,9 +46,9 @@ function withAlpha(c: string, a: number): string {
 // TREND view - 1 update/second loses nothing a human can see, and the
 // gauges/engine strip stay on the live cadence. shallowRef: the array is
 // replaced wholesale, never mutated.
-const data = shallowRef<[number, number][]>([])
+const data = shallowRef<[number, number | null][]>([])
 watchThrottled(
-  () => props.times.length,
+  () => [props.times[props.times.length - 1], props.values, props.unit],
   () => {
     const n = Math.min(props.times.length, props.values.length)
     const t = props.times.slice(-n)
@@ -87,8 +87,9 @@ const option = computed(() => {
       padding: [6, 10],
       textStyle: { color: primary, fontSize: 12 },
       axisPointer: { type: 'line', lineStyle: { color: muted, width: 1, type: 'dashed' } },
-      formatter: (params: { value: [number, number] }[]) => {
+      formatter: (params: { value: [number, number | null] }[]) => {
         const p = params[0]
+        if (!p || p.value[1] == null) return ''
         const d = new Date(p.value[0])
         const hms = d.toLocaleTimeString()
         const val = Math.round(p.value[1] * 10) / 10

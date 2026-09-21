@@ -153,10 +153,11 @@ public struct ManagerSnapshot: Decodable, Sendable {
   public let runners: [RunnerInfo]
   public let servers: [ConfiguredEndpoint]?
   public let jobs: [ManagementJob]?
+  public let gpu: GPUSnapshot?
 
   public init(
     identity: ManagerIdentity, readiness: Readiness, catalog: ModelCatalog, runners: [RunnerInfo],
-    servers: [ConfiguredEndpoint] = [], jobs: [ManagementJob] = []
+    servers: [ConfiguredEndpoint] = [], jobs: [ManagementJob] = [], gpu: GPUSnapshot? = nil
   ) {
     self.identity = identity
     self.readiness = readiness
@@ -164,6 +165,7 @@ public struct ManagerSnapshot: Decodable, Sendable {
     self.runners = runners
     self.servers = servers
     self.jobs = jobs
+    self.gpu = gpu
   }
 }
 

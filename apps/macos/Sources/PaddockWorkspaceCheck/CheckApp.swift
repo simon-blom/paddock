@@ -257,7 +257,7 @@ import WebKit
       guard let chrome = session.state?.nativeTranscript?.messages.last?.chrome else {
         return false
       }
-      return chrome.vendor == "Anthropic" && chrome.spec == "off"
+      return chrome.vendor == "Anthropic" && chrome.spec.isEmpty
         && chrome.footer == "120 tokens · 60 tok/s · 5.6s · $0.012"
         && chrome.thinkingMeta == "200 tokens · 67 tok/s"
         && chrome.promptText == "Fixture instructions"
@@ -290,7 +290,7 @@ import WebKit
     }
     try await check(
       "web and native footer use identical recorded statistics",
-      "document.querySelector('.msg__usage')?.textContent==='120 tokens · 60 tok/s · 5.6s · $0.012' && !!document.querySelector('.msg__hd svg') && document.querySelector('.msg__hd-spec')?.textContent==='off'"
+      "document.querySelector('.msg__usage')?.textContent==='120 tokens · 60 tok/s · 5.6s · $0.012' && !!document.querySelector('.msg__hd svg') && !document.querySelector('.msg__hd-spec')"
     )
     _ = try await session.webView.evaluateJavaScript(
       "document.querySelector('button[aria-label=\"Run details\"]').click()")

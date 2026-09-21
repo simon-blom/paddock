@@ -1297,6 +1297,10 @@ impl Registry {
                         av["total_size"] = serde_json::json!(a.total_size());
                         av["backend_supported"] =
                             serde_json::json!(a.runtime.supports_backend(&self.backend));
+                        av["kv_offload_supported"] = serde_json::json!(
+                            self.backend != "metal"
+                                || crate::backend_contract::metal_kv_offload(m, a)
+                        );
                     }
                 }
                 v

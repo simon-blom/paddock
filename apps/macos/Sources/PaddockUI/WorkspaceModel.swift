@@ -29,6 +29,13 @@ public final class WorkspaceModel {
   var draft = StudioDraft()
   var navigation = WorkspaceNavigation()
   var showsRendererSamples = false
+  var showsGPUMetrics = false
+  var gpuHistory = GPUHistory()
+  var gpuMeasurementsStale: Bool {
+    if case .failed = state { return true }
+    guard let gpu = snapshot?.gpu else { return false }
+    return abs(Date().timeIntervalSince1970 - Double(gpu.ts)) > 10
+  }
   var historySearchRequest: UUID?
   var selectedEndpointPort: UInt16?
   var systemToolsPort: UInt16?
@@ -206,7 +213,7 @@ public final class WorkspaceModel {
     guard monitor == nil, state != .stopped else { return }
     monitor = Task { [weak self] in
       while !Task.isCancelled {
-        let active = self?.operationInProgress == true
+        let active = self?.operationInProgress == true || self?.showsGPUMetrics == true
         do { try await Task.sleep(for: .seconds(active ? 1 : 5)) } catch { return }
         guard let self, self.state != .stopped else { return }
         if self.state != .loading && !self.quitting { await self.refresh() }
@@ -261,6 +268,7 @@ public final class WorkspaceModel {
       guard generation == attempt else { return }
       try Task.checkCancellation()
       snapshot = value
+      gpuHistory.ingest(value.gpu)
       endpointEditor?.observeRuntime(value)
       if let job = latestJob, job.action == "remove", job.state == "succeeded",
         let port = job.port, value.servers?.contains(where: { $0.port == port }) == false,
@@ -283,6 +291,7 @@ public final class WorkspaceModel {
       onSnapshot?(value)
     } catch {
       guard generation == attempt else { return }
+      gpuHistory.disconnect()
       state = .failed(
         error is CancellationError ? "Refresh cancelled." : error.localizedDescription)
     }

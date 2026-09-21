@@ -9,6 +9,10 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Distribution builds seal the embedded manager's model overrides too.
+hardened = ["paddock-manager/hardened"]
+
 [dependencies]
 paddock-admin = { path = "../paddock-admin" }
 paddock-manager = { path = "../paddock-manager" }

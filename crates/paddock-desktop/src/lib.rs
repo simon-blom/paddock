@@ -260,6 +260,7 @@ async fn snapshot(app: axum::Router) -> Result<String, String> {
         ("catalog", "/api/models/catalog"),
         ("runners", "/api/runners"),
         ("servers", "/api/servers"),
+        ("gpu", "/api/gpu"),
     ] {
         let response = app
             .clone()
@@ -302,6 +303,76 @@ fn project_for_ui(key: &str, value: &mut serde_json::Value) -> Result<(), String
         Ok(())
     }
     match key {
+        "gpu" => {
+            keep(value, &["available", "ts", "gpus", "reconciliation"])?;
+            if let Some(gpus) = value
+                .get_mut("gpus")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for gpu in gpus {
+                    keep(
+                        gpu,
+                        &[
+                            "index",
+                            "name",
+                            "util_gpu",
+                            "mem_used",
+                            "mem_total",
+                            "power_w",
+                            "temp_c",
+                            "metal",
+                        ],
+                    )?;
+                    if let Some(metal) = gpu.get_mut("metal").filter(|m| !m.is_null()) {
+                        keep(
+                            metal,
+                            &[
+                                "unified_memory_total",
+                                "recommended_working_set",
+                                "thermal_pressure",
+                                "memory_pressure",
+                                "counter_sets",
+                            ],
+                        )?;
+                    }
+                }
+            }
+            if let Some(recon) = value.get_mut("reconciliation").filter(|r| !r.is_null()) {
+                keep(recon, &["ts", "runners"])?;
+                if let Some(runners) = recon
+                    .get_mut("runners")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for runner in runners {
+                        keep(runner, &["port", "pid", "self_mem", "metal", "engine"])?;
+                        if let Some(metal) = runner.get_mut("metal").filter(|m| !m.is_null()) {
+                            keep(
+                                metal,
+                                &[
+                                    "allocated_bytes",
+                                    "completed_commands",
+                                    "gpu_seconds_total",
+                                    "last_command_ms",
+                                ],
+                            )?;
+                        }
+                        if let Some(engine) = runner.get_mut("engine").filter(|e| !e.is_null()) {
+                            keep(
+                                engine,
+                                &[
+                                    "tok_s",
+                                    "phase",
+                                    "active_slots",
+                                    "kv_used",
+                                    "kv_total",
+                                    "tokens_total",
+                                ],
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
         "servers" => {
             for server in value
                 .as_array_mut()
@@ -706,6 +777,31 @@ pub unsafe extern "C" fn paddock_desktop_close(core: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_projection_keeps_measurements_but_never_unknown_fields() {
+        let mut value = serde_json::json!({
+            "available": true, "ts": 10, "secret": "private-top",
+            "gpus": [{"index": 0, "name": "Apple M5 Max", "secret": "private-device",
+                "metal": {"unified_memory_total": 128, "recommended_working_set": 96,
+                    "thermal_pressure": "fair", "memory_pressure": null,
+                    "counter_sets": ["timestamp"], "secret": "private-hardware"}}],
+            "reconciliation": {"ts": 10, "secret": "private-recon", "runners": [{
+                "port": 11540, "pid": 42, "secret": "private-runner",
+                "engine": {"tok_s": 30.0, "secret": "private-engine"},
+                "metal": {"allocated_bytes": 12, "completed_commands": 30,
+                    "gpu_seconds_total": 0.8, "last_command_ms": 22.0, "secret": "private-metal"}
+            }]}
+        });
+        project_for_ui("gpu", &mut value).unwrap();
+        assert_eq!(value["gpus"][0]["metal"]["thermal_pressure"], "fair");
+        assert!(value["gpus"][0]["metal"]["memory_pressure"].is_null());
+        assert_eq!(value["gpus"][0]["metal"]["counter_sets"][0], "timestamp");
+        assert_eq!(
+            value["reconciliation"]["runners"][0]["metal"]["allocated_bytes"],
+            12
+        );
+        assert!(!value.to_string().contains("private-"));
+    }
     #[test]
     fn stopped_speech_capability_survives_without_exporting_config() {
         let mut servers = serde_json::json!([{

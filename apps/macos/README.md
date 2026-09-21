@@ -6,9 +6,11 @@ server and no access-key prompt. The app embeds the same Rust management core
 the web Studio uses, and starts the Metal runner as a child process when you
 start a model.
 
-This is a development foundation, not a finished product. Downloads, update,
-notarization and distribution are not done, and nothing here is a performance
-claim.
+This is a development foundation, not a finished product. Release tooling is
+described in [the macOS distribution runbook](../../packaging/macos/README.md).
+It is separate from the development build below; a working source build is not
+a notarized or fully qualified release. Automatic in-app updates are not done,
+and nothing here is a performance claim.
 
 ## What is in the bundle
 

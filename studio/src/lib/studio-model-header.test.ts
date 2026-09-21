@@ -5,10 +5,11 @@ import { useModelsStore, type ModelInfo } from '@/stores/models'
 import { useChatStore } from '@/stores/chat'
 import { useRegistryStore } from '@/stores/registry'
 import { studioModelHeader } from './studio-model-header'
-import { speculationBadge } from './model-name'
+import { messageStamp, speculationBadge } from './model-name'
 import fixture from './studio-model-header.fixture.json'
 import webHeader from '../components/layout/AppHeader.vue?raw'
 import webComposer from '../components/chat/Composer.vue?raw'
+import webInstances from '../components/manage/ServersPanel.vue?raw'
 import controller from '../../native-workspace/controller.ts?raw'
 import toolbar from '../../../apps/macos/Sources/PaddockUI/WorkspaceToolbar.swift?raw'
 import composer from '../../../apps/macos/Sources/PaddockUI/StudioComposerView.swift?raw'
@@ -39,7 +40,7 @@ describe('shared web/native model header', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
   it('omits disabled speculation in single and Compare headers, preserving active labels', () => {
-    for (const spec of [undefined, null, '', 'off', 'OFF', ' off ']) expect(speculationBadge(spec)).toBe('')
+    for (const spec of [undefined, null, '', 'off', 'OFF', ' off ', 'false', 'no', 'none', '0', 'disabled', ' DISABLED ']) expect(speculationBadge(spec)).toBe('')
     const models = useModelsStore(), chat = useChatStore()
     models.models[0]!.spec = 'off'
     expect(studioModelHeader().specLabel).toBe('')
@@ -52,6 +53,22 @@ describe('shared web/native model header', () => {
       expect(studioModelHeader().compareLanes[0]!.spec).toBe(active)
     }
     expect(fetch).not.toHaveBeenCalled()
+  })
+  it('filters both live and stopped instance badges and the Compare picker, not only the header', () => {
+    for (const value of ['en.r.spec', 'en.c.spec']) {
+      expect(webInstances).toContain(`v-if="speculationBadge(${value})"`)
+      expect(webInstances).toContain(`{{ speculationBadge(${value}) }}`)
+      expect(webInstances).not.toContain(`{{ ${value} }}`)
+    }
+    expect(webComposer).toContain('v-if="speculationBadge(models.specFor(m.id))"')
+    expect(webComposer).not.toContain('{{ models.specFor(m.id) }}')
+  })
+  it('keeps recorded off out of message badges without substituting the current active mechanism', () => {
+    const run = { model: local.id, spec: 'off' } as NonNullable<Parameters<typeof messageStamp>[0]['run']>
+    expect(messageStamp({ role: 'assistant', model: local.id, run }).spec).toBe('')
+    expect(run.spec).toBe('off') // preserve provenance and explicit settings
+    run.spec = ' MTP+DFlash2 '
+    expect(messageStamp({ role: 'assistant', model: local.id, run }).spec).toBe('MTP+DFlash2')
   })
   it('does not offer locked cloud credentials and restores the same provider pin after unlock', async () => {
     let ready = false
