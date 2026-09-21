@@ -1,13 +1,46 @@
 //! Unified memory accounting. Metal allocations and CPU prefix caches consume
 //! the SAME physical RAM. Never present process-local currentAllocatedSize as
-//! machine-wide GPU usage. Free/purgeable pages are a conservative availability
-//! sample, not a promise that inactive anonymous pages can be reclaimed for free.
+//! machine-wide GPU usage. Availability includes pageable file-backed caches,
+//! not inactive anonymous pages or the uncompressed contents of the compressor.
 use crate::routes::AppState;
 
-// Only the macOS sampler reads it; off-Mac `sample()` is the `None` stub, and
-// an ungated constant is dead code under `-D warnings` there.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const HEADROOM: u64 = 1 << 30;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct MemoryPages {
+    free: u64,
+    speculative: u64,
+    purgeable: u64,
+    file_backed: u64,
+    wired: u64,
+    compressor: u64,
+}
+
+/// An advisory reclaimable-memory estimate, not a guarantee of allocation or
+/// zero-cost reclamation (dirty file pages can require writeback). XNU's
+/// host_statistics64 reports pageable external pages, excluding wired pages;
+/// its speculative file pages also appear in free_count. Count that overlap
+/// once. Never add inactive_count: it includes anonymous application memory.
+/// See Apple's xnu/osfmk/kern/host.c and osfmk/mach/vm_statistics.h.
+#[cfg(any(target_os = "macos", test))]
+fn available_bytes(pages: MemoryPages, page_size: u64, physical: u64) -> u64 {
+    let reclaimable = pages
+        .free
+        .saturating_add(pages.file_backed.saturating_sub(pages.speculative))
+        .saturating_add(pages.purgeable)
+        .saturating_mul(page_size);
+    // Samples can straddle VM transitions. Never count wired/compressor memory
+    // as reclaimable even if individual counters momentarily disagree.
+    let unavailable = pages
+        .wired
+        .saturating_add(pages.compressor)
+        .saturating_mul(page_size);
+    reclaimable
+        .min(physical.saturating_sub(unavailable))
+        .saturating_sub(HEADROOM)
+}
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -71,14 +104,24 @@ pub fn sample() -> Option<Snapshot> {
     if page <= 0 {
         return None;
     }
-    // speculative_count is already included in free_count (Apple's SDK).
-    let available = (u64::from(stats.free_count) + u64::from(stats.purgeable_count)) * page as u64;
+    let available = available_bytes(
+        MemoryPages {
+            free: stats.free_count.into(),
+            speculative: stats.speculative_count.into(),
+            purgeable: stats.purgeable_count.into(),
+            file_backed: stats.external_page_count.into(),
+            wired: stats.wire_count.into(),
+            compressor: stats.compressor_page_count.into(),
+        },
+        page as u64,
+        physical,
+    );
     Some(Snapshot {
         name: device.name().to_string(),
         physical,
         limit: (device.recommendedMaxWorkingSetSize() * 9 / 10)
             .min(physical.saturating_sub(HEADROOM)),
-        available: available.min(physical).saturating_sub(HEADROOM),
+        available,
     })
 }
 
@@ -88,7 +131,7 @@ pub fn sample() -> Option<Snapshot> {
 }
 
 /// Reservations already backed by a live allocation must not be subtracted
-/// from the OS's free-page sample a second time. Reserve only their unused
+/// from the OS's available-memory sample a second time. Reserve only their unused
 /// headroom there, while the fleet ceiling counts the entire commitment.
 pub fn residual(
     snapshot: &Snapshot,
@@ -177,6 +220,94 @@ fn reservation(snapshot: &Snapshot, budget_mib: Option<u64>, baseline_matches: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_checkpoint_cache_does_not_prevent_saved_budget_restart() {
+        // Regression: a 32 GiB saved grant passed a cold start on a 128 GiB
+        // machine, but failed after 16 GiB moved from free to model-file cache.
+        let before = MemoryPages {
+            free: 42,
+            file_backed: 45,
+            ..Default::default()
+        };
+        let after = MemoryPages {
+            free: 26,
+            file_backed: 61,
+            ..Default::default()
+        };
+        let cold = available_bytes(before, 1 << 30, 128 << 30);
+        let warm = available_bytes(after, 1 << 30, 128 << 30);
+        assert_eq!(cold, warm);
+        let s = Snapshot {
+            name: "test".into(),
+            physical: 128 << 30,
+            limit: 97 << 30,
+            available: warm,
+        };
+        assert!(residual(&s, 0, 0, 0) >= 32 << 30);
+        // Cache reclaimability must not allow reselling another runner's
+        // unallocated reservation, or CPU offload-cache reservations.
+        assert!(residual(&s, 64 << 30, 0, 0) < 32 << 30);
+        assert!(residual(&s, 0, 0, 64 << 30) < 32 << 30);
+    }
+
+    #[test]
+    fn speculative_file_pages_are_counted_exactly_once() {
+        let pages = MemoryPages {
+            free: 8,
+            speculative: 4,
+            file_backed: 24,
+            purgeable: 2,
+            ..Default::default()
+        };
+        assert_eq!(available_bytes(pages, 1 << 30, 64 << 30), 29 << 30);
+    }
+
+    #[test]
+    fn anonymous_and_compressed_memory_is_not_available_capacity() {
+        let pages = MemoryPages {
+            free: 2,
+            file_backed: 2,
+            wired: 4,
+            compressor: 8,
+            ..Default::default()
+        };
+        // The rest is anonymous memory, not free just because it is pageable.
+        assert_eq!(available_bytes(pages, 1 << 30, 128 << 30), 3 << 30);
+    }
+
+    #[test]
+    fn inconsistent_samples_saturate_without_spending_os_headroom() {
+        assert_eq!(available_bytes(MemoryPages::default(), 16384, 8 << 30), 0);
+        assert_eq!(
+            available_bytes(
+                MemoryPages {
+                    free: u64::MAX,
+                    file_backed: u64::MAX,
+                    purgeable: u64::MAX,
+                    wired: 4,
+                    compressor: 2,
+                    ..Default::default()
+                },
+                1 << 30,
+                8 << 30,
+            ),
+            1 << 30,
+        );
+        assert_eq!(
+            available_bytes(
+                MemoryPages {
+                    free: 1,
+                    speculative: 10,
+                    file_backed: 4,
+                    ..Default::default()
+                },
+                1 << 30,
+                8 << 30,
+            ),
+            0,
+        );
+    }
     #[test]
     fn reservations_share_ram_without_double_charging_live_gpu_bytes() {
         let s = Snapshot {

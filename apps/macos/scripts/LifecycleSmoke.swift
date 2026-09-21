@@ -23,34 +23,50 @@ struct LifecycleSmoke {
       URL(fileURLWithPath: root).lastPathComponent.hasPrefix("paddock-macos-lifecycle."),
       let port = UInt16(CommandLine.arguments[2]), port >= 1024
     else { throw Failure.message("Use an isolated paddock-macos-lifecycle.* data root, library path and test port.") }
+    let environment = ProcessInfo.processInfo.environment
+    let model = environment["PADDOCK_LIFECYCLE_MODEL"] ?? "qwen3.8-27b"
+    let artifact = environment["PADDOCK_LIFECYCLE_ARTIFACT"] ?? "mlx-4bit"
+    let maxCtx = Int(environment["PADDOCK_LIFECYCLE_CONTEXT"] ?? "4096") ?? 0
+    let maxBatch = Int(environment["PADDOCK_LIFECYCLE_BATCH"] ?? "4") ?? 0
+    let restarts = Int(environment["PADDOCK_LIFECYCLE_RESTARTS"] ?? "3") ?? 0
+    guard maxCtx > 0, maxBatch > 0, (1...20).contains(restarts) else {
+      throw Failure.message("Invalid lifecycle context, batch or restart count.")
+    }
     let library = URL(fileURLWithPath: CommandLine.arguments[1])
     var client = NativeManager(libraryURL: library)
     var ownedPID: UInt32?
     do {
       let initial = try await client.snapshot()
       guard initial.runners.isEmpty, initial.servers?.isEmpty != false,
-        initial.catalog.models.first(where: { $0.id == "qwen3.8-27b" })?.artifacts.first(where: { $0.id == "mlx-4bit" })?.installed == true
-      else { throw Failure.message("Test root must be empty apart from the installed Qwen3.8-27B MLX artifact.") }
+        initial.catalog.models.first(where: { $0.id == model })?.artifacts.first(where: { $0.id == artifact })?.installed == true
+      else { throw Failure.message("Test root must be empty apart from the selected installed artifact and its companions.") }
       let started = try await settle(client, command: .create(CreateEndpointRequest(
-        model: "qwen3.8-27b", artifact: "mlx-4bit", port: port, maxCtx: 4096, maxBatch: 4)))
+        model: model, artifact: artifact, port: port, maxCtx: maxCtx, maxBatch: maxBatch)))
       let live = try runner(started, port: port)
       ownedPID = live.pid
       try await health(port)
       let config = URL(fileURLWithPath: root).appending(path: "servers/\(port).toml")
       let mode = try FileManager.default.attributesOfItem(atPath: config.path)[.posixPermissions] as? NSNumber
       guard mode?.intValue == 0o600 else { throw Failure.message("Endpoint credentials are not owner-only.") }
-      let stopped = try await settle(client, command: .stop(port: port, pid: live.pid))
-      ownedPID = nil
-      guard stopped.runners.isEmpty, stopped.servers?.first?.localOnly == true else {
-        throw Failure.message("Stop did not preserve a local-only saved endpoint.")
+      let savedBudget = try budget(config)
+      for iteration in 1...restarts {
+        guard let pid = ownedPID else { throw Failure.message("Lost the test runner's identity.") }
+        let stopped = try await settle(client, command: .stop(port: port, pid: pid))
+        ownedPID = nil
+        guard stopped.runners.isEmpty, stopped.servers?.first?.localOnly == true else {
+          throw Failure.message("Stop did not preserve a local-only saved endpoint.")
+        }
+        await client.close()
+        client = NativeManager(libraryURL: library)
+        let reopened = try await client.snapshot()
+        guard let saved = reopened.servers?.first(where: { $0.port == port }), let revision = saved.revision,
+          reopened.runners.isEmpty else { throw Failure.message("Saved endpoint did not survive core reopen.") }
+        let restarted = try await settle(client, command: .start(port: port, revision: revision))
+        ownedPID = try runner(restarted, port: port).pid
+        try await health(port)
+        guard try budget(config) == savedBudget else { throw Failure.message("Restart changed the saved memory budget.") }
+        print("PASS: warm-cache restart \(iteration)/\(restarts), saved budget unchanged")
       }
-      await client.close()
-      client = NativeManager(libraryURL: library)
-      let reopened = try await client.snapshot()
-      guard let saved = reopened.servers?.first(where: { $0.port == port }), let revision = saved.revision,
-        reopened.runners.isEmpty else { throw Failure.message("Saved endpoint did not survive core reopen.") }
-      let restarted = try await settle(client, command: .start(port: port, revision: revision))
-      ownedPID = try runner(restarted, port: port).pid
       await client.close()
       try await health(port)
       print("PASS: healthy endpoint survives app-core close")
@@ -67,6 +83,15 @@ struct LifecycleSmoke {
       await client.close()
       throw error
     }
+  }
+
+  static func budget(_ config: URL) throws -> String {
+    // Never print the configuration: it contains the test endpoint's API key.
+    let text = try String(contentsOf: config, encoding: .utf8)
+    guard let value = text.split(separator: "\n").first(where: { $0.hasPrefix("vram_budget = ") }) else {
+      throw Failure.message("Automatic admission did not persist a memory budget.")
+    }
+    return String(value)
   }
 
   static func settle(_ client: NativeManager, command: ModelCommand) async throws -> ManagerSnapshot {
