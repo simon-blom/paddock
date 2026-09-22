@@ -81,6 +81,16 @@ unicode-normalization = "0.1.25"
 cudarc = { version = "0.19.9", default-features = false, features = [
     "std", "driver",
     "cuda-13000", "f16", "fallback-dynamic-loading",
+    # Phase 3 (TP plan): the NCCL bindings for the engine-side communicator.
+    # `nccl` -> `nccl-02030` (NCCL 2.30 ABI). Load-bearing: this is a
+    # COMPILE-time module only. cudarc is built with `fallback-dynamic-loading`,
+    # which emits NO `rustc-link-lib` for nccl - the library is dlopen'd lazily
+    # on the first NCCL call (`culib()`). So a TP=1 process that never calls an
+    # NCCL function never loads libnccl: the "TP=1 performs zero NCCL
+    # initialization" invariant holds at runtime even though the module is
+    # compiled in. Do not switch to `dynamic-linking`/`static-linking` without
+    # re-checking that invariant.
+    "nccl",
 ] }
 half = "2.7.1"
 # KV-offload identity digests + payload integrity (kv_tier). BLAKE3 over sha2
@@ -190,6 +200,7 @@ paddock-models = { path = "crates/paddock-models" }
 paddock-tokenizer = { path = "crates/paddock-tokenizer" }
 paddock-estimator = { path = "crates/paddock-estimator" }
 paddock-engine = { path = "crates/paddock-engine" }
+paddock-dist = { path = "crates/paddock-dist" }
 paddock-forensics = { path = "crates/paddock-forensics" }
 paddock-pdfium = { path = "crates/paddock-pdfium" }
 paddock-kernels = { path = "crates/paddock-kernels" }

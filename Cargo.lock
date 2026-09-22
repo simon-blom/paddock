@@ -2954,6 +2954,7 @@ dependencies = [
  "image",
  "libc",
  "paddock-admin",
+ "paddock-dist",
  "paddock-kernels",
  "paddock-models",
  "paddock-tokenizer",

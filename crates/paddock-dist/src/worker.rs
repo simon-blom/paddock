@@ -167,6 +167,35 @@ fn greet(
 /// execution); today it is a bootstrap skeleton that validates the
 /// coordination plane end to end.
 pub fn work(resolved: &Resolved) -> Result<(), BootstrapError> {
+    let (mut stream, session) = connect_worker(resolved)?;
+    tracing::info!("accepted by coordinator (session {session})");
+
+    // Phase 2 expects exactly one Shutdown after handshake. Execution
+    // messages (and the benchmark's NcclId) have their own consumers.
+    match ControlMessage::from_stream(&mut stream)? {
+        ControlMessage::Shutdown { graceful } => {
+            tracing::info!(
+                "shutdown from coordinator (graceful={graceful}) - worker exiting {}",
+                if graceful { "cleanly" } else { "with error" }
+            );
+            if graceful {
+                Ok(())
+            } else {
+                Err(BootstrapError::Aborted)
+            }
+        }
+        other => Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
+            "worker received unexpected control message {other:?}"
+        )))),
+    }
+}
+
+/// Join as rank 1 and return the existing control connection after Hello /
+/// Welcome. The Phase-3 bench uses it to receive the NCCL ID; the normal
+/// worker retains the same shutdown-only loop until execution integration.
+pub fn connect_worker(
+    resolved: &Resolved,
+) -> Result<(std::net::TcpStream, u64), BootstrapError> {
     let addr = (resolved.master_addr.as_str(), resolved.master_port);
     let who = std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".to_string());
     tracing::info!(
@@ -175,34 +204,9 @@ pub fn work(resolved: &Resolved) -> Result<(), BootstrapError> {
         resolved.master_port,
         resolved.tp_size
     );
-
     let mut stream = connect_with_retry(addr, Duration::from_secs(30))?;
     let session = handshake(&mut stream, resolved.tp_size, &who)?;
-    tracing::info!("accepted by coordinator (session {session})");
-
-    // Phase 2 control loop: wait for Shutdown. A clean frame is the only
-    // expected traffic; read failures are errors.
-    loop {
-        match ControlMessage::from_stream(&mut stream) {
-            Ok(ControlMessage::Shutdown { graceful }) => {
-                tracing::info!(
-                    "shutdown from coordinator (graceful={graceful}) - worker exiting {}",
-                    if graceful { "cleanly" } else { "with error" }
-                );
-                return if graceful {
-                    Ok(())
-                } else {
-                    Err(BootstrapError::Aborted)
-                };
-            }
-            Ok(other) => {
-                return Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
-                    "worker received unexpected control message {other:?}"
-                ))));
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
+    Ok((stream, session))
 }
 
 /// Dial with retry so a worker started in parallel with its coordinator
