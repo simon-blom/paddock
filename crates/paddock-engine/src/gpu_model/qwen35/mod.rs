@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 mod batch;
 mod dflash;
+pub mod ffn_tp;
 mod forward;
 mod load;
 mod multimodal;
