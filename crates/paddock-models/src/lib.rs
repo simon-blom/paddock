@@ -27,6 +27,7 @@ pub mod safetensors;
 pub mod sampling;
 pub mod splash;
 pub mod split;
+pub mod tensor_slice;
 #[cfg(test)]
 pub(crate) mod testutil;
 
