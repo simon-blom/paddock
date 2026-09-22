@@ -5,6 +5,7 @@ use super::*;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::MappedGguf;
+use paddock_models::tensor_slice::{TensorSliceRequest, gguf_shard};
 
 /// Exact host transcode of raw Q4_0 blocks (18 B: f16 d + 16 nibble bytes)
 /// into raw Q8_0 blocks (34 B: f16 d + 32 int8). Same 32-weight granularity,
@@ -233,6 +234,59 @@ impl GpuExecutor {
                 name: name.to_owned(),
                 ty,
             }),
+        }
+    }
+
+    /// Rank-local matrix load: select host blocks before any staging/upload,
+    /// then use the same resident repackers as the whole-tensor loader.
+    /// The caller (Phase 5+) chooses the projection's shard axis; TP=1 keeps
+    /// calling `load_quantw` unchanged. This method does not execute a model.
+    pub fn load_quantw_shard(
+        &self,
+        map: &MappedGguf,
+        name: &str,
+        request: TensorSliceRequest,
+    ) -> Result<QuantW, GpuError> {
+        self.rotated_basis_guard(map, name)?;
+        let (ty, local) = gguf_shard(map, name, request)
+            .map_err(|e| GpuError::Unsupported(e.to_string()))?;
+        let dims = local.dims.to_vec();
+        let bytes = local.bytes.as_ref();
+        match ty {
+            GgmlType::Q8_0 => Ok(QuantW::Q8(self.repack_q8_blocks(bytes, dims)?)),
+            GgmlType::Q4_0 => {
+                if self.has_kquant() && self.has_kquant_q40() && dims[0].is_multiple_of(256) {
+                    Ok(QuantW::Kq(self.repack_kquant_raw(bytes, dims, ty, name)?))
+                } else {
+                    let q8 = q40_to_q8_blocks(bytes);
+                    Ok(QuantW::Q8(self.repack_q8_blocks(&q8, dims)?))
+                }
+            }
+            ty if kq_is_ternary(ty) && !self.has_kquant_ternary() => {
+                Err(GpuError::Unsupported(format!(
+                    "{name} is {ty:?} but the kernel pack has no ternary lanes (slot 625)"
+                )))
+            }
+            ty if kq_is_iq(ty) => {
+                if !self.has_kquant_iq() || !self.has_kquant_iq_dense() {
+                    return Err(GpuError::Unsupported(format!(
+                        "{name} is {ty:?} but the kernel pack has no dense i-quant lanes (slots 577/578)"
+                    )));
+                }
+                self.note_dense_iq();
+                let kq = self.repack_kquant_raw(bytes, dims, ty, name)?;
+                if !kq.dims[0].is_multiple_of(256) {
+                    self.note_dense_iq_flat();
+                }
+                Ok(QuantW::Kq(kq))
+            }
+            ty if kq_params(ty).is_some() => {
+                if !self.has_kquant() {
+                    return Err(GpuError::NoKernel { name: name.to_owned(), ty });
+                }
+                Ok(QuantW::Kq(self.repack_kquant_raw(bytes, dims, ty, name)?))
+            }
+            ty => Err(GpuError::NoKernel { name: name.to_owned(), ty }),
         }
     }
 
