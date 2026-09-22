@@ -1064,6 +1064,11 @@ pub async fn run(
             tracing::warn!("shutdown: connections still open after 10 s - proceeding");
         }
     }
+    // TP: release the worker first, so both ranks free device memory in
+    // parallel instead of the worker outliving the coordinator (a rank-1
+    // context dying late stalls the next CUDA start on its card, same as the
+    // engine-free note below).
+    paddock_dist::worker::broadcast_shutdown(true);
     if let Some(engine) = engine_shutdown {
         tracing::info!("shutdown: draining engine and freeing device memory");
         let clean = engine.shutdown(std::time::Duration::from_secs(30)).await;

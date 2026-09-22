@@ -70,7 +70,12 @@ pub struct Config {
     /// any key the runner doesn't know into a hard spawn failure, so a manager
     /// that writes this needs a runner that accepts it in the same release.
     pub catalog: Option<CatalogRef>,
-    /// Serving device - "cuda", or experimental "metal" on M5 (the CPU
+    /// Tensor-parallel rank/world configuration (Phase 2 of the TP plan).
+    /// Unset = the historical single-process path; existing configs parse
+    /// byte-identically (the key is optional and defaults to unconfigured).
+    #[serde(default)]
+    pub parallel: paddock_dist::config::ParallelConfig,
+    /// Compute device - "cuda", or experimental "metal" on M5 (the CPU
     /// reference arm is gone). Kept a string for the ROCm /
     /// Metal / Vulkan packs to come.
     pub device: String,
@@ -330,6 +335,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             loaded_file: None,
+            parallel: paddock_dist::config::ParallelConfig::default(),
             // All interfaces by default: agents on other
             // machines are the tier-1 workload. The API key + the loopback
             // exemption in auth_mw are what make this safe - network callers
@@ -561,6 +567,21 @@ impl Config {
         if let Some(v) = env_str("PADDOCK_VRAM_BUDGET") {
             self.vram_budget = Some(v.parse().map_err(|_| bad_env("PADDOCK_VRAM_BUDGET", &v))?);
         }
+        // TP rank/world env overlay. Every name below is also in
+        // ENV_SURFACE - hardened builds seal undocumented PADDOCK_*
+        // variables, so an addition here without the registration there is
+        // a setting that silently stops working in the shipped binary.
+        if let Err(e) = self.parallel.merge_env() {
+            return Err(match e {
+                paddock_dist::config::ParallelConfigError::BadInt { field, value } => {
+                    ConfigError::BadEnv { name: field, value }
+                }
+                other => ConfigError::BadEnv {
+                    name: "PADDOCK_TP_*",
+                    value: other.to_string(),
+                },
+            });
+        }
         if let Some(v) = env_str("PADDOCK_MAX_OUTPUT_TOKENS") {
             self.max_tokens = Some(
                 v.parse()
@@ -728,6 +749,11 @@ impl Config {
 pub const ENV_SURFACE: &[&str] = &[
     // --- config surface (mirrors merge_env, same file, edit together) ---
     "PADDOCK_ALIASES",
+    "PADDOCK_TP_MASTER_ADDR",
+    "PADDOCK_TP_MASTER_PORT",
+    "PADDOCK_TP_RANK",
+    "PADDOCK_TP_SIZE",
+    "PADDOCK_TP_WORKER_CHILD",
     "PADDOCK_API_KEY",
     "PADDOCK_CONCURRENCY_LIMIT",
     "PADDOCK_DEVICE",
@@ -783,6 +809,9 @@ pub const ENV_SURFACE: &[&str] = &[
     // --- outside merge_env ---
     // where the box's data lives (paddock_admin::data_root_resolved)
     "PADDOCK_DATA",
+    // TP dev/ops knob: rank 0 skips spawning a local rank-1 child and waits
+    // for an operator- or SSH-started worker (read in startup.rs).
+    "PADDOCK_TP_NO_SPAWN",
 ];
 
 fn env_str(name: &str) -> Option<String> {

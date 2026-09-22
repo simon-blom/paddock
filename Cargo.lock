@@ -2933,6 +2933,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "paddock-dist"
+version = "0.1.8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "paddock-engine"
 version = "0.1.10"
 dependencies = [
@@ -3147,6 +3159,7 @@ dependencies = [
  "minijinja-contrib",
  "paddock-admin",
  "paddock-api",
+ "paddock-dist",
  "paddock-engine",
  "paddock-filemeta",
  "paddock-forensics",

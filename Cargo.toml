@@ -18,6 +18,7 @@ members = [
     "crates/paddock-heif",
     "crates/paddock-websearch",
     "crates/paddock-admin",
+    "crates/paddock-dist",
     "crates/paddock-tls",
     "crates/paddock-forensics",
     "crates/paddock-pdfium",
