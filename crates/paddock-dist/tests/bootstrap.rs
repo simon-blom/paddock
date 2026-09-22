@@ -3,7 +3,7 @@
 //! coordinator/worker handshake tests here over localhost.
 
 use paddock_dist::config::{DEFAULT_MASTER_PORT, ParallelConfig, ParallelConfigError, RankRole};
-use paddock_dist::protocol::{ControlMessage, ProtocolError};
+use paddock_dist::protocol::{ControlMessage, ProtocolError, receive_nccl_id, send_nccl_id};
 use paddock_dist::worker::{BootstrapError, coordinate, shutdown_worker, work};
 use std::io::Write as _;
 use std::time::Duration;
@@ -217,6 +217,24 @@ fn oversized_frame_is_refused_not_read() {
     // Announce a frame larger than the cap without sending the payload.
     client.write_all(&(2u32 << 30).to_le_bytes()).unwrap();
     assert!(t.join().unwrap());
+}
+
+#[test]
+fn nccl_id_roundtrip_and_malformed_length_rejected() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let id = receive_nccl_id(&mut stream).unwrap();
+        assert_eq!(id, [0x9a; 128]);
+        assert!(matches!(receive_nccl_id(&mut stream), Err(ProtocolError::BadNcclId(3))));
+    });
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    send_nccl_id(&mut client, &[0x9a; 128]).unwrap();
+    ControlMessage::NcclId { id: vec![1, 2, 3] }
+        .to_stream(&mut client)
+        .unwrap();
+    t.join().unwrap();
 }
 
 // --- two-role handshake end to end ---------------------------------------

@@ -23,6 +23,7 @@ mod batch_ops;
 mod bf16;
 mod deltanet;
 mod dense_pred;
+pub mod distributed;
 mod error;
 mod fp4;
 mod fp8;

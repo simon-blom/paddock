@@ -34,6 +34,11 @@ rand_core = { workspace = true }
 blake3 = { workspace = true }
 paddock-kernels = { workspace = true }
 paddock-models = { workspace = true }
+# Phase 3 (TP plan): the engine depends on the control plane, never the reverse.
+# `paddock-dist` stays CUDA/NCCL-free; the engine's `gpu::distributed` module is
+# the only place NCCL lives. This dependency exists so the engine can read the
+# resolved rank/world config and (in a later phase) the control channel.
+paddock-dist = { workspace = true }
 libc = "0.2.189"
 symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "alac"] }
 symphonia-adapter-libopus = "0.3.0"

@@ -31,6 +31,29 @@ pub enum ProtocolError {
     Closed,
     #[error("peer rejected this rank: {0}")]
     Rejected(String),
+    #[error("NCCL unique ID must be 128 bytes, got {0}")]
+    BadNcclId(usize),
+}
+
+/// NCCL's fixed-size opaque unique ID, carried only over the bootstrap TCP
+/// connection. This control-plane type has no CUDA or NCCL dependency.
+pub const NCCL_ID_BYTES: usize = 128;
+
+pub fn send_nccl_id(stream: &mut TcpStream, id: &[u8; NCCL_ID_BYTES]) -> Result<(), ProtocolError> {
+    ControlMessage::NcclId { id: id.to_vec() }.to_stream(stream)
+}
+
+pub fn receive_nccl_id(stream: &mut TcpStream) -> Result<[u8; NCCL_ID_BYTES], ProtocolError> {
+    match ControlMessage::from_stream(stream)? {
+        ControlMessage::NcclId { id } => {
+            let len = id.len();
+            id.try_into().map_err(|_| ProtocolError::BadNcclId(len))
+        }
+        ControlMessage::Reject { reason } => Err(ProtocolError::Rejected(reason)),
+        other => Err(ProtocolError::Rejected(format!(
+            "expected NCCL unique ID after handshake, got {other:?}"
+        ))),
+    }
 }
 
 /// A control-plane message. Bootstrap messages only, per the phase scope.
@@ -64,6 +87,18 @@ pub enum ControlMessage {
         /// True when the shutdown is because the peer asked for it, false on
         /// error paths, so the worker knows how to exit (0 vs nonzero).
         graceful: bool,
+    },
+    /// Rank 0 -> rank 1, after the handshake. Carries the NCCL unique ID
+    /// (128 bytes) that both ranks need to initialize their communicators.
+    ///
+    /// Phase 3 (TP plan): this is the ONLY new control message the
+    /// communicator bootstrap needs. The NCCL ID is small (128 bytes) and
+    /// travels over the existing control channel, not the NCCL/RoCE data
+    /// path. Per-batch execution traffic (Prefill/Decode/...) is a later
+    /// phase and does NOT ride this channel.
+    NcclId {
+        /// The 128-byte NCCL unique ID (`ncclUniqueId.internal`).
+        id: Vec<u8>,
     },
 }
 
