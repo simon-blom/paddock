@@ -92,6 +92,22 @@ pub struct Cli {
     /// ("GPU-..." as nvidia-smi prints it; a unique prefix is enough)
     #[arg(long, value_name = "ID")]
     pub gpu: Option<String>,
+    /// Tensor-parallel world size (1 or 2). 2 starts this process as the
+    /// rank-0 coordinator and spawns (or waits for) a rank-1 worker.
+    #[arg(long, value_name = "N")]
+    pub tp_size: Option<usize>,
+    /// This process's tensor-parallel rank (0 = coordinator, 1 = worker).
+    /// Rank 1 starts in worker mode and serves no API of its own; it is
+    /// normally set by the coordinator's spawned child, not by hand.
+    #[arg(long, value_name = "RANK")]
+    pub tp_rank: Option<usize>,
+    /// Rank-0 control-plane address: bind target for rank 0, dial target
+    /// for rank 1 (the other node's IP on the RoCE fabric).
+    #[arg(long, value_name = "ADDR")]
+    pub tp_master_addr: Option<String>,
+    /// Rank-0 control-plane TCP port (default 11560).
+    #[arg(long, value_name = "PORT")]
+    pub tp_master_port: Option<u16>,
     /// Kernel pack path. Only needed by a build that has no kernels of its
     /// own - see --capabilities - and it OVERRIDES built-in kernels when both
     /// exist, which is how a bring-up campaign runs an architecture the
@@ -451,6 +467,20 @@ pub fn resolve(cli: &Cli) -> Result<(Config, Banner), ConfigError> {
     if let Some(g) = &cli.gpu {
         cfg.gpu = Some(g.clone());
     }
+    // TP rank/world: CLI wins over toml/env like every other flag. Parsed
+    // and validated together below the overlay (rank+world must agree).
+    if cli.tp_size.is_some() {
+        cfg.parallel.tp_size = cli.tp_size;
+    }
+    if cli.tp_rank.is_some() {
+        cfg.parallel.rank = cli.tp_rank;
+    }
+    if cli.tp_master_addr.is_some() {
+        cfg.parallel.master_addr = cli.tp_master_addr.clone();
+    }
+    if cli.tp_master_port.is_some() {
+        cfg.parallel.master_port = cli.tp_master_port;
+    }
     if let Some(k) = &cli.kernel_pack {
         cfg.kernel_pack = Some(k.clone());
     }
@@ -617,7 +647,7 @@ pub fn resolve(cli: &Cli) -> Result<(Config, Banner), ConfigError> {
     // silently accept-and-ignore (no-silent-failures principle).
     if cli.tensor_parallel_size.is_some() {
         return Err(crate::config::ConfigError::Unsupported(
-            "--tensor-parallel-size: paddock serves one GPU per process today (multi-GPU              tensor parallelism is not yet supported) - drop the flag",
+            "--tensor-parallel-size: use paddock's own --tp-size 2 (two-node tensor               parallelism over the control plane; one GPU per rank process)",
         ));
     }
     if cli.gpu_memory_utilization.is_some() {
@@ -849,6 +879,51 @@ pub fn run() -> std::process::ExitCode {
         return crate::service::dispatch(action);
     }
 
+    // --- Tensor-parallel worker child (rank 1) ------------------------------
+    //
+    // A coordinator-spawned worker enters here INSTEAD of config resolution:
+    // it serves nothing (no HTTP, no model scan, no banner) and its whole
+    // runtime for this phase is the control loop in paddock_dist::worker.
+    // Startup is env-only (PADDOCK_TP_* set by the coordinator's spawn), so
+    // the child never needs - and never reads - a paddock.toml of its own;
+    // there is no second config file to drift. The env names survive the
+    // hardened seal via ENV_SURFACE (same file, edit together).
+    if paddock_dist::config::ParallelConfig::is_worker_child() {
+        paddock_admin::logging::init(None);
+        let tp = paddock_dist::config::ParallelConfig::from_worker_env(
+            std::env::var("PADDOCK_TP_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            std::env::var("PADDOCK_TP_RANK")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            std::env::var("PADDOCK_TP_MASTER_ADDR").ok(),
+            std::env::var("PADDOCK_TP_MASTER_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+        );
+        // serving_mode = false: this process was spawned as a worker child,
+        // which is the one legitimate way to be rank 1.
+        match tp.resolved(false) {
+            Ok(Some(r)) if r.is_worker() => {
+                return match paddock_dist::worker::work(&r) {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "tensor-parallel worker failed");
+                        std::process::ExitCode::FAILURE
+                    }
+                };
+            }
+            _ => {
+                eprintln!(
+                    "config error: PADDOCK_TP_WORKER_CHILD is set but the rank env is not a \
+                     valid rank-1 worker configuration - refusing to serve as a fallback"
+                );
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     // Resolve before logging starts, because `log_file` is a resolved setting:
     // it can come from the config file as well as `--log-file`, and the old
     // order (subscriber first) is precisely why the flag was inert on a
@@ -881,6 +956,39 @@ pub fn run() -> std::process::ExitCode {
             sealed.len(),
             sealed.join(", ")
         );
+    }
+
+    // --- Tensor-parallel coordinator (rank 0) -------------------------------
+    //
+    // Validate the rank/world pair, then join the worker BEFORE the serving
+    // stack starts: the API must never answer into a half-formed TP pair.
+    // (The worker child took its own branch above and never reaches here.)
+    // `serve` was the historical refusal point for --tensor-parallel-size;
+    // paddock's own --tp-size lands here.
+    let tp = match cfg.parallel.resolved(true) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("config error: tensor-parallel configuration invalid: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if let Some(resolved) = tp.filter(|r| r.tp_size > 1) {
+        // PADDOCK_TP_NO_SPAWN is a dev/ops knob (dev builds only: the
+        // hardened seal removes it) that skips the local child spawn so a
+        // two-node start can wait for an SSH-started worker.
+        let spawn_worker = std::env::var_os("PADDOCK_TP_NO_SPAWN").is_none();
+        match paddock_dist::worker::coordinate_and_store(&resolved, spawn_worker) {
+            Ok(session) => {
+                tracing::info!(
+                    "tensor-parallel bootstrap complete (tp_size={}, session {session})",
+                    resolved.tp_size
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "tensor-parallel bootstrap failed");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
     }
 
     // Publish the output-token default to the Responses request deserializer.
