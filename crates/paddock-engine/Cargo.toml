@@ -23,6 +23,7 @@ hardened = ["paddock-models/hardened"]
 [dependencies]
 tracing = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 cudarc = { workspace = true, optional = true }
 half = { workspace = true }
 tokio = { workspace = true }

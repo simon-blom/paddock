@@ -10,9 +10,11 @@ use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::ops::{gemv_any, read_sections};
+use super::tp_kv::MirroredKv;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::kv_pool::BLOCK_TOKENS;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GqaTpError {
@@ -108,6 +110,9 @@ pub struct GqaTpRank {
     positions: CudaSlice<u32>,
     slots: CudaSlice<u32>,
     axes: CudaSlice<u32>,
+    block_tables: Option<CudaSlice<u32>>,
+    blocks_per_slot: usize,
+    slots_count: usize,
     pos: usize,
     max_ctx: usize,
     dtype: KvDtype,
@@ -230,6 +235,9 @@ impl GqaTpRank {
             positions: e.alloc_u32(1)?,
             slots: e.alloc_u32(1)?,
             axes: e.alloc_u32(4)?,
+            block_tables: None,
+            blocks_per_slot: 0,
+            slots_count: 1,
             pos: 0,
             max_ctx,
             dtype,
@@ -239,6 +247,49 @@ impl GqaTpRank {
             yarn,
             sections: read_sections(map)?,
         })
+    }
+    /// Isolated paged mode: the caller owns mirrored logical tables; each rank
+    /// allocates only its local K/V head payload for the same physical block IDs.
+    pub fn load_paged<C: Communicator>(
+        e: &GpuExecutor,
+        map: &MappedGguf,
+        layer: usize,
+        group: &C,
+        max_ctx: usize,
+        dtype: KvDtype,
+        blocks: u32,
+        slots: usize,
+    ) -> Result<Self, GqaTpError> {
+        let bps = max_ctx.div_ceil(BLOCK_TOKENS);
+        if blocks == 0
+            || slots == 0
+            || bps == 0
+            || bps.checked_mul(slots).is_none_or(|n| n > u32::MAX as usize)
+        {
+            return Err(GqaTpError::Shape("invalid paged KV capacity".into()));
+        }
+        let mut rank = Self::load(e, map, layer, group, max_ctx, dtype)?;
+        let bytes = rank
+            .geometry
+            .kv_bytes(
+                (blocks as usize)
+                    .checked_mul(BLOCK_TOKENS)
+                    .ok_or_else(|| GqaTpError::Shape("paged KV size overflow".into()))?,
+                dtype,
+            )
+            .ok_or_else(|| GqaTpError::Shape("paged KV size overflow".into()))?;
+        rank.kc = e.alloc_u8(bytes)?;
+        rank.vc = e.alloc_u8(bytes)?;
+        rank.block_tables = Some(e.alloc_u32(bps * slots)?);
+        rank.blocks_per_slot = bps;
+        rank.slots_count = slots;
+        Ok(rank)
+    }
+    /// Bytes charged to each rank for one physical block across this GQA layer.
+    pub fn local_block_bytes(&self) -> Option<usize> {
+        self.geometry
+            .kv_bytes(BLOCK_TOKENS, self.dtype)?
+            .checked_mul(2)
     }
     pub fn position(&self) -> usize {
         self.pos
@@ -256,11 +307,49 @@ impl GqaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
+        if self.block_tables.is_some() {
+            return Err(GqaTpError::Shape("use forward_paged for paged KV".into()));
+        }
+        self.forward_at(e, group, input, 0, self.pos, None)
+    }
+
+    /// Run one rank-0-authorized logical slot/position through paged GPU KV.
+    /// Validate the entire read prefix against the mirrored live block pool.
+    pub fn forward_paged<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        input: &CudaSlice<f32>,
+        slot: usize,
+        position: usize,
+        logical: &MirroredKv,
+    ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
+        if self.block_tables.is_none() {
+            return Err(GqaTpError::Shape("not a paged GQA rank".into()));
+        }
+        let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
+        let blocks = u32::try_from(self.kc.len() / stride)
+            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
+        let table = logical
+            .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
+            .map_err(|e| GqaTpError::Shape(e.into()))?;
+        self.forward_at(e, group, input, slot, position, Some(&table))
+    }
+
+    fn forward_at<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        input: &CudaSlice<f32>,
+        slot: usize,
+        position: usize,
+        table: Option<&[u32]>,
+    ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
             || input.len() != self.geometry.width
             || input.context().cu_ctx() != e.stream.context().cu_ctx()
-            || self.pos >= self.max_ctx
+            || position >= self.max_ctx
         {
             return Err(GqaTpError::Shape(
                 "rank, input or context limit changed".into(),
@@ -268,7 +357,7 @@ impl GqaTpRank {
         }
         let g = self.geometry;
         let pos =
-            u32::try_from(self.pos).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
+            u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
         e.stream
             .memcpy_htod(&[pos], &mut self.positions)
             .map_err(GpuError::from)?;
@@ -276,8 +365,13 @@ impl GqaTpRank {
             .memcpy_htod(&[pos; 4], &mut self.axes)
             .map_err(GpuError::from)?;
         e.stream
-            .memset_zeros(&mut self.slots)
+            .memcpy_htod(&[slot as u32], &mut self.slots)
             .map_err(GpuError::from)?;
+        if let Some(host) = table {
+            e.stream
+                .memcpy_htod(host, self.block_tables.as_mut().expect("paged checked"))
+                .map_err(GpuError::from)?;
+        }
         gemv_any(e, &self.weights[0], input, &mut self.qg)?;
         gemv_any(e, &self.weights[1], input, &mut self.k)?;
         gemv_any(e, &self.weights[2], input, &mut self.v)?;
@@ -325,50 +419,96 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
-        e.kv_append_batch(
-            &self.kn,
-            &mut self.kc,
-            &self.positions,
-            Some(&self.slots),
-            g.kv_dim(),
-            self.max_ctx,
-            1,
-            self.dtype,
-        )?;
-        e.kv_append_batch(
-            &self.v,
-            &mut self.vc,
-            &self.positions,
-            Some(&self.slots),
-            g.kv_dim(),
-            self.max_ctx,
-            1,
-            self.dtype,
-        )?;
-        e.attn_decode_batch(
-            &self.qn,
-            &self.kc,
-            &self.vc,
-            &self.sinks,
-            &mut self.attn,
-            &self.positions,
-            Some(&self.slots),
-            g.local_heads,
-            g.local_kv_heads,
-            g.head_dim,
-            self.max_ctx,
-            g.kv_dim(),
-            0,
-            1,
-            1.0 / (g.head_dim as f32).sqrt(),
-            self.dtype,
-        )?;
+        if let Some(bt) = self.block_tables.as_ref() {
+            e.kv_append_batch_paged(
+                &self.kn,
+                &mut self.kc,
+                &self.positions,
+                Some(&self.slots),
+                bt,
+                self.blocks_per_slot,
+                g.kv_dim(),
+                1,
+                self.dtype,
+            )?;
+            e.kv_append_batch_paged(
+                &self.v,
+                &mut self.vc,
+                &self.positions,
+                Some(&self.slots),
+                bt,
+                self.blocks_per_slot,
+                g.kv_dim(),
+                1,
+                self.dtype,
+            )?;
+            e.attn_decode_batch_paged(
+                &self.qn,
+                &self.kc,
+                &self.vc,
+                &self.sinks,
+                &mut self.attn,
+                &self.positions,
+                Some(&self.slots),
+                bt,
+                self.blocks_per_slot,
+                g.local_heads,
+                g.local_kv_heads,
+                g.head_dim,
+                g.kv_dim(),
+                0,
+                1,
+                1.0 / (g.head_dim as f32).sqrt(),
+                self.dtype,
+            )?;
+        } else {
+            e.kv_append_batch(
+                &self.kn,
+                &mut self.kc,
+                &self.positions,
+                Some(&self.slots),
+                g.kv_dim(),
+                self.max_ctx,
+                1,
+                self.dtype,
+            )?;
+            e.kv_append_batch(
+                &self.v,
+                &mut self.vc,
+                &self.positions,
+                Some(&self.slots),
+                g.kv_dim(),
+                self.max_ctx,
+                1,
+                self.dtype,
+            )?;
+            e.attn_decode_batch(
+                &self.qn,
+                &self.kc,
+                &self.vc,
+                &self.sinks,
+                &mut self.attn,
+                &self.positions,
+                Some(&self.slots),
+                g.local_heads,
+                g.local_kv_heads,
+                g.head_dim,
+                self.max_ctx,
+                g.kv_dim(),
+                0,
+                1,
+                1.0 / (g.head_dim as f32).sqrt(),
+                self.dtype,
+            )?;
+        }
         e.mul_sigmoid(&mut self.attn, &self.gate, g.q_dim())?;
         gemv_any(e, &self.weights[3], &self.attn, &mut self.partial)?;
         group.after_compute(&e.stream)?;
         group.all_reduce(&self.partial, &mut self.reduced)?;
         group.before_compute(&e.stream)?;
-        self.pos += 1;
+        if table.is_none() {
+            self.pos += 1;
+        }
         Ok(&self.reduced)
     }
 }
@@ -385,6 +525,11 @@ mod tests {
                 (12, 2, rank * 2)
             );
             assert_eq!(g.kv_bytes(64, KvDtype::Fp16), Some(64 * 2 * 256 * 2));
+            assert_eq!(
+                g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp16)
+                    .and_then(|n| n.checked_mul(2)),
+                Some(32_768)
+            );
         }
         for (h, kv, rank) in [(24, 3, 0), (23, 4, 0), (24, 4, 2), (0, 4, 0)] {
             assert!(GqaGeometry::new(5120, h, kv, 256, rank).is_err());

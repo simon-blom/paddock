@@ -9,11 +9,53 @@ use paddock_dist::{
 use paddock_engine::{
     gpu::distributed::{NcclCommunicator, create_unique_id},
     gpu::{GpuExecutor, KvDtype, QuantW},
-    gpu_model::qwen35::gqa_tp::GqaTpRank,
+    gpu_model::qwen35::{
+        gqa_tp::GqaTpRank,
+        tp_kv::{Event, MirroredKv, Operation},
+    },
 };
 use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
-use std::{error::Error, path::Path};
+use std::{
+    error::Error,
+    io::{Read, Write},
+    net::TcpStream,
+    path::Path,
+};
+
+// Probe-only length-prefixed event exchange; the production control protocol
+// is deliberately unchanged. Rank 1 never chooses a block/slot lifecycle op.
+fn kv_event(
+    stream: &mut TcpStream,
+    rank: usize,
+    kv: &mut MirroredKv,
+    op: Operation,
+) -> Result<(), Box<dyn Error>> {
+    if rank == 0 {
+        let event = kv.authorize(op)?;
+        let data = serde_json::to_vec(&event)?;
+        if data.len() > 65536 {
+            return Err("KV event too large".into());
+        }
+        stream.write_all(&(data.len() as u32).to_le_bytes())?;
+        stream.write_all(&data)?;
+    } else {
+        let mut size = [0; 4];
+        stream.read_exact(&mut size)?;
+        let n = u32::from_le_bytes(size) as usize;
+        if n > 65536 {
+            return Err("KV event too large".into());
+        }
+        let mut data = vec![0; n];
+        stream.read_exact(&mut data)?;
+        let event: Event = serde_json::from_slice(&data)?;
+        if event.operation != op {
+            return Err("KV operation diverged".into());
+        }
+        kv.mirror(&event)?;
+    }
+    Ok(())
+}
 
 fn gemv(
     e: &GpuExecutor,
@@ -204,6 +246,173 @@ impl Oracle {
         Ok(e.to_host(&out)?)
     }
 }
+fn run_paged(
+    rank: usize,
+    control: &mut TcpStream,
+    e: &GpuExecutor,
+    group: &NcclCommunicator,
+    map: &MappedGguf,
+    layer: usize,
+) -> Result<(), Box<dyn Error>> {
+    let mut tp = GqaTpRank::load_paged(e, map, layer, group, 32, KvDtype::Fp16, 4, 2)?;
+    let mut logical = MirroredKv::new(4, 2, 32)?;
+    let mut serial = if rank == 0 {
+        Some(Oracle::new(e, map, layer, 32, KvDtype::Fp16)?)
+    } else {
+        None
+    };
+    let mut outputs = Vec::new();
+    println!(
+        "rank={rank} paged local_block_bytes={:?} payload_bytes={}",
+        tp.local_block_bytes(),
+        tp.local_kv_bytes()
+    );
+    for position in 0..17 {
+        kv_event(
+            control,
+            rank,
+            &mut logical,
+            Operation::Ensure { slot: 0, position },
+        )?;
+        let host: Vec<f32> = (0..tp.geometry.width)
+            .map(|i| ((i * 31 + position * 7 + 3) % 127) as f32 / 63.0 - 1.0)
+            .collect();
+        let x = e.to_device(&host)?;
+        let expected = if let Some(s) = &mut serial {
+            Some(s.forward(e, &x)?)
+        } else {
+            None
+        };
+        let got = e.to_host(tp.forward_paged(e, group, &x, 0, position, &logical)?)?;
+        if let Some(ref expected) = expected {
+            for (i, (&a, &b)) in got.iter().zip(expected).enumerate() {
+                if !a.is_finite() || (a - b).abs() > 1e-3 + 1e-3 * b.abs() {
+                    return Err(format!(
+                        "paged parity position={position} element={i} tp={a} oracle={b}"
+                    )
+                    .into());
+                }
+            }
+        }
+        outputs.push(got);
+    }
+    // Ensure both ranks have finished using the slot before releasing it.
+    group.stream().synchronize()?;
+    e.synchronize()?;
+    let tokens: Vec<u32> = (0..17).collect();
+    kv_event(
+        control,
+        rank,
+        &mut logical,
+        Operation::Publish {
+            slot: 0,
+            tokens: tokens[..16].to_vec(),
+        },
+    )?;
+    kv_event(control, rank, &mut logical, Operation::Release { slot: 0 })?;
+    kv_event(
+        control,
+        rank,
+        &mut logical,
+        Operation::Reuse { slot: 1, tokens },
+    )?;
+    let snap = logical.snapshot();
+    if snap.tables[1].len() != 1 || snap.refcounts[snap.tables[1][0] as usize] != 2 {
+        return Err("prefix page not shared by cache and slot".into());
+    }
+    kv_event(
+        control,
+        rank,
+        &mut logical,
+        Operation::Ensure {
+            slot: 1,
+            position: 16,
+        },
+    )?;
+    // The full-weight contiguous oracle reconstructs the prefix independently;
+    // the TP path does not re-append the prefix and reads the shared physical page.
+    if let Some(s) = &mut serial {
+        s.reset();
+        for position in 0..16 {
+            let host: Vec<f32> = (0..tp.geometry.width)
+                .map(|i| ((i * 31 + position * 7 + 3) % 127) as f32 / 63.0 - 1.0)
+                .collect();
+            let x = e.to_device(&host)?;
+            s.forward(e, &x)?;
+        }
+    }
+    let position = 16;
+    let host: Vec<f32> = (0..tp.geometry.width)
+        .map(|i| ((i * 31 + position * 7 + 3) % 127) as f32 / 63.0 - 1.0)
+        .collect();
+    let x = e.to_device(&host)?;
+    let expected = if let Some(s) = &mut serial {
+        Some(s.forward(e, &x)?)
+    } else {
+        None
+    };
+    let got = e.to_host(tp.forward_paged(e, group, &x, 1, position, &logical)?)?;
+    if let Some(expected) = expected {
+        for (i, (&a, &b)) in got.iter().zip(&expected).enumerate() {
+            if !a.is_finite() || (a - b).abs() > 1e-3 + 1e-3 * b.abs() {
+                return Err(format!("prefix parity element={i} tp={a} oracle={b}").into());
+            }
+        }
+    }
+    if got != outputs[16] {
+        return Err("prefix reuse not exact replay".into());
+    }
+    group.stream().synchronize()?;
+    e.synchronize()?;
+    kv_event(control, rank, &mut logical, Operation::Release { slot: 1 })?;
+    kv_event(control, rank, &mut logical, Operation::Reset)?;
+    kv_event(control, rank, &mut logical, Operation::Flush)?;
+    if logical.snapshot().free != 4 {
+        return Err("flush did not release all pages".into());
+    }
+    kv_event(
+        control,
+        rank,
+        &mut logical,
+        Operation::Ensure {
+            slot: 0,
+            position: 0,
+        },
+    )?;
+    let host: Vec<f32> = (0..tp.geometry.width)
+        .map(|i| ((i * 31 + 3) % 127) as f32 / 63.0 - 1.0)
+        .collect();
+    let x = e.to_device(&host)?;
+    if let Some(s) = &mut serial {
+        s.reset();
+        let expected = s.forward(e, &x)?;
+        let replay = e.to_host(tp.forward_paged(e, group, &x, 0, 0, &logical)?)?;
+        if replay != outputs[0]
+            || replay
+                .iter()
+                .zip(&expected)
+                .any(|(&a, &b)| !a.is_finite() || (a - b).abs() > 1e-3 + 1e-3 * b.abs())
+        {
+            return Err("flush/reset GPU replay mismatch".into());
+        }
+    } else {
+        let replay = e.to_host(tp.forward_paged(e, group, &x, 0, 0, &logical)?)?;
+        if replay != outputs[0] {
+            return Err("worker flush/reset GPU replay mismatch".into());
+        }
+    }
+    group.stream().synchronize()?;
+    e.synchronize()?;
+    kv_event(control, rank, &mut logical, Operation::Flush)?;
+    println!(
+        "rank={rank} paged GPU parity and prefix reuse PASS checksum={:.6} free={} refcounts={:?}",
+        got.iter().sum::<f32>(),
+        logical.snapshot().free,
+        logical.snapshot().refcounts
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 5 {
@@ -239,6 +448,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         let group = NcclCommunicator::from_resolved(Some(&resolved), e.stream.context(), id)?
             .ok_or("expected NCCL")?;
         let map = MappedGguf::open(Path::new(&args[3]))?;
+        if args.get(7).is_some_and(|s| s == "paged") {
+            run_paged(rank, &mut control, &e, &group, &map, layer)?;
+            group.stream().synchronize()?;
+            e.synchronize()?;
+            return Ok(());
+        }
         let dtype = KvDtype::Fp16;
         let mut tp = GqaTpRank::load(&e, &map, layer, &group, 16, dtype)?;
         let mut serial = if rank == 0 {
