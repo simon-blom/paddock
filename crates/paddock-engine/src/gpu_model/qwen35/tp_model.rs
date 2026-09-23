@@ -5,7 +5,7 @@
 //! state are rank-local per slot; CUDA graphs remain disabled.
 use std::sync::Arc;
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaEvent, CudaSlice};
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::{TokEmbd, embed_any, gemv_any};
@@ -50,8 +50,9 @@ struct TpLayer {
 }
 
 /// One process's rank-local model path for deterministic TP=2 parity.
-/// Inputs are fed one token at a time; CUDA graphs, sampling, speculation,
-/// scheduler concurrency, and offload are deliberately not part of this API.
+/// Inputs are fed one token at a time; CUDA graphs, speculation, scheduler
+/// concurrency, and offload are deliberately not part of this API. The
+/// optional feedback primitive samples rank 0's device-resident logits.
 pub struct Qwen35TpRank {
     exec: Arc<GpuExecutor>,
     rank: usize,
@@ -68,6 +69,11 @@ pub struct Qwen35TpRank {
     x: CudaSlice<f32>,
     xn: CudaSlice<f32>,
     logits: CudaSlice<f32>,
+    sample_params: CudaSlice<u32>,
+    sample_id: CudaSlice<u32>,
+    // Two one-ID planes per slot. The coordinator owns plane reuse/draining;
+    // token and logits scratch are shared and compute-stream ordered.
+    feedback_ids: Vec<[CudaSlice<u32>; 2]>,
 }
 
 impl Qwen35TpRank {
@@ -204,11 +210,17 @@ impl Qwen35TpRank {
                 ffn,
             });
         }
+        let feedback_ids = (0..slots)
+            .map(|_| Ok([exec.alloc_u32(1)?, exec.alloc_u32(1)?]))
+            .collect::<Result<Vec<_>, GpuError>>()?;
         Ok(Self {
             token: exec.alloc_u32(1)?,
             x: exec.alloc(hidden)?,
             xn: exec.alloc(hidden)?,
             logits: exec.alloc(vocab)?,
+            sample_params: exec.alloc_u32(4)?,
+            sample_id: exec.alloc_u32(1)?,
+            feedback_ids,
             exec,
             rank: group.rank(),
             hidden,
@@ -231,6 +243,15 @@ impl Qwen35TpRank {
     }
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+
+    pub fn supports_device_sampling(&self) -> bool {
+        self.rank == 0 && self.exec.has_sample_rows()
+    }
+
+    pub fn synchronize(&self) -> Result<(), Qwen35TpError> {
+        self.exec.synchronize()?;
+        Ok(())
     }
 
     /// Advance one token through the entire backbone and return all logits.
@@ -256,6 +277,41 @@ impl Qwen35TpRank {
     ) -> Result<Vec<f32>, Qwen35TpError> {
         self.forward_token_gpu(group, logical_kv, token, position, slot)?;
         Ok(self.exec.to_host(&self.logits)?)
+    }
+
+    /// Rank-0-only finish: sample the replicated head in device memory and
+    /// transfer one ID, not the full vocabulary. The worker follows the same
+    /// forward but never chooses a token or draws scheduler RNG.
+    pub fn forward_token_sampled_slot<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+        plan: crate::sampler::DevicePlan,
+    ) -> Result<u32, Qwen35TpError> {
+        if self.rank != 0 || !self.exec.has_sample_rows() {
+            return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
+        }
+        let params = tp_sample_params(plan)?;
+        self.exec
+            .stream
+            .memcpy_htod(&params, &mut self.sample_params)
+            .map_err(GpuError::from)?;
+        self.forward_token_gpu(group, logical_kv, token, position, slot)?;
+        self.exec.sample_rows(
+            &self.logits,
+            &self.sample_params,
+            &mut self.sample_id,
+            1,
+            self.vocab,
+        )?;
+        Ok(self
+            .exec
+            .stream
+            .clone_dtoh(&self.sample_id)
+            .map_err(GpuError::from)?[0])
     }
 
     /// Worker-side execution: all collectives and state advance, but no
@@ -288,6 +344,130 @@ impl Qwen35TpRank {
         Ok(())
     }
 
+    /// Rank 0 enqueues a host-token forward and samples into a chosen plane.
+    /// Rank 1 executes the matching step via `forward_token_worker_slot`.
+    /// The completion event does not synchronize the host.
+    pub fn forward_host_to_feedback<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+        plane: usize,
+        plan: crate::sampler::DevicePlan,
+    ) -> Result<CudaEvent, Qwen35TpError> {
+        self.check_feedback(slot, plane, true)?;
+        let params = tp_sample_params(plan)?;
+        self.exec
+            .stream
+            .memcpy_htod(&params, &mut self.sample_params)
+            .map_err(GpuError::from)?;
+        self.forward_token_gpu(group, logical_kv, token, position, slot)?;
+        self.sample_feedback(slot, plane)
+    }
+
+    /// Both ranks call in identical order after rank 0's source plane was
+    /// sampled. NCCL sends that one ID to rank 1; the embedding input is a
+    /// stream-ordered device copy into persistent `token` scratch, not an
+    /// upload/readback. Only rank 0 samples the alternate plane.
+    /// The coordinator must drain/read a plane before reusing it, and must
+    /// authorize matching slot/position/plane parameters on both ranks.
+    pub fn forward_feedback_to_feedback<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        position: usize,
+        source_plane: usize,
+        next_plane: usize,
+        plan: crate::sampler::DevicePlan,
+    ) -> Result<Option<CudaEvent>, Qwen35TpError> {
+        self.check_feedback(slot, source_plane, false)?;
+        check_feedback_plane(self.slots, slot, next_plane)?;
+        if source_plane == next_plane {
+            return Err(Qwen35TpError::Shape(
+                "feedback planes must alternate".into(),
+            ));
+        }
+        if group.rank() != self.rank || group.world_size() != 2 || position >= self.max_ctx {
+            return Err(Qwen35TpError::Shape("rank or position changed".into()));
+        }
+        if self.rank == 0 {
+            let params = tp_sample_params(plan)?;
+            self.exec
+                .stream
+                .memcpy_htod(&params, &mut self.sample_params)
+                .map_err(GpuError::from)?;
+        }
+        group.after_compute(&self.exec.stream)?;
+        group.broadcast(&mut self.feedback_ids[slot][source_plane], 0)?;
+        group.before_compute(&self.exec.stream)?;
+        self.forward_device_feedback(group, logical_kv, position, slot, source_plane)?;
+        if self.rank == 0 {
+            Ok(Some(self.sample_feedback(slot, next_plane)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Poll without blocking; then read via the copy stream once complete.
+    /// Never overwrite the selected plane before the read/drain finishes.
+    pub fn feedback_done(&self, event: &CudaEvent) -> bool {
+        self.exec.event_done(event)
+    }
+
+    pub fn feedback_id_after(
+        &self,
+        event: &CudaEvent,
+        slot: usize,
+        plane: usize,
+    ) -> Result<u32, Qwen35TpError> {
+        self.check_feedback(slot, plane, true)?;
+        Ok(self
+            .exec
+            .to_host_u32_after(event, &self.feedback_ids[slot][plane], 0, 1)?[0])
+    }
+
+    fn check_feedback(
+        &self,
+        slot: usize,
+        plane: usize,
+        sampling: bool,
+    ) -> Result<(), Qwen35TpError> {
+        check_feedback_plane(self.slots, slot, plane)?;
+        if sampling && (self.rank != 0 || !self.exec.has_sample_rows()) {
+            return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
+        }
+        Ok(())
+    }
+
+    fn sample_feedback(&mut self, slot: usize, plane: usize) -> Result<CudaEvent, Qwen35TpError> {
+        self.exec.sample_rows(
+            &self.logits,
+            &self.sample_params,
+            &mut self.feedback_ids[slot][plane],
+            1,
+            self.vocab,
+        )?;
+        Ok(self.exec.record_event()?)
+    }
+
+    fn forward_device_feedback<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        position: usize,
+        slot: usize,
+        plane: usize,
+    ) -> Result<(), Qwen35TpError> {
+        self.exec
+            .stream
+            .memcpy_dtod(&self.feedback_ids[slot][plane], &mut self.token)
+            .map_err(GpuError::from)?;
+        self.forward_token_body(group, logical_kv, position, slot)
+    }
+
     fn forward_token_gpu<C: Communicator>(
         &mut self,
         group: &C,
@@ -307,6 +487,16 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut self.token)
             .map_err(GpuError::from)?;
+        self.forward_token_body(group, logical_kv, position, slot)
+    }
+
+    fn forward_token_body<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        position: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
         embed_any(
             &self.exec,
             &self.tok_embd,
@@ -377,6 +567,32 @@ impl Qwen35TpRank {
     }
 }
 
+fn check_feedback_plane(slots: usize, slot: usize, plane: usize) -> Result<(), Qwen35TpError> {
+    if slot >= slots || plane >= 2 {
+        return Err(Qwen35TpError::Shape(
+            "feedback slot or plane out of range".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn tp_sample_params(
+    plan: crate::sampler::DevicePlan,
+) -> Result<[u32; 4], Qwen35TpError> {
+    use crate::sampler::DevicePlan;
+    match plan {
+        DevicePlan::Greedy => Ok([0, 0, 1, 0]),
+        DevicePlan::Categorical { inv_t, u }
+            if inv_t.is_finite() && inv_t > 0.0 && u.is_finite() && (0.0..1.0).contains(&u) =>
+        {
+            Ok([inv_t.to_bits(), u.to_bits(), 2, 0])
+        }
+        _ => Err(Qwen35TpError::Shape(
+            "unsupported TP device sampling plan".into(),
+        )),
+    }
+}
+
 fn validate_dense_gemv_coverage(
     map: &MappedGguf,
     n_layers: usize,
@@ -423,7 +639,51 @@ fn validate_dense_gemv_coverage(
 
 #[cfg(test)]
 mod tests {
+    use super::{check_feedback_plane, tp_sample_params};
+    use crate::sampler::DevicePlan;
     use paddock_models::ggml_type::GgmlType;
+
+    #[test]
+    fn feedback_slot_planes_are_bounded() {
+        for slot in 0..2 {
+            for plane in 0..2 {
+                assert!(check_feedback_plane(2, slot, plane).is_ok());
+            }
+        }
+        assert!(check_feedback_plane(2, 2, 0).is_err());
+        assert!(check_feedback_plane(1, 0, 2).is_err());
+    }
+
+    #[test]
+    fn tp_device_sampler_packs_only_supported_plans() {
+        assert_eq!(tp_sample_params(DevicePlan::Greedy).unwrap(), [0, 0, 1, 0]);
+        assert_eq!(
+            tp_sample_params(DevicePlan::Categorical {
+                inv_t: 2.0,
+                u: 0.25
+            })
+            .unwrap(),
+            [2.0f32.to_bits(), 0.25f32.to_bits(), 2, 0]
+        );
+        assert!(
+            tp_sample_params(DevicePlan::Categorical {
+                inv_t: f32::NAN,
+                u: 0.5
+            })
+            .is_err()
+        );
+        assert!(tp_sample_params(DevicePlan::Categorical { inv_t: 1.0, u: 1.0 }).is_err());
+        assert!(
+            tp_sample_params(DevicePlan::TruncCat {
+                inv_t: 1.0,
+                u: 0.5,
+                k: 10,
+                top_p: 0.9,
+                min_p: 0.0
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn mixed_quant_types_have_repack_coverage() {

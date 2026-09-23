@@ -2387,6 +2387,18 @@ mod cohort_grace_tests {
     }
 }
 
+// The TP pipe has fixed KV capacity, including its dead-but-still-running
+// dummy members. A lookahead tick at the limit must drain before enqueuing.
+fn pipe_lookahead_exhausted(positions: &[u32], next_calls: usize, limit: usize) -> bool {
+    positions.iter().any(|&pos| {
+        pos != 0
+            && (pos as usize)
+                .checked_add(next_calls)
+                .and_then(|n| n.checked_add(1))
+                .is_none_or(|next| next >= limit)
+    })
+}
+
 /// Live-REQUEST floor (slots holding a request, chunking or decoding) for
 /// the two side-stream decode paths - the OVERLAP block (span-only prefill
 /// ticks on the main lane, decoders pumped on the pipe lane) and the
@@ -2747,7 +2759,6 @@ fn run_batched(
     // outright. Short segment => exponential extra-quiet, long segment =>
     // decay - the pipe self-selects into the regimes where it pays.
     let mut pipe_backoff: u32 = 0;
-    let mut pipe_seg_ticks: u32 = 0;
     // overlapped decode-pipe ticks pumped while a span was in flight (2o)
     let mut st_ovl = 0u64;
     let mut st_last = std::time::Instant::now();
@@ -5849,6 +5860,7 @@ fn run_batched(
                     _ => true,
                 })
                 && pipe_headroom(generator)
+                && generator.decode_pipe_context_limit().is_none_or(|limit| !pipe_lookahead_exhausted(&positions, 0, limit))
                 && match generator.decode_pipe_begin(&tokens, &positions, &plans) {
                     Ok(()) => true,
                     Err(e) => {
@@ -5863,6 +5875,7 @@ fn run_batched(
                     }
                 };
             if pipe_begun {
+                let mut pipe_seg_ticks: u32 = 0;
                 // `prev_plans` = plans of the OLDEST in-flight tick - the one
                 // whose ids the next decode_pipe_next/drain call returns.
                 let mut prev_plans = plans;
@@ -5878,15 +5891,22 @@ fn run_batched(
                     // recorded (c32 2321->2039). The overlap twin already
                     // drew trunc-aware; this site was the miss.
                     let mut host_row = false;
+                    let context_limit = generator.decode_pipe_context_limit()
+                        .is_some_and(|limit| pipe_lookahead_exhausted(&positions, pipe_seg_ticks as usize, limit));
+                    // Peek next-tick plans. An arrival, host row, low pool
+                    // headroom or context-limit drain can discard this lookahead;
+                    // consuming its categorical draw before a real enqueue
+                    // would shift that request's seed stream on resume.
                     let next_plans: Vec<RowSample> = slots[..high_water]
-                        .iter_mut()
+                        .iter()
                         .map(|s| match s {
+                            _ if context_limit => RowSample::Hole,
                             None => RowSample::Hole,
                             Some(sl) if sl.constraint.is_none() && sl.logprobs.is_none() => {
                                 match if trunc_pipe_ok {
-                                    sl.sampler.device_plan_trunc()
+                                    sl.sampler.peek_device_plan_trunc()
                                 } else {
-                                    sl.sampler.device_plan()
+                                    sl.sampler.peek_device_plan()
                                 } {
                                     Some(p) => RowSample::Device(p),
                                     None => {
@@ -5953,7 +5973,7 @@ fn run_batched(
                     // continue-gate: drain before the pool could exhaust under
                     // a worst-case tick of block growth (oversubscribed pools)
                     let low_headroom = !pipe_headroom(generator);
-                    if host_row || admit_req.is_some() || low_headroom {
+                    if host_row || admit_req.is_some() || low_headroom || context_limit {
                         if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
                             tracing::info!(
                                 "req-trace: pipe-break host={host_row} arrival={} lowroom={low_headroom} at {}",
@@ -5973,6 +5993,7 @@ fn run_batched(
                         // mixed flow), and the pass must not realloc scratch
                         // (a realloc would drop graphs with queued replays).
                         if !host_row
+                            && generator.supports_overlap()
                             && admit_req.as_ref().is_some_and(|r| {
                                 r.mm_chunks.is_none()
                                     && r.prompt.len() <= overlap_admit_max()
@@ -6061,7 +6082,6 @@ fn run_batched(
                         } else {
                             pipe_backoff /= 2;
                         }
-                        pipe_seg_ticks = 0;
                         match generator.decode_pipe_drain() {
                             Ok(ids) => {
                                 for (k, plan) in prev_plans.iter().enumerate() {
@@ -6109,6 +6129,15 @@ fn run_batched(
                                     if slots[k].is_none() {
                                         died = true;
                                     }
+                                }
+                            }
+                            // The next tick was enqueued speculatively. Its
+                            // draw belongs only to a request surviving the
+                            // previous token; a finished/cancelled member is
+                            // a dummy and must not advance that seed stream.
+                            for (slot, plan) in slots[..high_water].iter_mut().zip(&next_plans) {
+                                if let (Some(slot), RowSample::Device(device)) = (slot, plan) {
+                                    slot.sampler.commit_device_plan(device);
                                 }
                             }
                             prev_plans = next_plans;
@@ -6775,6 +6804,38 @@ mod serial_pipe_tests {
             usize::from(fin == Some(FinishReason::Stop))
         );
         (toks, fin)
+    }
+
+    #[test]
+    fn discarded_pipe_lookahead_does_not_consume_categorical_draw() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            seed: 913,
+            ..SamplingParams::default()
+        };
+        let mut after_drain = Sampler::new(params.clone());
+        let mut eager = Sampler::new(params);
+        let peek = after_drain.peek_device_plan().expect("categorical plan");
+        assert_eq!(peek, eager.device_plan().expect("eager plan"));
+        // Arrival or context exhaustion drained the in-flight tick; the
+        // lookahead was never enqueued, so its uniform must still be next.
+        assert_eq!(after_drain.device_plan(), Some(peek));
+        let next = after_drain.peek_device_plan().expect("next plan");
+        after_drain.commit_device_plan(&next);
+        let _ = eager.device_plan();
+        assert_eq!(after_drain.device_plan(), eager.device_plan());
+    }
+
+    #[test]
+    fn fixed_context_pipe_drains_before_lookahead_even_for_dummy_slots() {
+        assert!(!super::pipe_lookahead_exhausted(&[0, 44], 0, 48));
+        assert!(!super::pipe_lookahead_exhausted(&[0, 44], 2, 48));
+        assert!(super::pipe_lookahead_exhausted(&[0, 44], 3, 48));
+        // Slot 0 may already have completed; its in-flight dummy still
+        // advances until drain, so the live slot cannot mask its limit.
+        assert!(super::pipe_lookahead_exhausted(&[46, 2], 1, 48));
+        assert!(super::pipe_lookahead_exhausted(&[47, 0], 0, 48));
+        assert!(!super::pipe_lookahead_exhausted(&[0, 0], 0, 48));
     }
 
     /// Length finish: token 0 off the prefill logits, then exactly `want`
