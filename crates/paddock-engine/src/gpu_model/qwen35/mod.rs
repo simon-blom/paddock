@@ -32,14 +32,15 @@ use std::sync::Arc;
 mod batch;
 mod dflash;
 pub mod ffn_tp;
-pub mod gqa_tp;
 mod forward;
+pub mod gqa_tp;
 mod load;
 mod multimodal;
 mod ops;
 mod prefix;
 mod rotation;
 mod spec;
+pub mod tp_kv;
 pub mod vision;
 
 pub(crate) use ops::*;
