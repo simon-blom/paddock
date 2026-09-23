@@ -255,6 +255,8 @@ pub struct DeltaTpRank {
     norm: CudaSlice<f32>,
     recurrent: CudaSlice<f32>,
     conv: CudaSlice<f32>,
+    /// Slot 0 lives in recurrent/conv; other slots swap into that pair for a step.
+    slot_states: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     span: Span,
     eps: f32,
     rank: usize,
@@ -359,6 +361,7 @@ impl DeltaTpRank {
             span: Span::new(e, &g)?,
             recurrent: e.alloc(g.recurrent_elements())?,
             conv: e.alloc(g.conv_elements())?,
+            slot_states: Vec::new(),
             conv_weight: f32_select(
                 e,
                 map,
@@ -398,6 +401,59 @@ impl DeltaTpRank {
             .memset_zeros(&mut self.conv)
             .map_err(GpuError::from)?;
         Ok(())
+    }
+    pub fn enable_slots(&mut self, e: &GpuExecutor, slots: usize) -> Result<(), DeltaTpError> {
+        if slots == 0 || !self.slot_states.is_empty() {
+            return Err(DeltaTpError::Shape(
+                "invalid or repeated slot allocation".into(),
+            ));
+        }
+        for _ in 1..slots {
+            let mut recurrent = e.alloc(self.geometry.recurrent_elements())?;
+            let mut conv = e.alloc(self.geometry.conv_elements())?;
+            e.stream
+                .memset_zeros(&mut recurrent)
+                .map_err(GpuError::from)?;
+            e.stream.memset_zeros(&mut conv).map_err(GpuError::from)?;
+            self.slot_states.push((recurrent, conv));
+        }
+        Ok(())
+    }
+    pub fn reset_slot(&mut self, e: &GpuExecutor, slot: usize) -> Result<(), DeltaTpError> {
+        if slot == 0 {
+            self.reset(e)
+        } else {
+            let (recurrent, conv) = self
+                .slot_states
+                .get_mut(slot - 1)
+                .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+            e.stream.memset_zeros(recurrent).map_err(GpuError::from)?;
+            e.stream.memset_zeros(conv).map_err(GpuError::from)?;
+            Ok(())
+        }
+    }
+    pub fn decode_slot<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        input: &CudaSlice<f32>,
+        slot: usize,
+    ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
+        if slot == 0 {
+            return self.decode(e, group, input);
+        }
+        let state = self
+            .slot_states
+            .get_mut(slot - 1)
+            .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+        std::mem::swap(&mut self.recurrent, &mut state.0);
+        std::mem::swap(&mut self.conv, &mut state.1);
+        let result = self.forward(e, group, input, 1).map(|_| ());
+        let state = &mut self.slot_states[slot - 1];
+        std::mem::swap(&mut self.recurrent, &mut state.0);
+        std::mem::swap(&mut self.conv, &mut state.1);
+        result?;
+        Ok(&self.span.reduced)
     }
     pub fn state(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
         (&self.recurrent, &self.conv)

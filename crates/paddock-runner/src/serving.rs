@@ -1142,7 +1142,7 @@ pub fn load_with(
     tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
     if tp.is_some()
-        && (max_batch != 1
+        && (!(1..=2).contains(&max_batch)
             || device != "cuda"
             || mmproj.is_some()
             || mtp.is_some()
@@ -1151,7 +1151,7 @@ pub fn load_with(
     {
         return Err(ServeError::Open(
             path.to_path_buf(),
-            "Phase 9 TP=2 requires serial CUDA text-only Qwen3.8 GGUF without companions".into(),
+            "TP=2 requires up to two CUDA text slots of Qwen3.8 GGUF without companions".into(),
         ));
     }
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
@@ -1662,14 +1662,14 @@ fn build_engine(
     // the factory runs on the engine thread (required for CUDA context binding)
     Engine::spawn(max_batch, move || {
         if let Some(resolved) = tp {
-            if arch != "qwen35" || device != "cuda" || max_batch != 1 || mmproj.is_some()
+            if arch != "qwen35" || device != "cuda" || !(1..=2).contains(&max_batch) || mmproj.is_some()
                 || mtp.is_some() || fp8_native.is_some() || vram_budget.is_some() {
-                return Err("Phase 9 TP=2 requires serial text-only Qwen3.8 CUDA without companions or offload".into());
+                return Err("TP=2 requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
             }
             let pack = pack.as_deref().ok_or("Phase 9 TP=2 requires an explicit CUDA pack")?;
             let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
             let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
-                stream, resolved, &path, pack, gpu, max_ctx,
+                stream, resolved, &path, pack, gpu, max_ctx, max_batch,
             )?;
             return Ok(Box::new(generator) as Box<dyn Generator>);
         }
