@@ -99,6 +99,13 @@ pub trait Generator: Send {
         false
     }
 
+    /// A backend with fixed per-slot KV capacity must drain before a pipe's
+    /// device-driven lookahead would execute at this position. None preserves
+    /// existing backends' own rolling-window/eviction behavior.
+    fn decode_pipe_context_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Post-miss draft-depth floor for the spec round that just ran, when the
     /// backend's drafting regime wants a non-classic value. A block drafter
     /// drafts its whole block in one forward, so depth is nearly free and the

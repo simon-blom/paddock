@@ -104,6 +104,22 @@ pub enum ControlMessage {
         rows: Vec<(usize, u32, usize)>,
         kv_events: Vec<serde_json::Value>,
     },
+    /// Start an ordered device-feedback decode segment with host tokens.
+    TpPipeBegin {
+        sequence: u64,
+        rows: Vec<(usize, u32, usize)>,
+        kv_events: Vec<serde_json::Value>,
+    },
+    /// Next tick consumes rank-0's previous device IDs via NCCL broadcast.
+    TpPipeNext {
+        sequence: u64,
+        rows: Vec<(usize, usize)>,
+        source_plane: usize,
+        next_plane: usize,
+        kv_events: Vec<serde_json::Value>,
+    },
+    /// Fence the final tick on both ranks before slot release or reuse.
+    TpPipeDrain { sequence: u64 },
     /// Release completed/cancelled slots before the next admission.
     TpRelease {
         sequence: u64,

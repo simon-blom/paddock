@@ -3,6 +3,7 @@
 //! ordered live rows and mirrored KV operations. Each row uses eager kernels.
 use std::{io::Read, net::TcpStream, path::Path, sync::Arc, time::Duration};
 
+use cudarc::driver::CudaEvent;
 use paddock_dist::{
     config::Resolved,
     protocol::{ControlMessage, receive_nccl_id, send_nccl_id},
@@ -15,7 +16,7 @@ use super::{
     tp_model::Qwen35TpRank,
 };
 use crate::{
-    generator::{GenError, Generator},
+    generator::{GenError, Generator, RowSample, SampledStep},
     gpu::{
         GpuExecutor, KvDtype,
         distributed::{NcclCommunicator, create_unique_id},
@@ -97,6 +98,30 @@ fn active_rows(
         .collect())
 }
 
+fn validate_sampled_rows(
+    rows: &[(usize, u32, usize)],
+    plans: &[RowSample],
+    width: usize,
+) -> Result<(), String> {
+    if plans.len() != width || rows.iter().any(|&(slot, _, _)| slot >= width) {
+        return Err("TP sampling plan width mismatch".into());
+    }
+    let mut active = vec![false; width];
+    for &(slot, _, _) in rows {
+        active[slot] = true;
+    }
+    for (slot, plan) in plans.iter().enumerate() {
+        match (active[slot], plan) {
+            (false, RowSample::Hole) | (true, RowSample::Host) => {}
+            (true, RowSample::Device(plan)) => {
+                super::tp_model::tp_sample_params(*plan).map_err(|e| e.to_string())?;
+            }
+            _ => return Err("TP sampling plan disagrees with live slots".into()),
+        }
+    }
+    Ok(())
+}
+
 fn logical(max_ctx: usize, slots: usize) -> Result<MirroredKv, String> {
     let blocks = u32::try_from(
         max_ctx
@@ -108,6 +133,13 @@ fn logical(max_ctx: usize, slots: usize) -> Result<MirroredKv, String> {
     MirroredKv::new(blocks, slots, max_ctx).map_err(str::to_owned)
 }
 
+struct PipeFlight {
+    slots: Vec<usize>,
+    width: usize,
+    plane: usize,
+    events: Vec<(usize, CudaEvent)>,
+}
+
 /// Runs on the production engine thread; owns the control stream until drop.
 pub struct TpCoordinator {
     stream: TcpStream,
@@ -117,6 +149,7 @@ pub struct TpCoordinator {
     positions: Vec<usize>,
     occupied: Vec<bool>,
     sequence: u64,
+    pipe: Option<PipeFlight>,
     poisoned: Option<String>,
 }
 
@@ -171,6 +204,7 @@ impl TpCoordinator {
             positions: vec![0; slots],
             occupied: vec![false; slots],
             sequence: 1,
+            pipe: None,
             poisoned: None,
         })
     }
@@ -259,7 +293,239 @@ impl TpCoordinator {
         Ok(last)
     }
 
+    // Validate the entire tick before authorizing any KV mutation or sending
+    // control. Active pipe members keep executing as dummies after completion;
+    // the scheduler ignores their Hole results until the segment drains.
+    fn pipe_plans(
+        slots: &[usize],
+        width: usize,
+        plans: &[RowSample],
+    ) -> Result<Vec<crate::sampler::DevicePlan>, String> {
+        if plans.len() != width || slots.is_empty() {
+            return Err("TP pipe plan width mismatch".into());
+        }
+        let mut selected = Vec::with_capacity(slots.len());
+        for (i, plan) in plans.iter().enumerate() {
+            if slots.contains(&i) {
+                let device = match plan {
+                    RowSample::Device(p) => *p,
+                    RowSample::Hole => crate::sampler::DevicePlan::Greedy,
+                    RowSample::Host => return Err("TP pipe cannot read host logits".into()),
+                };
+                super::tp_model::tp_sample_params(device).map_err(|e| e.to_string())?;
+                selected.push(device);
+            } else if !matches!(plan, RowSample::Hole) {
+                return Err("TP pipe plan disagrees with holes".into());
+            }
+        }
+        Ok(selected)
+    }
+
+    fn pipe_begin(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<(), String> {
+        if self.pipe.is_some() || !self.model.supports_device_sampling() {
+            return Err("TP pipe unavailable or already in flight".into());
+        }
+        let rows = active_rows(tokens, positions, self.positions.len())?;
+        let slots: Vec<_> = rows.iter().map(|row| row.0).collect();
+        // Begin cannot contain a dead member; next ticks can carry dummy holes.
+        validate_sampled_rows(&rows, plans, tokens.len())?;
+        let devices = Self::pipe_plans(&slots, tokens.len(), plans)?;
+        if rows.is_empty()
+            || rows
+                .iter()
+                .any(|&(slot, _, pos)| pos != self.positions[slot] || pos >= self.model.max_ctx())
+        {
+            return Err("TP pipe begin position invalid".into());
+        }
+        let kv_events = rows
+            .iter()
+            .map(|&(slot, _, position)| {
+                self.logical
+                    .authorize(Operation::Ensure { slot, position })
+                    .map_err(str::to_owned)
+                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPipeBegin {
+            sequence: seq,
+            rows: rows.clone(),
+            kv_events,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        let mut events = Vec::with_capacity(rows.len());
+        for (&(slot, token, position), plan) in rows.iter().zip(devices) {
+            let event = self
+                .model
+                .forward_host_to_feedback(
+                    &self.group,
+                    &self.logical,
+                    token,
+                    position,
+                    slot,
+                    0,
+                    plan,
+                )
+                .map_err(|e| e.to_string())?;
+            events.push((slot, event));
+            self.positions[slot] += 1;
+            self.occupied[slot] = true;
+        }
+        self.sequence = seq;
+        self.pipe = Some(PipeFlight {
+            slots,
+            width: tokens.len(),
+            plane: 0,
+            events,
+        });
+        tracing::info!(sequence = seq, "TP decode pipe began");
+        Ok(())
+    }
+
+    fn pipe_next(&mut self, plans: &[RowSample]) -> Result<Vec<u32>, String> {
+        let flight = self.pipe.as_ref().ok_or("TP pipe next without begin")?;
+        let devices = Self::pipe_plans(&flight.slots, flight.width, plans)?;
+        let rows = flight
+            .slots
+            .iter()
+            .map(|&slot| (slot, self.positions[slot]))
+            .collect::<Vec<_>>();
+        if rows.iter().any(|&(_, pos)| pos >= self.model.max_ctx()) {
+            return Err("TP pipe reached context limit; drain before next tick".into());
+        }
+        let source_plane = flight.plane;
+        let next_plane = source_plane ^ 1;
+        let kv_events = rows
+            .iter()
+            .map(|&(slot, position)| {
+                self.logical
+                    .authorize(Operation::Ensure { slot, position })
+                    .map_err(str::to_owned)
+                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPipeNext {
+            sequence: seq,
+            rows: rows.clone(),
+            source_plane,
+            next_plane,
+            kv_events,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        let mut events = Vec::with_capacity(rows.len());
+        for (&(slot, position), plan) in rows.iter().zip(devices) {
+            let event = self
+                .model
+                .forward_feedback_to_feedback(
+                    &self.group,
+                    &self.logical,
+                    slot,
+                    position,
+                    source_plane,
+                    next_plane,
+                    plan,
+                )
+                .map_err(|e| e.to_string())?
+                .ok_or("rank 0 missing feedback event")?;
+            events.push((slot, event));
+            self.positions[slot] += 1;
+        }
+        // Rank 1 has enqueued the next tick before acknowledging the old one.
+        ready(&mut self.stream, self.sequence)?;
+        let old = self.pipe.as_mut().ok_or("TP pipe disappeared")?;
+        let mut ids = vec![0; old.width];
+        for (slot, event) in &old.events {
+            ids[*slot] = self
+                .model
+                .feedback_id_after(event, *slot, source_plane)
+                .map_err(|e| e.to_string())?;
+        }
+        old.events = events;
+        old.plane = next_plane;
+        self.sequence = seq;
+        Ok(ids)
+    }
+
+    fn pipe_drain(&mut self) -> Result<Vec<u32>, String> {
+        let flight = self.pipe.as_ref().ok_or("TP pipe drain without begin")?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPipeDrain { sequence: seq }
+            .to_stream(&mut self.stream)
+            .map_err(|e| e.to_string())?;
+        ready(&mut self.stream, self.sequence)?;
+        ready(&mut self.stream, seq)?;
+        let mut ids = vec![0; flight.width];
+        for (slot, event) in &flight.events {
+            ids[*slot] = self
+                .model
+                .feedback_id_after(event, *slot, flight.plane)
+                .map_err(|e| e.to_string())?;
+        }
+        self.group
+            .stream()
+            .synchronize()
+            .map_err(|e| e.to_string())?;
+        self.model.synchronize().map_err(|e| e.to_string())?;
+        self.sequence = seq;
+        self.pipe = None;
+        tracing::info!(sequence = seq, "TP decode pipe drained");
+        Ok(ids)
+    }
+
+    fn sampled(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<SampledStep, String> {
+        if !self.model.supports_device_sampling() {
+            return Err("TP device sampler unavailable".into());
+        }
+        let rows = active_rows(tokens, positions, self.positions.len())?;
+        validate_sampled_rows(&rows, plans, tokens.len())?;
+        if rows.is_empty() {
+            return Ok(SampledStep {
+                ids: vec![0; tokens.len()],
+                host_rows: Vec::new(),
+            });
+        }
+        self.run_rows_impl(&rows, tokens.len(), Some(plans))
+    }
+
     fn run_rows(&mut self, rows: &[(usize, u32, usize)], width: usize) -> Result<Vec<f32>, String> {
+        let result = self.run_rows_impl(rows, width, None)?;
+        if width == 0 {
+            return Ok(result
+                .host_rows
+                .into_iter()
+                .next()
+                .ok_or("TP missing serial logits")?
+                .1);
+        }
+        let mut logits = vec![0.0; width * self.model.vocab()];
+        for (slot, row) in result.host_rows {
+            logits[slot * self.model.vocab()..(slot + 1) * self.model.vocab()]
+                .copy_from_slice(&row);
+        }
+        Ok(logits)
+    }
+
+    fn run_rows_impl(
+        &mut self,
+        rows: &[(usize, u32, usize)],
+        width: usize,
+        plans: Option<&[RowSample]>,
+    ) -> Result<SampledStep, String> {
         if rows.is_empty()
             || rows.len() > self.positions.len()
             || rows.windows(2).any(|w| w[0].0 >= w[1].0)
@@ -273,6 +539,9 @@ impl TpCoordinator {
             {
                 return Err("TP slot position disagrees with rank-0 plan".into());
             }
+        }
+        if let Some(plans) = plans {
+            validate_sampled_rows(rows, plans, width)?;
         }
         let kv_events = rows
             .iter()
@@ -291,17 +560,33 @@ impl TpCoordinator {
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
         prepared(&mut self.stream, self.sequence + 1)?;
-        let mut logits = vec![0.0; width * self.model.vocab()];
+        let mut step = SampledStep {
+            ids: vec![0; width],
+            host_rows: Vec::new(),
+        };
         for &(slot, token, position) in rows {
-            let row = self
-                .model
-                .forward_token_slot(&self.group, &self.logical, token, position, slot)
-                .map_err(|e| e.to_string())?;
-            if width == 0 {
-                logits = row;
-            } else {
-                logits[slot * self.model.vocab()..(slot + 1) * self.model.vocab()]
-                    .copy_from_slice(&row);
+            match plans.map(|p| p[slot]).unwrap_or(RowSample::Host) {
+                RowSample::Host => {
+                    let row = self
+                        .model
+                        .forward_token_slot(&self.group, &self.logical, token, position, slot)
+                        .map_err(|e| e.to_string())?;
+                    step.host_rows.push((slot, row));
+                }
+                RowSample::Device(plan) => {
+                    step.ids[slot] = self
+                        .model
+                        .forward_token_sampled_slot(
+                            &self.group,
+                            &self.logical,
+                            token,
+                            position,
+                            slot,
+                            plan,
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                RowSample::Hole => return Err("TP live slot was planned as a hole".into()),
             }
         }
         self.sequence += 1;
@@ -310,7 +595,7 @@ impl TpCoordinator {
             self.positions[slot] += 1;
             self.occupied[slot] = true;
         }
-        Ok(logits)
+        Ok(step)
     }
 }
 
@@ -319,16 +604,27 @@ enum Command {
     Step(u32),
     Prefill(usize, Vec<u32>),
     Batch(Vec<u32>, Vec<u32>),
+    BatchSampled(Vec<u32>, Vec<u32>, Vec<RowSample>),
+    PipeBegin(Vec<u32>, Vec<u32>, Vec<RowSample>),
+    PipeNext(Vec<RowSample>),
+    PipeDrain,
     Release(Vec<bool>),
+}
+
+enum Response {
+    Logits(Vec<f32>),
+    Sampled(SampledStep),
+    Ids(Vec<u32>),
 }
 
 /// Send-only proxy on the engine scheduler thread. The NCCL communicator and
 /// CUDA context never leave their owning GPU thread (cudarc Comm is !Send).
 pub struct TpGenerator {
-    commands: std::sync::mpsc::Sender<(Command, std::sync::mpsc::Sender<Result<Vec<f32>, String>>)>,
+    commands: std::sync::mpsc::Sender<(Command, std::sync::mpsc::Sender<Result<Response, String>>)>,
     vocab: usize,
     max_ctx: usize,
     slots: usize,
+    device_sampling: bool,
     poisoned: Option<String>,
 }
 
@@ -344,7 +640,7 @@ impl TpGenerator {
     ) -> Result<Self, String> {
         let (commands, rx) = std::sync::mpsc::channel::<(
             Command,
-            std::sync::mpsc::Sender<Result<Vec<f32>, String>>,
+            std::sync::mpsc::Sender<Result<Response, String>>,
         )>();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let path = path.to_owned();
@@ -362,19 +658,45 @@ impl TpGenerator {
                         }
                     };
                 if ready_tx
-                    .send(Ok((coordinator.model.vocab(), coordinator.model.max_ctx())))
+                    .send(Ok((
+                        coordinator.model.vocab(),
+                        coordinator.model.max_ctx(),
+                        coordinator.model.supports_device_sampling(),
+                    )))
                     .is_err()
                 {
                     return;
                 }
                 for (cmd, reply) in rx {
-                    let result = match cmd {
-                        Command::Reset => coordinator.reset_both().map(|_| Vec::new()),
-                        Command::Step(token) => coordinator.step(token),
-                        Command::Prefill(slot, tokens) => coordinator.prefill(slot, &tokens),
-                        Command::Batch(tokens, positions) => coordinator.batch(&tokens, &positions),
-                        Command::Release(occupied) => {
-                            coordinator.release(&occupied).map(|_| Vec::new())
+                    let result = if coordinator.pipe.is_some()
+                        && !matches!(cmd, Command::PipeNext(_) | Command::PipeDrain)
+                    {
+                        Err("TP pipe must drain before release, reset or forward".into())
+                    } else {
+                        match cmd {
+                            Command::Reset => coordinator
+                                .reset_both()
+                                .map(|_| Response::Logits(Vec::new())),
+                            Command::Step(token) => coordinator.step(token).map(Response::Logits),
+                            Command::Prefill(slot, tokens) => {
+                                coordinator.prefill(slot, &tokens).map(Response::Logits)
+                            }
+                            Command::Batch(tokens, positions) => {
+                                coordinator.batch(&tokens, &positions).map(Response::Logits)
+                            }
+                            Command::BatchSampled(tokens, positions, plans) => coordinator
+                                .sampled(&tokens, &positions, &plans)
+                                .map(Response::Sampled),
+                            Command::PipeBegin(tokens, positions, plans) => coordinator
+                                .pipe_begin(&tokens, &positions, &plans)
+                                .map(|_| Response::Logits(Vec::new())),
+                            Command::PipeNext(plans) => {
+                                coordinator.pipe_next(&plans).map(Response::Ids)
+                            }
+                            Command::PipeDrain => coordinator.pipe_drain().map(Response::Ids),
+                            Command::Release(occupied) => coordinator
+                                .release(&occupied)
+                                .map(|_| Response::Logits(Vec::new())),
                         }
                     };
                     if let Err(e) = &result {
@@ -388,17 +710,18 @@ impl TpGenerator {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (vocab, max_ctx) = ready_rx.recv().map_err(|e| e.to_string())??;
+        let (vocab, max_ctx, device_sampling) = ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Self {
             commands,
             vocab,
             max_ctx,
             slots,
+            device_sampling,
             poisoned: None,
         })
     }
 
-    fn request(&mut self, command: Command) -> Result<Vec<f32>, String> {
+    fn request(&mut self, command: Command) -> Result<Response, String> {
         if let Some(e) = &self.poisoned {
             return Err(e.clone());
         }
@@ -413,6 +736,13 @@ impl TpGenerator {
             self.poisoned = Some(e.clone());
         }
         result
+    }
+
+    fn request_logits(&mut self, command: Command) -> Result<Vec<f32>, String> {
+        match self.request(command)? {
+            Response::Logits(logits) => Ok(logits),
+            _ => Err("TP reply kind mismatch".into()),
+        }
     }
 }
 
@@ -429,21 +759,87 @@ impl Generator for TpGenerator {
         Ok(self.slots)
     }
     fn release_inactive_slots(&mut self, occupied: &[bool]) {
-        let _ = self.request(Command::Release(occupied.to_vec()));
+        // The Generator trait has no error return here. Keep the proxy poisoned
+        // and surface the failure; subsequent forwards must fail rather than
+        // reuse a slot whose worker-side release was not acknowledged.
+        if let Err(e) = self.request(Command::Release(occupied.to_vec())) {
+            tracing::error!(error = %e, "TP slot release failed; rank pair poisoned");
+        }
+    }
+    fn supports_device_sampling(&self) -> bool {
+        self.device_sampling
+    }
+    fn supports_decode_pipe(&self) -> bool {
+        self.device_sampling
+    }
+    fn decode_pipe_context_limit(&self) -> Option<usize> {
+        Some(self.max_ctx)
+    }
+    fn decode_pipe_begin(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<(), GenError> {
+        self.request_logits(Command::PipeBegin(
+            tokens.to_vec(),
+            positions.to_vec(),
+            plans.to_vec(),
+        ))
+        .map(|_| ())
+        .map_err(GenError::Backend)
+    }
+    fn decode_pipe_next(&mut self, plans: &[RowSample]) -> Result<Vec<u32>, GenError> {
+        match self
+            .request(Command::PipeNext(plans.to_vec()))
+            .map_err(GenError::Backend)?
+        {
+            Response::Ids(ids) => Ok(ids),
+            _ => Err(GenError::Backend("TP pipe reply kind mismatch".into())),
+        }
+    }
+    fn decode_pipe_drain(&mut self) -> Result<Vec<u32>, GenError> {
+        match self
+            .request(Command::PipeDrain)
+            .map_err(GenError::Backend)?
+        {
+            Response::Ids(ids) => Ok(ids),
+            _ => Err(GenError::Backend("TP pipe reply kind mismatch".into())),
+        }
     }
     fn forward_prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, GenError> {
-        self.request(Command::Prefill(slot, tokens.to_vec()))
+        self.request_logits(Command::Prefill(slot, tokens.to_vec()))
             .map_err(|e| GenError::Backend(format!("TP rank lost: {e}")))
     }
     fn forward_batch(&mut self, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>, GenError> {
-        self.request(Command::Batch(tokens.to_vec(), positions.to_vec()))
+        self.request_logits(Command::Batch(tokens.to_vec(), positions.to_vec()))
             .map_err(|e| GenError::Backend(format!("TP rank lost: {e}")))
     }
+    fn forward_batch_sampled(
+        &mut self,
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<SampledStep, GenError> {
+        match self
+            .request(Command::BatchSampled(
+                tokens.to_vec(),
+                positions.to_vec(),
+                plans.to_vec(),
+            ))
+            .map_err(|e| GenError::Backend(format!("TP rank lost: {e}")))?
+        {
+            Response::Sampled(step) => Ok(step),
+            _ => Err(GenError::Backend("TP sampled reply kind mismatch".into())),
+        }
+    }
     fn reset(&mut self) {
-        let _ = self.request(Command::Reset);
+        if let Err(e) = self.request(Command::Reset) {
+            tracing::error!(error = %e, "TP reset failed; rank pair poisoned");
+        }
     }
     fn forward(&mut self, token: u32) -> Result<Vec<f32>, GenError> {
-        self.request(Command::Step(token))
+        self.request_logits(Command::Step(token))
             .map_err(|e| GenError::Backend(format!("TP rank lost: {e}")))
     }
     fn vocab(&self) -> usize {
@@ -510,10 +906,14 @@ pub fn run_worker(
             .map_err(|e| e.to_string())?
             .ok_or("TP group absent")?;
         let map = MappedGguf::open(model_path).map_err(|e| e.to_string())?;
-        let mut model = Qwen35TpRank::load_slots(exec, &map, &group, max_ctx, KvDtype::Fp16, slots)
-            .map_err(|e| e.to_string())?;
+        let mut model =
+            Qwen35TpRank::load_slots(exec.clone(), &map, &group, max_ctx, KvDtype::Fp16, slots)
+                .map_err(|e| e.to_string())?;
         let mut logical = logical(max_ctx, slots)?;
         let mut positions = vec![0; slots];
+        let mut pipe_slots: Option<Vec<usize>> = None;
+        let mut pipe_plane = 0usize;
+        let mut pending_pipe: Option<u64> = None;
         let mut sequence = 1;
         ControlMessage::TpReady { sequence }
             .to_stream(&mut stream)
@@ -526,8 +926,16 @@ pub fn run_worker(
             let got = match &msg {
                 ControlMessage::TpReset { sequence, .. }
                 | ControlMessage::TpBatch { sequence, .. }
+                | ControlMessage::TpPipeBegin { sequence, .. }
+                | ControlMessage::TpPipeNext { sequence, .. }
+                | ControlMessage::TpPipeDrain { sequence }
                 | ControlMessage::TpRelease { sequence, .. } => *sequence,
-                ControlMessage::Shutdown { graceful: true } => return Ok(()),
+                ControlMessage::Shutdown { graceful: true } if pipe_slots.is_none() => {
+                    return Ok(());
+                }
+                ControlMessage::Shutdown { graceful: true } => {
+                    return Err("TP pipe must drain before shutdown".into());
+                }
                 ControlMessage::Shutdown { graceful: false } => return Err("rank 0 aborted".into()),
                 other => return Err(format!("unexpected TP command: {other:?}")),
             };
@@ -537,7 +945,114 @@ pub fn run_worker(
                     sequence + 1
                 ));
             }
+            if pipe_slots.is_some()
+                && !matches!(
+                    msg,
+                    ControlMessage::TpPipeNext { .. } | ControlMessage::TpPipeDrain { .. }
+                )
+            {
+                return Err("TP pipe must drain before another command".into());
+            }
             match msg {
+                ControlMessage::TpPipeBegin {
+                    rows, kv_events, ..
+                } => {
+                    if rows.is_empty()
+                        || rows.len() > slots
+                        || rows.len() != kv_events.len()
+                        || rows.windows(2).any(|w| w[0].0 >= w[1].0)
+                    {
+                        return Err("invalid TP pipe begin membership".into());
+                    }
+                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
+                        if slot >= slots || position >= max_ctx || position != positions[slot] {
+                            return Err("TP pipe begin position mismatch".into());
+                        }
+                        let event: Event =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        if event.operation != (Operation::Ensure { slot, position }) {
+                            return Err("TP pipe begin KV event mismatch".into());
+                        }
+                        logical.mirror(&event).map_err(str::to_owned)?;
+                    }
+                    ControlMessage::TpPrepared { sequence: got }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
+                    for &(slot, token, position) in &rows {
+                        model
+                            .forward_token_worker_slot(&group, &logical, token, position, slot)
+                            .map_err(|e| e.to_string())?;
+                        positions[slot] += 1;
+                    }
+                    pipe_slots = Some(rows.iter().map(|r| r.0).collect());
+                    pipe_plane = 0;
+                    pending_pipe = Some(got);
+                }
+                ControlMessage::TpPipeNext {
+                    rows,
+                    source_plane,
+                    next_plane,
+                    kv_events,
+                    ..
+                } => {
+                    let members = pipe_slots.as_ref().ok_or("TP pipe next without begin")?;
+                    if rows.len() != members.len()
+                        || rows.len() != kv_events.len()
+                        || source_plane != pipe_plane
+                        || next_plane != (source_plane ^ 1)
+                    {
+                        return Err("TP pipe next shape or plane mismatch".into());
+                    }
+                    for ((&(slot, position), &member), value) in
+                        rows.iter().zip(members).zip(kv_events)
+                    {
+                        if slot != member || position >= max_ctx || position != positions[slot] {
+                            return Err("TP pipe next position or membership mismatch".into());
+                        }
+                        let event: Event =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        if event.operation != (Operation::Ensure { slot, position }) {
+                            return Err("TP pipe next KV event mismatch".into());
+                        }
+                        logical.mirror(&event).map_err(str::to_owned)?;
+                    }
+                    ControlMessage::TpPrepared { sequence: got }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
+                    for (slot, position) in rows {
+                        model
+                            .forward_feedback_to_feedback(
+                                &group,
+                                &logical,
+                                slot,
+                                position,
+                                source_plane,
+                                next_plane,
+                                crate::sampler::DevicePlan::Greedy,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        positions[slot] += 1;
+                    }
+                    let previous = pending_pipe
+                        .replace(got)
+                        .ok_or("TP pipe missing pending tick")?;
+                    ControlMessage::TpReady { sequence: previous }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
+                    pipe_plane = next_plane;
+                }
+                ControlMessage::TpPipeDrain { .. } => {
+                    if pipe_slots.is_none() {
+                        return Err("TP pipe drain without begin".into());
+                    }
+                    exec.synchronize().map_err(|e| e.to_string())?;
+                    group.stream().synchronize().map_err(|e| e.to_string())?;
+                    pipe_slots = None;
+                    let previous = pending_pipe.take().ok_or("TP pipe missing pending tick")?;
+                    ControlMessage::TpReady { sequence: previous }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
+                }
                 ControlMessage::TpReset { kv_event, .. } => {
                     let event: Event =
                         serde_json::from_value(kv_event).map_err(|e| e.to_string())?;
@@ -609,9 +1124,11 @@ pub fn run_worker(
                 _ => unreachable!("message shape checked above"),
             }
             sequence = got;
-            ControlMessage::TpReady { sequence }
-                .to_stream(&mut stream)
-                .map_err(|e| e.to_string())?;
+            if pending_pipe.is_none() {
+                ControlMessage::TpReady { sequence }
+                    .to_stream(&mut stream)
+                    .map_err(|e| e.to_string())?;
+            }
         }
     })();
     if let Err(ref e) = run {
@@ -642,6 +1159,99 @@ mod tests {
         assert!(active_rows(&[0, 0], &[0, 0], 2).unwrap().is_empty());
         assert!(active_rows(&[1], &[1, 2], 2).is_err());
         assert!(active_rows(&[1, 2, 3], &[1, 2, 3], 2).is_err());
+    }
+
+    #[test]
+    fn sampled_dense_rows_keep_holes_and_host_fallback() {
+        use crate::sampler::DevicePlan;
+        let rows = active_rows(&[11, 22], &[0, 9], 2).unwrap();
+        assert!(
+            validate_sampled_rows(
+                &rows,
+                &[RowSample::Hole, RowSample::Device(DevicePlan::Greedy)],
+                2
+            )
+            .is_ok()
+        );
+        assert!(validate_sampled_rows(&rows, &[RowSample::Hole, RowSample::Host], 2).is_ok());
+        assert!(validate_sampled_rows(&rows, &[RowSample::Host, RowSample::Host], 2).is_err());
+        assert!(validate_sampled_rows(&rows, &[RowSample::Hole, RowSample::Hole], 2).is_err());
+        assert!(validate_sampled_rows(&rows, &[RowSample::Hole], 2).is_err());
+        assert!(
+            validate_sampled_rows(
+                &[(0, 11, 3), (1, 22, 9)],
+                &[
+                    RowSample::Host,
+                    RowSample::Device(DevicePlan::Categorical { inv_t: 2.0, u: 0.5 })
+                ],
+                2
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_sampled_rows(
+                &rows,
+                &[
+                    RowSample::Hole,
+                    RowSample::Device(DevicePlan::TruncCat {
+                        inv_t: 1.0,
+                        u: 0.5,
+                        k: 10,
+                        top_p: 0.9,
+                        min_p: 0.0
+                    })
+                ],
+                2
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pipe_plan_preflight_handles_holes_and_rejects_host() {
+        use crate::sampler::DevicePlan;
+        let d = RowSample::Device(DevicePlan::Greedy);
+        assert_eq!(
+            TpCoordinator::pipe_plans(&[1], 2, &[RowSample::Hole, d])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            TpCoordinator::pipe_plans(&[0, 1], 2, &[RowSample::Hole, d])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(TpCoordinator::pipe_plans(&[1], 2, &[d, d]).is_err());
+        assert!(TpCoordinator::pipe_plans(&[0], 2, &[RowSample::Host, RowSample::Hole]).is_err());
+        assert!(TpCoordinator::pipe_plans(&[0], 2, &[d]).is_err());
+        assert!(TpCoordinator::pipe_plans(&[], 2, &[RowSample::Hole, RowSample::Hole]).is_err());
+    }
+
+    #[test]
+    fn pipe_acks_defer_old_ready_until_next_is_prepared() {
+        let (mut head, mut worker) = sockets();
+        ControlMessage::TpPrepared { sequence: 2 }
+            .to_stream(&mut worker)
+            .unwrap();
+        prepared(&mut head, 2).unwrap();
+        ControlMessage::TpPrepared { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        ControlMessage::TpReady { sequence: 2 }
+            .to_stream(&mut worker)
+            .unwrap();
+        prepared(&mut head, 3).unwrap();
+        ready(&mut head, 2).unwrap();
+        ControlMessage::TpReady { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        ControlMessage::TpReady { sequence: 4 }
+            .to_stream(&mut worker)
+            .unwrap();
+        ready(&mut head, 3).unwrap();
+        ready(&mut head, 4).unwrap();
     }
 
     #[test]
