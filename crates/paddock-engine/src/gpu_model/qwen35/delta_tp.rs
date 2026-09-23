@@ -333,7 +333,7 @@ impl DeltaTpRank {
             ),
         ] {
             let (ty, bytes) = select_matrix(map, &name(part), dims, &indices, rows)?;
-            if !matches!(ty, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K) {
+            if crate::gpu::kq_params(ty).is_none() {
                 return Err(DeltaTpError::Shape(format!(
                     "{part}: unsupported quant type {ty:?}"
                 )));
