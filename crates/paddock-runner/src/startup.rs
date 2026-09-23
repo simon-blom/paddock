@@ -1003,7 +1003,7 @@ pub fn run() -> std::process::ExitCode {
         // Refuse unsupported configurations before joining rank 1: never
         // acknowledge a TP pair and then quietly fall back to TP=1.
         let tp9 = cfg.device == "cuda"
-            && cfg.max_batch == 1
+            && (1..=2).contains(&cfg.max_batch)
             && (cfg.no_spec || cfg.spec.as_deref() == Some("off"))
             && !cfg.kv_offload.enabled
             && !cfg.moe_offload.enabled
@@ -1015,7 +1015,7 @@ pub fn run() -> std::process::ExitCode {
             && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file());
         if !tp9 {
             eprintln!(
-                "Phase 9 TP=2 requires an explicit GGUF file and CUDA pack, cuda, max_batch=1, --no-spec (or spec=off), F16 KV, and no vision/companions/offload"
+                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec (or spec=off), F16 KV, and no vision/companions/offload"
             );
             return std::process::ExitCode::from(2);
         }

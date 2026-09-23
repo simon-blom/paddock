@@ -1,9 +1,8 @@
-//! Eager, batch-one whole-backbone TP=2 path shared by parity and serving.
+//! Eager whole-backbone TP=2 path shared by parity and serving.
 //!
-//! This composes the accepted FFN, GQA/paged-KV and DeltaNet rank-local
-//! primitives. Embeddings, norms and lm_head are replicated; KV and recurrent
-//! state remain rank-local. This is a parity harness seam, not scheduler or
-//! serving integration.
+//! The accepted FFN, GQA/paged-KV and DeltaNet rank-local primitives are
+//! composed with replicated embeddings, norms and lm_head. KV and recurrent
+//! state are rank-local per slot; CUDA graphs remain disabled.
 use std::sync::Arc;
 
 use cudarc::driver::CudaSlice;
@@ -59,6 +58,7 @@ pub struct Qwen35TpRank {
     hidden: usize,
     vocab: usize,
     max_ctx: usize,
+    slots: usize,
     eps: f32,
     tok_embd: TokEmbd,
     layers: Vec<TpLayer>,
@@ -81,6 +81,26 @@ impl Qwen35TpRank {
         max_ctx: usize,
         dtype: KvDtype,
     ) -> Result<Self, Qwen35TpError> {
+        Self::load_slots(exec, map, group, max_ctx, dtype, 1)
+    }
+
+    pub fn load_slots<C: Communicator>(
+        exec: Arc<GpuExecutor>,
+        map: &MappedGguf,
+        group: &C,
+        max_ctx: usize,
+        dtype: KvDtype,
+        slots: usize,
+    ) -> Result<Self, Qwen35TpError> {
+        if slots == 0
+            || slots > 2
+            || max_ctx
+                .div_ceil(crate::kv_pool::BLOCK_TOKENS)
+                .checked_mul(slots)
+                .is_none()
+        {
+            return Err(Qwen35TpError::Shape("unsupported TP slot geometry".into()));
+        }
         if group.world_size() != 2
             || group.rank() >= 2
             || max_ctx == 0
@@ -149,22 +169,31 @@ impl Qwen35TpRank {
         let out_norm = exec.upload(map, "output_norm.weight")?;
         let output = exec.load_quantw(map, "output.weight")?;
         let mut layers = Vec::with_capacity(n_layers);
-        let blocks = u32::try_from(max_ctx.div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS))
-            .map_err(|_| Qwen35TpError::Shape("paged KV block count overflow".into()))?;
+        let blocks = u32::try_from(
+            max_ctx
+                .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
+                .checked_mul(slots)
+                .ok_or_else(|| Qwen35TpError::Shape("paged KV capacity overflow".into()))?,
+        )
+        .map_err(|_| Qwen35TpError::Shape("paged KV block count overflow".into()))?;
         for i in 0..n_layers {
             let prefix = format!("blk.{i}.");
             let attn_norm = exec.upload(map, &format!("{prefix}attn_norm.weight"))?;
             let post_norm = exec.upload(map, &format!("{prefix}post_attention_norm.weight"))?;
             let mixer = if (i + 1) % interval == 0 {
                 TpMixer::Full(
-                    GqaTpRank::load_paged(&exec, map, i, group, max_ctx, dtype, blocks, 1)
+                    GqaTpRank::load_paged(&exec, map, i, group, max_ctx, dtype, blocks, slots)
                         .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
                 )
             } else {
-                TpMixer::Linear(
-                    DeltaTpRank::load(&exec, map, i, group)
-                        .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
-                )
+                TpMixer::Linear({
+                    let mut delta = DeltaTpRank::load(&exec, map, i, group)
+                        .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
+                    if slots > 1 {
+                        delta.enable_slots(&exec, slots)?;
+                    }
+                    delta
+                })
             };
             let ffn = FfnTpRank::load(&exec, map, i, group)
                 .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
@@ -185,6 +214,7 @@ impl Qwen35TpRank {
             hidden,
             vocab,
             max_ctx,
+            slots,
             eps,
             tok_embd,
             layers,
@@ -213,7 +243,18 @@ impl Qwen35TpRank {
         token: u32,
         position: usize,
     ) -> Result<Vec<f32>, Qwen35TpError> {
-        self.forward_token_gpu(group, logical_kv, token, position)?;
+        self.forward_token_slot(group, logical_kv, token, position, 0)
+    }
+
+    pub fn forward_token_slot<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+    ) -> Result<Vec<f32>, Qwen35TpError> {
+        self.forward_token_gpu(group, logical_kv, token, position, slot)?;
         Ok(self.exec.to_host(&self.logits)?)
     }
 
@@ -226,12 +267,23 @@ impl Qwen35TpRank {
         token: u32,
         position: usize,
     ) -> Result<(), Qwen35TpError> {
+        self.forward_token_worker_slot(group, logical_kv, token, position, 0)
+    }
+
+    pub fn forward_token_worker_slot<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
         if self.rank != 1 {
             return Err(Qwen35TpError::Shape(
                 "worker forward requires rank 1".into(),
             ));
         }
-        self.forward_token_gpu(group, logical_kv, token, position)?;
+        self.forward_token_gpu(group, logical_kv, token, position, slot)?;
         self.exec.stream.synchronize().map_err(GpuError::from)?;
         Ok(())
     }
@@ -242,8 +294,13 @@ impl Qwen35TpRank {
         logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
         token: u32,
         position: usize,
+        slot: usize,
     ) -> Result<(), Qwen35TpError> {
-        if group.world_size() != 2 || group.rank() != self.rank || position >= self.max_ctx {
+        if group.world_size() != 2
+            || group.rank() != self.rank
+            || position >= self.max_ctx
+            || slot >= self.slots
+        {
             return Err(Qwen35TpError::Shape("rank or position changed".into()));
         }
         self.exec
@@ -270,9 +327,9 @@ impl Qwen35TpRank {
             )?;
             let mixed = match &mut layer.mixer {
                 TpMixer::Full(gqa) => {
-                    gqa.forward_paged(&self.exec, group, &self.xn, 0, position, logical_kv)?
+                    gqa.forward_paged(&self.exec, group, &self.xn, slot, position, logical_kv)?
                 }
-                TpMixer::Linear(delta) => delta.decode(&self.exec, group, &self.xn)?,
+                TpMixer::Linear(delta) => delta.decode_slot(&self.exec, group, &self.xn, slot)?,
             };
             self.exec.add(&mut self.x, mixed, self.hidden)?;
             self.exec.rmsnorm_batch(
@@ -298,13 +355,23 @@ impl Qwen35TpRank {
         Ok(())
     }
 
+    pub fn reset_slot(&mut self, slot: usize) -> Result<(), Qwen35TpError> {
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("slot out of range".into()));
+        }
+        for layer in &mut self.layers {
+            if let TpMixer::Linear(delta) = &mut layer.mixer {
+                delta.reset_slot(&self.exec, slot)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Clear recurrent state before an exact replay. Paged KV is logically
     /// reset by the harness and overwritten from position zero on the next run.
     pub fn reset(&mut self) -> Result<(), Qwen35TpError> {
-        for layer in &mut self.layers {
-            if let TpMixer::Linear(delta) = &mut layer.mixer {
-                delta.reset(&self.exec)?;
-            }
+        for slot in 0..self.slots {
+            self.reset_slot(slot)?;
         }
         Ok(())
     }

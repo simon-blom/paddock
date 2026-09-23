@@ -96,6 +96,19 @@ pub enum ControlMessage {
         checkpoint_sha256: String,
         pack_blake3: String,
         max_ctx: usize,
+        slots: usize,
+    },
+    /// Rank-0-authorized ordered active rows; holes are omitted.
+    TpBatch {
+        sequence: u64,
+        rows: Vec<(usize, u32, usize)>,
+        kv_events: Vec<serde_json::Value>,
+    },
+    /// Release completed/cancelled slots before the next admission.
+    TpRelease {
+        sequence: u64,
+        slots: Vec<usize>,
+        kv_events: Vec<serde_json::Value>,
     },
     /// Worker has mirrored and validated a step's logical KV operation. Rank 0
     /// must see this before launching any collective for the step.
