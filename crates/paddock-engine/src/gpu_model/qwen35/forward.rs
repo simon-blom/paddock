@@ -1628,6 +1628,39 @@ impl GpuQwen35 {
         self.step(token)
     }
 
+    /// Incremental decode using the same token kernel sequence as `forward_one`
+    /// without graph capture or replay. Intended for eager parity oracles.
+    pub fn forward_one_no_graph(&mut self, token: u32) -> Result<Vec<f32>, GpuModelError> {
+        self.history.push(token);
+        self.ensure_scratch(1)?;
+        self.ensure_decode()?;
+        let exec = self.exec.clone();
+        let ds = self.decode.as_mut().expect("decode");
+        let pos = ds.pos;
+        if pos >= self.max_ctx {
+            return Err(GpuModelError::ContextExceeded {
+                got: pos + 1,
+                max: self.max_ctx,
+            });
+        }
+        exec.stream
+            .memcpy_htod(&[token], &mut ds.d_token)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        exec.stream
+            .memcpy_htod(&[pos as u32], &mut ds.d_pos)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        let mp = ds.mrope_pos as u32;
+        exec.stream
+            .memcpy_htod(&[mp; 4], &mut ds.d_mrope)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        self.record_step()?;
+        let logits = exec.to_host(&self.scratch.as_ref().expect("scratch").d_logits)?;
+        let ds = self.decode.as_mut().expect("decode");
+        ds.pos += 1;
+        ds.mrope_pos += 1;
+        Ok(logits)
+    }
+
     /// True when a `rows`-row pass fits the CURRENT scratch (no realloc) -
     /// the overlapped-admission guard (see `Generator::prefill_scratch_fits`).
     pub fn prefill_scratch_fits(&self, rows: usize) -> bool {

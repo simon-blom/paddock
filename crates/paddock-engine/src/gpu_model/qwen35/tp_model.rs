@@ -1,0 +1,342 @@
+//! Eager, batch-one whole-backbone TP=2 path used to gate model integration.
+//!
+//! This composes the accepted FFN, GQA/paged-KV and DeltaNet rank-local
+//! primitives. Embeddings, norms and lm_head are replicated; KV and recurrent
+//! state remain rank-local. This is a parity harness seam, not scheduler or
+//! serving integration.
+use std::sync::Arc;
+
+use cudarc::driver::CudaSlice;
+use paddock_models::{gguf::Value, mapped::MappedGguf};
+
+use super::{TokEmbd, embed_any, gemv_any};
+use super::{
+    delta_tp::{DeltaTpError, DeltaTpRank},
+    ffn_tp::{FfnTpError, FfnTpRank},
+    gqa_tp::{GqaTpError, GqaTpRank},
+};
+use crate::{
+    gpu::distributed::{CollectiveError, Communicator},
+    gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, QuantW},
+    gpu_model::gpt_oss::GpuModelError,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Qwen35TpError {
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    #[error(transparent)]
+    Model(#[from] GpuModelError),
+    #[error(transparent)]
+    Collective(#[from] CollectiveError),
+    #[error(transparent)]
+    Ffn(#[from] FfnTpError),
+    #[error(transparent)]
+    Gqa(#[from] GqaTpError),
+    #[error(transparent)]
+    Delta(#[from] DeltaTpError),
+    #[error("Qwen3.8 TP integration: {0}")]
+    Shape(String),
+}
+
+enum TpMixer {
+    Full(GqaTpRank),
+    Linear(DeltaTpRank),
+}
+struct TpLayer {
+    attn_norm: DeviceTensor,
+    post_norm: DeviceTensor,
+    mixer: TpMixer,
+    ffn: FfnTpRank,
+}
+
+/// One process's rank-local model path for deterministic TP=2 parity.
+/// Inputs are fed one token at a time; CUDA graphs, sampling, speculation,
+/// scheduler concurrency, and offload are deliberately not part of this API.
+pub struct Qwen35TpRank {
+    exec: Arc<GpuExecutor>,
+    rank: usize,
+    hidden: usize,
+    vocab: usize,
+    max_ctx: usize,
+    eps: f32,
+    tok_embd: TokEmbd,
+    layers: Vec<TpLayer>,
+    out_norm: DeviceTensor,
+    output: QuantW,
+    token: CudaSlice<u32>,
+    x: CudaSlice<f32>,
+    xn: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+}
+
+impl Qwen35TpRank {
+    /// Load the pinned Qwen3.8 dense backbone's rank-local projections and
+    /// replicated embedding/norm/head tensors. The caller must verify model
+    /// identity and initialize NCCL before calling this on either rank.
+    pub fn load<C: Communicator>(
+        exec: Arc<GpuExecutor>,
+        map: &MappedGguf,
+        group: &C,
+        max_ctx: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, Qwen35TpError> {
+        if group.world_size() != 2
+            || group.rank() >= 2
+            || max_ctx == 0
+            || max_ctx > u32::MAX as usize
+        {
+            return Err(Qwen35TpError::Shape(
+                "requires TP=2, rank 0/1 and a nonempty u32 context".into(),
+            ));
+        }
+        let u = |key: &str| -> Result<usize, Qwen35TpError> {
+            map.gguf()
+                .arch_field(key)
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| Qwen35TpError::Shape(format!("missing or invalid {key}")))
+        };
+        let n_all = u("block_count")?;
+        let n_nextn = map
+            .gguf()
+            .arch_field("nextn_predict_layers")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let n_layers = n_all
+            .checked_sub(n_nextn)
+            .ok_or_else(|| Qwen35TpError::Shape("MTP block count exceeds total blocks".into()))?;
+        let hidden = u("embedding_length")?;
+        let interval = u("full_attention_interval")?;
+        let vocab = map
+            .tensor_info("token_embd.weight")
+            .and_then(|t| usize::try_from(t.dims.get(1).copied()?).ok())
+            .ok_or_else(|| Qwen35TpError::Shape("invalid token embedding dimensions".into()))?;
+        let eps = map
+            .gguf()
+            .arch_field("attention.layer_norm_rms_epsilon")
+            .and_then(Value::as_f32)
+            .unwrap_or(1e-6);
+        if n_layers == 0
+            || hidden != 5120
+            || interval == 0
+            || vocab == 0
+            || !eps.is_finite()
+            || eps <= 0.0
+        {
+            return Err(Qwen35TpError::Shape(
+                "unsupported Qwen3.8 backbone metadata".into(),
+            ));
+        }
+        validate_dense_gemv_coverage(map, n_layers, interval)?;
+        let emb_name = "token_embd.weight";
+        let emb_ty = map
+            .tensor_info(emb_name)
+            .ok_or_else(|| Qwen35TpError::Shape("missing token embeddings".into()))?
+            .ggml_type;
+        let tok_embd = if crate::gpu::kq_params(emb_ty).is_some() {
+            TokEmbd::Kq(exec.repack_kquant(map, emb_name)?)
+        } else {
+            let tensor = exec.upload_raw(map, emb_name)?;
+            if tensor.ty != paddock_models::ggml_type::GgmlType::Q8_0 {
+                return Err(Qwen35TpError::Shape(format!(
+                    "unsupported embedding type {:?}",
+                    tensor.ty
+                )));
+            }
+            TokEmbd::Q8(tensor)
+        };
+        let out_norm = exec.upload(map, "output_norm.weight")?;
+        let output = exec.load_quantw(map, "output.weight")?;
+        let mut layers = Vec::with_capacity(n_layers);
+        let blocks = u32::try_from(max_ctx.div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS))
+            .map_err(|_| Qwen35TpError::Shape("paged KV block count overflow".into()))?;
+        for i in 0..n_layers {
+            let prefix = format!("blk.{i}.");
+            let attn_norm = exec.upload(map, &format!("{prefix}attn_norm.weight"))?;
+            let post_norm = exec.upload(map, &format!("{prefix}post_attention_norm.weight"))?;
+            let mixer = if (i + 1) % interval == 0 {
+                TpMixer::Full(
+                    GqaTpRank::load_paged(&exec, map, i, group, max_ctx, dtype, blocks, 1)
+                        .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
+                )
+            } else {
+                TpMixer::Linear(
+                    DeltaTpRank::load(&exec, map, i, group)
+                        .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
+                )
+            };
+            let ffn = FfnTpRank::load(&exec, map, i, group)
+                .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
+            layers.push(TpLayer {
+                attn_norm,
+                post_norm,
+                mixer,
+                ffn,
+            });
+        }
+        Ok(Self {
+            token: exec.alloc_u32(1)?,
+            x: exec.alloc(hidden)?,
+            xn: exec.alloc(hidden)?,
+            logits: exec.alloc(vocab)?,
+            exec,
+            rank: group.rank(),
+            hidden,
+            vocab,
+            max_ctx,
+            eps,
+            tok_embd,
+            layers,
+            out_norm,
+            output,
+        })
+    }
+
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    /// Advance one token through the entire backbone and return all logits.
+    /// `position` is rank-0-authorized and must advance identically on both
+    /// ranks. `logical_kv` is the corresponding mirrored paged block table.
+    pub fn forward_token<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+    ) -> Result<Vec<f32>, Qwen35TpError> {
+        if group.world_size() != 2 || group.rank() != self.rank || position >= self.max_ctx {
+            return Err(Qwen35TpError::Shape("rank or position changed".into()));
+        }
+        self.exec
+            .stream
+            .memcpy_htod(&[token], &mut self.token)
+            .map_err(GpuError::from)?;
+        embed_any(
+            &self.exec,
+            &self.tok_embd,
+            &self.token,
+            &mut self.x,
+            self.hidden,
+            1,
+            None,
+        )?;
+        for layer in &mut self.layers {
+            self.exec.rmsnorm_batch(
+                &self.x,
+                &layer.attn_norm.buf,
+                &mut self.xn,
+                self.hidden,
+                self.eps,
+                1,
+            )?;
+            let mixed = match &mut layer.mixer {
+                TpMixer::Full(gqa) => {
+                    gqa.forward_paged(&self.exec, group, &self.xn, 0, position, logical_kv)?
+                }
+                TpMixer::Linear(delta) => delta.decode(&self.exec, group, &self.xn)?,
+            };
+            self.exec.add(&mut self.x, mixed, self.hidden)?;
+            self.exec.rmsnorm_batch(
+                &self.x,
+                &layer.post_norm.buf,
+                &mut self.xn,
+                self.hidden,
+                self.eps,
+                1,
+            )?;
+            let ffn = layer.ffn.forward(&self.exec, group, &self.xn)?;
+            self.exec.add(&mut self.x, ffn, self.hidden)?;
+        }
+        self.exec.rmsnorm_batch(
+            &self.x,
+            &self.out_norm.buf,
+            &mut self.xn,
+            self.hidden,
+            self.eps,
+            1,
+        )?;
+        gemv_any(&self.exec, &self.output, &self.xn, &mut self.logits)?;
+        Ok(self.exec.to_host(&self.logits)?)
+    }
+
+    /// Clear recurrent state before an exact replay. Paged KV is logically
+    /// reset by the harness and overwritten from position zero on the next run.
+    pub fn reset(&mut self) -> Result<(), Qwen35TpError> {
+        for layer in &mut self.layers {
+            if let TpMixer::Linear(delta) = &mut layer.mixer {
+                delta.reset(&self.exec)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_dense_gemv_coverage(
+    map: &MappedGguf,
+    n_layers: usize,
+    interval: usize,
+) -> Result<(), Qwen35TpError> {
+    use paddock_models::ggml_type::GgmlType;
+
+    for layer in 0..n_layers {
+        let mut parts = vec!["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+        if (layer + 1) % interval == 0 {
+            parts.extend([
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            ]);
+        } else {
+            parts.extend(["attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"]);
+        }
+        for part in parts {
+            let name = format!("blk.{layer}.{part}");
+            let ty = map
+                .tensor_info(&name)
+                .ok_or_else(|| Qwen35TpError::Shape(format!("missing tensor {name}")))?
+                .ggml_type;
+            if ty != GgmlType::Q8_0 && crate::gpu::kq_params(ty).is_none() {
+                return Err(Qwen35TpError::Shape(format!(
+                    "{name}: {ty:?} has no validated quantized repack/dequant dispatch"
+                )));
+            }
+        }
+    }
+    let ty = map
+        .tensor_info("output.weight")
+        .ok_or_else(|| Qwen35TpError::Shape("missing tensor output.weight".into()))?
+        .ggml_type;
+    if ty != GgmlType::Q8_0 && crate::gpu::kq_params(ty).is_none() {
+        return Err(Qwen35TpError::Shape(format!(
+            "output.weight: {ty:?} has no validated quantized repack/dequant dispatch"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use paddock_models::ggml_type::GgmlType;
+
+    #[test]
+    fn mixed_quant_types_have_repack_coverage() {
+        for ty in [
+            GgmlType::Iq4Xs,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq3S,
+            GgmlType::Q3K,
+        ] {
+            assert!(crate::gpu::kq_params(ty).is_some());
+        }
+    }
+}

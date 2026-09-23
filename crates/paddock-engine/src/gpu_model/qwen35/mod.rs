@@ -42,6 +42,8 @@ mod prefix;
 mod rotation;
 mod spec;
 pub mod tp_kv;
+mod tp_model;
+pub use tp_model::{Qwen35TpError, Qwen35TpRank};
 pub mod vision;
 
 pub(crate) use ops::*;

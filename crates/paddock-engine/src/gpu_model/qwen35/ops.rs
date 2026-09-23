@@ -5,8 +5,8 @@ use super::*;
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW, RepackedKQ, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use cudarc::driver::CudaSlice;
-use paddock_models::gguf::Value;
 use paddock_models::mapped::MappedGguf;
+use paddock_models::gguf::Value;
 
 /// Token rows into the residual stream. A rotated-basis file stores the
 /// table's rows rotated, so what the gather returns goes back through the
@@ -30,9 +30,10 @@ pub(super) fn embed_any(
     Ok(())
 }
 
-/// Decode GEMV with per-tensor dispatch: the Q8_0 arm is the existing repacked
-/// GEMV (bit-identical to before the k-quant seam); the k-quant arm is the
-/// stage-1 fused GEMV (exact - f32 products in-kernel).
+/// Decode GEMV with per-tensor dispatch: Q8_0 uses the existing repacked
+/// GEMV; k-quant and i-quant types use the pack's dtype-aware F32 GEMV.
+/// The CUDA launcher handles IQ4_XS directly and routes IQ3_S, IQ4_NL,
+/// Q3_K and other supported i-quant types to its dense F32 GEMV.
 pub(crate) fn gemv_any(
     exec: &GpuExecutor,
     w: &QuantW,

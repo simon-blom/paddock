@@ -4162,3 +4162,81 @@ fn kq_moe_down_mma_e_takes_a_partial_stage() {
         );
     }
 }
+
+/// Phase 8: direct dtype-aware GEMV must agree with the former dequant + F32
+/// GEMM fallback on one dense projection of each mixed type in the pinned GGUF.
+#[test]
+fn qwen38_mixed_dense_direct_gemv_matches_f32_fallback() {
+    let Some(model) = std::env::var_os("PADDOCK_TP_TEST_GGUF") else {
+        common::missing("set PADDOCK_TP_TEST_GGUF for the Qwen3.8-27B mixed-dense gate");
+        return;
+    };
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    assert!(exec.has_kquant() && exec.has_kquant_iq_dense());
+    let map = MappedGguf::open(std::path::Path::new(&model)).expect("pinned GGUF");
+    let parts = [
+        "ffn_gate",
+        "ffn_up",
+        "ffn_down",
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_output",
+        "attn_qkv",
+        "attn_gate",
+        "ssm_out",
+    ];
+    for ty in [
+        GgmlType::Iq4Xs,
+        GgmlType::Iq4Nl,
+        GgmlType::Iq3S,
+        GgmlType::Q3K,
+    ] {
+        let name = map
+            .tensor_infos()
+            .filter(|t| {
+                t.ggml_type == ty
+                    && t.name.starts_with("blk.")
+                    && parts
+                        .iter()
+                        .any(|part| t.name.ends_with(&format!(".{part}.weight")))
+            })
+            .min_by_key(|t| t.element_count())
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| panic!("missing dense {ty:?} tensor in pinned GGUF"));
+        let w = exec
+            .repack_kquant(&map, &name)
+            .expect("repack mixed tensor");
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        let x = exec
+            .to_device(&deterministic_input(in_dim, 42))
+            .expect("input");
+        let mut direct = exec.alloc(out_dim).expect("direct output");
+        exec.kquant_gemv(&w, &x, &mut direct)
+            .expect("dtype-aware GEMV");
+        let direct = exec.to_host(&direct).expect("direct host");
+        let mut dequant = exec.alloc(in_dim * out_dim).expect("F32 fallback scratch");
+        exec.kquant_dequant_rp(&w, &mut dequant)
+            .expect("repacked dequant");
+        let mut fallback = exec.alloc(out_dim).expect("fallback output");
+        exec.gemm_f32(&dequant, in_dim, out_dim, &x, &mut fallback, 1)
+            .expect("F32 fallback GEMM");
+        let fallback = exec.to_host(&fallback).expect("fallback host");
+        let max_abs = direct
+            .iter()
+            .zip(&fallback)
+            .map(|(&a, &b)| {
+                assert!(a.is_finite() && b.is_finite());
+                let delta = (a - b).abs();
+                assert!(
+                    delta <= 1e-3 + 1e-3 * b.abs(),
+                    "{name}: direct={a} fallback={b}"
+                );
+                delta
+            })
+            .fold(0.0_f32, f32::max);
+        eprintln!("{name} {ty:?} [{in_dim}->{out_dim}]: max_abs={max_abs:.8}");
+    }
+}
