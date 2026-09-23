@@ -1,4 +1,4 @@
-//! Eager, batch-one whole-backbone TP=2 path used to gate model integration.
+//! Eager, batch-one whole-backbone TP=2 path shared by parity and serving.
 //!
 //! This composes the accepted FFN, GQA/paged-KV and DeltaNet rank-local
 //! primitives. Embeddings, norms and lm_head are replicated; KV and recurrent
@@ -213,6 +213,36 @@ impl Qwen35TpRank {
         token: u32,
         position: usize,
     ) -> Result<Vec<f32>, Qwen35TpError> {
+        self.forward_token_gpu(group, logical_kv, token, position)?;
+        Ok(self.exec.to_host(&self.logits)?)
+    }
+
+    /// Worker-side execution: all collectives and state advance, but no
+    /// replicated full-vocabulary device-to-host transfer on rank 1.
+    pub fn forward_token_worker<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+    ) -> Result<(), Qwen35TpError> {
+        if self.rank != 1 {
+            return Err(Qwen35TpError::Shape(
+                "worker forward requires rank 1".into(),
+            ));
+        }
+        self.forward_token_gpu(group, logical_kv, token, position)?;
+        self.exec.stream.synchronize().map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    fn forward_token_gpu<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+    ) -> Result<(), Qwen35TpError> {
         if group.world_size() != 2 || group.rank() != self.rank || position >= self.max_ctx {
             return Err(Qwen35TpError::Shape("rank or position changed".into()));
         }
@@ -265,7 +295,7 @@ impl Qwen35TpRank {
             1,
         )?;
         gemv_any(&self.exec, &self.output, &self.xn, &mut self.logits)?;
-        Ok(self.exec.to_host(&self.logits)?)
+        Ok(())
     }
 
     /// Clear recurrent state before an exact replay. Paged KV is logically

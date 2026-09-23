@@ -1527,6 +1527,7 @@ pub fn load(
         fp8_native,
         vram_budget,
         None,
+        None,
     )
 }
 
@@ -1547,6 +1548,7 @@ pub fn load_with(
     fp8_native: Option<&Path>,
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
     load_with_residency(
         id,
@@ -1562,6 +1564,7 @@ pub fn load_with(
         vram_budget,
         max_image_tokens,
         None,
+        tp,
     )
 }
 
@@ -1580,6 +1583,7 @@ pub(crate) fn load_with_residency(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
     // HF-native lane - no GGUF exists in it, so everything (arch, tokenizer,
@@ -1617,6 +1621,12 @@ pub(crate) fn load_with_residency(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
+    if tp.is_some() && arch != "qwen35" {
+        return Err(ServeError::Open(
+            path.to_path_buf(),
+            format!("Phase 9 TP=2 requires Qwen3.8 qwen35 architecture, got {arch}"),
+        ));
+    }
 
     // sidecar-aware: SPM-class GGUFs (paddleocr) carry no merges, so the
     // checkpoint's tokenizer.json next to the weights is the source of truth
@@ -1778,6 +1788,7 @@ pub(crate) fn load_with_residency(
         .token_to_id("<|audio_pad|>")
         .or_else(|| tokenizer.token_to_id("<|audio|>"));
     let tokenizer = Arc::new(tokenizer);
+    let tp_enabled = tp.is_some();
     let engine = build_engine(
         &arch,
         path.to_path_buf(),
@@ -1792,12 +1803,14 @@ pub(crate) fn load_with_residency(
         vram_budget,
         max_image_tokens,
         residency,
+        tp,
     )?;
 
     Ok(ServingModel {
         id,
         spec: SpecReport {
-            heads: arch_has_infile_heads(&arch)
+            heads: !tp_enabled
+                && arch_has_infile_heads(&arch)
                 && (device != "metal"
                     || (matches!(arch.as_str(), "qwen35" | "qwen35moe") && mtp.is_none())),
             drafter: mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned())),
@@ -2043,6 +2056,7 @@ fn load_hf_dir(
         // Embedded MLX towers use their validated checkpoint processor budget.
         None,
         residency,
+        None,
     )?;
 
     Ok(ServingModel {
@@ -2097,6 +2111,7 @@ fn build_engine(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<crate::generation_residency::Handle, ServeError> {
     let (residency, reservation) = if let Some(options) = residency {
         if arch != "diffusion-gemma"
@@ -2159,7 +2174,28 @@ fn build_engine(
             mtp.clone(),
             fp8_native.clone(),
         );
+        let tp = tp.clone();
         Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
+            if let Some(resolved) = tp {
+                if arch != "qwen35"
+                    || device != "cuda"
+                    || max_batch != 1
+                    || mmproj.is_some()
+                    || mtp.is_some()
+                    || fp8_native.is_some()
+                    || vram_budget.is_some()
+                {
+                    return Err("Phase 9 TP=2 requires serial text-only Qwen3.8 CUDA without companions or offload".into());
+                }
+                let pack = pack
+                    .as_deref()
+                    .ok_or("Phase 9 TP=2 requires an explicit CUDA pack")?;
+                let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
+                let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
+                    stream, resolved, &path, pack, gpu, max_ctx,
+                )?;
+                return Ok(Box::new(generator) as Box<dyn Generator>);
+            }
             build_generator(
                 &arch,
                 &path,

@@ -800,6 +800,7 @@ pub async fn run(
                 cfg.vram_budget.map(|mib| mib << 20),
                 cfg.max_image_tokens,
                 resident_options,
+                cfg.parallel.resolved(true)?,
             )?;
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;

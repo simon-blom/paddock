@@ -43,6 +43,7 @@ mod rotation;
 mod spec;
 pub mod tp_kv;
 mod tp_model;
+pub mod tp_serve;
 pub use tp_model::{Qwen35TpError, Qwen35TpRank};
 pub mod vision;
 

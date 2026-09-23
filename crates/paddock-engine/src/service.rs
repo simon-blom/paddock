@@ -1106,6 +1106,13 @@ impl Engine {
                         generator.canvas_width()
                     );
                     (cap, cap > 1)
+                } else if generator.serial_only() {
+                    if max_batch != 1 {
+                        let _ = ready_tx.send(Err("serial-only TP=2 requires max_batch=1".into()));
+                        return;
+                    }
+                    tracing::info!("paddock: Phase 9 TP=2 serial eager scheduler selected");
+                    (1, false)
                 } else if max_batch > 1 {
                     // Width-by-VRAM backstop: models estimate a fitting width
                     // themselves (qwen35's clamp), but if an allocation still
@@ -8020,6 +8027,44 @@ mod error_class_tests {
         assert!(
             matches!(other, crate::gpu::GpuError::Driver(_)),
             "other codes stay Driver(text)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tp_serial_election_tests {
+    use super::*;
+
+    struct SerialOnly;
+    impl Generator for SerialOnly {
+        fn reset(&mut self) {}
+        fn forward(&mut self, _token: u32) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0.0, 1.0])
+        }
+        fn vocab(&self) -> usize {
+            2
+        }
+        fn max_context(&self) -> usize {
+            16
+        }
+        fn serial_only(&self) -> bool {
+            true
+        }
+        fn enable_batch(&mut self, _width: usize) -> Result<usize, GenError> {
+            panic!("serial-only TP must not attempt batch enable")
+        }
+    }
+
+    #[test]
+    fn serial_only_election_is_explicit_and_wide_configs_fail() {
+        let engine = Engine::spawn(1, || Ok(Box::new(SerialOnly))).unwrap();
+        assert!(engine.shutdown(std::time::Duration::from_secs(3)));
+        let failure = Engine::spawn(2, || Ok(Box::new(SerialOnly)));
+        assert!(
+            failure
+                .err()
+                .unwrap()
+                .contains("serial-only TP=2 requires max_batch=1")
         );
     }
 }
