@@ -1118,6 +1118,7 @@ pub fn load(
         fp8_native,
         vram_budget,
         None,
+        None,
     )
 }
 
@@ -1138,7 +1139,21 @@ pub fn load_with(
     fp8_native: Option<&Path>,
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
+    if tp.is_some()
+        && (max_batch != 1
+            || device != "cuda"
+            || mmproj.is_some()
+            || mtp.is_some()
+            || fp8_native.is_some()
+            || path.is_dir())
+    {
+        return Err(ServeError::Open(
+            path.to_path_buf(),
+            "Phase 9 TP=2 requires serial CUDA text-only Qwen3.8 GGUF without companions".into(),
+        ));
+    }
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
     // HF-native lane - no GGUF exists in it, so everything (arch, tokenizer,
     // template, weights) comes from the checkpoint's own files. First family:
@@ -1174,6 +1189,12 @@ pub fn load_with(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
+    if tp.is_some() && arch != "qwen35" {
+        return Err(ServeError::Open(
+            path.to_path_buf(),
+            format!("Phase 9 TP=2 requires Qwen3.8 qwen35 architecture, got {arch}"),
+        ));
+    }
 
     // sidecar-aware: SPM-class GGUFs (paddleocr) carry no merges, so the
     // checkpoint's tokenizer.json next to the weights is the source of truth
@@ -1323,6 +1344,7 @@ pub fn load_with(
         .token_to_id("<|audio_pad|>")
         .or_else(|| tokenizer.token_to_id("<|audio|>"));
     let tokenizer = Arc::new(tokenizer);
+    let tp_enabled = tp.is_some();
     let engine = build_engine(
         &arch,
         path.to_path_buf(),
@@ -1336,12 +1358,14 @@ pub fn load_with(
         fp8_native.map(Path::to_path_buf),
         vram_budget,
         max_image_tokens,
+        tp,
     )?;
 
     Ok(ServingModel {
         id,
         spec: SpecReport {
-            heads: arch_has_infile_heads(&arch)
+            heads: !tp_enabled
+                && arch_has_infile_heads(&arch)
                 && (device != "metal"
                     || (matches!(arch.as_str(), "qwen35" | "qwen35moe") && mtp.is_none())),
             drafter: mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned())),
@@ -1571,6 +1595,7 @@ fn load_hf_dir(
         vram_budget,
         // Embedded MLX towers use their validated checkpoint processor budget.
         None,
+        None,
     )?;
 
     Ok(ServingModel {
@@ -1624,6 +1649,7 @@ fn build_engine(
     fp8_native: Option<PathBuf>,
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<Engine, ServeError> {
     let arch = arch.to_owned();
     let device = device.to_owned();
@@ -1635,6 +1661,18 @@ fn build_engine(
 
     // the factory runs on the engine thread (required for CUDA context binding)
     Engine::spawn(max_batch, move || {
+        if let Some(resolved) = tp {
+            if arch != "qwen35" || device != "cuda" || max_batch != 1 || mmproj.is_some()
+                || mtp.is_some() || fp8_native.is_some() || vram_budget.is_some() {
+                return Err("Phase 9 TP=2 requires serial text-only Qwen3.8 CUDA without companions or offload".into());
+            }
+            let pack = pack.as_deref().ok_or("Phase 9 TP=2 requires an explicit CUDA pack")?;
+            let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
+            let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
+                stream, resolved, &path, pack, gpu, max_ctx,
+            )?;
+            return Ok(Box::new(generator) as Box<dyn Generator>);
+        }
         build_generator(
             &arch,
             &path,

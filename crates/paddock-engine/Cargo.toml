@@ -33,6 +33,8 @@ tokio = { workspace = true }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
 paddock-kernels = { workspace = true }
 paddock-models = { workspace = true }
 # Phase 3 (TP plan): the engine depends on the control plane, never the reverse.

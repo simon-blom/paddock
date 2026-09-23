@@ -29,6 +29,12 @@ pub trait Generator: Send {
         Ok(1)
     }
 
+    /// An explicitly elected serial-only implementation, not a failed
+    /// attempt to enable production batch kernels. Phase 9 TP=2 has one slot.
+    fn serial_only(&self) -> bool {
+        false
+    }
+
     /// True if this backend has a working speculative-decode drafter (a loaded MTP
     /// head with spec enabled). The service routes even single-user (max_batch 1)
     /// serving through the batched loop when this holds - spec decode, the big

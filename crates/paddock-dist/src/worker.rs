@@ -44,10 +44,24 @@ pub enum BootstrapError {
 /// the environment - the same mechanism the manager uses to start runners -
 /// so no second config file exists to drift.
 pub fn spawn_worker_local(resolved: &Resolved) -> Result<std::process::Child, BootstrapError> {
+    spawn_worker_local_with_paths(resolved, None, None)
+}
+
+fn spawn_worker_local_with_paths(
+    resolved: &Resolved,
+    model: Option<&std::path::Path>,
+    pack: Option<&std::path::Path>,
+) -> Result<std::process::Child, BootstrapError> {
     let exe = std::env::current_exe().map_err(BootstrapError::Spawn)?;
     let mut cmd = Command::new(exe);
     for (k, v) in resolved.worker_env() {
         cmd.env(k, v);
+    }
+    if let Some(model) = model {
+        cmd.env("PADDOCK_TP_MODEL", model);
+    }
+    if let Some(pack) = pack {
+        cmd.env("PADDOCK_TP_PACK", pack);
     }
     cmd.stdin(std::process::Stdio::null());
     // Worker logs go to the same stderr as the coordinator (its stdout is
@@ -68,6 +82,15 @@ pub fn coordinate(
     resolved: &Resolved,
     spawn_worker: bool,
 ) -> Result<(std::net::TcpStream, u64), BootstrapError> {
+    coordinate_with_paths(resolved, spawn_worker, None, None)
+}
+
+fn coordinate_with_paths(
+    resolved: &Resolved,
+    spawn_worker: bool,
+    model: Option<&std::path::Path>,
+    pack: Option<&std::path::Path>,
+) -> Result<(std::net::TcpStream, u64), BootstrapError> {
     let listener = TcpListener::bind((resolved.master_addr.as_str(), resolved.master_port))
         .map_err(|source| BootstrapError::Bind {
             addr: resolved.master_addr.clone(),
@@ -82,7 +105,7 @@ pub fn coordinate(
     );
 
     if spawn_worker {
-        match spawn_worker_local(resolved) {
+        match spawn_worker_local_with_paths(resolved, model, pack) {
             Ok(child) => tracing::info!("spawned rank-1 worker child (pid {})", child.id()),
             Err(e) => tracing::warn!(
                 "could not spawn worker locally ({e}); waiting for a manual or SSH start"
@@ -190,12 +213,10 @@ pub fn work(resolved: &Resolved) -> Result<(), BootstrapError> {
     }
 }
 
-/// Join as rank 1 and return the existing control connection after Hello /
-/// Welcome. The Phase-3 bench uses it to receive the NCCL ID; the normal
-/// worker retains the same shutdown-only loop until execution integration.
-pub fn connect_worker(
-    resolved: &Resolved,
-) -> Result<(std::net::TcpStream, u64), BootstrapError> {
+/// Join as rank 1 and return the bootstrap control connection after Hello /
+/// Welcome. Standalone parity probes exchange the NCCL ID on it; the Phase 9
+/// worker hands it to the ordered model execution loop.
+pub fn connect_worker(resolved: &Resolved) -> Result<(std::net::TcpStream, u64), BootstrapError> {
     let addr = (resolved.master_addr.as_str(), resolved.master_port);
     let who = std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".to_string());
     tracing::info!(
@@ -251,7 +272,7 @@ pub fn shutdown_worker(
 /// The coordinator's held control channel, stored at bootstrap so the
 /// runner's shutdown path can release the worker without threading the
 /// stream through every layer.
-static COORDINATOR_CONTROL: std::sync::OnceLock<std::sync::Mutex<std::net::TcpStream>> =
+static COORDINATOR_CONTROL: std::sync::OnceLock<std::sync::Mutex<Option<std::net::TcpStream>>> =
     std::sync::OnceLock::new();
 
 /// Run [`coordinate`] and store the connection for later
@@ -259,10 +280,32 @@ static COORDINATOR_CONTROL: std::sync::OnceLock<std::sync::Mutex<std::net::TcpSt
 pub fn coordinate_and_store(
     resolved: &Resolved,
     spawn_worker: bool,
+    model: Option<&std::path::Path>,
+    pack: Option<&std::path::Path>,
 ) -> Result<u64, BootstrapError> {
-    let (stream, session) = coordinate(resolved, spawn_worker)?;
-    let _ = COORDINATOR_CONTROL.set(std::sync::Mutex::new(stream));
+    let (stream, session) = coordinate_with_paths(resolved, spawn_worker, model, pack)?;
+    COORDINATOR_CONTROL
+        .set(std::sync::Mutex::new(Some(stream)))
+        .map_err(|_| {
+            BootstrapError::Handshake(ProtocolError::Rejected(
+                "coordinator already running".into(),
+            ))
+        })?;
     Ok(session)
+}
+
+/// Hand ownership of the bootstrap channel to the Phase 9 model. The generic
+/// runner shutdown path must not send Shutdown while the model is executing.
+pub fn take_control() -> Result<std::net::TcpStream, BootstrapError> {
+    COORDINATOR_CONTROL
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|mut slot| slot.take())
+        .ok_or_else(|| {
+            BootstrapError::Handshake(ProtocolError::Rejected(
+                "no coordinator channel to take".into(),
+            ))
+        })
 }
 
 /// Send Shutdown to the joined worker, if one is. Returns whether a worker
@@ -274,7 +317,10 @@ pub fn broadcast_shutdown(graceful: bool) -> bool {
             let Ok(mut stream) = mutex.lock() else {
                 return false;
             };
-            matches!(shutdown_worker(&mut stream, graceful), Ok(()))
+            matches!(
+                stream.as_mut().map(|s| shutdown_worker(s, graceful)),
+                Some(Ok(()))
+            )
         }
         None => false,
     }

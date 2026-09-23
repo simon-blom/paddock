@@ -674,6 +674,7 @@ pub async fn run(
                 // config carries MiB (nvidia-smi units); the engine takes bytes
                 cfg.vram_budget.map(|mib| mib << 20),
                 cfg.max_image_tokens,
+                cfg.parallel.resolved(true)?,
             )?;
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;

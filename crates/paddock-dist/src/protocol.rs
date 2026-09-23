@@ -1,10 +1,7 @@
 //! The rank0<->rank1 control protocol: length-prefixed JSON over TCP.
 //!
-//! Phase 2 scope is bootstrap coordination only - handshake, world-size
-//! agreement, shutdown. The command vocabulary for execution control
-//! (Prefill/Decode/ResetSlot/...) arrives with the distributed executor in a
-//! later phase; the frame format here is chosen so that extension is a new
-//! enum variant, not a wire change.
+//! Bootstrap, model identity and rank-0-authoritative serial execution
+//! share this channel. Tensor payloads and collectives stay on the GPU.
 //!
 //! Framing: u32 little-endian length, then JSON. One request, one response,
 //! per exchange - no pipelining, no fragmentation. Every buffer is capped
@@ -88,17 +85,41 @@ pub enum ControlMessage {
         /// error paths, so the worker knows how to exit (0 vs nonzero).
         graceful: bool,
     },
-    /// Rank 0 -> rank 1, after the handshake. Carries the NCCL unique ID
-    /// (128 bytes) that both ranks need to initialize their communicators.
-    ///
-    /// Phase 3 (TP plan): this is the ONLY new control message the
-    /// communicator bootstrap needs. The NCCL ID is small (128 bytes) and
-    /// travels over the existing control channel, not the NCCL/RoCE data
-    /// path. Per-batch execution traffic (Prefill/Decode/...) is a later
-    /// phase and does NOT ride this channel.
+    /// Phase 3 bootstrap ID. Only control messages travel on this socket;
+    /// collectives use the NCCL data path.
     NcclId {
-        /// The 128-byte NCCL unique ID (`ncclUniqueId.internal`).
         id: Vec<u8>,
+    },
+    /// Rank 0 starts Phase 9 execution after both checkpoint and pack hashes
+    /// are checked against the worker's local files.
+    TpInit {
+        checkpoint_sha256: String,
+        pack_blake3: String,
+        max_ctx: usize,
+    },
+    /// Worker has mirrored and validated a step's logical KV operation. Rank 0
+    /// must see this before launching any collective for the step.
+    TpPrepared {
+        sequence: u64,
+    },
+    /// Acknowledgement of model load or a completed reset/step.
+    TpReady {
+        sequence: u64,
+    },
+    /// Rank 0 owns the logical KV lifecycle. The worker mirrors this event
+    /// before executing; it must never allocate blocks independently.
+    TpReset {
+        sequence: u64,
+        kv_event: serde_json::Value,
+    },
+    TpStep {
+        sequence: u64,
+        token: u32,
+        position: usize,
+        kv_event: serde_json::Value,
+    },
+    TpError {
+        reason: String,
     },
 }
 

@@ -882,8 +882,8 @@ pub fn run() -> std::process::ExitCode {
     // --- Tensor-parallel worker child (rank 1) ------------------------------
     //
     // A coordinator-spawned worker enters here INSTEAD of config resolution:
-    // it serves nothing (no HTTP, no model scan, no banner) and its whole
-    // runtime for this phase is the control loop in paddock_dist::worker.
+    // it serves nothing (no HTTP, no model scan, no banner). For Phase 9,
+    // its execution loop owns the same model/pack and mirrors rank-0 commands.
     // Startup is env-only (PADDOCK_TP_* set by the coordinator's spawn), so
     // the child never needs - and never reads - a paddock.toml of its own;
     // there is no second config file to drift. The env names survive the
@@ -906,7 +906,21 @@ pub fn run() -> std::process::ExitCode {
         // which is the one legitimate way to be rank 1.
         match tp.resolved(false) {
             Ok(Some(r)) if r.is_worker() => {
-                return match paddock_dist::worker::work(&r) {
+                let model = std::env::var_os("PADDOCK_TP_MODEL");
+                let pack = std::env::var_os("PADDOCK_TP_PACK");
+                let (Some(model), Some(pack)) = (model, pack) else {
+                    eprintln!("TP rank 1 requires PADDOCK_TP_MODEL and PADDOCK_TP_PACK paths");
+                    return std::process::ExitCode::from(2);
+                };
+                let model = std::path::PathBuf::from(model);
+                let pack = std::path::PathBuf::from(pack);
+                return match paddock_dist::worker::connect_worker(&r)
+                    .map_err(|e| e.to_string())
+                    .and_then(|(stream, _)| {
+                        paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
+                            stream, &r, &model, &pack, 0,
+                        )
+                    }) {
                     Ok(()) => std::process::ExitCode::SUCCESS,
                     Err(e) => {
                         tracing::error!(error = %e, "tensor-parallel worker failed");
@@ -973,11 +987,36 @@ pub fn run() -> std::process::ExitCode {
         }
     };
     if let Some(resolved) = tp.filter(|r| r.tp_size > 1) {
+        // Phase 9 only implements the pinned, eager, serial Qwen3.8 lane.
+        // Refuse unsupported configurations before joining rank 1: never
+        // acknowledge a TP pair and then quietly fall back to TP=1.
+        let tp9 = cfg.device == "cuda"
+            && cfg.max_batch == 1
+            && (cfg.no_spec || cfg.spec.as_deref() == Some("off"))
+            && !cfg.kv_offload.enabled
+            && !cfg.moe_offload.enabled
+            && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16")
+            && cfg.mmproj.is_none()
+            && cfg.mtp.is_none()
+            && cfg.fp8_native.is_none()
+            && cfg.model.as_ref().is_some_and(|p| p.is_file())
+            && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file());
+        if !tp9 {
+            eprintln!(
+                "Phase 9 TP=2 requires an explicit GGUF file and CUDA pack, cuda, max_batch=1, --no-spec (or spec=off), F16 KV, and no vision/companions/offload"
+            );
+            return std::process::ExitCode::from(2);
+        }
         // PADDOCK_TP_NO_SPAWN is a dev/ops knob (dev builds only: the
         // hardened seal removes it) that skips the local child spawn so a
         // two-node start can wait for an SSH-started worker.
         let spawn_worker = std::env::var_os("PADDOCK_TP_NO_SPAWN").is_none();
-        match paddock_dist::worker::coordinate_and_store(&resolved, spawn_worker) {
+        match paddock_dist::worker::coordinate_and_store(
+            &resolved,
+            spawn_worker,
+            cfg.model.as_deref(),
+            cfg.kernel_pack.as_deref(),
+        ) {
             Ok(session) => {
                 tracing::info!(
                     "tensor-parallel bootstrap complete (tp_size={}, session {session})",
