@@ -30,6 +30,7 @@ use cudarc::driver::CudaSlice;
 use std::sync::Arc;
 
 mod batch;
+pub mod delta_tp;
 mod dflash;
 pub mod ffn_tp;
 mod forward;
