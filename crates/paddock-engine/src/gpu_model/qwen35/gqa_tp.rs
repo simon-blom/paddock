@@ -291,6 +291,20 @@ impl GqaTpRank {
             .kv_bytes(BLOCK_TOKENS, self.dtype)?
             .checked_mul(2)
     }
+
+    /// One physical block's byte stride within this rank's K (or V) slab.
+    pub fn block_stride(&self) -> usize {
+        BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes()
+    }
+
+    /// The rank-local K and V payload slabs (paged mode: block-strided).
+    pub fn kv_slabs(&self) -> (&CudaSlice<u8>, &CudaSlice<u8>) {
+        (&self.kc, &self.vc)
+    }
+
+    pub fn kv_slabs_mut(&mut self) -> (&mut CudaSlice<u8>, &mut CudaSlice<u8>) {
+        (&mut self.kc, &mut self.vc)
+    }
     pub fn position(&self) -> usize {
         self.pos
     }

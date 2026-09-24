@@ -458,6 +458,31 @@ impl DeltaTpRank {
     pub fn state(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
         (&self.recurrent, &self.conv)
     }
+
+    /// A slot's persistent state buffers: slot 0 works in place on the home
+    /// pair, other slots on their `slot_states` entry.
+    pub fn slot_state(&self, slot: usize) -> Option<(&CudaSlice<f32>, &CudaSlice<f32>)> {
+        if slot == 0 {
+            Some((&self.recurrent, &self.conv))
+        } else {
+            self.slot_states
+                .get(slot - 1)
+                .map(|(recurrent, conv)| (recurrent, conv))
+        }
+    }
+
+    pub fn slot_state_mut(
+        &mut self,
+        slot: usize,
+    ) -> Option<(&mut CudaSlice<f32>, &mut CudaSlice<f32>)> {
+        if slot == 0 {
+            Some((&mut self.recurrent, &mut self.conv))
+        } else {
+            self.slot_states
+                .get_mut(slot - 1)
+                .map(|(recurrent, conv)| (recurrent, conv))
+        }
+    }
     pub fn local_state_bytes(&self) -> usize {
         (self.recurrent.len() + self.conv.len()) * 4
     }
