@@ -651,7 +651,9 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                         .copied()
                         .filter(|p| Some(*p) != freeing)
                         .collect();
-                    if let Err(e) = perform_evictions(&state, &evict).await {
+                    if !spec.on_demand()
+                        && let Err(e) = perform_evictions(&state, &evict).await
+                    {
                         *job.follow_state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -946,6 +948,7 @@ async fn perform_evictions(state: &Arc<AppState>, ports: &[u16]) -> Result<(), S
 
 /// What admission needs to know about the start being priced.
 struct AdmitReq<'a> {
+    on_demand: bool,
     model: &'a str,
     artifact: Option<&'a str>,
     gpu_pin: Option<&'a str>,
@@ -1029,6 +1032,7 @@ fn spec_wanted(v: Option<&str>) -> bool {
 impl<'a> AdmitReq<'a> {
     fn for_spec(spec: &'a crate::supervisor::SpawnSpec, freeing_port: Option<u16>) -> Self {
         Self {
+            on_demand: spec.on_demand(),
             model: &spec.model,
             artifact: spec.artifact.as_deref(),
             gpu_pin: spec.gpu.as_deref(),
@@ -1064,6 +1068,11 @@ async fn vram_admission(
     state: &Arc<AppState>,
     req: AdmitReq<'_>,
 ) -> Result<Option<u64>, AdmissionRefusal> {
+    // This starts only an API listener. The runner admits the actual serving
+    // envelope against fresh device/host availability on EACH cold load.
+    if req.on_demand {
+        return Ok(None);
+    }
     // loud escape hatch for benches/experts - default is the hard no
     if std::env::var_os("PADDOCK_ALLOW_VRAM_OVERCOMMIT").is_some() {
         tracing::warn!(model = %req.model, "VRAM admission BYPASSED (PADDOCK_ALLOW_VRAM_OVERCOMMIT)");
@@ -1131,11 +1140,24 @@ async fn vram_admission(
         if !on_device {
             continue;
         }
-        let budget = state
-            .supervisor
-            .config_vram_budget(v.port)
-            .map(|mib| mib << 20)
-            .unwrap_or(0);
+        let dynamic = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            paddock_admin::client::AdminClient::new(v.port).config_status(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|s| s.residency_reservation(v.pid));
+        if dynamic == Some(0) {
+            continue;
+        }
+        let budget = dynamic.unwrap_or_else(|| {
+            state
+                .supervisor
+                .config_vram_budget(v.port)
+                .map(|mib| mib << 20)
+                .unwrap_or(0)
+        });
         let ledger = rv.and_then(|rv| rv.self_mem).unwrap_or(0);
         let held = budget.max(ledger);
         committed += held;
@@ -2180,7 +2202,9 @@ async fn runners_spawn(
 ) -> Response {
     let _admission = state.admission.lock().await;
     // caller-approved evictions first (the confirmed 507 offer)
-    if let Err(e) = perform_evictions(&state, &spec.evict).await {
+    if !spec.on_demand()
+        && let Err(e) = perform_evictions(&state, &spec.evict).await
+    {
         return relay_err(StatusCode::CONFLICT, e);
     }
     pin_envelope(&mut spec, &state.registry);
@@ -2346,7 +2370,9 @@ async fn runners_switch(
     // caller-approved evictions first (never the takeover's own incumbent -
     // that one drains as part of the switch itself)
     let evict: Vec<u16> = spec.evict.iter().copied().filter(|p| *p != port).collect();
-    if let Err(e) = perform_evictions(&state, &evict).await {
+    if !spec.on_demand()
+        && let Err(e) = perform_evictions(&state, &evict).await
+    {
         return relay_err(StatusCode::CONFLICT, e);
     }
     // a takeover frees its own incumbent - that VRAM counts as available;
@@ -2381,6 +2407,8 @@ async fn servers_file_get(
 ) -> Response {
     match state.supervisor.read_config_file(port) {
         Ok((content, hash)) => Json(serde_json::json!({
+            "runtime_state": tokio::time::timeout(std::time::Duration::from_secs(2),
+                paddock_admin::client::AdminClient::new(port).config_status()).await.ok().and_then(Result::ok),
             "path": state.supervisor.server_config_path(port).display().to_string(),
             "content": content,
             "hash": hash,
@@ -2475,11 +2503,14 @@ async fn servers_file_put(
     if let Err(error) = state.supervisor.validate_backend_config(&body.content) {
         return relay_err(StatusCode::BAD_REQUEST, error);
     }
-    if let Ok(doc) = toml::from_str::<toml::Value>(&body.content)
+    if !crate::native_endpoints::on_demand_config(&body.content)
+        && !state.supervisor.can_apply_live(port, &body.content).await
+        && let Ok(doc) = toml::from_str::<toml::Value>(&body.content)
         && let Some(model) = doc.get("model").and_then(toml::Value::as_str)
     {
         let get_int = |k: &str| doc.get(k).and_then(toml::Value::as_integer);
         let req = AdmitReq {
+            on_demand: false,
             model,
             artifact: None,
             gpu_pin: doc.get("gpu").and_then(toml::Value::as_str),
@@ -2727,15 +2758,21 @@ async fn start_saved(state: Arc<AppState>, port: u16, evict: Vec<u16>, cause: &s
             "This instance is already running.".into(),
         );
     }
-    if let Err(e) = perform_evictions(&state, &evict).await {
+    let on_demand = state
+        .supervisor
+        .read_config_file(port)
+        .ok()
+        .is_some_and(|(raw, _)| crate::native_endpoints::on_demand_config(&raw));
+    if !on_demand && let Err(e) = perform_evictions(&state, &evict).await {
         return relay_err(StatusCode::CONFLICT, e);
     }
     // price the file before the verbatim start: its own vram_budget is the
     // ask when present; otherwise its envelope prices a plain check. The
     // Metal fills an absent ceiling before launching the saved configuration.
-    if let Ok(spec) = state
-        .supervisor
-        .spec_from_config_file(&state.supervisor.server_config_path(port))
+    if !on_demand
+        && let Ok(spec) = state
+            .supervisor
+            .spec_from_config_file(&state.supervisor.server_config_path(port))
         && !spec.model.is_empty()
     {
         match vram_admission(&state, AdmitReq::for_spec(&spec, None)).await {

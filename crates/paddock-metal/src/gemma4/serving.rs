@@ -69,6 +69,9 @@ impl Gemma4 {
 }
 impl Generator for Gemma4 {
     fn reset(&mut self) {
+        if let Some(d) = &mut self.diffusion {
+            d.reset();
+        }
         if let Some(d) = &mut self.dflash {
             d.budget = Default::default();
         }
@@ -90,6 +93,113 @@ impl Generator for Gemma4 {
     }
     fn vocab(&self) -> usize {
         self.vocab
+    }
+    fn canvas_width(&self) -> usize {
+        if self.diffusion.is_some() {
+            diffusion::WIDTH
+        } else {
+            0
+        }
+    }
+    fn canvas_max_steps(&self) -> u32 {
+        if self.diffusion.is_some() { 48 } else { 0 }
+    }
+    fn canvas_tick_max(&self) -> usize {
+        if self.diffusion.is_some() {
+            CHUNK / diffusion::WIDTH
+        } else {
+            0
+        }
+    }
+    fn canvas_open(&mut self, w: usize) -> std::result::Result<usize, GenError> {
+        Ok(self.open_canvas(w)?)
+    }
+    fn canvas_set(&mut self, h: usize, ids: &[u32]) -> std::result::Result<(), GenError> {
+        Ok(self.set_canvas(h, ids)?)
+    }
+    fn canvas_close(&mut self, h: usize) {
+        self.close_canvas(h);
+    }
+    fn canvas_noise(&self, w: usize, seed: u64, offset: u32) -> Vec<u32> {
+        if w <= diffusion::WIDTH && self.diffusion.is_some() {
+            diffusion::noise(w, seed, offset)
+        } else {
+            Vec::new()
+        }
+    }
+    fn canvas_tick(
+        &mut self,
+        ticks: &[paddock_engine::generator::CanvasTickReq],
+    ) -> std::result::Result<Vec<paddock_engine::generator::CanvasStatus>, GenError> {
+        Ok(self.tick_canvases(ticks)?)
+    }
+    fn canvas_result(
+        &self,
+        h: usize,
+        labels: &[u32],
+    ) -> std::result::Result<paddock_engine::generator::CanvasReadOut, GenError> {
+        Ok(self.canvas_output(h, labels)?)
+    }
+    fn canvas_commit_slot(
+        &mut self,
+        slot: usize,
+        base: usize,
+        ids: &[u32],
+    ) -> std::result::Result<(), GenError> {
+        Ok(self.commit_canvas(slot, base, ids)?)
+    }
+    fn canvas_commit(&mut self, base: usize, ids: &[u32]) -> std::result::Result<(), GenError> {
+        Ok(self.commit_canvas(0, base, ids)?)
+    }
+    fn canvas_read(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        labels: &[u32],
+    ) -> std::result::Result<paddock_engine::generator::CanvasReadOut, GenError> {
+        let h = self.open_canvas(canvas.len())?;
+        let result = (|| {
+            self.set_canvas(h, canvas)?;
+            self.tick_canvases(&[paddock_engine::generator::CanvasTickReq {
+                handle: h,
+                slot: 0,
+                base,
+                temperature: Some(1.),
+                seed: 0,
+                accept: false,
+            }])?;
+            self.canvas_output(h, labels)
+        })();
+        self.close_canvas(h);
+        Ok(result?)
+    }
+    fn canvas_block(
+        &mut self,
+        base: usize,
+        w: usize,
+        temperature: Option<f32>,
+        seed: u64,
+    ) -> std::result::Result<(Vec<u32>, u32), GenError> {
+        let h = self.open_canvas(w)?;
+        let result: Result<(Vec<u32>, u32)> = (|| {
+            self.set_canvas(h, &diffusion::noise(w, seed, 0))?;
+            for step in 1..=48 {
+                let status = self.tick_canvases(&[paddock_engine::generator::CanvasTickReq {
+                    handle: h,
+                    slot: 0,
+                    base,
+                    temperature,
+                    seed,
+                    accept: true,
+                }])?[0];
+                if status.converged || step == 48 {
+                    return Ok((self.canvas_output(h, &[])?.argmax, step));
+                }
+            }
+            unreachable!()
+        })();
+        self.close_canvas(h);
+        result.map_err(GenError::from)
     }
     fn vision_budget(&self) -> Option<paddock_engine::generator::VisionBudget> {
         self.vision.as_ref().map(|_| {

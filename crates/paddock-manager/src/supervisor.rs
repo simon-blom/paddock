@@ -165,6 +165,13 @@ pub struct RunnerView {
     /// ours to report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<RunnerConfig>,
+    /// The runner-local model lifecycle, when the runner manages one (Whisper
+    /// on demand): its phase, the policy in force and the load/unload
+    /// counters. A row that is "running" with no VRAM is otherwise a puzzle -
+    /// this says the listener is up and the model is simply not resident.
+    /// Absent for runners that keep their model loaded for life.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residency: Option<paddock_admin::residency::Snapshot>,
 }
 
 /// The editable slice of a runner's spawn spec, as the API reports it. Since
@@ -173,6 +180,7 @@ pub struct RunnerView {
 /// the operator reading this.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerConfig {
+    pub residency: Option<paddock_admin::residency::Config>,
     pub model: String,
     /// Weights-artifact choice (schema 3), e.g. "q4". None = default.
     pub artifact: Option<String>,
@@ -213,6 +221,7 @@ pub struct RunnerConfig {
 impl RunnerConfig {
     fn from_spec(s: &SpawnSpec) -> Self {
         Self {
+            residency: s.residency.clone(),
             model: s.model.clone(),
             artifact: s.artifact.clone(),
             drafter: s.drafter.clone(),
@@ -254,6 +263,7 @@ pub(crate) const CONFIG_HEADER: &str = "# Written by the paddock manager (the St
 /// key there without adding it here fails the build rather than quietly turning
 /// that key into hand-edited state the manager can no longer change.
 pub const OWNED_CONFIG_KEYS: &[&str] = &[
+    "residency",
     "host",
     "port",
     "model",
@@ -434,6 +444,8 @@ impl Resolution {
 /// binds these to its controls and derives nothing.
 #[derive(Serialize)]
 pub struct ConfigProjection {
+    pub residency: Option<paddock_admin::residency::Config>,
+    pub residency_supported: bool,
     /// Catalog model id when the text can name one (its `[catalog]` block, or a
     /// weights path the registry still recognizes), else the weights path -
     /// same rule, same code, as every other reader.
@@ -526,6 +538,8 @@ fn is_zero(v: &f64) -> bool {
 /// dtype for not mentioning them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SpawnSpec {
+    #[serde(default)]
+    pub residency: Option<paddock_admin::residency::Config>,
     pub model: String,
     /// Weights-artifact selection for a catalog model (schema 3), e.g. "q4".
     /// None = the default choice, preferring an installed one.
@@ -665,6 +679,7 @@ fn de_gpu<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::E
 impl Default for SpawnSpec {
     fn default() -> Self {
         Self {
+            residency: None,
             model: String::new(),
             artifact: None,
             drafter: None,
@@ -690,6 +705,14 @@ impl Default for SpawnSpec {
             forensics: None,
             kv_offload: None,
         }
+    }
+}
+
+impl SpawnSpec {
+    pub(crate) fn on_demand(&self) -> bool {
+        self.residency.as_ref().is_some_and(|p| {
+            p.load == paddock_admin::residency::LoadPolicy::OnDemand && p.validate().is_ok()
+        })
     }
 }
 
@@ -1132,8 +1155,12 @@ impl Supervisor {
     /// changing only these on a running port is a plain file write - the
     /// runner serves the change on its next request, no drain, no relaunch
     /// (tools and web search are control-plane, restart-free).
-    const LIVE_KEYS: &'static [&'static str] =
-        &["mcp_servers", "web_search_provider", "web_search_api_key"];
+    const LIVE_KEYS: &'static [&'static str] = &[
+        "mcp_servers",
+        "web_search_provider",
+        "web_search_api_key",
+        "residency",
+    ];
 
     /// Native tools-only save. Unlike the general editor, this never spawns,
     /// drains or restarts a model, including when the endpoint is stopped.
@@ -1160,6 +1187,33 @@ impl Supervisor {
         a.keys()
             .chain(b.keys())
             .all(|k| a.get(k) == b.get(k) || Self::LIVE_KEYS.contains(&k.as_str()))
+    }
+
+    /// Admission must not allocate/pin a new budget for a control-plane edit.
+    /// Older runners and pending engine changes retain the restart path.
+    pub(crate) async fn can_apply_live(&self, port: u16, content: &str) -> bool {
+        let Ok((old, _)) = self.read_config_file(port) else {
+            return false;
+        };
+        if !Self::only_live_keys_changed(&old, content) {
+            return false;
+        }
+        let Ok(Ok(status)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            AdminClient::new(port).config_status(),
+        )
+        .await
+        else {
+            return false;
+        };
+        let residency_changed = toml::from_str::<toml::Value>(&old)
+            .ok()
+            .and_then(|v| v.get("residency").cloned())
+            != toml::from_str::<toml::Value>(content)
+                .ok()
+                .and_then(|v| v.get("residency").cloned());
+        status.restart_required == Some(false)
+            && (!residency_changed || status.residency_live == Some(true))
     }
 
     /// Returns the view plus whether the save applied live (true) or via the
@@ -1208,11 +1262,44 @@ impl Supervisor {
         } else {
             Some(false)
         };
-        let apply_saved = expected_pid.is_some()
-            && pending_restart == Some(true)
-            && toml::from_str::<toml::Value>(&old).ok()
-                == toml::from_str::<toml::Value>(content).ok();
-        if running && Self::only_live_keys_changed(&old, content) && !apply_saved {
+        // Native explicitly confirmed applying the saved engine geometry too;
+        // a simultaneous live-policy edit must not swallow that restart.
+        let apply_saved = expected_pid.is_some() && pending_restart == Some(true);
+        let residency_changed = toml::from_str::<toml::Value>(&old)
+            .ok()
+            .and_then(|v| v.get("residency").cloned())
+            != toml::from_str::<toml::Value>(content)
+                .ok()
+                .and_then(|v| v.get("residency").cloned());
+        let residency_live = !residency_changed
+            || tokio::time::timeout(Duration::from_secs(2), AdminClient::new(port).identify())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|id| id.capabilities.iter().any(|c| c == "residency"));
+        if running && Self::only_live_keys_changed(&old, content) && !apply_saved && residency_live
+        {
+            if residency_changed {
+                let doc = toml::from_str(content).map_err(|_| "Invalid saved configuration.")?;
+                let wanted = crate::native_endpoints::validate_residency(&doc)?;
+                let client = AdminClient::new(port);
+                let acknowledged = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        self.verify_reviewed_runner(port, expected_pid).await?;
+                        if let Some(snapshot) =
+                            client.residency().await.map_err(|e| e.to_string())?
+                            && snapshot.policy == wanted
+                        {
+                            return Ok::<_, String>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await;
+                if !matches!(acknowledged, Ok(Ok(()))) {
+                    return Err("Settings were saved without restarting, but the runner has not acknowledged the residency policy. Review the running instance before retrying.".into());
+                }
+            }
             // control-plane-only edit: the running runner re-reads these on
             // its next request - bouncing the model would be pure downtime
             if let Some(v) = self.list().await.into_iter().find(|v| v.port == port) {
@@ -1265,6 +1352,7 @@ impl Supervisor {
     /// Shared backend contract for previews, saved files and starts.
     pub fn validate_backend_config(&self, content: &str) -> Result<(), String> {
         let doc = toml::from_str(content).map_err(|e| format!("not valid TOML: {e}"))?;
+        crate::native_endpoints::validate_residency(&doc)?;
         crate::backend_contract::validate(&self.registry, &self.defaults.device, &doc)
     }
 
@@ -1590,6 +1678,7 @@ impl Supervisor {
         let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
         let v: toml::Value =
             toml::from_str(raw).map_err(|err| format!("does not parse as TOML: {err}"))?;
+        crate::native_endpoints::validate_residency(&v)?;
         let get_usize = |k: &str| {
             v.get(k)
                 .and_then(toml::Value::as_integer)
@@ -1632,6 +1721,12 @@ impl Supervisor {
             Path::new(&weights),
         );
         Ok(SpawnSpec {
+            residency: v
+                .get("residency")
+                .cloned()
+                .map(|v| v.try_into())
+                .transpose()
+                .map_err(|_| "Invalid model residency policy.")?,
             kv_offload,
             // identity when we have one, the weights path otherwise - a
             // filesystem path is a valid spawn model
@@ -1694,6 +1789,8 @@ impl Supervisor {
             .and_then(|m| spec.artifact.as_deref().and_then(|id| m.artifact(id)))
             .is_some_and(|a| a.runtime.embedded_vision);
         Ok(ConfigProjection {
+            residency: spec.residency,
+            residency_supported: crate::native_endpoints::residency_supported(&v),
             weights: v
                 .get("model")
                 .and_then(toml::Value::as_str)
@@ -2112,6 +2209,17 @@ impl Supervisor {
                         Ok(Ok(h)) => (h.status, Some(h.in_flight), Some(h.uptime_s)),
                         _ => ("unreachable".into(), None, None),
                     };
+                    // Only a runner that advertises the capability is asked,
+                    // so every other row costs nothing extra here.
+                    let residency = if id.capabilities.iter().any(|c| c == "residency") {
+                        tokio::time::timeout(Duration::from_secs(1), client.residency())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .flatten()
+                    } else {
+                        None
+                    };
                     // Read only. This used to adopt on sight - insert a record
                     // for any port that answered - which made a *read* path an
                     // owner of authoritative state, and that was the shape
@@ -2198,6 +2306,7 @@ impl Supervisor {
                         endpoint: format!("http://{}:{port}", Self::lan_ip()),
                         pinned,
                         config,
+                        residency,
                     });
                 }
                 _ => {
@@ -2231,6 +2340,7 @@ impl Supervisor {
                             endpoint: format!("http://{}:{port}", Self::lan_ip()),
                             pinned: rec.pinned,
                             config: rec.spec.as_ref().map(RunnerConfig::from_spec),
+                            residency: None,
                         });
                     } else {
                         // Enumerated, silent, and not ours - a runner someone
@@ -2262,6 +2372,7 @@ impl Supervisor {
                             endpoint: format!("http://{}:{port}", Self::lan_ip()),
                             pinned: false,
                             config: None,
+                            residency: None,
                         });
                     }
                 }
@@ -2863,6 +2974,16 @@ impl Supervisor {
                 )))
             })?;
             t.insert("forensics".into(), fv);
+        }
+        if let Some(policy) = &spec.residency {
+            policy
+                .validate()
+                .map_err(|e| SpawnError::Io(std::io::Error::other(e)))?;
+            t.insert(
+                "residency".into(),
+                toml::Value::try_from(policy)
+                    .map_err(|e| SpawnError::Io(std::io::Error::other(e)))?,
+            );
         }
         // `[kv_offload]` round-trips as a whole. Budgets only, and only when
         // ram_gb is real - the disk tier stores through RAM, so writing a

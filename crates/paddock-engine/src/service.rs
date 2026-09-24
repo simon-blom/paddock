@@ -989,6 +989,19 @@ impl Engine {
     where
         F: FnOnce() -> Result<Box<dyn Generator>, String> + Send + 'static,
     {
+        Self::spawn_with_metrics(max_batch, Arc::new(EngineMetrics::default()), build)
+    }
+
+    /// Residency reloads retain one telemetry identity/counter bank for the
+    /// lifetime of the endpoint. Only one engine may own this bank at a time.
+    pub fn spawn_with_metrics<F>(
+        max_batch: usize,
+        metrics: Arc<EngineMetrics>,
+        build: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Box<dyn Generator>, String> + Send + 'static,
+    {
         let (tx, rx) = std::sync::mpsc::channel::<GenRequest>();
         // Ok carries the generator's vision budget (None = no tower) - the one
         // fact the outside needs from the generator itself, read on the engine
@@ -997,7 +1010,6 @@ impl Engine {
             Result<(Option<crate::generator::VisionBudget>, usize), String>,
         >();
 
-        let metrics = Arc::new(EngineMetrics::default());
         let thread_metrics = metrics.clone();
         let shutdown = Arc::new(ShutdownCtl::new());
         let thread_shutdown = shutdown.clone();
@@ -1360,7 +1372,7 @@ impl Engine {
     }
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
-        req.submitted = Some(std::time::Instant::now());
+        req.submitted.get_or_insert_with(std::time::Instant::now);
         self.tx
             .send(req)
             .map_err(|_| "engine thread is gone".to_owned())

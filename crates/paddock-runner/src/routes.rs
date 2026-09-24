@@ -377,6 +377,13 @@ impl OutputCaps {
 }
 
 impl AppState {
+    pub fn residency(&self) -> Option<crate::residency::Snapshot> {
+        self.asr
+            .as_ref()
+            .and_then(|m| m.transcriber.residency())
+            .or_else(|| self.serving.as_ref().and_then(|m| m.engine.residency()))
+    }
+
     pub fn output_caps(&self) -> OutputCaps {
         OutputCaps {
             default: self.default_max_output_tokens,
@@ -1039,6 +1046,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         "aliases": state.filters.aliases,
         "variants": state.filters.variants.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
         "concurrency_limit": state.concurrency_limit,
+        "residency": state.residency(),
     }))
     .into_response()
 }

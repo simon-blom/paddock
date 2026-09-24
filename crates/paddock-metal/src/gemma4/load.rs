@@ -9,6 +9,15 @@ impl Gemma4 {
         budget: Option<u64>,
     ) -> Result<Self> {
         if path.is_dir() {
+            let config = std::fs::read(path.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+            if config
+                .as_ref()
+                .is_some_and(|c| c["model_type"] == "diffusion_gemma")
+            {
+                return Self::load_diffusion_mlx(path, context, max_batch, budget);
+            }
             return Self::load_mlx(path, context, max_batch, budget);
         }
         let map = MappedGguf::open(path).map_err(|e| MetalError::Model(e.to_string()))?;
@@ -16,7 +25,8 @@ impl Gemma4 {
             return Self::load_muse(&map, context, max_batch, budget);
         }
         let bad = |s: &str| MetalError::Model(format!("Gemma 4 Metal: {s}"));
-        if map.gguf().architecture() != Some("gemma4") {
+        let diffusion = map.gguf().architecture() == Some("diffusion-gemma");
+        if map.gguf().architecture() != Some("gemma4") && !diffusion {
             return Err(bad("expected gemma4 GGUF"));
         }
         let u = |key: &str| {
@@ -45,6 +55,12 @@ impl Gemma4 {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let moe = (width, ff, count, heads, experts) == (2816, 2112, 30, 16, 128);
+        if diffusion && !moe {
+            return Err(bad("DiffusionGemma requires the 26B-A4B graph"));
+        }
+        if diffusion && !(1..=8).contains(&max_batch) {
+            return Err(bad("DiffusionGemma requires 1..8 concurrent slots"));
+        }
         // Exact graph allowlist, not a family alias. Per-layer embeddings and
         // shared target KV remain unsupported on both elected geometries.
         if (!moe && (width, ff, count, heads, experts) != (5376, 21504, 60, HEADS, 0))
@@ -137,8 +153,23 @@ impl Gemma4 {
             (CHUNK * (width * 5 + HEADS * 512 * 2 + 4096 * 2 + scratch_ff * 2 + 9) * 4
                 + max_batch * (page_stride + vocab + HEADS * SPLITS * 514) * 4
                 + gemm_bytes) as u64
-                + if moe { moe::Workspace::bytes(CHUNK) } else { 0 };
-        let device = MetalDevice::new(budget)?;
+                + if moe { moe::Workspace::bytes(CHUNK) } else { 0 }
+                + if diffusion {
+                    diffusion::Lane::workspace_bytes(max_batch)
+                } else {
+                    0
+                };
+        let device = if diffusion {
+            let required = map
+                .total_len()
+                .saturating_add(kv_bytes)
+                .saturating_add(scratch_bytes)
+                .saturating_add(64 << 20);
+            diffusion_residency::admit(required, map.total_len(), budget)?;
+            MetalDevice::new_planned(budget, required)?
+        } else {
+            MetalDevice::new(budget)?
+        };
         if map
             .total_len()
             .saturating_add(kv_bytes)
@@ -169,6 +200,14 @@ impl Gemma4 {
                 Weight::load(&device, &map, &format!("blk.{i}.{name}.weight"), dims)
             };
             let scale = w("layer_output_scale", &[1])?;
+            if diffusion {
+                let enc = w("enc_layer_output_scale", &[1])?;
+                if enc.ty != 0
+                    || unsafe { enc.buffer.read_f32(0, 1) != scale.buffer.read_f32(0, 1) }
+                {
+                    return Err(bad("encoder and decoder layer scales differ"));
+                }
+            }
             if scale.ty != 0 {
                 return Err(bad("layer scale must be F32"));
             }
@@ -212,7 +251,7 @@ impl Gemma4 {
                 values: device.alloc(bytes)?,
             });
         }
-        let weight_bytes = device.allocated_bytes() - kv_bytes;
+        let mut weight_bytes = device.allocated_bytes() - kv_bytes;
         let a = |n: usize| device.alloc(CHUNK * n * 4);
         let scratch = Scratch {
             rows: CHUNK,
@@ -242,7 +281,15 @@ impl Gemma4 {
         } else {
             None
         };
+        let diffusion = if diffusion {
+            let lane = diffusion::Lane::load_gguf(&device, &map, max_batch)?;
+            weight_bytes += lane.weight_bytes();
+            Some(lane)
+        } else {
+            None
+        };
         Ok(Self {
+            diffusion,
             muse: false,
             mlx: false,
             device,

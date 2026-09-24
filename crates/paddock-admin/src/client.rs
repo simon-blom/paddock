@@ -54,6 +54,10 @@ impl AdminClient {
         self.get_json("/v1/config-status").await
     }
 
+    pub async fn residency(&self) -> Result<Option<crate::residency::Snapshot>, AdminError> {
+        self.get_json("/v1/residency").await
+    }
+
     pub async fn health(&self) -> Result<Health, AdminError> {
         self.get_json("/v1/health").await
     }

@@ -1,6 +1,47 @@
 use super::*;
 impl Whisper {
+    /// Peak GPU envelope for this fixed-shape backend, including alignment.
+    /// Metadata-only: also used before an on-demand runner opens its listener.
+    pub fn residency_bytes(map: &MappedGguf, context: usize, slots: usize) -> Result<u64> {
+        if !(1..=MAX_BATCH).contains(&slots) || context < 8 {
+            return Err(error(
+                "Whisper requires 1..16 slots and at least 8 context tokens",
+            ));
+        }
+        let mut source = 0u64;
+        let mut widened = 0u64;
+        let mut peak = 0u64;
+        for tensor in &map.gguf().tensors {
+            let (_, bytes) = map
+                .tensor_bytes(&tensor.name)
+                .map_err(|e| error(e.to_string()))?;
+            source += bytes.len() as u64;
+            if tensor.dims.len() == 1 || tensor.name.ends_with("embed_positions.weight") {
+                widened += bytes.len() as u64;
+                peak = peak.max(bytes.len() as u64);
+            }
+        }
+        let ctx = context.min(448);
+        let kv = (L * slots * (T + ctx) * D * 4) as u64;
+        let scratch = Scratch::sizes(slots).iter().sum::<usize>() as u64;
+        let admission = (slots.min(ENC_BATCH) * (3000 * 128 * 4 + T.div_ceil(32) * 16)) as u64;
+        let alignment = super::timing::reservation_bytes(ctx);
+        Ok(source + widened + peak.max(kv + scratch + admission + alignment))
+    }
+
     pub fn load(path: &Path, context: usize, budget: Option<u64>) -> Result<Self> {
+        Self::load_for_batch(path, context, budget, 1)
+    }
+
+    pub fn load_for_batch(
+        path: &Path,
+        context: usize,
+        budget: Option<u64>,
+        slots: usize,
+    ) -> Result<Self> {
+        if !(1..=MAX_BATCH).contains(&slots) {
+            return Err(error("decode slots must be 1..16"));
+        }
         if context < 8 {
             return Err(error("decoder context must be at least 8 tokens"));
         }
@@ -71,11 +112,18 @@ impl Whisper {
             }
             source_bytes += b.len() as u64;
         }
-        let device = MetalDevice::new(budget)?;
-        if source_bytes + 32 * 1024 * 1024 > device.budget_bytes() {
-            return Err(MetalError::Memory("Whisper weights exceed grant".into()));
-        }
         let ctx = context.min(448);
+        let required = Self::residency_bytes(&map, ctx, slots)?;
+        let host = paddock_engine::host_memory::sample()
+            .ok_or_else(|| MetalError::Memory("cannot read physical memory availability".into()))?;
+        let available = host.available.saturating_sub(1 << 30);
+        paddock_engine::host_memory::check(required, available, budget)
+            .map_err(MetalError::Memory)?;
+        // The mapped checkpoint and GPU copy coexist while loading. Do not
+        // pretend unified memory provides an independent host and VRAM pool.
+        paddock_engine::host_memory::check(required + source_bytes, available, None)
+            .map_err(MetalError::Memory)?;
+        let device = MetalDevice::new_planned(budget, required)?;
         let conv1 = linear(&device, &map, "encoder.conv1", 3 * 128, D)?;
         let conv2 = linear(&device, &map, "encoder.conv2", 3 * D, D)?;
         let enc_pos = wide(&device, &map, "encoder.embed_positions.weight")?;

@@ -242,6 +242,72 @@ fn expect_dims(name: &str, got: &[usize], want: &[usize]) -> Result<(), GpuModel
 }
 
 impl GpuWhisper {
+    /// Conservative serving envelope before any weight upload. Includes both
+    /// KV pools, encoder batch workspaces, 32-row alignment scratch and selected
+    /// attention heads. The executor adds driver/allocator slack separately.
+    pub fn residency_bytes(map: &MappedGguf, max_ctx: usize, slots: usize) -> Result<u64, String> {
+        let u = |key: &str| {
+            map.gguf()
+                .arch_field(key)
+                .and_then(Value::as_u64)
+                .filter(|&n| n > 0 && n <= 1_000_000)
+                .map(u128::from)
+                .ok_or_else(|| format!("invalid Whisper memory-plan field {key}"))
+        };
+        if !(1..=1024).contains(&slots) {
+            return Err("Whisper slots must be 1..1024".into());
+        }
+        let d = u("d_model")?;
+        let n = u("max_source_positions")?;
+        let ctx = u("max_target_positions")?.min(max_ctx as u128);
+        let layers = u("decoder.layer_count")?;
+        let heads = u("decoder.head_count")?;
+        let vocab = u("vocab_size")?;
+        let bins = u("mel.bins")?;
+        let ff = u("encoder.ffn_length")?.max(u("decoder.ffn_length")?);
+        let b = super::encoder::enc_batch_env() as u128;
+        let cap = slots as u128;
+        // FP16 is an upper bound even when explicitly using FP8 KV.
+        let kv = layers * cap * (n + ctx) * d * 4;
+        let encoder = (b * 2 * n + 1) * bins * 4
+            + b * 9 * n * 4
+            + b * (6 * n * bins).max(3 * n * d) * 4
+            + (b * 2 * n + 1) * d * 4
+            + b * (6 * n * bins).max(3 * n * d).max(n * ff) * 2
+            + b * (11 * n * d * 4 + n * ff * 4 + n * d * 2);
+        let decoder =
+            cap.max(32) * (26 * d + 6 * ff + 4 * vocab + heads * 32 * (d / heads + 2) * 4 + 52);
+        let cross_landing = b * n * d * (2 + layers * 4);
+        let selection = super::align::heads_for(
+            layers as usize,
+            heads as usize,
+            bins as usize,
+            vocab as usize,
+        )
+        .unwrap_or_else(|| super::align::fallback_heads(layers as usize, heads as usize));
+        let alignment = selection.heads.len() as u128 * ((ctx + 1) * n * 4 + 4);
+        // The F32 positional and 1-D norm/bias planes are wider than the file.
+        let mut widening = 0u128;
+        let mut staging = 0u128;
+        for tensor in &map.gguf().tensors {
+            let (_, bytes) = map.tensor_bytes(&tensor.name).map_err(|e| e.to_string())?;
+            staging = staging.max(bytes.len() as u128);
+            if tensor.dims.len() == 1 || tensor.name.ends_with("embed_positions.weight") {
+                widening += bytes.len() as u128 * 2;
+            }
+        }
+        (map.total_len() as u128
+            + widening
+            + staging
+            + kv
+            + encoder
+            + decoder
+            + cross_landing
+            + alignment)
+            .try_into()
+            .map_err(|_| "Whisper memory plan overflow".into())
+    }
+
     pub fn load(
         exec: Arc<GpuExecutor>,
         map: &MappedGguf,

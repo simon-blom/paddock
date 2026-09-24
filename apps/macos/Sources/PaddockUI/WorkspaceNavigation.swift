@@ -11,6 +11,7 @@ enum StudioDestination: String, CaseIterable, Identifiable {
   case newChat = "New chat"
   case chats = "Chats"
   case prompts = "Prompts"
+  case reads = "Reads"
   case settings = "Settings"
   // The native shell puts these destinations at the sidebar bottom, unlike
   // the web's separate ActivityBar.
@@ -21,6 +22,7 @@ enum StudioDestination: String, CaseIterable, Identifiable {
     case .newChat: "square.and.pencil"
     case .chats: "bubble.left.and.bubble.right"
     case .prompts: "text.alignleft"
+    case .reads: "list.bullet.clipboard"
     case .settings: "gearshape"
     }
   }

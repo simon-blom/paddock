@@ -309,7 +309,18 @@ pub async fn handle(
     if let Some(m) = &q.model {
         tracing::debug!(asked = %m, serving = %lane.model, "realtime: model names a deployment");
     }
-    ws.on_upgrade(move |socket| run(socket, lane))
+    let lease = if let LaneKind::Whisper { transcriber, .. } = &lane.kind {
+        match transcriber.session_lease().await {
+            Ok(lease) => lease,
+            Err(error) => return crate::asr_residency::error_response(error),
+        }
+    } else {
+        None
+    };
+    ws.on_upgrade(move |socket| async move {
+        let _lease = lease;
+        run(socket, lane).await;
+    })
 }
 
 /// Everything a session needs from the loaded model, cloned so the socket task
@@ -331,7 +342,7 @@ struct Lane {
 #[derive(Clone)]
 enum LaneKind {
     Whisper {
-        transcriber: paddock_engine::transcriber::Transcriber,
+        transcriber: crate::asr_residency::Handle,
         tok: Arc<paddock_tokenizer::GgufTokenizer>,
         /// the checkpoint's timestamp geometry - needed here only to tell a
         /// timestamp token from a text one when the marker rule reads a

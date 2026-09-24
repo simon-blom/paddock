@@ -6,7 +6,7 @@
 import { copyText } from '@/lib/clipboard'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useFleetStore } from '@/stores/fleet'
+import { useFleetStore, type ResidencySnapshot } from '@/stores/fleet'
 import { useDownloadsStore, jobActive } from '@/stores/downloads'
 import { selectStudioModel } from '@/lib/select-model'
 import { gpuApi } from '@/lib/api'
@@ -111,6 +111,36 @@ function uptime(s: number | null | undefined): string {
   if (s < 60) return `${s}s`
   if (s < 3600) return `${Math.floor(s / 60)}m`
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+
+/** What the model is doing on a runner that loads and unloads it by
+ *  policy, and the policy itself - so an endpoint that shows no VRAM
+ *  reads as idle on purpose, not as broken. */
+function residencyPhase(s: ResidencySnapshot): string {
+  switch (s.phase) {
+    case 'loaded':
+      return 'Loaded'
+    case 'loading':
+      return 'Loading'
+    case 'unloading':
+      return 'Unloading'
+    case 'failed':
+      return s.last_error ? `Load failed - ${s.last_error}` : 'Load failed'
+    default:
+      return s.policy.load === 'on_demand' ? 'Idle - loads on the first request' : 'Unloaded'
+  }
+}
+function residencyPolicy(s: ResidencySnapshot): string {
+  const load = s.policy.load === 'on_demand' ? 'On first request' : 'At runner startup'
+  const idle =
+    s.policy.unload_after_idle_seconds == null
+      ? 'stays loaded'
+      : `unloads after ${s.policy.unload_after_idle_seconds} s idle`
+  return `${load} · ${idle}`
+}
+function residencyCounts(s: ResidencySnapshot): string {
+  const last = s.last_load_ms != null ? ` · last load ${s.last_load_ms} ms` : ''
+  return `${s.loads} load${s.loads === 1 ? '' : 's'} · ${s.unloads} unload${s.unloads === 1 ? '' : 's'}${last}`
 }
 
 /** Human status labels - Title case, "Running" instead of API-speak "ok". */
@@ -309,6 +339,10 @@ const noTools = computed(() => !!cfg.value && !webProvider.value && !mcpLabels.v
               </template>
             </dd>
             <dt>GPU</dt><dd>{{ liveGpuLabel }}</dd>
+            <template v-if="row.residency">
+              <dt>Model</dt><dd>{{ residencyPhase(row.residency) }}</dd>
+              <dt>Loading</dt><dd>{{ residencyPolicy(row.residency) }} · {{ residencyCounts(row.residency) }}</dd>
+            </template>
             <dt>PID</dt><dd>{{ row.pid }}</dd>
             <dt>Runner</dt><dd>v{{ row.version ?? '-' }}</dd>
           </dl>

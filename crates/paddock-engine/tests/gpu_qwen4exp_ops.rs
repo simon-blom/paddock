@@ -11,6 +11,7 @@
 mod common;
 
 use paddock_engine::gpu::GpuExecutor;
+use paddock_engine::gpu::qsa::QsaRoute;
 use paddock_kernels::reference::qwen4exp as rq;
 
 /// The house deterministic input LCG.
@@ -842,62 +843,76 @@ fn qsa_logits_topk_match_reference() {
     let d_slots = exec
         .to_device_u32(&rows.iter().map(|&(s, _)| s as u32).collect::<Vec<_>>())
         .expect("slots");
-    let mut d_scores = exec.to_device(&vec![f32::NAN; n * cap]).expect("scores");
-    let mut d_sel = exec.to_device_u32(&vec![u32::MAX; n * k]).expect("sel");
-    let mut d_cnt = exec.to_device_u32(&vec![0; n]).expect("cnt");
-    exec.q4x_qsa_logits(
-        &d_q,
-        &d_cache,
-        &d_pos,
-        &d_slots,
-        &mut d_scores,
-        0,
-        n,
-        heads,
-        hd,
-        cap,
-        cr,
-        k,
-    )
-    .expect("logits");
-    exec.q4x_qsa_topk(&d_scores, &d_pos, &mut d_sel, &mut d_cnt, 0, n, cap, cr, k)
-        .expect("topk");
-    let scores = exec.to_host(&d_scores).expect("scores");
-    let sel = exec.to_host_u32(&d_sel).expect("sel");
-    let cnt = exec.to_host_u32(&d_cnt).expect("cnt");
-    for (r, &(s, p)) in rows.iter().enumerate() {
-        let nb = (p + 1) / cr;
-        let keys = &cache[s * cap * hd..(s * cap + nb) * hd];
-        let want_scores = rq::qsa_scores(&q[r * heads * hd..(r + 1) * heads * hd], keys, hd);
-        let got_sel = &sel[r * k..r * k + cnt[r] as usize];
-        assert_eq!(cnt[r] as usize, nb.min(k), "row {r}: count");
-        if nb <= k {
-            let all: Vec<u32> = (0..nb as u32).collect();
+    // the SIMT scores, then the tensor-core ones (bf16 mma: q and keys are
+    // bf16 values here, so only the f32 summation order differs)
+    let mut routes = vec![QsaRoute::Simt];
+    if exec.has_qsa_logits_mma() {
+        routes.push(QsaRoute::Mma);
+    } else {
+        common::missing("pack has no tensor-core QSA scores (slot 670)");
+    }
+    for route in routes {
+        let mut d_scores = exec.to_device(&vec![f32::NAN; n * cap]).expect("scores");
+        let mut d_sel = exec.to_device_u32(&vec![u32::MAX; n * k]).expect("sel");
+        let mut d_cnt = exec.to_device_u32(&vec![0; n]).expect("cnt");
+        exec.q4x_qsa_logits(
+            route,
+            &d_q,
+            &d_cache,
+            &d_pos,
+            &d_slots,
+            &mut d_scores,
+            0,
+            n,
+            heads,
+            hd,
+            cap,
+            cr,
+            k,
+        )
+        .expect("logits");
+        exec.q4x_qsa_topk(&d_scores, &d_pos, &mut d_sel, &mut d_cnt, 0, n, cap, cr, k)
+            .expect("topk");
+        let scores = exec.to_host(&d_scores).expect("scores");
+        let sel = exec.to_host_u32(&d_sel).expect("sel");
+        let cnt = exec.to_host_u32(&d_cnt).expect("cnt");
+        for (r, &(s, p)) in rows.iter().enumerate() {
+            let nb = (p + 1) / cr;
+            let keys = &cache[s * cap * hd..(s * cap + nb) * hd];
+            let want_scores = rq::qsa_scores(&q[r * heads * hd..(r + 1) * heads * hd], keys, hd);
+            let got_sel = &sel[r * k..r * k + cnt[r] as usize];
+            assert_eq!(cnt[r] as usize, nb.min(k), "row {r}: count");
+            if nb <= k {
+                let all: Vec<u32> = (0..nb as u32).collect();
+                assert_eq!(
+                    got_sel,
+                    &all[..],
+                    "row {r}: nb {nb} must select every block"
+                );
+                continue;
+            }
+            let got_scores = &scores[r * cap..r * cap + nb];
+            for (b, (g, w)) in got_scores.iter().zip(&want_scores).enumerate() {
+                let tol = 1e-5 * w.abs().max(1.0);
+                assert!(
+                    (g - w).abs() <= tol,
+                    "{route:?} row {r} block {b}: score {g} vs {w}"
+                );
+            }
+            let want_sel = rq::qsa_select(got_scores, k);
             assert_eq!(
                 got_sel,
-                &all[..],
-                "row {r}: nb {nb} must select every block"
+                &want_sel[..],
+                "row {r}: selection of the kernel's own scores"
             );
-            continue;
-        }
-        let got_scores = &scores[r * cap..r * cap + nb];
-        for (b, (g, w)) in got_scores.iter().zip(&want_scores).enumerate() {
-            let tol = 1e-5 * w.abs().max(1.0);
-            assert!((g - w).abs() <= tol, "row {r} block {b}: score {g} vs {w}");
-        }
-        let want_sel = rq::qsa_select(got_scores, k);
-        assert_eq!(
-            got_sel,
-            &want_sel[..],
-            "row {r}: selection of the kernel's own scores"
-        );
-        let zeros = got_scores.iter().filter(|&&v| v == 0.0).count();
-        eprintln!("qsa row {r}: nb {nb}, {zeros} relu-zero scores, selection exact");
-        if r == 6 {
-            assert!(
-                nb - zeros < k,
-                "row 6 was meant to tie at zero across the k-th place"
-            );
+            let zeros = got_scores.iter().filter(|&&v| v == 0.0).count();
+            eprintln!("qsa {route:?} row {r}: nb {nb}, {zeros} relu-zero scores, selection exact");
+            if r == 6 {
+                assert!(
+                    nb - zeros < k,
+                    "row 6 was meant to tie at zero across the k-th place"
+                );
+            }
         }
     }
 }
@@ -1076,32 +1091,49 @@ fn qsa_attn_matches_reference() {
                 }
             }
         }
-        let mut outs = Vec::new();
-        for splits in [1usize, 5] {
-            let mut d_po = exec
-                .to_device(&vec![f32::NAN; n * nkv * splits * g * hd])
-                .expect("po");
-            let mut d_pml = exec
-                .to_device(&vec![f32::NAN; n * nkv * splits * g * 2])
-                .expect("pml");
-            let mut d_out = exec.to_device(&vec![f32::NAN; n * nh * hd]).expect("out");
-            exec.q4x_qsa_attn(
-                &d_q, &d_k, &d_v, &d_pos, &d_slots, &d_sel, &d_cnt, &mut d_po, &mut d_pml, n, nh,
-                nkv, hd, max_ctx, k, cr, splits, scale, dtype,
-            )
-            .expect("qsa_attn");
-            exec.q4x_qsa_combine(&d_po, &d_pml, &mut d_out, n, nh, nkv, hd, splits)
-                .expect("combine");
-            let got = exec.to_host(&d_out).expect("dtoh");
-            let diff = max_abs_diff(&got, &want);
-            eprintln!(
-                "qsa_attn {dtype:?} splits {splits}: max_abs_diff vs f64 reference {diff:.2e}"
-            );
-            // f32 walk + __expf vs an f64 reference, outputs O(0.1)
-            assert!(diff < 2e-4, "qsa_attn {dtype:?} splits {splits}: {diff}");
-            outs.push(got);
+        // the f32 SIMT anchor (measured ~4e-8), then the tensor-core kernel
+        // (f16 Q/K/P operands, the dense f16 attention kernels' class:
+        // measured ~2.8e-5 at f16 and e4m3 KV) - one bar holds both
+        let mut routes = vec![(QsaRoute::Simt, 2e-4f32, 1e-4f32)];
+        if exec.has_qsa_attn_mma() {
+            routes.push((QsaRoute::Mma, 2e-4, 1e-4));
+        } else {
+            common::missing("pack has no tensor-core QSA attention (slot 669)");
         }
-        let split_diff = max_abs_diff(&outs[0], &outs[1]);
-        assert!(split_diff < 1e-4, "splits disagree: {split_diff}");
+        for (route, bar, split_bar) in routes {
+            let mut outs = Vec::new();
+            for splits in [1usize, 5] {
+                let mut d_po = exec
+                    .to_device(&vec![f32::NAN; n * nkv * splits * g * hd])
+                    .expect("po");
+                let mut d_pml = exec
+                    .to_device(&vec![f32::NAN; n * nkv * splits * g * 2])
+                    .expect("pml");
+                let mut d_out = exec.to_device(&vec![f32::NAN; n * nh * hd]).expect("out");
+                exec.q4x_qsa_attn(
+                    route, &d_q, &d_k, &d_v, &d_pos, &d_slots, &d_sel, &d_cnt, &mut d_po,
+                    &mut d_pml, n, nh, nkv, hd, max_ctx, k, cr, splits, scale, dtype,
+                )
+                .expect("qsa_attn");
+                exec.q4x_qsa_combine(&d_po, &d_pml, &mut d_out, n, nh, nkv, hd, splits)
+                    .expect("combine");
+                let got = exec.to_host(&d_out).expect("dtoh");
+                let diff = max_abs_diff(&got, &want);
+                eprintln!(
+                    "qsa_attn {route:?} {dtype:?} splits {splits}: max_abs_diff vs f64 reference {diff:.2e}"
+                );
+                // outputs O(0.1)
+                assert!(
+                    diff < bar,
+                    "qsa_attn {route:?} {dtype:?} splits {splits}: {diff}"
+                );
+                outs.push(got);
+            }
+            let split_diff = max_abs_diff(&outs[0], &outs[1]);
+            assert!(
+                split_diff < split_bar,
+                "{route:?} splits disagree: {split_diff}"
+            );
+        }
     }
 }

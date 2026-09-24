@@ -824,7 +824,7 @@
           "model": { "type": "string" },
           "answers": {
             "type": "object",
-            "description": "id -> answer, one per question. Every answer carries `confidence` (the mean probability of the reported label over the reads), `agreement` (the share of reads that picked it) and `outside` (the mass the model put outside the label set at that slot - the calibration signal a top-k logprobs read cannot see).",
+            "description": "id -> answer, one per question. Every answer carries `confidence` (Jev's measure: (n * max - 1) / (n - 1) over the mean label probabilities, 0 at uniform and 1 at certainty - (3 * max - 1) / 2 for three options; on a noul answer n = 2), `agreement` (the share of reads that picked it) and `outside` (the mass the model put outside the label set at that slot - the calibration signal a top-k logprobs read cannot see).",
             "additionalProperties": {
               "type": "object",
               "required": ["type", "confidence", "agreement", "outside"],

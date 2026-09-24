@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod residency;
 pub mod server;
 pub mod types;
 pub mod version;

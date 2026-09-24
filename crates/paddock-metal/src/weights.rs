@@ -221,7 +221,7 @@ impl Weight {
         let supported = if iq_only {
             crate::iquant::is_iq(t.raw_type)
         } else {
-            matches!(t.raw_type, 0 | 1 | 8 | 12 | 13 | 14 | 23 | 30)
+            matches!(t.raw_type, 0 | 1 | 6 | 8 | 12 | 13 | 14 | 23 | 30)
         };
         if !supported {
             return Err(MetalError::Model(format!(
@@ -232,9 +232,9 @@ impl Weight {
         if crate::iquant::is_iq(t.raw_type) {
             crate::iquant::validate(t.raw_type, dims, bytes.len())?;
         }
-        if t.raw_type == 8 && !dims[0].is_multiple_of(32) {
+        if matches!(t.raw_type, 6 | 8) && !dims[0].is_multiple_of(32) {
             return Err(MetalError::Model(format!(
-                "{name}: Q8 row is not block aligned"
+                "{name}: Q5_0/Q8_0 row is not block aligned"
             )));
         }
         if matches!(t.raw_type, 12 | 13 | 14 | 23) && !dims[0].is_multiple_of(256) {
@@ -247,6 +247,7 @@ impl Weight {
             .try_fold(1usize, |n, &d| n.checked_mul(d))
             .ok_or_else(|| MetalError::Model(format!("{name}: shape overflow")))?;
         let expected = match t.raw_type {
+            6 => (elements / 32).checked_mul(22),
             8 => (elements / 32).checked_mul(34),
             12 => (elements / 256).checked_mul(144),
             13 => (elements / 256).checked_mul(176),

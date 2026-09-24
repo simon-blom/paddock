@@ -532,6 +532,7 @@ fn prepare(
     } else {
         Some(Value::Object(kwargs_obj))
     };
+    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
 
     // deepseek2-ocr instruction mapping  - same seam as chat:
     // resolve the `ocr` object + prompt vocabulary against the normalized
@@ -566,7 +567,7 @@ fn prepare(
     // (This also fixes a latent gemma4 bug: the old bare `ends_with("<think>\n")`
     // read gemma4-thinking as off here, so a response_format grammar clamped
     // from token 0 and the thought channel could never open.)
-    let thinking_open = model.dialect.thinking_open(&prompt);
+    let thinking_open = model.dialect.thinking_open_for_arch(&model.arch, &prompt);
     let think_budget = budget_req
         .map(|n| crate::chat::think_budget(model, n, thinking_open, "reasoning.max_tokens"))
         .transpose()?;

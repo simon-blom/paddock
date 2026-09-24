@@ -646,6 +646,8 @@ export async function projectConfig(
  *  reconciled by the one implementation that also runs on a start. Nothing here
  *  is re-derived in the browser, which is the entire point of the endpoint. */
 export interface ConfigProjection {
+  residency?: import('@/stores/fleet').ResidencyConfig | null
+  residency_supported?: boolean
   model: string
   artifact: string | null
   /** Drafter-artifact pin; null = follow the catalog default. */

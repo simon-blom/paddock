@@ -654,7 +654,7 @@ kv_default = "fp8_e4m3"
   # the 26B-A4B MoE scratch (gemma-4-26b-a4b's measured 6.07 GiB at 32
   # slots) plus one canvas' logits plane (256 x 262144 x 4 B)
   workspace = 6338927036
-  runtime = { backends = ["cuda"] }
+  runtime = { backends = ["cuda", "metal"], default_spec = "off", backend_overrides = { metal = { default = false, companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 26878831200, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 26878831200, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } } } }
 
   [model.artifact.shape]
   # file bytes + the lane's resident planes (E^T bf16 1,476,395,008 B + the
@@ -684,11 +684,106 @@ kv_default = "fp8_e4m3"
     sha256 = "dd43baf2fb49a842ea7c106a7f3ce8d2e862e7d28d798d1d86bf94b48e50a607"
     size = 26878831200
 
-  # No compact (Q4_K_M) row yet: unsloth's Q4_K_M carries a Q6_K
-  # `token_embd.weight`, and the lane's embedding consumers (the row gathers
-  # and the transposed-embedding build) read Q8_0/bf16 only - the file
-  # (16,806,810,208 B, sha 24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a1036
-  # 45353114c8028bc5) loads once a k-quant embedding path lands.
+
+  # Metal keeps packed weights. No resident E^T copy, vision or drafter.
+  # The conservative Metal shape covers two sliding banks (ring up to 1536),
+  # encoder + decoder global KV and the spare sequence. Workspace covers all
+  # eight slots' probability planes, shared logits and expert scratch.
+  [[model.artifact]]
+  id = "q4"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact"
+  quant = "Q4_K_M"
+  runtime = { backends = ["metal"], companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "f16", default_max_ctx = 32768, default_max_batch = 1, default_spec = "off", memory = { weight_bytes = 16806810208, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 16806810208, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } }
+  source = { repo = "unsloth/diffusiongemma-26B-A4B-it-GGUF", revision = "f4183a2c7a354128d02545752303c4354d165bf0", base_model = "google/diffusiongemma-26B-A4B-it", license = "apache-2.0", license_url = "https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/main/LICENSE" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+    dest = "diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+    sha256 = "24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a103645353114c8028bc5"
+    size = 16806810208
+
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 4-bit"
+  quant = "affine-4/8"
+  runtime = { backends = ["metal"], checkpoint_dir = true, companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "auto", default_max_ctx = 32768, default_max_batch = 1, default_spec = "off", backend_overrides = { metal = { default = true } }, memory = { weight_bytes = 16543055405, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 16543055405, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } }
+  source = { repo = "mlx-community/diffusiongemma-26B-A4B-it-4bit", revision = "a7a81407613811e8ba63af92ac0d852b809e191f", base_model = "google/diffusiongemma-26B-A4B-it", license = "apache-2.0", license_url = "https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/main/LICENSE" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/model-00001-of-00004.safetensors"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/model-00001-of-00004.safetensors"
+    sha256 = "4e9e90d11166740e647ab81edc7eb85ce93fbd97bd6a3b352407224b6337833a"
+    size = 5215121220
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/config.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/config.json"
+    sha256 = "b41320c97651075363f2895e2cbb3d1580670ee11edb653a14290a35bbf7cac5"
+    size = 58854
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/generation_config.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/generation_config.json"
+    sha256 = "99334f763c3dbe8b161aeaca1c150a05344299fda2d2e4a0e1d342c744461200"
+    size = 357
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/tokenizer.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/tokenizer.json"
+    sha256 = "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    size = 32169626
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/tokenizer_config.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/tokenizer_config.json"
+    sha256 = "c1112569480ce4f86410f29131ff779f8944097f118f5524f4762ca85a32aa5b"
+    size = 2749
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/chat_template.jinja"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/chat_template.jinja"
+    sha256 = "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+    size = 17336
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/model.safetensors.index.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/model.safetensors.index.json"
+    sha256 = "9af3e8635b62d12870e3fe0cc63eafb4bc42d9e031eac409eb5f32cdc974e902"
+    size = 165362
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/model-00002-of-00004.safetensors"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/model-00002-of-00004.safetensors"
+    sha256 = "67508ed60a26b9e725be0fb4c2e5bb8f0b76f02ecd33650c66c3330164257ad2"
+    size = 5358706305
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/model-00003-of-00004.safetensors"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/model-00003-of-00004.safetensors"
+    sha256 = "a360651889edf28e7cc50e6d0e30f617b052d8b998cd9b826394f0325cfe9bad"
+    size = 5367044182
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/model-00004-of-00004.safetensors"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/model-00004-of-00004.safetensors"
+    sha256 = "ead1033d8d0907f5f7820efb5292a87359ba4683ce9b947fddf5e2e57792ae5f"
+    size = 602183698
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/processor_config.json"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/processor_config.json"
+    sha256 = "b113d8d45d04095c078674b92ec5f32b2857abee2c99c6993e1e557affd69cf9"
+    size = 911
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-MLX-4bit/README.md"
+    dest = "diffusiongemma-26B-A4B-it-MLX-4bit/README.md"
+    sha256 = "ad3262ee1b00cc856307a469e710991295712fee20480789aa522152785866c8"
+    size = 779
 
 # Qwen3.5/3.6 sourcing: official + unsloth only.
 # Elected line = the unsloth *-MTP-GGUF repos - the MTP/nextn tensors are

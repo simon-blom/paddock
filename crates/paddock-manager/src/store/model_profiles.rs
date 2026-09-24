@@ -34,6 +34,7 @@ impl Store {
             "kv_cache_dtype",
             "vram_budget",
             "kv_offload",
+            "residency",
             "runtime_options",
         ];
         let mut safe = serde_json::Map::new();

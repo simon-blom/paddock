@@ -23,6 +23,7 @@ pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod gpu_model;
 pub mod granite_layout;
+pub mod host_memory;
 pub mod image;
 pub mod kv_plan;
 pub mod kv_pool;

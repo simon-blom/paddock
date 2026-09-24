@@ -7,6 +7,8 @@ use std::path::Path;
 #[path = "mlx_multimodal.rs"]
 mod multimodal;
 pub use multimodal::{MultimodalConfig, MultimodalFamily};
+mod diffusion;
+pub use diffusion::DiffusionConfig;
 #[path = "mlx_llama.rs"]
 mod llama;
 pub use llama::MiniCpmConfig;

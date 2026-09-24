@@ -30,6 +30,19 @@ struct TransportPolicyTests {
       NativeConversationTransport.Endpoint.cloud("provider-id").path
         == "api/cloud/provider-id/v1/responses")
   }
+  @Test func localApiErrorsPreserveActionableMessagesWithoutRawJson() async throws {
+    let host = try descriptor("http://127.0.0.1:1234", String(repeating: "a", count: 64))
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [ReadsErrorProtocol.self]
+    let transport = try NativeConversationTransport(host: host, configuration: config)
+    do {
+      _ = try await transport.api("api/reads", method: "POST", body: .object([:]))
+      Issue.record("Expected the revision conflict")
+    } catch {
+      #expect(error.localizedDescription == "This question set changed. Reload it before saving.")
+    }
+    await transport.close()
+  }
   private func descriptor(_ origin: String, _ token: String) throws -> StudioHost {
     try JSONDecoder().decode(
       StudioHost.self,
@@ -37,4 +50,21 @@ struct TransportPolicyTests {
         "origin": origin, "cookieName": "paddock_desktop_session", "session": token,
       ]))
   }
+}
+
+private final class ReadsErrorProtocol: URLProtocol, @unchecked Sendable {
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() {
+    let response = HTTPURLResponse(
+      url: request.url!, statusCode: 409, httpVersion: nil,
+      headerFields: ["Content-Type": "application/json"])!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    client?.urlProtocol(
+      self,
+      didLoad: Data(
+        #"{"error":{"message":"This question set changed. Reload it before saving."}}"#.utf8))
+    client?.urlProtocolDidFinishLoading(self)
+  }
+  override func stopLoading() {}
 }

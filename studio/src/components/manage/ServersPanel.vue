@@ -224,6 +224,37 @@ function statusTone(r: FleetRow): string {
   return 'bad'
 }
 
+/** The chip beside the status on a runner that loads and unloads its model
+ *  by policy: what the model itself is doing now. "Running" alone with a
+ *  blank VRAM cell read as a fault; this says the listener is up and the
+ *  model is idle, loading, loaded or failed. Nothing for every other row. */
+function residencyChip(r: FleetRow): { label: string; tone: string; tip: string } | null {
+  const s = r.residency
+  if (!s) return null
+  const p = s.policy
+  const policy = `${p.load === 'on_demand' ? 'loads on first request' : 'loads at startup'} · ${
+    p.unload_after_idle_seconds == null
+      ? 'stays loaded'
+      : `unloads after ${p.unload_after_idle_seconds} s idle`
+  }`
+  const counts = `${s.loads} load${s.loads === 1 ? '' : 's'} · ${s.unloads} unload${s.unloads === 1 ? '' : 's'}${
+    s.last_load_ms != null ? ` · last load ${s.last_load_ms} ms` : ''
+  }`
+  const tip = `${policy} · ${counts}`
+  switch (s.phase) {
+    case 'loaded':
+      return { label: 'loaded', tone: 'live', tip }
+    case 'loading':
+      return { label: 'loading', tone: 'live', tip }
+    case 'unloading':
+      return { label: 'unloading', tone: 'idle', tip }
+    case 'failed':
+      return { label: 'load failed', tone: 'warn', tip: s.last_error ? `${s.last_error} · ${tip}` : tip }
+    default:
+      return { label: p.load === 'on_demand' ? 'idle' : 'unloaded', tone: 'idle', tip }
+  }
+}
+
 const copiedPort = ref<number | null>(null)
 async function copyEndpoint(r: FleetRow): Promise<void> {
   try {
@@ -463,6 +494,11 @@ async function stop(r: FleetRow): Promise<void> {
                 <span class="st" :class="`st--${statusTone(en.r)}`">
                   <span class="st__dot" /> {{ statusLabel(en.r.status) }}
                 </span>
+                <Tooltip v-if="residencyChip(en.r)" :label="residencyChip(en.r)!.tip">
+                  <span class="res" :class="`res--${residencyChip(en.r)!.tone}`">
+                    {{ residencyChip(en.r)!.label }}
+                  </span>
+                </Tooltip>
               </td>
               <td class="c-num">
                 <Tooltip
@@ -895,6 +931,26 @@ async function stop(r: FleetRow): Promise<void> {
   height: 8px;
   border-radius: 50%;
   flex: none;
+}
+/* the model's own state on a runner that loads it by policy - a quiet chip
+   after the status, coloured only when it is live or failing */
+.res {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: var(--pk-radius-full);
+  background: var(--pk-bg-inset);
+  color: var(--pk-text-muted);
+  font-size: var(--pk-font-size-xs);
+  white-space: nowrap;
+}
+.res--live {
+  background: var(--pk-status-success-subtle);
+  color: var(--pk-status-success);
+}
+.res--warn {
+  background: var(--pk-status-warning-subtle);
+  color: var(--pk-status-warning);
 }
 .st--good .st__dot {
   background: var(--pk-status-success, #4a9);

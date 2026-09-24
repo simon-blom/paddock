@@ -725,6 +725,7 @@ impl Qwen4ExpGpu {
             kv_k,
             kv_v,
             None, // the MTP head's attention is dense: it drafts, the model verifies
+            false,
             *max_tokens,
             n,
             phase,

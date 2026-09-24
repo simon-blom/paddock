@@ -3316,6 +3316,17 @@ struct KernelTableV1 {
     // tensor-core down (slot 603) takes a flat down at any 32-multiple width
     // (a partial last 128-weight stage), not only whole stages - moe/kquant.cuh.
     int (*kquant_moe_down_mma_e_tail)(void);
+    // 669: QSA attention on tensor cores (attn/qsa.cuh) - slot 666's
+    // signature and contract. Pure append - no PD_ABI_VERSION bump.
+    int (*q4x_qsa_attn_mma)(const void*, const void*, const void*, const void*, const void*,
+                            const void*, const void*, void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                            uint32_t, void*);
+    // 670: QSA block scores on tensor cores (attn/qsa.cuh) - slot 664's
+    // signature and contract. Pure append - no PD_ABI_VERSION bump.
+    int (*q4x_qsa_logits_mma)(const void*, const void*, const void*, const void*, void*,
+                              uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                              uint32_t, void*);
 };
 
 } // extern "C"

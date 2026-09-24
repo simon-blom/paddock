@@ -182,20 +182,39 @@ pub async fn available(state: &AppState, freeing: Option<u16>) -> Option<(Snapsh
         // a smaller saved ceiling. Unknown/drifted runners reserve the entire
         // backend ceiling until applied; never resell their live headroom.
         let client = paddock_admin::client::AdminClient::new(port);
-        let matches =
+        let status =
             tokio::time::timeout(std::time::Duration::from_secs(1), client.config_status())
                 .await
                 .ok()
-                .and_then(Result::ok)
-                .is_some_and(|s| {
-                    s.restart_required == Some(false)
-                        && views.iter().any(|v| v.port == port && v.pid == s.pid)
-                });
-        let budget = reservation(
-            &snapshot,
-            state.supervisor.config_vram_budget(port),
-            matches,
-        );
+                .and_then(Result::ok);
+        // A budget is a ceiling, not a reservation after confirmed unload.
+        // Fresh PID-checked state outranks a stale reconciliation ledger.
+        // Every subsequent cold load rechecks physical memory under the
+        // device-wide runner load gate; unknown/older runners stay reserved.
+        if status.as_ref().is_some_and(|s| {
+            views
+                .iter()
+                .any(|v| v.port == port && s.residency_released(v.pid))
+        }) {
+            continue;
+        }
+        let dynamic = status.as_ref().and_then(|s| {
+            views
+                .iter()
+                .find(|v| v.port == port)
+                .and_then(|v| s.residency_reservation(v.pid))
+        });
+        let matches = status.is_some_and(|s| {
+            s.restart_required == Some(false)
+                && views.iter().any(|v| v.port == port && v.pid == s.pid)
+        });
+        let budget = dynamic.unwrap_or_else(|| {
+            reservation(
+                &snapshot,
+                state.supervisor.config_vram_budget(port),
+                matches,
+            )
+        });
         reserved = reserved.saturating_add(budget.max(live));
         used = used.saturating_add(live);
         if let Ok(spec) = state

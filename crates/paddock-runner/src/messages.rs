@@ -602,6 +602,7 @@ fn render_prompt(
     if let Some(e) = effort {
         kwargs = crate::chat::merge_reasoning_effort(&model.reasoning, e, kwargs)?;
     }
+    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
 
     // deepseek2-ocr instruction mapping  - same seam as chat and
     // responses. This surface has no chat_template_kwargs channel, so the
@@ -640,7 +641,7 @@ fn render_prompt(
     // thinking-mode detection is dialect-shaped - see Dialect::thinking_open
     // (qwen pre-opens "<think>\n", laguna a bare "<think>", gemma4 pre-closes
     // when off)
-    let thinking_open = model.dialect.thinking_open(&prompt);
+    let thinking_open = model.dialect.thinking_open_for_arch(&model.arch, &prompt);
     // gemma4 thinking: pre-open the thought channel so the token sampled from
     // the prefill logits is already visible reasoning text (see g4_preopen)
     if thinking_open

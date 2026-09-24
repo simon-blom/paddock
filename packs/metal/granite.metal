@@ -44,6 +44,12 @@ inline float4 kquant4(device const uchar* w, uint ty, ulong i) {
 }
 
 inline float weight(device const uchar* w, uint ty, ulong i) {
+    if (ty == 6) {
+        device const uchar* b=w+(i/32)*22;uint j=uint(i%32);
+        uint hi=uint(b[2])|(uint(b[3])<<8)|(uint(b[4])<<16)|(uint(b[5])<<24);
+        int q=int(((b[6+j%16]>>((j/16)*4))&15)|(((hi>>j)&1)<<4))-16;
+        return float(*reinterpret_cast<device const half*>(b))*float(q);
+    }
     if(ty==12 || ty==13 || ty==14 || ty==23) return kquant4(w,ty,i&~3ul)[i%4];
     if (ty == 8) {
         ulong b = i / 32;

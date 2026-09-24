@@ -331,6 +331,15 @@ pub struct TranscribeJob {
 #[derive(Clone)]
 pub struct Transcriber {
     tx: Sender<TranscribeJob>,
+    stopped: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+struct WorkerExit(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.1.notify_all();
+    }
 }
 
 /// One in-flight request.
@@ -456,22 +465,20 @@ impl Transcriber {
     {
         let (tx, rx) = channel::<TranscribeJob>();
         let (ready_tx, ready_rx) = channel::<Result<AsrCard, String>>();
+        let stopped =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let finished = stopped.clone();
 
         std::thread::Builder::new()
             .name("paddock-transcriber".into())
             .spawn(move || {
+                // Declared before the model: signalled only AFTER its GPU objects drop.
+                let _finished = WorkerExit(finished);
                 let mut model = match build().and_then(|mut m| {
                     m.prepare_batch(slots).map_err(|e| e.to_string())?;
                     Ok(m)
                 }) {
-                    Ok(m) => {
-                        let _ = ready_tx.send(Ok(AsrCard {
-                            time_scale: m.time_scale(),
-                            word_times: m.supports_word_times(),
-                            languages: m.languages(),
-                        }));
-                        m
-                    }
+                    Ok(m) => m,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
@@ -486,14 +493,31 @@ impl Transcriber {
                         mt.model_mem_bytes.store(b, Relaxed);
                     }
                 }
+                let _ = ready_tx.send(Ok(AsrCard {
+                    time_scale: model.time_scale(),
+                    word_times: model.supports_word_times(),
+                    languages: model.languages(),
+                }));
                 schedule(&mut model, &rx, slots);
             })
             .map_err(|e| format!("spawn transcriber thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(card)) => Ok((Self { tx }, card)),
+            Ok(Ok(card)) => Ok((Self { tx, stopped }, card)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("transcriber thread died during startup".into()),
+        }
+    }
+
+    /// Close the last submission handle and wait for queued GPU work and model
+    /// destruction. Residency calls this only on a blocking disposal worker,
+    /// after all request/session leases have gone. Never abort a CUDA thread.
+    pub fn close_and_wait(self) {
+        let Self { tx, stopped } = self;
+        drop(tx);
+        let mut done = stopped.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = stopped.1.wait(done).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -622,6 +646,9 @@ fn schedule(
     let word_times_supported = model.supports_word_times();
 
     let mut take = |job: TranscribeJob, reqs: &mut HashMap<u64, Req>, order: &mut Vec<u64>| {
+        if job.reply.is_closed() {
+            return;
+        }
         // A job with no windows has nothing to admit and nothing to retire, so
         // parking it in `reqs` would leave it there forever - and now that the
         // intake gate waits on `reqs` being empty, forever means a spin rather

@@ -20,7 +20,7 @@ mod load;
 mod load_gguf;
 mod prefix;
 
-pub use forward::Qwen4ExpGpu;
+pub use forward::{QsaMode, Qwen4ExpGpu};
 pub use load::{load_layer, load_ple_projections, load_ple_table};
 
 use cudarc::driver::CudaSlice;
@@ -940,6 +940,31 @@ pub(crate) fn chunk_rows() -> usize {
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| (16..=8192).contains(&n))
             .unwrap_or(CHUNK_ROWS_DEFAULT)
+    })
+}
+
+/// The most rows one device walk of this lane carries - the size of every
+/// per-row scratch plane (activations, MoE routing, the indexer planes).
+/// It used to be the context (`max_ctx`), which made the lane cost ~1 MB of
+/// scratch per token of context (measured on GB10, UD-IQ3_XXS: 8K left 51 GB,
+/// 16K 43 GB, 32K 28 GB; 262K ran the box out of memory, 2026-09-24) - so a
+/// long context could not load at all. Now a walk longer than this splits at
+/// absolute multiples of it (the single-slot prefill and the chunked tick
+/// alike, so a resumed walk meets the boundaries the cold one did), and the
+/// context costs only its KV, state and index caches. 4096 is the envelope
+/// the lane was built and measured in (the 4K x 32 serving config, whose
+/// scratch this equals). `PADDOCK_Q38FN_WALK_ROWS` overrides (sweeps);
+/// multiples of 16 only (a walk boundary is a KV page boundary).
+const WALK_ROWS_DEFAULT: usize = 4096;
+pub(crate) fn walk_rows() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_Q38FN_WALK_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (256..=65536).contains(&n) && n.is_multiple_of(16))
+            .unwrap_or(WALK_ROWS_DEFAULT)
     })
 }
 

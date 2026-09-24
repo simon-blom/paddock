@@ -291,6 +291,7 @@ pub struct ModelIds {
     pub image: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 pub enum Format {
     /// `text/plain; version=0.0.4` - what most scrapers expect.
     Classic,
@@ -1411,7 +1412,46 @@ pub fn render_response(
         .filter(|a| a.contains("application/openmetrics-text"))
         .map_or(Format::Classic, |_| Format::OpenMetrics);
     let ct = fmt.content_type();
-    let body = state.metrics.render(fmt, state.drain.in_flight() as u64);
+    let mut body = state.metrics.render(fmt, state.drain.in_flight() as u64);
+    if state.metrics.enabled()
+        && let Some(residency) = state.asr.as_ref().and_then(|m| m.transcriber.residency())
+    {
+        let eof = body.ends_with("# EOF\n");
+        if eof {
+            body.truncate(body.len() - "# EOF\n".len());
+        }
+        for (name, value) in [
+            (
+                "paddock_model_resident",
+                u64::from(residency.phase == crate::residency::Phase::Loaded),
+            ),
+            (
+                "paddock_model_residency_leases",
+                residency.active_leases as u64,
+            ),
+            (
+                "paddock_model_residency_waiters",
+                residency.waiting_requests as u64,
+            ),
+        ] {
+            body.push_str(&format!("# TYPE {name} gauge\n{name} {value}\n"));
+        }
+        for (name, value) in [
+            ("paddock_model_loads", residency.loads),
+            ("paddock_model_unloads", residency.unloads),
+            ("paddock_model_load_failures", residency.load_failures),
+        ] {
+            let family = if matches!(fmt, Format::Classic) {
+                format!("{name}_total")
+            } else {
+                name.into()
+            };
+            body.push_str(&format!("# TYPE {family} counter\n{name}_total {value}\n"));
+        }
+        if eof {
+            body.push_str("# EOF\n");
+        }
+    }
     ([(axum::http::header::CONTENT_TYPE, ct)], body).into_response()
 }
 

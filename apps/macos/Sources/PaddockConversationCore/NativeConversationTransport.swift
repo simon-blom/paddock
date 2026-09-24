@@ -114,6 +114,19 @@ public actor NativeConversationTransport: ConversationStorage {
   private func data(_ request: URLRequest, maximum: Int) async throws -> Data {
     let (bytes, response) = try await network.bytes(for: request)
     defer { bytes.task.cancel() }
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      var errorData = Data()
+      for try await byte in bytes {
+        guard errorData.count < 64 * 1024 else { break }
+        errorData.append(byte)
+      }
+      if let value = try? JSONDecoder().decode(ConversationValue.self, from: errorData),
+        let message = value["error"]?["message"]?.string, !message.isEmpty
+      {
+        throw ConversationFailure.invalid(message)
+      }
+      throw ConversationFailure.http(http.statusCode)
+    }
     let http = try status(response)
     guard http.expectedContentLength <= Int64(maximum) else { throw ConversationFailure.tooLarge }
     var data = Data()

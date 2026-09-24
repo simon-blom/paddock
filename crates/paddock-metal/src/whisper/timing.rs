@@ -7,6 +7,16 @@ use paddock_engine::whisper::align;
 
 const CHUNK: usize = 32;
 
+pub(super) fn reservation_bytes(ctx: usize) -> u64 {
+    let heads = align::heads_for(L, 20, 128, V)
+        .expect("supported large-v3 alignment")
+        .heads
+        .len();
+    let capture = heads * (ctx + 1) * T * 4 + heads * 4;
+    let scratch = CHUNK * (7 * D * 4 + FF * 4 + 20 * 6 * 66 * 4 + 3 * 4) + 7 * 4;
+    (capture + scratch) as u64
+}
+
 struct LayerCapture {
     ids: Buffer,
     probs: Buffer,

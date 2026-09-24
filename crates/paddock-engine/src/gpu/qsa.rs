@@ -16,10 +16,45 @@ use super::{GpuError, GpuExecutor};
 /// Positions a QSA block spans (the checkpoint's `compress_ratio`).
 pub const QSA_BLOCK: usize = 4;
 
+/// Which kernel serves [`GpuExecutor::q4x_qsa_logits`] and
+/// [`GpuExecutor::q4x_qsa_attn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QsaRoute {
+    /// The f32 SIMT kernels (slots 664, 666): the parity anchors, any shape.
+    Simt,
+    /// Tensor cores (slots 670, 669): bf16 scores, f16 attention - the dense
+    /// f16 attention kernels' class; for the shapes the `*_fits` accept.
+    Mma,
+}
+
+impl QsaRoute {
+    /// Shapes the tensor-core attention takes: 4-token blocks, a kv group's
+    /// heads in one 16-row MMA tile, 128- or 256-dim heads.
+    pub fn attn_fits(nh: usize, nkv: usize, hd: usize, cr: usize) -> bool {
+        cr == 4 && nkv > 0 && nh.is_multiple_of(nkv) && nh / nkv <= 16 && (hd == 128 || hd == 256)
+    }
+
+    /// Shapes the tensor-core scores take: the model's indexer, 4 heads of
+    /// 128 over 4-token blocks.
+    pub fn logits_fits(heads: usize, hd: usize, cr: usize) -> bool {
+        heads == 4 && hd == 128 && cr == 4
+    }
+}
+
 impl GpuExecutor {
     /// True when the pack carries the QSA attention ops (slots 666-667).
     pub fn has_qsa_attn(&self) -> bool {
         self.kernels.q4x_qsa_attn.is_some() && self.kernels.q4x_qsa_combine.is_some()
+    }
+
+    /// True when the pack carries the tensor-core QSA attention (slot 669).
+    pub fn has_qsa_attn_mma(&self) -> bool {
+        self.kernels.q4x_qsa_attn_mma.is_some() && self.kernels.q4x_qsa_combine.is_some()
+    }
+
+    /// True when the pack carries the tensor-core QSA scores (slot 670).
+    pub fn has_qsa_logits_mma(&self) -> bool {
+        self.kernels.q4x_qsa_logits_mma.is_some()
     }
 
     /// True when the pack carries the QSA selection ops (slots 664-665).
@@ -191,9 +226,11 @@ impl GpuExecutor {
     /// `heads` query vectors (`q` [launch rows, heads, hd]) into
     /// `scores[(r-row0)*cap + b]`. Rows with `nb <= k` select everything and
     /// are skipped. The grid is fixed by `cap` (graph-safe across positions).
+    /// `route` picks the kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn q4x_qsa_logits(
         &self,
+        route: QsaRoute,
         q: &CudaSlice<f32>,
         cache: &CudaSlice<half::bf16>,
         pos: &CudaSlice<u32>,
@@ -207,10 +244,16 @@ impl GpuExecutor {
         cr: usize,
         k: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .q4x_qsa_logits
-            .ok_or(GpuError::MissingOp("q4x_qsa_logits"))?;
+        let f = match route {
+            QsaRoute::Simt => self
+                .kernels
+                .q4x_qsa_logits
+                .ok_or(GpuError::MissingOp("q4x_qsa_logits"))?,
+            QsaRoute::Mma => self
+                .kernels
+                .q4x_qsa_logits_mma
+                .ok_or(GpuError::MissingOp("q4x_qsa_logits_mma"))?,
+        };
         let (qp, _g1) = q.device_ptr(&self.stream);
         let (cp, _g2) = cache.device_ptr(&self.stream);
         let (pp, _g3) = pos.device_ptr(&self.stream);
@@ -278,7 +321,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Attention over each row's selection: row `r` (position `pos[r]`, slot
+    /// Attention over each row's selection, through `route`'s kernel: row `r` (position `pos[r]`, slot
     /// `slots[r]`) attends to the tokens of blocks `sel[r*k .. +cnt[r]]`
     /// (`cr` tokens each) and its tail `[cr*nb, pos]`, through the lane's
     /// slot-major `kc`/`vc` caches ([slots*max_ctx, nkv*hd], `kv_dtype`).
@@ -287,6 +330,7 @@ impl GpuExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn q4x_qsa_attn(
         &self,
+        route: QsaRoute,
         q: &CudaSlice<f32>,
         kc: &CudaSlice<u8>,
         vc: &CudaSlice<u8>,
@@ -307,10 +351,16 @@ impl GpuExecutor {
         scale: f32,
         kv_dtype: KvDtype,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .q4x_qsa_attn
-            .ok_or(GpuError::MissingOp("q4x_qsa_attn"))?;
+        let f = match route {
+            QsaRoute::Simt => self
+                .kernels
+                .q4x_qsa_attn
+                .ok_or(GpuError::MissingOp("q4x_qsa_attn"))?,
+            QsaRoute::Mma => self
+                .kernels
+                .q4x_qsa_attn_mma
+                .ok_or(GpuError::MissingOp("q4x_qsa_attn_mma"))?,
+        };
         let (qp, _g1) = q.device_ptr(&self.stream);
         let (kp, _g2) = kc.device_ptr(&self.stream);
         let (vp, _g3) = vc.device_ptr(&self.stream);

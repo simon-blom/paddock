@@ -12,12 +12,14 @@ pub mod admin;
 pub mod alignments;
 pub mod chat;
 pub use paddock_mcp::clock;
+mod asr_residency;
 pub mod chat_template;
 pub mod completions;
 pub mod config;
 pub mod constrained;
 pub mod context_management;
 pub mod deepseek_ocr;
+mod device_admission;
 pub mod doc;
 pub mod drain;
 pub mod embeddings;
@@ -26,6 +28,7 @@ pub mod extract;
 pub mod filters;
 pub mod forced_align;
 pub mod forensics;
+pub mod generation_residency;
 pub mod harmony;
 pub mod images;
 pub mod language;
@@ -39,6 +42,7 @@ pub mod pdf;
 pub mod ratelimit;
 pub mod realtime;
 pub mod reasoning;
+pub mod residency;
 pub mod responses;
 pub mod routes;
 pub mod segmentations;
@@ -370,6 +374,14 @@ pub async fn run(
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
+    cfg.residency
+        .validate()
+        .map_err(serving::ServeError::Engine)?;
+    if cfg.residency.enabled() && cfg.model.is_none() {
+        return Err(
+            "Residency requires a configured Whisper or Metal DiffusionGemma model.".into(),
+        );
+    }
     if let Some(path) = &cfg.model {
         // A DIRECTORY has no extension to strip, and `file_stem` would cut it
         // at the last dot - which is inside the version on every checkpoint
@@ -388,6 +400,30 @@ pub async fn run(
             .ok()
             .and_then(|m| m.gguf().architecture().map(str::to_owned))
             .unwrap_or_default();
+        let diffusion_residency = cfg.device == "metal"
+            && (arch == "diffusion-gemma"
+                || (path.is_dir() && paddock_models::mlx::DiffusionConfig::read(path).is_ok()));
+        if cfg.residency.enabled() && !serving::is_asr_arch(&arch) && !diffusion_residency {
+            return Err(serving::ServeError::Engine("Model residency supports Whisper on CUDA/Metal and native Metal DiffusionGemma; other families must keep their model loaded.".into()).into());
+        }
+        // Cooperate with on-demand Whisper reloads: check/allocate one model
+        // at a time per device, including standalone runners outside a manager.
+        // Whisper owns this same gate on EACH load, not while listening idle.
+        let _load_gate = if !serving::is_asr_arch(&arch)
+            && !diffusion_residency
+            && matches!(cfg.device.as_str(), "metal" | "cuda")
+        {
+            let device = cfg.device.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::device_admission::load_lock(&device, gpu_ordinal)
+                })
+                .await?
+                .map_err(serving::ServeError::Engine)?,
+            )
+        } else {
+            None
+        };
         tracing::info!(model = %path.display(), device = %cfg.device, %arch, "loading model");
         // arch `qwen3` is ambiguous: bare = the embeddings/rerank encoder;
         // paired with an AUDIO mmproj = the Qwen3-ASR generative family
@@ -528,15 +564,12 @@ pub async fn run(
             // whisper is speech-to-text only: encoder-decoder, no text
             // prompt, no chat surface - it serves /v1/audio/transcriptions
             // and nothing else, so it never reaches the generative lane.
-            let m = serving::load_asr(
+            let m = crate::asr_residency::configure(
+                &cfg,
                 cfg.served_model_name.clone().unwrap_or(id),
                 path,
-                &cfg.device,
                 gpu_ordinal,
-                cfg.kernel_pack.as_deref(),
-                cfg.max_ctx,
-                cfg.max_batch,
-                cfg.vram_budget.map(|mib| mib << 20),
+                banner.config_path.as_deref(),
             )?;
             tracing::info!(model = %m.id, "speech-to-text model ready");
             asr = Some(m);
@@ -711,7 +744,19 @@ pub async fn run(
                 cfg.mtp.as_deref()
             };
             let id = cfg.served_model_name.clone().unwrap_or(id);
-            let m = serving::load_with(
+            let resident_options = if diffusion_residency {
+                Some(
+                    generation_residency::Options::new(
+                        cfg.residency.clone(),
+                        path,
+                        banner.config_path.clone().map(Into::into),
+                    )
+                    .map_err(serving::ServeError::Engine)?,
+                )
+            } else {
+                None
+            };
+            let m = serving::load_with_residency(
                 id,
                 path,
                 &cfg.device,
@@ -725,6 +770,7 @@ pub async fn run(
                 // config carries MiB (nvidia-smi units); the engine takes bytes
                 cfg.vram_budget.map(|mib| mib << 20),
                 cfg.max_image_tokens,
+                resident_options,
             )?;
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;
@@ -990,11 +1036,7 @@ pub async fn run(
     }
     if let Some(engine) = engine_shutdown {
         tracing::info!("shutdown: draining engine and freeing device memory");
-        let clean = tokio::task::spawn_blocking(move || {
-            engine.shutdown(std::time::Duration::from_secs(30))
-        })
-        .await
-        .unwrap_or(false);
+        let clean = engine.shutdown(std::time::Duration::from_secs(30)).await;
         if clean {
             tracing::info!("shutdown: device memory freed - exiting");
         } else {

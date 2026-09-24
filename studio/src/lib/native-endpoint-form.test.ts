@@ -8,6 +8,7 @@ import start from '../../../apps/macos/Sources/PaddockUI/StartModelView.swift?ra
 import shell from '../../../apps/macos/Sources/PaddockUI/WorkspaceView.swift?raw'
 import advanced from '../../../apps/macos/Sources/PaddockUI/EndpointAdvancedSettings.swift?raw'
 import offload from '../../../apps/macos/Sources/PaddockUI/EndpointKVOffload.swift?raw'
+import residency from '../../../apps/macos/Sources/PaddockUI/EndpointResidencySettings.swift?raw'
 import memory from '../../../apps/macos/Sources/PaddockUI/EndpointMemorySettings.swift?raw'
 import search from '../../../apps/macos/Sources/PaddockUI/WebSearchSettingsView.swift?raw'
 import mcp from '../../../apps/macos/Sources/PaddockUI/EndpointMCPSection.swift?raw'
@@ -27,6 +28,7 @@ describe('native endpoint Simple form follows the web reference', () => {
     const headings = [...simple.matchAll(/<p class="sf__card-hd">([^<]+)<\/p>/g)].map(m => m[1]!.replace(/&amp;/g, '&'))
     const nativeSimple = native.slice(native.indexOf('private var simple:'))
       .replace('EndpointKVOffloadSettings(editor: editor)', offload)
+      .replace('EndpointResidencySettings(editor: editor)', residency)
     const nativeHeadings = [...nativeSimple.matchAll(/EndpointFormCard\("([^"]+)"\)/g)].map(m => m[1])
     expect(nativeHeadings).toEqual(headings)
     expect(advanced).toContain('editor.visibleRuntimeOptions.filter')
@@ -35,6 +37,17 @@ describe('native endpoint Simple form follows the web reference', () => {
     expect(memory).not.toContain('memoryLimit = "32"')
     expect(memory).toContain('not currently free memory')
     expect(native).not.toContain('EndpointConfigurationSummary')
+  })
+  it('offers the same per-runner residency choices without promising unsupported families', () => {
+    expect(web).toContain("catModel.value?.family === 'whisper'")
+    expect(web).toContain('v-if="canResidency"')
+    expect(residency).toContain('if editor.residencySupported')
+    for (const label of ['Load model', 'At runner startup', 'On first request', 'Unload after inactivity']) {
+      expect(web).toContain(label)
+      expect(residency).toContain(label)
+    }
+    expect(web).toContain("k === 'residency' && residencyLive.value")
+    expect(native).toContain('editor.runtimeState?.residencyLive == true')
   })
   it('keeps tools grouped with intrinsic provider pills and readable connector identities', () => {
     expect(search).toContain('EndpointFormCard("Web search")')

@@ -5,6 +5,18 @@ import Testing
 
 @Suite("Typed native model commands")
 struct ModelCommandTests {
+  @Test func residencyUsesOneStrictSharedWirePolicy() throws {
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let change = EndpointChange.residency(.init(load: "on_demand", unloadAfterIdleSeconds: 0))
+    let data = try encoder.encode(change)
+    let value = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    #expect(value["field"] as? String == "residency")
+    let policy = try #require(value["value"] as? [String: Any])
+    #expect(policy["load"] as? String == "on_demand")
+    #expect(policy["unload_after_idle_seconds"] as? Int == 0)
+    #expect(policy["load_timeout_seconds"] as? Int == 120)
+  }
   @Test func editIsAnAllowlistedPatchAndPollingCarriesOnlyReceiptIdentity() throws {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase

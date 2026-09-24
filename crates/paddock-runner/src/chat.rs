@@ -1513,6 +1513,7 @@ fn prepare(
     if let Some(effort) = req.reasoning_effort.as_deref() {
         kwargs = merge_reasoning_effort(&model.reasoning, effort, kwargs)?;
     }
+    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
     // reasoning: {"max_tokens": N} - the OpenRouter-shaped thinking budget
     // (effort stays on reasoning_effort above). Resolved against the rendered
     // prompt further down, once thinking_open is known.
@@ -1602,7 +1603,7 @@ fn prepare(
     // thinking-mode detection is dialect-shaped - see Dialect::thinking_open
     // (qwen pre-opens "<think>\n", laguna a bare "<think>", gemma4 pre-closes
     // when off)
-    let thinking_open = model.dialect.thinking_open(&prompt);
+    let thinking_open = model.dialect.thinking_open_for_arch(&model.arch, &prompt);
     let think_budget = budget_req
         .map(|n| think_budget(model, n, thinking_open, "reasoning.max_tokens"))
         .transpose()?;

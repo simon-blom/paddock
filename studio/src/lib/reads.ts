@@ -316,7 +316,10 @@ export function curlFor(port: number, body: ReadRequest): string {
 // ── the answer ───────────────────────────────────────────────────────────────
 
 interface AnswerCommon {
-  /** the mean probability of the reported label over the reads */
+  /** Jev's confidence measure, computed by the runner: `(n * max - 1) /
+   *  (n - 1)` over the mean label probabilities, 0 at uniform and 1 at
+   *  certainty - so a two-way 0.62 / 0.38 answer reads 0.24, not 0.62. The
+   *  probabilities beside it are the raw distribution. */
   confidence: number
   /** the share of reads that picked the reported label */
   agreement: number
