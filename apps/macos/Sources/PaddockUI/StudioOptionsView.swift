@@ -105,7 +105,8 @@ struct StudioCompareList: View {
   static func canApply(_ selected: Set<String>, models: [StudioState.Model]) -> Bool {
     let choices = models.filter { selected.contains($0.id) && $0.status == "ok" }
     return (1...4).contains(selected.count) && choices.count == selected.count
-      && (choices.allSatisfy(\.chat) || choices.allSatisfy(\.audio))
+      && (choices.allSatisfy(\.chat) || choices.allSatisfy(\.audio)
+        || choices.allSatisfy { $0.image == true })
   }
 
   private var groups: [Group] { Self.groups(models, search: search) }

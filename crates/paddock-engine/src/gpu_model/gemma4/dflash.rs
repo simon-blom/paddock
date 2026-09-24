@@ -1446,7 +1446,8 @@ impl GpuGemma4 {
         // decoder is a plain `ggml_get_rows(tok_embd, tokens)` with no scale
         // and no embedding norm, whatever the target's own graph does with
         // its embeddings. The drafter was trained against that input.
-        exec.embed_gather_plane(&self.token_embd, &st.d_toks, &mut st.x, embd, r, 1.0)?;
+        super::EmbdTable::of(&self.token_embd, head)
+            .gather(&exec, &st.d_toks, &mut st.x, embd, r, 1.0)?;
 
         for (li, layer) in layers.iter().enumerate() {
             exec.rmsnorm_batch(&st.x, &layer.attn_norm, &mut st.xn, embd, eps, r)?;
@@ -1550,7 +1551,12 @@ impl GpuGemma4 {
             // Prefill (WMMA) class, not the decode kernel: the block is 16
             // rows over a 2048-key window, which is the tile walk's shape,
             // and the decode grid would re-read the window per row.
-            // `d_apos` (block end) is what makes it non-causal.
+            // `d_apos` (block end) is what makes it non-causal; `d_pos` (the
+            // rows' true positions) is where each row's window starts, so
+            // the block's first rows keep the 15 oldest keys the bound-
+            // derived floor used to drop (a pack without the win_pos entries
+            // falls back to that floor).
+            let win = exec.has_win_pos().then_some(&st.d_pos);
             for b in 0..n {
                 exec.attn_prefill_f16_rows_paged(
                     &st.qn,
@@ -1559,6 +1565,7 @@ impl GpuGemma4 {
                     &st.sinks,
                     &mut st.attn,
                     &st.d_apos,
+                    win,
                     &st.d_slots,
                     &st.d_bt,
                     st.bps,
@@ -1747,7 +1754,20 @@ impl GpuGemma4 {
                 exec.quantize_e4m3_row(&st.xn, &mut st.e4q, &mut st.e4rs, embd, r)?;
                 exec.f8row_gemm(hr, &st.e4q, &st.e4rs, &mut st.logits, embd, vocab, r)?;
             }
-            (None, None) => head.gemm(&exec, &st.xn, &mut st.logits, r)?,
+            (None, None) => head.gemm(
+                &exec,
+                &mut super::planes::KqRows {
+                    xq: &mut st.xq,
+                    xs: &mut st.xs,
+                    ssums: &mut st.ssums,
+                    yq: &mut st.yq,
+                    xsums: &mut st.xsums,
+                    part: &mut st.part,
+                },
+                &st.xn,
+                &mut st.logits,
+                r,
+            )?,
         }
         let Some((sc, rank, top_k)) = sel else {
             return exec.argmax_rows(&st.logits, &mut st.d_out, r, vocab);

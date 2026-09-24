@@ -134,6 +134,12 @@ pub struct Cli {
     /// MTP drafter GGUF (speculative decoding; gemma4's mtp-*.gguf)
     #[arg(long, value_name = "PATH")]
     pub mtp: Option<PathBuf>,
+    /// Text-encoder GGUF (Qwen3-VL) for an image-generation model
+    #[arg(long = "text-encoder", value_name = "PATH")]
+    pub text_encoder: Option<PathBuf>,
+    /// VAE safetensors for an image-generation model
+    #[arg(long, value_name = "PATH")]
+    pub vae: Option<PathBuf>,
     /// Official-FP8/bf16 safetensors snapshot dir for native-fp8 plane
     /// ingestion (opt-in; skips the Q8_0 middle hop on fp8 hardware)
     #[arg(long = "fp8-native", value_name = "DIR")]
@@ -148,7 +154,7 @@ pub struct Cli {
     /// its prefill scratch is profiled at load)
     #[arg(long = "graph-scratch-mib", value_name = "MIB")]
     pub graph_scratch_mib: Option<u64>,
-    /// Default max output tokens per reply (when a request doesn't specify)
+    /// Default max output tokens per reply when a request doesn't specify (unset = the context window)
     #[arg(long = "max-output-tokens", value_name = "N")]
     pub max_output_tokens: Option<usize>,
     /// API key required for Bearer auth (empty on loopback = no auth)
@@ -465,6 +471,12 @@ pub fn resolve(cli: &Cli) -> Result<(Config, Banner), ConfigError> {
     }
     if let Some(mt) = &cli.mtp {
         cfg.mtp = Some(mt.clone());
+    }
+    if let Some(te) = &cli.text_encoder {
+        cfg.text_encoder = Some(te.clone());
+    }
+    if let Some(v) = &cli.vae {
+        cfg.vae = Some(v.clone());
     }
     if let Some(d) = &cli.fp8_native {
         cfg.fp8_native = Some(d.clone());
@@ -881,12 +893,6 @@ pub fn run() -> std::process::ExitCode {
             sealed.len(),
             sealed.join(", ")
         );
-    }
-
-    // Publish the output-token default to the Responses request deserializer.
-    // SAFETY: single-threaded startup, before the tokio runtime spawns threads.
-    if let Some(n) = cfg.max_tokens {
-        unsafe { std::env::set_var("PADDOCK_MAX_OUTPUT_TOKENS", n.to_string()) };
     }
 
     let rt = match tokio::runtime::Runtime::new() {

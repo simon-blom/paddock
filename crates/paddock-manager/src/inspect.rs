@@ -147,6 +147,7 @@ fn print_shape(s: &PublishedShape) {
     let kind = match s.kind {
         ModelKind::Generative => "generative",
         ModelKind::Encoder => "encoder",
+        ModelKind::Image => "image",
     };
     let source = match s.source {
         ShapeSource::Measured => "measured",

@@ -3623,3 +3623,542 @@ fn iq_w4a8_tile_matches_reference() {
     }
     assert!(checked > 0, "no i-quant plane in the file");
 }
+
+/// Synthetic raw Q5_0 blocks (22 B: f16 d, u32 qh, 16 nibble bytes) with
+/// scales spread over both signs and ~1e-3..2.0, every nibble and high bit
+/// pseudo-random - the GGUF layout `ggml_type` 6 exactly.
+fn synth_q50(n_blocks: usize, seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n_blocks * 22);
+    let mut state = seed;
+    for _ in 0..n_blocks {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mag = ((state >> 40) & 0x3FF) as f32 / 512.0 + 1e-3;
+        let d = if (state >> 51) & 1 == 1 { -mag } else { mag };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(17);
+        out.extend_from_slice(&((state >> 20) as u32).to_le_bytes());
+        for k in 0..16u64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(k);
+            out.push((state >> 33) as u8);
+        }
+    }
+    out
+}
+
+/// The Q5_0 format spec: weight k of a block is `d * ((nib_k | hbit_k << 4)
+/// - 16)`, the low nibbles first, the high bit k of `qh` for weight k.
+fn deq_q50_row(raw: &[u8], blocks: usize, row: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(blocks * 32);
+    for j in 0..blocks {
+        let blk = &raw[(row * blocks + j) * 22..(row * blocks + j + 1) * 22];
+        let d = f16(&blk[0..2]);
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        for k in 0..32 {
+            let nib = if k < 16 {
+                blk[6 + k] & 0xF
+            } else {
+                blk[6 + k - 16] >> 4
+            } as i32;
+            let q = nib | (((qh >> k) & 1) as i32) << 4;
+            v.push(d * (q - 16) as f32);
+        }
+    }
+    v
+}
+
+/// The Q5_0 seat on the flat 32-weight lanes (slot 655), on the shapes the
+/// gemma-4 A4B Q4_K_M file puts it on: the 704-wide expert down (2.75
+/// super-blocks a row, flat), the shared down padded to a whole number of
+/// super-blocks (the tile GEMM's width), and the tied embedding's transpose.
+/// Every number is checked against the format spec decoded on the CPU: the
+/// repacked dequant and the transpose are exact classes; the int8-activation
+/// lanes are checked against the same int8-quantized activations, so the
+/// only slack is f32 reassociation (5e-4, the family's anchor).
+#[test]
+fn q50_flat_seat_matches_reference() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_kquant() || !exec.has_kquant_q50() {
+        eprintln!("pack lacks the Q5_0 seat (slot 655) - skipping");
+        return;
+    }
+    // ---- flat rows: the expert down [704, 24, 5] ----
+    let (ff, embd, ne) = (704usize, 24usize, 5usize);
+    let blocks = ff / 32;
+    let raw = synth_q50(ne * embd * blocks, 91);
+    let down = exec
+        .repack_kquant_raw(
+            &raw,
+            vec![ff, embd, ne],
+            GgmlType::Q5_0,
+            "synthetic q5_0 down",
+        )
+        .expect("repack flat q5_0 rows");
+    assert_eq!(down.data.len(), ne * embd * blocks * 16, "flat data stream");
+    assert_eq!(
+        down.scales.len(),
+        ne * embd * blocks * 8,
+        "flat record stream"
+    );
+    let mut d_dq = exec.alloc(ne * embd * ff).expect("dq");
+    exec.kquant_dequant_rp(&down, &mut d_dq)
+        .expect("dequant rp");
+    let dq = exec.to_host(&d_dq).expect("dq host");
+    for r in 0..ne * embd {
+        let want = deq_q50_row(&raw, blocks, r);
+        assert!(
+            dq[r * ff..(r + 1) * ff] == want[..],
+            "row {r}: repacked Q5_0 dequant differs from the format spec"
+        );
+    }
+    let batch = 3usize;
+    let n_active = 4usize;
+    let idx_h: Vec<u32> = (0..batch * n_active)
+        .map(|i| ((i as u32).wrapping_mul(2654435761) >> 7) % ne as u32)
+        .collect();
+    let topk_h: Vec<f32> = (0..batch * n_active)
+        .map(|i| 1.0 / (1.0 + (i % n_active) as f32))
+        .collect();
+    let d_idx = exec.to_device_u32(&idx_h).expect("idx");
+    let d_topk = exec.to_device(&topk_h).expect("topk");
+    let act = deterministic_input(batch * n_active * ff, 5);
+    let d_act = exec.to_device(&act).expect("act");
+    let mut d_fq = exec.alloc_i8(batch * n_active * ff).expect("fq");
+    let mut d_fs = exec.alloc(batch * n_active * ff / 32).expect("fs");
+    exec.quantize_q8(&d_act, &mut d_fq, &mut d_fs, batch * n_active * ff)
+        .expect("fq quant");
+    let mut d_out = exec.alloc(batch * embd).expect("out");
+    exec.kquant_moe_down(
+        &down, &d_idx, &d_topk, &d_fq, &d_fs, None, &mut d_out, n_active, batch,
+    )
+    .expect("q5_0 down on flat rows");
+    let out_gpu = exec.to_host(&d_out).expect("out host");
+    let (fq, fs) = cpu_quantize_q8(&act);
+    let mut out_ref = vec![0f32; batch * embd];
+    for b in 0..batch {
+        for o in 0..embd {
+            let mut v = 0f64;
+            for slot in 0..n_active {
+                let srow = b * n_active + slot;
+                let e = idx_h[srow] as usize;
+                let w = deq_q50_row(&raw, blocks, e * embd + o);
+                let mut dot = 0f64;
+                for i in 0..ff {
+                    dot += w[i] as f64
+                        * (fq[srow * ff + i] as f32 * fs[srow * (ff / 32) + i / 32]) as f64;
+                }
+                v += topk_h[srow] as f64 * dot;
+            }
+            out_ref[b * embd + o] = v as f32;
+        }
+    }
+    let e = rel_err(&out_gpu, &out_ref);
+    eprintln!("q5_0 moe down on 704-wide flat rows vs f64 ref rel_err {e:.2e}");
+    assert!(e < 5e-4, "flat-row Q5_0 down mismatch ({e:.2e})");
+
+    // ---- a 256-aligned dense plane [2304, 40]: the W4A8 GEMV, the >64-row
+    // tile GEMM (Q5_0 rides the i-quant tile with no mu term) and the
+    // 3..=64-row rungs, against the exact dequant x the int8 activations ----
+    let (in_dim, out_dim) = (2304usize, 40usize);
+    let bpr = in_dim / 32;
+    let raw = synth_q50(out_dim * bpr, 123);
+    let w = exec
+        .repack_kquant_raw(
+            &raw,
+            vec![in_dim, out_dim],
+            GgmlType::Q5_0,
+            "synthetic q5_0 dense",
+        )
+        .expect("repack dense q5_0");
+    let deq: Vec<Vec<f32>> = (0..out_dim).map(|o| deq_q50_row(&raw, bpr, o)).collect();
+    let refy = |x: &[f32], rows: usize| -> Vec<f32> {
+        let (xq, xs) = cpu_quantize_q8(x);
+        let mut y = vec![0f32; rows * out_dim];
+        for b in 0..rows {
+            for o in 0..out_dim {
+                let mut dot = 0f64;
+                for i in 0..in_dim {
+                    dot += deq[o][i] as f64
+                        * (xq[b * in_dim + i] as f32 * xs[b * (in_dim / 32) + i / 32]) as f64;
+                }
+                y[b * out_dim + o] = dot as f32;
+            }
+        }
+        y
+    };
+    for &rows in &[1usize, 4, 16, 130] {
+        let x = deterministic_input(rows * in_dim, 7 + rows as u64);
+        let d_x = exec.to_device(&x).expect("x");
+        let mut d_y = exec.alloc(rows * out_dim).expect("y");
+        let mut d_xq = exec.alloc_i8(rows * in_dim).expect("xq");
+        let mut d_xs = exec.alloc(rows * in_dim / 32).expect("xs");
+        let mut d_ss = exec.alloc(rows * in_dim / 16).expect("ssums");
+        let what = if rows == 1 {
+            exec.quantize_q8_sums(&d_x, &mut d_xq, &mut d_xs, &mut d_ss, in_dim)
+                .expect("stage");
+            exec.kquant_gemv_w4a8(&w, &d_xq, &d_xs, None, &mut d_y)
+                .expect("q5_0 w4a8 gemv");
+            "w4a8 gemv"
+        } else if rows > 64 {
+            let mut d_yq = exec
+                .alloc_u8(in_dim.div_ceil(128) * rows.next_multiple_of(128) * 144)
+                .expect("yq");
+            exec.quantize_q8_mmq(&d_x, &mut d_yq, in_dim, rows)
+                .expect("mmq quant");
+            exec.kquant_gemm_w4a8_pipe2(&w, &d_yq, None, &mut d_y, rows)
+                .expect("q5_0 pipe2 tile");
+            "pipe2 tile"
+        } else {
+            exec.quantize_q8(&d_x, &mut d_xq, &mut d_xs, rows * in_dim)
+                .expect("quant");
+            exec.kquant_gemm_dp4a(&w, &d_xq, &d_xs, None, &mut d_y, rows)
+                .expect("q5_0 dp4a");
+            "dp4a"
+        };
+        let gy = exec.to_host(&d_y).expect("y host");
+        let cy = refy(&x, rows);
+        let e = rel_err(&gy, &cy);
+        eprintln!("q5_0 dense [{in_dim} x {out_dim}] {what} at {rows} rows rel_err {e:.2e}");
+        assert!(e < 5e-4, "Q5_0 {what} at {rows} rows mismatch ({e:.2e})");
+    }
+
+    // ---- E^T off the repacked plane: bf16 of the same f32 the dequant
+    // yields, transposed - exact ----
+    if exec
+        .kernels()
+        .is_ok_and(|k| k.kq_embed_transpose_bf16.is_some())
+    {
+        let vocab = 40usize;
+        let mut d_t = exec.alloc_u8(vocab * in_dim * 2).expect("E^T");
+        exec.kq_embed_transpose_bf16(&w, &mut d_t, vocab, in_dim)
+            .expect("q5_0 transpose");
+        let t: Vec<u8> = exec.stream.clone_dtoh(&d_t).expect("E^T host");
+        // compared as VALUES: the kernel's `f * q + g` lands a zero weight
+        // with a negative scale on +0 (IEEE `-0 + 0`), the spec's `d * 0`
+        // on -0 - equal numbers, different bits, and no consumer of E^T
+        // can tell them apart
+        let mut bad = 0usize;
+        for e_i in 0..in_dim {
+            for v in 0..vocab {
+                let got =
+                    u16::from_le_bytes([t[(e_i * vocab + v) * 2], t[(e_i * vocab + v) * 2 + 1]]);
+                let want = half::bf16::from_f32(deq[v][e_i]);
+                if half::bf16::from_bits(got).to_f32() != want.to_f32() {
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(
+            bad, 0,
+            "E^T off the repacked Q5_0 plane: {bad} cells differ"
+        );
+    } else {
+        eprintln!("pack lacks kq_embed_transpose_bf16 (slot 656) - transpose leg skipped");
+    }
+}
+
+/// The GEGLU instantiations of the k-quant MoE gate+up kernels (slots
+/// 657-659: the pair, the grouped pair, the register-tiled pair) against
+/// `gelu_tanh(g) * u` over the exact dequant x the int8 activations - the
+/// gemma-4 A4B's routed experts on k-quant seats. Flat Q5_0 gate/up planes
+/// at a 256-wide input, so all three kernels take them.
+#[test]
+fn kq_moe_geglu_pair_matches_reference() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_kquant() || !exec.has_kquant_q50() || !exec.has_kquant_moe_geglu() {
+        eprintln!("pack lacks the Q5_0 seat / GEGLU pair (slots 655, 657-660) - skipping");
+        return;
+    }
+    let (embd, ff, ne) = (256usize, 48usize, 6usize);
+    let bpr = embd / 32;
+    let graw = synth_q50(ne * ff * bpr, 301);
+    let uraw = synth_q50(ne * ff * bpr, 302);
+    let gate = exec
+        .repack_kquant_raw(&graw, vec![embd, ff, ne], GgmlType::Q5_0, "synthetic gate")
+        .expect("repack gate");
+    let up = exec
+        .repack_kquant_raw(&uraw, vec![embd, ff, ne], GgmlType::Q5_0, "synthetic up")
+        .expect("repack up");
+    // enough tokens that the grouped CSR holds several rows per expert
+    let (batch, n_active) = (40usize, 4usize);
+    let pairs = batch * n_active;
+    let idx_h: Vec<u32> = (0..pairs)
+        .map(|i| ((i as u32).wrapping_mul(2654435761) >> 9) % ne as u32)
+        .collect();
+    let d_idx = exec.to_device_u32(&idx_h).expect("idx");
+    let x = deterministic_input(batch * embd, 11);
+    let d_x = exec.to_device(&x).expect("x");
+    let mut d_xq = exec.alloc_i8(batch * embd).expect("xq");
+    let mut d_xs = exec.alloc(batch * embd / 32).expect("xs");
+    exec.quantize_q8(&d_x, &mut d_xq, &mut d_xs, batch * embd)
+        .expect("quant");
+    let (xq, xs) = cpu_quantize_q8(&x);
+    // pd_geglu's constants (sqrt(2/pi) at f32 precision)
+    let gelu = |g: f32| 0.5 * g * (1.0 + (0.797_884_6_f32 * g * (1.0 + 0.044715 * g * g)).tanh());
+    let mut want = vec![0f32; pairs * ff];
+    for b in 0..batch {
+        for slot in 0..n_active {
+            let p = b * n_active + slot;
+            let e = idx_h[p] as usize;
+            for o in 0..ff {
+                let gw = deq_q50_row(&graw, bpr, e * ff + o);
+                let uw = deq_q50_row(&uraw, bpr, e * ff + o);
+                let (mut g, mut u) = (0f64, 0f64);
+                for i in 0..embd {
+                    let a = (xq[b * embd + i] as f32 * xs[b * bpr + i / 32]) as f64;
+                    g += gw[i] as f64 * a;
+                    u += uw[i] as f64 * a;
+                }
+                want[p * ff + o] = gelu(g as f32) * u as f32;
+            }
+        }
+    }
+    let act = paddock_engine::gpu::GluAct::Gelu;
+    let mut d_out = exec.alloc(pairs * ff).expect("out");
+    exec.kquant_moe_gate_up_act(
+        act, &gate, &up, &d_idx, &d_xq, &d_xs, None, &mut d_out, n_active, batch,
+    )
+    .expect("geglu pair");
+    let got = exec.to_host(&d_out).expect("out host");
+    let e = rel_err(&got, &want);
+    eprintln!("kq moe gate_up GEGLU pair rel_err {e:.2e}");
+    assert!(e < 1e-4, "GEGLU pair mismatch ({e:.2e})");
+    // the grouped and tiled forms over a moe_align_bm CSR at the tile's group
+    for bm in [8usize, 16] {
+        let blocks = (pairs + ne * (bm - 1)).div_ceil(bm);
+        let mut srow = exec.alloc_u32(blocks * bm).expect("srow");
+        let mut sslot = exec.alloc_u32(blocks * bm).expect("sslot");
+        let mut bexp = exec.alloc_u32(blocks).expect("bexp");
+        exec.moe_align_bm(
+            &d_idx, &mut srow, &mut sslot, &mut bexp, batch, n_active, ne, bm, blocks,
+        )
+        .expect("align");
+        let mut d_grp = exec.alloc(pairs * ff).expect("grp out");
+        exec.kquant_moe_gate_up_grp_act(
+            act, &gate, &up, &srow, &sslot, &bexp, &d_xq, &d_xs, None, &mut d_grp, n_active, batch,
+            blocks, bm,
+        )
+        .expect("geglu grp");
+        let got = exec.to_host(&d_grp).expect("grp host");
+        let e = rel_err(&got, &want);
+        eprintln!("kq moe gate_up GEGLU grp({bm}) rel_err {e:.2e}");
+        assert!(e < 1e-4, "GEGLU grouped pair (bm {bm}) mismatch ({e:.2e})");
+        if bm == GpuExecutor::KQ_MOE_TILE_BM && exec.has_kquant_moe_gate_up_tile() {
+            let mut d_tile = exec.alloc(pairs * ff).expect("tile out");
+            exec.kquant_moe_gate_up_tile_act(
+                act,
+                &gate,
+                &up,
+                &srow,
+                &sslot,
+                &bexp,
+                &d_xq,
+                &d_xs,
+                None,
+                &mut d_tile,
+                n_active,
+                batch,
+                blocks,
+            )
+            .expect("geglu tile");
+            let got = exec.to_host(&d_tile).expect("tile host");
+            let e = rel_err(&got, &want);
+            eprintln!("kq moe gate_up GEGLU tile rel_err {e:.2e}");
+            assert!(e < 1e-4, "GEGLU tiled pair mismatch ({e:.2e})");
+        }
+    }
+}
+
+/// Synthetic raw Q8_0 blocks (34 B: f16 d, 32 int8) - GGUF `ggml_type` 8.
+fn synth_q80(n_blocks: usize, seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n_blocks * 34);
+    let mut state = seed;
+    for _ in 0..n_blocks {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mag = ((state >> 40) & 0x3FF) as f32 / 4096.0 + 1e-4;
+        let d = if (state >> 51) & 1 == 1 { -mag } else { mag };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        for k in 0..32u64 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(k);
+            out.push((state >> 33) as u8);
+        }
+    }
+    out
+}
+
+/// Q8_0 spec: weight k of a block is `d * q_k`, q_k the signed byte.
+fn deq_q80_row(raw: &[u8], blocks: usize, row: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(blocks * 32);
+    for j in 0..blocks {
+        let blk = &raw[(row * blocks + j) * 34..(row * blocks + j + 1) * 34];
+        let d = f16(&blk[0..2]);
+        for k in 0..32 {
+            v.push(d * (blk[2 + k] as i8) as f32);
+        }
+    }
+    v
+}
+
+/// The expert-major tensor-core down (slot 603) on the flat seats at a width
+/// that does not fill its last 128-weight stage (marker slot 668): the
+/// gemma-4 A4B's 704-wide expert down (22 blocks, 5.5 stages) on both flat
+/// types the file puts there (Q5_0, Q8_0), and a 96-wide one whose ONLY stage
+/// is partial. The down reads the pair's SORTED rows in place over a bm = 32
+/// `moe_align` layout (the tensor-core gate+up's output shape, built here on
+/// the host - the pair has its own tests), the slot fold sums per token. The
+/// reference dots the format-spec dequant against the same int8 rows, so
+/// the only slack is f32 reassociation; a 96-column output (1.5 strips)
+/// checks the strip's row guard.
+#[test]
+fn kq_moe_down_mma_e_takes_a_partial_stage() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_kquant() || !exec.has_kquant_q50() || !exec.has_kquant_moe_down_mma_e_tail() {
+        eprintln!("pack lacks the Q5_0 seat / slot-603 tail (655, 668) - skipping");
+        return;
+    }
+    let (out_dim, ne) = (96usize, 6usize);
+    let (batch, n_active) = (40usize, 4usize);
+    let pairs = batch * n_active;
+    let idx_h: Vec<u32> = (0..pairs)
+        .map(|i| ((i as u32).wrapping_mul(2654435761) >> 9) % ne as u32)
+        .collect();
+    let topk_h: Vec<f32> = (0..pairs)
+        .map(|i| 1.0 / (1.0 + (i % n_active) as f32))
+        .collect();
+    let d_idx = exec.to_device_u32(&idx_h).expect("idx");
+    let d_topk = exec.to_device(&topk_h).expect("topk");
+    let mb = (pairs + ne * 31).div_ceil(32);
+    let mut d_srow = exec.alloc_u32(mb * 32).expect("srow");
+    let mut d_sslot = exec.alloc_u32(mb * 32).expect("sslot");
+    let mut d_bexp = exec.alloc_u32(mb).expect("bexp");
+    exec.moe_align(
+        &d_idx,
+        &mut d_srow,
+        &mut d_sslot,
+        &mut d_bexp,
+        batch,
+        n_active,
+        ne,
+        mb,
+    )
+    .expect("align");
+    let srow_h = exec.to_host_u32(&d_srow).expect("srow host");
+    let sslot_h = exec.to_host_u32(&d_sslot).expect("sslot host");
+    let bexp_h = exec.to_host_u32(&d_bexp).expect("bexp host");
+    // a live sorted position: its block carries an expert and its row is not
+    // the PAD tail (blocks past the routing keep whatever the buffer held)
+    let live_at = |sp: usize| bexp_h[sp / 32] != u32::MAX && srow_h[sp] != u32::MAX;
+    for &(ff, q8) in &[(704usize, false), (704, true), (96, false)] {
+        let what = if q8 { "Q8_0" } else { "Q5_0" };
+        let blocks = ff / 32;
+        // the sorted rows as the tensor-core pair leaves them: a live
+        // position holds its pair's int8 row + per-32 scales, PAD rows are
+        // exact zeros (the walk reads them as nothing)
+        let mut sfq = vec![0i8; mb * 32 * ff];
+        let mut sfs = vec![0f32; mb * 32 * blocks];
+        for sp in 0..mb * 32 {
+            if !live_at(sp) {
+                continue;
+            }
+            let pair = srow_h[sp] as usize * n_active + sslot_h[sp] as usize;
+            let (q, s) = cpu_quantize_q8(&deterministic_input(ff, 500 + pair as u64));
+            sfq[sp * ff..(sp + 1) * ff].copy_from_slice(&q);
+            sfs[sp * blocks..(sp + 1) * blocks].copy_from_slice(&s);
+        }
+        let d_sfq = exec.stream.clone_htod(&sfq).expect("sfq");
+        let d_sfs = exec.to_device(&sfs).expect("sfs");
+        let (draw, down) = if q8 {
+            let raw = synth_q80(ne * out_dim * blocks, 403);
+            let w = exec
+                .repack_kquant_raw(
+                    &raw,
+                    vec![ff, out_dim, ne],
+                    GgmlType::Q8_0,
+                    "synthetic down",
+                )
+                .expect("repack q8_0 down");
+            (raw, w)
+        } else {
+            let raw = synth_q50(ne * out_dim * blocks, 404 + ff as u64);
+            let w = exec
+                .repack_kquant_raw(
+                    &raw,
+                    vec![ff, out_dim, ne],
+                    GgmlType::Q5_0,
+                    "synthetic down",
+                )
+                .expect("repack q5_0 down");
+            (raw, w)
+        };
+        let deq_down = |row: usize| -> Vec<f32> {
+            if q8 {
+                deq_q80_row(&draw, blocks, row)
+            } else {
+                deq_q50_row(&draw, blocks, row)
+            }
+        };
+        let mut d_emap = exec.alloc_u32(2 * ne).expect("emap");
+        let mut d_part = exec.alloc(pairs * out_dim).expect("part");
+        exec.kquant_moe_down_mma_e(
+            &down,
+            &d_srow,
+            &d_sslot,
+            &d_bexp,
+            &d_topk,
+            &d_sfq,
+            &d_sfs,
+            &mut d_emap,
+            &mut d_part,
+            0,
+            out_dim,
+            n_active,
+            batch,
+            ne,
+            mb,
+        )
+        .expect("mma_e down");
+        let mut d_out = exec.alloc(batch * out_dim).expect("out");
+        exec.moe_part_fold_at(&d_part, &mut d_out, out_dim, 0, out_dim, n_active, batch)
+            .expect("fold");
+        let got = exec.to_host(&d_out).expect("out host");
+        // reference: every live sorted position is one (token, slot) pair
+        let mut want = vec![0f64; batch * out_dim];
+        let mut live = 0usize;
+        for sp in 0..mb * 32 {
+            if !live_at(sp) {
+                continue;
+            }
+            live += 1;
+            let (b, slot) = (srow_h[sp] as usize, sslot_h[sp] as usize);
+            let e = idx_h[b * n_active + slot] as usize;
+            let a: Vec<f64> = (0..ff)
+                .map(|i| (sfq[sp * ff + i] as f32 * sfs[sp * blocks + i / 32]) as f64)
+                .collect();
+            for o in 0..out_dim {
+                let w = deq_down(e * out_dim + o);
+                let dot: f64 = w.iter().zip(&a).map(|(w, a)| *w as f64 * a).sum();
+                want[b * out_dim + o] += topk_h[b * n_active + slot] as f64 * dot;
+            }
+        }
+        assert_eq!(
+            live, pairs,
+            "every routed pair sits in the sorted layout once"
+        );
+        let want: Vec<f32> = want.iter().map(|v| *v as f32).collect();
+        let e = rel_err(&got, &want);
+        eprintln!("kq moe down mma_e {what} ff {ff} ({blocks} blocks) rel_err {e:.2e}");
+        assert!(
+            e < 5e-4,
+            "slot-603 down on a {what} {ff}-wide flat down mismatch ({e:.2e})"
+        );
+    }
+}

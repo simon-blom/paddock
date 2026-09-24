@@ -7,6 +7,19 @@ import Testing
 
 @Suite("Native compare model picker", .serialized) @MainActor
 struct StudioCompareTests {
+  @Test func imageDimensionsSnapToEndpointGridWithoutSilentStaleValues() {
+    #expect(StudioImageControls.snappedSide("999", grid: 32, maxSide: 2752, fallback: 1024) == 992)
+    #expect(
+      StudioImageControls.snappedSide("1008", grid: 32, maxSide: 2752, fallback: 1024) == 1024)
+    #expect(
+      StudioImageControls.snappedSide("999999", grid: 32, maxSide: 2752, fallback: 1024) == 2752)
+    #expect(StudioImageControls.snappedSide("-1", grid: 32, maxSide: 2752, fallback: 1024) == 32)
+    #expect(StudioImageControls.snappedSide("", grid: 32, maxSide: 2752, fallback: 768) == 768)
+    #expect(
+      StudioImageControls.snappedSide(
+        "99999999999999999999", grid: 32, maxSide: 2752, fallback: 768) == 768)
+  }
+
   @Test func savedCloudPicksAndLocalModelsShareThePickerWithoutLosingPins() throws {
     let models = try fixture()
     let groups = StudioCompareList.groups(models, search: "")
@@ -31,6 +44,15 @@ struct StudioCompareTests {
     #expect(!StudioCompareList.canApply(["text-0", "speech"], models: models))
     #expect(StudioCompareList.canApply(["both", "speech"], models: models))
     #expect(StudioCompareList.canApply(["both", "text-0"], models: models))
+  }
+
+  @Test func compareImagesShareALaneTypeButNeverMixWithChat() throws {
+    let models = try [
+      model(id: "image-1", chat: false, image: true),
+      model(id: "image-2", chat: false, image: true), model(id: "chat"),
+    ]
+    #expect(StudioCompareList.canApply(["image-1", "image-2"], models: models))
+    #expect(!StudioCompareList.canApply(["image-1", "chat"], models: models))
   }
 
   @Test func clearSelectionEditsOnlyTheDraftIncludingHiddenAndUnavailableModels() throws {
@@ -147,11 +169,12 @@ struct StudioCompareTests {
   }
   private func model(
     id: String, title: String = "Cloud model", provider: String = "OpenRouter",
-    port: Int? = nil, status: String = "ok", chat: Bool = true, audio: Bool = false
+    port: Int? = nil, status: String = "ok", chat: Bool = true, audio: Bool = false,
+    image: Bool = false
   ) throws -> StudioState.Model {
     var object: [String: Any] = [
       "id": id, "title": title, "provider": provider, "vendor": "Meta",
-      "status": status, "vision": false, "chat": chat, "audio": audio,
+      "status": status, "vision": false, "chat": chat, "audio": audio, "image": image,
     ]
     if let port { object["port"] = port }
     return try JSONDecoder().decode(

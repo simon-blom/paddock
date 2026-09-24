@@ -37,8 +37,12 @@ public struct DesktopMenu: View {
             Text(
               "\(runner.inFlight.map { "\($0) active requests" } ?? "Active request count unavailable")"
             )
-            Button("Chat with Model") { open(.chat(port: row.port)) }
-              .disabled(runner.status != "ok" || runner.model == nil || !workspace.canSubmit)
+            Button(runner.image == nil ? "Chat with Model" : "Create Image") {
+              open(.chat(port: row.port))
+            }
+            .disabled(
+              runner.status != "ok" || (runner.model == nil && runner.image == nil)
+                || !workspace.canSubmit)
             Button("Copy API Address") {
               NSPasteboard.general.clearContents()
               NSPasteboard.general.setString(row.baseURL, forType: .string)

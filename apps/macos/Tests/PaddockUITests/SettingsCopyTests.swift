@@ -25,6 +25,8 @@ struct SettingsCopyTests {
       "Credential stored in Keychain", "Credential stored by the shared manager",
       "Your key stays in Keychain.",
       "Add a compatible API endpoint, then choose the models you want in Studio.",
+      "Not requested", "Install Paddock in Applications before enabling launch at login.",
+      "Allowed by macOS", "Status unavailable",
     ]
     for file in try FileManager.default.contentsOfDirectory(
       at: root, includingPropertiesForKeys: nil)

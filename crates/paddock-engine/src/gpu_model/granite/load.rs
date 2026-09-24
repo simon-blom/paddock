@@ -86,16 +86,57 @@ impl GpuGranite {
 
         // The four Granite scalars. attention.scale replaces 1/sqrt(head_dim)
         // as the KQ scale - on the 8b it is 0.0078125 = 1/128 = 1/head_dim,
-        // not 1/sqrt(128) ≈ 0.0884. All four are required rather than
-        // defaulted: a missing multiplier silently degrades output.
-        let embedding_scale = f_req("embedding_scale")?;
-        let residual_scale = f_req("residual_scale")?;
-        let logit_scale = f_req("logit_scale")?;
-        let attention_scale = f_req("attention.scale")?;
+        // not 1/sqrt(128) ≈ 0.0884. On a granite file all four are required
+        // rather than defaulted: a missing multiplier silently degrades output.
+        //
+        // A plain `llama` file (MiniCPM5-2B is the first one served) is the
+        // same stack with every multiplier at identity - that is literally how
+        // llama.cpp defines granite, as llama plus the four scalars - so the
+        // arch string decides which rule applies. The llama arm is just as
+        // strict in its own direction: a llama file that stamps any of the
+        // granite keys is not a geometry we know, and refuses rather than
+        // having the value dropped on the floor.
+        let arch = map.gguf().architecture().unwrap_or("granite");
+        let (embedding_scale, residual_scale, logit_scale, attention_scale) = if arch == "llama" {
+            for k in [
+                "embedding_scale",
+                "residual_scale",
+                "logit_scale",
+                "attention.scale",
+            ] {
+                if map.gguf().arch_field(k).is_some() {
+                    return Err(GpuModelError::Unsupported(format!(
+                        "llama: file stamps llama.{k}, which no llama graph applies - refusing \
+                         rather than ignoring a scalar the author thought mattered"
+                    )));
+                }
+            }
+            (1.0, 1.0, 1.0, 1.0 / (head_dim as f32).sqrt())
+        } else {
+            (
+                f_req("embedding_scale")?,
+                f_req("residual_scale")?,
+                f_req("logit_scale")?,
+                f_req("attention.scale")?,
+            )
+        };
         if logit_scale == 0.0 {
             return Err(GpuModelError::Unsupported(
                 "granite: logit_scale 0 would divide the logits by zero".into(),
             ));
+        }
+        // Biases are a llama-arch option (Qwen1.5/2-era exports carry
+        // attn_q/k/v.bias under this arch string) that the granite graph has no
+        // seat for. Refuse on presence: loading the weights and skipping the
+        // bias is fluent, wrong text.
+        if map.tensor_info("blk.0.attn_q.bias").is_some()
+            || map.tensor_info("blk.0.attn_k.bias").is_some()
+            || map.tensor_info("blk.0.attn_v.bias").is_some()
+        {
+            return Err(GpuModelError::Unsupported(format!(
+                "{arch}: attention biases present - this graph serves the bias-free llama stack \
+                 only"
+            )));
         }
 
         // DeepStack: one entry per LLM layer, holding which vision stream to
@@ -170,12 +211,18 @@ impl GpuGranite {
         // Plain rope: ext_factor 0 collapses YarnRope's ramp, freq_scale 1.
         // Granite ships no rope-scaling keys; if a future file does, it must
         // be handled explicitly rather than silently ignored here.
+        // `rope_freqs.weight` is the llama-arch spelling of the same thing:
+        // Llama 3.1+ ships its per-frequency factors as a tensor (the
+        // converter stamps no scaling key for them), and a graph that rotates
+        // without them is right for short prompts and silently wrong past the
+        // original window.
         if map.gguf().arch_field("rope.scaling.type").is_some()
             || f_opt("rope.scaling.factor").is_some_and(|v| v != 1.0)
+            || map.tensor_info("rope_freqs.weight").is_some()
         {
-            return Err(GpuModelError::Unsupported(
-                "granite: rope scaling is stamped but unhandled - refusing to ignore it".into(),
-            ));
+            return Err(GpuModelError::Unsupported(format!(
+                "{arch}: rope scaling is stamped but unhandled - refusing to ignore it"
+            )));
         }
         let rope_base = f_req("rope.freq_base")?;
         let rope =

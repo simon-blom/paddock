@@ -24,13 +24,13 @@ public struct Readiness: Decodable, Sendable {
   public let generation: String?
   public let os: String
 
-  public var title: String {
+  /// Show actionable failures, not qualification bookkeeping or a generic
+  /// success badge. The backend's state remains available for diagnostics.
+  public var warning: String? {
     switch state {
-    case "ready": "Ready"
-    case "untested": "Hardware support not confirmed"
     case "driver-too-old": "Driver update needed"
     case "no-card": "Local serving unavailable"
-    default: "Readiness: \(state)"
+    default: nil
     }
   }
 }
@@ -133,6 +133,7 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   public let embedder: String?
   public let asr: String?
   public let aligner: String?
+  public let image: String?
   public let display: String?
   public let endpoint: String
   public let version: String?
@@ -143,7 +144,9 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
 
   // A replacement runner on the same port is a new identity.
   public var id: String { "\(port):\(pid)" }
-  public var title: String { display ?? model ?? embedder ?? asr ?? aligner ?? "Runner \(port)" }
+  public var title: String {
+    display ?? model ?? embedder ?? asr ?? aligner ?? image ?? "Runner \(port)"
+  }
 }
 
 public struct ManagerSnapshot: Decodable, Sendable {

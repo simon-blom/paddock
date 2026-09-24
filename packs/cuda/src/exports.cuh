@@ -630,6 +630,20 @@ extern "C" int pd_matvec_f32_sk(const void*, const void*, void*, void*, void*, u
 extern "C" int pd_bf16_gemv_silu_f32(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, float, void*);
 extern "C" int pd_bf16_gemv_nk_mr_f32(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_conv_dil_step_slots(const void*, const void*, const void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_q50(void);
+extern "C" int pd_kq_embed_transpose_bf16(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_gate_up_geglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_gate_up_grp_geglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_gate_up_tile_geglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_gate_up_mma_geglu(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_idx_q(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+extern "C" int pd_q4x_idx_pool(const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+extern "C" int pd_q4x_idx_store(const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_logits(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_topk(const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_attn(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_q4x_qsa_combine(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_down_mma_e_tail(void);
 
 static const KernelTableV1 PD_KERNELS = {
     (uint32_t)sizeof(KernelTableV1),
@@ -1621,6 +1635,58 @@ static const KernelTableV1 PD_KERNELS = {
 #else
     nullptr,
 #endif
+    // 632-640: diffusion-transformer glue (dit.cuh) - the image-generation
+    // lane's own small ops; every heavy op there is an existing lane
+    pd_dit_rope,
+    pd_dit_philox_randn,
+    pd_dit_gated_add,
+    pd_dit_silu,
+    pd_dit_softmax_rows,
+    pd_dit_transpose_f16,
+    pd_dit_split3_f16,
+    pd_dit_affine_cols,
+    pd_dit_to_u8,
+    // 641-643: image VAE conv glue (conv/vae.cuh)
+    pd_vae_norm_f16,
+    pd_vae_im2row3,
+    pd_vae_dupup_add,
+    // 644-646: VAE encoder pieces + interleaved M-RoPE
+    pd_vae_im2row3_down,
+    pd_vae_avgdown_add,
+    pd_imrope,
+    // 647-650: block-diffusion canvas ops
+    pd_q8_embed_transpose_bf16,
+    pd_canvas_sample,
+    pd_canvas_accept,
+    pd_gather_cols,
+    // 651-654: the four prefill attention entries with `win_pos` (the
+    // sliding-window floor from the TRUE position; prefill.cuh's pd_pf_wp)
+    pd_attn_prefill_wp,
+    pd_attn_prefill_f16_wp,
+    pd_attn_prefill_f16_paged_wp,
+    pd_attn_prefill_f16_paged2_wp,
+    // 655-656: the Q5_0 flat-32 seat marker + E^T off a repacked k-quant
+    // embedding (the gemma-4 A4B Q4_K_M lane)
+    pd_kquant_q50,
+    pd_kq_embed_transpose_bf16,
+    // 657-660: GEGLU instantiations of the k-quant MoE gate+up kernels
+    pd_kquant_moe_gate_up_geglu,
+    pd_kquant_moe_gate_up_grp_geglu,
+    pd_kquant_moe_gate_up_tile_geglu,
+    pd_kquant_moe_gate_up_mma_geglu,
+    // 661-663: QSA (Flash-Next sparse attention) indexer - query norm,
+    // compressed-key pool, store + raw-key ring (attn/qsa.cuh)
+    pd_q4x_idx_q,
+    pd_q4x_idx_pool,
+    pd_q4x_idx_store,
+    // 664-665: QSA selection - block scores, radix top-k (attn/qsa.cuh)
+    pd_q4x_qsa_logits,
+    pd_q4x_qsa_topk,
+    // 666-667: QSA attention over the selection + split combine (attn/qsa.cuh)
+    pd_q4x_qsa_attn,
+    pd_q4x_qsa_combine,
+    // 668: slot 603 takes a flat down at any 32-multiple width (partial tail stage)
+    pd_kquant_moe_down_mma_e_tail,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

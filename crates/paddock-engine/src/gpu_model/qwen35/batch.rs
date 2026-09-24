@@ -757,6 +757,7 @@ impl GpuQwen35 {
             dflash_cover: std::collections::HashSet::new(),
             seq: vec![Vec::new(); max_batch],
             reply_ckpt: vec![None; max_batch],
+            reply_pinned: vec![None; max_batch],
             kv_k,
             kv_v,
             recur,
@@ -4826,9 +4827,26 @@ impl GpuQwen35 {
         self.batch.is_some() && std::env::var_os("PADDOCK_CHUNKED_PREFILL").is_some()
     }
 
+    /// `Generator::prefill_queue`: every tick shape here spends its budget
+    /// FIFO over `chunked`, from each prompt's `done`.
+    pub(crate) fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.done, c.tokens.len() - c.done))
+            .collect()
+    }
+
+    /// `Generator::prefill_tick_cap`: a long prompt advances at most one
+    /// unified span per tick - fused, overlapped, spec-in-mixed, and the split
+    /// tick's bounded head alike (a short tail the split tick prefills whole
+    /// is shallow-or-short, never a paced tick's shape).
+    pub(crate) fn prefill_tick_cap(&self) -> usize {
+        super::unified_prefill_rows()
+    }
+
     /// Register a chunked prefill on `slot`. The whole prompt is queued; the
     /// unified tick advances it a budgeted SPAN per tick from `done` (or
-    /// `advance_chunks` prefills the tail whole under PADDOCK_NO_UNIFIED). We
+    /// the split tick's `advance_chunks` prefills a tail that fits whole). We
     /// match the prefix cache up front (`prefix_resume_begin`): a shared prefix
     /// ADOPTS the cached KV pages + restores the DeltaNet state into the slot, and
     /// `done` starts at the resume position so only the divergent tail re-prefills.
@@ -4911,22 +4929,59 @@ impl GpuQwen35 {
         self.chunked.len() != before
     }
 
-    /// Legacy (PADDOCK_NO_UNIFIED) prefill: run in-flight prompts this tick, FIFO
-    /// (earliest admission first -> its first token sooner), up to a ~`budget` row
-    /// soft cap but always at least one (so a prompt longer than the cap still
-    /// makes progress and never hangs). Each prompt's divergent tail is prefilled
-    /// whole from `done` (the resume point `prefill_begin` restored) via
-    /// `prefill_slot_tail` - bit-identical to a standalone prefill of the same
-    /// tokens. This staggers the cohort's first tokens over several ticks and lets
-    /// decode run between them (the TTFT win) without splitting a prompt mid-tick.
-    /// (The unified tick does the SOTA thing - intra-prompt spans fused into the
-    /// decode forward; this whole-tail path is only the opt-out fallback.)
-    /// Returns `(slot, last-token logits, prompt rows)` per finished prompt.
+    /// Split-tick prefill (the two-forward mixed tick: deep decode batches
+    /// past PADDOCK_UNIFIED_DEC_MAX, or PADDOCK_NO_UNIFIED): run in-flight
+    /// prompts this tick, FIFO (earliest admission first -> its first token
+    /// sooner), up to a ~`budget` row soft cap but always at least one. A tail
+    /// that FITS the cap is prefilled whole from `done` (the resume point
+    /// `prefill_begin` restored) via `prefill_slot_tail` - bit-identical to a
+    /// standalone prefill of the same tokens. This staggers the cohort's first
+    /// tokens over several ticks and lets decode run between them (the TTFT
+    /// win) without splitting a short prompt mid-tick.
+    ///
+    /// A tail LONGER than the cap never runs whole. It used to - "always at
+    /// least one" meant a 150K-token prompt at the head of the queue was one
+    /// prefill call, and every decode row of the serve waited minutes for its
+    /// next token (measured on GB10, qwen3.8-27b). Every serving engine bounds
+    /// the per-step prefill instead (vLLM's max_num_batched_tokens, SGLang's
+    /// chunked_prefill_size), and so does every other path here: such a head
+    /// advances by one prefill-only unified span per tick - the same span the
+    /// fused, overlapped and spec-in-mixed ticks run, cut at the budget, its
+    /// DeltaNet state and conv window resumed in the slot across ticks - and
+    /// the decode pass follows it. The scheduler's budget then bounds the tick
+    /// for long prompts too, which is what its tick pacer (crate::pacing)
+    /// relies on. A long tail behind a short head waits until it heads the
+    /// queue. Invariant this also keeps: the whole-tail path never sees a
+    /// tail longer than the elected chunk - its resume walk stages the conv
+    /// window for at most that many rows, and a 19,920-row tail against a
+    /// 1024-row election tripped that assert and took the engine thread down
+    /// (GB10, 16 slots under an 80 GiB budget, 2026-09-23). Finishers
+    /// sample per `fin_plans` on the span path (Logits without a plan), and
+    /// read logits back on the whole-tail path.
+    /// Returns `(slot, finish, prompt rows)` per finished prompt.
     fn advance_chunks(
         &mut self,
         budget: usize,
-    ) -> Result<Vec<(usize, Vec<f32>, usize)>, GpuModelError> {
-        let cap = budget.min(self.prefill_chunk_rows);
+        fin_plans: &[(usize, crate::generator::RowSample)],
+    ) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, GpuModelError> {
+        use crate::generator::FinishSample;
+        let cap = budget.min(self.prefill_chunk_rows).max(1);
+        if self
+            .chunked
+            .first()
+            .is_some_and(|c| c.tokens.len() - c.done > cap)
+        {
+            return if self.unified_span_launch(cap, fin_plans)? {
+                self.unified_span_finish()
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let logits = |v: Vec<(usize, Vec<f32>, usize)>| {
+            v.into_iter()
+                .map(|(k, l, r)| (k, FinishSample::Logits(l), r))
+                .collect()
+        };
         // With a DFlash drafter armed the soft cap is HARD past prompt 0. The
         // drafter's fusion accumulator is sized for chunk_tick_rows() prefill
         // rows (+ the verify/decode share), and the soft cap's overshoot -
@@ -4947,7 +5002,7 @@ impl GpuQwen35 {
         // which tanks decode throughput on every mixed tick. Batching keeps
         // the chunk path's low TTFT while restoring decode.
         if std::env::var_os("PADDOCK_QWEN35_CHUNK_BATCH").is_some() {
-            return self.advance_chunks_batched(cap, hard);
+            return self.advance_chunks_batched(cap, hard).map(logits);
         }
         let mut finished = Vec::new();
         let mut used = 0usize;
@@ -4964,6 +5019,9 @@ impl GpuQwen35 {
             if used > 0 && hard.is_some_and(|h| used + len > h) {
                 break; // the drafter's fusion cap: this tail goes next tick
             }
+            if len - done > cap {
+                break; // a long tail waits to head the queue (spans, above)
+            }
             // Resume from `done` (prefill_begin already restored the prefix state
             // + KV); prefill only the tail, snapshot + insert. Bit-identical to an
             // un-chunked prefill - chunked prefill changes only when prompts run.
@@ -4972,7 +5030,7 @@ impl GpuQwen35 {
             self.chunked.remove(0);
             used += len;
         }
-        Ok(finished)
+        Ok(logits(finished))
     }
 
     /// Lever 2 batched tick prefill: pop fresh (done==0) chunked prompts up to the
@@ -5014,6 +5072,9 @@ impl GpuQwen35 {
             let len = toks.len();
             if used > 0 && hard.is_some_and(|h| used + len > h) {
                 break; // the drafter's fusion cap: this tail goes next tick
+            }
+            if len - done > cap {
+                break; // a long tail waits to head the queue (advance_chunks)
             }
             if done != 0 {
                 // resumed span: keep the serial resume+snapshot path (correctness
@@ -5197,7 +5258,7 @@ impl GpuQwen35 {
         decodes: &[(usize, u32, u32)],
         budget: usize,
         plans: &[crate::generator::RowSample],
-        _fin_plans: &[(usize, crate::generator::RowSample)],
+        fin_plans: &[(usize, crate::generator::RowSample)],
     ) -> Result<
         (
             crate::generator::SampledStep,
@@ -5205,14 +5266,10 @@ impl GpuQwen35 {
         ),
         GpuModelError,
     > {
-        use crate::generator::{FinishSample, SampledStep};
+        use crate::generator::SampledStep;
         assert_eq!(plans.len(), decodes.len(), "one plan per decode row");
-        // two-forward fallback tick: prefill keeps the classic logits readback
-        let finished = self
-            .advance_chunks(budget)?
-            .into_iter()
-            .map(|(k, l, r)| (k, FinishSample::Logits(l), r))
-            .collect();
+        // two-forward tick: the prefill share, then the decode pass
+        let finished = self.advance_chunks(budget, fin_plans)?;
         let step = if decodes.is_empty() {
             SampledStep {
                 ids: Vec::new(),
@@ -8623,7 +8680,18 @@ impl GpuQwen35 {
         decodes: &[(usize, u32, u32)],
         budget: usize,
     ) -> Result<(Vec<f32>, Vec<(usize, Vec<f32>, usize)>), GpuModelError> {
-        let finished = self.advance_chunks(budget)?;
+        use crate::generator::FinishSample;
+        // no finisher plans: every finisher reads its logits back
+        let finished = self
+            .advance_chunks(budget, &[])?
+            .into_iter()
+            .map(|(k, f, r)| match f {
+                FinishSample::Logits(l) => Ok((k, l, r)),
+                FinishSample::Sampled(_) => Err(GpuModelError::Unsupported(
+                    "device-sampled finisher without a plan".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let logits = if decodes.is_empty() {
             Vec::new()
         } else {

@@ -9,11 +9,23 @@ import Testing
 struct RuntimeTests {
   typealias V = ConversationValue
   typealias O = [String: V]
-  func fixture(speechFeatures: Bool = false, history: [O] = []) async throws -> NativeStudioRuntime
+  func fixture(
+    speechFeatures: Bool = false, history: [O] = [], localCapabilities: O? = nil,
+    imagePeerCapabilities: O? = nil,
+    cloudContext: Int? = 131072, cloudOutput: Int? = 2048,
+    openPDF: @escaping @Sendable (Data) async throws -> NativeDocumentSource = { _ in
+      throw ConversationFailure.invalid("Test PDF loader not configured")
+    }
+  )
+    async throws -> NativeStudioRuntime
   {
     RuntimeProtocol.state.withLock {
       $0 = .init()
       $0.speechFeatures = speechFeatures
+      $0.localCapabilities = localCapabilities
+      $0.imagePeerCapabilities = imagePeerCapabilities
+      $0.cloudContext = cloudContext
+      $0.cloudOutput = cloudOutput
       $0.documents = Dictionary(uniqueKeysWithValues: history.map { ($0["id"]!.string!, $0) })
     }
     let host = try JSONDecoder().decode(
@@ -25,7 +37,7 @@ struct RuntimeTests {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [RuntimeProtocol.self]
     let transport = try NativeConversationTransport(host: host, configuration: configuration)
-    let runtime = NativeStudioRuntime(transport: transport) { _ in }
+    let runtime = NativeStudioRuntime(transport: transport, openPDF: openPDF) { _ in }
     try await runtime.start()
     return runtime
   }
@@ -36,6 +48,428 @@ struct RuntimeTests {
       try await Task.sleep(for: .milliseconds(10))
     }
     throw ConversationFailure.invalid("Native runtime did not settle")
+  }
+  @Test func nativeImagesUseImageAPIAndSurviveReopening() async throws {
+    let runtime = try await fixture(localCapabilities: [
+      "image_generation": .object([
+        "stream": .bool(true), "max_n": .number(4), "max_steps": .number(100),
+        "max_partial_images": .number(3), "default_steps": .number(40),
+        "default_size": .string("1024x1024"), "output_formats": .array([.string("png")]),
+      ])
+    ])
+    _ = try await runtime.command("models", ["ids": .array([.string("local")])])
+    #expect(await runtime.presentation()["composer"]?["imageMode"] == .bool(true))
+    _ = try await runtime.command(
+      "preferencesSave",
+      [
+        "changes": .object(["maxTokens": .number(1)]), "expected": .object(["maxTokens": .null]),
+      ])
+    _ = try await runtime.command("settings", ["imageParams": .object(["quality": .string("low")])])
+    _ = try await runtime.command("send", ["text": .string("A red apple")])
+    _ = try await settled(runtime)
+    let fields = try #require(await runtime.currentFields())
+    let response = try #require(fields["messages"]?.array?.last)
+    #expect(response["error"] == nil)
+    #expect(response["imageGen"]?["steps"] == .number(20))
+    #expect(response["imageGen"]?["previews"] == .number(1))
+    let picture = try #require(response["content"]?.array?.first)
+    #expect(picture["type"] == .string("image"))
+    #expect(picture["attachmentId"]?.string != nil && picture["dataURL"] == nil)
+    let requests = RuntimeProtocol.state.withLock { $0.requests }
+    #expect(requests.contains { $0["path"]?.string == "/api/runners/12481/v1/images/generations" })
+    #expect(
+      requests.first { $0["path"]?.string?.hasSuffix("/images/generations") == true }?["body"]?[
+        "max_output_tokens"] == nil)
+    #expect(!requests.contains { $0["path"]?.string?.hasSuffix("/responses") == true })
+    let encoded = try JSONEncoder().encode(fields)
+    #expect(!String(decoding: encoded, as: UTF8.self).contains("b64_json"))
+    _ = try await runtime.command("newChat")
+    _ = try await runtime.command("open", ["id": fields["id"]!])
+    #expect(
+      await runtime.currentFields()?["messages"]?.array?.last?["content"]?.array?.first == picture)
+    _ = try await runtime.command(
+      "openDocument", ["messageId": response["id"]!, "attachmentId": picture["attachmentId"]!])
+    #expect(await runtime.currentFields()?["activeDocId"] == response["id"])
+    #expect(
+      await runtime.presentation()["settings"]?["lastImageSeed"] == response["imageGen"]?["seed"])
+    _ = try await runtime.command("settings", ["imageParams": .null])
+    #expect(await runtime.currentFields()?["imageParams"] == nil)
+    #expect(
+      await runtime.presentation()["settings"]?["imageParams"]
+        == .object(NativeImageGeneration.defaults))
+    await runtime.close()
+  }
+  @Test func completedImageSurvivesAttachmentStoreFailureAndReopens() async throws {
+    let runtime = try await fixture(localCapabilities: [
+      "image_generation": .object([
+        "stream": .bool(true), "max_n": .number(4), "max_steps": .number(100),
+        "max_partial_images": .number(3), "default_steps": .number(40),
+        "default_size": .string("1024x1024"), "output_formats": .array([.string("png")]),
+      ])
+    ])
+    RuntimeProtocol.state.withLock { $0.failImageStore = true }
+    _ = try await runtime.command("models", ["ids": .array([.string("local")])])
+    _ = try await runtime.command("send", ["text": .string("A red apple")])
+    _ = try await settled(runtime)
+    let fields = try #require(await runtime.currentFields())
+    let response = try #require(fields["messages"]?.array?.last)
+    #expect(response["error"] == nil)
+    let part = try #require(response["content"]?.array?.first)
+    #expect(part["attachmentId"] == .string(""))
+    #expect(part["dataUrl"]?.string?.hasPrefix("data:image/png;base64,") == true)
+    _ = try await runtime.command("newChat")
+    _ = try await runtime.command("open", ["id": fields["id"]!])
+    let projected = await runtime.presentation()
+    let picture = try #require(
+      projected["nativeTranscript"]?["messages"]?.array?.last?["pictures"]?.array?.first)
+    #expect(picture["dataURL"] == part["dataUrl"])
+    #expect(picture["id"]?.string?.hasPrefix("inline-") == true)
+    _ = try await runtime.command(
+      "openDocument",
+      [
+        "messageId": response["id"]!, "attachmentId": picture["id"]!,
+      ])
+    #expect(await runtime.presentation()["nativeDocument"]?["id"] == picture["id"])
+    #expect(
+      await runtime.currentFields()?["messages"]?.array?.last?["content"]?.array?.first == part)
+    await runtime.close()
+  }
+  @Test func repetitiveOCRIsSavedForReviewWithoutLosingText() async throws {
+    let runtime = try await fixture(localCapabilities: [
+      "document_parser": .bool(true), "vision": .bool(true), "max_ctx": .number(8192),
+    ])
+    let loop = String(repeating: "INVOICE 123\n", count: 500)
+    RuntimeProtocol.state.withLock { $0.documentAnswer = loop }
+    _ = try await runtime.command(
+      "stage",
+      [
+        "id": .string("scan"), "name": .string("Scan.jpg"), "mime": .string("image/jpeg"),
+        "size": .number(10),
+      ])
+    _ = try await runtime.command(
+      "send", ["attachments": .array([.object(["id": .string("scan")])])])
+    _ = try await settled(runtime)
+    let page = try #require(
+      await runtime.currentFields()?["messages"]?.array?.last?["docRun"]?["pages"]?.array?.first)
+    #expect(page["state"] == .string("review"))
+    #expect(page["text"] == .string(loop))
+    #expect((page["repetitionRatio"]?.double ?? 0) > 4.5)
+    #expect(page["note"]?.string?.contains("original") == true)
+    await runtime.close()
+  }
+  @Test func documentImagesFanOutAndSelectedOriginalSurvivesReopening() async throws {
+    let runtime = try await fixture(localCapabilities: [
+      "document_parser": .bool(true), "vision": .bool(true), "max_ctx": .number(8192),
+      "ocr": .object(["modes": .array([.string("markdown")]), "grounding": .bool(true)]),
+    ])
+    _ = try await runtime.command(
+      "settings", ["ocrMode": .string("markdown"), "ocrRegions": .bool(true)])
+    for id in ["scan-one", "scan-two"] {
+      _ = try await runtime.command(
+        "stage",
+        [
+          "id": .string(id), "mime": .string("image/jpeg"),
+          "name": .string("\(id).jpg"), "size": .number(10),
+        ])
+    }
+    _ = try await runtime.command(
+      "send",
+      [
+        "text": .string("Free text cannot enter a fixed-vocabulary OCR decoder"),
+        "attachments": .array([
+          .object(["id": .string("scan-one")]), .object(["id": .string("scan-two")]),
+        ]),
+      ])
+    _ = try await settled(runtime)
+    let first = try #require(await runtime.currentFields())
+    let source = try #require(first["messages"]?.array?.first?["id"])
+    #expect(first["activeDocId"] == source)
+    let pages = try #require(first["messages"]?.array?.last?["docRun"]?["pages"]?.array)
+    #expect(pages.count == 2 && pages.allSatisfy { $0["state"] == .string("done") })
+    #expect(pages.allSatisfy { $0["text"] == .string("Local final tail 🦊") })
+    #expect(first["messages"]?.array?.last?["usage"]?["promptTokens"]?.integer == 20)
+    let requests = RuntimeProtocol.state.withLock {
+      $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }
+    }
+    #expect(requests.count == 2)
+    for request in requests {
+      let body = request["body"]
+      #expect(body?["input"]?.array?.count == 1)
+      #expect(body?["input"]?.array?.first?["content"]?.array?.count == 1)
+      #expect(
+        body?["input"]?.array?.first?["content"]?.array?.first?["type"] == .string("input_image"))
+      #expect(body?["ocr"] == .object(["mode": .string("markdown"), "grounding": .bool(true)]))
+      #expect(body?["tools"] == nil && body?["instructions"] == nil)
+      #expect(body?["include"] == .array([.string("message.output_text.logprobs")]))
+    }
+    // A fresh document selects itself, and opening the earlier original makes
+    // that document the target of the next text-only reading request.
+    _ = try await runtime.command(
+      "stage",
+      [
+        "id": .string("scan-new"), "mime": .string("image/jpeg"),
+        "name": .string("New.jpg"), "size": .number(10),
+      ])
+    _ = try await runtime.command(
+      "send", ["attachments": .array([.object(["id": .string("scan-new")])])])
+    _ = try await settled(runtime)
+    #expect(await runtime.currentFields()?["activeDocId"] != source)
+    _ = try await runtime.command(
+      "openDocument", ["messageId": source, "attachmentId": .string("scan-one")])
+    _ = try await runtime.command("newChat")
+    _ = try await runtime.command("open", ["id": first["id"]!])
+    #expect(await runtime.currentFields()?["activeDocId"] == source)
+    _ = try await runtime.command("send", ["text": .string("Read again")])
+    _ = try await settled(runtime)
+    let final = try #require(await runtime.currentFields())
+    #expect(final["messages"]?.array?.last?["docRun"]?["sourceId"] == source)
+    #expect(final["messages"]?.array?.last?["docRun"]?["pages"]?.array?.count == 2)
+    #expect(
+      RuntimeProtocol.state.withLock {
+        $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }.count
+      } == 5)
+    await runtime.close()
+  }
+  @Test func selectedPDFPagesRasterizeOneAtATimeAndCancellationKeepsCompletedPages() async throws {
+    let rendered = Mutex<[Int]>([])
+    let opened = Mutex(0)
+    let runtime = try await fixture(
+      localCapabilities: [
+        "document_parser": .bool(true), "vision": .bool(true), "max_ctx": .number(8192),
+        "pdf": .object(["max_pages": .number(40)]),
+      ],
+      openPDF: { bytes in
+        #expect(bytes == Data("{}".utf8))
+        opened.withLock { $0 += 1 }
+        return NativeDocumentSource(pageCount: 200) { page, maxPixels in
+          let previous = rendered.withLock { pages in
+            let count = pages.count
+            pages.append(page)
+            return count
+          }
+          #expect(maxPixels == 1_500_000)
+          #expect(
+            RuntimeProtocol.state.withLock {
+              $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }.count
+            } == previous)
+          if page == 198 { try await Task.sleep(for: .seconds(30)) }
+          return NativeRasterPage(
+            image: [
+              "type": .string("input_image"),
+              "image_url": .string("data:image/jpeg;base64,cGFnZQ=="),
+            ], width: 100, height: 200)
+        }
+      })
+    _ = try await runtime.command(
+      "stage",
+      [
+        "id": .string("book"), "mime": .string("application/pdf"),
+        "name": .string("Book.pdf"), "size": .number(2000), "pages": .number(200),
+      ])
+    _ = try await runtime.command(
+      "send",
+      [
+        "attachments": .array([
+          .object([
+            "id": .string("book"), "from": .number(197), "to": .number(199),
+          ])
+        ])
+      ])
+    for _ in 0..<500 {
+      if rendered.withLock({ $0.count }) == 2 { break }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(rendered.withLock { $0 } == [197, 198])
+    _ = try await runtime.command("stop")
+    _ = try await settled(runtime)
+    let saved = try #require(await runtime.currentFields())
+    let pages = try #require(saved["messages"]?.array?.last?["docRun"]?["pages"]?.array)
+    #expect(pages.map { $0["page"]?.integer } == [197, 198, 199])
+    #expect(pages.map { $0["state"]?.string } == ["done", "error", "error"])
+    #expect(pages[0]["text"] == .string("Local final tail 🦊"))
+    #expect(pages[1]["note"] == .string("Stopped") && pages[2]["note"] == .string("Stopped"))
+    #expect(saved["messages"]?.array?.last?["usage"] == nil)
+    #expect(opened.withLock { $0 } == 1)
+    #expect(rendered.withLock { $0 } == [197, 198])
+    _ = try await runtime.command("newChat")
+    _ = try await runtime.command("open", ["id": saved["id"]!])
+    #expect(
+      await runtime.currentFields()?["messages"]?.array?.last?["docRun"]?["pages"]?.array == pages)
+    await runtime.close()
+  }
+  @Test func imageOverflowPreservesDraftAndChecksCombinedImagesBeforeAnyRequest() async throws {
+    let budget = try #require(VisionBudgetTests.fixture()["budgets"]?["bonsai"])
+    let runtime = try await fixture(localCapabilities: [
+      "vision": .bool(true), "max_ctx": .number(8192), "vision_budget": budget,
+    ])
+    let state = await runtime.presentation()
+    #expect(state["capabilities"]?["imageLanes"]?.array?.first?["budget"] == budget)
+    for id in ["one", "two"] {
+      _ = try await runtime.command(
+        "stage",
+        [
+          "id": .string(id), "mime": .string("image/jpeg"), "name": .string("Photo.jpg"),
+          "size": .number(1000), "width": .number(6720), "height": .number(4480),
+        ])
+    }
+    for choices: [V] in [
+      [.object(["id": .string("one"), "detail": .string("high")])],
+      [
+        .object(["id": .string("one"), "detail": .string("auto")]),
+        .object(["id": .string("two"), "detail": .string("auto")]),
+      ],
+    ] {
+      await #expect(throws: ConversationFailure.self) {
+        _ = try await runtime.command(
+          "send", ["text": .string("Describe"), "attachments": .array(choices)])
+      }
+      #expect(await runtime.currentFields()?["messages"]?.array?.isEmpty == true)
+      #expect(RuntimeProtocol.state.withLock { $0.documents.isEmpty })
+      #expect(
+        !RuntimeProtocol.state.withLock {
+          $0.requests.contains { $0["path"]?.string?.contains("/responses") == true }
+        })
+    }
+    // The same originals are still staged after refusal; resizing permits send.
+    _ = try await runtime.command(
+      "send",
+      [
+        "text": .string("Describe"),
+        "attachments": .array([
+          .object(["id": .string("one"), "detail": .string("low")]),
+          .object(["id": .string("two"), "detail": .string("low")]),
+        ]),
+      ])
+    _ = try await settled(runtime)
+    #expect(await runtime.currentFields()?["messages"]?.array?.first?["content"]?.array?.count == 3)
+    await runtime.close()
+  }
+  @Test func documentRefusalsOnlyRetryExplicitUnsupportedLogprobsAndKeepOtherPages() async throws {
+    for refusal in [
+      (400, "Unsupported include: message.output_text.logprobs", true),
+      (429, "Temporarily rate limited", false),
+      (400, "Image size exceeds the configured context", false),
+    ] {
+      let runtime = try await fixture(localCapabilities: [
+        "document_parser": .bool(true), "vision": .bool(true), "max_ctx": .number(8192),
+      ])
+      RuntimeProtocol.state.withLock { $0.documentRefusals = [(refusal.0, refusal.1)] }
+      for id in ["one", "two"] {
+        _ = try await runtime.command(
+          "stage",
+          [
+            "id": .string(id), "mime": .string("image/jpeg"),
+            "name": .string("\(id).jpg"), "size": .number(10),
+          ])
+      }
+      _ = try await runtime.command(
+        "send",
+        [
+          "attachments": .array([
+            .object(["id": .string("one")]), .object(["id": .string("two")]),
+          ])
+        ])
+      let shown = try await settled(runtime)
+      let doc = try #require(await runtime.currentFields())
+      let reply = try #require(doc["messages"]?.array?.last)
+      let pages = try #require(reply["docRun"]?["pages"]?.array)
+      #expect(pages.map { $0["state"]?.string } == [refusal.2 ? "done" : "error", "done"])
+      #expect((reply["usage"] != nil) == refusal.2)
+      let calls = RuntimeProtocol.state.withLock {
+        $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }
+      }
+      #expect(calls.count == (refusal.2 ? 3 : 2))
+      if refusal.2 { #expect(calls[1]["body"]?["include"] == nil) }
+      #expect(shown["capabilities"]?["hasDocument"] == .bool(true))
+      _ = try await runtime.command("newChat")
+      #expect(
+        await runtime.presentation()["composer"]?["inputIssue"]
+          == .string("Attach an image or PDF to read"))
+      await runtime.close()
+    }
+  }
+  @Test func persistedDocumentOptionsAreGatedOnTheWireAfterSwitchingModels() async throws {
+    let runtime = try await fixture(localCapabilities: [
+      "vision": .bool(true), "max_ctx": .number(8192),
+      "ocr": .object(["modes": .array([.string("markdown")]), "grounding": .bool(true)]),
+      "forensics": .object(["vision": .bool(true)]),
+    ])
+    _ = try await runtime.command(
+      "settings",
+      [
+        "ocrMode": .string("markdown"), "ocrRegions": .bool(true), "forensicsEnabled": .bool(true),
+      ])
+    _ = try await runtime.command(
+      "stage",
+      [
+        "id": .string("photo"), "mime": .string("image/jpeg"), "name": .string("Photo"),
+        "size": .number(1000),
+      ])
+    _ = try await runtime.command(
+      "send", ["text": .string("Read"), "attachments": .array([.object(["id": .string("photo")])])])
+    _ = try await settled(runtime)
+    let local = try #require(
+      RuntimeProtocol.state.withLock {
+        $0.requests.last { $0["path"]?.string?.hasSuffix("/responses") == true }?["body"]
+      })
+    #expect(local["ocr"]?["mode"] == .string("markdown"))
+    #expect(local["ocr"]?["grounding"] == .bool(true))
+    #expect(local["forensics"] == .string("on"))
+    #expect(local["tools"] == nil)
+    _ = try await runtime.command("models", ["ids": .array([.string("cloud:ep:remote")])])
+    _ = try await runtime.command("send", ["text": .string("Continue as a normal conversation")])
+    _ = try await settled(runtime)
+    let cloud = try #require(
+      RuntimeProtocol.state.withLock {
+        $0.requests.last { $0["path"]?.string?.hasSuffix("/responses") == true }?["body"]
+      })
+    #expect(cloud["ocr"] == nil && cloud["forensics"] == nil)
+    #expect(cloud["tools"]?.array?.isEmpty == false)
+    #expect(await runtime.currentFields()?["ocrMode"] == .string("markdown"))
+    await runtime.close()
+  }
+  @Test func imageResizeChoiceSurvivesSavingReopeningAndResponsesInput() async throws {
+    for detail in ["auto", "high", "low"] {
+      let runtime = try await fixture()
+      _ = try await runtime.command(
+        "stage",
+        [
+          "id": .string("fixture-photo"), "name": .string("Photo.jpg"),
+          "mime": .string("image/jpeg"), "size": .number(18_171_177),
+          "width": .number(6720), "height": .number(4480),
+        ])
+      _ = try await runtime.command(
+        "send",
+        [
+          "text": .string("Describe this photo"),
+          "attachments": .array([
+            .object(["id": .string("fixture-photo"), "detail": .string(detail)])
+          ]),
+        ])
+      _ = try await settled(runtime)
+      let doc = try #require(await runtime.currentFields())
+      let part = try #require(doc["messages"]?.array?.first?["content"]?.array?.last)
+      #expect(part["detail"]?.string == detail)
+      #expect(part["attachmentId"]?.string == "fixture-photo")
+      #expect(part["width"]?.integer == 6720 && part["height"]?.integer == 4480)
+      #expect(part["size"]?.integer == 18_171_177)
+      #expect(part["modelUrl"] == nil && part["dataUrl"] == nil)
+      let body = try #require(
+        RuntimeProtocol.state.withLock {
+          $0.requests.last { $0["path"]?.string?.hasSuffix("/responses") == true }?["body"]
+        })
+      let image = try #require(body["input"]?.array?.first?["content"]?.array?.last)
+      #expect(image["type"]?.string == "input_image")
+      #expect(image["detail"]?.string == detail)
+      // The test transport's attachment bytes are an empty JSON object.
+      // Resizing stays in Rust, so the native client preserves those bytes.
+      #expect(image["image_url"]?.string == "data:image/jpeg;base64,e30=")
+      _ = try await runtime.command("newChat")
+      _ = try await runtime.command("open", ["id": doc["id"]!])
+      let reopened = await runtime.currentFields()
+      #expect(reopened?["messages"]?.array?.first?["content"]?.array?.last == part)
+      await runtime.close()
+    }
   }
   @Test func cloudHTTPFailureKeepsRecoveryMetadataAndIsNotAutomaticallyRetried() async throws {
     let runtime = try await fixture()
@@ -270,6 +704,56 @@ struct RuntimeTests {
     await runtime.close()
   }
 
+  @Test func compareUsesIndependentOutputCapacityAndDoesNotRewriteCustomPreference() async throws {
+    let runtime = try await fixture(cloudOutput: 16384)
+    _ = try await runtime.command(
+      "models", ["ids": .array([.string("local"), .string("cloud:ep:remote")])])
+    _ = try await runtime.command("send", ["text": .string("Independent capacities")])
+    _ = try await settled(runtime)
+    var requests = RuntimeProtocol.state.withLock {
+      $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }
+    }
+    #expect(
+      requests.first { $0["path"]?.string?.contains("/cloud/") == true }?["body"]?[
+        "max_output_tokens"] == .number(16384))
+    #expect(
+      requests.first { $0["path"]?.string?.contains("/runners/") == true }?["body"]?[
+        "max_output_tokens"] == .number(4096))
+    _ = try await runtime.command(
+      "preferencesSave",
+      [
+        "changes": .object(["maxTokens": .number(32768)]),
+        "expected": .object(["maxTokens": .null]),
+      ])
+    _ = try await runtime.command("send", ["text": .string("Custom ceiling")])
+    _ = try await settled(runtime)
+    requests = RuntimeProtocol.state.withLock {
+      Array($0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }.suffix(2))
+    }
+    #expect(
+      requests.first { $0["path"]?.string?.contains("/cloud/") == true }?["body"]?[
+        "max_output_tokens"] == .number(16384))
+    #expect(
+      requests.first { $0["path"]?.string?.contains("/runners/") == true }?["body"]?[
+        "max_output_tokens"] == .number(4096))
+    let saved = try await runtime.command("preferencesGet")
+    #expect(saved["preferences"]?["maxTokens"] == .number(32768))
+    await runtime.close()
+  }
+  @Test func unknownCapacityUsesEndpointDefaultInsteadOfAnInventedReplyCap() async throws {
+    let runtime = try await fixture(
+      localCapabilities: ["reasoning": .string("none")], cloudContext: nil, cloudOutput: nil)
+    _ = try await runtime.command(
+      "models", ["ids": .array([.string("local"), .string("cloud:ep:remote")])])
+    _ = try await runtime.command("send", ["text": .string("Unknown limits")])
+    _ = try await settled(runtime)
+    let requests = RuntimeProtocol.state.withLock {
+      $0.requests.filter { $0["path"]?.string?.hasSuffix("/responses") == true }
+    }
+    #expect(requests.count == 2)
+    #expect(requests.allSatisfy { $0["body"]?["max_output_tokens"] == nil })
+    await runtime.close()
+  }
   @Test func compareMakerProviderAndBadgesSurviveFleetRemovalWithoutChangingTheRoute() async throws
   {
     let runtime = try await fixture()
@@ -540,17 +1024,27 @@ struct RuntimeTests {
   }
 }
 
-private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
+final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
   typealias V = ConversationValue
   typealias O = [String: V]
   struct State: Sendable {
     var documents: [String: O] = [:]
     var requests: [O] = []
     var failSave = false
+    var failImageStore = false
+    var imageAttachments: [String: Data] = [:]
+    var imageEditError: Int?
+    var imageJSONCount: Int?
     var speechFeatures = false
     var cloudEnabled = true
+    var cloudContext: Int? = 131072
+    var cloudOutput: Int? = 2048
     var artifacts: [V] = []
     var responseFailure = false
+    var localCapabilities: O?
+    var imagePeerCapabilities: O?
+    var documentAnswer: String?
+    var documentRefusals: [(Int, String)] = []
   }
   static let state = Mutex(State())
   override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "127.0.0.1" }
@@ -574,10 +1068,25 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
       state.requests.append([
         "path": .string(path), "body": body,
         "multipart": .string(String(decoding: bytes, as: UTF8.self)),
+        "contentType": .string(request.value(forHTTPHeaderField: "Content-Type") ?? ""),
+        "method": .string(method),
       ])
       var value: V = .object([:])
       var status = 200
-      if state.speechFeatures, path.hasPrefix("/api/attachments/") {
+      if state.failImageStore, method == "PUT", path.hasPrefix("/api/attachments/") {
+        return (503, "application/json", Data("{\"error\":\"Store unavailable\"}".utf8))
+      } else if state.localCapabilities?["image_generation"] != nil,
+        path.hasPrefix("/api/attachments/")
+      {
+        let id = String(path.split(separator: "/").last!)
+        if method == "PUT" {
+          state.imageAttachments[id] = bytes
+        } else if let original = state.imageAttachments[id] {
+          return (200, "image/png", original)
+        } else {
+          return (404, "application/json", Data("{}".utf8))
+        }
+      } else if state.speechFeatures, path.hasPrefix("/api/attachments/") {
         return (200, "audio/wav", Data(repeating: 0, count: 44))
       } else if state.speechFeatures, path == "/api/runners" {
         value = .array([
@@ -620,7 +1129,8 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
       } else if path == "/api/runners" {
         value = .array([
           .object([
-            "model": .string("local"), "display": .string("Local model"), "port": .number(12481),
+            (state.localCapabilities?["image_generation"] != nil ? "image" : "model"): .string(
+              "local"), "display": .string("Local model"), "port": .number(12481),
             "status": .string("ok"),
           ]),
           .object([
@@ -628,6 +1138,15 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
             "status": .string("ok"),
           ]),
         ])
+        if state.imagePeerCapabilities != nil {
+          value = .array(
+            (value.array ?? []) + [
+              .object([
+                "image": .string("local-peer"), "display": .string("Other image model"),
+                "port": .number(12482), "status": .string("ok"),
+              ])
+            ])
+        }
       } else if path == "/api/cloud" {
         value = .array(
           state.cloudEnabled
@@ -637,7 +1156,9 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
                 "models": .array([
                   .object([
                     "id": .string("remote"), "display": .string("Remote model"),
-                    "vision": .bool(false), "ctx": .number(131072), "maxOut": .number(2048),
+                    "vision": .bool(false),
+                    "ctx": state.cloudContext.map { .number(Decimal($0)) } ?? .null,
+                    "maxOut": state.cloudOutput.map { .number(Decimal($0)) } ?? .null,
                   ]),
                   .object([
                     "id": .string("moonshotai/kimi-k3"), "display": .string("MoonshotAI: Kimi K3"),
@@ -651,11 +1172,14 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
         value = .object([
           "asr": .string("speech"), "timestamp_granularities": .array([.string("segment")]),
         ])
+      } else if path == "/api/runners/12482/server", let cap = state.imagePeerCapabilities {
+        value = .object(cap)
       } else if path.hasSuffix("/server") {
-        value = .object([
-          "max_ctx": .number(4096), "default_max_output_tokens": .number(1024),
-          "reasoning": .string("toggle"), "vision": .bool(true),
-        ])
+        value = .object(
+          state.localCapabilities ?? [
+            "max_ctx": .number(4096), "default_max_output_tokens": .number(1024),
+            "reasoning": .string("toggle"), "vision": .bool(true),
+          ])
       } else if path == "/api/conversations" {
         value = .array(state.documents.values.map(V.object))
       } else if path.hasSuffix("/artifacts") {
@@ -669,13 +1193,51 @@ private final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
         } else {
           status = 404
         }
+      } else if path.hasSuffix("/images/generations") || path.hasSuffix("/images/edits") {
+        if path.hasSuffix("/images/edits"), let status = state.imageEditError {
+          return (
+            status, "application/json",
+            Data("{\"error\":{\"message\":\"Reference image rejected by endpoint\"}}".utf8)
+          )
+        }
+        let png =
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+        if let count = state.imageJSONCount {
+          return (
+            200, "application/json",
+            try! JSONEncoder().encode(
+              V.object([
+                "data": .array((0..<count).map { _ in .object(["b64_json": .string(png)]) }),
+                "size": .string("1536x1024"), "output_format": .string("png"),
+              ]))
+          )
+        }
+        return (
+          200, "text/event-stream",
+          Data(
+            ("data: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"\(png)\",\"partial_image_index\":0}\n\n"
+              + "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"\(png)\",\"size\":\"1024x1024\",\"quality\":\"low\",\"background\":\"opaque\",\"usage\":{\"input_tokens\":5,\"output_tokens\":4096}}\n\n")
+              .utf8)
+        )
       } else if path.hasSuffix("/responses") {
+        if !state.documentRefusals.isEmpty {
+          let refusal = state.documentRefusals.removeFirst()
+          return (
+            refusal.0, "application/json",
+            try! JSONEncoder().encode(
+              V.object([
+                "error": .object(["message": .string(refusal.1)])
+              ]))
+          )
+        }
         if state.responseFailure {
           let error =
             #"{"error":{"message":"DeepInfra: model is temporarily rate-limited upstream.","metadata":{"provider_name":"DeepInfra","provider_error_code":"engine_overloaded","action":"openrouter_integrations"}}}"#
           return (429, "application/json", Data(error.utf8))
         }
-        let answer = path.contains("/cloud/") ? "Cloud final tail 🦊" : "Local final tail 🦊"
+        let answer =
+          state.documentAnswer
+          ?? (path.contains("/cloud/") ? "Cloud final tail 🦊" : "Local final tail 🦊")
         let terminal: O = [
           "type": .string("response.completed"),
           "response": .object([

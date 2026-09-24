@@ -72,6 +72,19 @@ pub enum Dialect {
     /// The arguments arrive already typed (real JSON), so unlike the two XML
     /// dialects there is nothing to coerce against the request's schema.
     JsonToolCall,
+    /// MiniCPM5's attribute-XML calls, the `<think>` region shared with qwen:
+    /// `<function name="NAME"><param name="KEY">VALUE</param>...</function>`,
+    /// repeated back to back for parallel calls, no `<tool_call>` wrapper, and
+    /// a value that carries `<`, `&` or a newline arrives wrapped in
+    /// `<![CDATA[...]]>` (the template's own rule for what it writes back, so
+    /// the model emits it too). `<function` and `<param` are single vocab
+    /// entries (ids 18 and 20), the closers are ordinary text.
+    ///
+    /// Selected off the TEMPLATE, never the arch: the file says
+    /// `general.architecture = llama`, which names a stack, not a chat
+    /// format. The marker pair `<function name="` + `<param name="` is the
+    /// same test llama.cpp's chat layer applies.
+    MiniCpmXml,
     /// No known structure: the whole text is content.
     Plain,
     /// Transcript text is not chat framing. Preserve generated whitespace
@@ -87,7 +100,8 @@ impl Dialect {
             // `<think>` region as qwen3.5 (the card's own parser election is
             // vLLM's `qwen3_coder`)
             "qwen35" | "qwen35moe" | "qwen4exp" | "nemotron" | "nemotron_h_moe" => Dialect::QwenXml,
-            "gemma4" => Dialect::GemmaChannel,
+            // diffusion-gemma ships Gemma 4's chat template verbatim
+            "gemma4" | "diffusion-gemma" => Dialect::GemmaChannel,
             "laguna" => Dialect::Laguna,
             "muse-glimmer" => Dialect::MuseChannel,
             "granite" => Dialect::JsonToolCall,
@@ -146,6 +160,15 @@ impl Dialect {
             {
                 Dialect::QwenXml
             }
+            // MiniCPM5 under the generic `llama` arch: the attribute-XML pair
+            // is unique to its template (qwen's `<function=` has no quote)
+            Dialect::Plain
+                if template.is_some_and(|t| {
+                    t.contains("<function name=\"") && t.contains("<param name=\"")
+                }) =>
+            {
+                Dialect::MiniCpmXml
+            }
             d => d,
         }
     }
@@ -193,6 +216,9 @@ impl Dialect {
             // cannot split across deltas, and the holdback is here for the
             // other case: a model spelling a marker out of ordinary text.
             Dialect::QwenXml | Dialect::Laguna => &["<tool_call>", "<think>", "</think>"],
+            // `<function` is one vocab entry on MiniCPM5 (arrives whole); the
+            // holdback covers a model spelling it out, as above
+            Dialect::MiniCpmXml => &[MINICPM_FUNC, "<think>", "</think>"],
             // the bare opener rides along so a turn that is a call cannot leak
             // its first bytes as content before the parse can classify it
             // (`bare_lead`); it withholds at most those few bytes, and a turn
@@ -226,6 +252,7 @@ impl Dialect {
             Dialect::Laguna => Some(ToolSyntax::LagunaXml),
             Dialect::JsonToolCall => Some(ToolSyntax::Json),
             Dialect::MuseChannel => Some(ToolSyntax::AtemXml),
+            Dialect::MiniCpmXml => Some(ToolSyntax::MiniCpmXml),
             _ => None,
         }
     }
@@ -262,6 +289,7 @@ impl Dialect {
     pub fn reasoning_markers(self) -> &'static [&'static str] {
         match self {
             Dialect::QwenXml => &["</think>", "<tool_call>"],
+            Dialect::MiniCpmXml => &["</think>", MINICPM_FUNC],
             Dialect::Laguna => &["</think>"],
             Dialect::GemmaChannel => &["<channel|>"],
             // muse-glimmer closes a thought with `<|eom|>`, a single special
@@ -286,6 +314,14 @@ impl Dialect {
     pub fn grammar_specials(self) -> &'static [&'static str] {
         match self {
             Dialect::MuseChannel => &[crate::muse::START, crate::muse::MESSAGE, crate::muse::EOM],
+            // MiniCPM5's four call markers are CONTROL tokens (ids 18-21,
+            // `token_type` 3) - the vocab's own spelling of the syntax. With
+            // the blanket refusal the model could not close a value with
+            // `</param>` and improvised from fragments (`Lisbon</param
+            // name="units">f</name>`, measured). llama.cpp's MiniCPM5
+            // handler preserves exactly these four (plus the think pair,
+            // which never sits inside a call here).
+            Dialect::MiniCpmXml => &[MINICPM_FUNC, "</function>", "<param", "</param>"],
             _ => &[],
         }
     }
@@ -345,6 +381,7 @@ pub fn parse(
     match dialect {
         Dialect::Harmony => crate::harmony::parse(text, hints.is_some()),
         Dialect::QwenXml => qwen_parse(text, thinking_open, hints),
+        Dialect::MiniCpmXml => minicpm_parse(text, thinking_open, hints),
         Dialect::GemmaChannel => gemma_parse(text, thinking_open),
         Dialect::Laguna => laguna_parse(text, thinking_open, hints),
         Dialect::MuseChannel => crate::muse::parse(text, thinking_open, hints),
@@ -581,6 +618,156 @@ fn parse_function_block(block: &str, hints: &ToolHints) -> Option<ToolCallRaw> {
         let val = val.strip_suffix('\n').unwrap_or(val);
         let declared_string = param_hints.and_then(|h| h.get(&key)).copied();
         args.insert(key, coerce(val, declared_string));
+        cur = next;
+    }
+
+    Some(ToolCallRaw {
+        name: name.to_owned(),
+        arguments: Value::Object(args).to_string(),
+    })
+}
+
+pub(crate) const MINICPM_FUNC: &str = "<function";
+const MINICPM_FUNC_END: &str = "</function>";
+const MINICPM_PARAM_END: &str = "</param>";
+const CDATA_OPEN: &str = "<![CDATA[";
+const CDATA_CLOSE: &str = "]]>";
+
+/// MiniCPM5 assistant output (specials visible, engine already stopped before
+/// `<|im_end|>`). The `<think>` choreography is qwen's - the template
+/// pre-opens `<think>\n` with thinking on, pre-closes an empty block with it
+/// off, and leaves the model to open its own when the caller said nothing -
+/// followed by preamble text and the calls:
+///
+///   <function name="NAME"><param name="KEY">VALUE</param>...</function>
+///
+/// back to back for parallel calls. No padding around values (a string goes
+/// verbatim, `<![CDATA[...]]>` when it holds `<`, `&` or a newline), so
+/// values are taken as written. Calls extract wherever they appear, the think
+/// region included, for the same reason qwen_parse does it.
+fn minicpm_parse(text: &str, thinking_open: bool, hints: Option<&ToolHints>) -> Parsed {
+    let mut out = Parsed::default();
+    let scan = |region: &str, out: &mut Parsed| -> String {
+        match hints {
+            Some(h) => scan_minicpm_blocks(region, h, out),
+            None => region.to_owned(),
+        }
+    };
+
+    // 1) split off the reasoning block - identical structure to qwen_parse,
+    // including the output-tail rule (never trim the end of a delta)
+    let rest = if let Some(i) = text.find(THINK_END) {
+        let r = text[..i].trim_start();
+        let r = r.strip_prefix(THINK).unwrap_or(r);
+        let r = scan(r, &mut out);
+        let r = r.trim_start();
+        if !r.is_empty() {
+            out.reasoning = Some(r.to_owned());
+        }
+        &text[i + THINK_END.len()..]
+    } else if thinking_open || text.trim_start().starts_with(THINK) {
+        let r = text.trim_start();
+        let r = r.strip_prefix(THINK).unwrap_or(r);
+        let r = scan(r, &mut out);
+        let r = r.trim_start();
+        if !r.is_empty() {
+            out.reasoning = Some(r.to_owned());
+        }
+        return out;
+    } else {
+        text
+    };
+
+    // 2) function blocks; content is everything outside them
+    let content = scan(rest, &mut out);
+    let content = content.trim_start();
+    if !content.is_empty() {
+        out.content = Some(content.to_owned());
+    }
+    out
+}
+
+/// Scan a region for `<function name="...">...</function>` blocks: parsed
+/// calls land in `out`, the return is the region with the blocks removed. An
+/// unterminated final block (max_tokens mid-call, or still generating) parses
+/// best-effort; only a closed block counts complete.
+fn scan_minicpm_blocks(region: &str, hints: &ToolHints, out: &mut Parsed) -> String {
+    let mut kept = String::new();
+    let mut cur = region;
+    while let Some(s) = cur.find(MINICPM_FUNC) {
+        // `<function` followed by anything but ` name="` is text, not a call
+        // (the closer `</function>` never matches here - it starts with `</`)
+        let after = &cur[s + MINICPM_FUNC.len()..];
+        let Some(rest) = after.strip_prefix(" name=\"") else {
+            // a bare `<function` at the very end is a call still being typed
+            if after.is_empty() || " name=\"".starts_with(after) {
+                kept.push_str(&cur[..s]);
+                break;
+            }
+            kept.push_str(&cur[..s + MINICPM_FUNC.len()]);
+            cur = after;
+            continue;
+        };
+        kept.push_str(&cur[..s]);
+        let (block, next, closed) = match rest.find(MINICPM_FUNC_END) {
+            Some(e) => (&rest[..e], &rest[e + MINICPM_FUNC_END.len()..], true),
+            None => (rest, "", false),
+        };
+        if let Some(tc) = parse_minicpm_call(block, hints) {
+            out.tool_calls.push(tc);
+            if closed {
+                out.complete_calls = out.tool_calls.len();
+            }
+        }
+        cur = next;
+    }
+    kept.push_str(cur);
+    kept
+}
+
+/// One call, from just after `<function name="` to before `</function>`.
+fn parse_minicpm_call(block: &str, hints: &ToolHints) -> Option<ToolCallRaw> {
+    let name_end = block.find('"')?;
+    let name = block[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut body = &block[name_end + 1..];
+    // the opener's own `>` - absent only mid-generation
+    body = body.strip_prefix('>').unwrap_or(body);
+
+    let param_hints = hints.get(name);
+    let mut args = serde_json::Map::new();
+    let mut cur = body;
+    while let Some(p) = cur.find("<param name=\"") {
+        let after_p = &cur[p + "<param name=\"".len()..];
+        let Some(k_end) = after_p.find('"') else {
+            break;
+        };
+        let key = after_p[..k_end].trim().to_owned();
+        let Some(vstart) = after_p[k_end + 1..].strip_prefix('>') else {
+            break;
+        };
+        // CDATA: the inner text only, the markers are framing. A value that
+        // opens CDATA and never closes it is still being generated - stop
+        // rather than file `<![CDATA[...` as the argument.
+        let (raw, next) = if let Some(inner) = vstart.strip_prefix(CDATA_OPEN) {
+            let Some(e) = inner.find(CDATA_CLOSE) else {
+                break;
+            };
+            let tail = &inner[e + CDATA_CLOSE.len()..];
+            (
+                &inner[..e],
+                tail.strip_prefix(MINICPM_PARAM_END).unwrap_or(tail),
+            )
+        } else {
+            match vstart.find(MINICPM_PARAM_END) {
+                Some(e) => (&vstart[..e], &vstart[e + MINICPM_PARAM_END.len()..]),
+                None => (vstart, ""),
+            }
+        };
+        let declared_string = param_hints.and_then(|h| h.get(&key)).copied();
+        args.insert(key, coerce(raw, declared_string));
         cur = next;
     }
 
@@ -1247,6 +1434,111 @@ mod tests {
                  <|start|>assistant<|channel|>commentary to=functions.b <|constrain|>json<|message|>{\"y\":";
         let p = parse(Dialect::Harmony, t, false, Some(&ToolHints::new()));
         assert_eq!((p.tool_calls.len(), p.complete_calls), (2, 1));
+    }
+
+    /// The MiniCPM5 template (openbmb/MiniCPM5-2B-GGUF, `tokenizer.chat_template`)
+    /// selects the attribute-XML dialect through its marker pair, off the
+    /// generic `llama` arch; a granite 4.1 or qwen template does not.
+    #[test]
+    fn minicpm5_template_selects_its_dialect_off_the_llama_arch() {
+        let tpl = "<function name=\"function-name\"><param name=\"param-name\">param-value\
+                   </param></function>";
+        assert_eq!(
+            Dialect::for_arch_and_template("llama", Some(tpl)),
+            Dialect::MiniCpmXml
+        );
+        assert_eq!(
+            Dialect::for_arch_and_template("llama", None),
+            Dialect::Plain
+        );
+        assert_eq!(
+            Dialect::for_arch_and_template("llama", Some("<tool_call>\n{json}\n</tool_call>")),
+            Dialect::Plain
+        );
+        assert!(Dialect::MiniCpmXml.thinking_open("<|im_start|>assistant\n<think>\n"));
+        assert!(
+            !Dialect::MiniCpmXml.thinking_open("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        );
+    }
+
+    #[test]
+    fn minicpm_single_call_with_typed_args() {
+        let t = "<function name=\"get_weather\"><param name=\"city\">Paris</param>\
+                 <param name=\"days\">3</param></function>";
+        let p = parse(Dialect::MiniCpmXml, t, false, hints_weather().as_ref());
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.complete_calls, 1);
+        assert_eq!(p.tool_calls[0].name, "get_weather");
+        let args: Value = serde_json::from_str(&p.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(args["days"], 3);
+        assert_eq!(p.finish_reason(), "tool_calls");
+        assert!(p.content.is_none());
+    }
+
+    #[test]
+    fn minicpm_cdata_value_is_unwrapped_and_kept_verbatim() {
+        // the template wraps a value holding `<`, `&` or a newline in CDATA;
+        // the inner text is the argument, including its newlines
+        let t = "<function name=\"get_weather\"><param name=\"city\"><![CDATA[Paris <3\n& more]]>\
+                 </param><param name=\"days\">2</param></function>";
+        let p = parse(Dialect::MiniCpmXml, t, false, hints_weather().as_ref());
+        let args: Value = serde_json::from_str(&p.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris <3\n& more");
+        assert_eq!(args["days"], 2);
+        assert_eq!(p.complete_calls, 1);
+    }
+
+    #[test]
+    fn minicpm_parallel_calls_with_preamble_and_thinking() {
+        let t = "need both\n</think>\n\nChecking.\n\
+                 <function name=\"get_weather\"><param name=\"city\">Paris</param></function>\
+                 <function name=\"get_weather\"><param name=\"city\">Berlin</param></function>";
+        let p = parse(Dialect::MiniCpmXml, t, true, hints_weather().as_ref());
+        assert_eq!(p.reasoning.as_deref(), Some("need both\n"));
+        assert_eq!(p.content.as_deref(), Some("Checking.\n"));
+        assert_eq!(p.tool_calls.len(), 2);
+        assert_eq!(p.complete_calls, 2);
+        let b: Value = serde_json::from_str(&p.tool_calls[1].arguments).unwrap();
+        assert_eq!(b["city"], "Berlin");
+    }
+
+    #[test]
+    fn minicpm_unterminated_call_is_a_call_but_not_complete() {
+        let t = "<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"da";
+        let p = parse(Dialect::MiniCpmXml, t, false, hints_weather().as_ref());
+        assert_eq!((p.tool_calls.len(), p.complete_calls), (1, 0));
+        let args: Value = serde_json::from_str(&p.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+        // an unclosed CDATA value is still being typed: not an argument yet
+        let t = "<function name=\"get_weather\"><param name=\"city\"><![CDATA[Par";
+        let p = parse(Dialect::MiniCpmXml, t, false, hints_weather().as_ref());
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].arguments, "{}");
+        assert!(p.content.is_none());
+    }
+
+    #[test]
+    fn minicpm_call_syntax_stays_text_without_tools() {
+        let t = "Use <function name=\"x\"><param name=\"a\">1</param></function> to call.";
+        let p = parse(Dialect::MiniCpmXml, t, false, None);
+        assert!(p.tool_calls.is_empty());
+        assert_eq!(p.content.as_deref(), Some(t));
+        // and `<function` as prose stays prose even with tools declared
+        let t = "The <function keyword is not a call.";
+        let p = parse(Dialect::MiniCpmXml, t, false, hints_weather().as_ref());
+        assert!(p.tool_calls.is_empty());
+        assert_eq!(p.content.as_deref(), Some(t));
+    }
+
+    #[test]
+    fn minicpm_self_opened_think_block() {
+        // enable_thinking unset: the template pre-opens nothing and the model
+        // opens its own region
+        let t = "<think>\nhmm\n</think>\n\nHello.";
+        let p = parse(Dialect::MiniCpmXml, t, false, None);
+        assert_eq!(p.reasoning.as_deref(), Some("hmm\n"));
+        assert_eq!(p.content.as_deref(), Some("Hello."));
     }
 
     #[test]

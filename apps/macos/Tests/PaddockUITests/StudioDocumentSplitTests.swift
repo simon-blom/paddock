@@ -227,6 +227,8 @@ struct StudioDocumentSplitTests {
     }
     let original = try #require(surface)
     let scroll = try #require(find(NSScrollView.self, in: split.chatHost.view))
+    #expect(
+      scroll.contentInsets.bottom == 0, "An absent composer must not reserve a full-height bar")
     // TextKit's string arrives before SwiftUI publishes its measured height
     // and applies the initial tail anchor. Start the reading-position test
     // after that layout, not while its programmatic scroll is being replaced.

@@ -25,6 +25,10 @@ public final class WorkspaceModel {
   public let downloads: DownloadsModel
   public let connections: ConnectionsModel
   public let integrations: IntegrationsModel
+  let insights: InsightsModel
+  let benchmarks: BenchmarksModel
+  let dataStorage: DataStorageModel
+  public var maintenanceInProgress: Bool { dataStorage.exporting || benchmarks.running }
   let speech: StudioSpeechModels
   var draft = StudioDraft()
   var navigation = WorkspaceNavigation()
@@ -75,6 +79,9 @@ public final class WorkspaceModel {
     cloudClient: any OpenRouterLoading = NativeOpenRouter()
   ) {
     self.client = client
+    insights = InsightsModel(client: client)
+    benchmarks = BenchmarksModel(client: client)
+    dataStorage = DataStorageModel(client: client)
     endpointLogs = EndpointLogsModel(client: client)
     cloud = CloudBrowserModel(client: cloudClient)
     downloads = DownloadsModel(client: client)

@@ -13,10 +13,11 @@ import AppKit
   static func capture(in root: NSView) -> Self? {
     for scroll in views(NSScrollView.self, in: root) {
       guard let document = scroll.documentView,
-        document.bounds.height > scroll.documentVisibleRect.height + 4,
-        document.bounds.maxY - scroll.documentVisibleRect.maxY > 4
+        document.bounds.height > scroll.documentVisibleRect.height
+          - scroll.contentInsets.top - scroll.contentInsets.bottom + 4,
+        document.bounds.maxY - scroll.documentVisibleRect.maxY + scroll.contentInsets.bottom > 4
       else { continue }  // Follow-tail remains owned by the transcript.
-      let top = scroll.documentVisibleRect.minY
+      let top = scroll.documentVisibleRect.minY + scroll.contentInsets.top
       for text in views(NSTextView.self, in: document) where !(text is DraftTextView) {
         let frame = text.convert(text.bounds, to: document)
         guard frame.maxY > top, !text.string.isEmpty,
@@ -38,8 +39,13 @@ import AppKit
     guard let scroll, let text, let document = scroll.documentView,
       let y = Self.lineY(text, character: character, document: document)
     else { return }
-    let maximum = max(0, document.bounds.height - scroll.contentView.bounds.height)
-    let origin = NSPoint(x: scroll.contentView.bounds.minX, y: min(maximum, max(0, y + lineOffset)))
+    let minimum = -scroll.contentInsets.top
+    let maximum = max(
+      minimum,
+      document.bounds.height + scroll.contentInsets.bottom - scroll.contentView.bounds.height)
+    let origin = NSPoint(
+      x: scroll.contentView.bounds.minX,
+      y: min(maximum, max(minimum, y + lineOffset - scroll.contentInsets.top)))
     scroll.contentView.scroll(to: origin)
     scroll.reflectScrolledClipView(scroll.contentView)
   }

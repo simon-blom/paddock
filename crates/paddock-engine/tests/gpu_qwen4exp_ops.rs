@@ -585,3 +585,523 @@ fn moe_topk_batch_covers_every_expert() {
     eprintln!("moe_topk over {n_expert} experts: ids exact, weight max_abs_diff {diff:.2e}");
     assert!(diff < 1e-5, "router weights off by {diff}");
 }
+
+// ── QSA indexer (slots 661-663, attn/qsa.cuh) ─────────────────────────────
+
+use half::bf16;
+use paddock_kernels::reference::ops::YarnRope;
+
+/// The lane's rotary: theta 1e7 over the first 64 dims, no YaRN (the
+/// engine's `yarn_params` is exactly this YarnRope's kernel_params).
+fn qsa_rope() -> YarnRope {
+    YarnRope::new(64, 1e7, 1.0, 262144, 0.0, 1.0, 32.0, 1.0)
+}
+const QSA_SECTIONS: [u32; 4] = [11, 11, 10, 0];
+
+fn exec_with_qsa() -> Option<GpuExecutor> {
+    let exec = exec_with_family()?;
+    if !exec.has_qsa_indexer() {
+        common::missing("pack has no QSA indexer kernels (rebuild packs/cuda)");
+        return None;
+    }
+    Some(exec)
+}
+
+/// Both sides round to bf16 last; a different reduction order may land a
+/// value one bf16 step away (a half-ulp tie flipping), never more.
+fn assert_bf16_close(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let mut exact = 0usize;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(g.is_finite(), "{what}[{i}] = {g} (unwritten?)");
+        if g == w {
+            exact += 1;
+            continue;
+        }
+        let tol = w.abs() * 2f32.powi(-7) + 1e-6;
+        assert!((g - w).abs() <= tol, "{what}[{i}]: got {g} want {w}");
+    }
+    eprintln!(
+        "{what}: {exact}/{} bit-exact, the rest within one bf16 step",
+        got.len()
+    );
+}
+
+#[test]
+fn qsa_idx_q_matches_reference() {
+    let Some(exec) = exec_with_qsa() else {
+        return;
+    };
+    let (rows, heads, hd, ld) = (5usize, 4usize, 128usize, 640usize);
+    let src = det(rows * ld, 21);
+    let w = det(hd, 22);
+    let mut want = Vec::new();
+    for r in 0..rows {
+        want.extend(rq::qsa_idx_q(&src[r * ld..r * ld + heads * hd], &w, EPS));
+    }
+    let d_src = exec.to_device(&src).expect("src");
+    let d_w = exec.to_device(&w).expect("w");
+    let mut d_dst = exec
+        .to_device(&vec![f32::NAN; rows * heads * hd])
+        .expect("dst");
+    exec.q4x_idx_q(&d_src, &d_w, &mut d_dst, rows, heads, hd, ld, EPS)
+        .expect("q4x_idx_q");
+    let got = exec.to_host(&d_dst).expect("dtoh");
+    assert_bf16_close(&got, &want, "idx_q");
+}
+
+/// Raw key of (slot, position): what the indexer projection would have
+/// produced there, deterministic so a block can be rebuilt on the host.
+fn raw_key(slot: usize, pos: usize) -> Vec<f32> {
+    det(128, 5000 + slot as u64 * 1000 + pos as u64)
+}
+
+/// The pool -> rotary -> store chain over launches shaped like the lane's
+/// walks, against blocks rebuilt on the host. Covers: blocks closed inside a
+/// run; a 38-row run longer than the 16-entry ring (only its last 16 raw keys
+/// may land, the others would race); blocks whose first tokens came from an
+/// EARLIER launch and must be read from the ring (a run's tail, a decode row);
+/// two slots interleaved in one launch. The ring and cache start poisoned
+/// with NaN, so a wrong read or a stray write fails loudly.
+#[test]
+fn qsa_idx_pool_store_matches_reference() {
+    let Some(exec) = exec_with_qsa() else {
+        return;
+    };
+    let (hd, ld, koff, ring_len, cr, slots, cap) = (128, 640, 512, 16usize, 4usize, 2, 64usize);
+    let rope = qsa_rope();
+    let w = det(hd, 31);
+    let d_w = exec.to_device(&w).expect("w");
+    let mut d_ring = exec
+        .to_device(&vec![f32::NAN; slots * ring_len * hd])
+        .expect("ring");
+    let mut d_cache = exec
+        .to_device_bf16(&vec![bf16::NAN; slots * cap * hd])
+        .expect("cache");
+
+    let launches: Vec<Vec<(usize, usize)>> = vec![
+        // slot 0 prefills 38 tokens (blocks 0..8 close, 36..37 are the tail),
+        // slot 1 prefills 3 (no block closes)
+        (0..38)
+            .map(|p| (0, p))
+            .chain((0..3).map(|p| (1, p)))
+            .collect(),
+        // slot 0: a 2-row verify chunk closes block 9 off the ring (36, 37);
+        // slot 1: a decode row closes block 0 off the ring (0..2)
+        vec![(0, 38), (0, 39), (1, 3)],
+        // slot 1: block 1 closes inside the launch
+        (4..8).map(|p| (1, p)).collect(),
+    ];
+    for rows in &launches {
+        let n = rows.len();
+        let mut raw = det(n * ld, 77); // q part: garbage the store must ignore
+        for (r, &(s, p)) in rows.iter().enumerate() {
+            raw[r * ld + koff..r * ld + koff + hd].copy_from_slice(&raw_key(s, p));
+        }
+        let d_raw = exec.to_device(&raw).expect("raw");
+        let d_pos = exec
+            .to_device_u32(&rows.iter().map(|&(_, p)| p as u32).collect::<Vec<_>>())
+            .expect("pos");
+        let d_slots = exec
+            .to_device_u32(&rows.iter().map(|&(s, _)| s as u32).collect::<Vec<_>>())
+            .expect("slots");
+        let mut d_stage = exec.to_device(&vec![f32::NAN; n * hd]).expect("stage");
+        let mut d_spos = exec.to_device_u32(&vec![0u32; 4 * n]).expect("spos");
+        exec.q4x_idx_pool(
+            &d_raw,
+            &d_ring,
+            &d_pos,
+            &d_slots,
+            &d_w,
+            &mut d_stage,
+            &mut d_spos,
+            n,
+            hd,
+            ld,
+            koff,
+            ring_len,
+            cr,
+            EPS,
+        )
+        .expect("q4x_idx_pool");
+        exec.mrope(
+            &mut d_stage,
+            &d_spos,
+            n,
+            1,
+            hd,
+            64,
+            rope.kernel_params(),
+            QSA_SECTIONS,
+        )
+        .expect("mrope");
+        exec.q4x_idx_store(
+            &d_raw,
+            &d_stage,
+            &d_pos,
+            &d_slots,
+            &mut d_cache,
+            &mut d_ring,
+            n,
+            hd,
+            ld,
+            koff,
+            ring_len,
+            cr,
+            cap,
+        )
+        .expect("q4x_idx_store");
+    }
+    let cache: Vec<f32> = exec
+        .to_host_bf16(&d_cache)
+        .expect("dtoh")
+        .iter()
+        .map(|v| v.to_f32())
+        .collect();
+    let block = |s: usize, b: usize| &cache[(s * cap + b) * hd..(s * cap + b + 1) * hd];
+    for (s, blocks) in [(0usize, 10usize), (1, 2)] {
+        for b in 0..blocks {
+            let raws: Vec<Vec<f32>> = (0..cr).map(|j| raw_key(s, b * cr + j)).collect();
+            let refs: Vec<&[f32]> = raws.iter().map(|v| v.as_slice()).collect();
+            let mut want = rq::qsa_pool_block(&refs, &w, EPS);
+            let p0 = (b * cr) as f32;
+            rope.apply_mrope(&mut want, &[p0; 4], &QSA_SECTIONS);
+            let want: Vec<f32> = want.iter().map(|&v| rq::bf16r(v)).collect();
+            assert_bf16_close(block(s, b), &want, &format!("slot {s} block {b}"));
+        }
+    }
+    // nothing wrote past the closed blocks
+    assert!(
+        block(0, 10).iter().all(|v| v.is_nan()),
+        "slot 0 block 10 written"
+    );
+    assert!(
+        block(1, 2).iter().all(|v| v.is_nan()),
+        "slot 1 block 2 written"
+    );
+}
+
+// ── QSA selection (slots 664-665) ─────────────────────────────────────────
+
+/// Scores off the compressed cache and the radix top-k, against the
+/// reference - judged in two halves so each kernel answers for itself: the
+/// scores within f32 summation-order noise, and the SELECTION exactly equal
+/// to the reference's selection OF THE SAME (GPU) SCORES. Rows straddle the
+/// k = 512 edge (nb 511 / 512 / 513), fill the cache (nb 1024), sit far
+/// below it, and one row's query is flipped negative so most of its scores
+/// are relu zeros - a massive tie the lowest ids must win.
+#[test]
+fn qsa_logits_topk_match_reference() {
+    let Some(exec) = exec_with_qsa() else {
+        return;
+    };
+    if !exec.has_qsa_select() {
+        common::missing("pack has no QSA selection kernels (rebuild packs/cuda)");
+        return;
+    }
+    let (heads, hd, cap, cr, k) = (4usize, 128usize, 1024usize, 4usize, 512usize);
+    let slots = 2usize;
+    // every key leans +0.5 along dim 0, so a query pointed against it scores
+    // mostly relu zeros (row 6 below)
+    let mut cache = det(slots * cap * hd, 41);
+    for kb in cache.chunks_mut(hd) {
+        kb[0] += 0.5;
+    }
+    let cache: Vec<f32> = cache.iter().map(|&v| rq::bf16r(v)).collect();
+    // (slot, position): nb = (pos+1)/4
+    let rows: Vec<(usize, usize)> = vec![
+        (0, 4095), // nb 1024 - the whole cache
+        (0, 2999), // nb 750
+        (1, 2047), // nb 512 - selects everything
+        (1, 2051), // nb 513 - the first row that drops one
+        (0, 2043), // nb 511
+        (1, 99),   // nb 25
+        (0, 3500), // nb 875, query flipped: relu zeros tie
+    ];
+    let n = rows.len();
+    let mut q: Vec<f32> = det(n * heads * hd, 42)
+        .iter()
+        .map(|&v| rq::bf16r(v))
+        .collect();
+    for (i, v) in q[6 * heads * hd..7 * heads * hd].iter_mut().enumerate() {
+        // against the keys' shared lean: nearly every dot is negative, so
+        // fewer than k blocks score above 0 and the rest tie at relu's 0
+        *v = if i % hd == 0 {
+            -4.0
+        } else {
+            rq::bf16r(*v * 0.02)
+        };
+    }
+    let d_q = exec.to_device(&q).expect("q");
+    let d_cache = exec
+        .to_device_bf16(&cache.iter().map(|&v| bf16::from_f32(v)).collect::<Vec<_>>())
+        .expect("cache");
+    let d_pos = exec
+        .to_device_u32(&rows.iter().map(|&(_, p)| p as u32).collect::<Vec<_>>())
+        .expect("pos");
+    let d_slots = exec
+        .to_device_u32(&rows.iter().map(|&(s, _)| s as u32).collect::<Vec<_>>())
+        .expect("slots");
+    let mut d_scores = exec.to_device(&vec![f32::NAN; n * cap]).expect("scores");
+    let mut d_sel = exec.to_device_u32(&vec![u32::MAX; n * k]).expect("sel");
+    let mut d_cnt = exec.to_device_u32(&vec![0; n]).expect("cnt");
+    exec.q4x_qsa_logits(
+        &d_q,
+        &d_cache,
+        &d_pos,
+        &d_slots,
+        &mut d_scores,
+        0,
+        n,
+        heads,
+        hd,
+        cap,
+        cr,
+        k,
+    )
+    .expect("logits");
+    exec.q4x_qsa_topk(&d_scores, &d_pos, &mut d_sel, &mut d_cnt, 0, n, cap, cr, k)
+        .expect("topk");
+    let scores = exec.to_host(&d_scores).expect("scores");
+    let sel = exec.to_host_u32(&d_sel).expect("sel");
+    let cnt = exec.to_host_u32(&d_cnt).expect("cnt");
+    for (r, &(s, p)) in rows.iter().enumerate() {
+        let nb = (p + 1) / cr;
+        let keys = &cache[s * cap * hd..(s * cap + nb) * hd];
+        let want_scores = rq::qsa_scores(&q[r * heads * hd..(r + 1) * heads * hd], keys, hd);
+        let got_sel = &sel[r * k..r * k + cnt[r] as usize];
+        assert_eq!(cnt[r] as usize, nb.min(k), "row {r}: count");
+        if nb <= k {
+            let all: Vec<u32> = (0..nb as u32).collect();
+            assert_eq!(
+                got_sel,
+                &all[..],
+                "row {r}: nb {nb} must select every block"
+            );
+            continue;
+        }
+        let got_scores = &scores[r * cap..r * cap + nb];
+        for (b, (g, w)) in got_scores.iter().zip(&want_scores).enumerate() {
+            let tol = 1e-5 * w.abs().max(1.0);
+            assert!((g - w).abs() <= tol, "row {r} block {b}: score {g} vs {w}");
+        }
+        let want_sel = rq::qsa_select(got_scores, k);
+        assert_eq!(
+            got_sel,
+            &want_sel[..],
+            "row {r}: selection of the kernel's own scores"
+        );
+        let zeros = got_scores.iter().filter(|&&v| v == 0.0).count();
+        eprintln!("qsa row {r}: nb {nb}, {zeros} relu-zero scores, selection exact");
+        if r == 6 {
+            assert!(
+                nb - zeros < k,
+                "row 6 was meant to tie at zero across the k-th place"
+            );
+        }
+    }
+}
+
+// ── QSA attention (slots 666-667) ─────────────────────────────────────────
+
+/// Attention over EXPLICIT selections (the selection kernels answer for
+/// themselves above), against an f64 masked-softmax reference over exactly
+/// the selected blocks' tokens plus each row's tail. The KV goes in through
+/// the lane's own append kernel, so the f16 and e4m3 caches hold what they
+/// hold in service, and the reference reads those stored values back. Rows:
+/// a 32-block selection with no tail, one with a 2-token tail, a short row
+/// that selects everything (exactly causal dense). Splits 1 and 5 (uneven)
+/// must land within summation noise of each other and of the reference.
+#[test]
+fn qsa_attn_matches_reference() {
+    let Some(exec) = exec_with_qsa() else {
+        return;
+    };
+    if !exec.has_qsa_attn() {
+        common::missing("pack has no QSA attention kernels (rebuild packs/cuda)");
+        return;
+    }
+    use paddock_engine::gpu::KvDtype;
+    let (nh, nkv, hd, max_ctx, cr, k, slots) = (
+        24usize, 2usize, 256usize, 1024usize, 4usize, 32usize, 2usize,
+    );
+    let kv_dim = nkv * hd;
+    let g = nh / nkv;
+    let scale = 1.0 / (hd as f32).sqrt();
+    for dtype in [KvDtype::Fp16, KvDtype::Fp8E4m3] {
+        // fill both slots' caches through the real append path
+        let mut d_k = exec
+            .alloc_u8(slots * max_ctx * kv_dim * dtype.bytes())
+            .expect("k");
+        let mut d_v = exec
+            .alloc_u8(slots * max_ctx * kv_dim * dtype.bytes())
+            .expect("v");
+        let (kf, vf) = (
+            det(slots * max_ctx * kv_dim, 51),
+            det(slots * max_ctx * kv_dim, 52),
+        );
+        let rows_all: Vec<u32> = (0..(slots * max_ctx) as u32).collect();
+        let d_kf = exec.to_device(&kf).expect("kf");
+        let d_vf = exec.to_device(&vf).expect("vf");
+        let d_p = exec
+            .to_device_u32(
+                &rows_all
+                    .iter()
+                    .map(|r| r % max_ctx as u32)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("p");
+        let d_s = exec
+            .to_device_u32(
+                &rows_all
+                    .iter()
+                    .map(|r| r / max_ctx as u32)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("s");
+        let n_all = slots * max_ctx;
+        exec.kv_append_batch(
+            &d_kf,
+            &mut d_k,
+            &d_p,
+            Some(&d_s),
+            kv_dim,
+            max_ctx,
+            n_all,
+            dtype,
+        )
+        .expect("append k");
+        exec.kv_append_batch(
+            &d_vf,
+            &mut d_v,
+            &d_p,
+            Some(&d_s),
+            kv_dim,
+            max_ctx,
+            n_all,
+            dtype,
+        )
+        .expect("append v");
+        // what the caches hold, as f32
+        let stored = |d: &cudarc::driver::CudaSlice<u8>| -> Vec<f32> {
+            let n = slots * max_ctx * kv_dim;
+            match dtype {
+                KvDtype::Fp16 => exec
+                    .to_host_f16_from_u8(d, n)
+                    .expect("dtoh")
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect(),
+                KvDtype::Fp8E4m3 => exec
+                    .to_host_range_u8(d, 0, n)
+                    .expect("dtoh")
+                    .iter()
+                    .map(|&b| rq::e4m3_to_f32(b))
+                    .collect(),
+            }
+        };
+        let (ks, vs) = (stored(&d_k), stored(&d_v));
+
+        // (slot, position, selected blocks)
+        let pick = |seed: u64, nb: usize, want: usize| -> Vec<u32> {
+            let mut ids: Vec<u32> = (0..nb as u32).collect();
+            let mut s = seed;
+            for i in (1..ids.len()).rev() {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ids.swap(i, (s >> 33) as usize % (i + 1));
+            }
+            ids.truncate(want);
+            ids.sort_unstable();
+            ids
+        };
+        let rows: Vec<(usize, usize, Vec<u32>)> = vec![
+            (0, 999, pick(1, 250, k)),  // no tail
+            (1, 1001, pick(2, 250, k)), // tail 1000..1001
+            (0, 50, (0..12).collect()), // nb 12 <= k: everything
+        ];
+        let n = rows.len();
+        let q = det(n * nh * hd, 53);
+        let mut sel = vec![0u32; n * k];
+        let mut cnt = vec![0u32; n];
+        for (r, (_, _, s)) in rows.iter().enumerate() {
+            sel[r * k..r * k + s.len()].copy_from_slice(s);
+            cnt[r] = s.len() as u32;
+        }
+        let d_q = exec.to_device(&q).expect("q");
+        let d_pos = exec
+            .to_device_u32(&rows.iter().map(|r| r.1 as u32).collect::<Vec<_>>())
+            .expect("pos");
+        let d_slots = exec
+            .to_device_u32(&rows.iter().map(|r| r.0 as u32).collect::<Vec<_>>())
+            .expect("slots");
+        let d_sel = exec.to_device_u32(&sel).expect("sel");
+        let d_cnt = exec.to_device_u32(&cnt).expect("cnt");
+
+        // reference: softmax over exactly the selected tokens + tail, f64
+        let mut want = vec![0f32; n * nh * hd];
+        for (r, (s, p, blocks)) in rows.iter().enumerate() {
+            let nb = (p + 1) / cr;
+            let mut toks: Vec<usize> = blocks
+                .iter()
+                .flat_map(|&b| (0..cr).map(move |j| b as usize * cr + j))
+                .collect();
+            toks.extend(nb * cr..=*p);
+            for h in 0..nh {
+                let kvh = h / g;
+                let qh = &q[(r * nh + h) * hd..(r * nh + h + 1) * hd];
+                let row = |t: usize| (s * max_ctx + t) * kv_dim + kvh * hd;
+                let sc: Vec<f64> = toks
+                    .iter()
+                    .map(|&t| {
+                        let kr = &ks[row(t)..row(t) + hd];
+                        qh.iter()
+                            .zip(kr)
+                            .map(|(a, b)| (*a as f64) * (*b as f64))
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect();
+                let m = sc.iter().copied().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = sc.iter().map(|v| (v - m).exp()).collect();
+                let l: f64 = e.iter().sum();
+                for d in 0..hd {
+                    let o: f64 = toks
+                        .iter()
+                        .zip(&e)
+                        .map(|(&t, w)| w * vs[row(t) + d] as f64)
+                        .sum();
+                    want[(r * nh + h) * hd + d] = (o / l) as f32;
+                }
+            }
+        }
+        let mut outs = Vec::new();
+        for splits in [1usize, 5] {
+            let mut d_po = exec
+                .to_device(&vec![f32::NAN; n * nkv * splits * g * hd])
+                .expect("po");
+            let mut d_pml = exec
+                .to_device(&vec![f32::NAN; n * nkv * splits * g * 2])
+                .expect("pml");
+            let mut d_out = exec.to_device(&vec![f32::NAN; n * nh * hd]).expect("out");
+            exec.q4x_qsa_attn(
+                &d_q, &d_k, &d_v, &d_pos, &d_slots, &d_sel, &d_cnt, &mut d_po, &mut d_pml, n, nh,
+                nkv, hd, max_ctx, k, cr, splits, scale, dtype,
+            )
+            .expect("qsa_attn");
+            exec.q4x_qsa_combine(&d_po, &d_pml, &mut d_out, n, nh, nkv, hd, splits)
+                .expect("combine");
+            let got = exec.to_host(&d_out).expect("dtoh");
+            let diff = max_abs_diff(&got, &want);
+            eprintln!(
+                "qsa_attn {dtype:?} splits {splits}: max_abs_diff vs f64 reference {diff:.2e}"
+            );
+            // f32 walk + __expf vs an f64 reference, outputs O(0.1)
+            assert!(diff < 2e-4, "qsa_attn {dtype:?} splits {splits}: {diff}");
+            outs.push(got);
+        }
+        let split_diff = max_abs_diff(&outs[0], &outs[1]);
+        assert!(split_diff < 1e-4, "splits disagree: {split_diff}");
+    }
+}

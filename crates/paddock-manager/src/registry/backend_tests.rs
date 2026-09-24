@@ -1,6 +1,119 @@
 use super::*;
 
 #[test]
+fn qwen_image_metal_resolves_embedded_mlx_and_gguf_editing_tower() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("qwen-image-2.1").unwrap();
+    let weights = model.default_weights_for_backend("metal", None).unwrap();
+    assert_eq!(weights.id, "mlx-4bit");
+    assert_eq!(weights.capabilities(model), ["image-generation"]);
+    assert!(weights.runtime.checkpoint_dir && weights.runtime.embedded_vision);
+    assert_eq!(weights.runtime.companions.as_deref(), Some([].as_slice()));
+    assert_eq!(weights.files.len(), 23);
+    for name in [
+        "LICENSE",
+        "Notice",
+        "model_index.json",
+        "processor/tokenizer.json",
+        "text_encoder/model.safetensors",
+        "transformer/model.safetensors",
+        "vae/model.safetensors",
+    ] {
+        assert!(
+            weights.files.iter().any(|f| f.dest.ends_with(name)),
+            "missing {name}"
+        );
+    }
+    assert!(weights.files.iter().all(
+        |f| f.url.contains("4db4e8c0c0e7a1debf0320415bec8388e888494c") && f.sha256.len() == 64
+    ));
+    assert!(
+        weights
+            .entry_path(metal.models_dir())
+            .unwrap()
+            .ends_with("Qwen-Image-2.1-MLX-4bit")
+    );
+    assert_eq!(metal.planned_lane_companions(&model.id, None), (None, None));
+    let (_, vision, draft) = metal.planned_paths(&model.id, None).unwrap();
+    assert!(vision.is_none() && draft.is_none());
+    let (text, vae) = metal.planned_lane_companions(&model.id, Some("q4"));
+    assert!(text.unwrap().ends_with("Qwen3VL-8B-Instruct-Q4_K_M.gguf"));
+    assert!(
+        vae.unwrap()
+            .ends_with("vae/diffusion_pytorch_model.safetensors")
+    );
+    assert_eq!(metal.default_envelope(&model.id, None).1, 1);
+    assert!(
+        metal
+            .planned_paths(&model.id, Some("q4"))
+            .unwrap()
+            .1
+            .unwrap()
+            .ends_with("mmproj-Qwen3VL-8B-Instruct-F16.gguf")
+    );
+    assert!(
+        !model
+            .artifact("q8")
+            .unwrap()
+            .runtime
+            .supports_backend("metal")
+    );
+    let cuda = metal.with_backend("cuda");
+    assert_eq!(
+        cuda.catalog_of("qwen-image-2.1")
+            .unwrap()
+            .default_weights()
+            .unwrap()
+            .id,
+        "q8"
+    );
+    assert!(
+        cuda.planned_paths("qwen-image-2.1", Some("q4"))
+            .unwrap()
+            .1
+            .is_some()
+    );
+}
+
+#[test]
+fn minicpm_metal_gguf_and_official_mlx_have_complete_local_contracts() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("minicpm5-2b").unwrap();
+    assert_eq!(
+        model.default_weights_for_backend("metal", None).unwrap().id,
+        "q8"
+    );
+    for id in ["q8", "q4", "mlx-4bit"] {
+        let a = model.artifact(id).unwrap();
+        assert!(a.runtime.supports_backend("metal"));
+        assert_eq!(a.runtime.checkpoint_dir, id == "mlx-4bit");
+        assert_eq!(metal.default_envelope("minicpm5-2b", Some(id)), (32768, 1));
+        let (path, vision, draft) = metal.planned_paths("minicpm5-2b", Some(id)).unwrap();
+        assert!(vision.is_none() && draft.is_none());
+        assert_eq!(a.capabilities(model), ["chat", "tools", "reasoning"]);
+        assert!(crate::backend_contract::metal_kv_offload(model, a));
+        if id == "mlx-4bit" {
+            assert!(path.ends_with("MiniCPM5-2B-MLX"));
+            assert_eq!(a.source.as_ref().unwrap().repo, "openbmb/MiniCPM5-2B-MLX");
+            assert_eq!(a.files.len(), 7);
+            for f in &a.files {
+                assert!(f.url.contains("/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/"));
+                assert_eq!(f.sha256.len(), 64);
+                assert!(f.size > 0);
+            }
+        } else {
+            assert_eq!(path.extension().unwrap(), "gguf");
+        }
+    }
+    let cuda = metal.with_backend("cuda");
+    assert!(
+        cuda.planned_paths("minicpm5-2b", Some("mlx-4bit"))
+            .is_none()
+    );
+    assert_eq!(cuda.default_envelope("minicpm5-2b", Some("q8")), (4096, 32));
+}
+
+#[test]
 fn metal_chat_defaults_are_32k_with_export_caps_and_no_cuda_or_speech_drift() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     for (model, artifact, context) in [

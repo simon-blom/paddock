@@ -66,7 +66,12 @@ impl GpuQwen35 {
             let mut buf = self.exec.alloc(n)?;
             self.exec
                 .copy_region(&self.image_cache[i].embd, 0, &mut buf, 0, n)?;
-            return Ok(VisionOutput { embd: buf, nx, ny });
+            return Ok(VisionOutput {
+                embd: buf,
+                nx,
+                ny,
+                deepstack: Vec::new(),
+            });
         }
 
         let out = {
@@ -186,7 +191,12 @@ impl GpuQwen35 {
                     let mut buf = self.exec.alloc(nlen)?;
                     self.exec
                         .copy_region(&self.image_cache[i].embd, 0, &mut buf, 0, nlen)?;
-                    row.push(Some(VisionOutput { embd: buf, nx, ny }));
+                    row.push(Some(VisionOutput {
+                        embd: buf,
+                        nx,
+                        ny,
+                        deepstack: Vec::new(),
+                    }));
                 } else {
                     let (img, tw, th) = {
                         let vm = self.vision.as_ref().expect("checked above");

@@ -229,6 +229,21 @@ impl ServingModel {
             .get_or_init(|| Arc::new(crate::constrained::VocabBytes::build(&self.tokenizer)))
             .clone()
     }
+
+    /// The special-token strings a chat template may name (`bos_token`,
+    /// `eos_token`), read off the vocab by the file's own ids - see
+    /// `chat_template::render_with_specials`. Absent ids bind an empty string,
+    /// which is what minja renders for them too.
+    pub fn template_specials(&self) -> Vec<(&'static str, String)> {
+        let text = |id: Option<u32>| {
+            id.and_then(|i| self.tokenizer.id_to_token(i))
+                .unwrap_or_default()
+        };
+        vec![
+            ("bos_token", text(self.tokenizer.bos_id)),
+            ("eos_token", text(self.tokenizer.eos_id)),
+        ]
+    }
 }
 
 /// An encoder-only served model (Qwen3 dense): serves `/v1/embeddings` and
@@ -402,6 +417,258 @@ pub fn load_segmenter(
     })
     .map_err(ServeError::Engine)?;
     Ok(SegmentModel { id, segmenter })
+}
+
+/// The image-generation served model (Qwen-Image): serves `/v1/images/*`
+/// only. Three files - the DiT GGUF, the Qwen3-VL text-encoder GGUF and the
+/// VAE safetensors - behind one engine thread; the tokenizer is the text
+/// encoder's, applied to the model's raw prompt template here.
+pub struct ImageModel {
+    pub id: String,
+    pub service: paddock_engine::image::ImageService,
+    pub tokenizer: Arc<GgufTokenizer>,
+    /// The tokenizer's `<|image_pad|>` id - the slot a reference picture's
+    /// tokens fill in the editing template. None when the tokenizer has no
+    /// such control token, in which case editing is refused by name.
+    pub image_pad_id: Option<u32>,
+    /// Memory counters for `/api/stats` - see `EmbedModel::metrics`.
+    pub metrics: Arc<paddock_engine::metrics::EngineMetrics>,
+}
+
+/// The text encoder's prompt window, pictures included: the OpenAI images
+/// API caps a prompt at 32k characters, which this tokenizer keeps well
+/// under 8k tokens, and a 1024^2 reference is 1024 tokens more.
+pub const IMAGE_TEXT_CTX: usize = 8192;
+
+/// Is `path` an image-generation DiT GGUF? The unsloth conversion carries no
+/// metadata at all, so this is decided by tensor names, not an arch string.
+pub fn is_image_gguf(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x == "gguf")
+        && MappedGguf::open(path)
+            .is_ok_and(|m| paddock_engine::gpu_model::qwen_image::is_dit_gguf(&m))
+}
+
+/// A self-contained MLX diffusion directory, never a causal language model.
+pub fn image_mlx_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let root = if path.is_dir() {
+        path
+    } else if path.file_name()?.to_str()? == "model_index.json" && path.is_file() {
+        path.parent()?
+    } else {
+        return None;
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("transformer/config.json")).ok()?).ok()?;
+    (v["_class_name"] == "QwenImage21Transformer2DModel" && v["mlx_format"] == true)
+        .then(|| root.to_path_buf())
+}
+
+#[cfg(test)]
+mod image_mlx_tests {
+    use super::*;
+    #[test]
+    fn diffusion_directory_and_catalog_entry_route_without_claiming_causal_models() {
+        let root =
+            std::env::temp_dir().join(format!("paddock-image-route-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let config = root.join("transformer/config.json");
+        std::fs::write(
+            &config,
+            br#"{"_class_name":"QwenImage21Transformer2DModel","mlx_format":true}"#,
+        )
+        .unwrap();
+        assert_eq!(image_mlx_dir(&root), Some(root.clone()));
+        assert_eq!(image_mlx_dir(&root.join("model_index.json")), None);
+        std::fs::write(root.join("model_index.json"), b"{}").unwrap();
+        assert_eq!(
+            image_mlx_dir(&root.join("model_index.json")),
+            Some(root.clone())
+        );
+        std::fs::write(root.join("unrelated.json"), b"{}").unwrap();
+        assert_eq!(image_mlx_dir(&root.join("unrelated.json")), None);
+        std::fs::write(
+            &config,
+            br#"{"_class_name":"QwenForCausalLM","mlx_format":true}"#,
+        )
+        .unwrap();
+        assert_eq!(image_mlx_dir(&root), None);
+        std::fs::write(
+            &config,
+            br#"{"_class_name":"QwenImage21Transformer2DModel","mlx_format":false}"#,
+        )
+        .unwrap();
+        assert_eq!(image_mlx_dir(&root), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+pub fn load_image_mlx(
+    id: String,
+    root: &Path,
+    device: &str,
+    budget: Option<u64>,
+) -> Result<ImageModel, ServeError> {
+    if device != "metal" {
+        return Err(ServeError::Engine("Qwen-Image MLX requires Metal".into()));
+    }
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        let tokenizer = Arc::new(
+            GgufTokenizer::from_hf_dir(&root.join("processor"))
+                .map_err(|e| ServeError::Tokenizer(e.to_string()))?,
+        );
+        let image_pad_id = tokenizer
+            .encode("<|image_pad|>")
+            .ok()
+            .filter(|ids| ids.len() == 1)
+            .map(|ids| ids[0]);
+        if image_pad_id.is_none() {
+            return Err(ServeError::Tokenizer(
+                "Qwen-Image editing requires an image_pad control token".into(),
+            ));
+        }
+        let root = root.to_path_buf();
+        let service = paddock_engine::image::ImageService::spawn(move || {
+            paddock_metal::QwenImage::load_mlx(&root, IMAGE_TEXT_CTX, budget)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(ServeError::Engine)?;
+        Ok(ImageModel {
+            id,
+            service,
+            tokenizer,
+            image_pad_id,
+            metrics: Arc::new(paddock_engine::metrics::EngineMetrics::default()),
+        })
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = (id, root, budget);
+        Err(ServeError::Engine(
+            "this runner was built without Metal".into(),
+        ))
+    }
+}
+
+/// Load an image-generation model. `mmproj` (the Qwen3-VL vision
+/// tower) wires the editing lane; without it the model makes pictures from
+/// text alone and `/v1/images/edits` refuses by name.
+#[allow(clippy::too_many_arguments)]
+pub fn load_image(
+    id: String,
+    dit: &Path,
+    text_encoder: &Path,
+    vae: &Path,
+    mmproj: Option<&Path>,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    vram_budget: Option<u64>,
+) -> Result<ImageModel, ServeError> {
+    if device != "cuda" && device != "metal" {
+        return Err(ServeError::Engine(format!(
+            "image-generation models need cuda or metal (got {device:?})"
+        )));
+    }
+    for (what, p) in [("text encoder", text_encoder), ("VAE", vae)] {
+        if !p.is_file() {
+            return Err(ServeError::Open(
+                p.to_path_buf(),
+                format!("{what} file not found"),
+            ));
+        }
+    }
+    // the text encoder's tokenizer, checked here so a mispaired file is an
+    // Open error naming it rather than an engine-thread string
+    let te_map = MappedGguf::open(text_encoder)
+        .map_err(|e| ServeError::Open(text_encoder.to_path_buf(), e.to_string()))?;
+    if te_map.gguf().architecture() != Some("qwen3vl") {
+        return Err(ServeError::Open(
+            text_encoder.to_path_buf(),
+            format!(
+                "not a Qwen3-VL text encoder (architecture {:?})",
+                te_map.gguf().architecture()
+            ),
+        ));
+    }
+    let tokenizer = Arc::new(
+        GgufTokenizer::from_gguf(te_map.gguf())
+            .map_err(|e| ServeError::Tokenizer(e.to_string()))?,
+    );
+    drop(te_map);
+    // the editing template's image slot: one control token, or the lane is
+    // off - a multi-token spelling could not be expanded into a grid
+    let image_pad_id = tokenizer
+        .encode("<|image_pad|>")
+        .ok()
+        .filter(|ids| ids.len() == 1)
+        .map(|ids| ids[0]);
+    if let Some(p) = mmproj
+        && !p.is_file()
+    {
+        return Err(ServeError::Open(
+            p.to_path_buf(),
+            "vision tower (mmproj) file not found".into(),
+        ));
+    }
+    let metrics = Arc::new(paddock_engine::metrics::EngineMetrics::default());
+    let pack = pack.map(Path::to_path_buf);
+    let (dit, te, vae) = (
+        dit.to_path_buf(),
+        text_encoder.to_path_buf(),
+        vae.to_path_buf(),
+    );
+    let mmproj = mmproj.map(Path::to_path_buf);
+    let service = if device == "metal" {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            paddock_engine::image::ImageService::spawn(move || {
+                paddock_metal::QwenImage::load_with_vision(
+                    &dit,
+                    &te,
+                    &vae,
+                    mmproj.as_deref(),
+                    IMAGE_TEXT_CTX,
+                    vram_budget,
+                )
+                .map_err(|e| e.to_string())
+            })
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            return Err(ServeError::Engine(
+                "this runner was built without Metal".into(),
+            ));
+        }
+    } else {
+        paddock_engine::image::ImageService::spawn(move || {
+            let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+                .map_err(|e| e.to_string())?;
+            note_device_cc(&exec);
+            if let Some(b) = vram_budget {
+                exec.set_vram_budget(b);
+            }
+            // the prompt budget: the OpenAI images API caps a prompt at 32k
+            // characters, which this tokenizer keeps well under 8k tokens
+            paddock_engine::gpu_model::qwen_image::QwenImage::load(
+                Arc::new(exec),
+                &dit,
+                &te,
+                &vae,
+                mmproj.as_deref(),
+                IMAGE_TEXT_CTX,
+            )
+            .map_err(|e| e.to_string())
+        })
+    }
+    .map_err(ServeError::Engine)?;
+    Ok(ImageModel {
+        id,
+        service,
+        tokenizer,
+        image_pad_id,
+        metrics,
+    })
 }
 
 /// True for architectures Paddock serves as SPEECH-TO-TEXT models - the
@@ -1201,11 +1468,23 @@ pub fn load_with(
     {
         stop_tokens.push(eot);
     }
+    // `<|im_end|>` by name: MiniCPM5's GGUF stamps eos `</s>` (1) and no eot
+    // key, while its ChatML template ends every turn with `<|im_end|>`
+    // (130073) - config.json lists both as eos, the conversion kept one.
+    // Without it the turn ran on, `<|im_end|><|im_end|>...` in the content.
+    // Same rule llama.cpp applies (its EOG scan matches this name), and a
+    // no-op for every family that already declares it as eos (qwen, bonsai).
+    // `<turn|>` is Gemma 4's spelling of the turn closer (106): the Gemma 4
+    // chat GGUFs declare it as eot, the DiffusionGemma conversion does not
+    // (eos 1, no eot key), and a canvas that closes its answer with it then
+    // showed a literal `<turn|>` in the content, pads behind it.
     for name in [
         "<|return|>",
         "<|call|>",
         "<|endoftext|>",
+        "<|im_end|>",
         "<end_of_turn>",
+        "<turn|>",
         "<eos>",
         "</assistant>",
     ] {
@@ -1451,6 +1730,11 @@ fn load_hf_dir(
             ServeError::Open(dir.to_path_buf(), "config.json has no model_type".into())
         })?;
     let arch = match model_type.as_str() {
+        "llama" if device == "metal" => {
+            paddock_models::mlx::MiniCpmConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            "llama".to_owned()
+        }
         "gemma4" | "muse_glimmer" if device == "metal" => {
             let config = paddock_models::mlx::MultimodalConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
@@ -1694,11 +1978,11 @@ fn build_generator(
             if paddock_metal::kv_offload_config().is_some()
                 && !matches!(
                     arch,
-                    "qwen35" | "qwen35moe" | "granite" | "gpt-oss" | "laguna"
+                    "qwen35" | "qwen35moe" | "granite" | "llama" | "gpt-oss" | "laguna"
                 )
             {
                 return Err(format!(
-                    "Metal KV offload supports Qwen35, Granite, GPT-OSS and Laguna checkpoints, not {arch}"
+                    "Metal KV offload supports Qwen35, Granite/Llama, GPT-OSS and Laguna checkpoints, not {arch}"
                 ));
             }
             if matches!(arch, "gemma4" | "muse-glimmer") && path.is_dir() {
@@ -1763,9 +2047,23 @@ fn build_generator(
                     })
                     .map_err(|e| e.to_string());
             }
+            if arch == "llama" && path.is_dir() {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err("MiniCPM5 MLX Metal is text-only; speculative companions and CUDA packs are not implemented".into());
+                }
+                return paddock_metal::Granite::load(path, max_ctx, max_batch, vram_budget)
+                    .and_then(|mut m| {
+                        if let Some(config) = paddock_metal::kv_offload_config() {
+                            m.enable_kv_offload(config, &[path])?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    })
+                    .map_err(|e| e.to_string());
+            }
             if !matches!(
                 arch,
                 "granite"
+                    | "llama"
                     | "qwen35"
                     | "qwen35moe"
                     | "gemma4"
@@ -1779,10 +2077,12 @@ fn build_generator(
                     | "qwen4exp"
             ) || path.is_dir()
             {
-                return Err("Metal supports elected Granite, Qwen dense/35B MoE/ASR/Flash Next IQ3, Gemma 4, Muse Glimmer, GPT-OSS, Laguna XS/S, Nemotron Q8, PaddleOCR-VL and Unlimited-OCR GGUF graphs".into());
+                return Err("Metal supports elected Granite/Llama (MiniCPM5), Qwen dense/35B MoE/ASR/Flash Next IQ3, Gemma 4, Muse Glimmer, GPT-OSS, Laguna XS/S, Nemotron Q8, PaddleOCR-VL and Unlimited-OCR GGUF graphs".into());
             }
-            if matches!(arch, "gpt-oss" | "laguna" | "nemotron_h_moe" | "qwen4exp")
-                && (mmproj.is_some() || mtp.is_some())
+            if matches!(
+                arch,
+                "llama" | "gpt-oss" | "laguna" | "nemotron_h_moe" | "qwen4exp"
+            ) && (mmproj.is_some() || mtp.is_some())
             {
                 return Err(format!(
                     "Metal {arch} is text-only without vision or speculative companions"
@@ -2170,7 +2470,10 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
         // handful of file-derived constants plus an attention output gate.
         // GpuGemma4::load_with reads `general.architecture` and picks the
         // header key prefix and graph constants from it - see gemma4::Arch.
-        "gemma4" | "muse-glimmer" => match device {
+        // `diffusion-gemma` (DiffusionGemma 26B-A4B) is the same body again,
+        // generating by block diffusion; the loader reads the arch and adds
+        // its lane (gemma4::diffusion), the walk is gemma4's.
+        "gemma4" | "muse-glimmer" | "diffusion-gemma" => match device {
             "cuda" => {
                 let exec = make_exec(pack)?;
                 let mut model = paddock_engine::gpu_model::gemma4::GpuGemma4::load_with(
@@ -2259,7 +2562,10 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
             }
             other => Err(format!("nemotron needs cuda (got {other:?})")),
         },
-        "granite" => match device {
+        // Plain `llama` files (MiniCPM5-2B) are the granite graph with its
+        // four scalars at identity - the loader reads the arch string and
+        // applies the right rule, see gpu_model/granite/mod.rs.
+        "granite" | "llama" => match device {
             "cuda" => {
                 let exec = make_exec(pack)?;
                 let mut model =

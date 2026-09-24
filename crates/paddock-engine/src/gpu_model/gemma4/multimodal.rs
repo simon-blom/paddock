@@ -152,11 +152,13 @@ impl GpuGemma4 {
         // projector string: they must agree, and the text side is what already
         // decided every other constant.
         let vm = match self.hp.arch {
-            Arch::Gemma4 => VisionTower::Gemma4(Box::new(super::vision::VisionModel::load(
-                self.exec.clone(),
-                map,
-                max_image_tokens,
-            )?)),
+            // DiffusionGemma's config carries Gemma 4's vision config verbatim
+            // (27 layers, 1152 wide, 280 tokens); its processor is
+            // Gemma4Processor. No mmproj ships for it yet, but the tower
+            // class is the same one.
+            Arch::Gemma4 | Arch::DiffusionGemma => VisionTower::Gemma4(Box::new(
+                super::vision::VisionModel::load(self.exec.clone(), map, max_image_tokens)?,
+            )),
             Arch::MuseGlimmer => VisionTower::Muse(Box::new(
                 super::muse_vision::VisionModel::load(self.exec.clone(), map)?,
             )),
@@ -421,7 +423,6 @@ impl GpuGemma4 {
             .map_err(|e| GpuError::Driver(e.to_string()))?;
 
         let n_embd = self.hp.n_embd;
-        let row_bytes = self.token_embd.row_bytes(n_embd);
         // resume: rows [0, start) are already in KV, so the tail starts there
         // and `base` stays ABSOLUTE - positions, rope and the non-causal
         // attention bounds are all indexed off the full prompt, not the tail.
@@ -459,10 +460,12 @@ impl GpuGemma4 {
             for (i, row) in chunk.iter().enumerate() {
                 if let Row::Token(t) = row {
                     let sc = &mut self.scratch;
-                    self.exec.dequant_slice(
-                        &self.token_embd,
-                        *t as usize * row_bytes,
+                    super::EmbdTable::of(&self.token_embd, &self.head).row(
+                        &self.exec,
+                        *t,
+                        &mut sc.embd_id,
                         &mut sc.pf_row,
+                        n_embd,
                     )?;
                     self.exec
                         .copy_region(&sc.pf_row, 0, &mut sc.pf_tmp, i * n_embd, n_embd)?;

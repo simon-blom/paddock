@@ -73,7 +73,15 @@ fn overlay(content: &str, rendered: &str, port: u16) -> Result<String, String> {
     let source: toml_edit::DocumentMut = rendered
         .parse()
         .map_err(|_| "Cannot prepare the model composition.")?;
-    for key in ["model", "catalog", "mmproj", "mtp", "fp8_native"] {
+    for key in [
+        "model",
+        "catalog",
+        "mmproj",
+        "mtp",
+        "fp8_native",
+        "text_encoder",
+        "vae",
+    ] {
         if let Some(value) = resolved.get(key) {
             expected
                 .as_table_mut()
@@ -99,6 +107,20 @@ fn overlay(content: &str, rendered: &str, port: u16) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_image_composition_replaces_or_removes_its_required_companions() {
+        let original =
+            "port=12345\nmodel='old.gguf'\ntext_encoder='old-te.gguf'\nvae='old-vae.safetensors'\n";
+        let image = "port=12345\nmodel='dit.gguf'\ntext_encoder='te.gguf'\nvae='vae.safetensors'\n";
+        let text = overlay(original, image, 12345).unwrap();
+        let value = parse(&text, 12345).unwrap();
+        assert_eq!(value["text_encoder"].as_str(), Some("te.gguf"));
+        assert_eq!(value["vae"].as_str(), Some("vae.safetensors"));
+        let text = overlay(&text, "port=12345\nmodel='chat.gguf'\n", 12345).unwrap();
+        let value = parse(&text, 12345).unwrap();
+        assert!(value.get("text_encoder").is_none() && value.get("vae").is_none());
+    }
 
     #[test]
     fn changing_weights_preserves_private_and_unrelated_settings() {

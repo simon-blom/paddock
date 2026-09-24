@@ -70,6 +70,19 @@ fn KV() -> KvDtype {
     })
 }
 
+/// The most tokens a row can see and still select everything under QSA:
+/// 512 complete blocks of 4 plus a tail of at most 3 - the dense walk is
+/// exact up to here and only up to here (bring-up §3.5).
+const QSA_DENSE_EXACT: usize = 512 * 4 + 3;
+
+/// Depth of the per-slot ring of raw QSA indexer keys: a block's first keys
+/// may come from earlier walks, and a verify chunk's rejected drafts must
+/// never alias a committed position the next pool reads - so the ring holds
+/// QSA_BLOCK + the deepest verify chunk, rounded up to whole blocks (the
+/// shape vLLM sizes its ring by). 16 covers chunks up to 12 rows.
+const QSA_RING: usize = 16;
+use crate::gpu::qsa::QSA_BLOCK;
+
 /// PLE conv dilation - a k=4 kernel over a 9-token receptive ring.
 pub(super) const PLE_DILATION: usize = 3;
 
@@ -387,6 +400,14 @@ pub struct Qwen4ExpGpu {
     /// per-layer KV caches `[max_tokens, kv_dim]`, None on GDN layers
     kv_k: Vec<Option<CudaSlice<u8>>>,
     kv_v: Vec<Option<CudaSlice<u8>>>,
+    /// per attention layer, the QSA indexer's compressed key cache
+    /// `[slots, max_tokens/4, 128]` bf16 - one normed, rotated key per
+    /// 4-token block, written as each block completes (attn/qsa.cuh). None on
+    /// GDN layers and on a pack without the indexer.
+    idx_cache: Vec<Option<CudaSlice<half::bf16>>>,
+    /// per attention layer, the raw indexer keys the next pool may still need
+    /// `[slots, QSA_RING, 128]` f32 (a ring by position)
+    idx_ring: Vec<Option<CudaSlice<f32>>>,
     /// per-GDN-layer conv window: the last `k-1` PRE-conv rows, oldest first
     /// (`conv_step`'s contract - it shifts the window itself)
     gdn_win: Vec<Option<CudaSlice<f32>>>,
@@ -399,6 +420,15 @@ pub struct Qwen4ExpGpu {
     cur_slots: Vec<usize>,
     /// the run table the CURRENT walk carries; empty outside `PrefillRuns`
     cur_runs: Vec<Run>,
+    /// A MIXED walk (forward/chunked.rs): the first `walk_lead` rows of a
+    /// `PrefillRuns` walk are decode rows - one token each for distinct
+    /// slots at their own positions, the first `walk_lead` entries of
+    /// `cur_runs` as length-1 runs. Their three carried-state ops and their
+    /// attention take the batched DECODE entries (one launch for all of
+    /// them, the decode tick's class) and the prompt runs behind them keep
+    /// the per-run arms; everything row-parallel runs once over all rows.
+    /// 0 outside a mixed tick.
+    walk_lead: usize,
     /// how many independent sequences this instance carries. 1 is the
     /// single-sequence lane every gate is stamped against; > 1 sizes every
     /// carried-state buffer per slot and unlocks `decode_step_batch`.
@@ -443,11 +473,16 @@ pub struct Qwen4ExpGpu {
     /// slot's reply is tracked at all (a prompt admitted through the cache,
     /// long enough to be worth a checkpoint).
     reply_ckpt: Vec<Option<(usize, u32)>>,
+    /// The reply checkpoint held at the reply's first tool call
+    /// (`reply_pin`); the rolling one moves on past the call.
+    reply_pinned: Vec<Option<(usize, u32)>>,
     reply_track: Vec<bool>,
     /// The MTP drafter (forward/mtp.rs), once a head GGUF is attached.
     mtp: Option<Box<mtp::Mtp>>,
     /// The verify round's planes (forward/spec.rs), built at its first round.
     verify: Option<Box<spec::Verify>>,
+    /// Prompts queued for chunked prefill (forward/chunked.rs), FIFO.
+    chunked: Vec<chunked::ChunkedPrefill>,
     /// Canonical RS (PADDOCK_SPEC_RS): this round's per-slot chain draws, put
     /// here by the service immediately before it arms the chain. The backend
     /// has no sampler access, so the inverse temperature and the per-step draft
@@ -491,6 +526,14 @@ struct Scratch {
     d_pos: CudaSlice<u32>,
     d_mrope: CudaSlice<u32>,
     d_slots: CudaSlice<u32>,
+    /// QSA indexer planes (`qsa_index`): the fused q|k projection
+    /// `[t, (idx_heads+idx_kv_heads)*idx_head_dim]`, the normed+rotated query
+    /// `[t, idx_heads*idx_head_dim]`, the pooled keys staged for their rotary
+    /// `[t, idx_head_dim]` and those keys' block positions `[4, t]`
+    d_idx_qk: CudaSlice<f32>,
+    d_idx_q: CudaSlice<f32>,
+    d_idx_stage: CudaSlice<f32>,
+    d_idx_spos: CudaSlice<u32>,
     d_x: CudaSlice<f32>,
     d_h: CudaSlice<f32>,
     d_xn: CudaSlice<f32>,
@@ -984,7 +1027,38 @@ impl Qwen4ExpGpu {
         max_tokens: usize,
         slots: usize,
     ) -> Result<Self, GpuModelError> {
+        if max_tokens > QSA_DENSE_EXACT {
+            tracing::warn!(
+                max_ctx = max_tokens,
+                "qwen4exp: attention is served DENSE and the QSA sparse path is not built - rows past \
+                 {QSA_DENSE_EXACT} visible tokens will not be the reference model's (they attend to \
+                 every token, the model to its indexer's selection)"
+            );
+        }
         let (recur, kv_k, kv_v) = alloc_state(exec, &cfg, max_tokens, slots)?;
+        // QSA indexer state beside every attention layer's KV (tiny: 64 B a
+        // token a layer, plus a 16-deep raw ring per slot). Written on every
+        // walk, dense or not, so a sequence crossing the dense-exact window
+        // already has every block key the sparse path will score.
+        let qsa = exec.has_qsa_indexer();
+        let (mut idx_cache, mut idx_ring) = (Vec::new(), Vec::new());
+        for b in &cfg.blocks {
+            let attn = qsa && matches!(b, Qwen4ExpBlock::Attention);
+            idx_cache.push(if attn {
+                Some(
+                    exec.stream_alloc_bf16(
+                        slots * max_tokens.div_ceil(QSA_BLOCK) * cfg.idx_head_dim,
+                    )?,
+                )
+            } else {
+                None
+            });
+            idx_ring.push(if attn {
+                Some(exec.alloc(slots * QSA_RING * cfg.idx_head_dim)?)
+            } else {
+                None
+            });
+        }
         let mut gdn_win = Vec::with_capacity(cfg.n_layer);
         for li in 0..cfg.n_layer {
             gdn_win.push(match cfg.blocks[li] {
@@ -1096,11 +1170,14 @@ impl Qwen4ExpGpu {
             recur,
             kv_k,
             kv_v,
+            idx_cache,
+            idx_ring,
             gdn_win,
             ple_win,
             slots,
             cur_slots: vec![0usize],
             cur_runs: Vec::new(),
+            walk_lead: 0,
             pos: vec![0usize; slots],
             stream: vec![Vec::new(); slots],
             batch_graphs: (0..=slots).map(|_| None).collect(),
@@ -1111,14 +1188,23 @@ impl Qwen4ExpGpu {
             walk_row0: 0,
             walk_cuts: Vec::new(),
             reply_ckpt: vec![None; slots],
+            reply_pinned: vec![None; slots],
             reply_track: vec![false; slots],
             mtp: None,
             verify: None,
+            chunked: Vec::new(),
             spec_rs_draws: None,
         };
         if slots >= 1 && !super::prefix::prefix_disabled() {
-            me.prefix =
-                super::prefix::PrefixCache::new(exec, &me.cfg, slots, max_tokens, KV().bytes())?;
+            let x_row_bytes = if qsa { me.cfg.idx_head_dim * 2 } else { 0 };
+            me.prefix = super::prefix::PrefixCache::new(
+                exec,
+                &me.cfg,
+                slots,
+                max_tokens,
+                KV().bytes(),
+                x_row_bytes,
+            )?;
         }
         Ok(me)
     }
@@ -1197,6 +1283,7 @@ impl Qwen4ExpGpu {
     fn reset_slot(&mut self, slot: usize) -> Result<(), GpuModelError> {
         self.reply_track[slot] = false;
         self.reply_ckpt[slot] = None;
+        self.reply_pinned[slot] = None;
         let st = self.cfg.gdn_v_heads * self.cfg.gdn_k_dim * self.cfg.gdn_v_dim;
         for r in self.recur.iter_mut().flatten() {
             self.exec.zero_region(r, slot * st, st)?;
@@ -1227,6 +1314,20 @@ impl Qwen4ExpGpu {
         from: usize,
         to: usize,
     ) -> Result<Vec<f32>, GpuModelError> {
+        self.walk_span_dev(slot, ids, from, to)?;
+        Ok(self.exec.to_host_len(&self.sc.d_out, self.cfg.vocab)?)
+    }
+
+    /// [`Self::walk_span`] without the logits readback: the span's last row
+    /// is left in `d_out` row 0 (a mid-prompt span of the mixed tick has no
+    /// use for it).
+    fn walk_span_dev(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        from: usize,
+        to: usize,
+    ) -> Result<(), GpuModelError> {
         let n = to - from;
         let pos: Vec<u32> = (from as u32..to as u32).collect();
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
@@ -1261,8 +1362,7 @@ impl Qwen4ExpGpu {
         self.walk_row0 = from;
         let walked = self.device_walk(n, Phase::Prefill);
         self.walk_row0 = 0;
-        walked?;
-        Ok(self.exec.to_host_len(&self.sc.d_out, self.cfg.vocab)?)
+        walked
     }
 
     /// The prefix-cache consult for `slot`: the resume point with the slot's
@@ -1278,6 +1378,7 @@ impl Qwen4ExpGpu {
             self.max_tokens,
             &mut self.kv_k,
             &mut self.kv_v,
+            &mut self.idx_cache,
             &mut self.recur,
             &mut self.gdn_win,
             self.ple_win.as_mut(),
@@ -1303,6 +1404,7 @@ impl Qwen4ExpGpu {
             self.max_tokens,
             &mut self.kv_k,
             &mut self.kv_v,
+            &mut self.idx_cache,
             &mut self.recur,
             &mut self.gdn_win,
             self.ple_win.as_mut(),
@@ -1321,10 +1423,35 @@ impl Qwen4ExpGpu {
     // checkpoint per reply; the next turn prefills <= 15 reply tokens plus
     // its new message. Kill: PADDOCK_NO_REPLY_CKPT=1.
 
+    /// The dense attention walk is the model only while a row sees at most
+    /// `QSA_DENSE_EXACT` tokens: past that, QSA attends to its indexer's 512
+    /// selected blocks of 4 plus the tail, and dense attends to everything - a
+    /// different model (the Flash-Next QSA design note). Until
+    /// the sparse path lands, say so the first time a sequence crosses it,
+    /// rather than serve the difference silently. Once per process: the
+    /// condition is the lane's, not the request's.
+    fn qsa_dense_guard(&self, slot: usize) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.pos[slot] > QSA_DENSE_EXACT
+            && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                slot,
+                visible = self.pos[slot],
+                "qwen4exp: a sequence passed {QSA_DENSE_EXACT} visible tokens on the DENSE attention \
+                 path - the model attends through QSA (512 selected blocks of 4) there, which this \
+                 lane does not implement yet, so outputs past this point are not the reference \
+                 model's"
+            );
+        }
+    }
+
     /// Admission: the prompt just landed in `slot`. Track its reply when the
     /// cache is on and the sequence is long enough to be worth a checkpoint.
     fn reply_track_admit(&mut self, slot: usize) {
+        self.qsa_dense_guard(slot);
         self.reply_ckpt[slot] = None;
+        self.reply_pinned[slot] = None;
         self.reply_track[slot] = self.prefix.is_some()
             && !crate::gpu_model::prefix_cache::reply_ckpt_disabled()
             && self.pos[slot] >= super::prefix::MIN_SNAPSHOT_LEN;
@@ -1335,6 +1462,7 @@ impl Qwen4ExpGpu {
     /// its reply checkpoint there.
     fn reply_after_rows(&mut self, rows: &[(usize, u32)]) -> Result<(), GpuModelError> {
         for &(sl, _) in rows {
+            self.qsa_dense_guard(sl);
             if self.reply_track[sl] && self.pos[sl].is_multiple_of(BLOCK_TOKENS) {
                 self.reply_snapshot(sl)?;
             }
@@ -1367,6 +1495,17 @@ impl Qwen4ExpGpu {
             tracing::info!("qwen4exp-reply-ckpt: slot {slot} cut {cut} idx {idx}");
         }
         Ok(())
+    }
+
+    /// The reply just started its first tool call (see
+    /// `Generator::reply_pin`): the rolling checkpoint becomes the held one
+    /// and the next page's snapshot opens a new rolling one instead of
+    /// dropping it. Once per reply.
+    fn reply_pin(&mut self, slot: usize) {
+        if slot >= self.reply_pinned.len() || self.reply_pinned[slot].is_some() {
+            return;
+        }
+        self.reply_pinned[slot] = self.reply_ckpt[slot].take();
     }
 
     /// Prefill `ids[start..]` into `slot` whose state is already the state
@@ -1692,15 +1831,35 @@ impl Qwen4ExpGpu {
         plans: &[crate::generator::RowSample],
     ) -> Result<crate::generator::SampledStep, GpuModelError> {
         use crate::generator::{RowSample, SampledStep};
-        let vocab = self.cfg.vocab;
-        let exec = self.exec.clone();
         // `d_out` holds one row per DECODED row, in `rows` order - hole rows
         // never reached the walk. Plans are indexed by the scheduler's slot,
         // so they are compacted the same way before packing and the ids are
         // scattered back at the end.
-        let r = rows.len();
         let live: Vec<RowSample> = rows.iter().map(|&(i, _)| plans[i]).collect();
-        let (par, tpar) = Self::pack_samp_par(&live);
+        let (packed, host) = self.sample_out_rows(&live)?;
+        let mut ids = vec![0u32; plans.len()];
+        for (j, &(i, _)) in rows.iter().enumerate() {
+            ids[i] = packed[j];
+        }
+        let host_rows = host.into_iter().map(|(j, row)| (rows[j].0, row)).collect();
+        Ok(SampledStep { ids, host_rows })
+    }
+
+    /// Sample `d_out` rows `[0, plans.len())` on device, row j by `plans[j]`:
+    /// the ids in row order, and the `Host`-plan rows' logits read back as
+    /// (row, logits).
+    fn sample_out_rows(
+        &mut self,
+        plans: &[crate::generator::RowSample],
+    ) -> Result<(Vec<u32>, Vec<(usize, Vec<f32>)>), GpuModelError> {
+        use crate::generator::RowSample;
+        let vocab = self.cfg.vocab;
+        let exec = self.exec.clone();
+        let r = plans.len();
+        if r == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let (par, tpar) = Self::pack_samp_par(plans);
         {
             let sc = &mut self.sc;
             let mut v = sc
@@ -1754,25 +1913,28 @@ impl Qwen4ExpGpu {
             .stream
             .clone_dtoh(&ids_view)
             .map_err(crate::gpu::from_driver)?;
-        let mut ids = vec![0u32; plans.len()];
         let mut host_rows = Vec::new();
-        for (j, &(i, _)) in rows.iter().enumerate() {
-            ids[i] = packed[j];
-            if matches!(plans[i], RowSample::Host) {
-                let v = self
-                    .sc
-                    .d_out
-                    .try_slice(j * vocab..(j + 1) * vocab)
-                    .ok_or_else(|| crate::gpu::GpuError::Driver("host row slice".into()))?;
-                host_rows.push((
-                    i,
-                    exec.stream
-                        .clone_dtoh(&v)
-                        .map_err(crate::gpu::from_driver)?,
-                ));
+        for (j, p) in plans.iter().enumerate() {
+            if matches!(p, RowSample::Host) {
+                host_rows.push((j, self.out_row(j)?));
             }
         }
-        Ok(SampledStep { ids, host_rows })
+        Ok((packed, host_rows))
+    }
+
+    /// `d_out` row `j` read back.
+    fn out_row(&self, j: usize) -> Result<Vec<f32>, GpuModelError> {
+        let vocab = self.cfg.vocab;
+        let v = self
+            .sc
+            .d_out
+            .try_slice(j * vocab..(j + 1) * vocab)
+            .ok_or_else(|| crate::gpu::GpuError::Driver("d_out row slice".into()))?;
+        Ok(self
+            .exec
+            .stream
+            .clone_dtoh(&v)
+            .map_err(crate::gpu::from_driver)?)
     }
 
     /// Stage one token per row, each against its own slot and position.
@@ -1999,14 +2161,23 @@ impl Qwen4ExpGpu {
         for ((_, toks), r) in items.iter().zip(runs) {
             ids.extend_from_slice(&toks[r.row0..r.row0 + r.len]);
         }
-        self.stage_inputs_runs_ids(&ids, runs)
+        self.stage_inputs_runs_ids(&ids, runs, 0)
     }
 
     /// [`Self::stage_inputs_runs`] over an already-assembled token plane (row
     /// order = run order): the verify round stages its chunks without the
     /// whole sequence in hand. The PLE hash still reads each slot's stream,
-    /// which must already hold the rows being staged.
-    fn stage_inputs_runs_ids(&mut self, ids: &[u32], runs: &[Run]) -> Result<(), GpuModelError> {
+    /// which must already hold the rows being staged. A mixed walk's leading
+    /// `lead` decode runs (see `walk_lead`) stage their rows like any other
+    /// but stay out of the tile and run tables - their attention and
+    /// carried-state ops take the decode entries, which read `d_slots` and
+    /// `d_pos` per row.
+    fn stage_inputs_runs_ids(
+        &mut self,
+        ids: &[u32],
+        runs: &[Run],
+        lead: usize,
+    ) -> Result<(), GpuModelError> {
         let n: usize = runs.iter().map(|r| r.len).sum();
         let mut pos = Vec::with_capacity(n);
         let mut slots = Vec::with_capacity(n);
@@ -2019,9 +2190,10 @@ impl Qwen4ExpGpu {
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&slots, &mut self.sc.d_slots)?;
-        let mut t_row0: Vec<u32> = Vec::with_capacity(n_qtiles(runs));
-        let mut t_slot: Vec<u32> = Vec::with_capacity(n_qtiles(runs));
-        for r in runs {
+        let seq = &runs[lead.min(runs.len())..];
+        let mut t_row0: Vec<u32> = Vec::with_capacity(n_qtiles(seq));
+        let mut t_slot: Vec<u32> = Vec::with_capacity(n_qtiles(seq));
+        for r in seq {
             let mut row = r.off;
             while row < r.off + r.len {
                 t_row0.push(row as u32);
@@ -2031,9 +2203,9 @@ impl Qwen4ExpGpu {
         }
         self.exec.upload_u32(&t_row0, &mut self.sc.d_tile_row0)?;
         self.exec.upload_u32(&t_slot, &mut self.sc.d_tile_slot)?;
-        let roff: Vec<u32> = runs.iter().map(|r| r.off as u32).collect();
-        let rlen: Vec<u32> = runs.iter().map(|r| r.len as u32).collect();
-        let rslot: Vec<u32> = runs.iter().map(|r| r.slot as u32).collect();
+        let roff: Vec<u32> = seq.iter().map(|r| r.off as u32).collect();
+        let rlen: Vec<u32> = seq.iter().map(|r| r.len as u32).collect();
+        let rslot: Vec<u32> = seq.iter().map(|r| r.slot as u32).collect();
         self.exec.upload_u32(&roff, &mut self.sc.d_run_off)?;
         self.exec.upload_u32(&rlen, &mut self.sc.d_run_len)?;
         self.exec.upload_u32(&rslot, &mut self.sc.d_run_slot)?;
@@ -2199,6 +2371,38 @@ impl Qwen4ExpGpu {
         self.pos[slot]
     }
 
+    /// Diagnostic read of the QSA compressed key cache: attention layer
+    /// `layer`'s keys for `slot`, blocks `b0..b1`, as `[b1-b0, idx_head_dim]`
+    /// f32. None when the lane keeps no indexer cache there (a GDN layer, a
+    /// pack without the indexer). For gates; the serving path never reads
+    /// the cache back.
+    pub fn qsa_index_keys(
+        &self,
+        layer: usize,
+        slot: usize,
+        b0: usize,
+        b1: usize,
+    ) -> Result<Option<Vec<f32>>, GpuModelError> {
+        let Some(cache) = self.idx_cache.get(layer).and_then(|c| c.as_ref()) else {
+            return Ok(None);
+        };
+        let (hd, cap) = (self.cfg.idx_head_dim, self.max_tokens.div_ceil(QSA_BLOCK));
+        if slot >= self.slots || b0 > b1 || b1 > cap {
+            return Err(GpuModelError::Unsupported(format!(
+                "qsa_index_keys: slot {slot} blocks {b0}..{b1} outside {} x {cap}",
+                self.slots
+            )));
+        }
+        let all = self.exec.to_host_bf16(cache)?;
+        let base = slot * cap * hd;
+        Ok(Some(
+            all[base + b0 * hd..base + b1 * hd]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect(),
+        ))
+    }
+
     /// How many sequences this instance is sized for.
     pub fn slot_count(&self) -> usize {
         self.slots
@@ -2301,11 +2505,14 @@ impl Qwen4ExpGpu {
             recur,
             kv_k,
             kv_v,
+            idx_cache,
+            idx_ring,
             gdn_win,
             ple_win,
             stage,
             cur_slots,
             cur_runs,
+            walk_lead,
             walk_row0,
             walk_cuts,
             prefix,
@@ -2313,6 +2520,13 @@ impl Qwen4ExpGpu {
             ..
         } = self;
         let row0 = *walk_row0;
+        // a mixed walk's decode rows lead; the per-run arms see the prompts
+        let lead = if matches!(phase, Phase::PrefillRuns) {
+            (*walk_lead).min(cur_runs.len())
+        } else {
+            0
+        };
+        let seq_runs = &cur_runs[lead..];
         // in-walk checkpoints: the pool the passes write them into, and each
         // GDN layer's place among the GDN layers (the checkpoint layout)
         let mut sink = if walk_cuts.is_empty() {
@@ -2460,7 +2674,8 @@ impl Qwen4ExpGpu {
                     phase,
                     ple_win.as_mut().expect("ple window"),
                     cur_slots,
-                    cur_runs,
+                    seq_runs,
+                    lead,
                     row0,
                     walk_cuts,
                     sink.as_mut(),
@@ -2516,7 +2731,8 @@ impl Qwen4ExpGpu {
                         n,
                         phase,
                         cur_slots.first().copied().unwrap_or(0),
-                        cur_runs,
+                        seq_runs,
+                        lead,
                         fork_ok,
                         row0,
                         verify
@@ -2560,10 +2776,12 @@ impl Qwen4ExpGpu {
                         stage,
                         kv_k[li].as_mut().expect("kv k"),
                         kv_v[li].as_mut().expect("kv v"),
+                        idx_cache[li].as_mut().zip(idx_ring[li].as_mut()),
                         *max_tokens,
                         n,
                         attn_phase,
-                        cur_runs,
+                        seq_runs,
+                        lead,
                         fork_ok,
                     )?;
                     pm_lap(e, "attn");
@@ -3188,6 +3406,9 @@ fn ple_pass(
     win: &mut CudaSlice<f32>,
     slot_ids: &[usize],
     runs: &[Run],
+    // a mixed walk's leading decode rows (see `walk_lead`); `runs` is then
+    // just the prompt runs behind them
+    lead: usize,
     row0: usize,
     // in-walk prefix-cache checkpoints (Prefill): (row in the span, pool
     // index), where their blobs sit, and how many GDN layers precede the ring
@@ -3320,6 +3541,22 @@ fn ple_pass(
             }
         }
         Phase::PrefillRuns => {
+            // A mixed walk's decode rows: the decode tick's one-launch ring
+            // step over rows [0, lead), each at its own slot and position.
+            if lead > 0 {
+                e.q4x_conv_dil_step_ring(
+                    &sc.d_pkn,
+                    win,
+                    &ple.conv.buf,
+                    &mut sc.d_pconv,
+                    &sc.d_slots,
+                    &sc.d_pos,
+                    hw,
+                    c.ple_conv,
+                    PLE_DILATION,
+                    lead,
+                )?;
+            }
             // Per run, the Prefill arm at a row offset: the dilated conv's own
             // left-pad guard is relative to the offset base, so a run never
             // reads the run before it - exactly a fresh sequence's zero pad.
@@ -3764,6 +4001,9 @@ fn gdn_pass(
     slot: usize,
     // run table; non-empty only in `PrefillRuns`
     runs: &[Run],
+    // a mixed walk's leading decode rows (see `walk_lead`); `runs` is then
+    // just the prompt runs behind them
+    lead: usize,
     fork_ok: bool,
     // the sequence position of the span's first row (`walk_row0`): a
     // continued sequence re-stages its conv window in front of the span
@@ -3968,6 +4208,27 @@ fn gdn_pass(
             }
         }
         Phase::PrefillRuns => {
+            // A mixed walk's decode rows: the decode tick's per-slot conv step
+            // over rows [0, lead) - the UNFUSED entry, so the split+widen below
+            // runs once over every row of the walk.
+            if lead > 0 {
+                let Scratch {
+                    d_qkv,
+                    d_conv,
+                    d_slots,
+                    ..
+                } = sc;
+                e.conv_step_slots(
+                    win,
+                    d_qkv,
+                    &w.conv.buf,
+                    d_conv,
+                    d_slots,
+                    lead,
+                    qkv_rows,
+                    c.gdn_conv,
+                )?;
+            }
             // Same as the Prefill arm at a row offset - `causal_conv1d_silu_at`
             // documents exactly this contract (rows before the offset base are
             // never read, which is the fresh prompt's zero left-pad).
@@ -4171,11 +4432,30 @@ fn gdn_pass(
         verify_gdn_rows(e, c, w, sc, state, vr, runs)?;
         gn_done = true;
     } else if matches!(phase, Phase::PrefillRuns) {
+        // A mixed walk's decode rows: one token per slot against its carried
+        // state, the decode tick's recurrence entry over rows [0, lead). The
+        // gated norm stays unfused (below) - it covers every row of the walk.
+        if lead > 0 {
+            let Scratch {
+                d_dq,
+                d_dk,
+                d_dv,
+                d_g,
+                d_beta,
+                d_slots,
+                d_dattn,
+                ..
+            } = sc;
+            e.gated_delta_recurrent_slots(
+                d_dq, d_dk, d_dv, d_g, d_beta, d_slots, state, d_dattn, lead, hv, kd,
+            )?;
+        }
         // Every run's whole sequence in one launch, grid (n_heads, n_runs).
         // The single-run entry grids 48 blocks at 255 registers - 32% of a
         // 148-SM die - and a serially-prefilled wave pays 195.9 us per layer
         // per prompt for it (7.05 ms of a 33.9 ms 128-token prefill).
-        let pn = super::dn_prenorm_on()
+        let pn = !runs.is_empty()
+            && super::dn_prenorm_on()
             && e.gated_delta_recurrent_runs_pn(
                 &sc.d_dq,
                 &sc.d_dk,
@@ -4193,7 +4473,7 @@ fn gdn_pass(
                 kd,
                 &mut sc.d_dnrn,
             )?;
-        if !pn {
+        if !pn && !runs.is_empty() {
             e.gated_delta_recurrent_runs(
                 &sc.d_dq,
                 &sc.d_dk,
@@ -4429,6 +4709,93 @@ fn verify_gdn_rows(
     Ok(())
 }
 
+/// The QSA indexer for this walk's `n` rows (the Flash-Next QSA design
+/// note, attn/qsa.cuh): project q|k off the layer input the main
+/// projections read, normalize and rotate the 4 query heads (the scores'
+/// left side - rung R2 reads `d_idx_q`), and pool every block a row closes
+/// into the compressed cache, the raw keys filed in the slot's ring for the
+/// blocks later walks close.
+#[allow(clippy::too_many_arguments)]
+fn qsa_index(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    w: &super::AttnW,
+    sc: &mut Scratch,
+    stage: &mut DenseStage,
+    cache: &mut CudaSlice<half::bf16>,
+    ring: &mut CudaSlice<f32>,
+    max_ctx: usize,
+    n: usize,
+) -> Result<(), GpuModelError> {
+    let (ih, ihd) = (c.idx_heads, c.idx_head_dim);
+    let ld = (ih + c.idx_kv_heads) * ihd;
+    let koff = ih * ihd;
+    let yarn = yarn_params(c);
+    w.idx_qk.matmul(e, &sc.d_bi, &mut sc.d_idx_qk, n, stage)?;
+    e.q4x_idx_q(
+        &sc.d_idx_qk,
+        &w.idx_q_norm.buf,
+        &mut sc.d_idx_q,
+        n,
+        ih,
+        ihd,
+        ld,
+        c.eps,
+    )?;
+    e.mrope(
+        &mut sc.d_idx_q,
+        &sc.d_mrope,
+        n,
+        ih,
+        ihd,
+        c.rotary_dim,
+        yarn,
+        MROPE_SECTIONS,
+    )?;
+    e.q4x_idx_pool(
+        &sc.d_idx_qk,
+        ring,
+        &sc.d_pos,
+        &sc.d_slots,
+        &w.idx_k_norm.buf,
+        &mut sc.d_idx_stage,
+        &mut sc.d_idx_spos,
+        n,
+        ihd,
+        ld,
+        koff,
+        QSA_RING,
+        QSA_BLOCK,
+        c.eps,
+    )?;
+    e.mrope(
+        &mut sc.d_idx_stage,
+        &sc.d_idx_spos,
+        n,
+        1,
+        ihd,
+        c.rotary_dim,
+        yarn,
+        MROPE_SECTIONS,
+    )?;
+    e.q4x_idx_store(
+        &sc.d_idx_qk,
+        &sc.d_idx_stage,
+        &sc.d_pos,
+        &sc.d_slots,
+        cache,
+        ring,
+        n,
+        ihd,
+        ld,
+        koff,
+        QSA_RING,
+        QSA_BLOCK,
+        max_ctx.div_ceil(QSA_BLOCK),
+    )?;
+    Ok(())
+}
+
 /// Gated full attention, dense path. The QSA sparse walk is a later rung and
 /// is exact anyway while the visible window stays inside the indexer budget.
 #[allow(clippy::too_many_arguments)]
@@ -4440,10 +4807,16 @@ fn attn_pass(
     stage: &mut DenseStage,
     kc: &mut CudaSlice<u8>,
     vc: &mut CudaSlice<u8>,
+    // the layer's QSA indexer state (compressed keys, raw ring); None where
+    // the lane keeps none (an old pack, the MTP head's own layer)
+    idx: Option<(&mut CudaSlice<half::bf16>, &mut CudaSlice<f32>)>,
     max_ctx: usize,
     n: usize,
     phase: Phase,
     runs: &[Run],
+    // a mixed walk's leading decode rows (see `walk_lead`); `runs` is then
+    // just the prompt runs behind them
+    lead: usize,
     fork_ok: bool,
 ) -> Result<(), GpuModelError> {
     let (nh, nkv, hd) = (c.n_heads, c.n_kv_heads, c.head_dim);
@@ -4604,7 +4977,68 @@ fn attn_pass(
         )?;
     }
     pm_lap(e, "attn-qkv");
+    if let Some((cache, ring)) = idx {
+        qsa_index(e, c, w, sc, stage, cache, ring, max_ctx, n)?;
+        pm_lap(e, "attn-qsa-index");
+    }
     let scale = 1.0 / (hd as f32).sqrt();
+    if matches!(phase, Phase::PrefillRuns) && lead > 0 {
+        // A mixed walk: the decode rows lead, one per slot at its own
+        // position, so the decode attention's dispatch (the class a decode
+        // tick runs, split-KV where elected) covers rows [0, lead) exactly -
+        // every row's K/V was appended above, before any read. The prompt
+        // runs behind them take the tiled prefill kernel through a tile table
+        // staged over those runs alone.
+        attn_core(
+            e,
+            c,
+            sc,
+            kc,
+            vc,
+            max_ctx,
+            lead,
+            Phase::DecodeBatch,
+            &[],
+            scale,
+        )?;
+        if !runs.is_empty() {
+            attn_core(e, c, sc, kc, vc, max_ctx, n, phase, runs, scale)?;
+        }
+    } else {
+        attn_core(e, c, sc, kc, vc, max_ctx, n, phase, runs, scale)?;
+    }
+    pm_lap(e, "attn-core");
+    e.mul_sigmoid(&mut sc.d_attn, &sc.d_agate, n * q_dim)?;
+    // The gate multiply is a full round trip of d_attn (~38 MB with the gate
+    // plane) and the o projection is a [q_dim -> hidden] Q8_0 GEMM (~31 MB).
+    // attn-out bills 0.813 ms a layer against a ~0.32 ms floor for the pair,
+    // so price them apart before deciding whether the lever is folding the
+    // gate into the GEMM's prologue or the GEMM itself.
+    pm_lap(e, "attn-gate");
+    w.o.matmul(e, &sc.d_attn, &mut sc.d_mix, n, stage)?;
+    pm_lap(e, "attn-out");
+    Ok(())
+}
+
+/// The attention core of `attn_pass`: rows [0, n) against the carried KV,
+/// dispatched by `phase` (decode kernels read one query row per slot, the
+/// prefill tile walks the run table staged for `runs`). K/V for every row
+/// is appended before this runs. Output rows land in `d_attn`.
+#[allow(clippy::too_many_arguments)]
+fn attn_core(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    sc: &mut Scratch,
+    kc: &CudaSlice<u8>,
+    vc: &CudaSlice<u8>,
+    max_ctx: usize,
+    n: usize,
+    phase: Phase,
+    runs: &[Run],
+    scale: f32,
+) -> Result<(), GpuModelError> {
+    let (nh, nkv, hd) = (c.n_heads, c.n_kv_heads, c.head_dim);
+    let kv_dim = nkv * hd;
     // tcgen05 decode attention (pack slot 431, the <256,6> instantiation built
     // for qwen3.8's 24q/4kv/hd256 - the same geometry). Needs e4m3 pools
     // (PADDOCK_Q38FN_KV8=1): its TMA maps assume 1-byte elements. The dense
@@ -4862,16 +5296,6 @@ fn attn_pass(
             )?,
         }
     }
-    pm_lap(e, "attn-core");
-    e.mul_sigmoid(&mut sc.d_attn, &sc.d_agate, n * q_dim)?;
-    // The gate multiply is a full round trip of d_attn (~38 MB with the gate
-    // plane) and the o projection is a [q_dim -> hidden] Q8_0 GEMM (~31 MB).
-    // attn-out bills 0.813 ms a layer against a ~0.32 ms floor for the pair,
-    // so price them apart before deciding whether the lever is folding the
-    // gate into the GEMM's prologue or the GEMM itself.
-    pm_lap(e, "attn-gate");
-    w.o.matmul(e, &sc.d_attn, &mut sc.d_mix, n, stage)?;
-    pm_lap(e, "attn-out");
     Ok(())
 }
 
@@ -6133,6 +6557,10 @@ impl Scratch {
             d_pos: e.alloc_u32(t)?,
             d_mrope: e.alloc_u32(4 * t)?,
             d_slots: e.alloc_u32(t)?,
+            d_idx_qk: e.alloc(t * (c.idx_heads + c.idx_kv_heads) * c.idx_head_dim)?,
+            d_idx_q: e.alloc(t * c.idx_heads * c.idx_head_dim)?,
+            d_idx_stage: e.alloc(t * c.idx_head_dim)?,
+            d_idx_spos: e.alloc_u32(4 * t)?,
             d_x: e.alloc(t * h)?,
             d_h: e.alloc(t * hw)?,
             d_xn: e.alloc(t * hw)?,
@@ -6341,6 +6769,7 @@ impl Scratch {
 // (n_heads, batch); `kv_append_batch` and the decode attention take slot
 // vectors), and `decode_step_batch` is gated by
 // `batched_slots_match_single_slot_runs`. So this is a seam, not a rewrite.
+mod chunked;
 mod mtp;
 mod spec;
 
@@ -6355,6 +6784,10 @@ impl crate::generator::Generator for Qwen4ExpGpu {
     /// shape generator measures from (see `weights_mem_bytes` above).
     fn weights_mem_bytes(&self) -> Option<u64> {
         Self::weights_mem_bytes(self)
+    }
+
+    fn reply_pin(&mut self, slot: usize) {
+        Qwen4ExpGpu::reply_pin(self, slot);
     }
 
     fn reset(&mut self) {
@@ -6541,6 +6974,91 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         // after the sample: feeding the head reuses the walk's scratch
         self.mtp_flush().map_err(q4x_gen_err)?;
         Ok(step)
+    }
+
+    // ---- chunked prefill: the mixed tick (forward/chunked.rs) ----------
+
+    fn supports_chunked_prefill(&self) -> bool {
+        self.chunked_supported()
+    }
+
+    fn prefill_begin(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+    ) -> Result<(), crate::generator::GenError> {
+        self.prefill_begin_impl(slot, tokens).map_err(q4x_gen_err)
+    }
+
+    fn prefill_abort(&mut self, slot: usize) -> bool {
+        self.prefill_abort_impl(slot)
+    }
+
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.prefill_queue_impl()
+    }
+
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.prefill_tick_cap_impl(decode_rows)
+    }
+
+    /// The mixed tick with host sampling: the decode rows' `[nd, vocab]`
+    /// logits in `decodes` order, and each finished prompt's last logits.
+    fn forward_mixed(
+        &mut self,
+        decodes: &[(usize, u32, u32)],
+        budget: usize,
+    ) -> Result<(Vec<f32>, Vec<(usize, Vec<f32>, usize)>), crate::generator::GenError> {
+        let w = self.mixed_walk(decodes, budget).map_err(q4x_gen_err)?;
+        let logits = if w.nd > 0 {
+            self.exec
+                .to_host_len(&self.sc.d_out, w.nd * self.cfg.vocab)
+                .map_err(|e| q4x_gen_err(e.into()))?
+        } else {
+            Vec::new()
+        };
+        let fins: Vec<(usize, usize, usize)> = w.finishers(self).collect();
+        let mut finished = Vec::with_capacity(fins.len());
+        for (slot, row, rows) in fins {
+            finished.push((slot, self.out_row(row).map_err(q4x_gen_err)?, rows));
+        }
+        self.mixed_commit(w).map_err(q4x_gen_err)?;
+        Ok((logits, finished))
+    }
+
+    /// The mixed tick, decode rows sampled on device (plans in `decodes`
+    /// order); a finishing prompt hands back its last logits.
+    fn forward_mixed_sampled(
+        &mut self,
+        decodes: &[(usize, u32, u32)],
+        budget: usize,
+        plans: &[RowSample],
+        _fin_plans: &[(usize, RowSample)],
+    ) -> Result<
+        (
+            SampledStep,
+            Vec<(usize, crate::generator::FinishSample, usize)>,
+        ),
+        crate::generator::GenError,
+    > {
+        if plans.len() != decodes.len() {
+            return Err(crate::generator::GenError::Backend(format!(
+                "forward_mixed_sampled: {} decode rows, {} plans",
+                decodes.len(),
+                plans.len()
+            )));
+        }
+        let w = self.mixed_walk(decodes, budget).map_err(q4x_gen_err)?;
+        let (ids, host_rows) = self.sample_out_rows(&plans[..w.nd]).map_err(q4x_gen_err)?;
+        let fins: Vec<(usize, usize, usize)> = w.finishers(self).collect();
+        let mut finished = Vec::with_capacity(fins.len());
+        for (slot, row, rows) in fins {
+            let logits = self.out_row(row).map_err(q4x_gen_err)?;
+            finished.push((slot, crate::generator::FinishSample::Logits(logits), rows));
+        }
+        // after the reads: seeding the drafter reuses the walk's scratch
+        self.mixed_commit(w).map_err(q4x_gen_err)?;
+        Ok((SampledStep { ids, host_rows }, finished))
     }
 
     /// A drafter exists once a head GGUF is attached (`attach_mtp`); the

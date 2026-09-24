@@ -16,8 +16,8 @@ public struct ConversationSelectionItem: Sendable {
   }
 }
 
-/// One AppKit selection responder for the transcript, not the composer or
-/// artifact/document panes. No dependency swizzling or global event monitors.
+/// One AppKit selection responder for registered transcript text only. Native
+/// safe-area bars may share its host, but composer/preview text is excluded.
 public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
   let items: [ConversationSelectionItem]
   let content: Content
@@ -28,13 +28,19 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
   public func makeNSView(context: Context) -> ConversationSelectionHost {
     let view = ConversationSelectionHost(
       rootView: AnyView(content.environment(\.self, context.environment)))
-    // The owning column already applies traffic-light clearance to its text.
-    // Re-inheriting NSWindow's title-bar safe area here shortens the actual
-    // scroll view (and its indicator) despite the outer split being full-height.
+    // The owning column places this viewport below its window header. Do not
+    // inherit that safe area again inside this nested hosting boundary.
     view.safeAreaRegions = []
+    // This host owns a viewport, not a document-sized window. Its parent
+    // supplies both dimensions through sizeThatFits; do not add competing
+    // minimum/maximum/intrinsic constraints for the scrolling contents.
+    view.sizingOptions = []
     return view
   }
   public func updateNSView(_ view: ConversationSelectionHost, context: Context) {
+    #if DEBUG
+      view.contentUpdates += 1
+    #endif
     view.items = items
     view.rootView = AnyView(content.environment(\.self, context.environment))
   }
@@ -47,6 +53,9 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
 }
 
 @MainActor public final class ConversationSelectionHost: NSHostingView<AnyView> {
+  #if DEBUG
+    var contentUpdates = 0
+  #endif
   var items: [ConversationSelectionItem] = []
   private var anchor: Point?
   private var extent: Point?
@@ -153,6 +162,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
           responder === self || responder.isDescendant(of: self),
           (responder as? NSTextView)?.isEditable != true
         else { return false }
+        if let text = responder as? NSTextView, !self.ownsText(text) { return false }
         if event.charactersIgnoringModifiers == "a" {
           self.selectAll(nil)
           return true
@@ -168,23 +178,27 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     }
   }
   public override func hitTest(_ point: NSPoint) -> NSView? {
+    hitTest(point, event: NSApp.currentEvent)
+  }
+  func hitTest(_ point: NSPoint, event: NSEvent?) -> NSView? {
     let hit = super.hitTest(point)
-    if NSApp.currentEvent?.type == .scrollWheel { return hit }
+    // AppKit also hit-tests during hover/layout, and currentEvent may still
+    // be a mouse press then. Never ask TextKit for glyphs or insertion points
+    // here: table attachments can re-enter SwiftUI's constraint pass.
+    guard let event,
+      event.type == .leftMouseDown || event.type == .leftMouseDragged
+        || event.type == .rightMouseDown
+    else { return hit }
     // Leave buttons, scrollbars, links, editable controls and context menus to
     // their actual owners. Only text drags belong to this responder.
-    guard let text = hit as? NSTextView, text.isSelectable, !text.isEditable else { return hit }
+    guard let text = hit as? NSTextView, text.isSelectable, !text.isEditable, ownsText(text) else {
+      return hit
+    }
     // Speech uses TextKit 2 and timed-word links. Never force its layout into
     // TextKit 1 or replace its word activation/selection behavior.
     if text.textLayoutManager != nil { return hit }
-    if let event = NSApp.currentEvent, event.type == .rightMouseDown {
+    if event.type == .rightMouseDown {
       return selectedText.isEmpty ? hit : self
-    }
-    let p = text.convert(point, from: superview)
-    let index = Self.insertionIndex(text, at: p)
-    if index < (text.string as NSString).length,
-      text.textStorage?.attribute(.link, at: index, effectiveRange: nil) != nil
-    {
-      return hit
     }
     return self
   }
@@ -195,7 +209,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     let local = superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
     let hit = super.hitTest(local)
     guard let text = hit as? NSTextView, text.isSelectable, !text.isEditable,
-      text.textLayoutManager == nil
+      text.textLayoutManager == nil, ownsText(text)
     else {
       selecting = false
       super.mouseDown(with: event)
@@ -206,7 +220,10 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
       text.textStorage?.attribute(.link, at: index, effectiveRange: nil) != nil
     {
       selecting = false
-      super.mouseDown(with: event)
+      // Resolve links only while handling the actual press, never in hitTest.
+      // Forward to the real text owner so its delegate/openURL policy handles
+      // activation exactly as it would without conversation-wide selection.
+      text.mouseDown(with: event)
       return
     }
     guard let point = point(at: event.locationInWindow) else { return }
@@ -329,10 +346,27 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     selectedText = ""
     for map in maps() { highlight(map, range: NSRange(location: 0, length: 0)) }
   }
+  private func ownsText(_ view: NSView) -> Bool {
+    // Read identifiers only: hit testing must never trigger TextKit layout.
+    // Unregistered labels/audio previews in native bars keep native selection.
+    var ancestor: NSView? = view
+    while let current = ancestor, current !== self {
+      if let id = current.identifier?.rawValue, !id.isEmpty,
+        items.contains(where: { $0.id == id })
+      {
+        return true
+      }
+      ancestor = current.superview
+    }
+    return false
+  }
+
   private func maps() -> [Map] {
     func roots(_ view: NSView) -> [NSTextView] {
       guard !view.isHidden else { return [] }
-      if let text = view as? NSTextView, text.isSelectable, !text.isEditable { return [text] }
+      if let text = view as? NSTextView, text.isSelectable, !text.isEditable {
+        return ownsText(text) ? [text] : []
+      }
       return view.subviews.flatMap(roots)
     }
     let order = Dictionary(

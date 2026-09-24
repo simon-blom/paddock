@@ -14,6 +14,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { attachmentsApi } from '@/lib/api'
 import type { Message } from '@/types/chat'
+import { restoredGraphRuns } from '@/lib/graph/history'
 // Type-only here - the implementation modules arrive via dynamic import in
 // boot(), because this store is reached from the main chunk (useChatStream)
 // and must not pull graphology/sigma/the wasm glue into it.
@@ -52,6 +53,19 @@ export const useGraphsStore = defineStore('graphs', () => {
   let session: GraphSession | null = null
   let bridge: GraphBridge | null = null
   let booting: Promise<void> | null = null
+  let generation = 0
+  let fetchController: AbortController | null = null
+  let historyKey = ''
+
+  function restoreHistory(history: readonly Message[]) {
+    const restored = restoredGraphRuns(history)
+    const key = JSON.stringify(restored.map(r => [r.cypher, r.model]))
+    if (key === historyKey) return
+    historyKey = key
+    // Keep already computed responses where possible; branch navigation still
+    // drops queries absent from the newly selected path.
+    modelRuns.value = restored.map(r => modelRuns.value.find(old => old.cypher === r.cypher && old.model === r.model) ?? r)
+  }
 
   const active = computed(() => status.value !== 'idle')
 
@@ -69,8 +83,9 @@ export const useGraphsStore = defineStore('graphs', () => {
    * pair; anything else is released first. `bytes` short-circuits the fetch
    * when the caller just uploaded the file and still holds it.
    */
-  function ensure(conv: string, attId: string, attName: string, bytes?: Uint8Array, history: readonly Message[] = []): Promise<void> {
+  function ensure(conv: string, attId: string, attName: string, bytes?: Uint8Array, history?: readonly Message[]): Promise<void> {
     if (conversationId.value === conv && attachmentId.value === attId && status.value !== 'error') {
+      if (history) restoreHistory(history)
       return booting ?? Promise.resolve()
     }
     release()
@@ -78,8 +93,17 @@ export const useGraphsStore = defineStore('graphs', () => {
     attachmentId.value = attId
     name.value = attName
     status.value = 'loading'
-    booting = boot(conv, attId, bytes, history)
+    restoreHistory(history ?? [])
+    const ticket = generation
+    const abort = new AbortController()
+    fetchController = abort
+    booting = boot(conv, attId, attName, ticket, abort.signal, bytes)
       .catch((e) => {
+        if (ticket !== generation) return
+        bridge?.close()
+        bridge = null
+        session?.close()
+        session = null
         // A load that dies here is overwhelmingly the will-it-fit wall - the
         // worker ran out of wasm memory parsing the image. Say what the
         // ceiling means and name the way out; never a bare stack line.
@@ -89,41 +113,54 @@ export const useGraphsStore = defineStore('graphs', () => {
           'If this graph is large, it may exceed what the in-browser engine can hold (~2 GB) - a Traverse server has no such limit.'
       })
       .finally(() => {
-        booting = null
+        if (ticket === generation) {
+          booting = null
+          fetchController = null
+        }
       })
     return booting
   }
 
-  async function boot(conv: string, attId: string, bytes?: Uint8Array, history: readonly Message[] = []): Promise<void> {
+  async function boot(conv: string, attId: string, attName: string, ticket: number, signal: AbortSignal, bytes?: Uint8Array): Promise<void> {
+    const current = () => { if (ticket !== generation) throw new DOMException('Graph closed', 'AbortError') }
     const [{ GraphSession }, { GraphBridge, answerModelQuery }] = await Promise.all([
       import('@/lib/graph/session'),
       import('@/lib/graph/bridge'),
     ])
+    current()
     const s = new GraphSession()
     session = s
     phase.value = 'starting the graph engine'
     await s.open()
+    current()
 
     const cacheKey = `paddock-att-${attId}`
     phase.value = 'restoring from cache'
     let loaded = await s.loadCached(cacheKey)
+    current()
     if (!loaded.ok) {
       let data = bytes
       if (!data) {
         phase.value = 'fetching the graph'
-        const r = await fetch(attachmentsApi.url(attId))
+        const r = await fetch(attachmentsApi.url(attId), { signal })
+        current()
         if (!r.ok) throw new Error(`could not fetch the stored graph (${r.status})`)
         data = new Uint8Array(await r.arrayBuffer())
+        current()
       }
       phase.value = 'loading into memory'
       loaded = await s.seedTvdb(data, cacheKey)
+      current()
       if (!loaded.ok) throw new Error('the engine could not read this .tvdb')
     }
     counts.value = { nodes: loaded.nodes ?? 0, edges: loaded.edges ?? 0 }
-    memBytes.value = await s.estimatedMemory().catch(() => 0)
+    const memory = await s.estimatedMemory().catch(() => 0)
+    current()
+    memBytes.value = memory
 
     phase.value = 'reading the schema'
     const schema = await s.schema()
+    current()
     const labelProps = schema.labels_detail
       .map((l) => `${l.name}{${l.properties.map((p) => p.name).join(', ')}}`)
       .join('; ')
@@ -136,7 +173,7 @@ export const useGraphsStore = defineStore('graphs', () => {
       .map((r) => `${r.name}{${r.properties.map((p) => p.name).join(', ')}}`)
       .join('; ')
     let g =
-      `A graph database "${name.value}" is attached to this conversation ` +
+      `A graph database "${attName}" is attached to this conversation ` +
       `(${counts.value.nodes.toLocaleString('en')} nodes, ${counts.value.edges.toLocaleString('en')} edges). ` +
       `Node labels: ${schema.labels.join(', ') || 'none'}. ` +
       `Node properties: ${labelProps || 'none'}. ` +
@@ -145,29 +182,12 @@ export const useGraphsStore = defineStore('graphs', () => {
     if (g.length > GROUNDING_CAP) g = g.slice(0, GROUNDING_CAP - 1) + '...'
     grounding.value = g
 
-    // Restore the model's earlier queries from the conversation's stored
-    // tool calls, so returning to a chat keeps its chips - re-run on click,
-    // which is exact: the graph is deterministic from the tvdb.
-    if (history.length) {
-      const restored: typeof modelRuns.value = []
-      for (const m of history) {
-        for (const tc of m.toolCalls ?? []) {
-          if (tc.serverLabel !== 'graph' || tc.name !== 'graph_query') continue
-          try {
-            const cypher = (JSON.parse(tc.arguments) as { cypher?: string }).cypher
-            if (cypher) restored.push({ cypher, model: '', response: null })
-          } catch {
-            // unparseable arguments carry nothing to re-run
-          }
-        }
-      }
-      if (restored.length > 0) modelRuns.value = restored.slice(-20)
-    }
-
     // Registered last: the model must never reach a session that is still
     // loading. The handler is the read-only gate + compaction in bridge.ts.
     const b = new GraphBridge(conv, async (cypher, model) => {
+      current()
       const answer = await answerModelQuery(s, cypher)
+      current()
       if (answer.response) {
         modelRuns.value.push({ cypher, model, response: answer.response })
         // Bounded: a long agentic session must not hold hundreds of result
@@ -183,6 +203,9 @@ export const useGraphsStore = defineStore('graphs', () => {
   }
 
   function release(): void {
+    ++generation
+    fetchController?.abort()
+    fetchController = null
     bridge?.close()
     bridge = null
     session?.close()
@@ -199,6 +222,7 @@ export const useGraphsStore = defineStore('graphs', () => {
     grounding.value = ''
     folded.value = false
     modelRuns.value = []
+    historyKey = ''
   }
 
   return {

@@ -103,17 +103,41 @@ pub struct EstimateQuery {
     budget: Option<u64>,
 }
 
-/// Capabilities served by one forward pass per input with nothing cached
-/// between calls: embedding, rerank and alignment encoders, and dense prediction
-/// (image chips in, rasters out). None of them holds a KV cache, so all of
-/// them are priced as `ModelKind::Encoder` - weights, workspace, context, and
-/// no decode terms. Pricing one as generative is how a 0.6B embedding model
-/// once came out "needing" 124 GB.
+/// Capabilities served by one pass per input with nothing cached between
+/// calls: embedding, rerank and alignment encoders, dense prediction (image
+/// chips in, rasters out) and image generation (a prompt in, a render out).
+/// None of them holds a KV cache, so none is priced with decode terms -
+/// weights, companions, workspace, and that is all. Pricing one as generative
+/// is how a 0.6B embedding model once came out "needing" 124 GB.
 fn is_single_pass(capability: &str) -> bool {
     matches!(
         capability,
-        "embeddings" | "rerank" | "alignment" | "segmentation"
+        "embeddings" | "rerank" | "alignment" | "segmentation" | "image-generation"
     )
+}
+
+/// The estimator's kind for a model with these capabilities. Image
+/// generation is its own single-pass kind (its workspace is sized by a
+/// picture, not a token window); the encoder capabilities share `Encoder`;
+/// everything else decodes.
+pub(crate) fn kind_for(capabilities: &[String]) -> ModelKind {
+    if capabilities.iter().any(|c| c == "image-generation") {
+        ModelKind::Image
+    } else if capabilities.iter().any(|c| is_single_pass(c)) {
+        ModelKind::Encoder
+    } else {
+        ModelKind::Generative
+    }
+}
+
+/// Is this model (catalog id or a path the catalog recognises) an
+/// image-generation lane? The one kind with no token envelope at all: a
+/// picture is one pass, nothing batched or windowed, so `max_ctx` /
+/// `max_batch` and the chat-side connectors mean nothing to it and the
+/// spawn path keeps them out of its config.
+pub(crate) fn is_image_lane(reg: &crate::registry::Registry, model: &str) -> bool {
+    reg.catalog_of(model)
+        .is_some_and(|m| kind_for(&m.capability) == ModelKind::Image)
 }
 
 /// `"8.6"` -> `(8, 6)`. Anything unparseable is None, and None never gates -
@@ -177,11 +201,7 @@ pub(crate) fn resolve_weights_for(
                 .find(|a| state.registry.is_artifact_installed(a))
         })
         .or_else(|| m.default_weights())?;
-        let kind = if m.capability.iter().any(|c| is_single_pass(c)) {
-            ModelKind::Encoder
-        } else {
-            ModelKind::Generative
-        };
+        let kind = kind_for(&m.capability);
         let path = state.registry.models_dir().join(&a.files.first()?.dest);
         return Some((path, a.total_size(), kind, a.workspace.unwrap_or(0)));
     }
@@ -276,6 +296,35 @@ pub(crate) fn tower_bytes_for(
         .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
 }
 
+/// The companions an image-generation lane holds resident beside its DiT:
+/// the text encoder and the VAE. Both load at startup and stay for the
+/// endpoint's life, like a tower - and unlike a tower neither has a switch,
+/// because the DiT conditions on one and decodes through the other. Elected
+/// per kind the way the tower is (installed, else default, else first),
+/// within what the weights artifact allows, since the compact DiT pairs with
+/// the compact text encoder. Zero for every other kind of model.
+pub(crate) fn lane_companion_bytes_for(
+    m: &crate::registry::CatalogModel,
+    reg: &crate::registry::Registry,
+    weights: Option<&crate::registry::CatalogArtifact>,
+) -> u64 {
+    use crate::registry::ArtifactKind;
+    [ArtifactKind::TextEncoder, ArtifactKind::Vae]
+        .into_iter()
+        .map(|kind| {
+            let of = || {
+                m.artifacts.iter().filter(|a| {
+                    a.kind == kind && weights.is_none_or(|w| w.runtime.allows_companion(&a.id))
+                })
+            };
+            of().find(|a| reg.is_artifact_installed(a))
+                .or_else(|| of().find(|a| a.default))
+                .or_else(|| of().next())
+                .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
+        })
+        .sum()
+}
+
 /// Shared geometry for fit and admission, including directory checkpoints.
 pub(crate) fn artifact_shape(
     state: &crate::routes::AppState,
@@ -283,11 +332,14 @@ pub(crate) fn artifact_shape(
     artifact: &crate::registry::CatalogArtifact,
     vision: bool,
 ) -> Option<ModelShape> {
-    let tower = if vision {
-        tower_bytes_for(model, &state.registry, Some(artifact))
-    } else {
-        0
-    };
+    // the mmproj tower follows the vision switch; an image lane's text
+    // encoder and VAE have no switch and are always charged
+    let tower = lane_companion_bytes_for(model, &state.registry, Some(artifact))
+        + if vision {
+            tower_bytes_for(model, &state.registry, Some(artifact))
+        } else {
+            0
+        };
     let path = artifact.entry_path(state.registry.models_dir())?;
     let published = artifact.shape.clone().or_else(|| {
         // Validate the dense Qwen architecture before borrowing its GGUF
@@ -307,15 +359,7 @@ pub(crate) fn artifact_shape(
         .map(|s| s.into_model_shape(tower, artifact.workspace.unwrap_or(0)))
         .or_else(|| {
             state.probes.get(&path).map(|p| {
-                let kind = if artifact
-                    .capabilities(model)
-                    .iter()
-                    .any(|c| is_single_pass(c))
-                {
-                    ModelKind::Encoder
-                } else {
-                    ModelKind::Generative
-                };
+                let kind = kind_for(artifact.capabilities(model));
                 ModelShape {
                     tower_bytes: tower,
                     workspace_bytes: artifact.workspace.unwrap_or(0),
@@ -361,7 +405,7 @@ pub(crate) fn backend_estimate(
     device: &Device,
 ) -> paddock_estimator::Estimate {
     let mut result = paddock_estimator::estimate(shape, env, device);
-    if backend != "metal" || shape.kind == ModelKind::Encoder {
+    if backend != "metal" || shape.kind != ModelKind::Generative {
         return result;
     }
     let sequences = env
@@ -623,14 +667,10 @@ pub async fn handle(
     let models_dir = state.registry.models_dir().to_path_buf();
     let mut rows = serde_json::Map::new();
     for m in &state.registry.catalog().models {
-        // Embedding, rerank, alignment and dense-prediction are single-pass - one
-        // forward per input, nothing cached between calls. They must not be
-        // priced with a decode cache.
-        let kind = if m.capability.iter().any(|c| is_single_pass(c)) {
-            ModelKind::Encoder
-        } else {
-            ModelKind::Generative
-        };
+        // Embedding, rerank, alignment, dense-prediction and image generation
+        // are single-pass - one pass per input, nothing cached between calls.
+        // They must not be priced with a decode cache.
+        let kind = kind_for(&m.capability);
         // Speculation, priced per model. A separate drafter artifact is
         // resident weights; in-file MTP (qwen3.5/3.6 `nextn`) contributes 0
         // because those tensors already sit inside the weights file we are
@@ -666,11 +706,14 @@ pub async fn handle(
                 spec: artifact_spec(m, a, want_spec),
                 ..env
             };
-            let tower = if want_vision {
-                tower_bytes_for(m, &state.registry, Some(a))
-            } else {
-                0
-            };
+            // the mmproj tower follows the vision switch; an image lane's
+            // text encoder and VAE have no switch and are always charged
+            let tower = lane_companion_bytes_for(m, &state.registry, Some(a))
+                + if want_vision {
+                    tower_bytes_for(m, &state.registry, Some(a))
+                } else {
+                    0
+                };
             let weights = a.total_size();
             let published = a.shape.clone();
             // Only an installed file can be probed. Rather than guess geometry
@@ -1011,11 +1054,23 @@ mod tests {
             let single = m.capability.iter().any(|c| super::is_single_pass(c));
             for a in m.weights() {
                 let Some(shape) = &a.shape else { continue };
-                let encoder = shape.kind == paddock_estimator::ModelKind::Encoder;
+                let no_decode = shape.kind != paddock_estimator::ModelKind::Generative;
                 assert_eq!(
-                    encoder, single,
+                    no_decode, single,
                     "{}/{}: capability {:?} but shape kind {:?}",
                     m.id, a.id, m.capability, shape.kind
+                );
+                // and the image kind is reserved for image generation, which
+                // must say so - a render priced as a token encoder would size
+                // its workspace by a window it does not have
+                assert_eq!(
+                    shape.kind == paddock_estimator::ModelKind::Image,
+                    m.capability.iter().any(|c| c == "image-generation"),
+                    "{}/{}: shape kind {:?} vs capability {:?}",
+                    m.id,
+                    a.id,
+                    shape.kind,
+                    m.capability
                 );
                 seen += usize::from(single);
             }
@@ -1165,18 +1220,34 @@ mod tests {
             // image capability has to be added here deliberately; forgetting
             // fails this assertion rather than quietly shipping a model the
             // picker prices but never labels.
+            //
+            // An image-GENERATION row is the one place a vision tower comes
+            // without an image-input chip: qwen-image's mmproj is the editing
+            // encoder (references go through it into the text encoder), and
+            // the picker labels that as `edit` on the image lane, not as chat
+            // image input. Such a row still gets priced (asserted above), it
+            // just doesn't claim `vision`.
             const IMAGE_CAPS: [&str; 2] = ["vision", "documents"];
             let claims_images = m
                 .capability
                 .iter()
                 .filter(|c| IMAGE_CAPS.contains(&c.as_str()))
                 .count();
-            assert_eq!(
-                claims_images,
-                usize::from(has_vision),
-                "{}: exactly one image capability ({IMAGE_CAPS:?}) goes with a vision artifact",
-                m.id
-            );
+            let generates_images = m.capability.iter().any(|c| c == "image-generation");
+            if generates_images {
+                assert_eq!(
+                    claims_images, 0,
+                    "{}: an image-generation row must not also claim image chat input",
+                    m.id
+                );
+            } else {
+                assert_eq!(
+                    claims_images,
+                    usize::from(has_vision),
+                    "{}: exactly one image capability ({IMAGE_CAPS:?}) goes with a vision artifact",
+                    m.id
+                );
+            }
             // ...and an image capability must never ride on an audio tower.
             assert!(
                 !has_audio || claims_images == 0,
@@ -1214,6 +1285,100 @@ mod tests {
                 .iter()
                 .any(|a| a.workspace.unwrap_or(0) > 900 << 20),
             "unlimited-ocr's mmproj must declare its ~950 MiB workspace"
+        );
+    }
+
+    /// The image lane's two companions are the same claim as its capability,
+    /// said three times: an `image-generation` row carries a text encoder AND
+    /// a VAE, both required and default (the DiT cannot render without either,
+    /// and "download it" must fetch them), every weights alternative admits
+    /// one of each, and nothing else in the catalog carries such a piece. And
+    /// they are CHARGED - a fit that priced the DiT alone would be short by
+    /// the text encoder, which on the full lane outweighs the DiT itself.
+    #[test]
+    fn every_image_lane_carries_and_prices_its_text_encoder_and_vae() {
+        let reg = Registry::new(std::path::PathBuf::from("./this-dir-does-not-exist"));
+        let mut lanes = 0;
+        for m in &reg.catalog().models {
+            let claims = m.capability.iter().any(|c| c == "image-generation");
+            let pieces: Vec<_> = m
+                .artifacts
+                .iter()
+                .filter(|a| a.kind.is_lane_companion())
+                .collect();
+            assert_eq!(
+                claims,
+                !pieces.is_empty(),
+                "{}: image-generation = {claims}, lane companions = {}",
+                m.id,
+                pieces.len()
+            );
+            if !claims {
+                continue;
+            }
+            lanes += 1;
+            for a in &pieces {
+                assert!(
+                    a.required && a.default,
+                    "{}/{}: a lane companion is required and part of the download",
+                    m.id,
+                    a.id
+                );
+            }
+            for w in m.weights() {
+                if w.runtime.checkpoint_dir {
+                    // Self-contained diffusion packs charge the text encoder
+                    // and VAE in their own resident-weight ledger, not twice
+                    // as separately downloaded GGUF companions.
+                    assert_eq!(w.runtime.companions.as_deref(), Some([].as_slice()));
+                    for component in [
+                        "text_encoder/model.safetensors",
+                        "transformer/model.safetensors",
+                        "vae/model.safetensors",
+                    ] {
+                        assert!(
+                            w.files.iter().any(|f| f.dest.ends_with(component)),
+                            "{}/{}: missing {component}",
+                            m.id,
+                            w.id
+                        );
+                    }
+                    assert!(
+                        w.shape
+                            .as_ref()
+                            .is_some_and(|s| s.weight_bytes > 8_000_000_000)
+                    );
+                    assert_eq!(super::lane_companion_bytes_for(m, &reg, Some(w)), 0);
+                    continue;
+                }
+                for kind in [ArtifactKind::TextEncoder, ArtifactKind::Vae] {
+                    assert!(
+                        pieces
+                            .iter()
+                            .any(|a| a.kind == kind && w.runtime.allows_companion(&a.id)),
+                        "{}/{}: admits no {kind:?} companion",
+                        m.id,
+                        w.id
+                    );
+                }
+                let charged = super::lane_companion_bytes_for(m, &reg, Some(w));
+                let smallest = pieces
+                    .iter()
+                    .filter(|a| w.runtime.allows_companion(&a.id))
+                    .map(|a| a.total_size())
+                    .min()
+                    .unwrap_or(0);
+                assert!(
+                    charged > smallest,
+                    "{}/{}: lane companions charged {charged} bytes - both pieces must be priced",
+                    m.id,
+                    w.id
+                );
+            }
+        }
+        assert!(
+            lanes > 0,
+            "the catalog has an image-generation row to check"
         );
     }
 }

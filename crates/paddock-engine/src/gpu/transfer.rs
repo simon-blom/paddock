@@ -194,6 +194,17 @@ impl GpuExecutor {
         self.stream.clone_dtoh(buf).map_err(drv)
     }
 
+    /// Upload a bf16 host slice (the QSA compressed-key caches are bf16).
+    pub fn to_device_bf16(&self, host: &[half::bf16]) -> Result<CudaSlice<half::bf16>, GpuError> {
+        self.stream.clone_htod(host).map_err(drv)
+    }
+
+    /// Read back a bf16 device buffer.
+    pub fn to_host_bf16(&self, buf: &CudaSlice<half::bf16>) -> Result<Vec<half::bf16>, GpuError> {
+        self.stream.synchronize().map_err(drv)?;
+        self.stream.clone_dtoh(buf).map_err(drv)
+    }
+
     /// Upload into the FRONT of an existing device buffer (no allocation).
     /// The serving hot path reuses persistent upload buffers: per-encode
     /// transient allocs are stream-ordered pool operations whose cross-

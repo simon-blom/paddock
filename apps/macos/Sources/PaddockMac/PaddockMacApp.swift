@@ -54,6 +54,13 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
   private var terminating = false
 
   func applicationWillFinishLaunching(_ notification: Notification) {
+    DesktopUpdater.shared.readyToInstall = { [weak self] in
+      guard let self, self.workspace.snapshot != nil else { return false }
+      return self.workspace.managedRunners.isEmpty && !self.workspace.operationInProgress
+        && !self.workspace.maintenanceInProgress
+        && !self.workspace.studioNeedsQuitConfirmation && !self.workspace.downloads.active
+        && !self.question.draft.hasContent
+    }
     notifications.open = { [weak self] in self?.open($0) }
     notifications.isVisible = { [weak self] in
       self?.workspace.isDesktopDestinationVisible($0) == true
@@ -128,11 +135,15 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard !terminating else { return .terminateLater }
-    if workspace.operationInProgress || workspace.desktopTransition {
+    if workspace.operationInProgress || workspace.desktopTransition
+      || workspace.maintenanceInProgress
+    {
       let alert = DesktopAlert.make()
       alert.messageText = "An operation is still in progress"
       alert.informativeText =
-        "Keep Paddock open until the model operation or settings save finishes. You can close its window; the menu bar remains available."
+        workspace.maintenanceInProgress
+        ? "Finish or cancel the benchmark, and allow any backup export to complete before quitting. You can close the window while Paddock finishes."
+        : "Keep Paddock open until the model operation or settings save finishes. You can close its window; the menu bar remains available."
       alert.addButton(withTitle: "Keep Paddock Open")
       alert.runModal()
       return .terminateCancel
@@ -161,14 +172,17 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
       let alert = DesktopAlert.make()
       alert.messageText =
         "Quit with \(runners.count) model\(runners.count == 1 ? "" : "s") running?"
+      let installingUpdate = DesktopUpdater.shared.hasPendingInstallation
       alert.informativeText =
-        "Keeping models running leaves their API endpoints available to external clients, but Paddock monitoring and notifications stop. Stop Models and Quit drains requests for up to 30 seconds per model; longer requests may be interrupted."
+        installingUpdate
+        ? "Models must stop before Paddock can install an update. Requests drain for up to 30 seconds per model; longer requests may be interrupted."
+        : "Keeping models running leaves their API endpoints available to external clients, but Paddock monitoring and notifications stop. Stop Models and Quit drains requests for up to 30 seconds per model; longer requests may be interrupted."
       alert.addButton(withTitle: "Cancel")
-      alert.addButton(withTitle: "Keep Models Running and Quit")
+      if !installingUpdate { alert.addButton(withTitle: "Keep Models Running and Quit") }
       alert.addButton(withTitle: "Stop Models and Quit")
       let reply = alert.runModal()
       if reply == .alertFirstButtonReturn { return .terminateCancel }
-      stopModels = reply == .alertThirdButtonReturn
+      stopModels = installingUpdate || reply == .alertThirdButtonReturn
     }
     terminating = true
     workspace.quitting = true

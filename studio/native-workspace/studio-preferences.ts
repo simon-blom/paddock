@@ -4,7 +4,6 @@ import { titleGenerator } from '@/lib/chat-title'
 import { tileHost, tileTemplate } from '@/lib/maptiles'
 import { savePreferences } from './preferences'
 import { object } from './protocol'
-import { useModelsStore } from '@/stores/models'
 import { studioSettingsLayout } from '@/lib/studio-settings-layout'
 
 export function studioPreferences() {
@@ -15,7 +14,7 @@ export function studioPreferences() {
 export function preferencePresentation() {
   const values = studioPreferences(), s = useSettingsStore()
   return { ...values, mapHost: tileHost(tileTemplate(values.mapTiles, s.theme)),
-    layout: studioSettingsLayout(useModelsStore().maxCtx) }
+    layout: studioSettingsLayout() }
 }
 export function validatePreferences(value: unknown): Partial<ReturnType<typeof studioPreferences>> {
   const p = object(value)

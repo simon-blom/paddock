@@ -5,6 +5,7 @@ extension NativeStudioRuntime {
     _ p: O, requestID: String,
     action: (ConversationMessageAction, ResolvedConversationAction)? = nil
   ) async throws -> O {
+    cancelCompaction()
     titleTask?.cancel()
     titleTask = nil
     guard let before = document else {
@@ -61,6 +62,12 @@ extension NativeStudioRuntime {
     }
     guard !laneIDs.isEmpty else { throw ConversationFailure.invalid("Choose a model") }
     for id in laneIDs { _ = try model(id) }
+    if parts.isEmpty, action == nil,
+      laneIDs.contains(where: { capability($0)["document_parser"]?.bool == true }),
+      before.activeMessages.contains(where: { !NativeDocumentPlan.rasterParts($0).isEmpty })
+    {
+      parts = [.object(["type": .string("text"), "text": .string("")])]
+    }
     guard !parts.isEmpty || action != nil else {
       throw ConversationFailure.invalid("Write a message or attach a file")
     }
@@ -81,7 +88,7 @@ extension NativeStudioRuntime {
       if let appendID, let i = messages.firstIndex(where: { $0["id"]?.string == appendID }) {
         continuationPrefixes[mid] = ConversationDocument.text(messages[i])
         messages[i]["streaming"] = .bool(true)
-        messages[i]["incomplete"] = nil
+        // Preserve Continue when preflight refuses before a new terminal.
         messages[i]["error"] = nil
         messages[i]["stopped"] = nil
       } else {
@@ -105,15 +112,34 @@ extension NativeStudioRuntime {
           (text.isEmpty ? parts.first?["name"]?.string ?? "New conversation" : text).prefix(100)
         ).replacingOccurrences(of: "\n", with: " "))
     }
-    let admitted = try ConversationDocument(fields: fields)
+    var admitted = try ConversationDocument(fields: fields)
+    for modelID in laneIDs {
+      if canImagine(modelID), let mid = laneMessages.first(where: { $0.0 == modelID })?.1,
+        let message = admitted.messages.first(where: { $0["id"]?.string == mid })
+      {
+        _ = try NativeImageGeneration.plan(
+          document: admitted, message: message,
+          caps: capability(modelID)["image_generation"]?.object ?? [:])
+        continue
+      }
+      if let plan = NativeDocumentPlan.make(document: admitted, capability: capability(modelID)) {
+        fields["activeDocId"] = .string(plan.sourceID)
+        for part in plan.parts { try validateImageBudget([.object(part)], models: [modelID]) }
+      } else {
+        try validateImageBudget(parts, models: [modelID])
+      }
+    }
+    admitted = try ConversationDocument(fields: fields)
     let graph = admitted.activeMessages.flatMap { $0["content"]?.array ?? [] }.last {
       $0["type"]?.string == "graph"
     }
     if let graph {
+      graphArtifact = nil
       graphVisible = true
       await emit()
       graphGrounding = try await prepareGraph([
         "conversationId": .string(admitted.id), "graphSource": graph, "visibleGraph": .bool(true),
+        "graphHistory": .array(Self.graphHistory(admitted)),
       ])
       guard !stopRequested else {
         throw ConversationFailure.invalid("Stopped before model execution; your draft is kept")
@@ -135,7 +161,7 @@ extension NativeStudioRuntime {
       try await persist()
     } else {
       for (modelID, mid) in laneMessages {
-        reducers[mid] = ResponseAccumulator()
+        if !canImagine(modelID) { reducers[mid] = ResponseAccumulator() }
         starts[mid] = .now
         responseMetrics[mid] = NativeResponseMetrics()
         tasks[mid] = Task { [weak self] in
@@ -188,16 +214,9 @@ extension NativeStudioRuntime {
     let params = fields["params"]?.object ?? Self.defaultParams
     var input: [V] = []
     var originals: [String: String] = [:]
-    var path = document.activeMessages
-    if !continuing, selected.count == 1, model["endpoint"] == nil,
-      preferenceBool("summarize", fallback: true), let summary = fields["serverCompaction"]?.object,
-      let anchor = path.firstIndex(where: { $0["id"] == summary["tailStartId"] }),
-      let sid = summary["id"], let content = summary["content"]
-    {
-      input.append(
-        .object(["type": .string("compaction"), "id": sid, "encrypted_content": content]))
-      path = Array(path.dropFirst(anchor))
-    }
+    let plan = contextPlan(document, modelID: modelID, continuing: continuing)
+    let path = document.activeMessages.dropFirst(plan.from)
+    if let item = plan.item { input.append(.object(item)) }
     for message in path {
       let role = message["role"]?.string ?? "user"
       if message["id"]?.string == messageID && !continuing { continue }
@@ -301,6 +320,7 @@ extension NativeStudioRuntime {
       [
         "Today's date: \(date) (user timezone: \(TimeZone.current.identifier)).",
         fields["systemPrompt"]?.string ?? "", graphGrounding,
+        plan.summary.map(NativeContextPlan.summaryBlock) ?? "",
       ].filter { !$0.isEmpty }.joined(separator: "\n\n"))
     let style = cap["reasoning"]?.string
     if style == "effort" {
@@ -326,46 +346,43 @@ extension NativeStudioRuntime {
       kwargs["preserve_thinking"] = .bool(true)
       body["chat_template_kwargs"] = .object(kwargs)
     }
-    if model["endpoint"] == nil, selected.count == 1, !continuing,
-      preferenceBool("summarize", fallback: true), let ctx = cap["max_ctx"]?.integer, ctx > 1024
-    {
+    if plan.threshold > 0 {
       body["context_management"] = .array([
         .object([
           "type": .string("compaction"),
-          "compact_threshold": .number(Decimal(Int(Double(ctx) * 0.8))),
+          "compact_threshold": .number(Decimal(plan.threshold)),
         ])
       ])
       body["truncation"] = .string("auto")
     }
-    if let mode = fields["ocrMode"]?.string, !mode.isEmpty {
-      body["ocr"] = .object(["mode": .string(mode)])
-    } else {
+    let extraction = NativeDocumentRequestOptions.apply(
+      fields: fields, capability: cap, input: input, body: &body)
+    if !extraction {
       let tools = await requestTools(modelID: modelID)
       if !tools.isEmpty { body["tools"] = .array(tools) }
     }
-    if let max = preferences["pk_max_tool_calls"]?.string.flatMap(Int.init), max > 0 {
+    if body["tools"]?.array?.isEmpty == false,
+      let max = preferences["pk_max_tool_calls"]?.string.flatMap(Int.init), max > 0
+    {
       body["max_tool_calls"] = .number(Decimal(max))
     }
-    if fields["fileMetadataEnabled"]?.bool == false { body["file_metadata"] = .string("off") }
-    body["forensics"] = .string(fields["forensicsEnabled"]?.bool == true ? "on" : "off")
-    let window = selected.count > 1 ? contextLimit : (cap["max_ctx"]?.integer ?? 0)
+    // Compare may trim shared history to the smallest window, but each lane's
+    // output budget belongs to THAT model, not to its smallest neighbour.
+    let window = cap["max_ctx"]?.integer ?? 0
     let ceiling = model["endpoint"] == nil ? nil : cap["default_max_output_tokens"]?.integer
-    let automatic =
-      model["endpoint"] == nil
-      ? NativeReplyBudget.localMaximum(context: window)
-      : NativeReplyBudget.maximum(
-        context: window,
-        prompt: NativeReplyBudget.estimate(
-          input: input, instructions: body["instructions"]?.string ?? ""),
-        outputCeiling: ceiling)
+    let prompt = NativeContextPlan.replyPrompt(
+      document, body: body, model: modelID, pending: messageID)
+    let limit = NativeReplyBudget.resolve(
+      requested: maxTokens.integer, cloud: model["endpoint"] != nil, context: window,
+      prompt: prompt.estimated, outputCeiling: ceiling, exact: prompt.exact)
     // 0 is the budget's refusal: under a useful reply's worth of room a send
     // would buy a fragment, and the provider's own refusal reads worse than ours.
-    if maxTokens == .null, automatic <= 0 {
+    if let limit, limit <= 0 {
       throw ConversationFailure.invalid(
         "No room left for a reply: this conversation fills the model's \(window)-token "
           + "context window. Start a new chat, or shorten this one.")
     }
-    body["max_output_tokens"] = maxTokens != .null ? maxTokens : .number(Decimal(automatic))
+    body["max_output_tokens"] = limit.map { .number(Decimal($0)) }
     return body
   }
   func run(modelID: String, messageID: String, requestID: String, continuing: Bool) async {
@@ -373,8 +390,15 @@ extension NativeStudioRuntime {
       try Task.checkCancellation()
       let audio = document?.activeMessages.last(where: { $0["role"]?.string == "user" })?[
         "content"]?.array?.first { $0["type"]?.string == "audio" }?.object
-      if let audio, canAudio(modelID) {
+      if canImagine(modelID) {
+        guard !continuing else {
+          throw ConversationFailure.invalid("Retry an image to make another picture")
+        }
+        try await generateImages(modelID: modelID, messageID: messageID)
+      } else if let audio, canAudio(modelID) {
         try await transcribe(audio, modelID: modelID, messageID: messageID)
+      } else if !continuing, try await runDocument(modelID: modelID, messageID: messageID) {
+        // The per-page path owns its reductions, persistence and usage totals.
       } else {
         let body = try await requestBody(
           modelID: modelID, messageID: messageID, continuing: continuing)
@@ -384,14 +408,19 @@ extension NativeStudioRuntime {
         try updateMessage(messageID) {
           if !continuing || $0["run"] == nil { $0["run"] = .object(run) }
         }
-        let result = try await transport.responses(endpoint: endpoint, body: body) {
-          [weak self] event in try await self?.receive(event, messageID: messageID)
-        }
+        let result = try await responseWithContextRetry(
+          endpoint: endpoint, body: body,
+          modelID: modelID, messageID: messageID, continuing: continuing)
         reducers[messageID] = result
         flushResponses()
         try updateMessage(messageID) { message in
           message["response"] = result.terminal.map(V.object)
-          message["ocr"] = result.terminal?["ocr"]
+          message["ocr"] = NativeOCRMetadata.stored(result.terminal?["ocr"])
+          if result.status == "completed" { message["incomplete"] = nil }
+          if continuing, var run = message["run"]?.object {
+            run["nativeContext"] = nil
+            message["run"] = .object(run)
+          }
           if result.status == "incomplete" {
             message["incomplete"] = .string(
               result.terminal?["incomplete_details"]?["reason"]?.string == "max_output_tokens"
@@ -426,10 +455,12 @@ extension NativeStudioRuntime {
       }
     }
     try? updateMessage(messageID) { $0["streaming"] = .bool(false) }
+    imagePreviews[messageID] = nil
     reducers[messageID] = nil
     starts[messageID] = nil
     continuationPrefixes[messageID] = nil
     responseMetrics[messageID] = nil
+    requestEvents.remove(messageID)
     // Cancellation of a stream does not cancel saving its partial response.
     do { try await persist() } catch {
       self.error = "The reply is in memory but could not be saved: \(error.localizedDescription)"
@@ -444,7 +475,8 @@ extension NativeStudioRuntime {
             ? "failed" : stopRequested ? "stopped" : "completed"),
       ])
       try? await refreshArtifacts()
-      if preferenceBool("auto_title", fallback: true), document.fields["titleSource"] == nil,
+      if canChat(modelID), preferenceBool("auto_title", fallback: true),
+        document.fields["titleSource"] == nil,
         document.activeMessages.filter({ $0["role"]?.string == "user" }).count == 1,
         !replies.contains(where: { $0["error"] != nil || $0["stopped"]?.bool == true })
       {
@@ -453,10 +485,12 @@ extension NativeStudioRuntime {
         }
       }
     }
+    if tasks.isEmpty { scheduleCompaction() }
     schedulePublish()
   }
   func receive(_ event: O, messageID: String) async throws {
     try Task.checkCancellation()
+    requestEvents.insert(messageID)
     guard reducers[messageID] != nil else { throw ConversationFailure.stale }
     try reducers[messageID]!.apply(event)
     if let start = starts[messageID] {
@@ -486,6 +520,7 @@ extension NativeStudioRuntime {
     schedulePublish()
   }
   func flushResponses() {
+    flushDocumentRuns()
     for (id, response) in reducers {
       let prefix = continuationPrefixes[id] ?? ""
       try? updateMessage(id) {

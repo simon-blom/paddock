@@ -306,6 +306,14 @@ pub(crate) fn kq_params(ty: GgmlType) -> Option<(u32, usize, usize)> {
         // the nibbles as data and {d, m, qh} per block as the record. Gate on
         // GpuExecutor::has_kquant_flat32.
         GgmlType::Q5_1 => Some((7, 192, 128)),
+        // Q5_0: the third flat type - 8 x 22 B raw per 256 weights, the
+        // nibbles as data and {d, 0, qh} per block as the record (Q5_1's
+        // record shape with no m: the value is d*(q-16), so there is no mu
+        // term and no sums plane). What a Q4_K_M recipe puts on rows the
+        // 256-block types cannot encode (the gemma-4 A4B's 704-wide expert
+        // down, its 2112-wide shared down). Gate on
+        // GpuExecutor::has_kquant_q50 (slot 655) on top of has_kquant_flat32.
+        GgmlType::Q5_0 => Some((6, 176, 128)),
         // PrismML's ternary packings (the Bonsai files): two 128-weight blocks
         // to a super-block, resident at their file size. PTQ1_0's data is the
         // two qs[24] (48 B) and its record {d0, d1, qh0[2], qh1[2]} - 56 B per
@@ -331,10 +339,13 @@ pub(crate) fn kq_layout(ty: GgmlType) -> Option<(u32, usize, usize)> {
 }
 
 /// 32-weight block formats whose rows lie flat in the repacked streams (a row
-/// need not be a whole number of 256-weight super-blocks): IQ4_NL, Q5_1, Q8_0.
-/// Mirrors the pack's `pd_kq_flat32`.
+/// need not be a whole number of 256-weight super-blocks): IQ4_NL, Q5_0,
+/// Q5_1, Q8_0. Mirrors the pack's `pd_kq_flat32`.
 pub(crate) fn kq_flat32(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::Iq4Nl | GgmlType::Q5_1 | GgmlType::Q8_0)
+    matches!(
+        ty,
+        GgmlType::Iq4Nl | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0
+    )
 }
 
 /// Repacked scale-record bytes per super-block (the pack's `pd_kq_scb`):
@@ -348,8 +359,10 @@ pub(crate) fn kq_scb(ty: GgmlType) -> usize {
         GgmlType::Iq3S => 8,
         GgmlType::Iq2Xs | GgmlType::Iq2S | GgmlType::Iq1M => 12,
         GgmlType::Iq4Nl => 16,
-        // flat 32-weight blocks: {f16 d, f16 m, u32 qh} / f16 d per block
+        // flat 32-weight blocks: {f16 d, f16 m, u32 qh} / {f16 d, 0, u32 qh} /
+        // f16 d per block
         GgmlType::Q5_1 => 64,
+        GgmlType::Q5_0 => 64,
         GgmlType::Q8_0 => 16,
         _ => 24,
     }
@@ -370,6 +383,7 @@ pub(crate) fn kq_is_iq(ty: GgmlType) -> bool {
             | GgmlType::Iq4Nl
             | GgmlType::Q2K
             | GgmlType::Q3K
+            | GgmlType::Q5_0
             | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Ptq1_0

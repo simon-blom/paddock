@@ -24,6 +24,11 @@ use([CanvasRenderer, BarChart, GridComponent, TooltipComponent])
 const props = defineProps<{
   est: Estimate
   device: EstimateDevice
+  /** How the model is served - `generative` (the default), `encoder`, or
+   *  `image`. Only the wording reads it: an image lane's "tower" band is its
+   *  text encoder and VAE, and its working memory is one render's, which
+   *  grows with the picture - the numbers are the estimator's either way. */
+  kind?: string
   ctx: number
   batch: number
   /** KV precision the estimate was PRICED at - the envelope's `kv_dtype`, never
@@ -127,7 +132,21 @@ const verdict = computed(() => {
     }
   }
   const r = residency.value
-  if (!r) return { tone: 'good' as const, icon: 'check-circle', text: 'Fits', detail: '' }
+  if (!r) {
+    // No conversation cache to size: an image lane's headroom is what bigger
+    // pictures can spend, and that is worth a number - the render's working
+    // memory grows with the pixel count (~4x from 1024 to 2048 a side).
+    if (props.kind === 'image') {
+      const spare = Math.max(0, (props.device.free ?? 0) - (props.est.resident ?? 0))
+      return {
+        tone: 'good' as const,
+        icon: 'check-circle',
+        text: 'Fits',
+        detail: `${fmtVram(spare)} left for pictures larger than 1024 x 1024`,
+      }
+    }
+    return { tone: 'good' as const, icon: 'check-circle', text: 'Fits', detail: '' }
+  }
   // One conversation that does not fit is not a swapping story - there is
   // nothing to swap with. It means the context on this form is longer than the
   // memory left after loading can hold, and on the families that require a
@@ -329,20 +348,32 @@ const parts = computed<{ segs: Seg[]; free: number }>(() => {
     // granite-vision), so it gets its own segment - folding it into "engine
     // overhead" would be a true total telling a false story about where the
     // memory went. Filtered out at 0 bytes, so text-only models are unchanged.
+    // An image lane's band here is its text encoder and VAE - companions of
+    // the same shape (loaded beside the model, held for as long as it runs)
+    // under a different name, and on the full lane the encoder outweighs the
+    // model itself, so the label has to say what it is.
     {
-      name: 'Vision/audio encoder',
+      name: props.kind === 'image' ? 'Text encoder + VAE' : 'Vision/audio encoder',
       bytes: e.tower ?? 0,
       color: cEncoder,
-      desc: 'the image or speech encoder, loaded alongside the model and held for as long as it runs - a model that can see or hear always pays this, whether or not you send pictures or audio',
+      desc:
+        props.kind === 'image'
+          ? 'the language model that reads the prompt and the decoder that turns the result into pixels, loaded alongside the image model and held for as long as it runs'
+          : 'the image or speech encoder, loaded alongside the model and held for as long as it runs - a model that can see or hear always pays this, whether or not you send pictures or audio',
     },
     // Declared serving scratch (mixture-of-experts staging) - its own segment
     // for the same reason as the tower: ~5.8 GB on gemma-4-26B-A4B is too big
     // to hide inside "engine overhead". Filtered out at 0 for everyone else.
     {
-      name: 'Model working memory',
+      name: props.kind === 'image' ? 'Render working memory' : 'Model working memory',
       bytes: e.workspace ?? 0,
       color: cWorkspace,
-      desc: d.unified ? 'checkpoint-specific workspace allowance, including declared vision and expert staging bounds' : 'working memory this model pins for serving beyond its weights (expert staging on mixture-of-experts models) - measured, and held for as long as it runs',
+      desc:
+        props.kind === 'image'
+          ? 'what one render takes beyond the weights, measured at 1024 x 1024 - a bigger picture takes more, roughly with its pixel count, and one that does not fit fails with an error rather than silently'
+          : d.unified
+            ? 'checkpoint-specific workspace allowance, including declared vision and expert staging bounds'
+            : 'working memory this model pins for serving beyond its weights (expert staging on mixture-of-experts models) - measured, and held for as long as it runs',
     },
     // state + scratch + CUDA context, lumped: the rest of the must-fit floor.
     // One bar, but its tooltip names every term - "how can a 17GB model have

@@ -1,5 +1,6 @@
 import AppKit
 import PaddockClient
+import PaddockNativeMarkdown
 import SwiftUI
 import Testing
 
@@ -8,6 +9,249 @@ import Testing
 
 @Suite("Column-owned native window chrome", .serialized) @MainActor
 struct WorkspaceColumnChromeTests {
+  @Test func flatHeaderSeparatesSharpContentWithoutAnyBackdropBlur() async throws {
+    guard #available(macOS 26.0, *) else { return }
+    _ = NSApplication.shared
+    // A continuous strip must stop at the header, without fading or bleeding
+    // into it. Away from the strip there must be just one subtle separator.
+    let host = NSHostingController(
+      rootView: StudioConversationChrome {
+        ConversationSelectionSurface(items: []) {
+          ScrollView {
+            PaddockStyle.primary.frame(width: 80, height: 2000).frame(maxWidth: .infinity)
+          }
+          .modifier(
+            StudioConversationBars {
+              EmptyView()
+            } footer: {
+              EmptyView()
+            }
+          )
+          .background(PaddockStyle.canvas)
+        }
+      })
+    host.sizingOptions = []
+    host.safeAreaRegions = []
+    let window = NSWindow(
+      contentRect: NSRect(x: -12000, y: -12000, width: 760, height: 740),
+      styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+      backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.titleVisibility = .hidden
+    window.titlebarAppearsTransparent = true
+    window.toolbarStyle = .unifiedCompact
+    window.toolbar = NSToolbar(identifier: "continuous-chrome-fixture")
+    window.contentViewController = host
+    window.setContentSize(NSSize(width: 760, height: 740))
+    window.setFrameOrigin(NSPoint(x: -12000, y: -12000))
+    window.orderBack(nil)
+    defer { window.close() }
+    for dark in [false, true] {
+      window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+      try await settleChrome(host.view)
+      let scroll = try #require(allViews(host.view).compactMap { $0 as? NSScrollView }.first)
+      scroll.contentView.scroll(to: NSPoint(x: 0, y: 300))
+      scroll.reflectScrolledClipView(scroll.contentView)
+      try await settleChrome(host.view)
+      let viewport = scroll.convert(scroll.bounds, to: nil)
+      #expect(abs(viewport.maxY - window.contentLayoutRect.maxY) < 1)
+      #expect(scroll.contentInsets.top == 0)
+      if let directory = ProcessInfo.processInfo.environment["PADDOCK_SCROLL_CHROME_CAPTURE_DIR"] {
+        let image = try capture(
+          window, directory: directory, name: "flat-header-\(dark ? "dark" : "light")")
+        let scale = CGFloat(image.pixelsWide) / window.frame.width
+        func luminance(_ y: CGFloat, x: CGFloat = 380) throws -> CGFloat {
+          let color = try #require(
+            image.colorAt(x: Int(x * scale), y: Int(y * scale))?.usingColorSpace(.deviceRGB))
+          return (color.redComponent + color.greenComponent + color.blueComponent) / 3
+        }
+        let canvas = try luminance(100, x: 600)
+        let ink = try luminance(100)
+        #expect(abs(ink - canvas) > 0.5)
+        let edge = window.frame.height - window.contentLayoutRect.maxY
+        for y in stride(from: CGFloat(8), through: edge - 3, by: 1) {
+          #expect(abs(try luminance(y) - canvas) < 0.02, "Content must not bleed into the header")
+        }
+        for y in stride(from: edge + 3, through: edge + 32, by: 1) {
+          #expect(abs(try luminance(y) - ink) < 0.02, "Content below the header must stay sharp")
+        }
+        let separator = try stride(from: edge - 2, through: edge + 2, by: 1 / scale).map {
+          abs(try luminance($0, x: 600) - canvas)
+        }
+        #expect((separator.max() ?? 0) > 0.02, "The header should have a visible separator")
+        #expect(separator.filter { $0 > 0.02 }.count <= Int(scale) + 1, "Only a single hairline")
+        #expect(abs(try luminance(20, x: 600) - canvas) < 0.02)
+      }
+    }
+  }
+
+  @Test func narrowConversationKeepsWindowControlsClearWhileScrolled() async throws {
+    _ = NSApplication.shared
+    let client = ChromeNoCore()
+    let chat = StudioWorkspace(client: client)
+    let model = WorkspaceModel(client: client, preparedStudio: chat)
+    chat.apply(try artifactState(previews: false))
+    model.navigation.sidebarVisible = false
+    let host = NSHostingController(rootView: WorkspaceView(model: model))
+    host.sizingOptions = []
+    let window = NSWindow(
+      contentRect: NSRect(x: -12000, y: -12000, width: 760, height: 740),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+      backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.titleVisibility = .hidden
+    window.titlebarAppearsTransparent = true
+    window.toolbarStyle = .unifiedCompact
+    window.toolbar = NSToolbar(identifier: "narrow-conversation-chrome")
+    window.contentViewController = host
+    window.setContentSize(NSSize(width: 760, height: 740))
+    window.setFrameOrigin(NSPoint(x: -12000, y: -12000))
+    window.orderBack(nil)
+    defer { window.close() }
+    for (width, sidebar, dark): (CGFloat, Bool, Bool) in [
+      (760, false, false), (760, false, true), (902, false, false), (902, false, true),
+      (902, true, false), (902, true, true),
+    ] {
+      model.navigation.sidebarVisible = sidebar
+      window.setContentSize(NSSize(width: width, height: 740))
+      window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+      for _ in 0..<10 {
+        host.view.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(40))
+      }
+      let text = try #require(
+        allViews(host.view).compactMap { $0 as? NSTextView }
+          .first { $0.string.hasPrefix("Full-height conversation fixture") })
+      let scroll = try #require(text.enclosingScrollView)
+      let viewport = scroll.convert(scroll.bounds, to: nil)
+      #expect(abs(viewport.maxY - window.contentLayoutRect.maxY) < 1)
+      #expect(abs(viewport.minY - host.view.convert(host.view.bounds, to: nil).minY) < 1)
+      #expect(scroll.contentInsets.top == 0)
+      let controls = try [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].map {
+        try #require(window.standardWindowButton($0))
+      }
+      for button in controls {
+        let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        let frameView = try #require(window.contentView?.superview)
+        let target = frameView.hitTest(frameView.convert(point, from: nil))
+        #expect(target === button || target?.isDescendant(of: button) == true)
+      }
+      scroll.contentView.scroll(to: NSPoint(x: 0, y: -scroll.contentInsets.top))
+      scroll.reflectScrolledClipView(scroll.contentView)
+      try await settleChrome(host.view)
+      let directory = ProcessInfo.processInfo.environment["PADDOCK_SCROLL_CHROME_CAPTURE_DIR"]
+      let name =
+        "titlebar-\(Int(width))-\(sidebar ? "sidebar" : "no-sidebar")-\(dark ? "dark" : "light")"
+      let reference: NSBitmapImageRep?
+      if let directory {
+        reference = try capture(window, directory: directory, name: name + "-rest")
+        try expectCanvasInEmptyHeader(try #require(reference), window: window)
+      } else {
+        reference = nil
+      }
+      for offset: CGFloat in [150, 173, 209] {
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: offset))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        try await settleChrome(host.view)
+        #expect(abs(scroll.documentVisibleRect.minY - offset) < 1)
+        if let directory, let reference {
+          let scrolled = try capture(window, directory: directory, name: name + "-\(Int(offset))")
+          let titlebar = window.frame.height - window.contentLayoutRect.maxY
+          // Compare actual window pixels, not layout insets: the old automatic
+          // style passes geometry tests while drawing text over these controls.
+          let controlBand = NSRect(x: 8, y: 4, width: width - 16, height: titlebar - 12)
+          let changed = try changedFraction(
+            reference, scrolled, region: controlBand, window: window)
+          #expect(
+            changed < 0.01, "Text leaked into the titlebar: \(name), offset \(offset), \(changed)")
+          let bodyBand = NSRect(x: sidebar ? 300 : 28, y: titlebar + 20, width: 300, height: 160)
+          #expect(
+            try changedFraction(reference, scrolled, region: bodyBand, window: window) > 0.03,
+            "The visual check must exercise genuinely scrolled text")
+        }
+      }
+    }
+    await model.shutdown()
+  }
+
+  private func settleChrome(_ view: NSView) async throws {
+    for _ in 0..<5 {
+      view.layoutSubtreeIfNeeded()
+      try await Task.sleep(for: .milliseconds(40))
+    }
+  }
+
+  private func expectCanvasInEmptyHeader(
+    _ image: NSBitmapImageRep, window: NSWindow
+  ) throws {
+    // An opaque/tinted material can hide every glyph and pass the legibility
+    // check, but still recolour the header. At rest this empty region must be
+    // the actual app canvas, in both appearances, not a system material tint.
+    let scale = CGFloat(image.pixelsWide) / window.frame.width
+    // Compare rendered pixels in the same capture, not NSColor components:
+    // screen capture's display/HDR conversion can differ from the source RGB.
+    // The median of this text fixture's body region is its canvas, not its ink.
+    let titlebar = window.frame.height - window.contentLayoutRect.height
+    var samples: [NSColor] = []
+    for y in stride(from: titlebar + 80, through: titlebar + 160, by: 8) {
+      for x in stride(from: window.frame.width - 100, through: window.frame.width - 40, by: 8) {
+        samples.append(
+          try #require(
+            image.colorAt(x: Int(x * scale), y: Int(y * scale))?.usingColorSpace(.deviceRGB)))
+      }
+    }
+    let red = samples.map(\.redComponent).sorted()[samples.count / 2]
+    let green = samples.map(\.greenComponent).sorted()[samples.count / 2]
+    let blue = samples.map(\.blueComponent).sorted()[samples.count / 2]
+    for dx: CGFloat in [48, 64, 80] {
+      let actual = try #require(
+        image.colorAt(x: Int((window.frame.width - dx) * scale), y: Int(20 * scale))?
+          .usingColorSpace(.deviceRGB))
+      let error = max(
+        abs(actual.redComponent - red),
+        abs(actual.greenComponent - green),
+        abs(actual.blueComponent - blue))
+      #expect(error < 0.02, "The empty header must preserve the app canvas colour: \(error)")
+    }
+  }
+
+  private func capture(_ window: NSWindow, directory: String, name: String) throws
+    -> NSBitmapImageRep
+  {
+    // Only this offscreen synthetic window; no desktop input or user content.
+    let url = URL(fileURLWithPath: directory).appendingPathComponent(name + ".png")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    process.arguments = ["-x", "-o", "-l", String(window.windowNumber), url.path]
+    try process.run()
+    process.waitUntilExit()
+    #expect(process.terminationStatus == 0)
+    return try #require(NSBitmapImageRep(data: Data(contentsOf: url)))
+  }
+
+  private func changedFraction(
+    _ before: NSBitmapImageRep, _ after: NSBitmapImageRep,
+    region: NSRect, window: NSWindow
+  ) throws -> Double {
+    #expect(before.pixelsWide == after.pixelsWide && before.pixelsHigh == after.pixelsHigh)
+    let scale = CGFloat(before.pixelsWide) / window.frame.width
+    #expect(abs(CGFloat(before.pixelsHigh) / scale - window.frame.height) < 1)
+    var changed = 0
+    var count = 0
+    for y in Int(region.minY * scale)..<Int(region.maxY * scale) {
+      for x in Int(region.minX * scale)..<Int(region.maxX * scale) {
+        let a = try #require(before.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+        let b = try #require(after.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+        let difference = max(
+          abs(a.redComponent - b.redComponent),
+          abs(a.greenComponent - b.greenComponent), abs(a.blueComponent - b.blueComponent))
+        if difference > 0.12 { changed += 1 }
+        count += 1
+      }
+    }
+    return Double(changed) / Double(max(1, count))
+  }
+
   @Test func productionConversationUsesFullHeightWithEitherSidebarState() async throws {
     _ = NSApplication.shared
     let client = ChromeNoCore()
@@ -50,17 +294,34 @@ struct WorkspaceColumnChromeTests {
             .first { $0.string.hasPrefix("Full-height conversation fixture") })
         let scroll = try #require(text.enclosingScrollView)
         let frame = scroll.convert(scroll.bounds, to: host.view)
-        #expect(abs(frame.minY) < 1, "The transcript viewport must reach the top: \(frame)")
+        let viewport = scroll.convert(scroll.bounds, to: nil)
+        #expect(abs(viewport.maxY - window.contentLayoutRect.maxY) < 1)
+        #expect(scroll.contentInsets.top == 0)
         #expect(
-          abs(frame.height - host.view.bounds.height) < 1,
-          "The composer must overlay, not shrink, the transcript")
-        #expect(scroll.scrollerInsets.top == 0 && scroll.scrollerInsets.bottom == 0)
+          abs(frame.maxY - host.view.bounds.height) < 1,
+          "The viewport must still reach the bottom behind the composer")
+        #expect(
+          abs(split.documentHost.view.convert(split.documentHost.view.bounds, to: host.view).minY)
+            < 1,
+          "The adjacent preview must keep its full-height layout")
+        #expect(
+          scroll.scrollerInsets.top == StudioConversationSpacing.scrollIndicatorInset
+            && scroll.scrollerInsets.bottom == StudioConversationSpacing.scrollIndicatorInset)
         let scroller = try #require(scroll.verticalScroller)
         let track = scroller.convert(scroller.bounds, to: host.view)
-        #expect(abs(track.minY) <= 2, "The real indicator must reach the window top: \(track)")
         #expect(
-          abs(track.maxY - host.view.bounds.height) <= 2,
-          "The real indicator must reach the window bottom: \(track)")
+          abs(
+            track.minY - frame.minY - scroll.contentInsets.top
+              - StudioConversationSpacing.scrollIndicatorInset)
+            <= 2,
+          "The native indicator must clear the top bar: \(track)")
+        #expect(
+          abs(
+            track.maxY
+              - (host.view.bounds.height - scroll.contentInsets.bottom
+                - StudioConversationSpacing.scrollIndicatorInset))
+            <= 2,
+          "The native indicator must clear the composer: \(track)")
       }
     }
     // Exercise production headers, not replacement close closures. Closing a
@@ -201,7 +462,7 @@ struct WorkspaceColumnChromeTests {
     (view as? T) ?? view.subviews.lazy.compactMap { find(type, in: $0) }.first
   }
   private func allViews(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(allViews) }
-  private func artifactState() throws -> StudioState {
+  private func artifactState(previews: Bool = true) throws -> StudioState {
     let artifacts: [[String: Any]] = (0..<2).map { i in
       [
         "id": "artifact-\(i)", "model": "writer-\(i)", "kind": "html", "title": "Page \(i)",
@@ -220,7 +481,7 @@ struct WorkspaceColumnChromeTests {
         "preserveThinking": false, "thinkingBudget": false, "webSearch": false, "vision": false,
         "context": 4096, "ocrModes": [], "docParser": false, "pdfRaster": false,
       ],
-      "nativeArtifacts": artifacts, "nativeArtifactsPaneOpen": true,
+      "nativeArtifacts": previews ? artifacts : [], "nativeArtifactsPaneOpen": previews,
       "nativeTranscript": [
         "available": true, "notice": "",
         "messages": [

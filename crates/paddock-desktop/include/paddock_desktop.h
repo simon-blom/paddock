@@ -8,6 +8,8 @@
 uint32_t paddock_desktop_abi_version(void);
 void *paddock_desktop_open(char **error);
 char *paddock_desktop_snapshot(void *core, char **error);
+// ABI 12: bounded native management jobs. No caller-provided URLs.
+char *paddock_desktop_maintenance(void *core, const uint8_t *bytes, uintptr_t len, char **error);
 // ABI 11: read-only model defaults and full Start/Edit settings parity.
 // ABI 10 added read-only open/poll/close runner-log subscriptions; <=1 KiB input.
 // Bounded queues, background file I/O, credential suppression, no arbitrary paths.

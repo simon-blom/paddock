@@ -5,6 +5,21 @@ import Testing
 
 @Suite("Native response decoding")
 struct ResponseTests {
+  @Test func visionKeepalivesDoNotBecomeMessagesOrConsumeSequenceNumbers() throws {
+    var parser = ServerSentEvents()
+    var response = ResponseAccumulator()
+    try response.apply(#"{"type":"response.created","sequence_number":0}"#)
+    for _ in 0..<20 {
+      #expect(try parser.push(Data(":\n\n".utf8)).isEmpty)
+    }
+    let events = try parser.push(
+      Data(
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"Photo\"}\n\n"
+          .utf8))
+    #expect(events.count == 1)
+    try response.apply(events[0].data)
+    #expect(response.text == "Photo")
+  }
   @Test func everyByteBoundaryCRLFAndUnicode() throws {
     let raw = Data(
       "\u{feff}: comment\r\nevent: response\r\ndata: {\"type\":\"x\",\r\ndata: \"text\":\"å🦊\"}\r\n\r\ndata: second\r\rdata: third\n\n"

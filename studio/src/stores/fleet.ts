@@ -35,11 +35,13 @@ export interface FleetRow {
    *  the model has nothing to speculate with */
   spec?: string | null
   embedder: string | null
-  /** Speech-to-text (whisper-family) and forced-aligner serving ids - a row
-   *  carries exactly one of model/embedder/asr/aligner, and dropping the
-   *  latter two made those runners nameless in the fleet. */
+  /** Speech-to-text (whisper-family), forced-aligner and image-generation
+   *  serving ids - a row carries exactly one of model/embedder/asr/aligner/
+   *  image, and dropping the latter ones made those runners nameless in the
+   *  fleet. */
   asr?: string | null
   aligner?: string | null
+  image?: string | null
   /** The catalog's human name ("Qwen 3.5 9B") + maker - what the UI shows;
    *  the technical id stays in `model` for tooltips. Absent for models this
    *  build's catalog doesn't know. */

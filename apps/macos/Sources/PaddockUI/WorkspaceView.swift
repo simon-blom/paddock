@@ -122,7 +122,10 @@ public struct WorkspaceView: View {
         navigation: $model.navigation, model: model,
         onNewChat: newChat, onStart: { navigation.showModelLibrary(purpose: .all) })
     }
-    .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+    // Like oMLX's native settings shell, leave the actual window toolbar's
+    // backdrop to macOS. Hiding it defeats legibility when text scrolls under
+    // traffic lights and navigation controls; do not replace it with a mask.
+    .toolbarBackgroundVisibility(.automatic, for: .windowToolbar)
     .task(id: model.desktopRequest?.id) {
       guard let request = model.desktopRequest else { return }
       await model.handleDesktopRequest(request)
@@ -233,6 +236,10 @@ public struct WorkspaceView: View {
           creation: instanceCreation(snapshot))
       }
     case .overview: OverviewView(snapshot: snapshot)
+    case .insights: InsightsView(model: model.insights, endpoints: snapshot.servers ?? [])
+    case .clients: ExternalClientsView(client: model.settingsClient, runners: snapshot.runners)
+    case .storage: DataStorageView(model: model.dataStorage, snapshot: snapshot)
+    case .benchmarks: BenchmarksView(model: model.benchmarks, runners: snapshot.runners)
     case .cloudProviders: CloudModelsView(model: model.cloud, connections: model.connections)
     case .customEndpoints:
       CloudModelsView(model: model.cloud, connections: model.connections, service: .custom)
@@ -285,29 +292,35 @@ public struct WorkspaceView: View {
 
   private var managerSidebar: some View {
     VStack(alignment: .leading, spacing: 0) {
-      VStack(spacing: 4) {
-        Text("Settings").font(.system(size: 18, weight: .semibold))
-          .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(
-            .bottom, 16)
-        ForEach([ManagerDestination.general, .application]) { item in
-          navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item) {
-            navigation.manager = item
+      PaddockScrollView {
+        VStack(spacing: 4) {
+          Text("Settings").font(.system(size: 18, weight: .semibold))
+            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(
+              .bottom, 16)
+          ForEach([ManagerDestination.general, .application, .storage]) { item in
+            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
+            {
+              navigation.manager = item
+            }
           }
-        }
-        sidebarSection("Local models").padding(.top, 24)
-        ForEach([ManagerDestination.runners, .models, .downloads]) { item in
-          navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item) {
-            navigation.manager = item
+          sidebarSection("Local models").padding(.top, 24)
+          ForEach([ManagerDestination.runners, .models, .downloads, .insights, .benchmarks]) {
+            item in
+            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
+            {
+              navigation.manager = item
+            }
           }
-        }
-        sidebarSection("Connections").padding(.top, 22)
-        ForEach([ManagerDestination.cloudProviders, .customEndpoints, .connectors]) { item in
-          navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item) {
-            navigation.manager = item
+          sidebarSection("Connections").padding(.top, 22)
+          ForEach([ManagerDestination.cloudProviders, .customEndpoints, .connectors, .clients]) {
+            item in
+            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
+            {
+              navigation.manager = item
+            }
           }
-        }
-      }.padding(.horizontal, 10).padding(.top, 18)
-      Spacer(minLength: 30)
+        }.padding(.horizontal, 10).padding(.top, 18).padding(.bottom, 20)
+      }.clipped()
       VStack(alignment: .leading, spacing: 12) {
         if let snapshot = model.snapshot {
           Label(
@@ -322,7 +335,9 @@ public struct WorkspaceView: View {
         ) {
           navigation.manager = .overview
         }
-      }.padding(.horizontal, 10).padding(.bottom, 18)
+      }.padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(PaddockStyle.sidebar).zIndex(1)
     }.frame(maxHeight: .infinity).background(PaddockStyle.sidebar)
       .accessibilityIdentifier("settings-sidebar")
   }

@@ -1680,6 +1680,9 @@ impl Generator for GpuNemotron {
     fn tier_pump(&mut self) {
         self.tier_pump_impl();
     }
+    fn reply_pin(&mut self, slot: usize) {
+        GpuNemotron::reply_pin(self, slot);
+    }
     fn tier_prefix_loading(&mut self, slot: usize, tokens: &[u32]) -> bool {
         self.tier_consult_impl(slot, tokens)
     }
@@ -1794,6 +1797,22 @@ impl Generator for GpuNemotron {
 
     fn supports_chunked_prefill(&self) -> bool {
         self.batch.is_some()
+    }
+
+    // the mixed tick's FIFO over the queue, row-exact from each cursor
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.cursor, c.tokens.len() - c.cursor))
+            .collect()
+    }
+
+    // plan_chunk's cap under the pass's row capacity (the decode rows share
+    // it); the prompt-aligned width rule only ever narrows a tick
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.batch.as_ref().map_or(0, |bs| {
+            self.prefill_chunk.min(bs.cap.saturating_sub(decode_rows))
+        })
     }
 
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {

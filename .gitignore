@@ -39,6 +39,10 @@ dist/
 # PrismML's llama.cpp fork, the reference for the Bonsai ternary GGUFs that
 # stock llama.cpp cannot read - a prebuilt release, fetched. Same deal.
 /vendor/llamacpp-prism/*
+# stable-diffusion.cpp, the same-weights reference and rival for the
+# image-generation lane - newest release, fetched by its fetch script,
+# never built. VERSION is force-added so the fetched tag is on record.
+/vendor/sdcpp/*
 
 # OS
 .DS_Store

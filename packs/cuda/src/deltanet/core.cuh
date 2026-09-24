@@ -2001,6 +2001,60 @@ int pd_mrope(void* x, const void* positions, uint32_t n_tokens, uint32_t n_heads
     return pd_launch_status();
 }
 
+// The INTERLEAVED-section twin (ggml ROPE_TYPE_IMROPE; HF `mrope_interleaved`
+// - Qwen3-VL and what llama.cpp serves qwen3vl / qwen35 as). Same contract as
+// pd_mrope_kernel except which axis a rotation pair reads: pair p takes h
+// when p % 3 == 1 (while p < 3 * s1), w when p % 3 == 2 (p < 3 * s2), t when
+// p % 3 == 0 (p < 3 * s0), and e otherwise - with [24, 20, 20, 0] that is
+// pairs 1, 4, .., 58 on h, 2, 5, .., 59 on w and the other 24 on t. The
+// contiguous kernel above gives pairs 0..23 to t, 24..43 to h, 44..63 to w;
+// a text-only prompt (t == h == w) cannot tell them apart, an image can.
+__global__ void pd_imrope_kernel(float* __restrict__ x, const unsigned int* __restrict__ positions,
+                                 uint32_t n_tokens, uint32_t n_heads, uint32_t head_dim,
+                                 uint32_t n_rot, float theta_scale, float freq_scale,
+                                 float corr_low, float corr_high, float ext_factor, float mscale,
+                                 uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3) {
+    PD_PDL_ARM();
+    (void)s3;
+    uint32_t half = n_rot / 2;
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_tokens * n_heads * half) return;
+    uint32_t p = gid % half;
+    uint32_t idx = gid / half;                    // (t, h) flat index
+    uint32_t t = idx / n_heads;
+    float* head = x + (size_t)idx * head_dim;
+    float base;
+    if (p % 3u == 1u && p < 3u * s1) base = (float)positions[(size_t)n_tokens + t];
+    else if (p % 3u == 2u && p < 3u * s2) base = (float)positions[(size_t)2 * n_tokens + t];
+    else if (p % 3u == 0u && p < 3u * s0) base = (float)positions[t];
+    else base = (float)positions[(size_t)3 * n_tokens + t];
+    for (uint32_t i = 0; i < p; ++i) base *= theta_scale;
+    float y = ((float)p - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+    float ramp = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+    float angle = (freq_scale * base) * (1.0f - ramp) + base * ramp;
+    float sn = sinf(angle) * mscale;
+    float cs = cosf(angle) * mscale;
+    float a = head[p];
+    float b = head[p + half];
+    head[p] = a * cs - b * sn;
+    head[p + half] = a * sn + b * cs;
+}
+
+PD_EXPORT
+int pd_imrope(void* x, const void* positions, uint32_t n_tokens, uint32_t n_heads,
+              uint32_t head_dim, uint32_t n_rot, float theta_scale, float freq_scale,
+              float corr_low, float corr_high, float ext_factor, float mscale,
+              uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3, void* stream) {
+    uint32_t total = n_tokens * n_heads * (n_rot / 2);
+    if (total == 0) return 0;
+    uint32_t threads = 256;
+    uint32_t blocks = (total + threads - 1) / threads;
+    pd_imrope_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (float*)x, (const unsigned int*)positions, n_tokens, n_heads, head_dim, n_rot,
+        theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, s0, s1, s2, s3);
+    return pd_launch_status();
+}
+
 // Sigmoid output gate, in place: x[i] *= sigmoid(gate[i]). grid ceil(n/256).
 __global__ void pd_mul_sigmoid_kernel(float* __restrict__ x, const float* __restrict__ gate,
                                       uint32_t n) {

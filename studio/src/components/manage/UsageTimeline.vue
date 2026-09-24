@@ -504,10 +504,10 @@ const portOptions = computed(() => {
       seen.set(g.port, { name: raw ? modelLabel(raw) || raw : '', vendor: genVendor(g) })
   }
   for (const r of fleet.rows) {
-    // All four roles here too. `display` usually covers it, but a model the
+    // All five roles here too. `display` usually covers it, but a model the
     // catalog does not know has none - and then a whisper or aligner row fell
     // through to its port NUMBER as its own label.
-    const raw = r.model ?? r.embedder ?? r.asr ?? r.aligner ?? ''
+    const raw = r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? ''
     seen.set(r.port, {
       name: r.display ?? (raw ? modelLabel(raw) || raw : ''),
       vendor: r.vendor ?? (raw ? modelVendor(raw) : undefined),

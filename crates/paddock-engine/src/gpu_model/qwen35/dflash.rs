@@ -2261,6 +2261,7 @@ impl GpuQwen35 {
                     &st.sinks,
                     &mut st.attn,
                     &st.d_apos,
+                    None, // full attention (window 0): no floor to derive
                     &st.d_slots,
                     &st.d_bt,
                     st.bps,
@@ -2285,6 +2286,7 @@ impl GpuQwen35 {
                         &st.sinks,
                         &mut st.attn,
                         &st.d_apos,
+                        None, // full attention (window 0): no floor to derive
                         &st.d_slots,
                         &st.d_bt,
                         st.bps,

@@ -35,6 +35,25 @@ struct AppIdentityTests {
     #expect(
       FileManager.default.fileExists(
         atPath: bundle.appending(path: "Contents/Frameworks/libpaddock_desktop.dylib").path))
+    let sdk = Process()
+    let output = Pipe()
+    sdk.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    sdk.arguments = ["--sdk", "macosx", "--show-sdk-version"]
+    sdk.standardOutput = output
+    try sdk.run()
+    let version = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    sdk.waitUntilExit()
+    #expect(sdk.terminationStatus == 0)
+    let check = Process()
+    check.executableURL = URL(fileURLWithPath: "/bin/bash")
+    check.arguments = [
+      repository.appending(path: "apps/macos/scripts/check-linked-sdk.sh").path,
+      bundle.appending(path: "Contents/MacOS/Paddock").path, version,
+    ]
+    try check.run()
+    check.waitUntilExit()
+    #expect(check.terminationStatus == 0, "Test-host SDK behavior must match the installed app")
   }
 
   private func verifyIdentity(_ url: URL) throws {

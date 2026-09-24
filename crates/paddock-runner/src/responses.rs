@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_stream::stream;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_api::responses::ResponsesRequest;
@@ -51,6 +51,18 @@ fn now_secs() -> u64 {
 
 fn err(status: StatusCode, kind: &str, msg: impl Into<String>) -> Response {
     (status, Json(ErrorBody::new(kind, msg))).into_response()
+}
+
+/// Full-detail vision can legitimately take longer than a client's idle
+/// timeout. SSE comments keep the connection live without inventing output,
+/// usage, progress percentages or Responses sequence numbers.
+fn streaming_response<S>(stream: S) -> Response
+where
+    S: futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
+{
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// The one `include` value this server delivers (the spec's name for
@@ -335,9 +347,9 @@ fn prepare(
     req: &ResponsesRequest,
     messages: &[Value],
     extra_tools: &[Value],
-    // Hard ceiling on generated tokens (`AppState::max_output_ceiling`), or
-    // `None` for no clamp. Bounds a request that asks for a huge generation.
-    output_ceiling: Option<usize>,
+    // The server default for a request that names no cap, and the deployment
+    // ceiling that bounds one asking for a huge generation.
+    caps: crate::routes::OutputCaps,
     sd: &crate::routes::SamplingDefaults,
 ) -> Result<Prepared, String> {
     let template = model
@@ -390,8 +402,10 @@ fn prepare(
     // type reached a `'text' in item` template, matched nothing, and vanished
     // with a 200.
     chat_template::validate_content_parts(messages)?;
+    // system/developer items past the opening run render in place, as on chat
+    let inlined = chat_template::inline_late_system_messages(messages)?;
     // arguments-strings -> objects, or templates drop them from history
-    let mut messages = chat_template::normalize_messages(messages);
+    let mut messages = chat_template::normalize_messages(&inlined);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -541,7 +555,13 @@ fn prepare(
         None
     };
 
-    let prompt = chat_template::render(template, &messages, tools.as_deref(), kwargs.as_ref())?;
+    let prompt = chat_template::render_with_specials(
+        template,
+        &messages,
+        tools.as_deref(),
+        kwargs.as_ref(),
+        &model.template_specials(),
+    )?;
     // thinking-mode detection is dialect-shaped - see Dialect::thinking_open.
     // (This also fixes a latent gemma4 bug: the old bare `ends_with("<think>\n")`
     // read gemma4-thinking as off here, so a response_format grammar clamped
@@ -693,9 +713,7 @@ fn prepare(
         engine_prompt,
         sampler,
         stop_tokens: model.stop_tokens.clone(),
-        // Clamp to the server ceiling so a request can't demand a huge (costly)
-        // generation on an exposed instance; unset = honor the request as-is.
-        max_tokens: output_ceiling.map_or(req.max_output_tokens, |c| req.max_output_tokens.min(c)),
+        max_tokens: caps.resolve(req.max_output_tokens),
         thinking_open,
         hints: tool_hints(tools.as_deref()),
         mm_chunks,
@@ -1091,7 +1109,7 @@ pub async fn handle(
         &req,
         &messages,
         &[],
-        state.max_output_ceiling,
+        state.output_caps(),
         &state.sampling,
     ) {
         Ok(p) => p,
@@ -1138,7 +1156,7 @@ pub async fn handle(
             &req,
             &messages,
             &[],
-            state.max_output_ceiling,
+            state.output_caps(),
             &state.sampling,
         ) {
             Ok(p) => p,
@@ -1202,6 +1220,7 @@ pub async fn handle(
         constraint,
         logprobs: logprobs_k,
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -1620,7 +1639,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         yield ev(event_name, json!({
             "type":event_name,"sequence_number":next(),"response":full}));
     };
-    Sse::new(sse).into_response()
+    streaming_response(sse)
 }
 
 fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {
@@ -1696,7 +1715,7 @@ fn greedy_for_summary(mut r: ResponsesRequest) -> ResponsesRequest {
     r.presence_penalty = Some(0.0);
     r.frequency_penalty = Some(0.0);
     r.text = None;
-    r.max_output_tokens = 4096;
+    r.max_output_tokens = Some(4096);
     if r.tool_choice
         .as_ref()
         .is_some_and(|tc| tc.as_str() != Some("none"))
@@ -1744,7 +1763,7 @@ async fn summary_pass(
         req1,
         msgs1,
         extra_tools,
-        state.max_output_ceiling,
+        state.output_caps(),
         &state.sampling,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
@@ -1778,6 +1797,7 @@ async fn summary_pass(
         constraint,
         logprobs: None,
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e));
@@ -1858,7 +1878,7 @@ async fn precompact_agent(
         req,
         messages,
         extra_tools,
-        state.max_output_ceiling,
+        state.output_caps(),
         &state.sampling,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_request_error", e))?;
@@ -1937,7 +1957,7 @@ async fn run_compacting_oa(
         &req,
         &messages,
         &[],
-        state.max_output_ceiling,
+        state.output_caps(),
         &state.sampling,
     ) {
         Ok(p) => p,
@@ -1968,7 +1988,7 @@ async fn run_compacting_oa(
             &req,
             &messages,
             &[],
-            state.max_output_ceiling,
+            state.output_caps(),
             &state.sampling,
         ) {
             Ok(p) => p,
@@ -2031,6 +2051,7 @@ async fn run_compacting_oa(
         constraint,
         logprobs: lane_want_logprobs(&req).then(|| req.top_logprobs.unwrap_or(0)),
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -2087,7 +2108,7 @@ async fn run_compact_trigger(
         hints: None,
         single_tool_call: req.parallel_tool_calls == Some(false),
         instructions: req.instructions.clone(),
-        max_output_tokens: req.max_output_tokens,
+        max_output_tokens: state.output_caps().resolve(req.max_output_tokens),
         max_tool_calls: req.max_tool_calls,
         // the compaction pass runs with thinking closed, so it echoes the
         // instruct-side election
@@ -2136,7 +2157,7 @@ async fn run_compact_trigger(
             yield ev("response.completed", json!({
                 "type":"response.completed","sequence_number":next(),"response":full}));
         };
-        return Sse::new(sse).into_response();
+        return streaming_response(sse);
     }
     Json(full).into_response()
 }
@@ -3382,7 +3403,7 @@ async fn run_agent(
     // the answer round - tools taken away, one instruction to answer with what
     // it has.
     let mut ledger = loop_budget::CallLedger::with_limit(req.max_tool_calls);
-    let turn_cap = loop_budget::turn_output_cap(req.max_output_tokens);
+    let turn_cap = loop_budget::turn_output_cap(state.output_caps().resolve(req.max_output_tokens));
     // Their `max_tool_calls` sets the ROUND ceiling too, up or down - it used
     // to only lower, so an ask for 100 calls still died at our default.
     let rounds = loop_budget::rounds_cap(req.max_tool_calls);
@@ -3499,7 +3520,7 @@ async fn run_agent(
             &req,
             &messages,
             round_tools,
-            state.max_output_ceiling,
+            state.output_caps(),
             &state.sampling,
         ) {
             Ok(p) => p,
@@ -3530,7 +3551,7 @@ async fn run_agent(
                 &req,
                 &messages,
                 round_tools,
-                state.max_output_ceiling,
+                state.output_caps(),
                 &state.sampling,
             ) {
                 Ok(p) => p,
@@ -3573,6 +3594,7 @@ async fn run_agent(
             constraint,
             logprobs: None,
             submitted: None, // stamped by Engine::submit
+            canvas_read: None,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -3629,7 +3651,7 @@ async fn run_agent(
                 total_out,
                 finish,
                 dropped,
-                &state.sampling,
+                &state,
                 scope,
             );
         }
@@ -3650,7 +3672,7 @@ async fn run_agent(
                 total_out,
                 finish,
                 dropped,
-                &state.sampling,
+                &state,
                 scope,
             );
         }
@@ -3669,7 +3691,7 @@ async fn run_agent(
                     total_out,
                     finish,
                     dropped,
-                    &state.sampling,
+                    &state,
                     scope,
                 );
             }
@@ -3918,7 +3940,7 @@ async fn run_agent(
                 total_out,
                 None,
                 dropped,
-                &state.sampling,
+                &state,
                 scope,
             );
         }
@@ -3950,9 +3972,10 @@ fn agent_final(
     finish: Option<FinishReason>,
     // messages truncation "auto" removed across the loop's rounds
     dropped: usize,
-    sd: &crate::routes::SamplingDefaults,
+    state: &AppState,
     scope: crate::events::EventScope,
 ) -> Response {
+    let sd = &state.sampling;
     scope.usage(prompt_len, out_tokens);
     scope.finish(finish.map_or("stop", |f| f.as_str()));
     let meta = Meta {
@@ -3969,7 +3992,7 @@ fn agent_final(
         hints: Some(ToolHints::new()),
         single_tool_call: false,
         instructions: req.instructions.clone(),
-        max_output_tokens: req.max_output_tokens,
+        max_output_tokens: state.output_caps().resolve(req.max_output_tokens),
         max_tool_calls: req.max_tool_calls,
         // the envelope echoes one pair for a loop that may have spanned both
         // modes, so it reports the model's default-mode election
@@ -4056,7 +4079,7 @@ fn stream_agent(
             hints: Some(ToolHints::new()),
             single_tool_call: false,
             instructions: req.instructions.clone(),
-            max_output_tokens: req.max_output_tokens,
+            max_output_tokens: state.output_caps().resolve(req.max_output_tokens),
             max_tool_calls: req.max_tool_calls,
             // one envelope for a loop that may have spanned both modes, so it
             // reports the model's default-mode election
@@ -4194,7 +4217,8 @@ fn stream_agent(
         // loop, and the same order: repeat ledger, per-round ceiling, and one
         // last tools-off pass that answers instead of stalling.
         let mut ledger = loop_budget::CallLedger::with_limit(req.max_tool_calls);
-        let turn_cap = loop_budget::turn_output_cap(req.max_output_tokens);
+        let turn_cap =
+            loop_budget::turn_output_cap(state.output_caps().resolve(req.max_output_tokens));
         let rounds = loop_budget::rounds_cap(req.max_tool_calls);
         let mut stop: Option<loop_budget::Stop> = None;
         let mut announced = false;
@@ -4250,7 +4274,7 @@ fn stream_agent(
             }
             let round_tools: &[Value] = if answering { &[] } else { &gathered.tools };
             let t_prep = std::time::Instant::now();
-            let mut prepared = match prepare(model, &req, &messages, round_tools, state.max_output_ceiling, &state.sampling) {
+            let mut prepared = match prepare(model, &req, &messages, round_tools, state.output_caps(), &state.sampling) {
                 Ok(p) => p,
                 Err(e) => {
                     let mut snap = response_object(&meta, "failed", vec![], None, None);
@@ -4283,7 +4307,7 @@ fn stream_agent(
                 }
                 dropped += n;
                 meta.ex.dropped = dropped;
-                prepared = match prepare(model, &req, &messages, round_tools, state.max_output_ceiling, &state.sampling) {
+                prepared = match prepare(model, &req, &messages, round_tools, state.output_caps(), &state.sampling) {
                     Ok(p) => p,
                     Err(e) => {
                         let mut snap = response_object(&meta, "failed", vec![], None, None);
@@ -4323,6 +4347,7 @@ fn stream_agent(
                 constraint,
                 logprobs: None,
                 submitted: None, // stamped by Engine::submit
+                canvas_read: None,
             };
             if let Err(e) = model.engine.submit(gen_req) {
                 let mut snap = response_object(&meta, "failed", vec![], None, None);
@@ -4729,12 +4754,27 @@ fn stream_agent(
         let full = response_object(&meta, status, done_items, Some((total_out, total_reasoning, cached0)), final_finish);
         yield ev(event_name, json!({"type":event_name,"sequence_number":seq,"response":full}));
     };
-    Sse::new(sse).into_response()
+    streaming_response(sse)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn quiet_response_stream_sends_comments_without_fabricating_events() {
+        use http_body_util::BodyExt;
+        let mut body = streaming_response(futures::stream::pending()).into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(30), body.frame())
+            .await
+            .expect("quiet vision stream must not remain idle")
+            .expect("stream stays open")
+            .expect("body frame");
+        let bytes = frame.into_data().expect("keepalive data");
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 comment");
+        assert!(text.starts_with(':') && text.ends_with("\n\n"));
+        assert!(!text.contains("data:") && !text.contains("event:"));
+    }
 
     fn forensics_runtime() -> std::sync::Arc<crate::forensics::ForensicRuntime> {
         crate::forensics::ForensicRuntime::build(&crate::config::ForensicsConfig {

@@ -670,6 +670,52 @@ impl GpuExecutor {
         })
     }
 
+    /// [`Self::vision_attn_x`] with the QUERY side windowed: `nq` rows of q/out
+    /// starting at `q_row_off`, over the first `nkv` rows of k/v, one group.
+    /// The image DiT's per-step attention: a target block's queries over
+    /// `[cached prefix | target]` keys, where two batch elements (the
+    /// conditional and unconditional prompts under guidance) have prefixes of
+    /// different lengths and so cannot share one `n_batch` launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vision_attn_xq_at(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        q_row_off: usize,
+        nq: usize,
+        nkv: usize,
+        n_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .vision_attn_x
+            .ok_or(GpuError::MissingOp("vision_attn_x"))?;
+        let off = (q_row_off * n_heads * head_dim * std::mem::size_of::<f32>()) as u64;
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (op, _g4) = out.device_ptr_mut(&self.stream);
+        check(unsafe {
+            f(
+                (qp + off) as *const _,
+                kp as *const _,
+                vp as *const _,
+                (op + off) as *mut _,
+                nq as u32,
+                nkv as u32,
+                n_heads as u32,
+                head_dim as u32,
+                1,
+                scale,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// `vision_attn` over rows [row_off, row_off+n) of batched q/k/v/out buffers
     /// - the per-image attention call inside a multi-image encode (each image's
     ///   patches attend only among themselves; every other tower op is

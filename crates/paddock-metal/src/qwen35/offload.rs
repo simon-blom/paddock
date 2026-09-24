@@ -107,6 +107,20 @@ impl Qwen35 {
         }
         if self.ternary.is_some() {
             layout.push_str(":bonsai-ptq1-gguf-f16-v1");
+            let add_decode = self.device.tensor_accelerated();
+            #[cfg(test)]
+            let add_decode = add_decode && !ternary_add_tests::BASELINE_PTQ.with(|v| v.get());
+            if add_decode {
+                // Changed decode/head contractions influence every later
+                // text or image prefix, including after process restart.
+                layout.push_str(":ptq1-sign-add-decode-v2");
+            }
+        }
+        #[cfg(test)]
+        if (self.bonsai.is_some() || self.ternary.is_some())
+            && ternary_add_tests::ADD_PROJECTIONS.with(|v| v.get())
+        {
+            layout.push_str(":ternary-sign-add-group-scale-v1");
         }
         if self.stable_affine_prefill() {
             // Old admission-sized BF16 partials produce different recurrent
@@ -586,6 +600,41 @@ impl Qwen35 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires Bonsai PTQ1; changed add/subtract decode must have a different persistent namespace"]
+    fn ptq1_add_decode_has_distinct_namespace() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ternary_add_tests::BASELINE_PTQ.with(|v| v.set(false));
+            }
+        }
+        let _reset = Reset;
+        let path = std::env::var("PADDOCK_METAL_PTQ1_MODEL").unwrap();
+        let mut model = Qwen35::load_for_offload(Path::new(&path), 1024, 1, None).unwrap();
+        if !model.device.tensor_accelerated() {
+            return;
+        }
+        let mut roots = Vec::new();
+        for baseline in [true, false, true, false] {
+            ternary_add_tests::BASELINE_PTQ.with(|v| v.set(baseline));
+            model
+                .enable_kv_offload(
+                    crate::KvOffloadConfig {
+                        ram_bytes: 1 << 30,
+                        disk: None,
+                        scope: b"ptq1-add-arithmetic-namespace-test".to_vec(),
+                    },
+                    &[Path::new(&path)],
+                )
+                .unwrap();
+            roots.push(model.cold.as_ref().unwrap().root);
+            drop(model.cold.take());
+        }
+        assert_ne!(roots[0], roots[1]);
+        assert_eq!(roots[0], roots[2]);
+        assert_eq!(roots[1], roots[3]);
+    }
     #[test]
     #[ignore = "requires Bonsai; changed M5 prompt arithmetic must not share a persistent namespace"]
     fn bonsai_prompt_arithmetic_has_distinct_namespace() {

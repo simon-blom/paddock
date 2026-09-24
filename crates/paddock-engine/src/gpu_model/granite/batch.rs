@@ -274,6 +274,15 @@ fn no_rope_fuse() -> bool {
 /// The export falls back to that scalar tile when the v4 arm is killed
 /// (PADDOCK_NO_PF_V4), so this gate only decides the ENGINE routing;
 /// PADDOCK_NO_NPF8 reverts it (mirrors qwen35's PADDOCK_NO_QPF8).
+///
+/// G=8 joined 2026-09-22 for the plain-llama files this family also serves
+/// (MiniCPM5-2B: 16q/2kv). The pack's hd128 fp8 ladders - pf7rp, pf7 and
+/// the v4 PIPE arm - all instantiate G=8 (they did for the muse/gpt-oss
+/// class), so this gate was the only thing sending that ratio to the scalar
+/// walk. The list mirrors the export's own hd128 entry set {4,6,8,9,16}
+/// minus 16, which no granite-graph file has; a ratio absent from both goes
+/// to the scalar paged tile inside the export, correct and slow, so this
+/// list is an election, not a correctness guard.
 fn pf_attn_dtype_ok(kv_dtype: KvDtype, n_heads: usize, n_kv_heads: usize) -> bool {
     match kv_dtype {
         KvDtype::Fp16 => true,
@@ -282,7 +291,7 @@ fn pf_attn_dtype_ok(kv_dtype: KvDtype, n_heads: usize, n_kv_heads: usize) -> boo
             *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NPF8").is_none())
                 && n_kv_heads > 0
                 && n_heads.is_multiple_of(n_kv_heads)
-                && matches!(n_heads / n_kv_heads, 4 | 6 | 9)
+                && matches!(n_heads / n_kv_heads, 4 | 6 | 8 | 9)
         }
     }
 }
@@ -1766,7 +1775,11 @@ impl GpuGranite {
         if scale_media && !spans.is_empty() {
             deepstack::apply_embed(&self.exec, &mut sc.x, spans, embd)?;
         }
-        self.exec.scale(&mut sc.x, scale, r * embd)?;
+        // identity on a plain llama file - a multiply by 1 is a launch for
+        // nothing, on a graph that is captured per token
+        if scale != 1.0 {
+            self.exec.scale(&mut sc.x, scale, r * embd)?;
+        }
         if !scale_media && !spans.is_empty() {
             deepstack::apply_embed(&self.exec, &mut sc.x, spans, embd)?;
         }
@@ -3493,8 +3506,11 @@ impl GpuGranite {
         }
         // logits_scaling: llama.cpp divides by f_logit_scale. This must stay
         // on the device logits rather than folding into sampling - argmax is
-        // invariant to it, but logprobs and temperature are not.
-        exec.scale(&mut sc.head_logits, inv_logit, rows * vocab)?;
+        // invariant to it, but logprobs and temperature are not. Skipped at
+        // identity (plain llama files) - same reason as embed_rows.
+        if inv_logit != 1.0 {
+            exec.scale(&mut sc.head_logits, inv_logit, rows * vocab)?;
+        }
         Ok(())
     }
 

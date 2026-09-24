@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::generator::{FinishSample, GenError, Generator, RowSample};
+use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, RowSample};
 use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
 use crate::sampler::{Sampler, SamplingParams, TokenConstraint};
 use crate::spec::NgramDraft;
@@ -484,6 +484,25 @@ pub struct GenRequest {
     /// Stamped by [`Engine::submit`] - the queue-wait anchor for `RunStats`.
     /// Callers leave it None; a direct `run_request` (warmup) has no queue.
     pub submitted: Option<std::time::Instant>,
+    /// A block-diffusion STRUCTURED READ instead of a generation: after the
+    /// prompt is prefilled, the seeded canvas is run once and each
+    /// position's probability of every label id comes back on the request's
+    /// own reply channel; the events channel then carries `Done`. Refused
+    /// with an error event on a next-token backend. `max_tokens`, sampler
+    /// and stop ids are ignored for a read.
+    pub canvas_read: Option<CanvasReadRequest>,
+}
+
+/// The structured read's inputs and its reply channel (see
+/// `GenRequest::canvas_read`, `Generator::canvas_read`).
+pub struct CanvasReadRequest {
+    /// the seeded canvas ids (template + noise at the answer slots)
+    pub canvas: Vec<u32>,
+    /// the label ids whose probabilities are wanted at every position
+    pub label_ids: Vec<u32>,
+    /// where the `[canvas.len()][label_ids.len()]` probabilities, entropies
+    /// and argmaxes go
+    pub reply: std::sync::mpsc::Sender<crate::generator::CanvasReadOut>,
 }
 
 /// Per-token log-probabilities (natural log of the raw softmax).
@@ -715,6 +734,11 @@ pub struct EngineError {
     pub class: ErrorClass,
     pub code: Option<&'static str>,
     pub message: String,
+    /// `(prompt tokens, context window)` when this is a context overflow. A
+    /// surface with its own wording for that renders from these numbers
+    /// instead of parsing `message` - Anthropic's "prompt is too long: N tokens
+    /// > M maximum" is the text Claude Code keys its compaction on.
+    pub overflow: Option<(usize, usize)>,
 }
 
 impl EngineError {
@@ -752,6 +776,7 @@ impl EngineError {
             class: ErrorClass::Internal,
             code: None,
             message,
+            overflow: None,
         }
     }
 
@@ -783,6 +808,7 @@ impl EngineError {
                       fewer or smaller pages (the attachment's `pages` selection, or a lower \
                       image `detail`), or retry once the device is less busy"
                 .to_string(),
+            overflow: None,
         }
     }
 
@@ -791,6 +817,7 @@ impl EngineError {
             class: ErrorClass::InvalidRequest,
             code: None,
             message: msg.into(),
+            overflow: None,
         }
     }
 
@@ -799,6 +826,7 @@ impl EngineError {
             class: ErrorClass::Overloaded,
             code: Some("overloaded"),
             message: msg.into(),
+            overflow: None,
         }
     }
 
@@ -812,6 +840,7 @@ impl EngineError {
                 "the prompt is {got} tokens but the model's context window is {max}; \
                  reduce the input (or restart with a larger --max-ctx)"
             ),
+            overflow: Some((got, max)),
         }
     }
 
@@ -834,6 +863,7 @@ impl EngineError {
                  attachment's `pages` selection, or a lower image `detail`), or restart with a \
                  larger --max-ctx"
             ),
+            overflow: Some((got, max)),
         }
     }
 }
@@ -942,6 +972,10 @@ pub struct Engine {
     /// signal out rather than needing a lock or a round-trip to the engine
     /// thread on every request that carries an image.
     vision_budget: Option<crate::generator::VisionBudget>,
+    /// The canvas width of a block-diffusion generator, 0 on next-token
+    /// ones - sampled at startup like `vision_budget`, so the serving layer
+    /// can offer (or refuse) the structured read without a round trip.
+    canvas_width: usize,
 }
 
 impl Engine {
@@ -959,8 +993,9 @@ impl Engine {
         // Ok carries the generator's vision budget (None = no tower) - the one
         // fact the outside needs from the generator itself, read on the engine
         // thread that owns it.
-        let (ready_tx, ready_rx) =
-            std::sync::mpsc::channel::<Result<Option<crate::generator::VisionBudget>, String>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<
+            Result<(Option<crate::generator::VisionBudget>, usize), String>,
+        >();
 
         let metrics = Arc::new(EngineMetrics::default());
         let thread_metrics = metrics.clone();
@@ -996,7 +1031,39 @@ impl Engine {
                 // family's own impl either builds fully or returns a real Err -
                 // granite/laguna's VRAM-insufficient path used to lie with a
                 // graceful Ok(1) here).
-                let (cap, batched) = if max_batch > 1 {
+                // A block-diffusion backend has its OWN batched loop
+                // (`run_batched_diffusion`): the next-token scheduler would
+                // put a canvas request through decode - wrong silently - so
+                // it never elects that one. Its slots and pools come from
+                // the same `enable_batch`; a width of 1 (or a pool that does
+                // not fit) keeps the serial loop.
+                let diffusion = generator.canvas_width() > 0;
+                let (cap, batched) = if diffusion {
+                    let cap = if max_batch > 1 {
+                        match generator.enable_batch(max_batch) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "paddock: block-diffusion batch of {max_batch} did not fit \
+                                     ({e}); serving one request at a time"
+                                );
+                                1
+                            }
+                        }
+                    } else {
+                        1
+                    };
+                    tracing::info!(
+                        "paddock: block-diffusion model - {} (canvas {} positions per block)",
+                        if cap > 1 {
+                            format!("batched loop, {cap} slots")
+                        } else {
+                            "serial loop".to_string()
+                        },
+                        generator.canvas_width()
+                    );
+                    (cap, cap > 1)
+                } else if max_batch > 1 {
                     // Width-by-VRAM backstop: models estimate a fitting width
                     // themselves (qwen35's clamp), but if an allocation still
                     // OOMs, halve and retry instead of cliff-dropping straight
@@ -1148,7 +1215,10 @@ impl Engine {
                 // of it up front. llama.cpp warms up by default (its --no-warmup
                 // skips it); PADDOCK_NO_WARMUP skips ours. `_wrx` stays bound so the
                 // run completes (unbounded sends just buffer, then drop with it).
-                if paddock_models::dev_var_os!("PADDOCK_NO_WARMUP").is_none() {
+                // (the batched diffusion loop warms below through its own
+                // loop - the single-stream state is not what it serves)
+                if paddock_models::dev_var_os!("PADDOCK_NO_WARMUP").is_none() && !(diffusion && batched)
+                {
                     let (wtx, _wrx) = tokio::sync::mpsc::unbounded_channel();
                     run_request(
                         generator.as_mut(),
@@ -1162,6 +1232,7 @@ impl Engine {
                             constraint: None,
                             logprobs: None,
                             submitted: None,
+                            canvas_read: None,
                         },
                         &metrics,
                     );
@@ -1203,12 +1274,17 @@ impl Engine {
                             constraint: None,
                             logprobs: None,
                             submitted: None,
+                            canvas_read: None,
                         });
                     }
                     drop(wtx);
                     let t0 = std::time::Instant::now();
                     let vocab = generator.vocab();
-                    run_batched(generator.as_mut(), &wrx, n, vocab, &metrics, &ctl);
+                    if diffusion {
+                        run_batched_diffusion(generator.as_mut(), &wrx, n, &metrics, &ctl);
+                    } else {
+                        run_batched(generator.as_mut(), &wrx, n, vocab, &metrics, &ctl);
+                    }
                     drop(keep_rx);
                     tracing::info!(
                         "engine: batched warm wave done ({n} prompts, {:.0} ms)",
@@ -1219,8 +1295,10 @@ impl Engine {
                 // right after build(), so the server starts listening only once warm.
                 // That moves the one-time cold-start cost into load time (a slightly
                 // longer "model ready") and makes request #1 fast, like every other.
-                let _ = ready_tx.send(Ok(generator.vision_budget()));
-                if batched {
+                let _ = ready_tx.send(Ok((generator.vision_budget(), generator.canvas_width())));
+                if batched && diffusion {
+                    run_batched_diffusion(generator.as_mut(), &rx, cap.max(1), &metrics, &ctl);
+                } else if batched {
                     let vocab = generator.vocab();
                     run_batched(generator.as_mut(), &rx, cap.max(1), vocab, &metrics, &ctl);
                 } else {
@@ -1245,11 +1323,12 @@ impl Engine {
             .map_err(|e| format!("failed to spawn engine thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(vision_budget)) => Ok(Self {
+            Ok(Ok((vision_budget, canvas_width))) => Ok(Self {
                 tx,
                 shutdown,
                 metrics,
                 vision_budget,
+                canvas_width,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("engine thread died during startup".into()),
@@ -1272,6 +1351,12 @@ impl Engine {
     /// picker both size against this, so there is one number, from the file.
     pub fn vision_budget(&self) -> Option<crate::generator::VisionBudget> {
         self.vision_budget
+    }
+
+    /// The canvas width when this engine serves a block-diffusion model
+    /// (the structured read's ceiling), 0 on a next-token model.
+    pub fn canvas_width(&self) -> usize {
+        self.canvas_width
     }
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
@@ -1324,6 +1409,21 @@ fn spec_live_slots(
 /// Only when no slot is ring-warm - the ramp, where the ring lane
 /// declines and the MTP chain takes the round - does the full ensure_warm
 /// pass run, exactly as before.
+/// Hand every due reply pin to the backend (`Generator::reply_pin`). Called
+/// where nothing has yet fed or committed a slot past the token that opened
+/// its call: the top of each scheduler tick (dense sampling feeds that token
+/// on the NEXT tick) and just before the sampled round's commit (whose
+/// snapshot would otherwise land past it).
+fn drain_reply_pins(generator: &mut dyn Generator, slots: &mut [Option<Slot>]) {
+    for (k, s) in slots.iter_mut().enumerate() {
+        if let Some(s) = s.as_mut()
+            && std::mem::take(&mut s.reply_pin_due)
+        {
+            generator.reply_pin(k);
+        }
+    }
+}
+
 fn spec_warm_vec(generator: &mut dyn Generator, slots: &[Option<Slot>], ks: &[usize]) -> Vec<bool> {
     let ring_owned = generator.spec_ring_owns_round(ks.len());
     let want = |s: &Slot| s.pos.saturating_sub(1);
@@ -1373,6 +1473,440 @@ fn spec_warm_vec(generator: &mut dyn Generator, slots: &[Option<Slot>], ks: &[us
                 .unwrap_or(false)
         })
         .collect()
+}
+
+/// The serial request on a BLOCK-DIFFUSION backend (DiffusionGemma), after
+/// `run_request` put the prompt's `rows` in the single-stream slot: the
+/// answer is denoised a canvas at a time - up to `canvas_width` positions,
+/// narrowed to what `max_tokens` still allows - each block emitted through
+/// the same Token events a next-token backend sends, cut at the first stop
+/// id, committed (re-run causally) only when the answer goes on.
+///
+/// What does not apply to a canvas and is refused rather than silently
+/// ignored: output constraints (the canvas is not sampled left to right, so
+/// a grammar cannot be walked) and per-token logprobs (the read primitive is
+/// the structured read, not a token stream). Penalties and top-k/top-p are
+/// not part of the model's sampler either; the request's `temperature` maps
+/// to deterministic at 0 and to the model's own schedule otherwise - there
+/// is no customer knob on the schedule.
+fn run_request_diffusion(
+    generator: &mut dyn Generator,
+    req: GenRequest,
+    rows: usize,
+    t_admit: std::time::Instant,
+    queued_ms: u32,
+    metrics: &EngineMetrics,
+) {
+    if req.constraint.is_some() {
+        let _ = req.events.send(TokenEvent::Error(EngineError::invalid(
+            "structured outputs are not served on a block-diffusion model: the canvas is not \
+             sampled left to right, so a grammar cannot constrain it",
+        )));
+        return;
+    }
+    if req.logprobs.is_some() {
+        let _ = req.events.send(TokenEvent::Error(EngineError::invalid(
+            "per-token logprobs are not served on a block-diffusion model; the structured read \
+             (/v1/systemone) is its probability surface",
+        )));
+        return;
+    }
+    let width = generator.canvas_width();
+    let temperature = if req.sampler.temperature <= 0.0 {
+        Some(0.0)
+    } else {
+        None
+    };
+    let t_prefilled = std::time::Instant::now();
+    let stats = |t_prefilled: std::time::Instant| RunStats {
+        sampled_stop: false,
+        queued_ms,
+        prefill_ms: dur_ms(t_prefilled.saturating_duration_since(t_admit)),
+        decode_ms: dur_ms(t_prefilled.elapsed()),
+        spec_drafted: 0,
+        spec_accepted: 0,
+        kv_pages: 0,
+    };
+    metrics.phase.store(PHASE_DECODE, Relaxed);
+    let mut base = rows;
+    let mut emitted = 0usize;
+    while emitted < req.max_tokens {
+        let w = width.min(req.max_tokens - emitted);
+        let (block, _steps) = match generator.canvas_block(base, w, temperature, req.sampler.seed) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = req
+                    .events
+                    .send(TokenEvent::Error(EngineError::from_gen(&e)));
+                return;
+            }
+        };
+        for &id in &block {
+            if req.stop_tokens.contains(&id) {
+                finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
+                return;
+            }
+            if req
+                .events
+                .send(TokenEvent::Token { id, logprobs: None })
+                .is_err()
+            {
+                return;
+            }
+            metrics.tokens_generated.fetch_add(1, Relaxed);
+            emitted += 1;
+        }
+        if emitted >= req.max_tokens {
+            break;
+        }
+        // the answer goes on: the block's K/V become real, the next canvas
+        // starts behind it
+        if let Err(e) = generator.canvas_commit(base, &block) {
+            let _ = req
+                .events
+                .send(TokenEvent::Error(EngineError::from_gen(&e)));
+            return;
+        }
+        base += block.len();
+    }
+    let _ = req
+        .events
+        .send(TokenEvent::Done(FinishReason::Length, stats(t_prefilled)));
+}
+
+/// The batched loop for a BLOCK-DIFFUSION backend (DiffusionGemma): up to
+/// `max_batch` requests, each in its own batch slot, their canvases denoised
+/// together - one `canvas_tick` per round carries every live canvas through
+/// one forward (`Generator::canvas_tick`), the way a spec round carries every
+/// slot's draft block. Admission is a blocking batched prefill of the new
+/// prompts (the classic admission pass); a converged canvas is emitted
+/// through the ordinary Token events, cut at the first stop id, committed
+/// causally when the answer goes on, and the slot opens its next canvas.
+/// Structured reads ride the same tick (one step at temperature 1, no
+/// accept) and answer on their own reply channel. Nothing the next-token
+/// scheduler has - host sampling, penalties, spec, the decode pipe - applies
+/// to a canvas, which is why this is its own loop and not a branch of
+/// `run_batched`.
+fn run_batched_diffusion(
+    generator: &mut dyn Generator,
+    rx: &Receiver<GenRequest>,
+    max_batch: usize,
+    metrics: &Arc<EngineMetrics>,
+    ctl: &ShutdownCtl,
+) {
+    struct DSlot {
+        events: UnboundedSender<TokenEvent>,
+        stop_tokens: Vec<u32>,
+        max_tokens: usize,
+        /// Some(0.0) = deterministic; None = the model's schedule
+        temperature: Option<f32>,
+        seed: u64,
+        read: Option<CanvasReadRequest>,
+        /// rows committed to the slot's KV (prompt, then each emitted block)
+        base: usize,
+        emitted: usize,
+        /// the open canvas: (handle, width, the seed folded with the block
+        /// offset), None between blocks
+        canvas: Option<(usize, usize, u64)>,
+        steps: u32,
+        queued_ms: u32,
+        t_admit: std::time::Instant,
+        t_prefilled: std::time::Instant,
+    }
+    impl DSlot {
+        fn stats(&self) -> RunStats {
+            RunStats {
+                sampled_stop: false,
+                queued_ms: self.queued_ms,
+                prefill_ms: dur_ms(self.t_prefilled.saturating_duration_since(self.t_admit)),
+                decode_ms: dur_ms(self.t_prefilled.elapsed()),
+                spec_drafted: 0,
+                spec_accepted: 0,
+                kv_pages: 0,
+            }
+        }
+    }
+    let width = generator.canvas_width();
+    let max_ctx = generator.max_context();
+    let max_steps = generator.canvas_max_steps().max(1);
+    let per_tick = generator.canvas_tick_max().max(1);
+    let mut slots: Vec<Option<DSlot>> = (0..max_batch).map(|_| None).collect();
+    let refuse = |events: &UnboundedSender<TokenEvent>, msg: &str| {
+        let _ = events.send(TokenEvent::Error(EngineError::invalid(msg)));
+    };
+    loop {
+        // ── admission: fill the free slots, blocking only when nothing is live
+        let mut pending: Vec<(usize, Vec<u32>)> = Vec::new();
+        while let Some(k) = slots.iter().position(Option::is_none) {
+            let idle = slots.iter().all(Option::is_none) && pending.is_empty();
+            let req = if idle {
+                match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                    Ok(r) => r,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if ctl.stop_requested() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            } else {
+                match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            };
+            let t_admit = std::time::Instant::now();
+            let queued_ms = req
+                .submitted
+                .map_or(0, |t| dur_ms(t_admit.saturating_duration_since(t)));
+            // what a canvas cannot carry, refused by name (the serial loop's
+            // rules); a read's canvas is checked like the serial path's
+            if req.mm_chunks.is_some() {
+                refuse(
+                    &req.events,
+                    "images are not served on a block-diffusion model",
+                );
+                continue;
+            }
+            if req.constraint.is_some() {
+                refuse(
+                    &req.events,
+                    "structured outputs are not served on a block-diffusion model: the canvas is \
+                     not sampled left to right, so a grammar cannot constrain it",
+                );
+                continue;
+            }
+            if req.logprobs.is_some() {
+                refuse(
+                    &req.events,
+                    "per-token logprobs are not served on a block-diffusion model; the structured \
+                     read (/v1/systemone) is its probability surface",
+                );
+                continue;
+            }
+            if req.prompt.is_empty() {
+                refuse(&req.events, "empty prompt");
+                continue;
+            }
+            let tail = req
+                .canvas_read
+                .as_ref()
+                .map_or(width.min(req.max_tokens.max(1)), |r| r.canvas.len());
+            if let Some(r) = &req.canvas_read
+                && (r.canvas.is_empty() || r.canvas.len() > width)
+            {
+                refuse(
+                    &req.events,
+                    "the read canvas must hold 1 .. canvas_width positions",
+                );
+                continue;
+            }
+            if req.prompt.len() + tail > max_ctx {
+                let _ = req
+                    .events
+                    .send(TokenEvent::Error(EngineError::context_overflow(
+                        req.prompt.len() + tail,
+                        max_ctx,
+                    )));
+                continue;
+            }
+            let temperature = if req.sampler.temperature <= 0.0 {
+                Some(0.0)
+            } else {
+                None
+            };
+            slots[k] = Some(DSlot {
+                events: req.events,
+                stop_tokens: req.stop_tokens,
+                max_tokens: req.max_tokens,
+                temperature,
+                seed: req.sampler.seed,
+                read: req.canvas_read,
+                base: req.prompt.len(),
+                emitted: 0,
+                canvas: None,
+                steps: 0,
+                queued_ms,
+                t_admit,
+                t_prefilled: t_admit,
+            });
+            pending.push((k, req.prompt));
+        }
+        if !pending.is_empty() {
+            metrics.phase.store(PHASE_PREFILL, Relaxed);
+            match generator.forward_prefill_batch(&pending) {
+                Ok(_) => {
+                    let now = std::time::Instant::now();
+                    for (k, _) in &pending {
+                        if let Some(s) = slots[*k].as_mut() {
+                            s.t_prefilled = now;
+                        }
+                    }
+                }
+                Err(e) => {
+                    for (k, _) in pending {
+                        if let Some(s) = slots[k].take() {
+                            let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                        }
+                    }
+                }
+            }
+        }
+        // ── every live slot without a canvas opens its next one
+        for slot in slots.iter_mut() {
+            let Some(s) = slot.as_mut() else {
+                continue;
+            };
+            if s.canvas.is_some() {
+                continue;
+            }
+            let opened = (|| -> Result<(usize, usize, u64), GenError> {
+                if let Some(read) = &s.read {
+                    let h = generator.canvas_open(read.canvas.len())?;
+                    generator.canvas_set(h, &read.canvas)?;
+                    return Ok((h, read.canvas.len(), 0));
+                }
+                let w = width.min(s.max_tokens - s.emitted).max(1);
+                let block_offset = (s.base as u32).wrapping_mul(2_654_435_761);
+                let h = generator.canvas_open(w)?;
+                let ids = generator.canvas_noise(w, s.seed, block_offset);
+                generator.canvas_set(h, &ids)?;
+                Ok((h, w, s.seed ^ u64::from(block_offset)))
+            })();
+            match opened {
+                Ok(c) => s.canvas = Some(c),
+                Err(e) => {
+                    let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                    *slot = None;
+                }
+            }
+        }
+        // ── the tick: every live canvas, in groups the prefill scratch holds
+        let live: Vec<usize> = (0..slots.len())
+            .filter(|&k| slots[k].as_ref().is_some_and(|s| s.canvas.is_some()))
+            .collect();
+        metrics.active_slots.store(live.len() as u32, Relaxed);
+        if live.is_empty() {
+            metrics.phase.store(PHASE_IDLE, Relaxed);
+            continue;
+        }
+        metrics.phase.store(PHASE_DECODE, Relaxed);
+        let mut outcomes: Vec<(usize, CanvasStatus)> = Vec::with_capacity(live.len());
+        for group in live.chunks(per_tick) {
+            let ticks: Vec<CanvasTickReq> = group
+                .iter()
+                .map(|&k| {
+                    let s = slots[k].as_ref().expect("live");
+                    let (handle, _, seed) = s.canvas.expect("live");
+                    CanvasTickReq {
+                        handle,
+                        slot: k,
+                        base: s.base,
+                        temperature: if s.read.is_some() {
+                            Some(1.0)
+                        } else {
+                            s.temperature
+                        },
+                        seed,
+                        accept: s.read.is_none(),
+                    }
+                })
+                .collect();
+            match generator.canvas_tick(&ticks) {
+                Ok(st) => outcomes.extend(group.iter().copied().zip(st)),
+                Err(e) => {
+                    for &k in group {
+                        if let Some(s) = slots[k].take() {
+                            if let Some((h, _, _)) = s.canvas {
+                                generator.canvas_close(h);
+                            }
+                            let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                        }
+                    }
+                }
+            }
+        }
+        // ── outcomes: a read answers; a converged (or exhausted) canvas emits
+        for (k, status) in outcomes {
+            let Some(s) = slots[k].as_mut() else {
+                continue;
+            };
+            let (h, _, _) = s.canvas.expect("ticked");
+            s.steps += 1;
+            if let Some(read) = &s.read {
+                let res = generator.canvas_result(h, &read.label_ids);
+                generator.canvas_close(h);
+                let s = slots[k].take().expect("live");
+                match res {
+                    Ok(out) => {
+                        let _ = s.read.as_ref().expect("read").reply.send(out);
+                        let _ = s
+                            .events
+                            .send(TokenEvent::Done(FinishReason::Stop, s.stats()));
+                    }
+                    Err(e) => {
+                        let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                    }
+                }
+                continue;
+            }
+            if !status.converged && s.steps < max_steps {
+                continue;
+            }
+            let block = match generator.canvas_result(h, &[]) {
+                Ok(out) => out.argmax,
+                Err(e) => {
+                    generator.canvas_close(h);
+                    let s = slots[k].take().expect("live");
+                    let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                    continue;
+                }
+            };
+            generator.canvas_close(h);
+            s.canvas = None;
+            s.steps = 0;
+            let mut finished = false;
+            for &id in &block {
+                if s.stop_tokens.contains(&id) {
+                    finish_sampled_stop(&s.events, metrics, s.stats());
+                    finished = true;
+                    break;
+                }
+                if s.events
+                    .send(TokenEvent::Token { id, logprobs: None })
+                    .is_err()
+                {
+                    finished = true; // the client went away
+                    break;
+                }
+                metrics.tokens_generated.fetch_add(1, Relaxed);
+                s.emitted += 1;
+                if s.emitted >= s.max_tokens {
+                    let _ = s
+                        .events
+                        .send(TokenEvent::Done(FinishReason::Length, s.stats()));
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                slots[k] = None;
+                continue;
+            }
+            // the answer goes on: the block's K/V become real, the next
+            // canvas starts behind it (opened at the top of the next round)
+            if let Err(e) = generator.canvas_commit_slot(k, s.base, &block) {
+                let s = slots[k].take().expect("live");
+                let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                continue;
+            }
+            s.base += block.len();
+        }
+        let occupied: Vec<bool> = slots.iter().map(Option::is_some).collect();
+        generator.release_inactive_slots(&occupied);
+    }
 }
 
 fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineMetrics) {
@@ -1496,6 +2030,65 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
     // indexes off the end of the window (the batched twin corrupted a
     // block-table stripe on exactly this).
     req.max_tokens = req.max_tokens.min(max_ctx.saturating_sub(rows as usize));
+
+    // A structured read: one forward of the seeded canvas after the prompt,
+    // the label probabilities on the request's reply channel, then Done.
+    // Nothing is generated and nothing is committed.
+    if let Some(read) = req.canvas_read.take() {
+        if generator.canvas_width() == 0 {
+            let _ = req.events.send(TokenEvent::Error(EngineError::invalid(
+                "structured reads need a block-diffusion model",
+            )));
+            return;
+        }
+        if read.canvas.is_empty() || read.canvas.len() > generator.canvas_width() {
+            let _ = req.events.send(TokenEvent::Error(EngineError::invalid(
+                "the read canvas must hold 1 .. canvas_width positions",
+            )));
+            return;
+        }
+        if rows as usize + read.canvas.len() > max_ctx {
+            let _ = req
+                .events
+                .send(TokenEvent::Error(EngineError::context_overflow(
+                    rows as usize + read.canvas.len(),
+                    max_ctx,
+                )));
+            return;
+        }
+        let t_read = std::time::Instant::now();
+        match generator.canvas_read(rows as usize, &read.canvas, &read.label_ids) {
+            Ok(out) => {
+                let _ = read.reply.send(out);
+                let _ = req.events.send(TokenEvent::Done(
+                    FinishReason::Stop,
+                    RunStats {
+                        sampled_stop: false,
+                        queued_ms,
+                        prefill_ms: dur_ms(t_read.saturating_duration_since(t_admit)),
+                        decode_ms: dur_ms(t_read.elapsed()),
+                        spec_drafted: 0,
+                        spec_accepted: 0,
+                        kv_pages: 0,
+                    },
+                ));
+            }
+            Err(e) => {
+                let _ = req
+                    .events
+                    .send(TokenEvent::Error(EngineError::from_gen(&e)));
+            }
+        }
+        return;
+    }
+
+    // Block diffusion (DiffusionGemma): the prompt is in KV; the answer is
+    // written a whole canvas at a time. Its own loop - nothing below (host
+    // sampling, penalties, the decode pipe, spec) applies to a canvas.
+    if generator.canvas_width() > 0 {
+        run_request_diffusion(generator, req, rows as usize, t_admit, queued_ms, metrics);
+        return;
+    }
 
     let mut history = req.prompt.clone();
     let mut sampler = Sampler::new(req.sampler);
@@ -1784,10 +2377,21 @@ struct Slot {
     chunk_started: Option<std::time::Instant>,
     spec_drafted: u32,
     spec_accepted: u32,
+    /// The constraint was in its free phase after the last committed token
+    /// (true without one). `note_constraint` watches it leave: that token
+    /// opened the reply's first tool call.
+    constraint_free: bool,
+    /// The reply's first tool call just started and the backend has not been
+    /// told yet - `drain_reply_pins` hands it to `Generator::reply_pin`
+    /// before this slot's next forward or commit.
+    reply_pin_due: bool,
+    /// The pin was taken; once per reply.
+    reply_pinned: bool,
 }
 
 impl Slot {
     fn new(mut req: GenRequest, metrics: Arc<EngineMetrics>) -> Self {
+        let constraint_free = req.constraint.as_ref().is_none_or(|c| c.free_now());
         Slot {
             history: req.prompt.clone(),
             prompt: req.prompt,
@@ -1812,7 +2416,28 @@ impl Slot {
             chunk_started: None,
             spec_drafted: 0,
             spec_accepted: 0,
+            constraint_free,
+            reply_pin_due: false,
+            reply_pinned: false,
         }
+    }
+
+    /// Call after the constraint accepted a token: the free phase ending here
+    /// means the reply just opened its first tool call (a tool-choice gate
+    /// arming, a dispatcher entering a call), and the backend's reply
+    /// checkpoint is due to be held there (`Generator::reply_pin`). Reading
+    /// the constraint rather than a dialect's call marker keeps it
+    /// family-agnostic: the machine is exactly what knows a call began.
+    fn note_constraint(&mut self) {
+        let Some(c) = self.constraint.as_ref() else {
+            return;
+        };
+        let free = c.free_now();
+        if self.constraint_free && !free && !self.reply_pinned {
+            self.reply_pinned = true;
+            self.reply_pin_due = true;
+        }
+        self.constraint_free = free;
     }
 
     /// The §8.8 stats snapshot, taken at Done time.
@@ -1888,6 +2513,7 @@ impl Slot {
             finish_sampled_stop(&self.events, &self.metrics, self.run_stats());
             return false;
         }
+        self.note_constraint();
         self.history.push(next);
         self.generated += 1;
         self.metrics.tokens_generated.fetch_add(1, Relaxed);
@@ -2637,6 +3263,8 @@ fn run_batched(
     // scheduler + backend queue bound on prompts advancing through mixed
     // ticks at once (see max_chunks_inflight)
     let mut chunking: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // time-budgeted mixed ticks at long context, every family (crate::pacing)
+    let mut pacers = crate::pacing::Pacers::new();
     // In-flight shared-prefix dedupe - SGLang's in-batch prefix caching in
     // the form a DeltaNet hybrid needs. A cohort that arrives together and
     // shares a prefix (one system prompt, N users; a benchmark's shared
@@ -2782,6 +3410,9 @@ fn run_batched(
     let mut last_stall_warn: Option<std::time::Instant> = None;
 
     loop {
+        // Every reply that opened its first tool call last tick has its
+        // checkpoint held before any forward can move the slot past the call.
+        drain_reply_pins(generator, &mut slots);
         // Close out the previous tick for the controller before anything else
         // touches the clock. Every decoding tick reports - including the plain
         // dense ones at k=0, which are the baseline the speculative cells are
@@ -4229,12 +4860,23 @@ fn run_batched(
                             Some((k, plan))
                         })
                         .collect();
-                    let launched = generator.forward_mixed_spec_begin(
-                        &reqs,
+                    // the round waits on the span beside it: pace the span
+                    let verify_rows: usize = reqs.iter().map(|r| r.2.len()).sum();
+                    let (spec_budget, spec_tick, launched) = match pacers.begin(
+                        crate::pacing::TickKind::Spec,
+                        generator,
+                        reqs.len(),
+                        verify_rows,
                         prefill_tick_rows(),
-                        &splans,
-                        &spec_fin_plans,
-                    );
+                        verify_rows,
+                    ) {
+                        Err(e) => (prefill_tick_rows(), None, Err(e)),
+                        Ok((b, t)) => (
+                            b,
+                            t,
+                            generator.forward_mixed_spec_begin(&reqs, b, &splans, &spec_fin_plans),
+                        ),
+                    };
                     if let Ok(true) = launched {
                         let t_df = std::time::Instant::now();
                         let ndf = mix_deferred.len();
@@ -4262,12 +4904,15 @@ fn run_batched(
                         Ok(true) => generator.forward_mixed_spec_finish(),
                         Ok(false) => generator.forward_mixed_spec_plans(
                             &reqs,
-                            prefill_tick_rows(),
+                            spec_budget,
                             &splans,
                             &spec_fin_plans,
                         ),
                         Err(e) => Err(e),
                     };
+                    if mixed_res.is_ok() {
+                        pacers.end(&*generator, spec_tick);
+                    }
                     match mixed_res {
                         Ok((Some(picks), finished)) => {
                             // async round: fill the placeholder chunks with
@@ -4562,21 +5207,27 @@ fn run_batched(
                     crate::tickseg::gap(m.elapsed());
                 }
                 let seg_t = std::time::Instant::now();
-                let mixed_result = if unified_now {
-                    generator.forward_unified_sampled(
-                        &dec,
-                        mixed_tick_budget(dec.len()),
-                        &plans,
-                        &fin_plans,
-                    )
+                let kind = if unified_now {
+                    crate::pacing::TickKind::Unified
                 } else {
-                    generator.forward_mixed_sampled(
-                        &dec,
-                        mixed_tick_budget(dec.len()),
-                        &plans,
-                        &fin_plans,
-                    )
+                    crate::pacing::TickKind::Mixed
                 };
+                let nd = dec.len();
+                let mixed_result =
+                    match pacers.begin(kind, generator, nd, nd, mixed_tick_budget(nd), nd) {
+                        Err(e) => Err(e),
+                        Ok((budget, tick)) => {
+                            let r = if unified_now {
+                                generator.forward_unified_sampled(&dec, budget, &plans, &fin_plans)
+                            } else {
+                                generator.forward_mixed_sampled(&dec, budget, &plans, &fin_plans)
+                            };
+                            if r.is_ok() {
+                                pacers.end(&*generator, tick);
+                            }
+                            r
+                        }
+                    };
                 match mixed_result {
                     Ok((step, finished)) => {
                         if crate::tickseg::on() {
@@ -4692,7 +5343,25 @@ fn run_batched(
                 crate::tickseg::gap(m.elapsed());
             }
             let seg_t = std::time::Instant::now();
-            match generator.forward_mixed(&dec, mixed_tick_budget(dec.len())) {
+            let nd = dec.len();
+            let mixed_result = match pacers.begin(
+                crate::pacing::TickKind::Mixed,
+                generator,
+                nd,
+                nd,
+                mixed_tick_budget(nd),
+                nd,
+            ) {
+                Err(e) => Err(e),
+                Ok((budget, tick)) => {
+                    let r = generator.forward_mixed(&dec, budget);
+                    if r.is_ok() {
+                        pacers.end(&*generator, tick);
+                    }
+                    r
+                }
+            };
+            match mixed_result {
                 Ok((mut dlogits, finished)) => {
                     if crate::tickseg::on() {
                         crate::tickseg::fwd(seg_t.elapsed());
@@ -5569,7 +6238,18 @@ fn run_batched(
                         .iter()
                         .map(|&k| (k, slots[k].as_ref().expect("live").pending))
                         .collect();
-                    let model_drafts = if k_budget > 0 {
+                    // The warm pass every other round runs first (see the
+                    // greedy and device branches): it re-syncs the draft head
+                    // over whatever advanced the slot without it - a prefix-
+                    // cache resume, a dense tick, a cooldown. Skipped here,
+                    // the first desync after a session's first turn left
+                    // every later round of this branch - the one constrained
+                    // slots (every tool-carrying agent request) speculate
+                    // through - drafting from a stale head until the verify
+                    // declined into the 256-tick cooldown, over and over.
+                    let any_warm =
+                        k_budget > 0 && spec_warm_vec(generator, &slots, &live).iter().any(|&w| w);
+                    let model_drafts = if any_warm {
                         let draft_k = synchronous_draft_budget(
                             k_budget,
                             generator.spec_block_width(),
@@ -5670,6 +6350,10 @@ fn run_batched(
                                         if let Some(c) = slot.constraint.as_mut() {
                                             c.accept(t);
                                         }
+                                        // a call opening mid-round (and maybe
+                                        // closing again before the round ends)
+                                        // is seen here, per pick
+                                        slot.note_constraint();
                                         if j + 1 < chunk.len() && t != chunk[j + 1] {
                                             break;
                                         }
@@ -5706,6 +6390,8 @@ fn run_batched(
                                     }
                                     base_row += chunk.len();
                                 }
+                                // before the commit snapshots past the call
+                                drain_reply_pins(generator, &mut slots);
                                 if let Err(e) = generator.spec_commit(&committed) {
                                     for slot in slots.iter_mut() {
                                         if let Some(s) = slot.take() {
@@ -5721,7 +6407,14 @@ fn run_batched(
                                 }
                                 continue; // round done - next tick
                             }
-                            Ok(None) => spec_retry_at = spec_ticks + 256,
+                            Ok(None) => {
+                                if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
+                                    tracing::info!(
+                                        "[spec-sampled] verify declined - 256-tick cooldown"
+                                    );
+                                }
+                                spec_retry_at = spec_ticks + 256
+                            }
                             Err(e) => {
                                 for slot in slots.iter_mut() {
                                     if let Some(s) = slot.take() {
@@ -6379,6 +7072,126 @@ fn sample_slot_row(slot_opt: &mut Option<Slot>, row: &mut [f32]) {
 }
 
 #[cfg(test)]
+mod reply_pin_tests {
+    use super::*;
+
+    /// Free until token 100 opens a call, constrained until 101 closes it -
+    /// the shape of a tool-choice gate / dispatcher.
+    struct Calls {
+        in_call: bool,
+    }
+
+    impl TokenConstraint for Calls {
+        fn allows(&self, _id: u32) -> bool {
+            true
+        }
+        fn accept(&mut self, id: u32) {
+            match id {
+                100 => self.in_call = true,
+                101 => self.in_call = false,
+                _ => {}
+            }
+        }
+        fn may_stop(&self) -> bool {
+            !self.in_call
+        }
+        fn free_now(&self) -> bool {
+            !self.in_call
+        }
+    }
+
+    struct Pins(Vec<usize>);
+
+    impl Generator for Pins {
+        fn reset(&mut self) {}
+        fn forward(&mut self, _token: u32) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0.0])
+        }
+        fn vocab(&self) -> usize {
+            1
+        }
+        fn reply_pin(&mut self, slot: usize) {
+            self.0.push(slot);
+        }
+    }
+
+    fn slot(constraint: Option<Box<dyn TokenConstraint>>) -> Slot {
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(rx); // keep the channel open: accept() sends on it
+        Slot::new(
+            GenRequest {
+                prompt: vec![1],
+                max_tokens: 64,
+                sampler: SamplingParams::default(),
+                stop_tokens: vec![2],
+                events,
+                mm_chunks: None,
+                constraint,
+                logprobs: None,
+                submitted: None,
+                canvas_read: None,
+            },
+            Arc::new(EngineMetrics::default()),
+        )
+    }
+
+    /// What pick_next does, then what the tick does with the token.
+    fn commit(s: &mut Slot, t: u32) {
+        if let Some(c) = s.constraint.as_mut() {
+            c.accept(t);
+        }
+        assert!(s.accept(t, None));
+    }
+
+    /// The token that opens the reply's first call makes the pin due; the
+    /// drain hands it to the backend once, for that slot; a second call in
+    /// the same reply does not move it.
+    #[test]
+    fn the_first_call_pins_the_reply_once() {
+        let mut slots = vec![None, Some(slot(Some(Box::new(Calls { in_call: false }))))];
+        let mut g = Pins(Vec::new());
+        let s = slots[1].as_mut().unwrap();
+        for t in [5, 6, 7] {
+            commit(s, t);
+        }
+        assert!(!s.reply_pin_due, "free-phase tokens pin nothing");
+        commit(s, 100);
+        assert!(s.reply_pin_due);
+        drain_reply_pins(&mut g, &mut slots);
+        assert_eq!(g.0, [1]);
+        let s = slots[1].as_mut().unwrap();
+        for t in [8, 101, 9, 100, 10] {
+            commit(s, t);
+        }
+        drain_reply_pins(&mut g, &mut slots);
+        assert_eq!(g.0, [1], "one pin per reply");
+    }
+
+    /// A call opened and closed inside one sampled round is still seen: the
+    /// round's walk notes the machine after every pick, not once at the end.
+    #[test]
+    fn a_call_inside_one_round_still_pins() {
+        let mut s = slot(Some(Box::new(Calls { in_call: false })));
+        for t in [100, 3, 101] {
+            s.constraint.as_mut().unwrap().accept(t);
+            s.note_constraint();
+        }
+        assert!(s.reply_pin_due);
+    }
+
+    #[test]
+    fn an_unconstrained_reply_never_pins() {
+        let mut slots = vec![Some(slot(None))];
+        for t in [100, 3, 101] {
+            commit(slots[0].as_mut().unwrap(), t);
+        }
+        let mut g = Pins(Vec::new());
+        drain_reply_pins(&mut g, &mut slots);
+        assert!(g.0.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod usage_tests {
     use super::*;
 
@@ -6398,6 +7211,7 @@ mod usage_tests {
                     constraint: None,
                     logprobs: None,
                     submitted: None,
+                    canvas_read: None,
                 },
                 metrics.clone(),
             );
@@ -6437,6 +7251,7 @@ mod usage_tests {
                 constraint: None,
                 logprobs: None,
                 submitted: None,
+                canvas_read: None,
             },
             metrics.clone(),
         );
@@ -6523,6 +7338,7 @@ mod usage_tests {
                     constraint: None,
                     logprobs: None,
                     submitted: None,
+                    canvas_read: None,
                 },
                 Arc::new(EngineMetrics::default()),
             )
@@ -6595,6 +7411,7 @@ mod usage_tests {
                 constraint: None,
                 logprobs: None,
                 submitted: None,
+                canvas_read: None,
             },
             &metrics,
         );
@@ -6742,6 +7559,7 @@ mod serial_pipe_tests {
                 constraint: None,
                 logprobs: None,
                 submitted: None,
+                canvas_read: None,
             },
             &metrics,
         );

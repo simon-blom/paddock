@@ -392,6 +392,12 @@ impl GgufTokenizer {
         self.inner.token_to_id(token)
     }
 
+    /// Ids the vocabulary spans, added tokens included - the range a random
+    /// canvas id is drawn from.
+    pub fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.inner.id_to_token(id)
     }

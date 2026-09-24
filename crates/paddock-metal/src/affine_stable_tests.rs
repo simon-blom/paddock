@@ -8,6 +8,85 @@ fn bf(value: f32) -> f32 {
 }
 
 #[test]
+fn llama_affine_cohorts_preserve_isolated_contracts_and_scratch_grants() {
+    let device = MetalDevice::new(None).unwrap();
+    let lengths = [1usize, 1, 4, 29, 17, 33, 34];
+    let rows: usize = lengths.iter().sum();
+    for (k, n) in [(2048, 256), (2048, 2048), (2048, 6144), (6144, 2048)] {
+        let mut bytes: Vec<_> = (0..k * n / 8)
+            .flat_map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        for bias in [false, true] {
+            bytes.extend((0..k * n / 64).flat_map(|i| {
+                let s = (i % 251 + 1) as f32 / 9973.;
+                half::bf16::from_f32(if bias { -7.5 * s } else { s })
+                    .to_bits()
+                    .to_le_bytes()
+            }));
+        }
+        let weight = Weight {
+            buffer: device.upload(&bytes).unwrap(),
+            ty: affine::AFFINE4,
+            k,
+            n,
+        };
+        let values: Vec<_> = (0..rows * k)
+            .map(|i| bf(((i * 37) % 1999) as f32 / 113. - 8.))
+            .collect();
+        let input = device
+            .upload(
+                &values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let output = device.alloc((rows * n + 32) * 4).unwrap();
+        let mut spans = Vec::new();
+        let mut first = 0;
+        for &count in &lengths {
+            spans.push((first, count, count));
+            first += count;
+        }
+        for capacity in [34, 512] {
+            // The smaller grant forces compatible cohorts to split before
+            // their partial-result tail would overrun existing workspace.
+            let bytes = affine::workspace_bytes(k, n, capacity);
+            let workspace = device.alloc(bytes).unwrap();
+            let mut expected = Vec::new();
+            for &(first, count, _) in &spans {
+                let x = device
+                    .upload(
+                        &values[first * k..(first + count) * k]
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let cmd = device.begin().unwrap();
+                affine::project_llama(&cmd, &[(&weight, &output)], &x, count, &workspace);
+                cmd.finish().unwrap();
+                expected.extend(unsafe { output.read_f32(0, count * n) });
+            }
+            unsafe {
+                output.write_u32(&vec![u32::MAX; rows * n + 32]);
+            }
+            let cmd = device.begin().unwrap().with_projection_rows(&spans);
+            affine::project_llama(&cmd, &[(&weight, &output)], &input, rows, &workspace);
+            cmd.finish().unwrap();
+            let actual = unsafe { output.read_f32(0, rows * n) };
+            assert!(actual.iter().all(|v| v.is_finite()));
+            assert_eq!(actual, expected, "k={k} n={n} capacity={capacity}");
+            assert!(
+                unsafe { output.read_u32(rows * n + 32) }[rows * n..]
+                    .iter()
+                    .all(|v| *v == u32::MAX)
+            );
+        }
+    }
+}
+
+#[test]
 fn stable_affine_mixed_phases_preserve_isolated_rows_and_guards() {
     let device = MetalDevice::new(None).unwrap();
     for k in [5120usize, 6144, 17408] {

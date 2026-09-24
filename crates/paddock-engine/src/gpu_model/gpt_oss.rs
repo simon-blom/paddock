@@ -2004,6 +2004,7 @@ impl GpuGptOss {
                                 &layer.sinks_dev,
                                 &mut bs.d_attn,
                                 d_pos,
+                                None, // causal rows: the bound is the position
                                 sl,
                                 bs.d_bt[layer.is_swa as usize]
                                     .as_ref()
@@ -2027,6 +2028,7 @@ impl GpuGptOss {
                                 &layer.sinks_dev,
                                 &mut bs.d_attn,
                                 d_pos,
+                                None, // causal rows: the bound is the position
                                 sl,
                                 n_heads,
                                 n_kv_heads,
@@ -3675,6 +3677,23 @@ impl GpuGptOss {
             done: l,
         });
         Ok(())
+    }
+
+    /// `Generator::prefill_queue`: `forward_mixed_core` fills its budget FIFO
+    /// over `chunked`, from each prompt's `done`.
+    pub(crate) fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.done, c.tokens.len() - c.done))
+            .collect()
+    }
+
+    /// `Generator::prefill_tick_cap`: the pass's row cap less its decode rows
+    /// (`forward_mixed_core`'s own room).
+    pub(crate) fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.batch
+            .as_ref()
+            .map_or(0, |bs| bs.row_cap.saturating_sub(decode_rows))
     }
 
     /// One MIXED continuous-batching tick: every live decode row plus up to

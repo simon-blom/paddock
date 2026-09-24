@@ -1,13 +1,31 @@
 import Foundation
 
 /// Native counterpart of Studio's tokens.ts windowRemaining policy. A missing
-/// user cap means available context, not omission of max_output_tokens (which
-/// would silently elect the runner's 1024-token API default).
+/// user cap means available context, sent as an explicit max_output_tokens so
+/// the run record shows what rode (the runner's own default for an omitted cap
+/// has been the window too since 2026-09-22; it was a flat 1024 before).
 enum NativeReplyBudget {
   typealias V = ConversationValue
+  /// One lane's effective ceiling. Unknown capacity is nil (leave the field
+  /// out and let the endpoint choose), not a guessed 4096-token maximum.
+  /// A custom preference is an upper bound, so it too respects model limits.
+  static func resolve(
+    requested: Int?, cloud: Bool, context: Int, prompt: Int = 0,
+    outputCeiling: Int? = nil, exact: Int = 0
+  ) -> Int? {
+    let ceiling = outputCeiling.flatMap { $0 > 0 ? $0 : nil }
+    var available =
+      context > 0
+      ? (cloud
+        ? maximum(context: context, prompt: prompt, outputCeiling: ceiling, exact: exact)
+        : context) : ceiling
+    if let limit = available, let ceiling { available = min(limit, ceiling) }
+    guard let requested else { return available }
+    return available.map { min(requested, $0) } ?? requested
+  }
   /// Paddock clamps against the exactly tokenized prompt in service.rs (also
   /// after multimodal admission). Do not waste another 1024 tokens on a client
-  /// estimate. The API default is still bypassed by this explicit ceiling.
+  /// estimate.
   static func localMaximum(context: Int) -> Int { context > 0 ? context : 4096 }
   /// Below this much real room a turn is refused rather than sent.
   static let minimumUsefulReply = 256

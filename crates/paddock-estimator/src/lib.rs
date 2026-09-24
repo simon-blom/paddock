@@ -53,7 +53,7 @@ pub const GRAPH_MARGIN: u64 = (3 << 30) - CUDA_CONTEXT;
 /// Fixed overhead for a model of this kind.
 fn fixed_overhead(kind: ModelKind) -> u64 {
     match kind {
-        ModelKind::Encoder => CUDA_CONTEXT,
+        ModelKind::Encoder | ModelKind::Image => CUDA_CONTEXT,
         ModelKind::Generative => CUDA_CONTEXT + GRAPH_MARGIN,
     }
 }
@@ -181,6 +181,14 @@ pub enum ModelKind {
     /// (`serving::is_encoder_arch`). Pricing them with a decode cache is how a
     /// 0.6B embedding model came out "needing" 124 GB.
     Encoder,
+    /// Image generation: a diffusion transformer with its text encoder and
+    /// VAE beside it. One render per request and nothing kept between them,
+    /// so it prices like an encoder - weights, companions, workspace, no KV
+    /// pool, no logits - but it is its own kind because its "context" is a
+    /// picture: the workspace is sized by the largest output the endpoint
+    /// serves, not by a token window, and the Studio must not draw it a
+    /// context slider.
+    Image,
 }
 
 /// Static cross-attention K/V an encoder-decoder holds per slot (whisper).
@@ -698,7 +706,7 @@ pub enum Fit {
 /// dependency on the context it is used to derive.
 fn block_tables(shape: &ModelShape, env: &Envelope) -> u64 {
     match shape.kind {
-        ModelKind::Encoder => 0,
+        ModelKind::Encoder | ModelKind::Image => 0,
         ModelKind::Generative => env.concurrency * shape.max_ctx.div_ceil(16) * 4,
     }
 }
@@ -708,7 +716,7 @@ fn block_tables(shape: &ModelShape, env: &Envelope) -> u64 {
 /// couple of rows per call and is transient, so it rides in the margin.
 fn logits(shape: &ModelShape, env: &Envelope) -> u64 {
     match shape.kind {
-        ModelKind::Encoder => 0,
+        ModelKind::Encoder | ModelKind::Image => 0,
         // A speculative round scores 1 pending + K drafted tokens per slot in
         // one pass, so the plane is that many times wider and stays resident
         // for the round.
@@ -720,7 +728,9 @@ fn logits(shape: &ModelShape, env: &Envelope) -> u64 {
 }
 
 pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
-    let encoder = shape.kind == ModelKind::Encoder;
+    // "encoder" below means the single-pass class - nothing held between
+    // calls, no pool to size. An image lane is priced the same way.
+    let encoder = shape.kind != ModelKind::Generative;
     let n = env.concurrency.max(1);
     let kv_sequences = n.saturating_add(shape.kv_reserve_sequences);
     // An encoder holds nothing between calls, so concurrency is the only knob

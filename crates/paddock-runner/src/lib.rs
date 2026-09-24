@@ -1,3 +1,7 @@
+// `/api/server`'s one-call model card is a single `serde_json::json!`
+// literal with a key per served capability; the macro recurses per token
+// and the default 128 ran out when the image-generation keys joined it.
+#![recursion_limit = "256"]
 //! The paddock **runner** - the data plane. One process, one served model, one
 //! port, the full API surface (OpenAI chat + Responses, Anthropic messages,
 //! embeddings/rerank). Headless and stateless on disk: no SQLite, no Studio
@@ -23,8 +27,10 @@ pub mod filters;
 pub mod forced_align;
 pub mod forensics;
 pub mod harmony;
+pub mod images;
 pub mod language;
 pub mod messages;
+pub mod messages_system;
 pub mod metrics;
 pub mod muse;
 pub mod paddle_ocr;
@@ -41,6 +47,7 @@ pub mod serving;
 pub mod startup;
 pub mod stats;
 pub mod subtitles;
+pub mod systemone;
 pub mod tiffdoc;
 pub use paddock_mcp::{loop_budget, tool_search};
 pub mod transcriptions;
@@ -360,6 +367,7 @@ pub async fn run(
     // are generative and serve chat/completions.
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
     let mut segmenter = None;
+    let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
     if let Some(path) = &cfg.model {
@@ -386,7 +394,7 @@ pub async fn run(
         // (routed through serving::load like every other generator).
         let audio_companion = cfg.mmproj.as_deref().is_some_and(serving::mmproj_is_audio);
         // Normalize --kv-cache-dtype into the env transport the engine reads
-        // (the PADDOCK_MAX_OUTPUT_TOKENS pattern) before the arch branch:
+        // before the arch branch:
         // whisper serves through `load_asr`, which is not the generative
         // lane, and leaving this inside the generative branch made the flag a
         // silent no-op for the one family whose KV bytes dominate its wall.
@@ -410,7 +418,50 @@ pub async fn run(
                 );
             }
         }
-        if let Some(dir) = serving::segment_dir(path) {
+        if let Some(root) = serving::image_mlx_dir(path) {
+            if cfg.text_encoder.is_some() || cfg.vae.is_some() || cfg.mmproj.is_some() {
+                return Err("Qwen-Image MLX is self-contained; remove GGUF text-encoder, VAE and mmproj overrides".into());
+            }
+            let id = root
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(id);
+            let m = serving::load_image_mlx(
+                cfg.served_model_name.clone().unwrap_or(id),
+                &root,
+                &cfg.device,
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(model = %m.id, "MLX image-generation model ready");
+            image = Some(m);
+        } else if serving::is_image_gguf(path) {
+            // Image generation (Qwen-Image): a DiT GGUF that says nothing
+            // about itself - identified by its tensor names - plus the
+            // text-encoder GGUF and the VAE it cannot run without. Both are
+            // required by name, not discovered: a diffusion model served
+            // with the wrong encoder produces images that are quietly wrong.
+            let (Some(te), Some(vae)) = (cfg.text_encoder.as_deref(), cfg.vae.as_deref()) else {
+                return Err(format!(
+                    "{} is an image-generation DiT: pass its text encoder (--text-encoder \
+                     <Qwen3-VL GGUF>) and VAE (--vae <safetensors>) too",
+                    path.display()
+                )
+                .into());
+            };
+            let m = serving::load_image(
+                cfg.served_model_name.clone().unwrap_or(id),
+                path,
+                te,
+                vae,
+                cfg.mmproj.as_deref(),
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(model = %m.id, "image-generation model ready");
+            image = Some(m);
+        } else if let Some(dir) = serving::segment_dir(path) {
             // Dense prediction (tic-forestry: DINOv3 + decoder): chips in,
             // rasters out, /v1/segmentations and nothing else. Like the
             // aligner it arrives as a checkpoint directory or the
@@ -710,7 +761,8 @@ pub async fn run(
         .as_ref()
         .map(|s| s.engine.metrics())
         .or_else(|| embedder.as_ref().map(|e| Arc::clone(&e.metrics)))
-        .or_else(|| asr.as_ref().map(|a| Arc::clone(&a.metrics)));
+        .or_else(|| asr.as_ref().map(|a| Arc::clone(&a.metrics)))
+        .or_else(|| image.as_ref().map(|m| Arc::clone(&m.metrics)));
     let stats = crate::stats::start(engine_metrics.clone());
     // Held for the graceful-shutdown path below: on SIGINT/SIGTERM the engine
     // thread drops the generator (freeing all device memory) before the
@@ -739,6 +791,7 @@ pub async fn run(
                 serving: serving.as_ref().map(|m| m.id.clone()),
                 embedder: embedder.as_ref().map(|e| e.id.clone()),
                 asr: asr.as_ref().map(|a| a.id.clone()),
+                image: image.as_ref().map(|m| m.id.clone()),
             },
             engine_metrics,
         )
@@ -835,10 +888,11 @@ pub async fn run(
         asr,
         aligner,
         segmenter,
+        image,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,
         max_batch: cfg.max_batch,
-        default_max_output_tokens: cfg.max_tokens.unwrap_or(1024),
+        default_max_output_tokens: cfg.max_tokens.unwrap_or(cfg.max_ctx),
         max_output_ceiling: cfg.max_output_ceiling,
         // live view: server-tool and web-search changes in the config file
         // apply on the next request (control-plane state), never via a

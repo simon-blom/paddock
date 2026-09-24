@@ -189,6 +189,7 @@ struct StudioMicrophoneSettings: View {
 /// No capture starts merely because this view or its popover is opened.
 struct StudioAudioInputSettings: View {
   @Bindable var chat: StudioWorkspace
+  var inset: CGFloat = 8
   private var audio: StudioState.Audio? { chat.state?.audio }
   private var selected: String {
     guard let audio, !audio.device.isEmpty else { return "System default" }
@@ -228,7 +229,7 @@ struct StudioAudioInputSettings: View {
         }.accessibilityIdentifier("audio-system-permission")
       }.buttonStyle(QuietButtonStyle()).font(.system(size: 11))
       if let note = audio?.deviceNote, !note.isEmpty { Text(note).font(.caption) }
-    }.padding(8)
+    }.padding(inset)
   }
   private func choose(_ id: String) {
     Task { await chat.perform("microphoneSettings", ["device": .string(id)]) }

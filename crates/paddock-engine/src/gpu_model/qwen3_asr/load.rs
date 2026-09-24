@@ -65,6 +65,7 @@ impl GpuQwen3Asr {
             .and_then(Value::as_u64)
             .map(|v| v as usize)
             .unwrap_or(head_dim);
+        let mut sections = [(n_rot / 2) as u32, 0, 0, 0];
         if let Some(Value::Array(secs)) = map.gguf().arch_field("rope.dimension_sections") {
             let sum: u64 = secs.iter().filter_map(Value::as_u64).sum();
             if sum as usize * 2 != n_rot {
@@ -72,6 +73,9 @@ impl GpuQwen3Asr {
                     "qwen3-asr: rope.dimension_sections sum {sum}*2 != rotary width {n_rot} - \
                      not the equal-axis M-RoPE geometry this family serves as plain rope"
                 )));
+            }
+            for (slot, v) in sections.iter_mut().zip(secs) {
+                *slot = v.as_u64().unwrap_or(0) as u32;
             }
         }
         if map.gguf().arch_field("rope.scaling.type").is_some()
@@ -168,6 +172,8 @@ impl GpuQwen3Asr {
                 n_vocab,
                 eps,
                 rope,
+                n_rot,
+                sections,
             },
             max_ctx,
             // f16, and MEASURED to be the right default here. fp8-e4m3 was

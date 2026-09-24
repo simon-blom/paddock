@@ -40,6 +40,14 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/prompts/{id}",
             get(get_prompt).put(update_prompt).delete(delete_prompt),
         )
+        // the Reads page's saved question sets - the prompt library's shape
+        .route("/api/reads", get(list_read_sets).post(create_read_set))
+        .route(
+            "/api/reads/{id}",
+            get(get_read_set)
+                .put(update_read_set)
+                .delete(delete_read_set),
+        )
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/export", get(export_db))
         .route(
@@ -168,6 +176,62 @@ async fn delete_prompt(
     Query(q): Query<PromptRevision>,
 ) -> Response {
     match s.db.delete_prompt_checked(&id, q.revision.as_deref()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+
+// ── read sets ────────────────────────────────────────────────────────────────
+
+async fn list_read_sets(State(s): State<Arc<AppState>>) -> Response {
+    match s.db.list_read_sets() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn get_read_set(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match s.db.list_read_sets() {
+        Ok(v) => match v
+            .into_iter()
+            .find(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        {
+            Some(p) => Json(p).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody::not_found(format!("read set {id}"))),
+            )
+                .into_response(),
+        },
+        Err(e) => err500(e),
+    }
+}
+
+async fn create_read_set(State(s): State<Arc<AppState>>, Json(doc): Json<Value>) -> Response {
+    match s.db.put_read_set(&doc) {
+        Ok(set) => Json(json!({ "ok": true, "set": set })).into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+
+async fn update_read_set(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(mut doc): Json<Value>,
+) -> Response {
+    doc["id"] = Value::String(id);
+    match s.db.put_read_set(&doc) {
+        Ok(set) => Json(json!({ "ok": true, "set": set })).into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+
+async fn delete_read_set(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<PromptRevision>,
+) -> Response {
+    match s.db.delete_read_set_checked(&id, q.revision.as_deref()) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => prompt_error(e),
     }
@@ -596,6 +660,11 @@ async fn export_db(State(state): State<Arc<AppState>>) -> Response {
 
 /// Strip credentials from a snapshot copy in place, then read its bytes.
 fn sanitize_export(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    sanitize_export_file(path)?;
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
+pub(crate) fn sanitize_export_file(path: &std::path::Path) -> Result<(), String> {
     let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
     // API keys are hashes, but drop them regardless - nothing to share here.
     conn.execute("DELETE FROM api_keys", [])
@@ -607,6 +676,9 @@ fn sanitize_export(path: &std::path::Path) -> Result<Vec<u8>, String> {
     // always carries the current schema.
     conn.execute("UPDATE cloud_endpoints SET api_key = ''", [])
         .map_err(|e| e.to_string())?;
+    // Both web plaintext and native Keychain references must stay local.
+    conn.execute("UPDATE connectors SET headers = '{}', oauth = ''", [])
+        .map_err(|e| e.to_string())?;
     // Legacy rows from before the config-file split: MCP servers
     // and the web-search key no longer live in this DB - drop the leftovers
     // from older installs so an export can't leak what current code never
@@ -615,7 +687,7 @@ fn sanitize_export(path: &std::path::Path) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM settings WHERE key = 'web_search'", [])
         .map_err(|e| e.to_string())?;
-    conn.execute_batch("VACUUM").ok(); // compact after the deletes
-    drop(conn);
-    std::fs::read(path).map_err(|e| e.to_string())
+    // Mandatory: a failed compaction must not export deleted credential bytes.
+    conn.execute_batch("VACUUM").map_err(|e| e.to_string())?;
+    Ok(())
 }

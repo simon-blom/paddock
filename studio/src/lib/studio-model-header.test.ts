@@ -166,7 +166,7 @@ describe('shared web/native model header', () => {
       expect(positions).toEqual([...positions].sort((a, b) => a - b))
     }
     // Bionic's left edge begins with attachment, rather than reasoning.
-    inOrder(tools, ['Button("Attach files"', '"Thinking", icon:', 'Button("Web search"',
+    inOrder(tools, ['"Attach a picture to edit" : "Attach files"', '"Thinking", icon:', 'Button("Web search"',
       '"Tools and connectors", icon:', '"Instructions", icon:', '"Sampling", icon:',
       'accessibilityIdentifier("composer-context")'])
     // Extra Studio settings retain their web ordering, while the microphone
@@ -185,14 +185,16 @@ describe('shared web/native model header', () => {
     const overflow = composer.split('private var overflowPresented')[1]!.split('@ViewBuilder')[0]!
     expect(tools).toContain('Button("Thinking…") { panel = .reasoning }')
     expect(tools).toContain('accessibilityIdentifier("composer-more")')
-    expect(overflow).toContain('get: { panel != nil && panel != .compare }')
+    expect(overflow).toContain('get: { panel?.usesOverflow == true }')
+    expect(composer).toContain('case .image, .compare: false')
     expect(tools).not.toContain('Button("Compare models…")')
     expect(modelPicker).toContain('Button("Compare models…", action: compare)')
   })
   it('keeps samples diagnostic-only and offers no web renderer switch', () => {
     expect(conversation).not.toMatch(/Transcript renderer|NativeMarkdownSamples|pickerStyle\(.segmented\)/)
     expect(conversation).toContain('NativeStudioTranscript(')
-    expect(conversation).toContain('WorkspaceContentView(session: chat)')
+    expect(conversation).toContain('WorkspaceContentView(session: chat, role: .document)')
+    expect(conversation).toContain('WorkspaceContentView(session: chat, role: .graph)')
     expect(rendererCommands).toContain('#if DEBUG')
     expect(rendererCommands).toContain('CommandMenu("Renderer")')
     expect(rendererCommands).not.toContain('model.chat.perform("renderer"')

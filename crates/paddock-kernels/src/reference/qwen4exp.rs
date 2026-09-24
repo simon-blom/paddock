@@ -289,6 +289,85 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
     }
 }
 
+// ── QSA (sparse attention) indexer ───────────────────────────────────────
+//
+// HF transformers `modular_qwen4_exp.py` L368-475 (4b28d51d0d): the rounding
+// points below are the reference's (its projection output, pooled mean,
+// normed q/k are bf16 tensors); the rotary is applied by the caller with
+// `YarnRope::apply_mrope` at the right position (a query at its own, a block
+// key at its block's first token).
+
+/// Round to the nearest bf16 (ties to even) and back.
+pub fn bf16r(x: f32) -> f32 {
+    half::bf16::from_f32(x).to_f32()
+}
+
+/// (1+w) RMSNorm of one `hd`-vector in the FMA form, output rounded to bf16.
+fn norm_1p_bf16(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (ms + eps).sqrt();
+    x.iter()
+        .zip(w)
+        .map(|(v, wi)| {
+            let xn = v * inv;
+            bf16r(xn + xn * wi)
+        })
+        .collect()
+}
+
+/// The indexer query of one token before its rotary: `q` holds `heads`
+/// heads of `w.len()`, each normalized on its own under the shared weight.
+pub fn qsa_idx_q(q: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    q.chunks(w.len())
+        .flat_map(|h| norm_1p_bf16(h, w, eps))
+        .collect()
+}
+
+/// One block's compressed key before its rotary: the f32 mean of its raw
+/// keys (each a bf16 value, as the reference projects them), rounded to bf16,
+/// then the (1+w) norm.
+pub fn qsa_pool_block(raw: &[&[f32]], w: &[f32], eps: f32) -> Vec<f32> {
+    let hd = w.len();
+    let mut sum = vec![0.0f32; hd];
+    for k in raw {
+        for (s, v) in sum.iter_mut().zip(*k) {
+            *s += bf16r(*v);
+        }
+    }
+    let mean: Vec<f32> = sum.iter().map(|s| bf16r(s / raw.len() as f32)).collect();
+    norm_1p_bf16(&mean, w, eps)
+}
+
+/// QSA block scores for one query: `q` holds `heads` vectors of `hd`,
+/// `keys` the query's visible complete blocks' compressed keys `[nb, hd]`;
+/// score_b = sum over heads of relu(q_h . k_b) (the reference's 1/sqrt(hd)
+/// is monotone and dropped, as the kernels drop it).
+pub fn qsa_scores(q: &[f32], keys: &[f32], hd: usize) -> Vec<f32> {
+    keys.chunks(hd)
+        .map(|k| {
+            q.chunks(hd)
+                .map(|qh| qh.iter().zip(k).map(|(a, b)| a * b).sum::<f32>().max(0.0))
+                .sum()
+        })
+        .collect()
+}
+
+/// The QSA selection from a query's block scores: the top `k` block ids
+/// (all of them when there are no more than `k`), ties to the LOWEST id, in
+/// ascending order - the kernels' deterministic reading of a tie the
+/// reference leaves unspecified.
+pub fn qsa_select(scores: &[f32], k: usize) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..scores.len() as u32).collect();
+    ids.sort_by(|&a, &b| {
+        scores[b as usize]
+            .total_cmp(&scores[a as usize])
+            .then(a.cmp(&b))
+    });
+    ids.truncate(k);
+    ids.sort_unstable();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5067,26 +5067,21 @@ impl GpuQwen35 {
             }
             (sb.n_draft + 1, self.vocab)
         };
-        let mut eligible = true;
-        // ragged slot sets accepted - see spec_draft_batch_mtp
-        for (slot, start, chunk) in reqs.iter() {
-            let sb = self.spec_batch.as_ref().expect("spec batch");
-            if *slot >= sb.alloc_batch
-                || chunk.is_empty()
-                || chunk.len() > k1
-                || *start + k1 > self.max_ctx
-                || !sb.mtp_warm[*slot]
-            {
-                eligible = false;
-                break;
-            }
-            if sb.pos[*slot] != *start {
-                self.spec_batch.as_mut().expect("spec batch").mtp_warm[*slot] = false;
-                eligible = false;
-                break;
-            }
-        }
-        if !eligible {
+        // The device round's single eligibility rule, not a copy of its MTP
+        // half: a round the DFlash drafter drafted is judged by ring
+        // coverage (which dense ticks keep current) and re-syncs sb.pos to
+        // the service's cursor; only an MTP-drafted round needs the chain
+        // warm and in step. The MTP-only copy this replaced declined every
+        // DFlash round after a prefix resume or a single dense tick - the
+        // chain is not advanced by either - and each decline armed the
+        // service's 256-tick cooldown, so a constrained slot (every
+        // tool-carrying request: this is the round that hosts the grammar)
+        // stopped speculating after its session's first turn. Measured with
+        // Claude Code's request shape on GB10 (qwen3.8-27b + DFlash2):
+        // 18-20 tok/s on the first request, 4.9 tok/s dense on every
+        // later one. Plans are the host's to draw here - no device plans.
+        let dbg = paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some();
+        if !self.spec_round_precheck(reqs, &[], k1, dbg) {
             return Ok(None);
         }
         // RAGGED k: this round's k1 = its widest chunk (min 2 so the

@@ -164,6 +164,7 @@ fn api_allowed(method: &Method, path: &str) -> bool {
                 | ["v1", "rerank"]
                 | ["v1", "realtime"]
                 | ["v1", "audio", "transcriptions" | "alignments"]
+                | ["v1", "images", "generations" | "edits"]
                 | ["v1", "messages", "count_tokens"]
                 | ["extract"]
                 | ["mcp-approvals", _]
@@ -562,6 +563,29 @@ async fn asset(policy: &Policy, path: &str, head: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_image_relay_keeps_the_session_boundary() {
+        for suffix in ["generations", "edits"] {
+            let path = format!("/api/runners/12587/v1/images/{suffix}");
+            assert!(api_allowed(&Method::POST, &path));
+            assert!(!authorized(
+                &policy(),
+                &Request::builder()
+                    .uri(&path)
+                    .header("host", "127.0.0.1:1234")
+                    .body(Body::empty())
+                    .unwrap()
+            ));
+            assert!(authorized(
+                &policy(),
+                &request(&path).method("POST").body(Body::empty()).unwrap()
+            ));
+        }
+        assert!(!api_allowed(
+            &Method::POST,
+            "/api/runners/12587/v1/images/delete"
+        ));
+    }
     fn policy() -> Policy {
         Policy {
             authority: "127.0.0.1:1234".into(),

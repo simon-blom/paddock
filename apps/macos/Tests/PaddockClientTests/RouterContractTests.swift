@@ -25,6 +25,15 @@ struct RouterContractTests {
     #expect(catalog.schema == 3)
     #expect(!catalog.models.isEmpty)
     #expect(runners.isEmpty)
+    let usage = try ManagerWire.decode(
+      UsageHistorySnapshot.self, from: Data(contentsOf: directory.appending(path: "usage.json")))
+    let activity = try ManagerWire.decode(
+      ActivitySnapshot.self, from: Data(contentsOf: directory.appending(path: "activity.json")))
+    let cache = try ManagerWire.decode(
+      CacheSnapshot.self, from: Data(contentsOf: directory.appending(path: "cache.json")))
+    #expect(usage.buckets.isEmpty && cache.servers.isEmpty)
+    #expect(activity.events.first?.model == "fixture")
+    #expect(activity.events.first?.number("paddock.ttft_ms") == 12.5)
     let qwen = try #require(catalog.models.first { $0.id == "qwen3.8-27b" })
     let mlx = try #require(qwen.artifacts.first { $0.id == "mlx-4bit" })
     #expect(mlx.supports(backend: readiness.backend))

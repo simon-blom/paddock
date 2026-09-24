@@ -1943,7 +1943,9 @@ fn stream_whisper(
         ));
         yield sse_data("[DONE]".to_owned());
     };
-    axum::response::Sse::new(sse).into_response()
+    axum::response::Sse::new(sse)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// One whole-clip transcription on a generative ASR lane, start to finish.
@@ -2010,6 +2012,7 @@ pub(crate) async fn generative_pass(
         // and asking for them drops the slot out of the decode-overlap path
         logprobs: None,
         submitted: None,
+        canvas_read: None,
     })?;
 
     let mut ids = Vec::new();
@@ -2991,6 +2994,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         // one every transcription pays for a number most never read.
         logprobs: want_logprobs.then_some(2),
         submitted: None,
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -3117,7 +3121,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             ));
             yield sse_data("[DONE]".to_owned());
         };
-        return axum::response::Sse::new(sse).into_response();
+        return axum::response::Sse::new(sse)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response();
     }
 
     let mut ids: Vec<u32> = Vec::new();

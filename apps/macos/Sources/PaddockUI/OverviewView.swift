@@ -19,9 +19,9 @@ struct OverviewView: View {
               .font(.system(size: 17, weight: .medium))
           }
           Spacer()
-          StatusBadge(
-            title: snapshot.readiness.title,
-            tone: snapshot.readiness.state == "ready" ? .success : .caution)
+          if let warning = snapshot.readiness.warning {
+            StatusBadge(title: warning, tone: .caution)
+          }
         }.padding(.vertical, 8)
         WorkspaceRule()
         VStack(alignment: .leading, spacing: 20) {
@@ -57,8 +57,6 @@ struct OverviewView: View {
         VStack(alignment: .leading, spacing: 20) {
           Text("Application").font(.system(size: 14, weight: .semibold))
           FactRow(title: "Paddock version", value: snapshot.identity.version)
-          FactRow(title: "Backend", value: snapshot.readiness.backend ?? "Unavailable")
-          FactRow(title: "Operating system", value: snapshot.readiness.os)
           FactRow(title: "Running endpoints", value: String(snapshot.runners.count))
         }.font(.system(size: 13))
       }.padding(.horizontal, 32).padding(.top, 20).padding(.bottom, 32)

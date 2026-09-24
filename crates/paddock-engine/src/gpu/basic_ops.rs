@@ -279,6 +279,49 @@ impl GpuExecutor {
         })
     }
 
+    /// [`Self::mrope`] with INTERLEAVED sections (HF `mrope_interleaved`,
+    /// ggml IMROPE) - rotation pair p reads h when p % 3 == 1, w when
+    /// p % 3 == 2, t otherwise, each within its section's reach. What the
+    /// qwen3vl text stack applies to image tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn imrope(
+        &self,
+        x: &mut CudaSlice<f32>,
+        positions: &CudaSlice<u32>,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_rot: usize,
+        params: (f32, f32, f32, f32, f32, f32),
+        sections: [u32; 4],
+    ) -> Result<(), GpuError> {
+        let f = self.kernels.imrope.ok_or(GpuError::MissingOp("imrope"))?;
+        let (theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale) = params;
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let (pp, _g2) = positions.device_ptr(&self.stream);
+        check(unsafe {
+            f(
+                xp as *mut _,
+                pp as *const _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                n_rot as u32,
+                theta_scale,
+                freq_scale,
+                corr_low,
+                corr_high,
+                ext_factor,
+                mscale,
+                sections[0],
+                sections[1],
+                sections[2],
+                sections[3],
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Sigmoid output gate in place: `x[i] *= sigmoid(gate[i])`, `n` elements.
     pub fn mul_sigmoid(
         &self,

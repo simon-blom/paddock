@@ -25,7 +25,7 @@ import type {
   WebSearchCall,
   WebSearchStatus,
 } from '@/types/chat'
-import { messageText } from '@/types/chat'
+import { imageParamsOf, messageText } from '@/types/chat'
 import {
   DEGENERATION_THRESHOLD,
   degenerationRatio,
@@ -37,6 +37,8 @@ import {
 import { pdfEngine } from '@/lib/pdf'
 import { alignClip, alignmentRefused, mergeWordTimes } from '@/lib/align'
 import { transcribeClip } from '@/lib/transcribe'
+import { blobOf, generateImages, resolveImageSeed, thumbnailOf } from '@/lib/imagine'
+import type { ImageGenCaps } from '@/stores/models'
 import { fleetLabel } from '@/lib/model-name'
 import { isHarmony } from '@/lib/model-caps'
 import { isTaskTurn } from '@/lib/tasks'
@@ -44,7 +46,6 @@ import {
   MIN_USEFUL_REPLY,
   parseContextOverflow,
   planContext,
-  localOutputMaximum,
   promptShape,
   promptTokensFrom,
   replyPrompt,
@@ -53,9 +54,9 @@ import {
   serverCompactionValid,
   summaryBlock,
   trimIndex,
-  windowRemaining,
 } from '@/lib/tokens'
 import { maybeCompact } from '@/lib/compact'
+import { resolveReplyLimit } from '@/lib/reply-limit'
 import { activeMessages, activeSteps, stepAnchor, tipId } from '@/lib/tree'
 import { readSse } from '@/lib/sse'
 import {
@@ -440,13 +441,20 @@ function runningLanes(conv: Conversation, models: ReturnType<typeof useModelsSto
   )
   const live = set.filter((id) => running.has(id))
   if (live.length < 2) return []
-  if (live.every((id) => models.canChat(id)) || live.every((id) => models.canTranscribe(id))) {
+  if (
+    live.every((id) => models.canChat(id)) ||
+    live.every((id) => models.canTranscribe(id)) ||
+    live.every((id) => models.canImagine(id))
+  ) {
     return live
   }
   // No input they all take. Keep the group the first lane belongs to, and say
   // so - dropping a lane is loud, never silent.
   const byAudio = models.canTranscribe(live[0])
-  const kept = live.filter((id) => (byAudio ? models.canTranscribe(id) : models.canChat(id)))
+  const byImage = !byAudio && models.canImagine(live[0])
+  const kept = live.filter((id) =>
+    byAudio ? models.canTranscribe(id) : byImage ? models.canImagine(id) : models.canChat(id),
+  )
   console.warn(
     'compare lanes share no input; dropped',
     live.filter((id) => !kept.includes(id)),
@@ -526,7 +534,7 @@ export function previewPlan(conv: Conversation | null | undefined): {
   const plan = resolvePlan(
     conv,
     window,
-    replyReserve(settings.maxTokens),
+    replyReserve(settings.maxTokens, window, models.outCapFor(conv.model)),
     settings.summarize,
     !isCloud && !compare,
   )
@@ -1044,6 +1052,314 @@ export function useChatStream() {
     return undefined
   }
 
+  /** The prompt an image turn answers: the nearest earlier user turn's text.
+   *  Same walk as `clipFor` - the picture answers the question above it. */
+  /** The description a picture turn renders: every user turn of the thread
+   *  up to this answer, in order. The model keeps no history of its own, so
+   *  the conversation IS the prompt - "show a happy guy" then "make him
+   *  older" renders both lines, which is what a follow-up means here; a
+   *  fresh description starts a new conversation. (Editing, where a turn
+   *  hands the previous picture back as an input, is the lane after this.) */
+  function promptFor(conv: Conversation, assistant: Message): string {
+    const msgs = activeMessages(conv)
+    const at = msgs.indexOf(assistant)
+    const lines: string[] = []
+    for (let i = 0; i < (at < 0 ? msgs.length : at); i++) {
+      const m = msgs[i]
+      if (m.role !== 'user') continue
+      const t = messageText(m).trim()
+      if (t) lines.push(t)
+    }
+    return lines.join('\n')
+  }
+
+  /** The conversation's seed for a picture turn in `thread` mode: the last
+   *  picture before this answer. Undefined when there is none yet, or when
+   *  this answer is a retry - another take of the same question hangs beside
+   *  an earlier one (same parent, not a compare sibling), and the same words
+   *  on the same seed would only repeat that picture. */
+  function threadSeed(conv: Conversation, assistant: Message): number | undefined {
+    const retry = conv.messages.some(
+      (m) =>
+        m.id !== assistant.id &&
+        m.role === 'assistant' &&
+        m.parentId === assistant.parentId &&
+        !(assistant.group && m.group === assistant.group) &&
+        m.imageGen !== undefined,
+    )
+    if (retry) return undefined
+    const msgs = activeMessages(conv)
+    const at = msgs.indexOf(assistant)
+    for (let i = (at < 0 ? msgs.length : at) - 1; i >= 0; i--) {
+      const s = msgs[i].imageGen?.seed
+      if (s !== undefined) return s
+    }
+    return undefined
+  }
+
+  /** The user turn this answer replies to - its text alone, the instruction
+   *  of an edit. */
+  function lastUserText(conv: Conversation, assistant: Message): string {
+    const msgs = activeMessages(conv)
+    const at = msgs.indexOf(assistant)
+    for (let i = (at < 0 ? msgs.length : at) - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user') return messageText(msgs[i]).trim()
+    }
+    return ''
+  }
+
+  /** The reference pictures of an image turn, when the endpoint edits: the
+   *  person's own pictures on the turn being answered, else the thread's
+   *  last generated picture - a follow-up on a picture is an edit of it,
+   *  which is what "make him older" means. Null = a text-to-image turn. */
+  async function referencesFor(
+    conv: Conversation,
+    assistant: Message,
+    caps: ImageGenCaps | undefined,
+  ): Promise<{ blobs: Blob[]; from: 'attached' | 'previous' } | null> {
+    if (!caps?.edit) return null
+    const msgs = activeMessages(conv)
+    const at = msgs.indexOf(assistant)
+    const upto = at < 0 ? msgs.length : at
+    const user = msgs.slice(0, upto).reverse().find((m) => m.role === 'user')
+    const attached = (user?.content ?? []).filter(
+      (p): p is ImagePart => p.type === 'image' && !p.unreadable,
+    )
+    const max = Math.max(1, caps.maxReferences || 1)
+    if (attached.length) {
+      if (attached.length > max) {
+        throw new Error(
+          `This model takes up to ${max} reference pictures - ${attached.length} were attached.`,
+        )
+      }
+      return { blobs: await Promise.all(attached.map(partBlob)), from: 'attached' }
+    }
+    for (let i = upto - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (m.role !== 'assistant' || !m.imageGen) continue
+      const pictures = m.content.filter(
+        (p): p is ImagePart => p.type === 'image' && !!p.gen && !p.gen.preview,
+      )
+      const last = pictures[pictures.length - 1]
+      if (last) return { blobs: [await partBlob(last)], from: 'previous' }
+    }
+    return null
+  }
+
+  /** A picture part's bytes: the attachments table when it is stored, the
+   *  inline copy otherwise. */
+  async function partBlob(p: ImagePart): Promise<Blob> {
+    const src = p.attachmentId ? attachmentsApi.url(p.attachmentId) : (p.dataUrl ?? p.modelUrl)
+    if (!src) throw new Error(`The picture "${p.name}" has no bytes to send.`)
+    const r = await fetch(src)
+    if (!r.ok) throw new Error(`Could not read the picture "${p.name}" (HTTP ${r.status}).`)
+    return await r.blob()
+  }
+
+  /** One image-generation turn: the prompt goes to `/v1/images/generations`
+   *  through the manager relay, previews land in the turn as they arrive,
+   *  and the finished pictures are stored as attachments (bytes in the
+   *  manager's table, a small thumbnail inline) with the recipe that made
+   *  them on each part. Compare fan-out already makes one grouped assistant
+   *  message per lane, so two image models race side by side through this
+   *  on the SAME seed - which is what makes their pictures comparable. */
+  async function runImageGeneration(
+    conv: Conversation,
+    assistant: Message,
+    lane: boolean,
+    sharedGpu: boolean,
+  ): Promise<void> {
+    const modelId = assistant.model ?? conv.model
+    const caps = await models.capsFor(modelId)
+    const controller = new AbortController()
+    beginStream(conv.id, controller)
+    const params = imageParamsOf(conv)
+    // An edit when there is a picture to edit (the endpoint's tower wired,
+    // a picture attached or one earlier in the thread): the instruction is
+    // this turn's words alone, since the picture carries what the earlier
+    // turns said. Otherwise the description accumulates - text-to-image
+    // keeps no memory of its own.
+    let refs: Awaited<ReturnType<typeof referencesFor>> = null
+    try {
+      refs = await referencesFor(conv, assistant, caps?.imageGeneration)
+    } catch (e) {
+      assistant.error = e instanceof Error ? e.message : String(e)
+      assistant.content = []
+      assistant.streaming = false
+      endStream(conv.id, controller)
+      chat.persistNow(conv)
+      return
+    }
+    const prompt = refs ? lastUserText(conv, assistant) : promptFor(conv, assistant)
+    // The seed the request carries, resolved HERE and recorded on the turn.
+    // Reference edits need fresh noise: their pixels already carry the
+    // composition, and reusing the noise that made them can cause artifacts.
+    // Pinned seeds remain untouched; compare siblings still share one draw.
+    const seed = resolveImageSeed(
+      params.seed, threadSeed(conv, assistant), assistant.group, refs !== null,
+    )
+    const previews = Math.min(
+      params.n > 1 ? 0 : params.previews,
+      caps?.imageGeneration?.stream ? (caps.imageGeneration.maxPartialImages ?? 0) : 0,
+    )
+    assistant.run = {
+      model: modelId,
+      // Sampling does not reach this endpoint - the record carries the chat's
+      // params untouched with no reply cap, and `imageGen` says what rode.
+      params: { ...conv.params, maxTokens: null },
+      tools: [],
+      contended: sharedGpu || undefined,
+      at: Date.now(),
+    }
+    assistant.imageGen = {
+      prompt,
+      params,
+      seed,
+      steps: params.steps ?? caps?.imageGeneration?.defaultSteps ?? 0,
+      // an edit takes the last reference's shape unless the settings say
+      size:
+        params.size === 'auto'
+          ? refs
+            ? 'auto'
+            : (caps?.imageGeneration?.defaultSize ?? 'auto')
+          : params.size,
+      previews: 0,
+      references: refs?.blobs.length,
+      referencesFrom: refs?.from,
+    }
+    // the reply is pictures, not prose: no empty text part to render as one
+    assistant.content = []
+    if (!lane) tele.beginCapture()
+
+    try {
+      const url = refs ? models.imageEditUrl(modelId) : models.imageUrl(modelId)
+      if (!url) {
+        assistant.error = `No running model serves "${modelId}" - start one in the Manager first.`
+        return
+      }
+      if (!models.canImagine(modelId)) {
+        assistant.error = `${fleetLabel(modelId)} does not make pictures. Pick an image model.`
+        return
+      }
+      if (!prompt) {
+        assistant.error = 'Describe the picture to make - the prompt is the whole request.'
+        return
+      }
+      const out = await generateImages({
+        url,
+        model: modelId,
+        prompt,
+        params,
+        seed,
+        previews,
+        references: refs?.blobs,
+        signal: controller.signal,
+        onPreview: (index, dataUrl) => {
+          // one part, refreshed per preview: the picture the render is
+          // converging on, standing in for the final until it lands
+          const part: ImagePart = {
+            type: 'image',
+            attachmentId: '',
+            mime: `image/${params.format}`,
+            name: `preview ${index + 1}`,
+            dataUrl,
+            gen: {
+              seed,
+              size: assistant.imageGen?.size ?? '',
+              steps: assistant.imageGen?.steps ?? 0,
+              quality: params.quality,
+              format: params.format,
+              background: params.background,
+              preview: true,
+              previewIndex: index,
+            },
+          }
+          assistant.content = [part]
+          if (assistant.imageGen) assistant.imageGen.previews = index + 1
+        },
+      })
+      const parts: ImagePart[] = []
+      for (const [i, img] of out.images.entries()) {
+        const mime = `image/${img.format}`
+        const blob = blobOf(img.b64, mime)
+        const id = uuid()
+        const name = `${img.size || 'image'}-seed${seed}${out.images.length > 1 ? `-${i + 1}` : ''}.${img.format}`
+        let attachmentId = ''
+        let thumb = ''
+        let width: number | undefined
+        let height: number | undefined
+        try {
+          const t = await thumbnailOf(blob)
+          thumb = t.thumb
+          width = t.width
+          height = t.height
+        } catch {
+          /* undecodable here - the stored bytes still open */
+        }
+        try {
+          await attachmentsApi.put(id, blob, mime, { name, w: width, h: height, conv: conv.id })
+          attachmentId = id
+        } catch {
+          /* store unavailable - keep the picture inline rather than lose it */
+        }
+        parts.push({
+          type: 'image',
+          attachmentId,
+          mime,
+          name,
+          thumbUrl: thumb || undefined,
+          // no store: the full data URL is the only copy there is
+          dataUrl: attachmentId ? undefined : `data:${mime};base64,${img.b64}`,
+          width,
+          height,
+          gen: {
+            seed,
+            size: img.size,
+            steps: assistant.imageGen?.steps ?? 0,
+            quality: img.quality,
+            format: img.format,
+            background: img.background,
+          },
+        })
+      }
+      assistant.content = parts
+      const steps = assistant.imageGen?.steps ?? 0
+      if (assistant.imageGen) {
+        assistant.imageGen.previews = out.previews
+        assistant.imageGen.size = out.images[0]?.size ?? assistant.imageGen.size
+        assistant.imageGen.elapsedS = out.ms / 1000
+        assistant.imageGen.sPerStep = steps > 0 ? out.ms / 1000 / steps / Math.max(1, out.images.length) : undefined
+      }
+      assistant.usage = {
+        // prompt tokens as the encoder counted them; the output is the
+        // pictures' latent tokens, which is what the API bills as output
+        promptTokens: out.usage?.inputTokens ?? 0,
+        completionTokens: out.usage?.outputTokens ?? 0,
+        ms: out.ms,
+        ttftMs: out.firstPreviewMs,
+      }
+    } catch (e) {
+      if (controller.signal.aborted) {
+        assistant.stopped = true
+      } else {
+        assistant.error = e instanceof Error ? e.message : String(e)
+        console.error('image generation failed', e)
+      }
+      // a preview left standing for a picture that never finished would read
+      // as the answer; the failure is the answer
+      assistant.content = assistant.content.filter((p) => !(p.type === 'image' && p.gen?.preview))
+    } finally {
+      if (!lane) {
+        const gpu = tele.endCapture()
+        if (gpu && assistant.run) assistant.run.gpu = gpu
+      }
+      assistant.streaming = false
+      endStream(conv.id, controller)
+      chat.maybeTitle(conv)
+      chat.persistNow(conv)
+    }
+  }
+
   /** The enrichment pass: a transcript that settled without
    *  word times gets them from the fleet's forced aligner, if one is
    *  running - which is what finally gives every lane karaoke, not just
@@ -1310,6 +1626,12 @@ export function useChatStream() {
       await runTranscription(conv, assistant, clip, lane, sharedGpu)
       return
     }
+    // An image model answers a prompt with a picture - its own path, keyed
+    // on the model because the input (text) is the same as a chat's.
+    if (!append && !models.canChat(modelId) && models.canImagine(modelId)) {
+      await runImageGeneration(conv, assistant, lane, sharedGpu)
+      return
+    }
     // A speech model with no clip to work on: say what it can do rather than
     // send it a chat request it will refuse in its own words.
     if (!models.canChat(modelId)) {
@@ -1337,7 +1659,7 @@ export function useChatStream() {
     const plan = resolvePlan(
       conv,
       window,
-      replyReserve(settings.maxTokens),
+      replyReserve(settings.maxTokens, window, models.outCapFor(modelId)),
       settings.summarize,
       !isCloud && !lane && !append,
     )
@@ -1356,7 +1678,7 @@ export function useChatStream() {
         `#${webSearch ? 'w' : ''}${forensicsTool ? 'f' : ''}${clockTool ? 'c' : ''}`,
     )
     // Local admission clamps exact remaining context; clouds need a number and
-    // their separate published output ceiling. Never elect the 1024 API default.
+    // their separate published output ceiling. Always send the number.
     // Both the wire and the run record use this number - the run record must
     // show what actually rode (same rule as the maxTokens note below).
     //
@@ -1368,20 +1690,20 @@ export function useChatStream() {
     const prompt = lane
       ? { exact: 0, estimated: promptTokensFrom(conv, plan.from, plan.summary) }
       : replyPrompt(conv, plan, { model: modelId, shape, pending: assistant.id })
-    let replyCap =
-      settings.maxTokens ??
-      (isCloud
-        ? windowRemaining(window, prompt.estimated, outCap, prompt.exact)
-        : localOutputMaximum(window))
+    // Shared Compare history can fit the smallest window without forcing all
+    // lanes to use that model's reply ceiling. Preserve the user's preference.
+    let replyCap = resolveReplyLimit(
+      settings.maxTokens, isCloud, models.ctxFor(modelId), prompt.estimated, outCap, prompt.exact,
+    )
     // No room: refuse here rather than send. buildBody leaves a nonpositive cap
     // off the wire, which would ask the provider for its default instead, and
     // the provider's own refusal reads worse than this one. Nothing about the
     // turn is touched, so a Continue keeps its cut-off marker and can be tried
     // again once the conversation is shorter.
-    if (replyCap <= 0) {
+    if (replyCap != null && replyCap <= 0) {
       assistant.error =
         `No room left for a reply: this conversation fills ${fleetLabel(modelId)}'s ` +
-        `${window}-token context window. Start a new chat, or shorten this one.`
+        `${models.ctxFor(modelId)}-token context window. Start a new chat, or shorten this one.`
       assistant.streaming = false
       chat.persistNow(conv)
       return
@@ -1453,7 +1775,7 @@ export function useChatStream() {
         assistant.error = `No running model serves "${modelId}" - start one in the Manager first.`
         return
       }
-      const post = (cap: number) =>
+      const post = (cap: number | null) =>
         fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1481,11 +1803,11 @@ export function useChatStream() {
         // The backstop for whatever the estimate still missed. A provider that
         // refuses on size and states its numbers has counted the prompt with
         // its own tokenizer, so `limit - input` is the exact reply that fits.
-        // One resend, only for a cap we derived (a cap the user set is theirs),
-        // and only when what fits is worth having.
-        const over = isCloud && settings.maxTokens == null ? parseContextOverflow(message) : null
+        // One resend before any stream, only for an explicit context refusal.
+        // A custom cap is an upper bound too; the saved preference stays intact.
+        const over = isCloud && [400, 413, 422].includes(res.status) ? parseContextOverflow(message) : null
         const fits = over ? Math.floor(Math.min(over.limit - over.input, outCap || Infinity)) : 0
-        if (!over || fits < MIN_USEFUL_REPLY || fits >= replyCap) {
+        if (!over || fits < MIN_USEFUL_REPLY || (replyCap != null && fits >= replyCap)) {
           assistant.error = message
           return
         }
@@ -1691,8 +2013,10 @@ export function useChatStream() {
         !assistant.error &&
         !controller.signal.aborted
       ) {
-        void maybeCompact(conv, models.maxCtx, replyReserve(settings.maxTokens), (c) =>
-          chat.persistNow(c),
+        void maybeCompact(
+          conv, models.ctxFor(modelId),
+          replyReserve(settings.maxTokens, models.ctxFor(modelId), outCap),
+          (c) => chat.persistNow(c),
         )
       }
       if (!lane && !assistant.error && !assistant.stopped && !controller.signal.aborted) {
@@ -1992,9 +2316,8 @@ export function useChatStream() {
           // extension
           include: ['message.output_text.logprobs'],
         }
-        if (settings.maxTokens != null && settings.maxTokens > 0) {
-          body.max_output_tokens = settings.maxTokens
-        }
+        const replyCap = resolveReplyLimit(settings.maxTokens, false, models.ctxFor(modelId))
+        if (replyCap != null) body.max_output_tokens = replyCap
         // the reading-mode object, per page - same three gates as the single
         // request path; 'multipage' cannot mean anything to one page
         if (caps.ocr && (conv!.ocrMode || conv!.ocrRegions)) {

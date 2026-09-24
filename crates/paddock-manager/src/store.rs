@@ -16,7 +16,10 @@ use uuid::Uuid;
 mod connections;
 mod downloads;
 mod integrations;
+mod model_profiles;
+mod native_benchmarks;
 mod prompts;
+mod reads;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -241,7 +244,7 @@ fn forensic_finding_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 }
 
 /// What a conversation turned out to be, from its own turns: `"document"`,
-/// `"transcription"`, or `"chat"`.
+/// `"image"`, `"transcription"`, or `"chat"`.
 ///
 /// Decided here, on the way in, because this is the only place that has both
 /// the messages and the row. The Studio's list is summaries - every unopened
@@ -280,6 +283,17 @@ pub fn conversation_kind(doc: &Value) -> &'static str {
     if documented {
         return "document";
     }
+    // A picture the MODEL made: an image part on an ASSISTANT turn. A person's
+    // attached photo is a user part and stays a chat about it.
+    let drew = msgs.iter().any(|m| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && parts(m)
+                .iter()
+                .any(|p| p.get("type").and_then(Value::as_str) == Some("image"))
+    });
+    if drew {
+        return "image";
+    }
     let heard = msgs.iter().any(|m| {
         parts(m)
             .iter()
@@ -293,14 +307,17 @@ impl Store {
     /// so no WAL/locking surprises). The caller owns the file - sanitize it,
     /// read it, then delete it. Used by the sanitized export endpoint.
     pub fn snapshot_to_temp(&self) -> Result<PathBuf, StoreError> {
-        let tmp = std::env::temp_dir().join(format!(
-            "paddock-export-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
+        // The unsanitized snapshot contains credentials. Random exclusive
+        // creation and mode 0600 apply BEFORE SQLite starts writing.
+        let tmp = tempfile::Builder::new()
+            .prefix("paddock-export-")
+            .suffix(".db")
+            .tempfile()
+            .map_err(|e| StoreError::Bad(e.to_string()))?
+            .into_temp_path();
         let conn = self.lock();
         conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
-        Ok(tmp)
+        tmp.keep().map_err(|e| StoreError::Bad(e.to_string()))
     }
 }
 
@@ -344,6 +361,33 @@ CREATE TABLE IF NOT EXISTS presets (
     name       TEXT NOT NULL,
     params     TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    artifact TEXT NOT NULL,
+    settings TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(model, artifact, name)
+);
+
+CREATE TABLE IF NOT EXISTS native_benchmarks (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    report TEXT NOT NULL
+);
+
+-- The Reads page's saved question sets (store/reads.rs): `body` is the JSON
+-- text of { questions, samples } in the /v1/systemone shape. User content,
+-- like prompts - never model configuration.
+CREATE TABLE IF NOT EXISTS read_sets (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -3205,6 +3249,20 @@ mod tests {
             json!([{"role": "user", "content": [{"type": "text"}]}]),
         ))
         .expect("put chat");
+        // a picture the model MADE is an image conversation; a photo the
+        // person attached is a chat about it
+        s.put_conversation(&conv(
+            "drew",
+            json!([{"role": "user", "content": [{"type": "text", "text": "a cat"}]},
+                   {"role": "assistant", "content": [{"type": "image", "name": "cat.png"}]}]),
+        ))
+        .expect("put image");
+        s.put_conversation(&conv(
+            "shown",
+            json!([{"role": "user", "content": [{"type": "image", "name": "me.jpg"}, {"type": "text"}]},
+                   {"role": "assistant", "content": [{"type": "text", "text": "a person"}]}]),
+        ))
+        .expect("put vision chat");
 
         let kinds: std::collections::HashMap<String, String> = s
             .list_conversations()
@@ -3220,6 +3278,8 @@ mod tests {
         assert_eq!(kinds["doc"], "document");
         assert_eq!(kinds["heard"], "transcription");
         assert_eq!(kinds["plain"], "chat");
+        assert_eq!(kinds["drew"], "image");
+        assert_eq!(kinds["shown"], "chat");
     }
 
     /// A single OCR pass is the other shape the document lane writes.

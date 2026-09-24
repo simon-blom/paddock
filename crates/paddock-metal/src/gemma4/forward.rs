@@ -78,65 +78,7 @@ pub(super) fn prefill96_projection(
     }
 }
 
-// Keep this election model-local: Qwen/Granite retain their qualified ladder.
-// Both ordinary narrow decode and target verification consume the same F32
-// operands here, including odd output-column tails and mixed Q4/Q5/Q6 planes.
-pub(super) fn pair_projection(
-    cmd: &Commands<'_>,
-    planes: &[(&Weight, &Buffer)],
-    input: &Buffer,
-    m: usize,
-) {
-    debug_assert!((3..=4).contains(&m) && planes.iter().all(|(w, _)| matches!(w.ty, 12..=14)));
-    let k = planes[0].0.k;
-    assert!(planes.iter().all(|(w, _)| w.k == k));
-    if planes.len() == 1 {
-        let (w, out) = planes[0];
-        cmd.dispatch(
-            if m == 3 { "gemma_pair3" } else { "gemma_pair4" },
-            &[&w.buffer, input, out],
-            &[k as u32, w.n as u32, m as u32, w.ty, 1f32.to_bits()],
-            [w.n.div_ceil(32), 1, 1],
-            128,
-        );
-    } else {
-        assert!(matches!(planes.len(), 2 | 3));
-        let third = planes.get(2).unwrap_or(&planes[1]);
-        cmd.dispatch(
-            if m == 3 {
-                "gemma_multi_pair3"
-            } else {
-                "gemma_multi_pair4"
-            },
-            &[
-                &planes[0].0.buffer,
-                &planes[1].0.buffer,
-                &third.0.buffer,
-                input,
-                planes[0].1,
-                planes[1].1,
-                third.1,
-            ],
-            &[
-                k as u32,
-                planes[0].0.n as u32,
-                planes[1].0.n as u32,
-                if planes.len() == 3 {
-                    third.0.n as u32
-                } else {
-                    0
-                },
-                m as u32,
-                planes[0].0.ty,
-                planes[1].0.ty,
-                third.0.ty,
-            ],
-            [planes.iter().map(|(w, _)| w.n.div_ceil(32)).sum(), 1, 1],
-            128,
-        );
-    }
-}
-
+pub(super) use crate::weights::paired_projections as pair_projection;
 impl Gemma4 {
     fn project(&self, cmd: &Commands<'_>, planes: &[(&Weight, &Buffer)], input: &Buffer, m: usize) {
         if self.mlx {

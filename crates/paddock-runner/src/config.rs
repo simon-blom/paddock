@@ -95,6 +95,12 @@ pub struct Config {
     /// MTP drafter GGUF (separate-model speculative drafter, e.g. gemma4's
     /// mtp-*.gguf); enables serving spec rounds with model drafts.
     pub mtp: Option<PathBuf>,
+    /// Text-encoder GGUF (Qwen3-VL) for an image-generation model; required
+    /// with a DiT `model`, never discovered.
+    pub text_encoder: Option<PathBuf>,
+    /// VAE safetensors for an image-generation model; required with a DiT
+    /// `model`.
+    pub vae: Option<PathBuf>,
     /// Official-FP8 (or bf16) safetensors snapshot dir to source the e4m3
     /// serving planes from, skipping the Q8_0 middle hop (opt-in - the
     /// measured default keeps the bf16-derived planes). Threaded to the
@@ -120,6 +126,8 @@ pub struct Config {
     /// None = each family's default.
     pub graph_scratch_mib: Option<u64>,
     /// Default max output tokens per reply when a request doesn't specify.
+    /// None = the context window (what an omitted cap means on every other
+    /// engine; the engine clamps to the room the prompt leaves regardless).
     pub max_tokens: Option<usize>,
     /// API key for Bearer auth. Empty + loopback bind = no auth; empty +
     /// non-loopback = auto-generate and require (see startup).
@@ -347,6 +355,8 @@ impl Default for Config {
             max_batch: 32,
             mmproj: None,
             mtp: None,
+            text_encoder: None,
+            vae: None,
             fp8_native: None,
             vram_budget: None,
             kv_offload: KvOffload::default(),
@@ -528,6 +538,12 @@ impl Config {
         }
         if let Some(v) = env_str("PADDOCK_MTP") {
             self.mtp = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_str("PADDOCK_TEXT_ENCODER") {
+            self.text_encoder = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_str("PADDOCK_VAE") {
+            self.vae = Some(PathBuf::from(v));
         }
         if let Some(v) = env_str("PADDOCK_FP8_NATIVE") {
             self.fp8_native = Some(PathBuf::from(v));
@@ -749,12 +765,14 @@ pub const ENV_SURFACE: &[&str] = &[
     "PADDOCK_SERVED_MODEL_NAME",
     "PADDOCK_SESSION_HEADERS",
     "PADDOCK_SPEC",
+    "PADDOCK_TEXT_ENCODER",
     "PADDOCK_STRIP_PARAMS",
     "PADDOCK_TEMP",
     "PADDOCK_TOP_K",
     "PADDOCK_TOP_P",
     "PADDOCK_TRUSTED_PROXY",
     "PADDOCK_VAD_GATE",
+    "PADDOCK_VAE",
     "PADDOCK_VARIANTS",
     "PADDOCK_VRAM_BUDGET",
     "PADDOCK_WEB_SEARCH_API_KEY",

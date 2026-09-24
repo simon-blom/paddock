@@ -6,6 +6,7 @@ import SwiftUI
 struct StudioAttachmentOptions: View {
   @Binding var attachment: StudioAttachment
   let canRasterPDF: Bool
+  var capabilities: StudioState.Capabilities? = nil
   let onDone: () -> Void
   private var metadata: String {
     (attachment.pages.map { "\($0) \($0 == 1 ? "page" : "pages") · " } ?? "")
@@ -29,10 +30,26 @@ struct StudioAttachmentOptions: View {
         .accessibilityIdentifier("attachment-pdf-text")
       }
       if attachment.mime.hasPrefix("image/") {
-        ForEach(["auto", "low", "high"], id: \.self) { value in
+        ForEach(StudioAttachment.imageDetailOptions, id: \.value) { option in
+          let estimates = capabilities?.imageEstimates(for: attachment, detail: option.value) ?? []
+          let overflow = estimates.first(where: \.exceedsContext)
           StudioPopoverChoice(
-            title: "\(value.capitalized) detail", selected: attachment.detail == value
-          ) { attachment.detail = value }
+            title: option.title,
+            subtitle: estimates.isEmpty
+              ? nil
+              : [
+                StudioImageEstimate.label(estimates),
+                overflow.map { "Exceeds \($0.modelName)'s context" },
+              ]
+              .compactMap { $0 }.joined(separator: " · "),
+            selected: attachment.detail == option.value
+          ) { attachment.detail = option.value }
+          .disabled(overflow != nil)
+          .help(
+            ([option.help] + estimates.map { "\($0.modelName): ≈ \($0.tokens.formatted()) tokens" })
+              .joined(separator: "\n")
+          )
+          .accessibilityIdentifier("attachment-image-\(option.value)")
         }
       }
       if attachment.supportsPageSelection {

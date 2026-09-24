@@ -634,9 +634,25 @@ impl GpuNemotron {
         }
     }
 
+    /// The reply just started its first tool call (see
+    /// `Generator::reply_pin`): the live checkpoint becomes the held one and
+    /// the next filed snapshot opens a new live one instead of replacing it.
+    /// Once per reply. A snapshot still waiting for its ids precedes the call
+    /// too; it files as the new live one.
+    pub(crate) fn reply_pin(&mut self, slot: usize) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if slot >= bs.reply_pinned.len() || bs.reply_pinned[slot].is_some() {
+            return;
+        }
+        bs.reply_pinned[slot] = bs.reply_ckpt[slot].take();
+    }
+
     /// The slot went idle (or is being re-admitted): stop tracking. Its last
-    /// reply checkpoint STAYS in the radix for the next turn - the pool's
-    /// LRU owns it now; snapshots whose ids never arrived are given back.
+    /// reply checkpoint - and the one held at its first tool call - STAY in
+    /// the radix for the next turn; the pool's LRU owns them now; snapshots
+    /// whose ids never arrived are given back.
     pub(super) fn reply_release(&mut self, slot: usize) {
         let Some(bs) = self.batch.as_mut() else {
             return;
@@ -646,6 +662,7 @@ impl GpuNemotron {
         }
         bs.seq[slot].clear();
         bs.reply_ckpt[slot] = None;
+        bs.reply_pinned[slot] = None;
         if let Some(radix) = bs.prefix.as_mut() {
             let mut i = 0;
             while i < bs.reply_pending.len() {

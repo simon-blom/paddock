@@ -35,6 +35,7 @@ struct NativeCompareBlock: View {
               NativeStudioMessage(
                 message: message, workspace: workspace,
                 target: StudioMessageTarget(transcript: transcript, messageId: message.id),
+                onOpenDocument: openDocument,
                 inLane: true
               ).equatable()
             }
@@ -56,6 +57,19 @@ struct NativeCompareBlock: View {
       }.fixedSize(horizontal: false, vertical: true)
         .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
     }.accessibilityIdentifier("native-compare-group-\(block.id)")
+  }
+
+  private var openDocument: ((String, String) -> Void)? {
+    guard let workspace else { return nil }
+    return { messageID, attachmentID in
+      Task {
+        await workspace.perform(
+          "openDocument",
+          [
+            "messageId": .string(messageID), "attachmentId": .string(attachmentID),
+          ])
+      }
+    }
   }
 
   private func branchButton(

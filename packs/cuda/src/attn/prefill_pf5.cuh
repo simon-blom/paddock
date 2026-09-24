@@ -192,17 +192,22 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t kv_dim, uint32_t swa_window, uint32_t rows,
-    float scale, const uint32_t* __restrict__ run_offs = nullptr) {
+    float scale, const uint32_t* __restrict__ run_offs,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_TC5_OK
     // batched-runs arm: grid.z indexes a run table; every
     // pointer is base-valued and the prologue re-aims it at this run.
     // run_offs == nullptr is the classic one-run launch, bit-identical.
+    // window floors from the true positions (null = positions; pd_pf_wp),
+    // re-aimed with `positions` under the runs arm
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     if (run_offs != nullptr) {
         const uint32_t roff = run_offs[blockIdx.z];
         rows = run_offs[blockIdx.z + 1u] - roff;
         q += (size_t)roff * n_heads * HD;
         out += (size_t)roff * n_heads * HD;
         positions += roff;
+        wp += roff;
         if (slots) slots += roff;
     }
     constexpr uint32_t MR = 128u;                  // mma rows = TQ*G
@@ -304,8 +309,8 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
     const uint32_t my_row = warp * 32u + lane;         // rows for warps 0-3
     const uint32_t my_tok = my_row / G;
     const uint32_t my_pos = my_tok < ntok ? positions[tq0 + my_tok] : 0u;
-    const uint32_t my_lo = (swa_window > 0 && my_pos + 1 > swa_window)
-        ? my_pos + 1 - swa_window : 0u;
+    const uint32_t my_lo =
+        pd_pf_floor(my_tok < ntok ? wp[tq0 + my_tok] : 0u, swa_window);
 
     // O accumulators: warp -> 16-row m-tile, all HD dims (HD/8 n8-subs)
     constexpr uint32_t NSUB = HD / 8u;
@@ -317,8 +322,7 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
 
     // walk: union span of the CTA's windows
     const uint32_t pos_last = positions[tq0 + ntok - 1u];
-    const uint32_t lo0 = (swa_window > 0 && positions[tq0] + 1 > swa_window)
-        ? positions[tq0] + 1 - swa_window : 0u;
+    const uint32_t lo0 = pd_pf_floor(wp[tq0], swa_window);
     const uint32_t span = pos_last + 1u - lo0;
     const uint32_t ntiles = (span + TK - 1u) / TK;
     // spans never cross slot boundaries (caller contract) - one table
@@ -645,8 +649,10 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5g_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t kv_dim, uint32_t swa_window, uint32_t rows,
-    float scale) {
+    float scale, const unsigned int* __restrict__ win_pos) {
 #if PD_TC5_OK
+    // window floors from the true positions (null = positions; pd_pf_wp)
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     constexpr uint32_t MR = 64u;                   // real O/P rows
     constexpr uint32_t MS = 128u;                  // S-GEMM M (rows 64+ pad:
                                                    // the M=64 tmem D layout
@@ -715,8 +721,8 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5g_kernel(
     const uint32_t my_tok = my_row / G;
     const uint32_t my_pos = (warp < 2u && my_tok < ntok)
         ? positions[tq0 + my_tok] : 0u;
-    const uint32_t my_lo = (swa_window > 0 && my_pos + 1 > swa_window)
-        ? my_pos + 1 - swa_window : 0u;
+    const uint32_t my_lo = pd_pf_floor(
+        (warp < 2u && my_tok < ntok) ? wp[tq0 + my_tok] : 0u, swa_window);
 
     // O: warp w -> m-tile (w>>1), dim half (w&1): 16 rows x 256 dims
     constexpr uint32_t DHALF = HD / 2u;
@@ -730,8 +736,7 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5g_kernel(
         for (uint32_t j = 0; j < 4u; ++j) o_acc[s2][j] = 0.0f;
 
     const uint32_t pos_last = positions[tq0 + ntok - 1u];
-    const uint32_t lo0 = (swa_window > 0 && positions[tq0] + 1 > swa_window)
-        ? positions[tq0] + 1 - swa_window : 0u;
+    const uint32_t lo0 = pd_pf_floor(wp[tq0], swa_window);
     const uint32_t span = pos_last + 1u - lo0;
     const uint32_t ntiles = (span + TK - 1u) / TK;
     const uint32_t slot = slots ? slots[0] : 0u;   // span = one sequence (v4 convention)
@@ -970,16 +975,21 @@ pd_attn_prefill_pf5g_c2_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t kv_dim, uint32_t swa_window, uint32_t rows,
-    float scale, const uint32_t* __restrict__ run_offs = nullptr) {
+    float scale, const uint32_t* __restrict__ run_offs,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_TC5_OK
     // batched-runs arm: same convention as pf5 - grid.z indexes
     // the armed run table, pointers re-aim, nullptr = classic launch.
+    // window floors from the true positions (null = positions; pd_pf_wp),
+    // re-aimed with `positions` under the runs arm
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     if (run_offs != nullptr) {
         const uint32_t roff = run_offs[blockIdx.z];
         rows = run_offs[blockIdx.z + 1u] - roff;
         q += (size_t)roff * n_heads * HD;
         out += (size_t)roff * n_heads * HD;
         positions += roff;
+        wp += roff;
         if (slots) slots += roff;
     }
     constexpr uint32_t MR = 64u;                   // real rows per CTA
@@ -1073,8 +1083,8 @@ pd_attn_prefill_pf5g_c2_kernel(
     const uint32_t my_tok = my_row / G;
     const uint32_t my_pos = (warp < 4u && my_tok < ntok)
         ? positions[tq0 + my_tok] : 0u;
-    const uint32_t my_lo = (swa_window > 0 && my_pos + 1 > swa_window)
-        ? my_pos + 1 - swa_window : 0u;
+    const uint32_t my_lo = pd_pf_floor(
+        (warp < 4u && my_tok < ntok) ? wp[tq0 + my_tok] : 0u, swa_window);
 
     // O: warp w -> m-tile (w>>1), dim half (w&1): 16 rows x 256 dims
     constexpr uint32_t DHALF = HD / 2u;
@@ -1091,8 +1101,7 @@ pd_attn_prefill_pf5g_c2_kernel(
     const uint32_t last_q = tq_pair + 2u * TQ <= rows ? tq_pair + 2u * TQ - 1u
                                                       : rows - 1u;
     const uint32_t pos_last = positions[last_q];
-    const uint32_t lo0 = (swa_window > 0 && positions[tq_pair] + 1 > swa_window)
-        ? positions[tq_pair] + 1 - swa_window : 0u;
+    const uint32_t lo0 = pd_pf_floor(wp[tq_pair], swa_window);
     const uint32_t span = pos_last + 1u - lo0;
     const uint32_t ntiles = (span + TK - 1u) / TK;
     const uint32_t slot = slots ? slots[0] : 0u;
@@ -1382,16 +1391,21 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf6s_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t kv_dim, uint32_t swa_window, uint32_t rows,
-    float scale, const uint32_t* __restrict__ run_offs = nullptr) {
+    float scale, const uint32_t* __restrict__ run_offs,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_TC5_OK
     // batched-runs arm: identical convention to pf5/pf6g -
     // grid.z indexes the armed run table; nullptr = classic launch.
+    // window floors from the true positions (null = positions; pd_pf_wp),
+    // re-aimed with `positions` under the runs arm
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     if (run_offs != nullptr) {
         const uint32_t roff = run_offs[blockIdx.z];
         rows = run_offs[blockIdx.z + 1u] - roff;
         q += (size_t)roff * n_heads * HD;
         out += (size_t)roff * n_heads * HD;
         positions += roff;
+        wp += roff;
         if (slots) slots += roff;
     }
     constexpr uint32_t MR = 128u;
@@ -1462,12 +1476,11 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf6s_kernel(
     const uint32_t my_row = warp * 32u + lane;         // rows for warps 0-3
     const uint32_t my_tok = my_row / G;
     const uint32_t my_pos = my_tok < ntok ? positions[tq0 + my_tok] : 0u;
-    const uint32_t my_lo = (swa_window > 0 && my_pos + 1 > swa_window)
-        ? my_pos + 1 - swa_window : 0u;
+    const uint32_t my_lo =
+        pd_pf_floor(my_tok < ntok ? wp[tq0 + my_tok] : 0u, swa_window);
 
     const uint32_t pos_last = positions[tq0 + ntok - 1u];
-    const uint32_t lo0 = (swa_window > 0 && positions[tq0] + 1 > swa_window)
-        ? positions[tq0] + 1 - swa_window : 0u;
+    const uint32_t lo0 = pd_pf_floor(wp[tq0], swa_window);
     const uint32_t span = pos_last + 1u - lo0;
     const uint32_t ntiles = (span + TK - 1u) / TK;
     const uint32_t slot = slots ? slots[0] : 0u;
@@ -1755,16 +1768,21 @@ pd_attn_prefill_pf6g_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t kv_dim, uint32_t swa_window, uint32_t rows,
-    float scale, const uint32_t* __restrict__ run_offs = nullptr) {
+    float scale, const uint32_t* __restrict__ run_offs,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_TC5_OK
     // batched-runs arm: same convention as pf5 - grid.z indexes
     // the armed run table, pointers re-aim, nullptr = classic launch.
+    // window floors from the true positions (null = positions; pd_pf_wp),
+    // re-aimed with `positions` under the runs arm
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     if (run_offs != nullptr) {
         const uint32_t roff = run_offs[blockIdx.z];
         rows = run_offs[blockIdx.z + 1u] - roff;
         q += (size_t)roff * n_heads * HD;
         out += (size_t)roff * n_heads * HD;
         positions += roff;
+        wp += roff;
         if (slots) slots += roff;
     }
     constexpr uint32_t MR = 64u;                   // real rows per CTA
@@ -1882,15 +1900,14 @@ pd_attn_prefill_pf6g_kernel(
     const uint32_t my_tok = my_row / G;
     const uint32_t my_pos = (warp < 4u && my_tok < ntok)
         ? positions[tq0 + my_tok] : 0u;
-    const uint32_t my_lo = (swa_window > 0 && my_pos + 1 > swa_window)
-        ? my_pos + 1 - swa_window : 0u;
+    const uint32_t my_lo = pd_pf_floor(
+        (warp < 4u && my_tok < ntok) ? wp[tq0 + my_tok] : 0u, swa_window);
 
     // PAIR-uniform span (both ranks must agree on ntiles)
     const uint32_t last_q = tq_pair + 2u * TQ <= rows ? tq_pair + 2u * TQ - 1u
                                                       : rows - 1u;
     const uint32_t pos_last = positions[last_q];
-    const uint32_t lo0 = (swa_window > 0 && positions[tq_pair] + 1 > swa_window)
-        ? positions[tq_pair] + 1 - swa_window : 0u;
+    const uint32_t lo0 = pd_pf_floor(wp[tq_pair], swa_window);
     const uint32_t span = pos_last + 1u - lo0;
     const uint32_t ntiles = (span + TK - 1u) / TK;
     const uint32_t slot = slots ? slots[0] : 0u;
@@ -2272,14 +2289,21 @@ pd_attn_prefill_pf6g_kernel(
 #endif  // __cluster_dims__ guard (host pass || sm_90+)
 
 
-PD_EXPORT
-int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* pool_v,
-                              const void* sinks, void* out, const void* positions,
-                              const void* slots, const void* block_tables,
-                              uint32_t blocks_per_slot, uint32_t n_heads, uint32_t n_kv_heads,
-                              uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
-                              uint32_t batch, float scale, uint32_t kv_dtype, void* stream) {
+// The paged prefill election with nullable `win_pos` (the window floors'
+// true positions - see pd_pf_wp in prefill.cuh): `pd_attn_prefill_f16_paged`
+// is the original export (null), `pd_attn_prefill_f16_paged_wp` the appended
+// one. Every arm below stages both arrays; the one that cannot - the fa
+// tile, whose masks are ARITHMETIC in a consecutive-position contract - is
+// skipped whenever a window is in force and win_pos is set.
+static int pd_attn_prefill_f16_paged_impl(
+        const void* q, const void* pool_k, const void* pool_v, const void* sinks,
+        void* out, const void* positions, const void* win_pos, const void* slots,
+        const void* block_tables, uint32_t blocks_per_slot, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
+        uint32_t batch, float scale, uint32_t kv_dtype, void* stream) {
     if (n_heads == 0 || batch == 0) return 0;
+    const unsigned int* wp = (const unsigned int*)win_pos;
+    const bool wp_swa = wp != nullptr && swa_window != 0u;
     if (head_dim != 256u && head_dim != 64u && head_dim != 512u && head_dim != 128u)
         return cudaErrorInvalidValue;
     // fp8 caches: the v3w (hd512 8:1) and v3s (hd256 2:1) tiles convert at
@@ -2382,13 +2406,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                             (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                             (const float*)sinks, (float*)out, (const unsigned int*)positions,
                             (const unsigned int*)slots, (const uint32_t*)block_tables,
-                            blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r6);
+                            blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r6, wp);
                     else
                         pd_attn_prefill_pf6g_kernel<512u, 8u, TK6><<<g6, 256, smem6f16, (cudaStream_t)stream>>>(
                             (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                             (const float*)sinks, (float*)out, (const unsigned int*)positions,
                             (const unsigned int*)slots, (const uint32_t*)block_tables,
-                            blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r6);
+                            blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r6, wp);
                     return pd_launch_status();
                 };
                 if (tk6e == 96u)
@@ -2432,13 +2456,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                         (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                         (const float*)sinks, (float*)out, (const unsigned int*)positions,
                         (const unsigned int*)slots, (const uint32_t*)block_tables,
-                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale);
+                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, nullptr, wp);
                 else
                     pd_attn_prefill_pf5g_c2_kernel<512u, 8u, TKC2><<<gc2, 256, smemc2, (cudaStream_t)stream>>>(
                         (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                         (const float*)sinks, (float*)out, (const unsigned int*)positions,
                         (const unsigned int*)slots, (const uint32_t*)block_tables,
-                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale);
+                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, nullptr, wp);
                 return pd_launch_status();
 #endif
             }
@@ -2480,13 +2504,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                         (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                         (const float*)sinks, (float*)out, (const unsigned int*)positions,
                         (const unsigned int*)slots, (const uint32_t*)block_tables,
-                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale);
+                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, wp);
                 else
                     pd_attn_prefill_pf5g_kernel<512u, 8u, TK5G><<<g5g, 256, smem5g, (cudaStream_t)stream>>>(
                         (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                         (const float*)sinks, (float*)out, (const unsigned int*)positions,
                         (const unsigned int*)slots, (const uint32_t*)block_tables,
-                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale);
+                        blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, wp);
                 return pd_launch_status();
             }
         }
@@ -2499,7 +2523,8 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
         // 2x the KV walks of v3w (k1 4 vs NR 16 in half-groups) but v3w is
         // latency-bound (compute 36%, L2 21%), so traffic has headroom.
         static const bool pf_fa512 = pd_env("PADDOCK_G4_PF_FA512") != nullptr;
-        if (pf_fa512 && kv_dtype != PD_KV_FP8_E4M3 && n_heads == 8u * n_kv_heads) {
+        if (pf_fa512 && !wp_swa && kv_dtype != PD_KV_FP8_E4M3
+            && n_heads == 8u * n_kv_heads) {
             constexpr uint32_t FK1 = 4u, FMp = 32u, FPT = 16u;
             const uint32_t smem = FMp * (512u + 8u) * 2u
                 + 2u * FPT * (512u + 8u) * 2u
@@ -2559,7 +2584,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                 (const float*)sinks, (float*)out, (const unsigned int*)positions,
                 (const uint32_t*)block_tables, blocks_per_slot,
                 (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch,
-                scale);
+                scale, nullptr, wp);
             return pd_launch_status();
             }
         }
@@ -2581,20 +2606,20 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
             else
                 pd_attn_prefill_f16_v3w_kernel<512u, __half><<<gw, 256, PD_AF3W_SMEM, (cudaStream_t)stream>>>(
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
             return pd_launch_status();
         }
         pd_attn_prefill_f16_paged_kernel<512u><<<grid, 128, 0, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
             (const float*)sinks, (float*)out, (const unsigned int*)positions,
             (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-            n_heads, n_kv_heads, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     // FA-2 prefill tile (PADDOCK_G4_PF_FA=1, A/B rung): hd256 group-fused
@@ -2668,7 +2693,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables,
-                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5);
+                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5, wp);
                 return pd_launch_status();
             }
             //  arm (PADDOCK_PF_F8QK=1): fp8-NATIVE QK^T - K consumed
@@ -2713,28 +2738,28 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables,
-                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5);
+                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5, wp);
             else if (f8s && f8qk)
                 pd_attn_prefill_pf5_kernel<256u, 2u, TK5, true, true><<<g5, 256, smem5, (cudaStream_t)stream>>>(
                     pf5_tm0, pf5_tm0,
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables,
-                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5);
+                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5, wp);
             else if (f8s)
                 pd_attn_prefill_pf5_kernel<256u, 2u, TK5, true><<<g5, 256, smem5, (cudaStream_t)stream>>>(
                     pf5_tm0, pf5_tm0,
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables,
-                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5);
+                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5, wp);
             else
                 pd_attn_prefill_pf5_kernel<256u, 2u, TK5><<<g5, 256, smem5, (cudaStream_t)stream>>>(
                     pf5_tm0, pf5_tm0,
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables,
-                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5);
+                    blocks_per_slot, n_heads, kv_dim, swa_window, batch, scale, r5, wp);
             return pd_launch_status();
         }
     }
@@ -2772,7 +2797,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)sinks, (float*)out, (const unsigned int*)positions,
             (const uint32_t*)block_tables, blocks_per_slot,
             (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch,
-            scale);
+            scale, nullptr, wp);
         return pd_launch_status();
         }
     }
@@ -2837,7 +2862,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const unsigned char*)pool_v, (const float*)sinks, (float*)out,    \
             (const unsigned int*)positions, (const uint32_t*)block_tables,     \
             blocks_per_slot, (const unsigned int*)slots, n_heads, kv_dim,      \
-            swa_window, batch, scale)
+            swa_window, batch, scale, nullptr, nullptr, wp)
                 if (g_ == 4u) PD_PF7RP_LAUNCH(4u);
                 else if (g_ == 6u) PD_PF7RP_LAUNCH(6u);
                 else PD_PF7RP_LAUNCH(8u);
@@ -2881,7 +2906,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const unsigned char*)pool_v, (const float*)sinks, (float*)out,    \
             (const unsigned int*)positions, (const uint32_t*)block_tables,     \
             blocks_per_slot, (const unsigned int*)slots, n_heads, kv_dim,      \
-            swa_window, batch, scale)
+            swa_window, batch, scale, nullptr, nullptr, wp)
                 if (g_ == 4u) PD_PF7_LAUNCH(4u);
                 else if (g_ == 6u) PD_PF7_LAUNCH(6u);
                 else PD_PF7_LAUNCH(8u);
@@ -2946,7 +2971,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)sinks, (float*)out, (const unsigned int*)positions,  \
             (const uint32_t*)block_tables, blocks_per_slot,                    \
             (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch,    \
-            scale)
+            scale, nullptr, wp)
             if (f8v4) {
                 if (g_ == 4u) PD_PFV4Q_LAUNCH(4u, __nv_fp8_e4m3);
                 else if (g_ == 6u) PD_PFV4Q_LAUNCH(6u, __nv_fp8_e4m3);
@@ -2966,7 +2991,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             return pd_attn_prefill_paged_launch<__nv_fp8_e4m3, 256u>(q, pool_k,
                 pool_v, sinks, out, positions, slots, block_tables,
                 blocks_per_slot, n_heads, n_kv_heads, kv_dim, swa_window,
-                batch, scale, (cudaStream_t)stream);
+                batch, scale, (cudaStream_t)stream, wp);
     }
     // v4 staged-HMMA tile for the granite/laguna/muse/paddleocr hd128 shapes:
     // G=4 (granite 32q/8kv), G=6 (laguna full-attn layers, 48q/8kv), G=8
@@ -3064,7 +3089,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
         (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
         (const uint32_t*)block_tables, blocks_per_slot,                        \
         (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch, scale, \
-        nullptr, ro)
+        nullptr, ro, wp)
                 if (g_ == 4u) PD_PF7RP_128_LAUNCH(4u);
                 else if (g_ == 6u) PD_PF7RP_128_LAUNCH(6u);
                 else if (g_ == 8u) PD_PF7RP_128_LAUNCH(8u);
@@ -3143,7 +3168,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
         (const float*)q, (const unsigned char*)pool_k, (const unsigned char*)pool_v, \
         (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
         (const uint32_t*)block_tables, blocks_per_slot, (const unsigned int*)slots, \
-        n_heads, kv_dim, swa_window, batch, scale, nullptr, ro)
+        n_heads, kv_dim, swa_window, batch, scale, nullptr, ro, wp)
                 if (g_ == 4u) PD_PF7_128_LAUNCH(4u);
                 else if (g_ == 6u) PD_PF7_128_LAUNCH(6u);
                 else if (g_ == 8u) PD_PF7_128_LAUNCH(8u);
@@ -3241,7 +3266,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)sinks, (float*)out, (const unsigned int*)positions,  \
             (const uint32_t*)block_tables, blocks_per_slot,                    \
             (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch,    \
-            scale, r4n)
+            scale, r4n, wp)
             if (f8v4n) {
                 if (g_ == 4u) PD_PFV4N_LAUNCH(4u, __nv_fp8_e4m3);
                 else if (g_ == 6u) PD_PFV4N_LAUNCH(6u, __nv_fp8_e4m3);
@@ -3265,7 +3290,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             return pd_attn_prefill_paged_launch<__nv_fp8_e4m3, 128u>(q, pool_k,
                 pool_v, sinks, out, positions, slots, block_tables,
                 blocks_per_slot, n_heads, n_kv_heads, kv_dim, swa_window,
-                batch, scale, (cudaStream_t)stream);
+                batch, scale, (cudaStream_t)stream, wp);
     }
     // v4 staged-HMMA tile, FP8 ARM only, for gpt-oss's shape (G=8, hd64).
     // This family's own hd64 kernel (pd_attn_prefill_f16_paged_kernel<64>,
@@ -3322,7 +3347,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     (float*)out, (const unsigned int*)positions,
                     (const uint32_t*)block_tables, blocks_per_slot,
                     (const unsigned int*)slots, n_heads, kv_dim, swa_window,
-                    batch, scale);
+                    batch, scale, nullptr, wp);
             return pd_launch_status();
         }
         }
@@ -3387,7 +3412,9 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
             }
         }
-        if (pfa_ok) {
+        // the fa tile's masks are arithmetic in the consecutive-position
+        // contract (no per-row floor to stage): skipped under win_pos
+        if (pfa_ok && !wp_swa) {
             dim3 gf(n_kv_heads, (batch + PFA_K1 - 1u) / PFA_K1);
             if (spl)
                 pd_attn_prefill_fa_kernel<32u, PFA_TPW, false, 256u, 256u, 1u, true><<<gf, nt, smem, (cudaStream_t)stream>>>(
@@ -3467,13 +3494,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                     (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
             else
                 pd_attn_prefill_f16_v3c_kernel<__half><<<gc, 256, PD_AF3C_SMEM, (cudaStream_t)stream>>>(
                     (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                     (const float*)sinks, (float*)out, (const unsigned int*)positions,
                     (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                    n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
             return pd_launch_status();
         }
         static bool a3s = false;
@@ -3490,13 +3517,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                 (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                 (const float*)sinks, (float*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         else
             pd_attn_prefill_f16_v3s_kernel<__half><<<gs, 256, PD_AF3S_SMEM, (cudaStream_t)stream>>>(
                 (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                 (const float*)sinks, (float*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     static const bool v3p = pd_env("PADDOCK_ATTN_PF_V3") != nullptr;
@@ -3512,7 +3539,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
             (const float*)sinks, (float*)out, (const unsigned int*)positions,
             (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-            n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     static const bool v2p = pd_env("PADDOCK_ATTN_PF_V2") != nullptr;
@@ -3522,13 +3549,13 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
                 (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                 (const float*)sinks, (float*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         else
             pd_attn_prefill_f16_v2_kernel<64u><<<grid, 128, 0, (cudaStream_t)stream>>>(
                 (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
                 (const float*)sinks, (float*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     if (head_dim == 256u) {
@@ -3536,7 +3563,7 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
             (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, kv_dim,
-            swa_window, batch, scale);
+            swa_window, batch, scale, wp);
     } else if (head_dim == 128u) {
         // hd 128 (laguna XS / the qwen3 head shape): same NC=32 tile as 256/64,
         // ~26 KB static smem - instantiation was simply never needed before
@@ -3544,15 +3571,43 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
             (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, kv_dim,
-            swa_window, batch, scale);
+            swa_window, batch, scale, wp);
     } else {
         pd_attn_prefill_f16_paged_kernel<64u><<<grid, 128, 0, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
             (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, kv_dim,
-            swa_window, batch, scale);
+            swa_window, batch, scale, wp);
     }
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* pool_v,
+                              const void* sinks, void* out, const void* positions,
+                              const void* slots, const void* block_tables,
+                              uint32_t blocks_per_slot, uint32_t n_heads, uint32_t n_kv_heads,
+                              uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
+                              uint32_t batch, float scale, uint32_t kv_dtype, void* stream) {
+    return pd_attn_prefill_f16_paged_impl(q, pool_k, pool_v, sinks, out, positions, nullptr,
+                                          slots, block_tables, blocks_per_slot, n_heads,
+                                          n_kv_heads, head_dim, kv_dim, swa_window, batch,
+                                          scale, kv_dtype, stream);
+}
+
+// slot 653: pd_attn_prefill_f16_paged + `win_pos` after `positions`
+PD_EXPORT
+int pd_attn_prefill_f16_paged_wp(const void* q, const void* pool_k, const void* pool_v,
+                                 const void* sinks, void* out, const void* positions,
+                                 const void* win_pos, const void* slots,
+                                 const void* block_tables, uint32_t blocks_per_slot,
+                                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                 uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                 float scale, uint32_t kv_dtype, void* stream) {
+    return pd_attn_prefill_f16_paged_impl(q, pool_k, pool_v, sinks, out, positions, win_pos,
+                                          slots, block_tables, blocks_per_slot, n_heads,
+                                          n_kv_heads, head_dim, kv_dim, swa_window, batch,
+                                          scale, kv_dtype, stream);
 }
 
 // a16 twin (attention streams): q and out are f16 planes. Own
@@ -3562,20 +3617,19 @@ int pd_attn_prefill_f16_paged(const void* q, const void* pool_k, const void* poo
 // there is no per-call fallback). The q side is bit-equal at scale=1.0
 // (those kernels round q to f16 into fragments anyway); the out side
 // rounds once at the store - serve acceptance arbitrates.
-PD_EXPORT
-int pd_attn_prefill_f16_paged2(const void* q, const void* pool_k, const void* pool_v,
-                               const void* sinks, void* out, const void* positions,
-                               const void* slots, const void* block_tables,
-                               uint32_t blocks_per_slot, uint32_t n_heads, uint32_t n_kv_heads,
-                               uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
-                               uint32_t batch, float scale, uint32_t kv_dtype, uint32_t a16,
-                               void* stream) {
+static int pd_attn_prefill_f16_paged2_impl(
+        const void* q, const void* pool_k, const void* pool_v, const void* sinks,
+        void* out, const void* positions, const void* win_pos, const void* slots,
+        const void* block_tables, uint32_t blocks_per_slot, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
+        uint32_t batch, float scale, uint32_t kv_dtype, uint32_t a16, void* stream) {
     if (!a16)
-        return pd_attn_prefill_f16_paged(q, pool_k, pool_v, sinks, out, positions,
-                                         slots, block_tables, blocks_per_slot,
-                                         n_heads, n_kv_heads, head_dim, kv_dim,
-                                         swa_window, batch, scale, kv_dtype, stream);
+        return pd_attn_prefill_f16_paged_impl(q, pool_k, pool_v, sinks, out, positions,
+                                              win_pos, slots, block_tables, blocks_per_slot,
+                                              n_heads, n_kv_heads, head_dim, kv_dim,
+                                              swa_window, batch, scale, kv_dtype, stream);
     if (n_heads == 0 || batch == 0) return 0;
+    const unsigned int* wp = (const unsigned int*)win_pos;
     if (head_dim == 512u && n_heads == 8u * n_kv_heads) {
         static bool a3w16 = false;
         if (!a3w16) {
@@ -3594,14 +3648,14 @@ int pd_attn_prefill_f16_paged2(const void* q, const void* pool_k, const void* po
                 (const __half*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                 (const float*)sinks, (__half*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         else
             pd_attn_prefill_f16_v3w_kernel<512u, __half, __half, __half>
                 <<<gw, 256, PD_AF3W_SMEM, (cudaStream_t)stream>>>(
                 (const __half*)q, (const __half*)pool_k, (const __half*)pool_v,
                 (const float*)sinks, (__half*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     if (head_dim == 256u && n_heads == 2u * n_kv_heads && (n_kv_heads & 3u) == 0u
@@ -3621,7 +3675,7 @@ int pd_attn_prefill_f16_paged2(const void* q, const void* pool_k, const void* po
                 (const __half*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
                 (const float*)sinks, (__half*)out, (const unsigned int*)positions,
                 (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+                n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
             return pd_launch_status();
         }
         static bool a3s16 = false;
@@ -3637,10 +3691,40 @@ int pd_attn_prefill_f16_paged2(const void* q, const void* pool_k, const void* po
             (const __half*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
             (const float*)sinks, (__half*)out, (const unsigned int*)positions,
             (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
-            n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, 0u, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     return cudaErrorInvalidValue;
+}
+
+PD_EXPORT
+int pd_attn_prefill_f16_paged2(const void* q, const void* pool_k, const void* pool_v,
+                               const void* sinks, void* out, const void* positions,
+                               const void* slots, const void* block_tables,
+                               uint32_t blocks_per_slot, uint32_t n_heads, uint32_t n_kv_heads,
+                               uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
+                               uint32_t batch, float scale, uint32_t kv_dtype, uint32_t a16,
+                               void* stream) {
+    return pd_attn_prefill_f16_paged2_impl(q, pool_k, pool_v, sinks, out, positions, nullptr,
+                                           slots, block_tables, blocks_per_slot, n_heads,
+                                           n_kv_heads, head_dim, kv_dim, swa_window, batch,
+                                           scale, kv_dtype, a16, stream);
+}
+
+// slot 654: pd_attn_prefill_f16_paged2 + `win_pos` after `positions`
+PD_EXPORT
+int pd_attn_prefill_f16_paged2_wp(const void* q, const void* pool_k, const void* pool_v,
+                                  const void* sinks, void* out, const void* positions,
+                                  const void* win_pos, const void* slots,
+                                  const void* block_tables, uint32_t blocks_per_slot,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                  float scale, uint32_t kv_dtype, uint32_t a16,
+                                  void* stream) {
+    return pd_attn_prefill_f16_paged2_impl(q, pool_k, pool_v, sinks, out, positions, win_pos,
+                                           slots, block_tables, blocks_per_slot, n_heads,
+                                           n_kv_heads, head_dim, kv_dim, swa_window, batch,
+                                           scale, kv_dtype, a16, stream);
 }
 
 // --------------------------------- attn prefill batch f16 (multi-slot WMMA)
@@ -3670,7 +3754,8 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_batch_f16_kernel(
     const unsigned int* __restrict__ slots, const unsigned int* __restrict__ tile_row0,
     const unsigned int* __restrict__ tile_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     using namespace nvcuda;
     constexpr uint32_t NC = PD_ABF16_NC, TK = PD_ABF16_TK;
@@ -3689,6 +3774,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_batch_f16_kernel(
     const uint32_t slot = tile_slot[blockIdx.y];
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     __shared__ half sh_q[NC * DP];
     __shared__ float sh_s[NC * KQP];   // scores f32; P overwrites as f16
@@ -3696,13 +3782,16 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_batch_f16_kernel(
     __shared__ float sh_corr[NC];
     __shared__ float sh_onorm[NC];
     __shared__ uint32_t sh_hi[NC];
+    __shared__ uint32_t sh_lo[NC];     // window floors (+1), from wp
     half* sh_p = (half*)sh_s;          // P at half stride 2*KQP, in place
 
     // liveness first: the CUDA-graph path pads the tile grid with dead
     // sentinels, and those blocks must exit before the Q/O staging cost
     if (tid < NC) {
         const uint32_t b = row0 + tid;
-        sh_hi[tid] = (b < n_rows && slots[b] == slot) ? positions[b] + 1u : 0u;
+        const bool live = b < n_rows && slots[b] == slot;
+        sh_hi[tid] = live ? positions[b] + 1u : 0u;
+        sh_lo[tid] = live ? wp[b] + 1u : 0u;
     }
     __syncthreads();
     uint32_t hi = 0;
@@ -3751,7 +3840,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_batch_f16_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NC; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -3784,8 +3873,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_batch_f16_kernel(
             const uint32_t b = row0 + j;
             const bool live = b < n_rows && slots[b] == slot;
             const uint32_t pos = live ? positions[b] : 0u;
-            const uint32_t fp =
-                (swa_window > 0 && pos + 1u > swa_window) ? pos + 1u - swa_window : 0u;
+            const uint32_t fp = pd_pf_floor(live ? wp[b] : 0u, swa_window);
             float s0 = -1e30f, s1 = -1e30f;
             const uint32_t k0 = t0 + lane, k1 = t0 + 32u + lane;
             if (live && k0 >= fp && k0 <= pos && k0 < hi) s0 = sh_s[j * KQP + lane];
@@ -3909,7 +3997,8 @@ int pd_attn_prefill_batch_f16(const void* q, const void* kc, const void* vc,
         (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
         (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
         (const unsigned int*)tile_row0, (const unsigned int*)tile_slot,
-        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, n_rows, scale);
+        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, n_rows, scale,
+        nullptr);  // causal rows only (the encoder's ragged batch): floors from positions
     return pd_launch_status();
 }
 

@@ -89,7 +89,34 @@ const DEEPSEEK3_NUM: &str = r"\p{N}{1,3}";
 const DEEPSEEK3_CJK: &str = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
 const DEEPSEEK3_MAIN: &str = r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##;
 
+/// MiniCPM5 (`tokenizer.ggml.pre = "minicpm5"`; openbmb/MiniCPM5-2B, vocab
+/// 130560, served under arch `llama`). Two-stage, reproduced 1:1 from the
+/// model's own tokenizer.json: digit runs are capped at 3 FIRST, then a
+/// llama3-shaped main split whose digit branch is the unbounded `\p{N}+` -
+/// which is only correct because stage 1 already cut every run. llama.cpp's
+/// MINICPM5 case carries the same pair (contractions spelled as [sS]
+/// classes there; we keep the original `(?i:)`).
+const MINICPM5_NUM: &str = r"\p{N}{1,3}";
+const MINICPM5_MAIN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 pub fn build(pre: &str) -> Result<PreTokenizerWrapper, TokenizerError> {
+    if pre == "minicpm5" {
+        let mut stages = Vec::with_capacity(3);
+        for pat in [MINICPM5_NUM, MINICPM5_MAIN] {
+            let s = Split::new(
+                SplitPattern::Regex(pat.to_owned()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map_err(|e| TokenizerError::Library(e.to_string()))?;
+            stages.push(PreTokenizerWrapper::Split(s));
+        }
+        let mut byte_level = ByteLevel::default();
+        byte_level.add_prefix_space = false;
+        byte_level.use_regex = false;
+        stages.push(PreTokenizerWrapper::ByteLevel(byte_level));
+        return Ok(Sequence::new(stages).into());
+    }
     if pre == "deepseek-v3" {
         let mut stages = Vec::with_capacity(4);
         for pat in [DEEPSEEK3_NUM, DEEPSEEK3_CJK, DEEPSEEK3_MAIN] {
@@ -219,6 +246,44 @@ mod tests {
         assert_eq!(
             segments("deepseek-v3", "(hello) .World  x\ny"),
             ["(hello", ")", "Ġ.", "World", "Ġ", "Ġx", "Ċ", "y"]
+        );
+    }
+
+    /// The two-stage minicpm5 split vs segments captured from HF tokenizers
+    /// (0.22.1) running openbmb/MiniCPM5-2B's own tokenizer.json. Pins the
+    /// 3-digit cap landing BEFORE the main pattern ("2026" -> "202","6"), the
+    /// `(?i:)` contractions, and the llama3-shaped punctuation run that
+    /// swallows a following newline pair (".\n\n" is one segment).
+    #[test]
+    fn minicpm5_splits_like_the_reference() {
+        assert_eq!(
+            segments("minicpm5", "Revenue reached 12.4 million (up 1234%)."),
+            [
+                "Revenue",
+                "Ġreached",
+                "Ġ",
+                "12",
+                ".",
+                "4",
+                "Ġmillion",
+                "Ġ(",
+                "up",
+                "Ġ",
+                "123",
+                "4",
+                "%)."
+            ]
+        );
+        assert_eq!(
+            segments("minicpm5", "I'm sure it's 2026-09-22.\n\nNext line."),
+            [
+                "I", "'m", "Ġsure", "Ġit", "'s", "Ġ", "202", "6", "-", "09", "-", "22", ".ĊĊ",
+                "Next", "Ġline", "."
+            ]
+        );
+        assert_eq!(
+            segments("minicpm5", "文档解析123テスト"),
+            ["æĸĩæ¡£è§£æŀĲ", "123", "ãĥĨãĤ¹ãĥĪ"]
         );
     }
 }

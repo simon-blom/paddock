@@ -282,6 +282,9 @@ pub struct AppState {
     /// The loaded dense-prediction model (tic-forestry: DINOv3 + decoder), if
     /// one was configured - serves `/v1/segmentations` only.
     pub segmenter: Option<crate::serving::SegmentModel>,
+    /// The loaded image-generation model (Qwen-Image), if one was configured
+    /// - serves `/v1/images/*` only.
+    pub image: Option<crate::serving::ImageModel>,
     /// Served context window (`--max-ctx`) - the hard ceiling for a reply's
     /// tokens; clients can read it from /api/server.
     pub max_ctx: usize,
@@ -293,7 +296,15 @@ pub struct AppState {
     /// the will-it-fit estimate is priced against - KV cost is ctx × batch, so
     /// showing a VRAM figure without both is meaningless.
     pub max_batch: usize,
-    /// Default max output tokens (`--max-output-tokens`) when a request omits it.
+    /// Output cap for a request that sends none: the config's `max_tokens`
+    /// (`--max-output-tokens`), else the context window. The window is what
+    /// an omitted cap means everywhere else (OpenAI, vLLM, llama.cpp: the
+    /// model stops or the window ends), and the engine clamps every run to
+    /// the room its prompt leaves anyway. It was a flat 1024 until
+    /// 2026-09-22: a reasoning model asked for "about 200 words" spent all of
+    /// it counting words in its thinking and the reply came back with no
+    /// content at all, a `length` finish, and a client showing the counting
+    /// as the answer.
     pub default_max_output_tokens: usize,
     /// Hard ceiling that clamps a request's `max_output_tokens` (`None` = no
     /// clamp). Set on an exposed instance so a request can't demand a huge,
@@ -347,7 +358,32 @@ pub struct AppState {
     pub forensics: Option<std::sync::Arc<crate::forensics::ForensicRuntime>>,
 }
 
+/// What bounds a request's generation: the server default for a request that
+/// names no cap, and the deployment ceiling over both. One value handed to
+/// every prepare() so the routes cannot drift apart on either half.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputCaps {
+    pub default: usize,
+    pub ceiling: Option<usize>,
+}
+
+impl OutputCaps {
+    /// The cap a request generates under: what it asked for, else the
+    /// default, and never above the ceiling.
+    pub fn resolve(self, asked: Option<usize>) -> usize {
+        let n = asked.unwrap_or(self.default);
+        self.ceiling.map_or(n, |c| n.min(c))
+    }
+}
+
 impl AppState {
+    pub fn output_caps(&self) -> OutputCaps {
+        OutputCaps {
+            default: self.default_max_output_tokens,
+            ceiling: self.max_output_ceiling,
+        }
+    }
+
     /// Minimal state for integration tests: a served model (or none) and inert
     /// defaults for everything else. Tests must build state through this - a
     /// struct literal in a test rots every time `AppState` grows a field
@@ -372,10 +408,12 @@ impl AppState {
             asr: None,
             aligner: None,
             segmenter: None,
+            image: None,
             max_ctx: 8192,
             vad_gate: false,
             max_batch: 8,
-            default_max_output_tokens: 1024,
+            // the window, like a real state's (see the field)
+            default_max_output_tokens: 8192,
             max_output_ceiling: None,
             rate_limiter: Arc::new(crate::ratelimit::RateLimiter::new(
                 crate::ratelimit::Limits {
@@ -413,6 +451,15 @@ impl AppState {
     pub fn for_tests_asr(asr: AsrModel) -> Self {
         AppState {
             asr: Some(asr),
+            ..Self::for_tests(None)
+        }
+    }
+
+    /// Same, for an image-generation runner: `/v1/images/*` and nothing else.
+    #[doc(hidden)]
+    pub fn for_tests_image(image: crate::serving::ImageModel) -> Self {
+        AppState {
+            image: Some(image),
             ..Self::for_tests(None)
         }
     }
@@ -468,6 +515,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/audio/alignments", post(crate::alignments::handle))
         .route("/v1/segmentations", post(crate::segmentations::handle))
+        .route("/v1/images/generations", post(crate::images::generations))
+        .route("/v1/images/edits", post(crate::images::edits))
+        .route("/v1/systemone", post(crate::systemone::handle))
         .fallback(not_found)
         // Axum's default body limit is 2 MB, which is below what a single
         // legitimate request carries here: a data-URI image inflates 4/3 in
@@ -713,6 +763,24 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let caps = state.serving.as_ref().map(|s| &s.reasoning);
     let reasoning = caps.map(|c| c.style());
     let dflt = state.sampling.resolve(true);
+    // built outside the big literal below: one more nested object in it and
+    // `json!` runs out of macro recursion
+    let image_generation = state.image.as_ref().map(|m| {
+        serde_json::json!({
+            "size_multiple": m.service.info().size_multiple,
+            "max_side": crate::images::MAX_SIDE,
+            "default_size": format!("{0}x{0}", crate::images::DEFAULT_SIDE),
+            "default_steps": crate::images::DEFAULT_STEPS,
+            "max_steps": crate::images::MAX_STEPS,
+            "max_n": crate::images::MAX_N,
+            "edit": m.service.info().edit && m.image_pad_id.is_some(),
+            "max_references": crate::images::MAX_REFERENCES,
+            "stream": true,
+            "max_partial_images": crate::images::MAX_PARTIAL_IMAGES,
+            "output_formats": ["png", "webp", "jpeg"],
+            "weights_bytes": m.service.info().weights_bytes,
+        })
+    });
     Json(serde_json::json!({
         "role": "runner",
         "version": env!("CARGO_PKG_VERSION"),
@@ -826,6 +894,22 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                 },
                 "epsg": c.epsg,
                 "chips_per_pass": i.max_batch,
+            })
+        }),
+        // Image generation: the served model and what a valid request looks
+        // like - the size grid, the ceiling, the step default and the
+        // encodings - so a client builds one without probing.
+        "image_model": state.image.as_ref().map(|m| m.id.clone()),
+        "image_generation": image_generation,
+        // Structured decisions (POST /v1/systemone) serve iff the chat model
+        // generates by block diffusion: the canvas width bounds how many
+        // `id: label` lines one call can read, and the caps say so up front.
+        "structured_read": state.serving.as_ref().filter(|s| s.engine.canvas_width() > 0).map(|s| {
+            serde_json::json!({
+                "canvas_width": s.engine.canvas_width(),
+                "max_questions": crate::systemone::MAX_QUESTIONS,
+                "max_samples": crate::systemone::MAX_SAMPLES,
+                "types": ["noul", "choice", "score"],
             })
         }),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
@@ -1323,6 +1407,33 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             ),
         );
     }
+    if let Some(im) = &state.image {
+        // image generation only: text in, an image out - /v1/images/* and
+        // nothing else. No context window; the listing says so with a 0.
+        data.push(
+            ModelObject::new(im.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["text"],
+                    "output_modalities": ["image"],
+                    "modality": "text->image",
+                }),
+                serde_json::json!({
+                    "image_generation": true,
+                    "image_edit": false,
+                    "stream": true,
+                    "size_multiple": im.service.info().size_multiple,
+                    "max_side": crate::images::MAX_SIDE,
+                    "default_steps": crate::images::DEFAULT_STEPS,
+                    "output_formats": ["png", "webp", "jpeg"],
+                }),
+                crate::images::SUPPORTED_PARAMETERS
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect(),
+                0,
+            ),
+        );
+    }
     Json(ModelList::new(data)).into_response()
 }
 
@@ -1363,6 +1474,9 @@ pub(crate) fn is_generation_path(path: &str) -> bool {
             | "/v1/responses"
             | "/v1/responses/compact"
             | "/v1/messages"
+            | "/v1/images/generations"
+            | "/v1/images/edits"
+            | "/v1/systemone"
     )
 }
 
@@ -1481,6 +1595,37 @@ mod tests {
 
     fn test_router() -> Router {
         router(Arc::new(AppState::for_tests(None)))
+    }
+
+    #[test]
+    fn an_omitted_output_cap_is_the_window_and_the_ceiling_bounds_both() {
+        // the request said nothing: it runs to the window (the engine clamps
+        // to the room its prompt leaves), never to a small fixed number
+        let caps = OutputCaps {
+            default: 65_536,
+            ceiling: None,
+        };
+        assert_eq!(caps.resolve(None), 65_536);
+        assert_eq!(caps.resolve(Some(300)), 300);
+        // a configured default is what an omitted cap gets instead
+        let caps = OutputCaps {
+            default: 2_048,
+            ceiling: None,
+        };
+        assert_eq!(caps.resolve(None), 2_048);
+        // the deployment ceiling clamps the default and the ask alike
+        let caps = OutputCaps {
+            default: 65_536,
+            ceiling: Some(4_096),
+        };
+        assert_eq!(caps.resolve(None), 4_096);
+        assert_eq!(caps.resolve(Some(100_000)), 4_096);
+        assert_eq!(caps.resolve(Some(16)), 16);
+        // the Responses wire leaves the field absent, not defaulted, so the
+        // server decides (it used to deserialize straight to 1024)
+        let req: paddock_api::responses::ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "input": "hi"})).unwrap();
+        assert_eq!(req.max_output_tokens, None);
     }
 
     #[test]

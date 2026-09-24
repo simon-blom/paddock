@@ -36,6 +36,10 @@ enum ManagerDestination: String, CaseIterable, Identifiable {
   case customEndpoints = "Custom endpoints"
   case connectors = "Connectors"
   case overview = "This Mac"
+  case insights = "Usage & activity"
+  case clients = "Client setup"
+  case storage = "Data & storage"
+  case benchmarks = "Benchmarks"
   var id: Self { self }
   var symbol: String {
     switch self {
@@ -48,6 +52,10 @@ enum ManagerDestination: String, CaseIterable, Identifiable {
     case .customEndpoints: "network"
     case .connectors: "puzzlepiece.extension"
     case .overview: "laptopcomputer"
+    case .insights: "chart.bar.xaxis"
+    case .clients: "terminal"
+    case .storage: "externaldrive"
+    case .benchmarks: "speedometer"
     }
   }
 }

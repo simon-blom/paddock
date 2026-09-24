@@ -68,13 +68,17 @@ onUnmounted(() => release?.())
 // render of this tab. logTargetOptions below already spells it 'all'; this now
 // matches. The setter's `Number(v) || null` maps it back to "no filter"
 // unchanged, since Number('all') is NaN.
+// every serving role in the chain: a catalog model has `display`, but a
+// hand-started file in any other role would otherwise label as "undefined"
+const servedOf = (r: (typeof fleet.rows)[number]) =>
+  r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? undefined
 const portOptions = computed(() => [
   { value: 'all', label: 'All servers' },
   ...fleet.rows.map((r) => ({
     value: r.port,
-    label: `${r.port} - ${r.display ?? r.model ?? r.embedder}`,
+    label: `${r.port} - ${r.display ?? servedOf(r)}`,
     vendor: r.vendor ?? undefined,
-    title: r.model ?? r.embedder ?? undefined,
+    title: servedOf(r),
   })),
 ])
 const portSel = computed({
@@ -86,9 +90,9 @@ const logTargetOptions = computed(() => [
   { value: 'manager', label: 'Manager' },
   ...fleet.rows.map((r) => ({
     value: String(r.port),
-    label: `${r.port} - ${r.display ?? r.model ?? r.embedder}`,
+    label: `${r.port} - ${r.display ?? servedOf(r)}`,
     vendor: r.vendor ?? undefined,
-    title: r.model ?? r.embedder ?? undefined,
+    title: servedOf(r),
   })),
 ])
 

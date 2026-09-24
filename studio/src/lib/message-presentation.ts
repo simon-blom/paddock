@@ -1,5 +1,5 @@
 import { measuredUsage, measuredSpeed } from './response-metrics'
-import type { Message, Usage } from '@/types/chat'
+import type { ImageGenMeta, Message, Usage } from '@/types/chat'
 import { fmtCost, fmtDuration, fmtVram } from './format'
 
 /** Shared message chrome for the web and native transcripts. These are
@@ -35,6 +35,27 @@ export function answerMetricsHint(raw?: Usage): string {
   return parts.join(' · ')
 }
 
+/** The picture turn's footer. Its "output tokens" are latent patches - the
+ *  API's billing unit, not words - so the footer talks about the render
+ *  instead: how long, and how long per step, which is the number that tells
+ *  a person what a bigger picture or more steps will cost them. */
+export function imageMetrics(ig: ImageGenMeta): string {
+  if (!ig.elapsedS) return ''
+  const parts = [`${fmtDuration(ig.elapsedS * 1000)}`]
+  if (ig.sPerStep) parts.push(`${ig.sPerStep.toFixed(2)} s/step`)
+  return parts.join(' · ')
+}
+
+export function imageMetricsHint(ig: ImageGenMeta, raw?: Usage): string {
+  if (!ig.elapsedS) return ''
+  const parts = ['Render time from send to done']
+  const u = raw ? measuredUsage(raw) : undefined
+  if (u?.ttftMs) parts.push(`${fmtDuration(u.ttftMs)} to the first preview`)
+  if (u?.promptTokens) parts.push(`${u.promptTokens} prompt tokens read`)
+  if (u?.completionTokens) parts.push(`${u.completionTokens} latent tokens drawn`)
+  return parts.join(' · ')
+}
+
 export function tokenLimitNote(u?: Usage): string {
   const reasoning = u?.reasoningTokens ?? 0
   if (!reasoning || !u?.completionTokens) return 'Reply reached its output limit. The context window also includes your prompt and history.'
@@ -63,11 +84,38 @@ const join = (parts: (string | undefined | false)[]): string => parts.filter(Boo
 /** Snapshot provenance and measurements, not today's runner configuration.
  * Only explicit fields enter the native bridge; extra provider payloads cannot
  * accidentally become Swift state by spreading a run/usage object. */
-export function runDetailSections(message: Pick<Message, 'run' | 'usage'>): RunDetailSection[] {
-  const { run: r } = message
+export function runDetailSections(message: Pick<Message, 'run' | 'usage' | 'imageGen'>): RunDetailSection[] {
+  const { run: r, imageGen: ig } = message
   const u = message.usage ? measuredUsage(message.usage) : undefined
   const sections: RunDetailSection[] = []
-  if (r) {
+  // An image turn's provenance is its recipe, not sampling: the seed, size
+  // and steps reproduce the picture, so they lead, and the sampling rows
+  // (which never rode) are left out rather than shown as defaults.
+  if (ig) {
+    const rows = [{ label: 'Model', value: r?.model ?? '-' }]
+    rows.push(
+      { label: 'Prompt', value: ig.prompt.length > 200 ? `${ig.prompt.slice(0, 200)}...` : ig.prompt || '-' },
+      {
+        label: 'Seed',
+        value: `${ig.seed} (${ig.params.seed === 'random' ? 'drawn for this turn' : ig.params.seed === 'thread' ? 'automatic' : 'pinned'})`,
+      },
+      { label: 'Picture', value: join([ig.size, `${ig.steps} steps`, ig.params.quality !== 'auto' ? `quality ${ig.params.quality}` : '', ig.params.format, ig.params.background !== 'auto' ? ig.params.background : '']) },
+    )
+    if (ig.references) {
+      rows.push({
+        label: 'Edit of',
+        value:
+          ig.referencesFrom === 'previous'
+            ? 'the previous picture in this conversation'
+            : `${ig.references} attached picture${ig.references > 1 ? 's' : ''}`,
+      })
+    }
+    if (ig.params.n > 1) rows.push({ label: 'Count', value: `${ig.params.n} pictures on one seed` })
+    if (ig.previews) rows.push({ label: 'Previews', value: `${ig.previews} while rendering` })
+    if (ig.elapsedS) rows.push({ label: 'Render', value: join([`${ig.elapsedS.toFixed(1)} s`, ig.sPerStep ? `${ig.sPerStep.toFixed(2)} s/step all-in` : '']) })
+    if (r?.contended) rows.push({ label: 'Concurrency', value: 'Other compare lanes shared the GPU during this run' })
+    sections.push({ id: 'provenance', title: 'Provenance', rows })
+  } else if (r) {
     const p = r.params
     const sampling = join([
       `temp ${dial(p.temperature)}`, `top-p ${dial(p.topP)}`, `top-k ${p.topK === 0 ? 'off' : (p.topK ?? 'default')}`,

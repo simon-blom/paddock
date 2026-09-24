@@ -1,0 +1,19 @@
+[
+  {"name":"local automatic uses advertised context", "cloud":false, "context":32768, "expected":32768},
+  {"name":"local custom stays exact", "cloud":false, "context":32768, "requested":5000, "expected":5000},
+  {"name":"local custom respects smaller context", "cloud":false, "context":4096, "requested":32768, "expected":4096},
+  {"name":"cloud automatic respects output ceiling", "cloud":true, "context":131072, "prompt":40, "ceiling":16384, "expected":16384},
+  {"name":"cloud custom respects output ceiling", "cloud":true, "context":131072, "prompt":40, "requested":32768, "ceiling":2048, "expected":2048},
+  {"name":"cloud custom respects remaining context", "cloud":true, "context":4096, "prompt":2000, "requested":5000, "expected":1072},
+  {"name":"explicit short replies are not raised", "cloud":true, "context":131072, "prompt":40, "requested":16, "ceiling":2048, "expected":16},
+  {"name":"published tiny output ceilings are respected", "cloud":true, "context":4096, "prompt":24, "ceiling":128, "expected":128},
+  {"name":"cloud exact prefix plus new input", "cloud":true, "context":4096, "prompt":400, "exact":2000, "expected":1568},
+  {"name":"full context refuses automatic", "cloud":true, "context":4096, "prompt":4096, "expected":0},
+  {"name":"full context refuses custom too", "cloud":true, "context":4096, "prompt":5000, "requested":512, "expected":0},
+  {"name":"unknown local capacity defers to endpoint", "cloud":false, "context":0, "expected":null},
+  {"name":"unknown custom endpoint capacity defers to endpoint", "cloud":true, "context":0, "expected":null},
+  {"name":"unknown context with known ceiling uses that ceiling", "cloud":true, "context":0, "ceiling":32768, "expected":32768},
+  {"name":"unknown capacity retains exact custom limit", "cloud":true, "context":0, "requested":5000, "expected":5000},
+  {"name":"zero metadata ceiling is unknown", "cloud":true, "context":0, "ceiling":0, "expected":null},
+  {"name":"large model is not restricted by editor maximum in automatic", "cloud":false, "context":2097152, "expected":2097152}
+]

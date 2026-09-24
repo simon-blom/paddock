@@ -13,7 +13,7 @@ import nativeFooter from '../../../apps/macos/Sources/PaddockUI/StudioSidebarFoo
 import nativeDetail from '../../../apps/macos/Sources/PaddockUI/EndpointDetailView.swift?raw'
 import nativeEdit from '../../../apps/macos/Sources/PaddockUI/EndpointEditView.swift?raw'
 import fixture from './studio-settings-layout.fixture.json'
-import { STUDIO_SETTINGS_SECTIONS, replyLengthStops, studioSettingsLayout } from './studio-settings-layout'
+import { STUDIO_SETTINGS_SECTIONS, studioSettingsLayout } from './studio-settings-layout'
 
 describe('web/native information placement contract', () => {
   it('does not put manual refresh controls in native headers or lists', () => {
@@ -29,14 +29,19 @@ describe('web/native information placement contract', () => {
     expect(settingsSource).not.toMatch(/v-model="settings\.(autoTitle|markUnsure)"/)
   })
   it('keeps the native decoding fixture identical to the shared presentation', () => {
-    expect(studioSettingsLayout(8192)).toEqual(fixture)
+    expect(studioSettingsLayout()).toEqual(fixture)
   })
-  it('uses the same model-dependent reply stops including the maximum sentinel', () => {
-    expect(replyLengthStops(0)).toEqual(replyLengthStops(8192))
-    expect(replyLengthStops(1024)).toEqual([512, null])
-    expect(replyLengthStops(256)).toEqual([null])
-    expect(replyLengthStops(4096)).toEqual([512, 1024, 2048, null])
-    expect(replyLengthStops(32768)).toEqual([512, 1024, 2048, 4096, 8192, 16384, null])
+  it('uses a model-independent exact editor, never a rounded slider label', () => {
+    expect(studioSettingsLayout().replyLimit.maximum).toBe(1048576)
+    expect(settingsSource).toContain('ReplyLimitControl v-model="settings.maxTokens"')
+    expect(nativeSettings).toContain('StudioReplyLimitControl(draft: $model.reply)')
+    expect(nativeSettings).not.toContain('replyIndex')
+    expect(settingsSource).not.toContain('replyLengthStops')
+  })
+  it('keeps This Mac free of qualification badges and redundant platform facts', () => {
+    expect(nativeOverview).not.toContain('readiness.title')
+    expect(nativeOverview).not.toContain('FactRow(title: "Backend"')
+    expect(nativeOverview).not.toContain('FactRow(title: "Operating system"')
   })
   it('keeps contextual switches on the web surfaces the native client must follow', () => {
     expect(sidebarSource).toContain('@select="settings.autoTitle = !settings.autoTitle"')

@@ -61,11 +61,12 @@ const router = useRouter()
 // server does the reading now (store.rs conversation_kind, arriving on the
 // summary as `kind`) and everything below it is fallback for a row that
 // predates the column or a manager that does not send one.
-type ConvKind = 'chat' | 'transcription' | 'document'
+type ConvKind = 'chat' | 'transcription' | 'document' | 'image'
 const KIND: Record<ConvKind, { icon: string; label: string }> = {
   chat: { icon: 'message-square', label: 'Chat' },
   transcription: { icon: 'microphone', label: 'Transcription' },
   document: { icon: 'file-text', label: 'Document' },
+  image: { icon: 'image', label: 'Pictures' },
 }
 function convKind(c: Conversation): ConvKind {
   // 1. This conversation's own turns, once they are here. Both arms read
@@ -74,11 +75,14 @@ function convKind(c: Conversation): ConvKind {
   //    silent fall-through was the bug: every unopened row read as a chat and
   //    corrected itself on click.
   if (isDocParserConv(c, models.caps)) return 'document'
+  // a picture the MODEL made - a person's attached photo is a chat about it
+  if (c.messages.some((m) => m.role === 'assistant' && m.content.some((p) => p.type === 'image')))
+    return 'image'
   if (c.messages.some((m) => m.content.some((p) => p.type === 'audio'))) return 'transcription'
   // 2. What the SERVER decided when it last saved this conversation - the same
   //    evidence, read where the messages actually are. This is the arm that
   //    stops a row changing its mind when you click it.
-  if (c.kind === 'document' || c.kind === 'transcription') return c.kind
+  if (c.kind === 'document' || c.kind === 'transcription' || c.kind === 'image') return c.kind
   // 3. The CATALOG, for a row saved before the column existed. Transcription
   //    and alignment models are catalogued with no `chat` at all, so they say
   //    what they are on their own.
@@ -90,12 +94,13 @@ function convKind(c: Conversation): ConvKind {
   //    conversation" mislabels every ordinary granite-vision chat (measured:
   //    13 of them, not one with a document run).
   const cap = modelCapability(c.model)
+  if (cap.includes('image-generation')) return 'image'
   if (cap.length && !cap.includes('chat')) return 'transcription'
   // 4. Off-catalog (a hand-started GGUF): a model that cannot hold a text
-  //    conversation can only be transcribing. `canChat` and not
+  //    conversation is drawing or transcribing. `canChat` and not
   //    `canTranscribe` deliberately - the latter is true of every generative ASR
   //    model, which are ordinary chat models that happen to take audio.
-  if (!models.canChat(c.model)) return 'transcription'
+  if (!models.canChat(c.model)) return models.canImagine(c.model) ? 'image' : 'transcription'
   return 'chat'
 }
 const emit = defineEmits<{ newChat: []; fold: [] }>()

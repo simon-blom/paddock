@@ -14,6 +14,28 @@ pub fn render(
     tools: Option<&[serde_json::Value]>,
     kwargs: Option<&serde_json::Value>,
 ) -> Result<String, String> {
+    render_with_specials(template, messages, tools, kwargs, &[])
+}
+
+/// [`render`] with the tokenizer's special-token strings bound as template
+/// globals - `bos_token`, `eos_token` - the way transformers and llama.cpp's
+/// minja both do it. A template that writes `{{ bos_token }}` (MiniCPM5 opens
+/// every prompt with it; gemma4's and muse-glimmer's do too) rendered EMPTY
+/// before this existed, because minijinja prints an unbound name as nothing.
+/// gemma4 and muse never noticed - their BOS is prepended at tokenization,
+/// which dedups against a leading one - but MiniCPM5 stamps `add_bos_token =
+/// false` and relies on the template alone, so its prompts were missing the
+/// `<s>` llama.cpp sends, one token off the reference from the first token.
+///
+/// `specials` are inserted before the request's `chat_template_kwargs`, so a
+/// caller can still override them the way every other context key works.
+pub fn render_with_specials(
+    template: &str,
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    kwargs: Option<&serde_json::Value>,
+    specials: &[(&str, String)],
+) -> Result<String, String> {
     let mut env = Environment::new();
 
     // Chat templates are AUTHORED against transformers' environment, which is
@@ -137,6 +159,9 @@ pub fn render(
     // default - so `true` here turns gemma4 thinking on and is a no-op for
     // qwen. Request `chat_template_kwargs.enable_thinking=false` overrides.
     ctx.insert("enable_thinking".into(), true.into());
+    for (name, text) in specials {
+        ctx.insert((*name).to_owned(), serde_json::Value::String(text.clone()));
+    }
     if let Some(kw) = kwargs {
         let obj = kw
             .as_object()
@@ -712,9 +737,182 @@ pub fn validate_roles(messages: &[serde_json::Value]) -> Result<(), String> {
     Ok(())
 }
 
+/// Operator text in a turn that cannot carry a system role: the
+/// `<system-reminder>` fallback Anthropic documents for models without
+/// mid-conversation system messages. One spelling for every surface, so the
+/// same instruction renders the same bytes whichever API carried it.
+pub fn system_reminder(text: &str) -> String {
+    format!("<system-reminder>\n{text}\n</system-reminder>")
+}
+
+/// `system` / `developer` messages past the opening run, rendered in place.
+///
+/// OpenAI's chat schema and the Responses input list both allow them anywhere
+/// ("from here on, answer in Swedish"), but the templates we serve only render
+/// them at the start: Qwen's raises "System message must be at the beginning",
+/// gemma's folds the first one into the first user turn and has no slot for
+/// another. So every such request was a 400 from inside the template.
+///
+/// The LEADING run is left alone - each family has its own reading of it
+/// (gpt-oss's Harmony keeps system and developer apart, unsloth's Qwen merges
+/// a run) and it already renders. A later one becomes a [`system_reminder`] in
+/// a user turn at its own position: appended to the user turn it follows,
+/// else prepended to the user turn that follows it, else a user turn of its
+/// own - never two user turns in a row, which gemma's template rejects. It is
+/// not hoisted into the leading system prompt: that would move it to the
+/// front and rewrite the cached prefix of the whole conversation every time
+/// one arrives, where in place the history renders byte-for-byte as before.
+///
+/// Text only, as the OpenAI schema defines system content - a non-text part
+/// is a 400 here rather than something dropped on the way to the template.
+pub fn inline_late_system_messages(
+    messages: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, String> {
+    use serde_json::{Value, json};
+    fn role(m: &Value) -> Option<&str> {
+        m.get("role").and_then(Value::as_str)
+    }
+    fn is_sys(m: &Value) -> bool {
+        matches!(role(m), Some("system" | "developer"))
+    }
+    let lead = messages.iter().take_while(|m| is_sys(m)).count();
+    if !messages[lead..].iter().any(is_sys) {
+        return Ok(messages.to_vec());
+    }
+    let mut out: Vec<Value> = messages[..lead].to_vec();
+    // reminders waiting for the user turn they will be prepended to
+    let mut pending: Vec<String> = Vec::new();
+    for (i, m) in messages.iter().enumerate().skip(lead) {
+        if !is_sys(m) {
+            let mut m = m.clone();
+            if !pending.is_empty() {
+                // only ever set when this next non-system turn is a user turn
+                let head = std::mem::take(&mut pending).join("\n\n");
+                match m.get_mut("content") {
+                    Some(Value::String(s)) => *s = format!("{head}\n\n{s}"),
+                    Some(Value::Array(parts)) => {
+                        parts.insert(0, json!({"type": "text", "text": head}))
+                    }
+                    _ => m["content"] = Value::String(head),
+                }
+            }
+            out.push(m);
+            continue;
+        }
+        let text = late_system_text(m)?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        let reminder = system_reminder(&text);
+        if let Some(last) = out.last_mut().filter(|l| role(l) == Some("user")) {
+            match last.get_mut("content") {
+                Some(Value::String(s)) => {
+                    s.push_str("\n\n");
+                    s.push_str(&reminder);
+                }
+                Some(Value::Array(parts)) => parts.push(json!({"type": "text", "text": reminder})),
+                _ => last["content"] = Value::String(reminder),
+            }
+        } else if messages[i + 1..]
+            .iter()
+            .find(|n| !is_sys(n))
+            .is_some_and(|n| role(n) == Some("user"))
+        {
+            pending.push(reminder);
+        } else {
+            out.push(json!({"role": "user", "content": reminder}));
+        }
+    }
+    Ok(out)
+}
+
+/// The text of a system/developer message: a string, or text parts (chat's
+/// `text`, Responses' `input_text`) concatenated - the spec defines the array
+/// form as exactly that.
+fn late_system_text(m: &serde_json::Value) -> Result<String, String> {
+    use serde_json::Value;
+    match m.get("content") {
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("text" | "input_text") => {
+                    Ok(p.get("text").and_then(Value::as_str).unwrap_or_default())
+                }
+                other => Err(format!(
+                    "a system/developer message carries text only - got a {other:?} part"
+                )),
+            })
+            .collect::<Result<String, String>>(),
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(_) => Err("message content must be a string or an array of parts".into()),
+    }
+}
+
+/// A prior assistant turn's reasoning, under every name a template reads it by.
+///
+/// The templates we serve disagree on the key: Qwen 3.5-3.8, Flash Next,
+/// gemma4, laguna and muse read `reasoning_content` (gemma4 also takes
+/// `reasoning`); gpt-oss's Harmony template reads `thinking`. Callers disagree
+/// too - chat completions sends `reasoning_content` (llama.cpp's spelling) or
+/// `reasoning` (vLLM's since 0.11), and our Anthropic conversion emits
+/// `reasoning_content`. So the one value is filled in under `reasoning_content`
+/// and `thinking` where the message doesn't carry them, and each template
+/// finds it where it looks; whether a turn's reasoning is then SHOWN stays the
+/// template's call (Qwen3.8 keeps all of it unless `preserve_thinking` is
+/// false, gpt-oss keeps only a tool-calling turn's). llama.cpp does the same
+/// mirroring for gpt-oss (`reasoning_content` -> `thinking`). A key the caller
+/// set is never overwritten.
+///
+/// One exception, and it is Harmony's rule, not ours: a tool-calling turn
+/// renders its `content` AS the analysis there, and `thinking` beside a
+/// non-empty `content` on such a turn is a hard `raise_exception` ("Cannot
+/// pass both content and thinking"). `thinking` is left unset on that turn,
+/// so gpt-oss renders exactly what it rendered before this mirror existed
+/// instead of refusing the request.
+fn mirror_reasoning(msg: &mut serde_json::Value) {
+    let Some(obj) = msg.as_object_mut() else {
+        return;
+    };
+    if obj.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+        return;
+    }
+    const KEYS: [&str; 3] = ["reasoning_content", "reasoning", "thinking"];
+    let Some(text) = KEYS
+        .iter()
+        .find_map(|k| {
+            obj.get(*k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    if !obj.get("reasoning_content").is_some_and(|v| v.is_string()) {
+        obj.insert(
+            "reasoning_content".into(),
+            serde_json::Value::String(text.clone()),
+        );
+    }
+    let calls_tools = obj
+        .get("tool_calls")
+        .and_then(|c| c.as_array())
+        .is_some_and(|c| !c.is_empty());
+    let has_content = match obj.get("content") {
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(serde_json::Value::Array(parts)) => !parts.is_empty(),
+        _ => false,
+    };
+    if !obj.get("thinking").is_some_and(|v| v.is_string()) && !(calls_tools && has_content) {
+        obj.insert("thinking".into(), serde_json::Value::String(text));
+    }
+}
+
 pub fn normalize_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut out = messages.to_vec();
     for msg in &mut out {
+        mirror_reasoning(msg);
         // OpenAI image parts arrive as {"type":"image_url","image_url":{...}};
         // gemma4's template only renders an image slot for type == "image"
         // (qwen's accepts both). The pixels were already extracted - the
@@ -1002,6 +1200,56 @@ mod tests {
             !out.starts_with(' '),
             "leading indentation leaked into the prompt: {out:?}"
         );
+    }
+
+    /// Each template finds a prior turn's reasoning under the name it reads,
+    /// whichever name the caller used - and nothing the caller set moves.
+    #[test]
+    fn reasoning_reaches_every_template_spelling() {
+        let out = normalize_messages(&[
+            json!({"role": "assistant", "content": "a", "reasoning_content": "rc"}),
+            json!({"role": "assistant", "content": "b", "reasoning": "vllm"}),
+            json!({"role": "assistant", "content": "c", "thinking": "harmony"}),
+            json!({"role": "assistant", "content": "d", "reasoning_content": "mine", "thinking": "theirs"}),
+            json!({"role": "user", "content": "u", "reasoning_content": "not an assistant"}),
+            json!({"role": "assistant", "content": "e"}),
+        ]);
+        assert_eq!(
+            (&out[0]["reasoning_content"], &out[0]["thinking"]),
+            (&json!("rc"), &json!("rc"))
+        );
+        assert_eq!(
+            (&out[1]["reasoning_content"], &out[1]["thinking"]),
+            (&json!("vllm"), &json!("vllm"))
+        );
+        assert_eq!(out[1]["reasoning"], "vllm");
+        assert_eq!(
+            (&out[2]["reasoning_content"], &out[2]["thinking"]),
+            (&json!("harmony"), &json!("harmony"))
+        );
+        assert_eq!(
+            (&out[3]["reasoning_content"], &out[3]["thinking"]),
+            (&json!("mine"), &json!("theirs"))
+        );
+        assert!(out[4].get("thinking").is_none());
+        assert!(out[5].get("reasoning_content").is_none() && out[5].get("thinking").is_none());
+    }
+
+    /// Harmony's one refusal: `thinking` beside non-empty `content` on a
+    /// tool-calling turn is a raise_exception in gpt-oss's template, so the
+    /// mirror stays off exactly there (the reasoning still reaches the
+    /// `reasoning_content` readers).
+    #[test]
+    fn a_tool_turn_with_text_gets_no_harmony_thinking() {
+        let call = json!([{"id": "c1", "type": "function",
+                           "function": {"name": "f", "arguments": "{}"}}]);
+        let out = normalize_messages(&[
+            json!({"role": "assistant", "content": "preamble", "reasoning_content": "r", "tool_calls": call}),
+            json!({"role": "assistant", "reasoning_content": "r", "tool_calls": call}),
+        ]);
+        assert_eq!(out[0]["reasoning_content"], "r");
+        assert!(out[0].get("thinking").is_none());
+        assert_eq!(out[1]["thinking"], "r");
     }
 
     /// The official ASR template end-to-end through our normalize + render
@@ -1400,5 +1648,144 @@ mod tests {
         // non-null content untouched
         let out = normalize_messages(&[json!({"role": "user", "content": "hi"})]);
         assert_eq!(out[0]["content"], "hi");
+    }
+
+    mod late_system {
+        use super::super::{inline_late_system_messages, normalize_messages, render};
+        use serde_json::{Value, json};
+
+        fn sys(t: &str) -> Value {
+            json!({"role": "system", "content": t})
+        }
+        fn user(t: &str) -> Value {
+            json!({"role": "user", "content": t})
+        }
+        fn asst(t: &str) -> Value {
+            json!({"role": "assistant", "content": t})
+        }
+        fn roles(ms: &[Value]) -> String {
+            ms.iter()
+                .map(|m| m["role"].as_str().unwrap()[..1].to_uppercase())
+                .collect()
+        }
+
+        /// The rule Qwen's templates enforce, reduced to itself: a system
+        /// turn anywhere but first raises.
+        const QWEN_RULE: &str = "{%- for m in messages -%}\
+            {%- if m.role in ['system', 'developer'] and not loop.first -%}\
+            {{- raise_exception('System message must be at the beginning.') -}}\
+            {%- endif -%}\
+            <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+            {%- endfor -%}";
+
+        #[test]
+        fn the_template_raise_is_gone() {
+            let msgs = [
+                sys("be terse"),
+                user("hi"),
+                asst("hello"),
+                sys("answer in Swedish"),
+                user("bye"),
+            ];
+            assert!(render(QWEN_RULE, &normalize_messages(&msgs), None, None).is_err());
+            let out = inline_late_system_messages(&msgs).unwrap();
+            let text = render(QWEN_RULE, &normalize_messages(&out), None, None).expect("renders");
+            assert!(
+                text.contains("<system-reminder>\nanswer in Swedish\n</system-reminder>\n\nbye")
+            );
+        }
+
+        #[test]
+        fn the_opening_run_is_left_to_the_template() {
+            // gpt-oss reads system and developer apart; unsloth's Qwen merges
+            // a run - either way it is the template's call, not ours
+            let msgs = [
+                sys("a"),
+                json!({"role": "developer", "content": "b"}),
+                user("hi"),
+            ];
+            assert_eq!(inline_late_system_messages(&msgs).unwrap(), msgs.to_vec());
+        }
+
+        #[test]
+        fn placement_by_neighbour() {
+            // after a user turn: appended to it
+            let out = inline_late_system_messages(&[user("hi"), sys("x")]).unwrap();
+            assert_eq!(roles(&out), "U");
+            assert_eq!(
+                out[0]["content"],
+                "hi\n\n<system-reminder>\nx\n</system-reminder>"
+            );
+            // between assistant and user: prepended to the user turn
+            let out =
+                inline_late_system_messages(&[user("a"), asst("b"), sys("x"), user("c")]).unwrap();
+            assert_eq!(roles(&out), "UAU");
+            assert_eq!(
+                out[2]["content"],
+                "<system-reminder>\nx\n</system-reminder>\n\nc"
+            );
+            // last after an assistant turn: a user turn of its own
+            let out = inline_late_system_messages(&[user("a"), asst("b"), sys("x")]).unwrap();
+            assert_eq!(roles(&out), "UAU");
+            // after tool results, before the assistant: its own turn there
+            let tool = json!({"role": "tool", "content": "42", "tool_call_id": "t"});
+            let out =
+                inline_late_system_messages(&[user("a"), asst("b"), tool, sys("x"), asst("c")])
+                    .unwrap();
+            assert_eq!(roles(&out), "UATUA");
+        }
+
+        #[test]
+        fn a_run_of_late_ones_never_makes_two_user_turns() {
+            let msgs = [
+                user("a"),
+                asst("b"),
+                sys("x"),
+                json!({"role": "developer", "content": "y"}),
+                user("c"),
+            ];
+            let out = inline_late_system_messages(&msgs).unwrap();
+            assert_eq!(roles(&out), "UAU");
+            assert_eq!(
+                out[2]["content"],
+                "<system-reminder>\nx\n</system-reminder>\n\n<system-reminder>\ny\n</system-reminder>\n\nc"
+            );
+        }
+
+        /// Append-only history keeps its prefix: everything before the late
+        /// message converts exactly as it did without it.
+        #[test]
+        fn the_history_before_it_does_not_move() {
+            let head = [sys("s"), user("a"), asst("b")];
+            let mut with = head.to_vec();
+            with.extend([sys("x"), user("c")]);
+            let out = inline_late_system_messages(&with).unwrap();
+            assert_eq!(out[..head.len()], head[..]);
+        }
+
+        #[test]
+        fn text_parts_count_and_other_parts_are_a_400() {
+            // Responses spells its text parts input_text
+            let parts = json!({"role": "developer", "content": [
+                {"type": "input_text", "text": "sw"}, {"type": "text", "text": "edish"},
+            ]});
+            let out = inline_late_system_messages(&[user("a"), parts]).unwrap();
+            assert!(out[0]["content"].as_str().unwrap().contains("\nswedish\n"));
+            let img = json!({"role": "system", "content": [{"type": "image_url", "image_url": {"url": "x"}}]});
+            let e = inline_late_system_messages(&[user("a"), img]).unwrap_err();
+            assert!(e.contains("text only"), "{e}");
+        }
+
+        #[test]
+        fn image_bearing_user_turns_take_a_text_part() {
+            let u = json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]});
+            let out = inline_late_system_messages(&[u.clone(), sys("x")]).unwrap();
+            assert_eq!(out[0]["content"][1]["type"], "text");
+            let out = inline_late_system_messages(&[user("a"), asst("b"), sys("x"), u]).unwrap();
+            assert_eq!(
+                out[2]["content"][0]["type"], "text",
+                "prepended ahead of the image"
+            );
+        }
     }
 }

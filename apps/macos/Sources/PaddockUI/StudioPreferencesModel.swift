@@ -6,7 +6,7 @@ import PaddockStudio
   var command: StudioCommand = { _, _ in
     throw StudioLibraryError.message("Studio is not connected.")
   }
-  var replyLimit = ""
+  var reply = ReplyLimitDraft()
   var toolLimit = ""
   var summarize = true
   var mapTiles = ""
@@ -28,6 +28,7 @@ import PaddockStudio
     } catch { return error.localizedDescription }
   }
   private func values() throws -> [String: StudioValue] {
+    if let validation = reply.validation { throw StudioLibraryError.message(validation) }
     func limit(_ text: String, max: Int) throws -> StudioValue {
       let t = text.trimmingCharacters(in: .whitespaces)
       if t.isEmpty { return .null }
@@ -38,7 +39,7 @@ import PaddockStudio
       return .number(Double(n))
     }
     return [
-      "maxTokens": try limit(replyLimit, max: 1_048_576),
+      "maxTokens": reply.value.map { .number(Double($0)) } ?? .null,
       "maxToolCalls": try limit(toolLimit, max: 10_000),
       "summarize": .bool(summarize),
       "mapTiles": .string(mapTiles),
@@ -60,8 +61,8 @@ import PaddockStudio
       let layoutValue = p["layout"]
     else { throw StudioLibraryError.message("Studio preferences could not be read.") }
     let layout = try studioDecode(StudioSettingsLayout.self, layoutValue)
-    guard !layout.replyStops.isEmpty, layout.replyStops.last?.value == nil else {
-      throw StudioLibraryError.message("Studio reply-length choices could not be read.")
+    guard layout.replyLimit.maximum == ReplyLimitDraft.maximum else {
+      throw StudioLibraryError.message("Studio reply-limit settings could not be read.")
     }
     func limitText(_ key: String) throws -> String {
       if p[key] == .null { return "" }
@@ -73,7 +74,7 @@ import PaddockStudio
     }
     let reply = try limitText("maxTokens")
     let tools = try limitText("maxToolCalls")
-    replyLimit = reply
+    self.reply = ReplyLimitDraft(value: Int(reply))
     toolLimit = tools
     self.summarize = summarize
     self.layout = layout

@@ -44,6 +44,30 @@ final class EndpointEditor {
   private(set) var removed = false
   private(set) var needsReload = false
   @ObservationIgnored private let client: any ManagerLoading
+  var settingsClient: any ManagerLoading { client }
+
+  /// Profiles fill the reviewed draft only. Saving/restarting still uses the
+  /// existing revision/PID-checked backend contract and its validation.
+  func useProfile(_ profile: ModelProfile) {
+    guard !saving, !refreshing, !dirty, profile.model == modelID, profile.artifact == artifactID
+    else { return }
+    let values = profile.settings
+    context = values.maxCtx.map(String.init) ?? ""
+    concurrency = values.maxBatch.map(String.init) ?? ""
+    speculation = values.noSpec == true ? "off" : values.spec ?? ""
+    kvDtype = values.kvCacheDtype ?? ""
+    memoryLimit = Self.budgetText(values.vramBudget)
+    customMemoryBudget = values.vramBudget != nil
+    kvOffloadEnabled = values.kvOffload?.enabled ?? false
+    kvOffloadRAM = Self.offloadText(values.kvOffload?.ramGb)
+    kvOffloadDisk = Self.offloadText(values.kvOffload?.nvmeGb)
+    for option in values.runtimeOptions ?? []
+    where runtimeOptions.contains(where: { $0.id == option.id }) {
+      runtimeDraft[option.id] = option.value?.text ?? ""
+    }
+    customWorkload = !Self.workloads.contains { $0.batch == effectiveConcurrency }
+    customContext = !Self.contextSteps.contains(effectiveContext)
+  }
   @ObservationIgnored private var task: Task<Void, Never>?
   @ObservationIgnored var onChange: (() async -> Void)?
 

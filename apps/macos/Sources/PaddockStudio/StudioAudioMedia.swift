@@ -26,8 +26,8 @@ private final class AudioSource: Sendable {
 /// Previewing a clip never replaces the currently playing AVPlayer item.
 @MainActor public final class StudioAudioMedia {
   private let decoder = AudioWaveformDecoder()
-  private let fetchGate = AudioWorkGate(capacity: 2)
-  private let analysisGate = AudioWorkGate(capacity: 1)
+  private let fetchGate = StudioMediaWorkGate(capacity: 2)
+  private let analysisGate = StudioMediaWorkGate(capacity: 1)
   private var sources: [String: AudioSource] = [:]
   private var sourceOrder: [String] = []
   private struct SourceJob {
@@ -167,7 +167,7 @@ private final class AudioSource: Sendable {
 
 /// Cancellable admission; queued invisible previews hold neither a downloaded
 /// file nor decoded PCM. No sleep/poll loop and no unbounded decode task fanout.
-private actor AudioWorkGate {
+actor StudioMediaWorkGate {
   private var available: Int
   private var queue: [(UUID, CheckedContinuation<Void, any Error>)] = []
   init(capacity: Int) { available = capacity }

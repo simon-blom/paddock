@@ -909,6 +909,49 @@ pub(crate) fn q8_launch_rows(in_dim: usize, yq_len: usize) -> usize {
 
 /// Prefix-cache checkpoints taken inside the prefill walk (`prefill_from`):
 /// `PADDOCK_Q38FN_INWALK_CKPT=0` walks the cut chunks instead (A/B).
+/// Prompt rows one mixed tick carries while decode rows ride it (see
+/// forward/chunked.rs). Every rider waits the whole tick for its next token,
+/// and this lane prefills at a few hundred rows a second on GB10, so the
+/// scheduler's 8K-row budget (elected for qwen35) made one ~3.5K admission
+/// one ~10 s tick. Elected on GB10 (UD-IQ3_XXS, MTP drafter, 4K x 32 slots,
+/// 2026-09-23), c8 of 1000-token prompts x 256 out, one leg each:
+///
+///   span      tok/s  TTFT p50/p90   gap p99/max
+///   blocking  29.8   2.7 / 15.6 s   1.9 / 13.6 s   (the classic wave)
+///   256       27.5   7.0 / 14.4     0.8 / 1.0
+///   512       27.0   6.3 / 18.2     1.35 / 1.55
+///   1024      29.9   4.1 / 13.7     1.4 / 1.9
+///
+/// 1024 holds the blocking lane's throughput and cuts its worst stall 7x;
+/// at c32 (same shape) it takes TTFT p50 44.6 -> 7.9 s and the worst gap
+/// 45.0 -> 2.5 s at 50.6 -> 52.9 tok/s. It is still a TIME of 4-5 s when a
+/// span is a full 1024 rows (a long prompt, ~250 rows/s here). Narrower
+/// spans buy that back at a TTFT and throughput cost - a rider on a mixed
+/// tick decodes one token where a decode tick speculates (spec-in-mixed is
+/// the lever that would change the trade).
+/// `PADDOCK_Q38FN_CHUNK_ROWS` overrides (A/B sweeps).
+const CHUNK_ROWS_DEFAULT: usize = 1024;
+pub(crate) fn chunk_rows() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_Q38FN_CHUNK_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (16..=8192).contains(&n))
+            .unwrap_or(CHUNK_ROWS_DEFAULT)
+    })
+}
+
+/// Chunked prefill (forward/chunked.rs): admissions ride the decode walk a
+/// budgeted span per tick instead of a blocking wave. DEFAULT on;
+/// `PADDOCK_Q38FN_NO_CHUNKED=1` pins the classic wave for A/B.
+pub(crate) fn chunked_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_Q38FN_NO_CHUNKED").is_none())
+}
+
 pub(crate) fn inwalk_ckpt_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();

@@ -77,6 +77,10 @@ pub enum Operation {
     /// /v1/messages/count_tokens - its own series so a token-count utility
     /// never pollutes the chat latency histograms.
     CountTokens,
+    /// /v1/images/generations.
+    ImageGeneration,
+    /// /v1/images/edits.
+    ImageEdit,
 }
 
 impl Operation {
@@ -91,6 +95,8 @@ impl Operation {
             "/v1/audio/transcriptions" => Self::Transcription,
             "/v1/audio/alignments" => Self::Alignment,
             "/v1/messages/count_tokens" => Self::CountTokens,
+            "/v1/images/generations" => Self::ImageGeneration,
+            "/v1/images/edits" => Self::ImageEdit,
             _ => return None,
         })
     }
@@ -103,6 +109,8 @@ impl Operation {
             Self::Rerank => "rerank",
             Self::Transcription => "transcription",
             Self::Alignment => "alignment",
+            Self::ImageGeneration => "image_generation",
+            Self::ImageEdit => "image_edit",
             Self::CountTokens => "count_tokens",
         }
     }
@@ -280,6 +288,7 @@ pub struct ModelIds {
     pub serving: Option<String>,
     pub embedder: Option<String>,
     pub asr: Option<String>,
+    pub image: Option<String>,
 }
 
 pub enum Format {
@@ -351,6 +360,7 @@ impl Metrics {
         let owner = match op {
             Operation::Embeddings | Operation::Rerank => &self.ids.embedder,
             Operation::Transcription => &self.ids.asr,
+            Operation::ImageGeneration | Operation::ImageEdit => &self.ids.image,
             _ => &self.ids.serving,
         };
         owner.as_deref().unwrap_or("")
@@ -1555,6 +1565,7 @@ mod tests {
             serving: Some("qwen3.5-9b".into()),
             embedder: None,
             asr: None,
+            image: None,
         };
         let m = Metrics::new("i6".into(), ids, None);
         // 401 refused before any handler could stamp the model.
@@ -1585,6 +1596,7 @@ mod tests {
             serving: Some("we\"ird\\model".into()),
             embedder: None,
             asr: None,
+            image: None,
         };
         let m = Metrics::new("i7".into(), ids, None);
         m.observe(&Observation {

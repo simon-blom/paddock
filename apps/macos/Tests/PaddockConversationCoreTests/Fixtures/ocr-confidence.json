@@ -1,0 +1,5 @@
+[
+  {"entries":[{"token":" Hello","logprob":-0.2},{"token":" world","logprob":-2}],"expected":[{"w":"Hello","c":0.8187307530779818},{"w":"world","c":0.1353352832366127}]},
+  {"entries":[{"token":"<|grounding|>","logprob":-10},{"token":"Test","logprob":-0.2},{"token":"ar\nfunktionen\t🦊","logprob":-0.6}],"expected":[{"w":"Testar","c":0.6703200460356393},{"w":"funktionen","c":0.5488116360940264},{"w":"🦊","c":0.5488116360940264}]},
+  {"entries":[{"token":"  \r\n","logprob":-9},{"token":"café\u00a0東京","logprob":-0.8}],"expected":[{"w":"café","c":0.44932896411722156},{"w":"東京","c":0.44932896411722156}]}
+]

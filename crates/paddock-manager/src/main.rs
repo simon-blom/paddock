@@ -645,6 +645,14 @@ fn main() -> std::process::ExitCode {
                     if let Some(m) = r.mtp {
                         println!("      {} (MTP drafter)", m.display());
                     }
+                    // an image lane's pieces: the DiT above, and these two
+                    // it cannot render without
+                    if let Some(m) = r.text_encoder {
+                        println!("      {} (text encoder)", m.display());
+                    }
+                    if let Some(m) = r.vae {
+                        println!("      {} (VAE)", m.display());
+                    }
                     println!("serve it: paddock-runner -m {id}");
                     std::process::ExitCode::SUCCESS
                 }

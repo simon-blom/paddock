@@ -108,6 +108,16 @@
   --pk-chart-cache:     #34D399;
   --pk-chart-foreign:   #64748B;
 
+  /* Confidence, in four bins (under 0.5, to 0.7, to 0.9, over) - a
+     cividis-class ramp, blue-grey to yellow, so the bins read in order for
+     every kind of colour vision and never lean on red/green. The number is
+     always printed beside the swatch; the colour only sorts the page. The
+     low end is lifted off the ground here and deepened on the light one. */
+  --pk-conf-1: #4E5B7A;
+  --pk-conf-2: #7E8386;
+  --pk-conf-3: #B7AE6E;
+  --pk-conf-4: #F2DF3F;
+
   /* Accent (sky - used sparingly) */
   --pk-accent:        #0EA5E9;
   --pk-accent-hover:  #38BDF8;
@@ -181,6 +191,12 @@
   --pk-chart-overhead:  #64748B;
   --pk-chart-cache:     #059669;
   --pk-chart-foreign:   #94A3B8;
+
+  /* The same four bins, deepened for white - see the dark block. */
+  --pk-conf-1: #23305A;
+  --pk-conf-2: #64686D;
+  --pk-conf-3: #9A8C3E;
+  --pk-conf-4: #D2B800;
 
   /* Accent (deep-sky - used sparingly) */
   --pk-accent:        #0369A1;

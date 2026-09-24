@@ -29,7 +29,9 @@
 //! lanes come after parity locks.
 
 mod batch;
+mod chunked;
 pub mod dflash;
+pub mod diffusion;
 mod forward;
 pub(crate) mod load;
 ///  uniq-routing diagnostic arm - shared with the other MoE families
@@ -38,6 +40,7 @@ pub(crate) mod load;
 pub(crate) use load::g4_moe_uniq_arm;
 mod multimodal;
 pub mod muse_vision;
+pub(crate) mod planes;
 mod prefix;
 mod scratch;
 mod spec;
@@ -46,6 +49,8 @@ pub mod vision;
 use cudarc::driver::CudaSlice;
 use std::sync::Arc;
 
+pub(crate) use planes::{EmbdTable, kq_rows, kq_stage};
+
 /// A captured decode tick. The model is single-threaded on the engine's
 /// thread (same argument as qwen35's SendGraph).
 pub(crate) struct SendGraph(pub crate::gpu::CapturedGraph);
@@ -53,7 +58,7 @@ pub(crate) struct SendGraph(pub crate::gpu::CapturedGraph);
 unsafe impl Send for SendGraph {}
 
 use crate::generator::{GenError, Generator, RowSample, SampledStep};
-use crate::gpu::{GluAct, GpuExecutor, QuantTensor, RepackedQ8};
+use crate::gpu::{GluAct, GpuExecutor, QuantTensor, RepackedKQ, RepackedQ8};
 
 /// Rung B2 candidate pipe shape (captured by a strip round).
 #[derive(Clone, Copy)]
@@ -104,104 +109,44 @@ pub(crate) struct SpecAsyncPlan {
 ///
 /// UD quant files are MIXED - muse-glimmer's UD-Q8_K_XL keeps `attn_k` and
 /// `attn_v` (and `token_embd`/`output`) at bf16 next to Q8_0 everything else,
-/// because the quantizer judged those planes worth the bytes. The project's rule
-/// for that is per-TENSOR dispatch rather than a per-model switch, and the
-/// correctness spine is same-weights parity on the identical GGUF, so
-/// down-quantizing the bf16 planes into the Q8_0 lane at load is out on both
-/// counts. The class travels with the plane; `q8()` is how an arm that can
-/// only eat Q8 (the int8-mma and mmq rungs, every fp8 converter) asks.
+/// because the quantizer judged those planes worth the bytes; the A4B's
+/// Q4_K_M holds Q4_K attention beside Q6_K `attn_v` on half the layers and
+/// Q5_0 / Q8_0 on the rows a 256-block format cannot encode. The project's
+/// rule for that is per-TENSOR dispatch rather than a per-model switch, and
+/// the correctness spine is same-weights parity on the identical GGUF, so
+/// requantizing a plane into another class at load is out on both counts.
+/// The class travels with the plane; `q8()` is how an arm that can only eat
+/// Q8 (the int8-mma and mmq rungs, every fp8 converter) asks, and `kq()` is
+/// the k-quant lanes' question (`planes.rs` holds the dispatch).
 pub(crate) enum Plane {
     Q8(RepackedQ8),
     /// bf16 bytes exactly as the file holds them, `dims` = `[in, out]`.
     Bf16(QuantTensor),
-}
-
-impl Plane {
-    pub(crate) fn dims(&self) -> &[usize] {
-        match self {
-            Plane::Q8(w) => &w.dims,
-            Plane::Bf16(w) => &w.dims,
-        }
-    }
-
-    /// The Q8 plane, or None when this tensor is not in that class. Arms that
-    /// can only consume Q8 must route around on None rather than assume.
-    pub(crate) fn q8(&self) -> Option<&RepackedQ8> {
-        match self {
-            Plane::Q8(w) => Some(w),
-            Plane::Bf16(_) => None,
-        }
-    }
-
-    /// Has the Q8 plane been stubbed by the reclaim pass (bytes freed, dims
-    /// kept)? A bf16 plane is never stubbed - nothing else can serve it.
-    pub(crate) fn is_stub(&self) -> bool {
-        matches!(self, Plane::Q8(w) if w.data.len() == 48)
-    }
-
-    /// `y = W x`, r == 1.
-    pub(crate) fn gemv(
-        &self,
-        exec: &GpuExecutor,
-        x: &CudaSlice<f32>,
-        y: &mut CudaSlice<f32>,
-    ) -> Result<(), crate::gpu::GpuError> {
-        match self {
-            Plane::Q8(w) => exec.q8_0_gemv_repacked(w, None, x, y),
-            Plane::Bf16(w) => exec.bf16_gemv(w, None, x, y),
-        }
-    }
-
-    /// `y = W x` landing at output-row offset `off` - the fused `[q|k|v]`
-    /// decode row's writer.
-    pub(crate) fn gemv_at(
-        &self,
-        exec: &GpuExecutor,
-        x: &CudaSlice<f32>,
-        y: &mut CudaSlice<f32>,
-        off: usize,
-    ) -> Result<(), crate::gpu::GpuError> {
-        match self {
-            Plane::Q8(w) => exec.q8_0_gemv_repacked_at(w, x, y, off),
-            Plane::Bf16(w) => exec.bf16_gemv_at(w, x, y, off),
-        }
-    }
-
-    /// `y = W x` over `r` activation rows (`x` `[r, in]`, `y` `[r, out]`).
-    pub(crate) fn gemm(
-        &self,
-        exec: &GpuExecutor,
-        x: &CudaSlice<f32>,
-        y: &mut CudaSlice<f32>,
-        r: usize,
-    ) -> Result<(), crate::gpu::GpuError> {
-        match self {
-            Plane::Q8(w) => exec.q8_0_gemm_repacked(w, None, x, y, r),
-            Plane::Bf16(w) => exec.bf16_gemm(w, None, x, y, r),
-        }
-    }
+    /// A k-quant (Q4_K / Q5_K / Q6_K / IQ4_XS) or flat 32-weight (Q5_0 /
+    /// Q5_1 / Q8_0-as-flat) plane on the repacked W4A8 streams.
+    Kq(RepackedKQ),
 }
 
 /// Per-layer weights. `wv == None` on the V-less global layers.
 pub(crate) struct LayerWeights {
     pub attn_norm: CudaSlice<f32>,
-    pub wq: RepackedQ8,
+    pub wq: Plane,
     pub wk: Plane,
     pub wv: Option<Plane>,
-    pub wo: RepackedQ8,
+    pub wo: Plane,
     /// Muse Glimmer's attention OUTPUT gate [n_embd -> n_head*head_dim].
     /// Fed by the post-attn_norm hidden state (not the raw residual), then
     /// `attn_out *= sigmoid(gate)` before o_proj. Presence of the tensor is
     /// the discriminator - gemma4 files have no `attn_gate` and leave this
     /// None, so no flag is needed to tell the two graphs apart.
-    pub attn_gate: Option<RepackedQ8>,
+    pub attn_gate: Option<Plane>,
     pub q_norm: CudaSlice<f32>,
     pub k_norm: CudaSlice<f32>,
     pub attn_post_norm: CudaSlice<f32>,
     pub ffn_norm: CudaSlice<f32>,
-    pub ffn_gate: RepackedQ8,
-    pub ffn_up: RepackedQ8,
-    pub ffn_down: RepackedQ8,
+    pub ffn_gate: Plane,
+    pub ffn_up: Plane,
+    pub ffn_down: Plane,
     pub ffn_post_norm: CudaSlice<f32>,
     /// `layer_output_scale` - host scalar, multiplies the residual stream as
     /// the layer's last op. 1.0 when the tensor is absent.
@@ -362,6 +307,27 @@ impl LayerWeights {
     }
 }
 
+/// The routed experts' three planes, one class per layer: the loader keeps
+/// the trio on ONE lane family because the gate+up's int8 output feeds the
+/// down through the same fq/fs handshake, and a Q8_0 down beside Q4_K
+/// gate/up (the A4B Q4_K_M's 14 such layers) rides the k-quant lanes as the
+/// flat Q8_0 seat rather than crossing families mid-layer.
+pub(crate) enum ExpertPlanes {
+    /// flat rows (e*ff_exp + o); `down` is `ffn_down_exps` [ff_exp, n_embd, n_expert]
+    Q8 {
+        gate: RepackedQ8,
+        up: RepackedQ8,
+        down: RepackedQ8,
+    },
+    /// the same three on the repacked k-quant streams; `down` a flat
+    /// 32-weight plane at the expert's own width when the file's is
+    Kq {
+        gate: RepackedKQ,
+        up: RepackedKQ,
+        down: RepackedKQ,
+    },
+}
+
 /// Routed-expert weights for the 26B-A4B hybrid FFN. Load-time folds keep
 /// the reference math on existing ops:
 /// the router's unweighted-rms + 1/sqrt(d) + scale chain collapses into one
@@ -373,11 +339,9 @@ pub(crate) struct MoeWeights {
     pub router_w: crate::gpu::DeviceTensor,
     /// pre-folded router norm gamma = ffn_gate_inp.scale / sqrt(n_embd).
     pub router_gamma: CudaSlice<f32>,
-    /// split halves of `ffn_gate_up_exps`, flat rows (e*ff_exp + o).
-    pub gate_exps: RepackedQ8,
-    pub up_exps: RepackedQ8,
-    /// `ffn_down_exps` [ff_exp, n_embd, n_expert].
-    pub down_exps: RepackedQ8,
+    /// the split halves of `ffn_gate_up_exps` and `ffn_down_exps`, in the
+    /// class the file ships them
+    pub experts: ExpertPlanes,
     /// `ffn_down_exps.scale` f32 [n_expert] - folded into combine weights.
     pub down_scale: CudaSlice<f32>,
     /// pre_ffw_norm_2 / post_ffw_norm_1 / post_ffw_norm_2 - the MoE branch's
@@ -455,6 +419,15 @@ pub(crate) struct MoeWeights {
 pub(crate) enum Arch {
     Gemma4,
     MuseGlimmer,
+    /// DiffusionGemma 26B-A4B (Google, 2026-06): the Gemma 4 26B-A4B body
+    /// verbatim - same geometry, norms, MoE, softcap, rope - generating by
+    /// block diffusion instead of next-token decode. The file adds a
+    /// self-conditioning MLP and `diffusion.canvas_length`; its
+    /// `attention.causal = false` describes the CANVAS pass, the prompt is
+    /// still encoded causally. Every constant below that gemma4 answers,
+    /// this arch answers the same way; what differs is the generation loop
+    /// (`diffusion.rs`), not the layer walk.
+    DiffusionGemma,
 }
 
 impl Arch {
@@ -463,7 +436,14 @@ impl Arch {
         match self {
             Arch::Gemma4 => "gemma4",
             Arch::MuseGlimmer => "muse-glimmer",
+            Arch::DiffusionGemma => "diffusion-gemma",
         }
+    }
+
+    /// Whether this arch generates by block diffusion (a canvas denoised in
+    /// place, committed as a block) rather than one token per step.
+    pub(crate) fn is_diffusion(self) -> bool {
+        matches!(self, Arch::DiffusionGemma)
     }
 }
 
@@ -506,6 +486,9 @@ pub(crate) struct Hparams {
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub ff_exp: usize,
+    /// Block-diffusion canvas width (`diffusion.canvas_length`, 256 on
+    /// DiffusionGemma); 0 on the next-token archs.
+    pub canvas_len: usize,
 }
 
 /// The arch's gated-FFN activation. Free function (not just the `Hparams`
@@ -516,7 +499,7 @@ pub(crate) fn glu_act_of(arch: Arch) -> GluAct {
     // EXHAUSTIVE on PURPOSE - no `_` arm. See Arch's note: a catch-all here is
     // how the next arch silently inherits gemma4's nonlinearity.
     match arch {
-        Arch::Gemma4 => GluAct::Gelu,
+        Arch::Gemma4 | Arch::DiffusionGemma => GluAct::Gelu,
         Arch::MuseGlimmer => GluAct::Silu,
     }
 }
@@ -567,7 +550,7 @@ impl Hparams {
     pub(crate) fn rope_neox(&self) -> bool {
         // EXHAUSTIVE on PURPOSE - no `_` arm (see Arch).
         match self.arch {
-            Arch::Gemma4 => true,
+            Arch::Gemma4 | Arch::DiffusionGemma => true,
             Arch::MuseGlimmer => false,
         }
     }
@@ -587,7 +570,7 @@ impl Hparams {
     pub(crate) fn v_norm(&self) -> bool {
         // EXHAUSTIVE on PURPOSE - no `_` arm (see Arch).
         match self.arch {
-            Arch::Gemma4 => true,
+            Arch::Gemma4 | Arch::DiffusionGemma => true,
             Arch::MuseGlimmer => false,
         }
     }
@@ -607,7 +590,7 @@ impl Hparams {
     pub(crate) fn attn_scale(&self, head_dim: usize) -> f32 {
         // EXHAUSTIVE on PURPOSE - no `_` arm (see Arch).
         match self.arch {
-            Arch::Gemma4 => 1.0,
+            Arch::Gemma4 | Arch::DiffusionGemma => 1.0,
             Arch::MuseGlimmer => 1.0 / (head_dim as f32).sqrt(),
         }
     }
@@ -622,7 +605,8 @@ impl Hparams {
 /// markers would tokenize to `<unk>`-ish garbage around every picture.
 pub(crate) fn image_markers(arch: Arch) -> (&'static str, &'static str) {
     match arch {
-        Arch::Gemma4 => ("<|image>", "<image|>"),
+        // DiffusionGemma's processor is Gemma4Processor - the same markers
+        Arch::Gemma4 | Arch::DiffusionGemma => ("<|image>", "<image|>"),
         Arch::MuseGlimmer => ("<|image_start|>", "<|image_end|>"),
     }
 }
@@ -838,6 +822,36 @@ pub(crate) struct Scratch {
     pub pf_ffq: CudaSlice<i8>,
     pub pf_ffs: CudaSlice<u8>,
 
+    // ── k-quant plane staging (1-elem stubs on a Q8/bf16 file; see
+    // planes.rs). The decode row: int8 + per-32 scales + per-16 sums of the
+    // widest input the walk quantizes (n_embd, n_ff, the wo input).
+    pub kq_xq: CudaSlice<i8>,
+    pub kq_xs: CudaSlice<f32>,
+    pub kq_ssums: CudaSlice<f32>,
+    /// per-16 sums beside `pf_xq` (the 2..=64-row rungs' mu operand)
+    pub pf_ssums: CudaSlice<f32>,
+    /// per-32 sums off the mmq tile (`mmq_sums`; the tile GEMM's mu operand)
+    pub pf_xsums: CudaSlice<f32>,
+    /// one-slot id buffer for the single-row k-quant gather
+    pub embd_id: CudaSlice<u32>,
+    /// k-quant expert seats: the per-16 sums over `moe_xq` (rows of n_embd)
+    /// and then over `moe_fq` (pairs of ff_exp), and the expert-grouped CSR
+    /// at the 8/16-row groups the grouped kernels take (the `moe_srow` set
+    /// is sized for BM >= 32 and holds fewer blocks)
+    pub moe_ssums: CudaSlice<f32>,
+    pub kq_srow: CudaSlice<u32>,
+    pub kq_sslot: CudaSlice<u32>,
+    pub kq_bexp: CudaSlice<u32>,
+    /// the tensor-core gate+up's SORTED int8 rows + per-32 scales (the
+    /// BM=32 `moe_align` layout, `[mb32 * 32][ff_exp]`): read in place by
+    /// the expert-major tensor-core down, else unsorted into `moe_fq` /
+    /// `moe_fs` for the grouped down
+    pub kq_sfq: CudaSlice<i8>,
+    pub kq_sfs: CudaSlice<f32>,
+    /// the expert-major tensor-core down's per-expert `[first, end)` over
+    /// those sorted rows (`[2 * n_expert]` u32; the pack fills it per launch)
+    pub moe_emap: CudaSlice<u32>,
+
     // ── 26B-A4B hybrid-MoE lane (1-elem stubs on dense models). Sized for
     // PF_ROWS like the pf planes - every lane (prefill, batched decode, b=1
     // step) runs through the same g4_moe_tail helper.
@@ -916,7 +930,10 @@ pub struct GpuGemma4 {
     pub(crate) exec: Arc<GpuExecutor>,
     pub(crate) hp: Hparams,
     pub(crate) layers: Vec<LayerWeights>,
-    pub(crate) token_embd: QuantTensor,
+    /// The raw embedding table for row gathers - Q8_0 or bf16 as the file
+    /// holds it. None on a k-quant embedding: the repacked head below is the
+    /// table then (`planes::EmbdTable` is the one seam every gather uses).
+    pub(crate) token_embd: Option<QuantTensor>,
     /// The LM head plane. gemma4 TIES its head to the embedding (the file has
     /// no `output.weight`, so this is the repacked token_embd - the raw plane
     /// above stays for row gathers); muse-glimmer ships its own
@@ -990,6 +1007,13 @@ pub struct GpuGemma4 {
     /// honored for A/B scripts; the env wins the f16 direction when both
     /// are set.
     pub(crate) kv_dtype_pref: Option<crate::gpu::KvDtype>,
+    /// DiffusionGemma's block-diffusion lane (self-conditioning MLP, the
+    /// transposed embedding, the sampler constants) - Some exactly when the
+    /// file's arch is the diffusion one. See `diffusion.rs`.
+    pub(crate) diffusion: Option<diffusion::DiffusionLane>,
+    /// the canvases the batched diffusion loop holds open, by handle
+    /// (`Generator::canvas_open`); None = a released handle, reused first
+    pub(crate) canvases: Vec<Option<diffusion::CanvasState>>,
     /// global-layer budget pool (enable_batch + paging mode only; None =
     /// dense global planes - single-stream loads and the
     /// PADDOCK_NO_GLOBAL_POOL escape hatch)
@@ -1061,7 +1085,7 @@ pub struct GpuGemma4 {
     pub(crate) lco_tickets: Option<CudaSlice<u32>>,
     /// chunked-prefill queue: prompts advancing FIFO through mixed ticks
     /// (prefill_begin pushes, forward_mixed_sampled drains under budget)
-    pub(crate) chunked: Vec<batch::ChunkedPrefill>,
+    pub(crate) chunked: Vec<chunked::ChunkedPrefill>,
     /// MTP drafter (attach_mtp) - the separate gemma4-assistant model
     pub(crate) mtp: Option<spec::MtpDrafter>,
     /// Muse Glimmer's DFlash block-diffusion drafter  - the
@@ -1184,7 +1208,11 @@ impl Generator for GpuGemma4 {
     }
 
     fn weights_mem_bytes(&self) -> Option<u64> {
+        // the diffusion lane's planes (self-cond MLP + the transposed
+        // embedding) are weights too - resident for the process, priced with
+        // the body so the fit chart and the catalog row see them
         self.weights_bytes
+            .map(|b| b + self.diffusion.as_ref().map_or(0, |l| l.bytes))
     }
 
     fn kv_mem_bytes(&self) -> Option<u64> {
@@ -1236,6 +1264,86 @@ impl Generator for GpuGemma4 {
 
     fn forward_prefill_stream(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GenError> {
         self.prefill_stream(tokens).map_err(gen_err)
+    }
+
+    // ── block diffusion (DiffusionGemma only; see diffusion.rs) ──
+    fn canvas_width(&self) -> usize {
+        self.hp.canvas_len
+    }
+
+    fn canvas_block(
+        &mut self,
+        base: usize,
+        w: usize,
+        temperature: Option<f32>,
+        seed: u64,
+    ) -> Result<(Vec<u32>, u32), GenError> {
+        self.canvas_block_impl(base, w, temperature, seed)
+            .map_err(gen_err)
+    }
+
+    fn canvas_commit(&mut self, base: usize, ids: &[u32]) -> Result<(), GenError> {
+        self.canvas_commit_at(0, base, ids).map_err(gen_err)
+    }
+
+    fn canvas_read(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        label_ids: &[u32],
+    ) -> Result<crate::generator::CanvasReadOut, GenError> {
+        self.canvas_read_impl(base, canvas, label_ids)
+            .map_err(gen_err)
+    }
+
+    fn canvas_max_steps(&self) -> u32 {
+        self.diffusion_config().map_or(0, |c| c.max_steps)
+    }
+
+    fn canvas_tick_max(&self) -> usize {
+        self.pf_rows.checked_div(self.hp.canvas_len).unwrap_or(0)
+    }
+
+    fn canvas_open(&mut self, w: usize) -> Result<usize, GenError> {
+        self.canvas_open_impl(w).map_err(gen_err)
+    }
+
+    fn canvas_set(&mut self, h: usize, ids: &[u32]) -> Result<(), GenError> {
+        self.canvas_set_impl(h, ids).map_err(gen_err)
+    }
+
+    fn canvas_close(&mut self, h: usize) {
+        if let Some(c) = self.canvases.get_mut(h) {
+            *c = None;
+        }
+    }
+
+    fn canvas_noise(&self, w: usize, seed: u64, offset: u32) -> Vec<u32> {
+        self.random_canvas(w, seed, offset)
+    }
+
+    fn canvas_tick(
+        &mut self,
+        ticks: &[crate::generator::CanvasTickReq],
+    ) -> Result<Vec<crate::gpu::CanvasStatus>, GenError> {
+        self.canvas_tick_impl(ticks).map_err(gen_err)
+    }
+
+    fn canvas_result(
+        &self,
+        h: usize,
+        label_ids: &[u32],
+    ) -> Result<crate::generator::CanvasReadOut, GenError> {
+        self.canvas_result_impl(h, label_ids).map_err(gen_err)
+    }
+
+    fn canvas_commit_slot(
+        &mut self,
+        slot: usize,
+        base: usize,
+        ids: &[u32],
+    ) -> Result<(), GenError> {
+        self.canvas_commit_at(slot, base, ids).map_err(gen_err)
     }
 
     fn enable_batch(&mut self, max_batch: usize) -> Result<usize, GenError> {
@@ -1484,6 +1592,24 @@ impl Generator for GpuGemma4 {
     // PADDOCK_NO_CHUNKED_PREFILL kill pins the classic blocking pass for A/B.
     fn supports_chunked_prefill(&self) -> bool {
         self.d_tokens.is_some()
+    }
+
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.prefill_queue_impl()
+    }
+
+    fn prefill_abort(&mut self, slot: usize) -> bool {
+        self.prefill_abort_impl(slot)
+    }
+
+    fn prefill_prepare(&mut self, budget: usize) -> Result<(), GenError> {
+        self.prefill_prepare_impl(budget).map_err(gen_err)
+    }
+
+    // a prompt longer than the budget spans this many rows a tick
+    // (chunked.rs); whole prompts under it are the shallow-or-short ticks
+    fn prefill_tick_cap(&self, _decode_rows: usize) -> usize {
+        batch::mixed_tick_rows()
     }
 
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {

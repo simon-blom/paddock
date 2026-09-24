@@ -131,9 +131,8 @@ struct StudioSamplingControls: View {
 struct StudioContextControls: View {
   @Bindable var chat: StudioWorkspace
   @Environment(\.dismiss) private var dismiss
-  @State private var limit: Int?
+  @State private var reply = ReplyLimitDraft()
   @State private var summarize = true
-  @State private var mode = ""
   @State private var language = ""
   @State private var expectedPreferences: [String: StudioValue] = [:]
   var body: some View {
@@ -151,17 +150,8 @@ struct StudioContextControls: View {
           )
         }
         Divider()
-        TextField("Reply limit · model maximum", value: $limit, format: .number)
-          .textFieldStyle(StudioPopoverFieldStyle()).accessibilityLabel("Reply token limit")
-          .help("Leave empty for the model maximum. Thinking and answer share the reply budget.")
+        StudioReplyLimitControl(draft: $reply)
         Toggle("Summarize older context when needed", isOn: $summarize)
-        if !cap.ocrModes.isEmpty {
-          Dropdown(title: "Document reading", value: mode.isEmpty ? "Automatic reading mode" : mode)
-          {
-            Button("Automatic") { mode = "" }
-            ForEach(cap.ocrModes, id: \.self) { value in Button(value) { mode = value } }
-          }
-        }
         if p.audioMode {
           TextField("Audio language · automatic", text: $language).textFieldStyle(
             StudioPopoverFieldStyle())
@@ -173,7 +163,7 @@ struct StudioContextControls: View {
         Button("Apply") {
           Task {
             let changes: [String: StudioValue] = [
-              "maxTokens": limit.map { .number(Double($0)) } ?? .null,
+              "maxTokens": reply.value.map { .number(Double($0)) } ?? .null,
               "summarize": .bool(summarize),
             ]
             await chat.perform(
@@ -186,26 +176,24 @@ struct StudioContextControls: View {
             await chat.perform(
               "settings",
               [
-                "ocrMode": .string(mode),
-                "audioLanguage": .string(language),
+                "audioLanguage": .string(language)
               ])
             if chat.error == nil { dismiss() }
           }
-        }.buttonStyle(FlatButtonStyle(primary: true)).disabled(limit.map { $0 < 1 } ?? false)
+        }.buttonStyle(FlatButtonStyle(primary: true)).disabled(reply.validation != nil)
       }
     }.font(.system(size: 12)).padding(16).frame(width: 320)
       .task {
         let s = chat.state?.settings ?? [:]
-        limit = s["maxTokens"]?.number.map(Int.init)
+        reply = ReplyLimitDraft(value: s["maxTokens"]?.number.flatMap(Int.init(exactly:)))
         summarize = s["summarize"]?.boolean ?? true
         expectedPreferences = ["maxTokens": s["maxTokens"] ?? .null, "summarize": .bool(summarize)]
-        mode = s["ocrMode"]?.text ?? ""
         language = s["audioLanguage"]?.text ?? ""
       }
   }
 }
 
-private struct ComposerError: View {
+struct ComposerError: View {
   let chat: StudioWorkspace
   var body: some View {
     if let error = chat.error {

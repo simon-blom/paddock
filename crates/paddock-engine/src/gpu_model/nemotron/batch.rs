@@ -228,6 +228,9 @@ pub(crate) struct NemoBatch {
     pub seq: Vec<Vec<u32>>,
     /// Stage F: the slot's live reply checkpoint (cut, pool index).
     pub reply_ckpt: Vec<Option<(usize, u32)>>,
+    /// Stage F: the reply checkpoint held at the reply's first tool call
+    /// (`reply_pin`); the live one moves on past the call.
+    pub reply_pinned: Vec<Option<(usize, u32)>>,
     /// Stage F: snapshots copied on the device whose ids the host has not
     /// seen yet (slot, cut, pool index).
     pub reply_pending: Vec<(usize, usize, u32)>,
@@ -870,6 +873,7 @@ impl GpuNemotron {
             verify: None,
             seq: vec![Vec::new(); slots],
             reply_ckpt: vec![None; slots],
+            reply_pinned: vec![None; slots],
             reply_pending: Vec::new(),
         });
         self.last_reused = vec![0; slots];

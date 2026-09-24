@@ -1,5 +1,6 @@
 import AppKit
 import PaddockClient
+import PaddockConversationCore
 import PaddockStudio
 import SwiftUI
 import WebKit
@@ -31,7 +32,6 @@ struct StudioConversationView: View {
         VStack(spacing: 0) {
           if let notices { notices.padding(.top, conversationTopInset) }
           conversationContent
-            .environment(\.workspaceLeadingPaneInset, conversationTopInset)
         }
       } document: {
         if graphOpen {
@@ -43,7 +43,7 @@ struct StudioConversationView: View {
                 Task { await chat.perform("graphPanel", ["open": .bool(false)]) }
               }.labelStyle(.iconOnly).buttonStyle(.plain)
             }.padding(12)
-            WorkspaceContentView(session: chat)
+            WorkspaceContentView(session: chat, role: .graph)
           }.background(PaddockStyle.canvas)
         } else if artifact != nil {
           NativeArtifactPanel(workspace: chat)
@@ -62,7 +62,7 @@ struct StudioConversationView: View {
                 Task { await chat.perform("documentAction", ["action": .string(action)]) }
               })
             if let document = chat.state?.nativeDocument, ["pdf", "docx"].contains(document.kind) {
-              WorkspaceContentView(session: chat)
+              WorkspaceContentView(session: chat, role: .document)
             }
           }.background(PaddockStyle.canvas)
         }
@@ -99,96 +99,79 @@ struct StudioConversationView: View {
       let column = StudioColumnLayout.resolve(
         available: geometry.size.width, viewport: nil,
         comparison: chat.state?.nativeTranscript?.hasComparisons == true)
-      ZStack(alignment: .bottomLeading) {
-        // NativeStudioRuntime owns streaming; no hidden WebView is required.
-        // Attach web content only in the allowlisted viewer panels above.
-        if !welcome, let transcript = chat.state?.nativeTranscript {
-          NativeStudioTranscript(
-            transcript: transcript, columnWidth: column.width,
-            composerHeight: measuredComposerHeight,
-            workspace: chat,
-            onOpenDocument: { messageId, attachmentId in
-              Task {
-                await chat.perform(
-                  "openDocument",
-                  ["messageId": .string(messageId), "attachmentId": .string(attachmentId)])
+      StudioConversationChrome(title: chat.conversation?.title) {
+        Group {
+          // NativeStudioRuntime owns streaming; no hidden WebView is required.
+          // Attach web content only in the allowlisted viewer panels above.
+          if !welcome, let transcript = chat.state?.nativeTranscript {
+            NativeStudioTranscript(
+              transcript: transcript, columnWidth: column.width,
+              composerHeight: measuredComposerHeight,
+              composer: AnyView(composer(columnWidth: column.width)),
+              workspace: chat,
+              onOpenDocument: { messageId, attachmentId in
+                Task {
+                  await chat.perform(
+                    "openDocument",
+                    ["messageId": .string(messageId), "attachmentId": .string(attachmentId)])
+                }
               }
-            }
-          )
-          .id(chat.conversation?.id)
-        }
-        if !welcome {
-          StudioComposerBottomCover().frame(width: column.width).offset(x: column.minX)
-        }
-        VStack(spacing: 0) {
-          if welcome {
-            Spacer(minLength: 30)
-            Text("What would you like to work on?")
-              .font(.system(size: 28, weight: .medium)).tracking(-0.6).padding(.bottom, 26)
-          }
-          if let error = chat.error {
-            HStack(alignment: .top, spacing: 8) {
-              Text(error).textSelection(.enabled).font(.system(size: 12)).foregroundStyle(
-                .secondary)
-              if !chat.ready {
-                Button("Reload content") { chat.reload() }.buttonStyle(FlatButtonStyle())
-              }
-            }.padding(.bottom, 10).accessibilityIdentifier("chat-error")
-          }
-          if let clip = chat.state?.nativeAudioPreview {
-            HStack(alignment: .top, spacing: 8) {
-              NativeAudioPlayerView(clip: clip, workspace: chat)
-              Button("Close recording preview", systemImage: "xmark") {
-                Task { await chat.perform("closePreview") }
-              }.labelStyle(.iconOnly).buttonStyle(.plain).padding(.top, 14)
-            }.padding(.bottom, 12)
-          }
-          StudioComposerView(chat: chat, draft: $draft, maximumWidth: column.width)
-          if welcome {
-            Spacer(minLength: 30)
+            )
+            .id(chat.conversation?.id)
+          } else {
+            composer(columnWidth: column.width)
           }
         }
-        .padding(.bottom, welcome ? 0 : StudioConversationSpacing.edgeInset)
-        .frame(
-          width: column.width, height: welcome ? geometry.size.height : nil
-        )
-        .onGeometryChange(for: CGFloat.self) {
-          $0.size.height
-        } action: { height in
-          if !welcome, height > 0 { measuredComposerHeight = height }
-        }
-        .offset(x: column.minX)
+        .frame(width: geometry.size.width)
+        .frame(maxHeight: .infinity)
+        .background(PaddockStyle.canvas)
       }
-      .frame(width: geometry.size.width, height: geometry.size.height, alignment: .bottomLeading)
-      .background(PaddockStyle.canvas)
-      .overlay(alignment: .topTrailing) {
-        HStack(spacing: 14) {
-          if chat.state?.nativeGraph?.available == true {
-            Button("Graph", systemImage: "point.3.connected.trianglepath.dotted") {
-              chat.selectedArtifactId = nil
-              Task { await chat.perform("graphPanel", ["open": .bool(!graphOpen)]) }
-            }.buttonStyle(.plain)
-          }
-        }.font(.system(size: 12)).padding(.horizontal, 28).padding(.top, conversationTopInset + 12)
+    }
+  }
+
+  private func composer(columnWidth: CGFloat) -> some View {
+    VStack(spacing: 0) {
+      if welcome {
+        Spacer(minLength: 30)
+        Text("What would you like to work on?")
+          .font(.system(size: 28, weight: .medium)).tracking(-0.6).padding(.bottom, 26)
       }
+      if let error = chat.error {
+        HStack(alignment: .top, spacing: 8) {
+          Text(error).textSelection(.enabled).font(.system(size: 12)).foregroundStyle(
+            .secondary)
+          if !chat.ready {
+            Button("Reload content") { chat.reload() }.buttonStyle(FlatButtonStyle())
+          }
+        }.padding(.bottom, 10).accessibilityIdentifier("chat-error")
+      }
+      if let clip = chat.state?.nativeAudioPreview {
+        HStack(alignment: .top, spacing: 8) {
+          NativeAudioPlayerView(clip: clip, workspace: chat)
+          Button("Close recording preview", systemImage: "xmark") {
+            Task { await chat.perform("closePreview") }
+          }.labelStyle(.iconOnly).buttonStyle(.plain).padding(.top, 14)
+        }.padding(.bottom, 12)
+      }
+      StudioComposerView(chat: chat, draft: $draft, maximumWidth: columnWidth)
+      if welcome {
+        Spacer(minLength: 30)
+      }
+    }
+    .padding(.bottom, welcome ? 0 : StudioConversationSpacing.edgeInset)
+    .frame(width: columnWidth)
+    .onGeometryChange(for: CGFloat.self) {
+      $0.size.height
+    } action: { height in
+      if !welcome, height > 0 { measuredComposerHeight = height }
     }
   }
 }
 
 enum StudioConversationSpacing {
   static let edgeInset: CGFloat = 20
-  static func topInset(windowControls: CGFloat, hasGraphAction: Bool = false) -> CGFloat {
-    max(edgeInset, windowControls + 12 + (hasGraphAction ? 28 : 0))
-  }
-}
-
-/// The viewport stays full-height, but text scrolling behind the composer must
-/// not reappear through the narrow gap between it and the bottom window edge.
-struct StudioComposerBottomCover: View {
-  var body: some View {
-    PaddockStyle.canvas.frame(height: StudioConversationSpacing.edgeInset)
-      .frame(maxWidth: .infinity).allowsHitTesting(false).accessibilityHidden(true)
-  }
+  static let composerGap: CGFloat = 20
+  static let scrollIndicatorInset: CGFloat = 12
 }
 
 enum StudioColumnLayout {
@@ -210,11 +193,14 @@ enum StudioColumnLayout {
 
 struct WorkspaceContentView: NSViewRepresentable {
   let session: StudioWorkspace
+  let role: NativeViewerRole
   func makeNSView(context: Context) -> WorkspaceWebContainer { WorkspaceWebContainer() }
-  func updateNSView(_ view: WorkspaceWebContainer, context: Context) { view.embed(session.webView) }
+  func updateNSView(_ view: WorkspaceWebContainer, context: Context) {
+    view.embed(session.webView(for: role))
+  }
 }
 
-/// SwiftUI owns each slot, not the shared WKWebView. Returning that same web
+/// SwiftUI owns each slot, not its role's WKWebView. Returning that same web
 /// view from two representable identities lets the retiring slot's teardown
 /// remove it from its new parent after a chat/document/Settings transition.
 final class WorkspaceWebContainer: NSView {

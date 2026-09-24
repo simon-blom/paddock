@@ -1,0 +1,6 @@
+[
+  {"name":"short repetitions are not a reliable quality signal","text":"A","repeat":399,"review":false},
+  {"name":"reproduced invoice loop","text":"INVOICE 123\n","repeat":500,"review":true},
+  {"name":"unicode loop","text":"Fakturan är klar — belopp 123 kronor.\n","repeat":100,"review":true},
+  {"name":"ordinary page prose","text":"The first page describes a small community library. Its entrance faces the railway station, while the reading room looks over a garden. Members can borrow books for three weeks and renew them online. A separate desk handles historical records and requests from visiting researchers. The renovation added step-free access, adjustable tables, and quieter study spaces upstairs. Opening hours vary by season; the current schedule is printed beside the door. Staff asked residents to suggest activities for next spring, including writing workshops, language exchanges, and an exhibition of local photographs.","repeat":1,"review":false}
+]

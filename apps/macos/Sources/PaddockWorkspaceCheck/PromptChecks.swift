@@ -96,7 +96,7 @@ extension Checks {
         == ["maxTokens", "maxToolCalls", "summarize", "microphone", "mapTiles"],
       layout?["toolStops"]?.array?.compactMap({ $0.object?["value"]?.number })
         == [0, 5, 10, 25, 50, 100],
-      layout?["replyStops"]?.array?.last?.object?["value"] == .null
+      layout?["replyLimit"]?.object?["maximum"] == .number(1_048_576)
     else {
       throw Failure(message: "Native settings presentation differs from the shared web layout")
     }

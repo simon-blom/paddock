@@ -123,6 +123,17 @@ impl Generator for GptOss {
     fn supports_chunked_prefill(&self) -> bool {
         true
     }
+    // the scheduler's tick pacer reads the FIFO queue from each offset
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.pending
+            .iter()
+            .map(|p| (p.slot, p.offset, p.tokens.len() - p.offset))
+            .collect()
+    }
+    // the mixed grant: row_cap less the decode rows sharing it
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        crate::schedule::row_cap(decode_rows, CHUNK).saturating_sub(decode_rows)
+    }
     fn prefill_begin(
         &mut self,
         slot: usize,

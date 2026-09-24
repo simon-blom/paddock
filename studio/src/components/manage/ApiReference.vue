@@ -68,7 +68,11 @@ const port = computed(() => Number(route.params.port))
 const row = computed(() => fleet.rows.find((r) => r.port === port.value))
 const title = computed(() => {
   const served =
-    row.value?.model ?? row.value?.embedder ?? row.value?.asr ?? row.value?.aligner
+    row.value?.model ??
+    row.value?.embedder ??
+    row.value?.asr ??
+    row.value?.aligner ??
+    row.value?.image
   const t = row.value?.display ?? modelLabel(served)
   return t || served || `server ${port.value}`
 })
