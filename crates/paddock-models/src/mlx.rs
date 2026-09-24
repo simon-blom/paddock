@@ -7,6 +7,9 @@ use std::path::Path;
 #[path = "mlx_multimodal.rs"]
 mod multimodal;
 pub use multimodal::{MultimodalConfig, MultimodalFamily};
+#[path = "mlx_llama.rs"]
+mod llama;
+pub use llama::MiniCpmConfig;
 
 #[derive(Clone, Debug)]
 pub struct QwenConfig {

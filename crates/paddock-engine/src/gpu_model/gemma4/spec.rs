@@ -556,8 +556,8 @@ impl GpuGemma4 {
         // CPU each - 192/round of the wide round's 224 DtoD calls); the
         // stitch kernel is one launch, bit-identical movement.
         // PADDOCK_NO_SPEC_STITCH restores the loop.
-        exec.embed_gather_plane(
-            &self.token_embd,
+        super::EmbdTable::of(&self.token_embd, &self.head).gather(
+            &exec,
             &m.tok,
             &mut m.emb,
             n_main,

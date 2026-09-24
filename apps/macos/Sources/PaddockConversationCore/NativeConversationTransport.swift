@@ -182,11 +182,91 @@ public actor NativeConversationTransport: ConversationStorage {
     throw ConversationFailure.interrupted
   }
 
+  /// Image SSE carries bounded encoded pictures, not Responses token events.
+  /// Read with backpressure and finish on the semantic completed event.
+  public func images(
+    port: UInt16, body: [String: ConversationValue],
+    references: [[String: ConversationValue]] = [],
+    receive: @Sendable ([String: ConversationValue]) async throws -> Void
+  ) async throws -> [String: ConversationValue] {
+    guard port > 0 else { throw ConversationFailure.invalid("Invalid image endpoint") }
+    let encoded = try JSONEncoder().encode(body)
+    guard encoded.count <= 256 * 1024 else { throw ConversationFailure.tooLarge }
+    let form =
+      references.isEmpty ? nil : try await imageEditBody(fields: body, references: references)
+    defer { form?.discard() }
+    var req = try request(
+      "api/runners/\(port)/v1/images/\(form == nil ? "generations" : "edits")", method: "POST",
+      body: try form?.finish() ?? encoded)
+    if let form {
+      req.setValue(
+        "multipart/form-data; boundary=\(form.boundary)", forHTTPHeaderField: "Content-Type")
+    }
+    req.timeoutInterval = 3600
+    req.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
+    let started = ContinuousClock.now
+    let (bytes, response) = try await network.bytes(for: req)
+    defer { bytes.task.cancel() }
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      var data = Data()
+      for try await byte in bytes {
+        guard data.count < 64 * 1024 else { throw ConversationFailure.http(http.statusCode) }
+        data.append(byte)
+      }
+      let problem = try? JSONDecoder().decode(ConversationValue.self, from: data)
+      throw ConversationFailure.invalid(
+        problem?["error"]?["message"]?.string ?? "Image generation failed (\(http.statusCode))")
+    }
+    let http = try status(response)
+    if http.mimeType != "text/event-stream" {
+      var data = Data()
+      for try await byte in bytes {
+        guard data.count < 256 * 1024 * 1024 else { throw ConversationFailure.tooLarge }
+        data.append(byte)
+      }
+      try Task.checkCancellation()
+      return try JSONDecoder().decode([String: ConversationValue].self, from: data)
+    }
+    var parser = ServerSentEvents(maximumBytes: 64 * 1024 * 1024)
+    var count = 0
+    var firstPreviewMs: Double?
+    for try await byte in bytes {
+      if let frame = try parser.push(byte), frame.data != "[DONE]" {
+        let event = try JSONDecoder().decode(
+          [String: ConversationValue].self, from: Data(frame.data.utf8))
+        if frame.name == "error" || event["error"] != nil {
+          throw ConversationFailure.invalid(
+            event["error"]?["message"]?.string ?? "Image generation failed")
+        }
+        if event["type"]?.string == "image_generation.partial_image" {
+          count += 1
+          if firstPreviewMs == nil {
+            let elapsed = started.duration(to: .now).components
+            firstPreviewMs = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1e15
+          }
+          guard count <= 3 else { throw ConversationFailure.invalid("Too many image previews") }
+          try await receive(event)
+        } else if event["type"]?.string == "image_generation.completed" {
+          guard let image = event["b64_json"]?.string, !image.isEmpty else {
+            throw ConversationFailure.interrupted
+          }
+          var reply = event
+          if let firstPreviewMs { reply["firstPreviewMs"] = .number(Decimal(firstPreviewMs)) }
+          reply["data"] = .array([.object(["b64_json": .string(image)])])
+          try Task.checkCancellation()
+          return reply
+        }
+      }
+    }
+    throw ConversationFailure.interrupted
+  }
+
   /// Pull-based and awaited: no unbounded AsyncStream queue between transport
   /// and state reducer. Only the caller's coalesced presentation reaches UI.
   /// Returns on the semantic terminal event (the socket need not close first).
   public func responses(
     endpoint: Endpoint, body: [String: ConversationValue],
+    maximumBytes: Int = 16 * 1024 * 1024,
     receive: @Sendable ([String: ConversationValue]) async throws -> Void
   ) async throws -> ResponseAccumulator {
     guard let path = endpoint.path, body["stream"]?.bool == true,
@@ -221,8 +301,8 @@ public actor NativeConversationTransport: ConversationStorage {
     guard http.mimeType?.lowercased() == "text/event-stream" else {
       throw ConversationFailure.invalid("The model did not return a response event stream")
     }
-    var parser = ServerSentEvents()
-    var reducer = ResponseAccumulator()
+    var parser = ServerSentEvents(maximumBytes: min(maximumBytes, 4 * 1024 * 1024))
+    var reducer = ResponseAccumulator(maximumBytes: maximumBytes)
     for try await byte in bytes {
       if let frame = try parser.push(byte), let event = try reducer.apply(frame.data) {
         try Task.checkCancellation()

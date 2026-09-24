@@ -3144,8 +3144,8 @@ impl GpuQwen35 {
     }
 
     /// The slot went idle (or is being re-admitted): stop tracking. Its last
-    /// reply checkpoint STAYS in the radix for the next turn - the pool's
-    /// LRU owns it now.
+    /// reply checkpoint - and the one held at its first tool call - STAY in
+    /// the radix for the next turn; the pool's LRU owns them now.
     pub(super) fn reply_release(&mut self, slot: usize) {
         let Some(bs) = self.batch.as_mut() else {
             return;
@@ -3155,5 +3155,25 @@ impl GpuQwen35 {
         }
         bs.seq[slot].clear();
         bs.reply_ckpt[slot] = None;
+        bs.reply_pinned[slot] = None;
+    }
+
+    /// The reply just started its first tool call (see
+    /// `Generator::reply_pin`): the live checkpoint becomes the held one and
+    /// the next page's snapshot opens a new live one instead of replacing it.
+    /// Once per reply; a reply with no checkpoint yet has nothing to hold.
+    pub(crate) fn reply_pin(&mut self, slot: usize) {
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        if slot >= bs.reply_pinned.len() || bs.reply_pinned[slot].is_some() {
+            return;
+        }
+        bs.reply_pinned[slot] = bs.reply_ckpt[slot].take();
+        if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some()
+            && let Some((cut, idx)) = bs.reply_pinned[slot]
+        {
+            tracing::info!("qwen35-reply-pin: slot {slot} cut {cut} idx {idx}");
+        }
     }
 }

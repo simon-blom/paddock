@@ -18,6 +18,7 @@ struct EndpointSettingsView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 22) {
       if editor.endpoint.settings != nil {
+        EndpointProfilesView(editor: editor)
         if editor.pid != nil {
           if editor.restartRequired {
             VStack(alignment: .leading, spacing: 6) {

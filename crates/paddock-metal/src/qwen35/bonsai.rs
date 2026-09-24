@@ -350,6 +350,8 @@ impl Bonsai {
         let fused = !prefill && cmd.tensor_accelerated() && rows <= 4 && (2..=3).contains(&packed);
         #[cfg(test)]
         let fused = fused && !BASELINE_PROJECTIONS.with(|v| v.get());
+        #[cfg(test)]
+        let fused = fused && !ternary_add_tests::ADD_PROJECTIONS.with(|v| v.get());
         if fused {
             let (a, ao) = planes[0];
             let (b, bo) = planes[1];
@@ -432,6 +434,12 @@ impl Bonsai {
                 ("bonsai_mm32", 16, 32)
             } else {
                 ("bonsai_mm64", 16, 64)
+            };
+            #[cfg(test)]
+            let (kernel, cols, tile) = if w.ty == AFFINE2 {
+                ternary_add_tests::election(false, rows).unwrap_or((kernel, cols, tile))
+            } else {
+                (kernel, cols, tile)
             };
             cmd.dispatch_at(
                 kernel,

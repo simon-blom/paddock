@@ -7,15 +7,23 @@ import SwiftUI
 /// introspection, delegate replacement or modifications to dependency sources.
 struct SelectableMarkdownSurface<Content: View>: NSViewRepresentable {
   let content: Content
+  var unsureWords: [String]
 
-  init(@ViewBuilder content: () -> Content) { self.content = content() }
+  init(unsureWords: [String] = [], @ViewBuilder content: () -> Content) {
+    self.content = content()
+    self.unsureWords = unsureWords
+  }
 
   func makeNSView(context: Context) -> SelectionHostingView {
     SelectionHostingView(rootView: AnyView(content.environment(\.self, context.environment)))
   }
 
   func updateNSView(_ view: SelectionHostingView, context: Context) {
+    #if DEBUG
+      view.contentUpdates += 1
+    #endif
     view.identifier = .init(context.environment.conversationTextID)
+    view.confidence.words = unsureWords
     view.preserveSelectionForUpdate()
     view.rootView = AnyView(content.environment(\.self, context.environment))
     view.needsLayout = true
@@ -23,6 +31,10 @@ struct SelectableMarkdownSurface<Content: View>: NSViewRepresentable {
 }
 
 final class SelectionHostingView: PaddockScrollHostingView {
+  #if DEBUG
+    var contentUpdates = 0
+  #endif
+  let confidence = NativeConfidenceDecoration()
   private struct Selection {
     weak var view: NSTextView?
     let text: String
@@ -39,6 +51,7 @@ final class SelectionHostingView: PaddockScrollHostingView {
 
   override func layout() {
     super.layout()
+    confidence.reconcile(self)
     guard let selection = pending else { return }
     pending = nil
     guard let view = selection.view else { return }

@@ -46,6 +46,18 @@ async fn assert_native_client_read_routes() {
     state.registry = Arc::new(Registry::new(temp.path().join("models")).with_backend("metal"));
     state.readiness = Arc::new(paddock_manager::readiness::probe_for_backend("metal"));
     state.auth_key = Some("macos-contract-test".into());
+    state
+        .db
+        .insert_activity(
+            "native-contract",
+            11540,
+            1,
+            &[serde_json::json!({
+                "seq":1,"ts_ms":1000,"status":200,"gen_ai.request.model":"fixture",
+                "paddock.ttft_ms":12.5,"gen_ai.usage.output_tokens":128
+            })],
+        )
+        .expect("activity fixture");
     let router = paddock_manager::routes::router(Arc::new(state));
     let export = std::env::var_os("PADDOCK_MACOS_CONTRACT_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &export {
@@ -61,6 +73,9 @@ async fn assert_native_client_read_routes() {
         ("/api/readiness", "readiness.json"),
         ("/api/models/catalog", "catalog.json"),
         ("/api/runners", "runners.json"),
+        ("/api/usage/history?from=0&to=10000", "usage.json"),
+        ("/api/activity?limit=200", "activity.json"),
+        ("/api/cache", "cache.json"),
     ] {
         let response = router
             .clone()
@@ -161,6 +176,11 @@ async fn assert_native_client_read_routes() {
                 }
             }
             "/api/runners" => assert_eq!(json, serde_json::json!([])),
+            "/api/usage/history?from=0&to=10000" => assert!(json["buckets"].is_array()),
+            "/api/activity?limit=200" => {
+                assert_eq!(json["events"][0]["gen_ai.request.model"], "fixture")
+            }
+            "/api/cache" => assert_eq!(json["servers"], serde_json::json!([])),
             _ => unreachable!(),
         }
         if let Some(dir) = &export {

@@ -43,10 +43,19 @@ export interface GraphResult {
 
 export class GraphSession {
   private db: TraverseDb | null = null
+  private generation = 0
 
   /** Spawns the worker and boots the WASM. One session per open panel. */
   async open(): Promise<void> {
-    this.db = await TraverseDb.open()
+    const ticket = ++this.generation
+    this.db?.close()
+    this.db = null
+    const db = await TraverseDb.open()
+    if (ticket !== this.generation) {
+      db.close()
+      throw new DOMException('Graph closed while opening', 'AbortError')
+    }
+    this.db = db
   }
 
   private need(): TraverseDb {
@@ -134,6 +143,7 @@ export class GraphSession {
   }
 
   close(): void {
+    ++this.generation
     this.db?.close()
     this.db = null
   }

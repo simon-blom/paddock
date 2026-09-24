@@ -46,6 +46,78 @@ export interface ImagePart {
   /** Multi-page images (TIFF): which pages of this file reach the model
    *  ("2-4" / "3" / "2-") - sent as the part-level `pages` field. */
   pageRange?: string
+  /** Present when a MODEL made this picture (an image-generation turn's
+   *  answer): what it took to make it, which is what makes it reproducible.
+   *  Absent on every attachment a person added. */
+  gen?: GeneratedImage
+}
+
+/** One generated picture's record - the facts that reproduce it byte for
+ *  byte on the same model and box (seed, size, steps), plus what it was
+ *  asked to look like. Lives on the ImagePart so the picture and its recipe
+ *  never part company. */
+export interface GeneratedImage {
+  seed: number
+  /** `WIDTHxHEIGHT` as rendered. */
+  size: string
+  steps: number
+  quality: string
+  format: string
+  /** `opaque` | `transparent` - what the model produced, never `auto`. */
+  background: string
+  /** Set while a PREVIEW stands in for the final picture: the render is
+   *  still going and `dataUrl` holds the latest partial. Cleared, and the
+   *  stored bytes take over, when the final one lands. */
+  preview?: boolean
+  /** 0-based index of the preview on show, while previewing. */
+  previewIndex?: number
+}
+
+/** How pictures are asked for in this chat - the composer's controls in
+ *  image mode, sticky per conversation the way sampling is, and snapshotted
+ *  onto each turn's `imageGen` so Run details says what actually rode. */
+export interface ImageParams {
+  /** `WIDTHxHEIGHT` on the model's grid, or `auto` for its default. */
+  size: string
+  quality: 'auto' | 'low' | 'medium' | 'high'
+  /** an explicit step count; null = the quality's own. */
+  steps: number | null
+  /** `thread` automatically keeps the seed for text-only variations, but
+   *  reference edits and retries draw afresh. The reference preserves the
+   *  composition; reusing its generating noise can corrupt an edit.
+   *  `random` draws on every send; a number pins one outright. */
+  seed: number | 'thread' | 'random'
+  /** pictures per turn (each its own draw on the seed). */
+  n: number
+  format: 'png' | 'webp' | 'jpeg'
+  background: 'auto' | 'opaque' | 'transparent'
+  /** progressive previews while a picture renders (0 = wait for the whole
+   *  thing). Costs one decode each; three on a 40-step render is ~3 %. */
+  previews: number
+}
+
+/** The record of an image-generation turn: the prompt as sent, the
+ *  parameters that rode, and what the render cost. Beside `run` (the
+ *  provenance every turn has) rather than inside it, because nothing about
+ *  sampling applies here. */
+export interface ImageGenMeta {
+  prompt: string
+  params: ImageParams
+  /** the seed actually used - the pinned one, or the draw `random` made */
+  seed: number
+  steps: number
+  size: string
+  /** previews that arrived before the final picture */
+  previews: number
+  /** an EDIT: how many reference pictures rode, and where they came from -
+   *  the person's attachments on the turn, or the thread's last picture
+   *  (a follow-up on a picture is an edit of it) */
+  references?: number
+  referencesFrom?: 'attached' | 'previous'
+  /** seconds the engine spent on the turn, all images */
+  elapsedS?: number
+  /** seconds per denoising step, all-in (prefix + steps + decode) */
+  sPerStep?: number
 }
 
 /** A document attachment (PDF today). Bytes live in the attachments table by
@@ -457,6 +529,12 @@ export interface Message {
    *  PDF's pages) - DocumentPages builds its stack the same way, so index i
    *  here is page i there. Absent on single-request turns. */
   docRun?: DocRunMeta
+  /** Present when this turn is an IMAGE-GENERATION answer: the prompt and
+   *  parameters that rode and what the render cost. The pictures themselves
+   *  are `image` parts in `content`, each carrying its own `gen` record.
+   *  Set the moment the turn starts, so the renderer never treats the empty
+   *  turn as a chat reply. */
+  imageGen?: ImageGenMeta
   usage?: Usage
   /** recorded run: provenance (prompt/params/model) + GPU environment. */
   run?: RunMeta
@@ -631,6 +709,11 @@ export interface Conversation {
    *  What actually rode is COPIED onto each AudioPart at send time, already
    *  resolved, so the turn records what happened even after this changes. */
   audioLanguage?: string
+  /** The composer's controls in image mode - size, quality, seed and the
+   *  rest - sticky per chat the way sampling is. Absent = the defaults
+   *  (`DEFAULT_IMAGE_PARAMS`). What actually rode is snapshotted onto each
+   *  turn's `imageGen`. */
+  imageParams?: ImageParams
   /** Whether document metadata (PDF title/author/dates) rides into the prompt
    *  with attached files (default on - the server's `file_metadata: "full"`).
    *  Off sends `file_metadata: "off"`: only the extracted content goes. */
@@ -694,6 +777,27 @@ export const DEFAULT_PARAMS: SamplingParams = {
   // house value - on the wire, not just in the picker.
   reasoningEffort: '',
   preserveThinking: false,
+}
+
+/** What a new chat asks a picture for: the model's own default size and
+ *  step count, the seed following the conversation, one picture, a lossless
+ *  file, and two previews on the way - enough to watch it converge without
+ *  paying for more decodes than that. */
+export const DEFAULT_IMAGE_PARAMS: ImageParams = {
+  size: 'auto',
+  quality: 'auto',
+  steps: null,
+  seed: 'thread',
+  n: 1,
+  format: 'png',
+  background: 'auto',
+  previews: 2,
+}
+
+/** A conversation's image settings, defaults filled in - never the stored
+ *  object itself, so a caller can read fields without writing them back. */
+export function imageParamsOf(c: Pick<Conversation, 'imageParams'>): ImageParams {
+  return { ...DEFAULT_IMAGE_PARAMS, ...(c.imageParams ?? {}) }
 }
 
 /** Concatenate a message's text parts (for copy / plain rendering). */

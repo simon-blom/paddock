@@ -361,7 +361,7 @@ fn ptq1_embedding_and_grouped_rotation_match_cpu_butterflies() {
 
 #[test]
 #[ignore = "requires PADDOCK_METAL_PTQ1_MODEL and PADDOCK_PTQ1_REFERENCE"]
-fn ptq1_complete_generations_batch_and_cache() {
+pub(super) fn ptq1_complete_generations_batch_and_cache() {
     let path = std::env::var("PADDOCK_METAL_PTQ1_MODEL").unwrap();
     let data: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::env::var("PADDOCK_PTQ1_REFERENCE").unwrap()).unwrap(),

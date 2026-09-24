@@ -112,6 +112,23 @@ pub(super) struct Ternary {
     rotated: Buffer,
 }
 
+// Unpacking changes integer work only. All choices retain the same F32
+// additions, group-scale FMAs and four-team K reduction, including tails.
+pub(super) fn decode_kernel(k: usize, n: usize, rows: usize) -> (&'static str, usize) {
+    assert!(rows > 0);
+    if k <= 6144 && n >= 5120 {
+        for tile in [4, 3, 2] {
+            if rows.is_multiple_of(tile) {
+                return (
+                    ["ptq1_unroll_2", "ptq1_unroll_3", "ptq1_unroll_4"][tile - 2],
+                    tile,
+                );
+            }
+        }
+    }
+    ("ptq1_swar_1", 1)
+}
+
 impl Ternary {
     pub(super) fn reserve_rows(&mut self, device: &MetalDevice, rows: usize) -> Result<()> {
         let bytes = rows
@@ -228,6 +245,27 @@ impl Ternary {
                 } else {
                     ("ptq1_mm64", 32, 64)
                 };
+                // Reuse unpacked codes for short/wide batched planes. Long K
+                // and narrow outputs prefer the lower-register triplet decoder.
+                // Prompt projections retain their tensor-accelerated path.
+                let add_decode = cmd.tensor_accelerated() && (head || role == 1);
+                #[cfg(test)]
+                let add_decode = add_decode && !ternary_add_tests::BASELINE_PTQ.with(|v| v.get());
+                let (kernel, columns, tile) = if add_decode {
+                    let (kernel, tile) = decode_kernel(k, w.n, count);
+                    #[cfg(test)]
+                    let (kernel, tile) = if ternary_add_tests::BASELINE_UNPACK.with(|v| v.get()) {
+                        ("ptq1_add_full_1", 1)
+                    } else {
+                        (kernel, tile)
+                    };
+                    (kernel, 4, tile)
+                } else {
+                    (kernel, columns, tile)
+                };
+                #[cfg(test)]
+                let (kernel, columns, tile) =
+                    ternary_add_tests::election(true, count).unwrap_or((kernel, columns, tile));
                 cmd.dispatch_at(
                     kernel,
                     &[&w.buffer, &self.rotated, out],
@@ -245,6 +283,24 @@ impl Ternary {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
+
+    #[test]
+    fn ptq1_decode_tiles_never_read_past_live_rows() {
+        for k in [5120, 6144, 17408] {
+            for n in [1024, 5120, 17408, 248320] {
+                for rows in 1..=CHUNK {
+                    let (_, tile) = decode_kernel(k, n, rows);
+                    assert!(rows.is_multiple_of(tile));
+                    if k > 6144 || n < 5120 {
+                        assert_eq!(tile, 1);
+                    }
+                }
+            }
+        }
+        assert_eq!(decode_kernel(5120, 17408, 4), ("ptq1_unroll_4", 4));
+        assert_eq!(decode_kernel(5120, 248320, 3), ("ptq1_unroll_3", 3));
+        assert_eq!(decode_kernel(5120, 17408, 5), ("ptq1_swar_1", 1));
+    }
 
     #[test]
     fn ptq1_rotation_workspace_grows_transactionally_and_checks_overflow() {

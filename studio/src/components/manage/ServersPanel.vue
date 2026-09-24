@@ -450,10 +450,10 @@ async function stop(r: FleetRow): Promise<void> {
             <tr v-else-if="en.kind === 'live'" class="srow srow--click" @click="toDetail(en.port)">
               <td class="c-port">{{ en.port }}</td>
               <td class="c-model">
-                <Tooltip :label="en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? ''">
+                <Tooltip :label="en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? en.r.image ?? ''">
                   <span class="c-model__name">
                     <VendorLogo v-if="en.r.vendor" :vendor="en.r.vendor" :size="16" class="c-model__logo" />
-                    <span class="c-model__id">{{ en.r.display ?? en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? '-' }}</span>
+                    <span class="c-model__id">{{ en.r.display ?? en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? en.r.image ?? '-' }}</span>
                     <span v-if="speculationBadge(en.r.spec)" class="c-model__spec">{{ speculationBadge(en.r.spec) }}</span>
                   </span>
                 </Tooltip>

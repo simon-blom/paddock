@@ -49,6 +49,11 @@ pub(crate) struct ScratchDims {
     pub f8w_pf: bool,
     pub f8a: bool,
     pub f8t_dec: bool,
+    /// any dense plane (attention, shared FFN, head, the diffusion MLP) is
+    /// k-quant: the W4A8 staging planes are real
+    pub kq_dense: bool,
+    /// the routed experts are k-quant seats: their sums + grouped CSR planes
+    pub kq_moe: bool,
     /// Raw (non-pool) accumulator for the uniq-routing diagnostic, armed once
     /// by the loader. Carried rather than re-armed because `g4_moe_uniq_arm`
     /// leaks its buffer by design (process lifetime) - arming it per rebuild
@@ -99,6 +104,10 @@ pub(crate) fn build(
     // tc5 f8 expert-lane planes are sized on the BM=128 superset
     let moe_f8_rows = if n_expert != 0 { mb128 * 128 } else { 0 };
     let ff_pad = ff_exp.next_multiple_of(128).max(1);
+    // k-quant seats: the grouped CSR at the 8-row group has the most blocks
+    let kq_mb8 = (moe_pairs + n_expert * 7).div_ceil(8).max(1);
+    // k-quant dense staging: the widest quantize input (n_embd, n_ff, wo's)
+    let kq_in = n_ff.max(n_embd).max(max_q);
 
     Ok(Scratch {
         x: alloc(n_embd)?,
@@ -228,6 +237,41 @@ pub(crate) fn build(
                 32
             })
             .map_err(|e| name("pf_ffs", &e))?,
+        // k-quant staging: the widest quantize input of the walk (the same
+        // rule pf_yq / pf_xq follow), sized only when a plane needs it
+        kq_xq: exec
+            .alloc_i8(if d.kq_dense { kq_in } else { 1 })
+            .map_err(|e| name("kq_xq", &e))?,
+        kq_xs: alloc(if d.kq_dense { kq_in / 32 } else { 1 })?,
+        kq_ssums: alloc(if d.kq_dense { kq_in / 16 } else { 1 })?,
+        pf_ssums: alloc(if d.kq_dense { 192 * kq_in / 16 } else { 1 })?,
+        pf_xsums: alloc(if d.kq_dense {
+            kq_in.div_ceil(128) * pf_rows.next_multiple_of(128) * 4
+        } else {
+            1
+        })?,
+        embd_id: exec.alloc_u32(1).map_err(|e| name("embd_id", &e))?,
+        moe_ssums: alloc(if d.kq_moe {
+            (pf_rows * n_embd).max(pf_rows * n_expert_used * ff_exp) / 16
+        } else {
+            1
+        })?,
+        kq_srow: exec
+            .alloc_u32(if d.kq_moe { kq_mb8 * 8 } else { 1 })
+            .map_err(|e| name("kq_srow", &e))?,
+        kq_sslot: exec
+            .alloc_u32(if d.kq_moe { kq_mb8 * 8 } else { 1 })
+            .map_err(|e| name("kq_sslot", &e))?,
+        kq_bexp: exec
+            .alloc_u32(if d.kq_moe { kq_mb8 } else { 1 })
+            .map_err(|e| name("kq_bexp", &e))?,
+        kq_sfq: exec
+            .alloc_i8(if d.kq_moe { mb32 * 32 * ff_exp } else { 1 })
+            .map_err(|e| name("kq_sfq", &e))?,
+        kq_sfs: alloc(if d.kq_moe { mb32 * 32 * ff_exp / 32 } else { 1 })?,
+        moe_emap: exec
+            .alloc_u32(if d.kq_moe { 2 * n_expert } else { 1 })
+            .map_err(|e| name("moe_emap", &e))?,
         // hybrid-MoE lane (26B-A4B): pf_rows-sized like the pf planes; 1-elem
         // stubs on dense models.
         moe_xn: alloc(if n_expert != 0 { pf_rows * n_embd } else { 1 })?,

@@ -347,6 +347,14 @@ describe('send: a compacted prompt pays for its summary', () => {
     await useChatStream().send([{ type: 'text', text: ASK }])
     expect(sent().max_output_tokens).toBe(1500)
   })
+  it('bounds a custom reply at send time without changing the global setting', async () => {
+    seed(8)
+    mock.settings.maxTokens = 32768
+    mock.outCap = 1500
+    await useChatStream().send([{ type: 'text', text: ASK }])
+    expect(sent().max_output_tokens).toBe(1500)
+    expect(mock.settings.maxTokens).toBe(32768)
+  })
 
   it('has no client summary to charge on a local lane, which the runner compacts', async () => {
     // Why the tests above run on a cloud lane: a local single-model send arms
@@ -357,8 +365,8 @@ describe('send: a compacted prompt pays for its summary', () => {
     mock.cloud = false
     await useChatStream().send([{ type: 'text', text: ASK }])
     const req = sent()
-    // 70% of the 10880-token prompt budget, in the runner's own tokens
-    expect(req.context_management).toEqual([{ type: 'compaction', compact_threshold: 7615 }])
+    // 70% of 16000 - min(4096, 16000/4) - 1024, in the runner's tokens.
+    expect(req.context_management).toEqual([{ type: 'compaction', compact_threshold: 7683 }])
     expect(req.instructions).not.toContain(WRAPPER)
     // A local lane asks for the whole window: the runner clamps against exact
     // prompt tokens at admission, so no client estimate rides (localOutputMaximum).

@@ -65,6 +65,11 @@ The app marketing version comes from `[workspace.package].version` in
 commit counts are not a stable app build sequence. Binaries retain their commit
 stamp and the build manifest includes the full source hash inventory.
 
+The app icon is the committed `Paddock.icns`, rendered from the Truespar mark
+in `studio/public/img/truespar-mark-3d.svg` by
+`swift packaging/macos/make-icon.swift`. Rerun that and commit the result when
+the mark changes; neither build script renders it.
+
 `build` uses ad-hoc signatures only and produces visibly `UNSIGNED` artifacts.
 These are packaging candidates, **not customer downloads**. It checks native
 viewer boundaries, arm64 dependencies and signatures, CLI startup, and a real

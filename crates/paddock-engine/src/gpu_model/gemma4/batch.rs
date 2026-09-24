@@ -24,6 +24,7 @@ use crate::gpu::GpuExecutor;
 use crate::kv_plan;
 
 use super::forward::{PF_ROWS, g4_e4m3_glu, pf_mmq};
+use super::{EmbdTable, ExpertPlanes, kq_rows, kq_stage, planes};
 
 /// Issue-ahead: outcome of forward_mixed_spec_launch_impl.
 pub(crate) enum MixLaunch {
@@ -50,7 +51,7 @@ pub(crate) struct MixInflight {
     /// half reads a 4-byte id instead of its [1, vocab] logits row
     fin_dev: Vec<Option<crate::sampler::DevicePlan>>,
     out: Vec<Vec<f32>>,
-    batch: Vec<(usize, Vec<u32>)>,
+    batch: Vec<super::chunked::PfShare>,
 }
 
 /// F8A projection ladder: mma_ks twin through 31 rows (and 32..64 where the
@@ -1483,8 +1484,8 @@ impl GpuGemma4 {
         let n_embd = self.hp.n_embd;
         {
             let sc = &mut self.scratch;
-            self.exec.embed_gather_plane(
-                &self.token_embd,
+            EmbdTable::of(&self.token_embd, &self.head).gather(
+                &self.exec,
                 &sc.pf_toks,
                 &mut sc.pf_x,
                 n_embd,
@@ -1502,12 +1503,13 @@ impl GpuGemma4 {
         self.prefill_layers(r, runs, spans, 0)
     }
 
+    /// Classic batched prefill of whole prompts (the blocking admission
+    /// pass): each item's admission prologue, then one coalesced pass.
     pub(crate) fn forward_prefill_batch_impl(
         &mut self,
         items: &[(usize, Vec<u32>)],
     ) -> Result<Vec<Vec<f32>>, GpuError> {
-        let n_embd = self.hp.n_embd;
-        let mut starts = Vec::with_capacity(items.len());
+        let mut shares = Vec::with_capacity(items.len());
         for (slot, toks) in items {
             assert!(
                 *slot < self.n_slots,
@@ -1515,17 +1517,41 @@ impl GpuGemma4 {
                 self.n_slots
             );
             self.gpool_clear_slot(*slot);
-            starts.push(self.prefix_resume(*slot, toks)?);
+            let start = self.prefix_resume(*slot, toks)?;
             self.ensure_global_rows(&[*slot as u32], &[(toks.len() - 1) as u32])?;
+            shares.push(super::chunked::PfShare {
+                slot: *slot,
+                tokens: toks.clone(),
+                start,
+                from: start,
+                to: toks.len(),
+            });
         }
+        self.forward_prefill_shares(&shares)
+    }
+
+    /// One coalesced prefill pass over prompt shares whose admission
+    /// prologue already ran (see chunked.rs): rows `[from, to)` of each, in
+    /// PF_ROWS chunks. A finishing share's last row returns its logits and
+    /// its prompt lands in the prefix cache; a spanning share returns an
+    /// empty row and leaves its KV and window ring in the slot for the next
+    /// tick.
+    pub(crate) fn forward_prefill_shares(
+        &mut self,
+        items: &[super::chunked::PfShare],
+    ) -> Result<Vec<Vec<f32>>, GpuError> {
+        let n_embd = self.hp.n_embd;
         // row stream: (slot, pos, token, item) - items stay contiguous
         let mut rows: Vec<(u32, u32, u32, usize)> = Vec::new();
-        let mut last_row = vec![0usize; items.len()];
-        for (it, ((slot, toks), &start)) in items.iter().zip(&starts).enumerate() {
-            for (j, &t) in toks[start..].iter().enumerate() {
-                rows.push((*slot as u32, (start + j) as u32, t, it));
+        // usize::MAX = no finishing row (a spanning share)
+        let mut last_row = vec![usize::MAX; items.len()];
+        for (it, sh) in items.iter().enumerate() {
+            for p in sh.from..sh.to {
+                rows.push((sh.slot as u32, p as u32, sh.tokens[p], it));
             }
-            last_row[it] = rows.len() - 1;
+            if sh.finishes() {
+                last_row[it] = rows.len() - 1;
+            }
         }
         let _row_bytes = (n_embd / 32) * 34;
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
@@ -1671,9 +1697,9 @@ impl GpuGemma4 {
             base += r;
         }
         // per-item radix insert + direct ring->pool checkpoint landing
-        for (it, (slot, toks)) in items.iter().enumerate() {
-            let cut = self.prefix_cut(toks.len(), starts[it]);
-            self.prefix_insert(*slot, toks, cut)?;
+        for sh in items.iter().filter(|sh| sh.finishes()) {
+            let cut = self.prefix_cut(sh.tokens.len(), sh.start);
+            self.prefix_insert(sh.slot, &sh.tokens, cut)?;
         }
         // restore the single-stream slot-0 staging convention
         let zeros = vec![0u32; self.pf_rows];
@@ -2018,8 +2044,8 @@ impl GpuGemma4 {
 
         // token rows straight from the embedding plane, the arch's
         // embedding scale folded into the gather
-        exec.embed_gather_plane(
-            &self.token_embd,
+        EmbdTable::of(&self.token_embd, &self.head).gather(
+            exec,
             self.d_tokens.as_ref().expect("enable_batch"),
             &mut sc.pf_x,
             hp.n_embd,
@@ -2121,7 +2147,7 @@ impl GpuGemma4 {
             // The widening requires exactly the conditions under which the
             // r==1 qkv chain takes the fused f8t GEMM (reclaimed stubs, no
             // f8w plane, fused qkv plane), so the f32 norm is never read.
-            let r1_f8t_qkv = lw.wq.data.len() == 48 && lw.f8w_wq.is_none() && lw.f8t_qkv.is_some();
+            let r1_f8t_qkv = lw.wq.is_stub() && lw.f8w_wq.is_none() && lw.f8t_qkv.is_some();
             let nqf_row_attn = (r > 1 || r1_f8t_qkv)
                 && r <= nqf_wide_cap()
                 && lw.f8a_wqkv.is_none()
@@ -2344,7 +2370,13 @@ impl GpuGemma4 {
                             hp.n_embd,
                             kv_dim,
                         )?,
-                        None => lw.wk.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim)?,
+                        None => lw.wk.gemv_at(
+                            exec,
+                            kq_stage!(sc),
+                            &sc.pf_normed,
+                            &mut sc.pf_q,
+                            q_dim,
+                        )?,
                     }
                     match (&lw.f8a_wv, &lw.wv) {
                         (Some(v8w), _) => exec.f8_gemv_at(
@@ -2356,9 +2388,13 @@ impl GpuGemma4 {
                             kv_dim,
                         )?,
                         // bf16 v: its own plane, same output offset
-                        (None, Some(wv)) => {
-                            wv.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim + kv_dim)?
-                        }
+                        (None, Some(wv)) => wv.gemv_at(
+                            exec,
+                            kq_stage!(sc),
+                            &sc.pf_normed,
+                            &mut sc.pf_q,
+                            q_dim + kv_dim,
+                        )?,
                         // V-less global layer: v = copy of k
                         (None, None) => exec
                             .copy_region(&sc.pf_q, q_dim, &mut sc.pf_tmp, 0, kv_dim)
@@ -2372,7 +2408,7 @@ impl GpuGemma4 {
                                 )
                             })?,
                     }
-                } else if lw.wq.data.len() == 48
+                } else if lw.wq.is_stub()
                     && let Some(q8) = &lw.f8w_wq
                 {
                     // Q8-reclaim + KEEP_F8W: the originals are 48-byte stubs -
@@ -2388,7 +2424,13 @@ impl GpuGemma4 {
                             hp.n_embd,
                             kv_dim,
                         )?,
-                        None => lw.wk.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim)?,
+                        None => lw.wk.gemv_at(
+                            exec,
+                            kq_stage!(sc),
+                            &sc.pf_normed,
+                            &mut sc.pf_q,
+                            q_dim,
+                        )?,
                     }
                     match (&lw.f8w_wv, &lw.wv) {
                         (Some(v8), _) => exec.f8_gemv_at(
@@ -2399,9 +2441,13 @@ impl GpuGemma4 {
                             hp.n_embd,
                             kv_dim,
                         )?,
-                        (None, Some(wv)) => {
-                            wv.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim + kv_dim)?
-                        }
+                        (None, Some(wv)) => wv.gemv_at(
+                            exec,
+                            kq_stage!(sc),
+                            &sc.pf_normed,
+                            &mut sc.pf_q,
+                            q_dim + kv_dim,
+                        )?,
                         (None, None) => exec
                             .copy_region(&sc.pf_q, q_dim, &mut sc.pf_tmp, 0, kv_dim)
                             .and_then(|_| {
@@ -2414,7 +2460,7 @@ impl GpuGemma4 {
                                 )
                             })?,
                     }
-                } else if lw.wq.data.len() == 48
+                } else if lw.wq.is_stub()
                     && let Some(qkv) = &lw.f8t_qkv
                 {
                     // Q8-reclaim, unified planes: the fused f8t qkv
@@ -2454,11 +2500,22 @@ impl GpuGemma4 {
                             })?;
                     }
                 } else {
-                    exec.q8_0_gemv_repacked_at(&lw.wq, &sc.pf_normed, &mut sc.pf_q, 0)?;
-                    lw.wk.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim)?;
+                    // the concat row off each plane's own class; a k-quant
+                    // layer stages the normed row once for all three
+                    let st = kq_stage!(sc);
+                    if lw.wq.kq().is_some()
+                        || lw.wk.kq().is_some()
+                        || lw.wv.as_ref().is_some_and(|v| v.kq().is_some())
+                    {
+                        planes::kq_stage_x(exec, st, &sc.pf_normed, hp.n_embd)?;
+                    }
+                    lw.wq
+                        .gemv_at_pre(exec, st, &sc.pf_normed, &mut sc.pf_q, 0)?;
+                    lw.wk
+                        .gemv_at_pre(exec, st, &sc.pf_normed, &mut sc.pf_q, q_dim)?;
                     match &lw.wv {
                         Some(wv) => {
-                            wv.gemv_at(exec, &sc.pf_normed, &mut sc.pf_q, q_dim + kv_dim)?
+                            wv.gemv_at_pre(exec, st, &sc.pf_normed, &mut sc.pf_q, q_dim + kv_dim)?
                         }
                         None => exec
                             .copy_region(&sc.pf_q, q_dim, &mut sc.pf_tmp, 0, kv_dim)
@@ -2514,13 +2571,17 @@ impl GpuGemma4 {
                     f8a_mm!(exec, sc, q8w, &mut sc.pf_q, hp.n_embd, q_dim, r);
                     match &lw.f8a_wk {
                         Some(k8w) => f8a_mm!(exec, sc, k8w, &mut sc.pf_k, hp.n_embd, kv_dim, r),
-                        None => lw.wk.gemm(exec, &sc.pf_normed, &mut sc.pf_k, r)?,
+                        None => lw
+                            .wk
+                            .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?,
                     }
                     match (&lw.f8a_wv, &lw.wv) {
                         (Some(v8w), _) => {
                             f8a_mm!(exec, sc, v8w, &mut sc.pf_v, hp.n_embd, kv_dim, r)
                         }
-                        (None, Some(wv)) => wv.gemm(exec, &sc.pf_normed, &mut sc.pf_v, r)?,
+                        (None, Some(wv)) => {
+                            wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?
+                        }
                         (None, None) => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                     }
                 } else if r >= 65
@@ -2557,7 +2618,9 @@ impl GpuGemma4 {
                             kv_dim,
                             r,
                         )?,
-                        None => lw.wk.gemm(exec, &sc.pf_normed, &mut sc.pf_k, r)?,
+                        None => lw
+                            .wk
+                            .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?,
                     }
                     match (&lw.f8w_wv, &lw.wv) {
                         (Some(v8), _) => exec.f8_gemm_w8(
@@ -2570,7 +2633,9 @@ impl GpuGemma4 {
                             kv_dim,
                             r,
                         )?,
-                        (None, Some(wv)) => wv.gemm(exec, &sc.pf_normed, &mut sc.pf_v, r)?,
+                        (None, Some(wv)) => {
+                            wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?
+                        }
                         (None, None) => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                     }
                 } else if r >= 65
@@ -2606,7 +2671,9 @@ impl GpuGemma4 {
                             kv_dim,
                             r,
                         )?,
-                        None => lw.wk.gemm(exec, &sc.pf_normed, &mut sc.pf_k, r)?,
+                        None => lw
+                            .wk
+                            .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?,
                     }
                     match (&lw.f8_wv, &lw.wv) {
                         (Some(v8), _) => exec.f8row_gemm(
@@ -2618,7 +2685,9 @@ impl GpuGemma4 {
                             kv_dim,
                             r,
                         )?,
-                        (None, Some(wv)) => wv.gemm(exec, &sc.pf_normed, &mut sc.pf_v, r)?,
+                        (None, Some(wv)) => {
+                            wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?
+                        }
                         (None, None) => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                     }
                 } else if let Some(qkv) = &lw.f8t_qkv {
@@ -2841,10 +2910,12 @@ impl GpuGemma4 {
                             None => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                         }
                     }
-                } else if r <= 192 {
+                } else if r <= 192
+                    && let Some(wq8) = lw.wq.q8()
+                {
                     exec.quantize_q8(&sc.pf_normed, &mut sc.pf_xq, &mut sc.pf_xs, r * hp.n_embd)?;
                     exec.q8_0_gemm_mma_ks(
-                        &lw.wq,
+                        wq8,
                         &sc.pf_xq,
                         &sc.pf_xs,
                         &mut sc.pf_skfix,
@@ -2860,8 +2931,10 @@ impl GpuGemma4 {
                             &mut sc.pf_k,
                             r,
                         )?,
-                        // bf16 k: no int8 rung, its own dispatch serves
-                        None => lw.wk.gemm(exec, &sc.pf_normed, &mut sc.pf_k, r)?,
+                        // bf16 / k-quant k: no Q8 rung, its own dispatch serves
+                        None => lw
+                            .wk
+                            .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?,
                     }
                     match &lw.wv {
                         Some(wv) => match wv.q8() {
@@ -2873,24 +2946,37 @@ impl GpuGemma4 {
                                 &mut sc.pf_v,
                                 r,
                             )?,
-                            None => wv.gemm(exec, &sc.pf_normed, &mut sc.pf_v, r)?,
+                            None => wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?,
                         },
                         None => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                     }
-                } else {
+                } else if let Some(wq8) = lw.wq.q8() {
                     exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
-                    pf_mmq(exec, &lw.wq, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_q, r)?;
+                    pf_mmq(exec, wq8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_q, r)?;
                     match lw.wk.q8() {
                         Some(wk) => pf_mmq(exec, wk, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_k, r)?,
-                        None => lw.wk.gemm(exec, &sc.pf_normed, &mut sc.pf_k, r)?,
+                        None => lw
+                            .wk
+                            .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?,
                     }
                     match &lw.wv {
                         Some(wv) => match wv.q8() {
                             Some(v8) => {
                                 pf_mmq(exec, v8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_v, r)?
                             }
-                            None => wv.gemm(exec, &sc.pf_normed, &mut sc.pf_v, r)?,
+                            None => wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?,
                         },
+                        None => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
+                    }
+                } else {
+                    // a k-quant q plane: every segment on its own class -
+                    // the W4A8 ladder (planes.rs) picks the rung per r
+                    lw.wq
+                        .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_q, r)?;
+                    lw.wk
+                        .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_k, r)?;
+                    match &lw.wv {
+                        Some(wv) => wv.gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_v, r)?,
                         None => exec.copy_slice(&sc.pf_k, 0, r * kv_dim, &mut sc.pf_v)?,
                     }
                 }
@@ -3570,13 +3656,13 @@ impl GpuGemma4 {
                 }
             }
 
-            let n_ff = lw.ffn_gate.dims[1];
+            let n_ff = lw.ffn_gate.dims()[1];
             // F8R: the whole FFN rides e4m3 - gemv at r==1 (f32 x, no
             // activation quant), mma_ks twin 2..=31, TMA GEMM from 32 (the
             // q8 trio is stubs in this mode). e4m3 class, quality-gated.
             let f8r = (lw.f8_gate.is_some() || lw.f8_gu.is_some())
-                && matches!(lw.ffn_gate.dims.len(), 2)
-                && lw.ffn_gate.data.len() <= 32;
+                && matches!(lw.ffn_gate.dims().len(), 2)
+                && lw.ffn_gate.q8_len() <= 32;
             // FFN arm selection (plane unification): one decision the
             // gate/up chain, the norm-fusion flags, and the down-skip guard
             // all share - the old scattered r-band guards drifted. f8w arms
@@ -3584,14 +3670,14 @@ impl GpuGemma4 {
             // otherwise); the f8t arm covers every band through the launcher
             // (tc5p <=64 / tc5r 65+), including r==1 once the q8 originals
             // are reclaim-stubbed.
-            let ffn_f8w_r1 = !f8r && r == 1 && lw.ffn_gate.data.len() <= 48 && lw.f8_gate.is_some();
+            let ffn_f8w_r1 = !f8r && r == 1 && lw.ffn_gate.q8_len() <= 48 && lw.f8_gate.is_some();
             let ffn_f8w_pf = !f8r && r >= 65 && lw.f8w_wq.is_some() && lw.f8_gate.is_some();
             let ffn_f8row_pf = !f8r && !ffn_f8w_pf && r >= 65 && lw.f8r_gate.is_some();
             let ffn_f8t = !f8r
                 && !ffn_f8w_r1
                 && !ffn_f8w_pf
                 && !ffn_f8row_pf
-                && (r > 1 || lw.ffn_gate.data.len() <= 48)
+                && (r > 1 || lw.ffn_gate.q8_len() <= 48)
                 && (lw.f8t_gu.is_some() || lw.f8t_gate.is_some());
             // Two fused rmsnorm->e4m3 paths, mutually exclusive by FFN arm
             // (mirrors the attn band): the f8r batch kernel (r>1) and the
@@ -3653,7 +3739,7 @@ impl GpuGemma4 {
                         // exactly, so the deferred post always finds its
                         // fused consumer
                         && (r > 1
-                            || (nl.wq.data.len() == 48
+                            || (nl.wq.is_stub()
                                 && nl.f8w_wq.is_none()
                                 && nl.f8t_qkv.is_some()))
                 };
@@ -3739,7 +3825,7 @@ impl GpuGemma4 {
                     f8a_mm!(exec, sc, o8w, &mut sc.pf_proj, hp.n_head * hd, hp.n_embd, r);
                 }
             } else if r == 1
-                && lw.wo.data.len() == 48
+                && lw.wo.is_stub()
                 && let Some(wo8) = &lw.f8w_wo
             {
                 // Q8-reclaim + KEEP_F8W: stubbed original -> f8w gemv
@@ -3751,8 +3837,9 @@ impl GpuGemma4 {
                     hp.n_head * hd,
                     hp.n_embd,
                 )?;
-            } else if r == 1 && lw.wo.data.len() > 48 {
-                exec.q8_0_gemm_repacked(&lw.wo, None, &sc.pf_attn, &mut sc.pf_proj, r)?;
+            } else if r == 1 && !lw.wo.is_stub() {
+                lw.wo
+                    .gemm(exec, kq_rows!(sc), &sc.pf_attn, &mut sc.pf_proj, r)?;
             } else if r >= 65
                 && let Some(wo8) = &lw.f8w_wo
             {
@@ -3834,7 +3921,9 @@ impl GpuGemma4 {
                     hp.n_embd,
                     r,
                 )?;
-            } else if r <= 192 {
+            } else if r <= 192
+                && let Some(wo8) = lw.wo.q8()
+            {
                 exec.quantize_q8(
                     &sc.pf_attn,
                     &mut sc.pf_xq,
@@ -3842,23 +3931,19 @@ impl GpuGemma4 {
                     r * hp.n_head * hd,
                 )?;
                 exec.q8_0_gemm_mma_ks(
-                    &lw.wo,
+                    wo8,
                     &sc.pf_xq,
                     &sc.pf_xs,
                     &mut sc.pf_skfix,
                     &mut sc.pf_proj,
                     r,
                 )?;
-            } else {
+            } else if let Some(wo8) = lw.wo.q8() {
                 exec.quantize_q8_mmq(&sc.pf_attn, &mut sc.pf_yq, hp.n_head * hd, r)?;
-                pf_mmq(
-                    exec,
-                    &lw.wo,
-                    &sc.pf_yq,
-                    &mut sc.pf_skfix,
-                    &mut sc.pf_proj,
-                    r,
-                )?;
+                pf_mmq(exec, wo8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_proj, r)?;
+            } else {
+                lw.wo
+                    .gemm(exec, kq_rows!(sc), &sc.pf_attn, &mut sc.pf_proj, r)?;
             }
             // x = x + rmsnorm(proj)·w  (attention half: scale 1) - fused
             // with the FFN pre-norm + row quant on the nqf_row_ffn arm
@@ -4583,11 +4668,7 @@ impl GpuGemma4 {
                     hp.n_embd,
                     r,
                 )?;
-            } else if r == 1
-                && lw.ffn_gate.data.len() > 48
-                && lw.ffn_up.data.len() > 48
-                && !r1_gu_off()
-            {
+            } else if r == 1 && !lw.ffn_gate.is_stub() && !lw.ffn_up.is_stub() && !r1_gu_off() {
                 // One row: mma_ks fills 1 of its 16 MMA rows, so it streams the
                 // plane at 579 GB/s where the plain repacked GEMM does 692 on
                 // the identical 141 MB plane (measured on sm_86). `ffn_down`
@@ -4601,13 +4682,17 @@ impl GpuGemma4 {
                 // thing making batch-r1 and dense-r1 numerically different
                 // here. (Kept the mma arm reachable via PADDOCK_G4_NO_R1GU for
                 // A/B work; it stays the right rung the moment r > 1.)
-                exec.q8_0_gemm_repacked(&lw.ffn_gate, None, &sc.pf_normed, &mut sc.pf_gate, r)?;
-                exec.q8_0_gemm_repacked(&lw.ffn_up, None, &sc.pf_normed, &mut sc.pf_up, r)?;
+                lw.ffn_gate
+                    .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_gate, r)?;
+                lw.ffn_up
+                    .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_up, r)?;
                 exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
-            } else if r <= 192 {
+            } else if r <= 192
+                && let (Some(g8), Some(u8_)) = (lw.ffn_gate.q8(), lw.ffn_up.q8())
+            {
                 exec.quantize_q8(&sc.pf_normed, &mut sc.pf_xq, &mut sc.pf_xs, r * hp.n_embd)?;
                 exec.q8_0_gemm_mma_ks(
-                    &lw.ffn_gate,
+                    g8,
                     &sc.pf_xq,
                     &sc.pf_xs,
                     &mut sc.pf_skfix,
@@ -4615,7 +4700,7 @@ impl GpuGemma4 {
                     r,
                 )?;
                 exec.q8_0_gemm_mma_ks(
-                    &lw.ffn_up,
+                    u8_,
                     &sc.pf_xq,
                     &sc.pf_xs,
                     &mut sc.pf_skfix,
@@ -4623,24 +4708,19 @@ impl GpuGemma4 {
                     r,
                 )?;
                 exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
-            } else {
+            } else if let (Some(g8), Some(u8_)) = (lw.ffn_gate.q8(), lw.ffn_up.q8()) {
                 exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
-                pf_mmq(
-                    exec,
-                    &lw.ffn_gate,
-                    &sc.pf_yq,
-                    &mut sc.pf_skfix,
-                    &mut sc.pf_gate,
-                    r,
-                )?;
-                pf_mmq(
-                    exec,
-                    &lw.ffn_up,
-                    &sc.pf_yq,
-                    &mut sc.pf_skfix,
-                    &mut sc.pf_up,
-                    r,
-                )?;
+                pf_mmq(exec, g8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_gate, r)?;
+                pf_mmq(exec, u8_, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_up, r)?;
+                exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
+            } else {
+                // k-quant gate/up: the W4A8 ladder per plane (r == 1 stages
+                // the row twice here; the dense decode walk in forward.rs
+                // is the c1 path and merges the pair into one launch)
+                lw.ffn_gate
+                    .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_gate, r)?;
+                lw.ffn_up
+                    .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_up, r)?;
                 exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
             }
             if f8r || ffn_f8w_pf || ffn_f8row_pf || ffn_f8t {
@@ -4655,28 +4735,27 @@ impl GpuGemma4 {
                     n_ff,
                     hp.n_embd,
                 )?;
-            } else if r == 1 && lw.ffn_down.data.len() > 48 {
-                exec.q8_0_gemm_repacked(&lw.ffn_down, None, &sc.pf_gate, &mut sc.pf_proj, r)?;
-            } else if r <= 192 {
+            } else if r == 1 && !lw.ffn_down.is_stub() {
+                lw.ffn_down
+                    .gemm(exec, kq_rows!(sc), &sc.pf_gate, &mut sc.pf_proj, r)?;
+            } else if r <= 192
+                && let Some(d8) = lw.ffn_down.q8()
+            {
                 exec.quantize_q8(&sc.pf_gate, &mut sc.pf_xq, &mut sc.pf_xs, r * n_ff)?;
                 exec.q8_0_gemm_mma_ks(
-                    &lw.ffn_down,
+                    d8,
                     &sc.pf_xq,
                     &sc.pf_xs,
                     &mut sc.pf_skfix,
                     &mut sc.pf_proj,
                     r,
                 )?;
-            } else {
+            } else if let Some(d8) = lw.ffn_down.q8() {
                 exec.quantize_q8_mmq(&sc.pf_gate, &mut sc.pf_yq, n_ff, r)?;
-                pf_mmq(
-                    exec,
-                    &lw.ffn_down,
-                    &sc.pf_yq,
-                    &mut sc.pf_skfix,
-                    &mut sc.pf_proj,
-                    r,
-                )?;
+                pf_mmq(exec, d8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_proj, r)?;
+            } else {
+                lw.ffn_down
+                    .gemm(exec, kq_rows!(sc), &sc.pf_gate, &mut sc.pf_proj, r)?;
             }
             // x = (x + rmsnorm(proj)·w) · layer_output_scale - deferred into
             // the next layer's fused attn pre-norm when it can consume it
@@ -4803,7 +4882,8 @@ impl GpuGemma4 {
             // repacked Q8 plane, so the whole r-ladder collapses to the
             // plane's own dispatch. The f8t twin is what puts this band back
             // on the tile route - see head_f8t's note in the loader.
-            self.head.gemm(exec, &sc.pf_normed, logits_dev, r)?;
+            self.head
+                .gemm(exec, kq_rows!(sc), &sc.pf_normed, logits_dev, r)?;
         }
         Ok(())
     }
@@ -5125,16 +5205,22 @@ impl GpuGemma4 {
         if self.chunked.len() >= crate::service::max_chunks_inflight() {
             return Err(GpuError::Driver("chunked prefill queue is full".into()));
         }
-        self.chunked.push(ChunkedPrefill { slot, tokens });
+        self.chunked.push(super::chunked::ChunkedPrefill {
+            slot,
+            tokens,
+            start: None,
+            cursor: 0,
+        });
         Ok(())
     }
 
-    /// One MIXED tick: advance the chunk queue by ~`budget` rows (whole
-    /// prompts, FIFO, always at least one - the existing coalesced batch
-    /// pass does the work, prefix resume included), then run the live decode
-    /// rows as a compacted slot-explicit sampled tick. Two weight-amortized
-    /// passes; first tokens stagger out of the cohort instead of waiting for
-    /// all of it.
+    /// One MIXED tick: advance the chunk queue by ~`budget` rows (the
+    /// chunked.rs tick rules: whole prompts FIFO, a prompt longer than the
+    /// budget one bounded span - the coalesced batch pass does the work,
+    /// prefix resume included), then run the live decode rows as a
+    /// compacted slot-explicit sampled tick. Two weight-amortized passes;
+    /// first tokens stagger out of the cohort instead of waiting for all of
+    /// it.
     pub(crate) fn forward_mixed_sampled_impl(
         &mut self,
         decodes: &[(usize, u32, u32)],
@@ -5154,30 +5240,20 @@ impl GpuGemma4 {
             None => budget,
         }
         .clamp(1, mixed_tick_rows());
-        let mut batch: Vec<(usize, Vec<u32>)> = Vec::new();
-        let mut used = 0usize;
         // PEEK, don't drain: the queue commits only once the chunk pass
-        // succeeds (`self.chunked.drain(..batch.len())` at the success
-        // point) - same contract as the unified/spec sites. The earlier
-        // conversion MISSED this site's loop while adding its post-success
-        // drain: the destructive remove(0) + drain double-consumed the
-        // queue, silently deleting the next queued prompt(s) whenever two
-        // multi-chunk cold prefills were queued together - the deleted
-        // slot then decoded over unwritten KV (garbage output, illegal
-        // address, poisoned server). Only greedy/non-spec serving routes
-        // here (unified_ok covers the spec default), which is why every
-        // temperature-0.7 bench missed it.
+        // succeeds (`chunk_commit` at the success point) - same contract as
+        // the unified/spec sites. The earlier conversion MISSED this site's
+        // loop while adding its post-success drain: the destructive
+        // remove(0) + drain double-consumed the queue, silently deleting the
+        // next queued prompt(s) whenever two multi-chunk cold prefills were
+        // queued together - the deleted slot then decoded over unwritten KV
+        // (garbage output, illegal address, poisoned server). Only
+        // greedy/non-spec serving routes here (unified_ok covers the spec
+        // default), which is why every temperature-0.7 bench missed it.
         // Cap rule unchanged: stop before exceeding the cap (always take
         // at least one) - an overshooting batch splits into a full chunk
         // + a small tail chunk on the sub-1024 mmq rung.
-        for c in self.chunked.iter() {
-            let next = c.tokens.len();
-            if used > 0 && used + next > cap {
-                break;
-            }
-            used += next;
-            batch.push((c.slot, c.tokens.clone()));
-        }
+        let batch = self.chunk_pick(budget, cap)?;
         //  lever-sizing (PADDOCK_MIXTIME): host-wall the two SPLIT-path
         // forwards separately so the c32 tail-attribution aggregate can size
         // stream-overlap's ceiling. Both calls end in a readback (logits d2h /
@@ -5185,18 +5261,20 @@ impl GpuGemma4 {
         // exactly the serialization overlap would hide. pf_us=0 marks a pure
         // decode tick. Zero behaviour change: gated, times only, no reorder.
         let mixtime = paddock_models::dev_var_os!("PADDOCK_MIXTIME").is_some();
-        let pf_rows = used;
+        let pf_rows: usize = batch.iter().map(|sh| sh.to - sh.from).sum();
         let mut pf_us: u128 = 0;
         let mut finished = Vec::new();
         if !batch.is_empty() {
             let t = mixtime.then(std::time::Instant::now);
-            let outs = self.forward_prefill_batch_impl(&batch)?;
+            let outs = self.forward_prefill_shares(&batch)?;
             if let Some(t) = t {
                 pf_us = t.elapsed().as_micros();
             }
-            self.chunked.drain(..batch.len());
-            for ((slot, toks), logits) in batch.iter().zip(outs) {
-                finished.push((*slot, logits, toks.len()));
+            self.chunk_commit(&batch);
+            for (sh, logits) in batch.iter().zip(outs) {
+                if sh.finishes() {
+                    finished.push((sh.slot, logits, sh.tokens.len()));
+                }
             }
         }
         if decodes.is_empty() {
@@ -5313,22 +5391,16 @@ impl GpuGemma4 {
         let row_plans: Vec<RowSample> = plans.iter().map(|p| RowSample::Device(*p)).collect();
         // prompt chunk drain (the unified rules)
         let cap = budget.clamp(1, mixed_tick_rows());
-        let mut batch: Vec<(usize, Vec<u32>)> = Vec::new();
-        let mut used = 0usize;
         // PEEK, don't drain: the queue commits only once the chunk pass
-        // succeeds (`self.chunked.drain(..batch.len())` at the success
-        // point). The old destructive take lost these entries when the pass
-        // hit PoolExhausted - the scheduler's `chunking` set then pointed at
-        // slots this queue no longer held, and the serve spun forever on
-        // no-op mixed ticks (found live as a wide-batch wedge).
-        for c in self.chunked.iter() {
-            let next = c.tokens.len();
-            if used > 0 && used + next > cap {
-                break;
-            }
-            used += next;
-            batch.push((c.slot, c.tokens.clone()));
-        }
+        // succeeds (`chunk_commit` in the wait half). The old destructive
+        // take lost these entries when the pass hit PoolExhausted - the
+        // scheduler's `chunking` set then pointed at slots this queue no
+        // longer held, and the serve spun forever on no-op mixed ticks
+        // (found live as a wide-batch wedge). The pick runs each picked
+        // prompt's admission prologue (fresh-sequence clear + prefix adopt +
+        // pool grow).
+        let t_adm = std::time::Instant::now();
+        let batch = self.chunk_pick(budget, cap)?;
         if batch.is_empty() {
             // nothing chunking after all - the pure (graph-captured) verify
             let picks = self.forward_spec_rows_impl(reqs, &row_plans)?;
@@ -5369,18 +5441,6 @@ impl GpuGemma4 {
             row_plans
         };
         let n_embd = self.hp.n_embd;
-        let t_adm = std::time::Instant::now();
-        let mut starts = Vec::with_capacity(batch.len());
-        for (slot, toks) in &batch {
-            assert!(
-                *slot < self.n_slots,
-                "slot {slot} >= enabled {}",
-                self.n_slots
-            );
-            self.gpool_clear_slot(*slot);
-            starts.push(self.prefix_resume(*slot, toks)?);
-            self.ensure_global_rows(&[*slot as u32], &[(toks.len() - 1) as u32])?;
-        }
         if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
             let ms = t_adm.elapsed().as_secs_f64() * 1e3;
             if ms > 1.0 {
@@ -5406,12 +5466,15 @@ impl GpuGemma4 {
                 rows.push((*slot as u32, (*start + i) as u32, t, usize::MAX));
             }
         }
-        let mut last_row = vec![0usize; batch.len()];
-        for (it, ((slot, toks), &start)) in batch.iter().zip(&starts).enumerate() {
-            for (j, &t) in toks[start..].iter().enumerate() {
-                rows.push((*slot as u32, (start + j) as u32, t, it));
+        // usize::MAX = no finishing row (a spanning share)
+        let mut last_row = vec![usize::MAX; batch.len()];
+        for (it, sh) in batch.iter().enumerate() {
+            for p in sh.from..sh.to {
+                rows.push((sh.slot as u32, p as u32, sh.tokens[p], it));
             }
-            last_row[it] = rows.len() - 1;
+            if sh.finishes() {
+                last_row[it] = rows.len() - 1;
+            }
         }
         let _row_bytes = (n_embd / 32) * 34;
         // verify-fold rung A: when every slot's verify chunk is
@@ -5547,8 +5610,8 @@ impl GpuGemma4 {
                         rr,
                     )?;
                 }
-                self.exec.embed_gather_plane(
-                    &self.token_embd,
+                EmbdTable::of(&self.token_embd, &self.head).gather(
+                    &self.exec,
                     &sc.pf_toks,
                     &mut sc.pf_x,
                     n_embd,
@@ -5582,7 +5645,7 @@ impl GpuGemma4 {
                         self.logits_head_stage(lr - base, it)?;
                         fin_staged[it] = true;
                         fin_dev[it] = fin_plans.iter().find_map(|&(s2, p)| {
-                            (s2 == batch[it].0)
+                            (s2 == batch[it].slot)
                                 .then_some(match p {
                                     crate::generator::RowSample::Device(d) => Some(d),
                                     _ => None,
@@ -5689,9 +5752,9 @@ impl GpuGemma4 {
         // cache the finished prompts (direct ring->pool checkpoint + zero-copy
         // radix insert)
         let t_ins = std::time::Instant::now();
-        for (it, (slot, toks)) in batch.iter().enumerate() {
-            let cut = self.prefix_cut(toks.len(), starts[it]);
-            self.prefix_insert(*slot, toks, cut)?;
+        for sh in batch.iter().filter(|sh| sh.finishes()) {
+            let cut = self.prefix_cut(sh.tokens.len(), sh.start);
+            self.prefix_insert(sh.slot, &sh.tokens, cut)?;
         }
         if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
             let ms = t_ins.elapsed().as_secs_f64() * 1e3;
@@ -5885,19 +5948,20 @@ impl GpuGemma4 {
         } else {
             Vec::new()
         };
-        self.chunked.drain(..batch.len());
+        self.chunk_commit(&batch);
         use crate::generator::FinishSample;
         let finished = batch
             .into_iter()
             .zip(out)
             .enumerate()
-            .map(|(it, ((slot, toks), logits))| {
+            .filter(|(_, (sh, _))| sh.finishes())
+            .map(|(it, (sh, logits))| {
                 let fs = if fin_dev.get(it).copied().flatten().is_some() {
                     FinishSample::Sampled(fin_ids[it])
                 } else {
                     FinishSample::Logits(logits)
                 };
-                (slot, fs, toks.len())
+                (sh.slot, fs, sh.tokens.len())
             })
             .collect();
         // padded rounds: compact picks back to the service's RAW chunk
@@ -5939,24 +6003,18 @@ impl GpuGemma4 {
     ) -> Result<(crate::generator::SampledStep, Vec<(usize, Vec<f32>, usize)>), GpuError> {
         use crate::generator::SampledStep;
         assert_eq!(plans.len(), decodes.len(), "one plan per decode row");
-        // same whole-prompt tick budget as the mixed path
+        // same tick rules as the mixed path (chunked.rs)
         let cap = budget.clamp(1, mixed_tick_rows());
-        let mut batch: Vec<(usize, Vec<u32>)> = Vec::new();
-        let mut used = 0usize;
         // PEEK, don't drain: the queue commits only once the chunk pass
-        // succeeds (`self.chunked.drain(..batch.len())` at the success
-        // point). The old destructive take lost these entries when the pass
-        // hit PoolExhausted - the scheduler's `chunking` set then pointed at
+        // succeeds (`chunk_commit` at the success point). The old
+        // destructive take lost these entries when the pass hit
+        // PoolExhausted - the scheduler's `chunking` set then pointed at
         // slots this queue no longer held, and the serve spun forever on
-        // no-op mixed ticks (found live as a wide-batch wedge).
-        for c in self.chunked.iter() {
-            let next = c.tokens.len();
-            if used > 0 && used + next > cap {
-                break;
-            }
-            used += next;
-            batch.push((c.slot, c.tokens.clone()));
-        }
+        // no-op mixed ticks (found live as a wide-batch wedge). The pick
+        // runs each picked prompt's admission prologue (fresh-sequence
+        // clear + prefix adopt + pool grow).
+        let t_adm = std::time::Instant::now();
+        let batch = self.chunk_pick(budget, cap)?;
         // degenerate ticks keep their specialized fast paths (graph replay
         // for pure decode; the plain coalesced pass for pure prefill)
         if batch.is_empty() {
@@ -5967,12 +6025,13 @@ impl GpuGemma4 {
             return Ok((step, Vec::new()));
         }
         if decodes.is_empty() {
-            let outs = self.forward_prefill_batch_impl(&batch)?;
-            self.chunked.drain(..batch.len());
+            let outs = self.forward_prefill_shares(&batch)?;
+            self.chunk_commit(&batch);
             let finished = batch
                 .iter()
                 .zip(outs)
-                .map(|((slot, toks), logits)| (*slot, logits, toks.len()))
+                .filter(|(sh, _)| sh.finishes())
+                .map(|(sh, logits)| (sh.slot, logits, sh.tokens.len()))
                 .collect();
             return Ok((
                 SampledStep {
@@ -5985,19 +6044,6 @@ impl GpuGemma4 {
 
         let nd = decodes.len();
         let n_embd = self.hp.n_embd;
-        // prompt admission: fresh-sequence clear + prefix adopt + pool grow
-        let t_adm = std::time::Instant::now();
-        let mut starts = Vec::with_capacity(batch.len());
-        for (slot, toks) in &batch {
-            assert!(
-                *slot < self.n_slots,
-                "slot {slot} >= enabled {}",
-                self.n_slots
-            );
-            self.gpool_clear_slot(*slot);
-            starts.push(self.prefix_resume(*slot, toks)?);
-            self.ensure_global_rows(&[*slot as u32], &[(toks.len() - 1) as u32])?;
-        }
         if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
             let ms = t_adm.elapsed().as_secs_f64() * 1e3;
             if ms > 1.0 {
@@ -6016,12 +6062,15 @@ impl GpuGemma4 {
             .iter()
             .map(|&(slot, tok, pos)| (slot as u32, pos, tok, usize::MAX))
             .collect();
-        let mut last_row = vec![0usize; batch.len()];
-        for (it, ((slot, toks), &start)) in batch.iter().zip(&starts).enumerate() {
-            for (j, &t) in toks[start..].iter().enumerate() {
-                rows.push((*slot as u32, (start + j) as u32, t, it));
+        // usize::MAX = no finishing row (a spanning share)
+        let mut last_row = vec![usize::MAX; batch.len()];
+        for (it, sh) in batch.iter().enumerate() {
+            for p in sh.from..sh.to {
+                rows.push((sh.slot as u32, p as u32, sh.tokens[p], it));
             }
-            last_row[it] = rows.len() - 1;
+            if sh.finishes() {
+                last_row[it] = rows.len() - 1;
+            }
         }
 
         let _row_bytes = (n_embd / 32) * 34;
@@ -6072,8 +6121,8 @@ impl GpuGemma4 {
                     .stream
                     .memcpy_htod(&toks, &mut v)
                     .map_err(|e| GpuError::Driver(e.to_string()))?;
-                self.exec.embed_gather_plane(
-                    &self.token_embd,
+                EmbdTable::of(&self.token_embd, &self.head).gather(
+                    &self.exec,
                     &sc.pf_toks,
                     &mut sc.pf_x,
                     n_embd,
@@ -6121,9 +6170,9 @@ impl GpuGemma4 {
         // cache the finished prompts (direct ring->pool checkpoint + zero-copy
         // radix insert)
         let t_ins = std::time::Instant::now();
-        for (it, (slot, toks)) in batch.iter().enumerate() {
-            let cut = self.prefix_cut(toks.len(), starts[it]);
-            self.prefix_insert(*slot, toks, cut)?;
+        for sh in batch.iter().filter(|sh| sh.finishes()) {
+            let cut = self.prefix_cut(sh.tokens.len(), sh.start);
+            self.prefix_insert(sh.slot, &sh.tokens, cut)?;
         }
         if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some() {
             let ms = t_ins.elapsed().as_secs_f64() * 1e3;
@@ -6148,11 +6197,12 @@ impl GpuGemma4 {
                 out[it] = l;
             }
         }
-        self.chunked.drain(..batch.len());
+        self.chunk_commit(&batch);
         let finished = batch
             .into_iter()
             .zip(out)
-            .map(|((slot, toks), logits)| (slot, logits, toks.len()))
+            .filter(|(sh, _)| sh.finishes())
+            .map(|(sh, logits)| (sh.slot, logits, sh.tokens.len()))
             .collect();
         Ok((step.expect("chunk 0 carries the decode rows"), finished))
     }
@@ -6247,7 +6297,9 @@ impl GpuGemma4 {
                         pf_mmq(&exec, hq, &sc.pf_yq, &mut sc.pf_skfix, logits_dev, nd)?;
                     }
                     // bf16 head: no int8 rung applies (see the decode head)
-                    None => self.head.gemm(&exec, &sc.pf_normed, logits_dev, nd)?,
+                    None => self
+                        .head
+                        .gemm(&exec, kq_rows!(sc), &sc.pf_normed, logits_dev, nd)?,
                 }
             }
             super::logit_epilogue_dev(&exec, logits_dev, nd * vocab, lscale, cap)?;
@@ -6656,170 +6708,328 @@ pub(super) fn g4_moe_tail(
     if sc.moe_uniq_dev != 0 {
         exec.moe_uniq_hist(&sc.moe_idx, r * k, hp.n_expert, sc.moe_uniq_dev)?;
     }
-    // Sorted (moe_align) vs token-batched: sorted reads each touched
-    // expert's weights once per pass; token-batched re-reads routed rows per
-    // token (the qwen bring-up measured 0.18x llama at prefill on exactly
-    // that). Boundary default = qwen's measured mma crossover (128 pairs);
-    // PADDOCK_QMOE_SORTED_MIN retunes, PADDOCK_NO_SORTED_QMOE pins
-    // token-batched for A/B. BM=64 (wider prefill block) engages on the
-    // same fill heuristic as qwen (only pays when blocks populate).
-    let sorted_min: usize = std::env::var("PADDOCK_QMOE_SORTED_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128);
-    let sorted = r * k >= sorted_min
-        && exec.has_q8_moe_geglu_sorted()
-        && paddock_models::dev_var_os!("PADDOCK_NO_SORTED_QMOE").is_none();
-    // tcgen05 e4m3 expert lane (a4b-expert-tcgen05.md): the sorted layout at
-    // BM=128 (a block is a tc5 Y tile) over the fused/K-padded f8 planes.
-    // Engages only at prefill-scale pair counts - the 128-row blocks are
-    // mostly PAD below that (the sorted-min=1 falsification, amplified).
-    // PADDOCK_MOE_F8_MIN retunes; PADDOCK_NO_MOE_F8_RUN pins the s8 route.
-    // The boundary was swept: 64 regresses badly (PAD overhead on
-    // pure-decode 64-pair ticks vs dec2) and 512 wins every config, so
-    // mixed ticks from ~512 pairs ride tc5 and pure decode keeps the dec2
-    // pair.
-    let f8_min: usize = paddock_models::dev_var!("PADDOCK_MOE_F8_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
-    // v2 ring-pair band routing: at
-    // verify-scale pair counts the exact-class sorted v2 pair beats the
-    // e4m3 f8s band outright (kbench uni:128 = 1024 pairs: v2 gu+dn 228.9us
-    // vs f8s 418.5 + its quantize/gather interstitials), so ticks up to
-    // PADDOCK_QMMA2_MAX pairs (default 2048; uni:256 priced the boundary)
-    // stay on the sorted route. PADDOCK_NO_MOE_QMMA2 restores the f8s band
-    // (one-env A/B, same switch as the pair itself).
-    let qmma2_max: usize = paddock_models::dev_var!("PADDOCK_QMMA2_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        // 4096 (was 2048): kbench uni:512 = 4096 pairs has v2 at 315.2us vs
-        // f8s 448.8 + interstitials; uni:1024 (8192) is a wash - and 8192 is
-        // exactly the bm=64 election edge, so the bound stays below it.
-        .unwrap_or(4096);
-    let qmma2_route = exec.has_q8_moe_qmma2()
-        && hp.n_embd.is_multiple_of(256)
-        && ff % 64 == 0
-        && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none();
-    let f8s = r * k >= f8_min
-        && !(qmma2_route && r * k <= qmma2_max)
-        && moe.gu_f8.is_some()
-        && exec.has_f8bs_moe()
-        && paddock_models::dev_var_os!("PADDOCK_NO_MOE_F8_RUN").is_none();
-    // decode-band f8 shapes - OPT-IN (PADDOCK_MOE_F8D=1) until the serve
-    // gates arbitrate. Profiling the f8_min=64 arm showed the M=128 gu
-    // already beat dec2 at decode (55 vs 71us) and the chain lost on the
-    // dn geometry (81us) + worst-case-srp interstitials (41us); this band
-    // reruns the tc5 pipe at BM=32 with the Y-resident dn and PAD-aware
-    // geglu. e4m3-expert numeric class (same as the >=512 default band).
-    // PADDOCK_MOE_F8D_MIN sets the lower edge (default 8 = everything).
-    let f8d_min: usize = paddock_models::dev_var!("PADDOCK_MOE_F8D_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    let f8d = !f8s
-        && r * k >= f8d_min
-        && moe.gu_f8.is_some()
-        && exec.has_f8d_moe()
-        && paddock_models::dev_var_os!("PADDOCK_MOE_F8D").is_some()
-        && paddock_models::dev_var_os!("PADDOCK_NO_MOE_F8_RUN").is_none();
-    if f8s {
-        let bm = 128usize;
-        let mb = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm);
-        let srp = mb * bm;
-        let ffp = ff.next_multiple_of(128);
-        {
-            // pre2-normed f32 rows: the fused head lands them in moe_out
-            let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
-            exec.quantize_e4m3(pn, &mut sc.moe_e4q, &mut sc.moe_e4s, r * hp.n_embd)?;
+    // The expert planes' class picks the whole expert path: k-quant seats
+    // take their own two-band routine (planes.rs), the Q8 trio the ladder
+    // of arms below.
+    match &moe.experts {
+        ExpertPlanes::Kq { gate, up, down } => {
+            planes::g4_moe_experts_kq(exec, sc, hp, gate, up, down, r)?;
         }
-        exec.moe_align_bm(
-            &sc.moe_idx,
-            &mut sc.moe_srow,
-            &mut sc.moe_sslot,
-            &mut sc.moe_bexp,
-            r,
-            k,
-            hp.n_expert,
-            bm,
-            mb,
-        )?;
-        exec.moe_gather_e4m3(
-            &sc.moe_e4q,
-            &sc.moe_e4s,
-            &sc.moe_srow,
-            &mut sc.moe_xg,
-            &mut sc.moe_sg,
-            hp.n_embd,
-            srp,
-        )?;
-        exec.f8bs_moe_gemm_gu(
-            moe.gu_f8.as_ref().expect("checked by f8s"),
-            &sc.moe_xg,
-            &sc.moe_sg,
-            &sc.moe_bexp,
-            &mut sc.moe_gu,
-            hp.n_embd,
-            2 * ff,
-            hp.n_expert,
-            srp,
-            mb,
-        )?;
-        // prefill dn hybrid (slots 489/490): at every measured width the
-        // BM=128 tc5 down loses to the v2 BM=32 down (uni:1024 8192p: 424
-        // vs 213us), so the f8s-gu f32 output is GEGLU-quantized to q8
-        // STRAIGHT into bm32 rows (pair map) and the v2 down runs the
-        // band. fq moves e4m3 -> q8 (finer); PPL_PREFIX=2048 + the serve
-        // cells gate it. PADDOCK_NO_PF_HYBRID restores the tc5 down.
-        let hybrid = exec.has_pf_dn_hybrid()
-            && exec.has_q8_moe_qmma2()
-            && ff % 64 == 0
-            && paddock_models::dev_var_os!("PADDOCK_NO_PF_HYBRID").is_none();
-        if hybrid {
-            let mb32 = (r * k + hp.n_expert * 31).div_ceil(32);
-            exec.moe_align(
-                &sc.moe_idx,
-                &mut sc.moe_srow2,
-                &mut sc.moe_sslot2,
-                &mut sc.moe_bexp2,
-                r,
-                k,
-                hp.n_expert,
-                mb32,
-            )?;
-            exec.moe_pair_map(
-                &sc.moe_srow2,
-                &sc.moe_sslot2,
-                &mut sc.moe_pairmap,
-                k,
-                mb32 * 32,
-            )?;
-            exec.quantize_q8_geglu_remap(
-                &sc.moe_gu,
-                &sc.moe_srow,
-                &sc.moe_sslot,
-                &sc.moe_pairmap,
-                &mut sc.moe_fq,
-                &mut sc.moe_fs,
-                ff,
-                k,
-                srp,
-                0,
-            )?;
-            // DBG bisect: =1 exercises every hybrid WRITE (align2/map/remap)
-            // but keeps the old e4m3 + f8s down producing the output - an
-            // OOB write in the new kernels still corrupts, a v2-down issue
-            // does not.
-            if paddock_models::dev_var_os!("PADDOCK_PF_HYBRID_DBG").is_some() {
-                exec.quantize_e4m3_geglu2_pad(
+        ExpertPlanes::Q8 {
+            gate: gate_exps,
+            up: up_exps,
+            down: down_exps,
+        } => {
+            // Sorted (moe_align) vs token-batched: sorted reads each touched
+            // expert's weights once per pass; token-batched re-reads routed rows per
+            // token (the qwen bring-up measured 0.18x llama at prefill on exactly
+            // that). Boundary default = qwen's measured mma crossover (128 pairs);
+            // PADDOCK_QMOE_SORTED_MIN retunes, PADDOCK_NO_SORTED_QMOE pins
+            // token-batched for A/B. BM=64 (wider prefill block) engages on the
+            // same fill heuristic as qwen (only pays when blocks populate).
+            let sorted_min: usize = std::env::var("PADDOCK_QMOE_SORTED_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128);
+            let sorted = r * k >= sorted_min
+                && exec.has_q8_moe_geglu_sorted()
+                && paddock_models::dev_var_os!("PADDOCK_NO_SORTED_QMOE").is_none();
+            // tcgen05 e4m3 expert lane (a4b-expert-tcgen05.md): the sorted layout at
+            // BM=128 (a block is a tc5 Y tile) over the fused/K-padded f8 planes.
+            // Engages only at prefill-scale pair counts - the 128-row blocks are
+            // mostly PAD below that (the sorted-min=1 falsification, amplified).
+            // PADDOCK_MOE_F8_MIN retunes; PADDOCK_NO_MOE_F8_RUN pins the s8 route.
+            // The boundary was swept: 64 regresses badly (PAD overhead on
+            // pure-decode 64-pair ticks vs dec2) and 512 wins every config, so
+            // mixed ticks from ~512 pairs ride tc5 and pure decode keeps the dec2
+            // pair.
+            let f8_min: usize = paddock_models::dev_var!("PADDOCK_MOE_F8_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512);
+            // v2 ring-pair band routing: at
+            // verify-scale pair counts the exact-class sorted v2 pair beats the
+            // e4m3 f8s band outright (kbench uni:128 = 1024 pairs: v2 gu+dn 228.9us
+            // vs f8s 418.5 + its quantize/gather interstitials), so ticks up to
+            // PADDOCK_QMMA2_MAX pairs (default 2048; uni:256 priced the boundary)
+            // stay on the sorted route. PADDOCK_NO_MOE_QMMA2 restores the f8s band
+            // (one-env A/B, same switch as the pair itself).
+            let qmma2_max: usize = paddock_models::dev_var!("PADDOCK_QMMA2_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                // 4096 (was 2048): kbench uni:512 = 4096 pairs has v2 at 315.2us vs
+                // f8s 448.8 + interstitials; uni:1024 (8192) is a wash - and 8192 is
+                // exactly the bm=64 election edge, so the bound stays below it.
+                .unwrap_or(4096);
+            let qmma2_route = exec.has_q8_moe_qmma2()
+                && hp.n_embd.is_multiple_of(256)
+                && ff % 64 == 0
+                && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none();
+            let f8s = r * k >= f8_min
+                && !(qmma2_route && r * k <= qmma2_max)
+                && moe.gu_f8.is_some()
+                && exec.has_f8bs_moe()
+                && paddock_models::dev_var_os!("PADDOCK_NO_MOE_F8_RUN").is_none();
+            // decode-band f8 shapes - OPT-IN (PADDOCK_MOE_F8D=1) until the serve
+            // gates arbitrate. Profiling the f8_min=64 arm showed the M=128 gu
+            // already beat dec2 at decode (55 vs 71us) and the chain lost on the
+            // dn geometry (81us) + worst-case-srp interstitials (41us); this band
+            // reruns the tc5 pipe at BM=32 with the Y-resident dn and PAD-aware
+            // geglu. e4m3-expert numeric class (same as the >=512 default band).
+            // PADDOCK_MOE_F8D_MIN sets the lower edge (default 8 = everything).
+            let f8d_min: usize = paddock_models::dev_var!("PADDOCK_MOE_F8D_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8);
+            let f8d = !f8s
+                && r * k >= f8d_min
+                && moe.gu_f8.is_some()
+                && exec.has_f8d_moe()
+                && paddock_models::dev_var_os!("PADDOCK_MOE_F8D").is_some()
+                && paddock_models::dev_var_os!("PADDOCK_NO_MOE_F8_RUN").is_none();
+            if f8s {
+                let bm = 128usize;
+                let mb = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm);
+                let srp = mb * bm;
+                let ffp = ff.next_multiple_of(128);
+                {
+                    // pre2-normed f32 rows: the fused head lands them in moe_out
+                    let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
+                    exec.quantize_e4m3(pn, &mut sc.moe_e4q, &mut sc.moe_e4s, r * hp.n_embd)?;
+                }
+                exec.moe_align_bm(
+                    &sc.moe_idx,
+                    &mut sc.moe_srow,
+                    &mut sc.moe_sslot,
+                    &mut sc.moe_bexp,
+                    r,
+                    k,
+                    hp.n_expert,
+                    bm,
+                    mb,
+                )?;
+                exec.moe_gather_e4m3(
+                    &sc.moe_e4q,
+                    &sc.moe_e4s,
+                    &sc.moe_srow,
+                    &mut sc.moe_xg,
+                    &mut sc.moe_sg,
+                    hp.n_embd,
+                    srp,
+                )?;
+                exec.f8bs_moe_gemm_gu(
+                    moe.gu_f8.as_ref().expect("checked by f8s"),
+                    &sc.moe_xg,
+                    &sc.moe_sg,
+                    &sc.moe_bexp,
+                    &mut sc.moe_gu,
+                    hp.n_embd,
+                    2 * ff,
+                    hp.n_expert,
+                    srp,
+                    mb,
+                )?;
+                // prefill dn hybrid (slots 489/490): at every measured width the
+                // BM=128 tc5 down loses to the v2 BM=32 down (uni:1024 8192p: 424
+                // vs 213us), so the f8s-gu f32 output is GEGLU-quantized to q8
+                // STRAIGHT into bm32 rows (pair map) and the v2 down runs the
+                // band. fq moves e4m3 -> q8 (finer); PPL_PREFIX=2048 + the serve
+                // cells gate it. PADDOCK_NO_PF_HYBRID restores the tc5 down.
+                let hybrid = exec.has_pf_dn_hybrid()
+                    && exec.has_q8_moe_qmma2()
+                    && ff % 64 == 0
+                    && paddock_models::dev_var_os!("PADDOCK_NO_PF_HYBRID").is_none();
+                if hybrid {
+                    let mb32 = (r * k + hp.n_expert * 31).div_ceil(32);
+                    exec.moe_align(
+                        &sc.moe_idx,
+                        &mut sc.moe_srow2,
+                        &mut sc.moe_sslot2,
+                        &mut sc.moe_bexp2,
+                        r,
+                        k,
+                        hp.n_expert,
+                        mb32,
+                    )?;
+                    exec.moe_pair_map(
+                        &sc.moe_srow2,
+                        &sc.moe_sslot2,
+                        &mut sc.moe_pairmap,
+                        k,
+                        mb32 * 32,
+                    )?;
+                    exec.quantize_q8_geglu_remap(
+                        &sc.moe_gu,
+                        &sc.moe_srow,
+                        &sc.moe_sslot,
+                        &sc.moe_pairmap,
+                        &mut sc.moe_fq,
+                        &mut sc.moe_fs,
+                        ff,
+                        k,
+                        srp,
+                        0,
+                    )?;
+                    // DBG bisect: =1 exercises every hybrid WRITE (align2/map/remap)
+                    // but keeps the old e4m3 + f8s down producing the output - an
+                    // OOB write in the new kernels still corrupts, a v2-down issue
+                    // does not.
+                    if paddock_models::dev_var_os!("PADDOCK_PF_HYBRID_DBG").is_some() {
+                        exec.quantize_e4m3_geglu2_pad(
+                            &sc.moe_gu,
+                            &mut sc.moe_fq8,
+                            &mut sc.moe_fs8,
+                            ff,
+                            ffp,
+                            srp,
+                        )?;
+                        exec.f8bs_moe_gemm_dn(
+                            moe.dn_f8.as_ref().expect("dn_f8 pairs gu_f8"),
+                            &sc.moe_fq8,
+                            &sc.moe_fs8,
+                            &sc.moe_bexp,
+                            &sc.moe_srow,
+                            &sc.moe_sslot,
+                            &sc.moe_w,
+                            &mut sc.moe_part,
+                            ffp,
+                            hp.n_embd,
+                            hp.n_expert,
+                            srp,
+                            mb,
+                            k,
+                        )?;
+                    } else {
+                        if exec.has_q8_moe_qmma2t()
+                            && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA2_TMA").is_some()
+                        {
+                            // v3t twin on the hybrid prefill down (bitwise)
+                            exec.q8_0_moe_down_mma2t(
+                                down_exps,
+                                &sc.moe_srow2,
+                                &sc.moe_sslot2,
+                                &sc.moe_bexp2,
+                                &sc.moe_w,
+                                &sc.moe_fq,
+                                &sc.moe_fs,
+                                &mut sc.moe_part,
+                                k,
+                                mb32,
+                                32,
+                            )?;
+                        } else {
+                            exec.q8_0_moe_down_mma2(
+                                down_exps,
+                                &sc.moe_srow2,
+                                &sc.moe_sslot2,
+                                &sc.moe_bexp2,
+                                &sc.moe_w,
+                                &sc.moe_fq,
+                                &sc.moe_fs,
+                                &mut sc.moe_part,
+                                k,
+                                mb32,
+                                32,
+                            )?;
+                        }
+                    }
+                } else {
+                    exec.quantize_e4m3_geglu2_pad(
+                        &sc.moe_gu,
+                        &mut sc.moe_fq8,
+                        &mut sc.moe_fs8,
+                        ff,
+                        ffp,
+                        srp,
+                    )?;
+                    exec.f8bs_moe_gemm_dn(
+                        moe.dn_f8.as_ref().expect("dn_f8 pairs gu_f8"),
+                        &sc.moe_fq8,
+                        &sc.moe_fs8,
+                        &sc.moe_bexp,
+                        &sc.moe_srow,
+                        &sc.moe_sslot,
+                        &sc.moe_w,
+                        &mut sc.moe_part,
+                        ffp,
+                        hp.n_embd,
+                        hp.n_expert,
+                        srp,
+                        mb,
+                        k,
+                    )?;
+                }
+                if tail_fold {
+                    part_combined = true; // the tail fold sums part directly
+                } else if exec.has_moe_combine_init()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
+                {
+                    // slot 485: write-out fold - bitwise the memset + combine chain
+                    // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
+                    // census caught idling the die after every down launch.
+                    exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                } else {
+                    exec.stream
+                        .memset_zeros(&mut sc.moe_xn)
+                        .map_err(|e| GpuError::Driver(e.to_string()))?;
+                    exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                }
+            } else if f8d {
+                // decode band at BM=32: the histogram worst case caps ~140 blocks
+                // below f8_min=512 and every live block holds >= 1 pair, so
+                // min(r*k, worst) is a true bound - it shrinks the srp-scaled
+                // interstitials 2-16x at small r. f8s-sized scratch covers all of it.
+                let bm = 32usize;
+                let mb = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm).min(r * k);
+                let srp = mb * bm;
+                let ffp = ff.next_multiple_of(128);
+                {
+                    let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
+                    exec.quantize_e4m3(pn, &mut sc.moe_e4q, &mut sc.moe_e4s, r * hp.n_embd)?;
+                }
+                exec.moe_align_bm(
+                    &sc.moe_idx,
+                    &mut sc.moe_srow,
+                    &mut sc.moe_sslot,
+                    &mut sc.moe_bexp,
+                    r,
+                    k,
+                    hp.n_expert,
+                    bm,
+                    mb,
+                )?;
+                exec.moe_gather_e4m3(
+                    &sc.moe_e4q,
+                    &sc.moe_e4s,
+                    &sc.moe_srow,
+                    &mut sc.moe_xg,
+                    &mut sc.moe_sg,
+                    hp.n_embd,
+                    srp,
+                )?;
+                exec.f8bs_moe_gemm_gu_d32(
+                    moe.gu_f8.as_ref().expect("checked by f8d"),
+                    &sc.moe_xg,
+                    &sc.moe_sg,
+                    &sc.moe_bexp,
+                    &mut sc.moe_gu,
+                    hp.n_embd,
+                    2 * ff,
+                    hp.n_expert,
+                    srp,
+                    mb,
+                )?;
+                exec.quantize_e4m3_geglu2_pad_b(
                     &sc.moe_gu,
                     &mut sc.moe_fq8,
                     &mut sc.moe_fs8,
+                    &sc.moe_bexp,
                     ff,
                     ffp,
+                    bm,
                     srp,
                 )?;
-                exec.f8bs_moe_gemm_dn(
+                exec.f8bs_moe_gemm_dn_d32(
                     moe.dn_f8.as_ref().expect("dn_f8 pairs gu_f8"),
                     &sc.moe_fq8,
                     &sc.moe_fs8,
@@ -6835,635 +7045,493 @@ pub(super) fn g4_moe_tail(
                     mb,
                     k,
                 )?;
-            } else {
-                if exec.has_q8_moe_qmma2t()
-                    && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA2_TMA").is_some()
+                if tail_fold {
+                    part_combined = true; // the tail fold sums part directly
+                } else if exec.has_moe_combine_init()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
                 {
-                    // v3t twin on the hybrid prefill down (bitwise)
-                    exec.q8_0_moe_down_mma2t(
-                        &moe.down_exps,
-                        &sc.moe_srow2,
-                        &sc.moe_sslot2,
-                        &sc.moe_bexp2,
-                        &sc.moe_w,
-                        &sc.moe_fq,
-                        &sc.moe_fs,
-                        &mut sc.moe_part,
+                    // slot 485: write-out fold - bitwise the memset + combine chain
+                    // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
+                    // census caught idling the die after every down launch.
+                    exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                } else {
+                    exec.stream
+                        .memset_zeros(&mut sc.moe_xn)
+                        .map_err(|e| GpuError::Driver(e.to_string()))?;
+                    exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                }
+            } else if sorted {
+                let bm64_fill: usize = paddock_models::dev_var!("PADDOCK_QMOE_BM64_FILL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(64);
+                let bm = if r * k >= hp.n_expert * bm64_fill
+                    && paddock_models::dev_var_os!("PADDOCK_NO_QMOE_BM64").is_none()
+                {
+                    64usize
+                } else {
+                    32usize
+                };
+                let max_blocks = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm);
+                // g2 lane pre-gate: when the token-major GU will
+                // run, one dual-output align emits the bm32 CSR + bm16 CSR + pair
+                // map (saves two launches vs align+align16+pair_map).
+                let g2_max: usize = paddock_models::dev_var!("PADDOCK_MOE_G2_MAX")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2048);
+                let g2_align = bm == 32
+                    && !xg_lane
+                    && r * k <= g2_max
+                    && hp.n_embd.is_multiple_of(256)
+                    && ff % 64 == 0
+                    && exec.has_q8_moe_g2()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none()
+                    && paddock_models::dev_var!("PADDOCK_MOE_G2")
+                        .ok()
+                        .is_some_and(|v| v != "0");
+                let g2_mb16 = (r * k + hp.n_expert * 15).div_ceil(16);
+                if g2_align {
+                    exec.moe_align_dual(
+                        &sc.moe_idx,
+                        &mut sc.moe_srow,
+                        &mut sc.moe_sslot,
+                        &mut sc.moe_bexp,
+                        &mut sc.moe_srow2,
+                        &mut sc.moe_sslot2,
+                        &mut sc.moe_bexp2,
+                        &mut sc.moe_pairmap,
+                        r,
                         k,
-                        mb32,
-                        32,
+                        hp.n_expert,
+                        max_blocks,
+                        g2_mb16,
+                    )?;
+                } else if bm == 64 {
+                    exec.moe_align_bm(
+                        &sc.moe_idx,
+                        &mut sc.moe_srow,
+                        &mut sc.moe_sslot,
+                        &mut sc.moe_bexp,
+                        r,
+                        k,
+                        hp.n_expert,
+                        bm,
+                        max_blocks,
                     )?;
                 } else {
-                    exec.q8_0_moe_down_mma2(
-                        &moe.down_exps,
-                        &sc.moe_srow2,
-                        &sc.moe_sslot2,
-                        &sc.moe_bexp2,
+                    exec.moe_align(
+                        &sc.moe_idx,
+                        &mut sc.moe_srow,
+                        &mut sc.moe_sslot,
+                        &mut sc.moe_bexp,
+                        r,
+                        k,
+                        hp.n_expert,
+                        max_blocks,
+                    )?;
+                }
+                // Flat-scale e4m3 gate_up (change A) - same sorted layout,
+                // same fq/fs handshake into the q8 down GEMM, but the weight scale is
+                // per-OUTPUT-ROW so it never enters the k walk. That drops 6.25% of
+                // the weight bytes (no per-32 scale plane to stream) and ~5x the
+                // per-mma ALU. Lossy requant: OPT-IN until the greedy gate says
+                // otherwise, and it needs the planes built at load.
+                let f8row = moe.gate_f8r.is_some() && exec.has_f8row_moe();
+                // The down half is a separate arm: with it, gate_up must use the
+                // e4m3-out epilogue so the two agree on fq's encoding. Without it,
+                // gate_up emits int8 and the Q8_0 down keeps serving.
+                let f8row_dn = f8row && moe.down_f8r.is_some() && exec.has_f8row_moe_down();
+                // v2 ring twins of the q8 pair:
+                // S-stage cp.async ring + live-quarter skip, BITWISE vs the shipped
+                // pair on live outputs -- default-on where the shape qualifies
+                // (BM=32 blocks, in_dim % 256, ff % 64). PADDOCK_NO_MOE_QMMA2 = A/B.
+                let qmma2 = bm == 32
+                    && exec.has_q8_moe_qmma2()
+                    && hp.n_embd.is_multiple_of(256)
+                    && ff % 64 == 0
+                    && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none();
+                // v3t: TMA-staged v2 twins - bitwise, opt-in
+                // (PADDOCK_MOE_QMMA2_TMA=1), sm_90+ packs only. Excludes the xg/dn64
+                // encodings (v3t writes the v2 fq/fs layout).
+                let qmma2t = qmma2
+                    && !xg_lane
+                    && exec.has_q8_moe_qmma2t()
+                    && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA2_TMA").is_some();
+                // g2 (slot 504): the dual align already ran when g2_align is set.
+                let g2 = qmma2 && g2_align;
+                if f8row {
+                    let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
+                    exec.quantize_e4m3_b32f(pn, &mut sc.moe_x8q, &mut sc.moe_x8s, r * hp.n_embd)?;
+                    let (g, u) = (
+                        moe.gate_f8r.as_ref().expect("checked by f8row"),
+                        moe.up_f8r.as_ref().expect("up_f8r pairs gate_f8r"),
+                    );
+                    if f8row_dn {
+                        exec.f8row_moe_gate_up_mma_geglu_f8(
+                            g,
+                            u,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_x8q,
+                            &sc.moe_x8s,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            hp.n_embd,
+                            ff,
+                            max_blocks,
+                            bm,
+                        )?;
+                    } else {
+                        exec.f8row_moe_gate_up_mma_geglu(
+                            g,
+                            u,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_x8q,
+                            &sc.moe_x8s,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            hp.n_embd,
+                            ff,
+                            max_blocks,
+                            bm,
+                        )?;
+                    }
+                } else if qmma2 {
+                    // v5 (slot 488): the rival-geometry gate_up (BM16 tile view,
+                    // 128 thr) - BITWISE the v2 kernel but FALSIFIED on perf
+                    // (u64r32 73.9 vs 72.4 wash; u48r8 70.1 vs 58.7 worse): the
+                    // rival's tile geometry is not the differentiator. OPT-IN for
+                    // the record (PADDOCK_MOE_QMMA3=1).
+                    if g2 {
+                        static G2_ONCE: std::sync::Once = std::sync::Once::new();
+                        G2_ONCE.call_once(|| {
+                            tracing::info!("g2 token-major GU lane ENGAGED (dual align)")
+                        });
+                        let mb16 = g2_mb16;
+                        exec.q8_0_moe_gate_up_g2_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow2,
+                            &sc.moe_sslot2,
+                            &sc.moe_bexp2,
+                            &sc.moe_pairmap,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            k,
+                            mb16,
+                            16,
+                        )?;
+                    } else if qmma2t {
+                        static Q2T_ONCE: std::sync::Once = std::sync::Once::new();
+                        Q2T_ONCE.call_once(|| tracing::info!("v3t qmma2t lane ENGAGED (decode)"));
+                        exec.q8_0_moe_gate_up_mma2t_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            max_blocks,
+                            bm,
+                        )?;
+                    } else if exec.has_q8_moe_mma3()
+                        && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA3").is_some()
+                    {
+                        exec.q8_0_moe_gate_up_mma3_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            max_blocks,
+                            bm,
+                        )?;
+                    } else if xg_lane && dn64_env {
+                        exec.q8_0_moe_gate_up_mma2g_y64_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            max_blocks,
+                            bm,
+                        )?;
+                        fs_is_64 = true;
+                    } else if xg_lane {
+                        exec.q8_0_moe_gate_up_mma2g_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            max_blocks,
+                            bm,
+                        )?;
+                    } else {
+                        exec.q8_0_moe_gate_up_mma2_geglu(
+                            gate_exps,
+                            up_exps,
+                            &sc.moe_srow,
+                            &sc.moe_bexp,
+                            &sc.moe_xq,
+                            &sc.moe_xs,
+                            &mut sc.moe_fq,
+                            &mut sc.moe_fs,
+                            max_blocks,
+                            bm,
+                        )?;
+                    }
+                } else {
+                    exec.q8_0_moe_gate_up_mma_geglu(
+                        gate_exps,
+                        up_exps,
+                        &sc.moe_srow,
+                        &sc.moe_bexp,
+                        &sc.moe_xq,
+                        &sc.moe_xs,
+                        &mut sc.moe_fq,
+                        &mut sc.moe_fs,
+                        max_blocks,
+                        bm,
+                    )?;
+                }
+                if f8row_dn {
+                    exec.f8row_moe_down_mma(
+                        moe.down_f8r.as_ref().expect("checked by f8row_dn"),
+                        &sc.moe_srow,
+                        &sc.moe_sslot,
+                        &sc.moe_bexp,
+                        &sc.moe_w,
+                        &sc.moe_fq,
+                        &sc.moe_fs,
+                        &mut sc.moe_part,
+                        ff,
+                        hp.n_embd,
+                        k,
+                        max_blocks,
+                        bm,
+                    )?;
+                } else if qmma2 {
+                    if fs_is_64 {
+                        // dn64: fs was written per-64 this tick - the fs64 consumer
+                        // is the only down that reads that stride (pbf16 composes).
+                        exec.q8_0_moe_down_mma2_fs64(
+                            down_exps,
+                            &sc.moe_srow,
+                            &sc.moe_sslot,
+                            &sc.moe_bexp,
+                            &sc.moe_w,
+                            &sc.moe_fq,
+                            &sc.moe_fs,
+                            &mut sc.moe_part,
+                            k,
+                            max_blocks,
+                            bm,
+                            pbf16_env,
+                        )?;
+                        part_is_bf16 = pbf16_env;
+                    } else if pbf16_env {
+                        exec.q8_0_moe_down_mma2_pbf16(
+                            down_exps,
+                            &sc.moe_srow,
+                            &sc.moe_sslot,
+                            &sc.moe_bexp,
+                            &sc.moe_w,
+                            &sc.moe_fq,
+                            &sc.moe_fs,
+                            &mut sc.moe_part,
+                            k,
+                            max_blocks,
+                            bm,
+                        )?;
+                        part_is_bf16 = true;
+                    } else if qmma2t {
+                        exec.q8_0_moe_down_mma2t(
+                            down_exps,
+                            &sc.moe_srow,
+                            &sc.moe_sslot,
+                            &sc.moe_bexp,
+                            &sc.moe_w,
+                            &sc.moe_fq,
+                            &sc.moe_fs,
+                            &mut sc.moe_part,
+                            k,
+                            max_blocks,
+                            bm,
+                        )?;
+                    } else {
+                        exec.q8_0_moe_down_mma2(
+                            down_exps,
+                            &sc.moe_srow,
+                            &sc.moe_sslot,
+                            &sc.moe_bexp,
+                            &sc.moe_w,
+                            &sc.moe_fq,
+                            &sc.moe_fs,
+                            &mut sc.moe_part,
+                            k,
+                            max_blocks,
+                            bm,
+                        )?;
+                    }
+                } else {
+                    exec.q8_0_moe_down_mma(
+                        down_exps,
+                        &sc.moe_srow,
+                        &sc.moe_sslot,
+                        &sc.moe_bexp,
                         &sc.moe_w,
                         &sc.moe_fq,
                         &sc.moe_fs,
                         &mut sc.moe_part,
                         k,
-                        mb32,
-                        32,
+                        max_blocks,
+                        bm,
                     )?;
                 }
-            }
-        } else {
-            exec.quantize_e4m3_geglu2_pad(
-                &sc.moe_gu,
-                &mut sc.moe_fq8,
-                &mut sc.moe_fs8,
-                ff,
-                ffp,
-                srp,
-            )?;
-            exec.f8bs_moe_gemm_dn(
-                moe.dn_f8.as_ref().expect("dn_f8 pairs gu_f8"),
-                &sc.moe_fq8,
-                &sc.moe_fs8,
-                &sc.moe_bexp,
-                &sc.moe_srow,
-                &sc.moe_sslot,
-                &sc.moe_w,
-                &mut sc.moe_part,
-                ffp,
-                hp.n_embd,
-                hp.n_expert,
-                srp,
-                mb,
-                k,
-            )?;
-        }
-        if tail_fold {
-            part_combined = true; // the tail fold sums part directly
-        } else if exec.has_moe_combine_init()
-            && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
-        {
-            // slot 485: write-out fold - bitwise the memset + combine chain
-            // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
-            // census caught idling the die after every down launch.
-            exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        } else {
-            exec.stream
-                .memset_zeros(&mut sc.moe_xn)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-            exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        }
-    } else if f8d {
-        // decode band at BM=32: the histogram worst case caps ~140 blocks
-        // below f8_min=512 and every live block holds >= 1 pair, so
-        // min(r*k, worst) is a true bound - it shrinks the srp-scaled
-        // interstitials 2-16x at small r. f8s-sized scratch covers all of it.
-        let bm = 32usize;
-        let mb = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm).min(r * k);
-        let srp = mb * bm;
-        let ffp = ff.next_multiple_of(128);
-        {
-            let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
-            exec.quantize_e4m3(pn, &mut sc.moe_e4q, &mut sc.moe_e4s, r * hp.n_embd)?;
-        }
-        exec.moe_align_bm(
-            &sc.moe_idx,
-            &mut sc.moe_srow,
-            &mut sc.moe_sslot,
-            &mut sc.moe_bexp,
-            r,
-            k,
-            hp.n_expert,
-            bm,
-            mb,
-        )?;
-        exec.moe_gather_e4m3(
-            &sc.moe_e4q,
-            &sc.moe_e4s,
-            &sc.moe_srow,
-            &mut sc.moe_xg,
-            &mut sc.moe_sg,
-            hp.n_embd,
-            srp,
-        )?;
-        exec.f8bs_moe_gemm_gu_d32(
-            moe.gu_f8.as_ref().expect("checked by f8d"),
-            &sc.moe_xg,
-            &sc.moe_sg,
-            &sc.moe_bexp,
-            &mut sc.moe_gu,
-            hp.n_embd,
-            2 * ff,
-            hp.n_expert,
-            srp,
-            mb,
-        )?;
-        exec.quantize_e4m3_geglu2_pad_b(
-            &sc.moe_gu,
-            &mut sc.moe_fq8,
-            &mut sc.moe_fs8,
-            &sc.moe_bexp,
-            ff,
-            ffp,
-            bm,
-            srp,
-        )?;
-        exec.f8bs_moe_gemm_dn_d32(
-            moe.dn_f8.as_ref().expect("dn_f8 pairs gu_f8"),
-            &sc.moe_fq8,
-            &sc.moe_fs8,
-            &sc.moe_bexp,
-            &sc.moe_srow,
-            &sc.moe_sslot,
-            &sc.moe_w,
-            &mut sc.moe_part,
-            ffp,
-            hp.n_embd,
-            hp.n_expert,
-            srp,
-            mb,
-            k,
-        )?;
-        if tail_fold {
-            part_combined = true; // the tail fold sums part directly
-        } else if exec.has_moe_combine_init()
-            && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
-        {
-            // slot 485: write-out fold - bitwise the memset + combine chain
-            // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
-            // census caught idling the die after every down launch.
-            exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        } else {
-            exec.stream
-                .memset_zeros(&mut sc.moe_xn)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-            exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        }
-    } else if sorted {
-        let bm64_fill: usize = paddock_models::dev_var!("PADDOCK_QMOE_BM64_FILL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
-        let bm = if r * k >= hp.n_expert * bm64_fill
-            && paddock_models::dev_var_os!("PADDOCK_NO_QMOE_BM64").is_none()
-        {
-            64usize
-        } else {
-            32usize
-        };
-        let max_blocks = (r * k + hp.n_expert * (bm - 1)).div_ceil(bm);
-        // g2 lane pre-gate: when the token-major GU will
-        // run, one dual-output align emits the bm32 CSR + bm16 CSR + pair
-        // map (saves two launches vs align+align16+pair_map).
-        let g2_max: usize = paddock_models::dev_var!("PADDOCK_MOE_G2_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
-        let g2_align = bm == 32
-            && !xg_lane
-            && r * k <= g2_max
-            && hp.n_embd.is_multiple_of(256)
-            && ff % 64 == 0
-            && exec.has_q8_moe_g2()
-            && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none()
-            && paddock_models::dev_var!("PADDOCK_MOE_G2")
-                .ok()
-                .is_some_and(|v| v != "0");
-        let g2_mb16 = (r * k + hp.n_expert * 15).div_ceil(16);
-        if g2_align {
-            exec.moe_align_dual(
-                &sc.moe_idx,
-                &mut sc.moe_srow,
-                &mut sc.moe_sslot,
-                &mut sc.moe_bexp,
-                &mut sc.moe_srow2,
-                &mut sc.moe_sslot2,
-                &mut sc.moe_bexp2,
-                &mut sc.moe_pairmap,
-                r,
-                k,
-                hp.n_expert,
-                max_blocks,
-                g2_mb16,
-            )?;
-        } else if bm == 64 {
-            exec.moe_align_bm(
-                &sc.moe_idx,
-                &mut sc.moe_srow,
-                &mut sc.moe_sslot,
-                &mut sc.moe_bexp,
-                r,
-                k,
-                hp.n_expert,
-                bm,
-                max_blocks,
-            )?;
-        } else {
-            exec.moe_align(
-                &sc.moe_idx,
-                &mut sc.moe_srow,
-                &mut sc.moe_sslot,
-                &mut sc.moe_bexp,
-                r,
-                k,
-                hp.n_expert,
-                max_blocks,
-            )?;
-        }
-        // Flat-scale e4m3 gate_up (change A) - same sorted layout,
-        // same fq/fs handshake into the q8 down GEMM, but the weight scale is
-        // per-OUTPUT-ROW so it never enters the k walk. That drops 6.25% of
-        // the weight bytes (no per-32 scale plane to stream) and ~5x the
-        // per-mma ALU. Lossy requant: OPT-IN until the greedy gate says
-        // otherwise, and it needs the planes built at load.
-        let f8row = moe.gate_f8r.is_some() && exec.has_f8row_moe();
-        // The down half is a separate arm: with it, gate_up must use the
-        // e4m3-out epilogue so the two agree on fq's encoding. Without it,
-        // gate_up emits int8 and the Q8_0 down keeps serving.
-        let f8row_dn = f8row && moe.down_f8r.is_some() && exec.has_f8row_moe_down();
-        // v2 ring twins of the q8 pair:
-        // S-stage cp.async ring + live-quarter skip, BITWISE vs the shipped
-        // pair on live outputs -- default-on where the shape qualifies
-        // (BM=32 blocks, in_dim % 256, ff % 64). PADDOCK_NO_MOE_QMMA2 = A/B.
-        let qmma2 = bm == 32
-            && exec.has_q8_moe_qmma2()
-            && hp.n_embd.is_multiple_of(256)
-            && ff % 64 == 0
-            && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none();
-        // v3t: TMA-staged v2 twins - bitwise, opt-in
-        // (PADDOCK_MOE_QMMA2_TMA=1), sm_90+ packs only. Excludes the xg/dn64
-        // encodings (v3t writes the v2 fq/fs layout).
-        let qmma2t = qmma2
-            && !xg_lane
-            && exec.has_q8_moe_qmma2t()
-            && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA2_TMA").is_some();
-        // g2 (slot 504): the dual align already ran when g2_align is set.
-        let g2 = qmma2 && g2_align;
-        if f8row {
-            let pn = if fused { &sc.moe_out } else { &sc.moe_xn };
-            exec.quantize_e4m3_b32f(pn, &mut sc.moe_x8q, &mut sc.moe_x8s, r * hp.n_embd)?;
-            let (g, u) = (
-                moe.gate_f8r.as_ref().expect("checked by f8row"),
-                moe.up_f8r.as_ref().expect("up_f8r pairs gate_f8r"),
-            );
-            if f8row_dn {
-                exec.f8row_moe_gate_up_mma_geglu_f8(
-                    g,
-                    u,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_x8q,
-                    &sc.moe_x8s,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    hp.n_embd,
-                    ff,
-                    max_blocks,
-                    bm,
-                )?;
-            } else {
-                exec.f8row_moe_gate_up_mma_geglu(
-                    g,
-                    u,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_x8q,
-                    &sc.moe_x8s,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    hp.n_embd,
-                    ff,
-                    max_blocks,
-                    bm,
-                )?;
-            }
-        } else if qmma2 {
-            // v5 (slot 488): the rival-geometry gate_up (BM16 tile view,
-            // 128 thr) - BITWISE the v2 kernel but FALSIFIED on perf
-            // (u64r32 73.9 vs 72.4 wash; u48r8 70.1 vs 58.7 worse): the
-            // rival's tile geometry is not the differentiator. OPT-IN for
-            // the record (PADDOCK_MOE_QMMA3=1).
-            if g2 {
-                static G2_ONCE: std::sync::Once = std::sync::Once::new();
-                G2_ONCE.call_once(|| tracing::info!("g2 token-major GU lane ENGAGED (dual align)"));
-                let mb16 = g2_mb16;
-                exec.q8_0_moe_gate_up_g2_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow2,
-                    &sc.moe_sslot2,
-                    &sc.moe_bexp2,
-                    &sc.moe_pairmap,
-                    &sc.moe_xq,
-                    &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    k,
-                    mb16,
-                    16,
-                )?;
-            } else if qmma2t {
-                static Q2T_ONCE: std::sync::Once = std::sync::Once::new();
-                Q2T_ONCE.call_once(|| tracing::info!("v3t qmma2t lane ENGAGED (decode)"));
-                exec.q8_0_moe_gate_up_mma2t_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_xq,
-                    &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    max_blocks,
-                    bm,
-                )?;
-            } else if exec.has_q8_moe_mma3()
-                && paddock_models::dev_var_os!("PADDOCK_MOE_QMMA3").is_some()
+                if tail_fold {
+                    part_combined = true; // the tail fold sums part directly
+                } else if exec.has_moe_combine_init()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
+                {
+                    // slot 485: write-out fold - bitwise the memset + combine chain
+                    // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
+                    // census caught idling the die after every down launch.
+                    exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                } else {
+                    exec.stream
+                        .memset_zeros(&mut sc.moe_xn)
+                        .map_err(|e| GpuError::Driver(e.to_string()))?;
+                    exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
+                }
+            } else if exec
+                .kernels()
+                .map(|kt| kt.q8_0_moe_gu_dec2_geglu.is_some())
+                .unwrap_or(false)
+                && paddock_models::dev_var_os!("PADDOCK_MOE_DEC2").is_some()
             {
-                exec.q8_0_moe_gate_up_mma3_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_xq,
-                    &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    max_blocks,
-                    bm,
-                )?;
-            } else if xg_lane && dn64_env {
-                exec.q8_0_moe_gate_up_mma2g_y64_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_xq,
-                    &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    max_blocks,
-                    bm,
-                )?;
-                fs_is_64 = true;
-            } else if xg_lane {
-                exec.q8_0_moe_gate_up_mma2g_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
-                    &sc.moe_xq,
-                    &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    max_blocks,
-                    bm,
+                // decode-band intensity twins - now OPT-IN (PADDOCK_MOE_DEC2=1).
+                // GREEDY-REFUTED 2026-09-04 on gemma-4-26b-A4B: the gu_dec2 + dn_dec2
+                // PAIR produces token-repetition garbage ("CAPITAL.- Ezil, own-own..."
+                // deterministic), while either twin paired with its original
+                // counterpart is correct (bisected: gu_dec2 + original down = OK;
+                // original gate_up + dn_dec2 = OK; both dec2 = garbage). So neither
+                // kernel is wrong alone - the defect is an interaction between the
+                // two (a value-/state-dependent hazard; survives PADDOCK_NO_MOE_FORK,
+                // so not the side-stream fork). The old "greedy-identical" claim held
+                // only because aiperf never reads the text. Root cause still open;
+                // default routes the correct original gate_up_geglu + down below.
+                // The 1.5x/1.25x decode-band win (a4b_moe_kbench: gu 110.5->74.5us,
+                // dn 67.6->53.3us at r=8) is forfeited until the pair is fixed;
+                // it only ever engaged at r*k < 128 (the sorted path owns >=128).
+                //
+                // dec3 gate_up - OPT-IN only, FALSIFIED as default. The
+                // bulk-streamed kernel (moe_align BM=2 + one TMA-ring CTA per
+                // (block, out tile)) is bitwise gu dec2 and won every UNIFORM-routing
+                // kbench cell from r=4 - but the serve A/B LOST, and profiling told
+                // why: real routing is SKEWED, hot experts make straggler CTAs
+                // (gu dec3 median 96us stdev 20 vs dec2 stdev 1.1), and the kbench
+                // `hot` case then showed dec2 on skewed routing beats everything
+                // (40us at r=8: the hot slabs are L2-RESIDENT, so dec2's per-pair
+                // "re-reads" are L2 hits - the dedup dec3 streams for, the cache
+                // already gives dec2 for free, and evict_first bypasses it). Kept
+                // for the uniform/large-uniq regime study; the down half always
+                // stays dec2 (dn dec3 lost at every r).
+                let dec3_min: usize = paddock_models::dev_var!("PADDOCK_MOE_DEC3_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(32);
+                let dec3 = r * k >= dec3_min
+                    && exec.has_moe_dec3()
+                    && paddock_models::dev_var_os!("PADDOCK_MOE_DEC3").is_some();
+                if dec3 {
+                    let mb2 = (r * k + hp.n_expert).div_ceil(2);
+                    exec.moe_align_bm(
+                        &sc.moe_idx,
+                        &mut sc.moe_srow,
+                        &mut sc.moe_sslot,
+                        &mut sc.moe_bexp,
+                        r,
+                        k,
+                        hp.n_expert,
+                        2,
+                        mb2,
+                    )?;
+                    exec.q8_0_moe_gu_dec3_geglu(
+                        gate_exps,
+                        up_exps,
+                        &sc.moe_bexp,
+                        &sc.moe_srow,
+                        &sc.moe_sslot,
+                        &sc.moe_xq,
+                        &sc.moe_xs,
+                        &mut sc.moe_fused,
+                        k,
+                        mb2,
+                        r * k,
+                    )?;
+                } else {
+                    exec.q8_0_moe_gu_dec2_geglu(
+                        gate_exps,
+                        up_exps,
+                        &sc.moe_idx,
+                        &sc.moe_xq,
+                        &sc.moe_xs,
+                        &mut sc.moe_fused,
+                        k,
+                        r,
+                    )?;
+                }
+                exec.quantize_q8(&sc.moe_fused, &mut sc.moe_fq, &mut sc.moe_fs, r * k * ff)?;
+                exec.q8_0_moe_dn_dec2(
+                    down_exps,
+                    &sc.moe_idx,
+                    &sc.moe_w,
+                    &sc.moe_fq,
+                    &sc.moe_fs,
+                    &mut sc.moe_xn,
+                    k,
+                    r,
                 )?;
             } else {
-                exec.q8_0_moe_gate_up_mma2_geglu(
-                    &moe.gate_exps,
-                    &moe.up_exps,
-                    &sc.moe_srow,
-                    &sc.moe_bexp,
+                exec.q8_0_moe_gate_up_geglu(
+                    gate_exps,
+                    up_exps,
+                    &sc.moe_idx,
                     &sc.moe_xq,
                     &sc.moe_xs,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    max_blocks,
-                    bm,
+                    &mut sc.moe_fused,
+                    k,
+                    r,
+                )?;
+                exec.quantize_q8(&sc.moe_fused, &mut sc.moe_fq, &mut sc.moe_fs, r * k * ff)?;
+                exec.q8_0_moe_down(
+                    down_exps,
+                    &sc.moe_idx,
+                    &sc.moe_w,
+                    &sc.moe_fq,
+                    &sc.moe_fs,
+                    &mut sc.moe_xn,
+                    k,
+                    r,
                 )?;
             }
-        } else {
-            exec.q8_0_moe_gate_up_mma_geglu(
-                &moe.gate_exps,
-                &moe.up_exps,
-                &sc.moe_srow,
-                &sc.moe_bexp,
-                &sc.moe_xq,
-                &sc.moe_xs,
-                &mut sc.moe_fq,
-                &mut sc.moe_fs,
-                max_blocks,
-                bm,
-            )?;
         }
-        if f8row_dn {
-            exec.f8row_moe_down_mma(
-                moe.down_f8r.as_ref().expect("checked by f8row_dn"),
-                &sc.moe_srow,
-                &sc.moe_sslot,
-                &sc.moe_bexp,
-                &sc.moe_w,
-                &sc.moe_fq,
-                &sc.moe_fs,
-                &mut sc.moe_part,
-                ff,
-                hp.n_embd,
-                k,
-                max_blocks,
-                bm,
-            )?;
-        } else if qmma2 {
-            if fs_is_64 {
-                // dn64: fs was written per-64 this tick - the fs64 consumer
-                // is the only down that reads that stride (pbf16 composes).
-                exec.q8_0_moe_down_mma2_fs64(
-                    &moe.down_exps,
-                    &sc.moe_srow,
-                    &sc.moe_sslot,
-                    &sc.moe_bexp,
-                    &sc.moe_w,
-                    &sc.moe_fq,
-                    &sc.moe_fs,
-                    &mut sc.moe_part,
-                    k,
-                    max_blocks,
-                    bm,
-                    pbf16_env,
-                )?;
-                part_is_bf16 = pbf16_env;
-            } else if pbf16_env {
-                exec.q8_0_moe_down_mma2_pbf16(
-                    &moe.down_exps,
-                    &sc.moe_srow,
-                    &sc.moe_sslot,
-                    &sc.moe_bexp,
-                    &sc.moe_w,
-                    &sc.moe_fq,
-                    &sc.moe_fs,
-                    &mut sc.moe_part,
-                    k,
-                    max_blocks,
-                    bm,
-                )?;
-                part_is_bf16 = true;
-            } else if qmma2t {
-                exec.q8_0_moe_down_mma2t(
-                    &moe.down_exps,
-                    &sc.moe_srow,
-                    &sc.moe_sslot,
-                    &sc.moe_bexp,
-                    &sc.moe_w,
-                    &sc.moe_fq,
-                    &sc.moe_fs,
-                    &mut sc.moe_part,
-                    k,
-                    max_blocks,
-                    bm,
-                )?;
-            } else {
-                exec.q8_0_moe_down_mma2(
-                    &moe.down_exps,
-                    &sc.moe_srow,
-                    &sc.moe_sslot,
-                    &sc.moe_bexp,
-                    &sc.moe_w,
-                    &sc.moe_fq,
-                    &sc.moe_fs,
-                    &mut sc.moe_part,
-                    k,
-                    max_blocks,
-                    bm,
-                )?;
-            }
-        } else {
-            exec.q8_0_moe_down_mma(
-                &moe.down_exps,
-                &sc.moe_srow,
-                &sc.moe_sslot,
-                &sc.moe_bexp,
-                &sc.moe_w,
-                &sc.moe_fq,
-                &sc.moe_fs,
-                &mut sc.moe_part,
-                k,
-                max_blocks,
-                bm,
-            )?;
-        }
-        if tail_fold {
-            part_combined = true; // the tail fold sums part directly
-        } else if exec.has_moe_combine_init()
-            && paddock_models::dev_var_os!("PADDOCK_NO_COMBINE_INIT").is_none()
-        {
-            // slot 485: write-out fold - bitwise the memset + combine chain
-            // (0.0f + x == x), minus the ~8.8us/tick driver memset the gap
-            // census caught idling the die after every down launch.
-            exec.moe_slot_combine_init(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        } else {
-            exec.stream
-                .memset_zeros(&mut sc.moe_xn)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-            exec.moe_slot_combine(&sc.moe_part, &mut sc.moe_xn, hp.n_embd, k, r)?;
-        }
-    } else if exec
-        .kernels()
-        .map(|kt| kt.q8_0_moe_gu_dec2_geglu.is_some())
-        .unwrap_or(false)
-        && paddock_models::dev_var_os!("PADDOCK_MOE_DEC2").is_some()
-    {
-        // decode-band intensity twins - now OPT-IN (PADDOCK_MOE_DEC2=1).
-        // GREEDY-REFUTED 2026-09-04 on gemma-4-26b-A4B: the gu_dec2 + dn_dec2
-        // PAIR produces token-repetition garbage ("CAPITAL.- Ezil, own-own..."
-        // deterministic), while either twin paired with its original
-        // counterpart is correct (bisected: gu_dec2 + original down = OK;
-        // original gate_up + dn_dec2 = OK; both dec2 = garbage). So neither
-        // kernel is wrong alone - the defect is an interaction between the
-        // two (a value-/state-dependent hazard; survives PADDOCK_NO_MOE_FORK,
-        // so not the side-stream fork). The old "greedy-identical" claim held
-        // only because aiperf never reads the text. Root cause still open;
-        // default routes the correct original gate_up_geglu + down below.
-        // The 1.5x/1.25x decode-band win (a4b_moe_kbench: gu 110.5->74.5us,
-        // dn 67.6->53.3us at r=8) is forfeited until the pair is fixed;
-        // it only ever engaged at r*k < 128 (the sorted path owns >=128).
-        //
-        // dec3 gate_up - OPT-IN only, FALSIFIED as default. The
-        // bulk-streamed kernel (moe_align BM=2 + one TMA-ring CTA per
-        // (block, out tile)) is bitwise gu dec2 and won every UNIFORM-routing
-        // kbench cell from r=4 - but the serve A/B LOST, and profiling told
-        // why: real routing is SKEWED, hot experts make straggler CTAs
-        // (gu dec3 median 96us stdev 20 vs dec2 stdev 1.1), and the kbench
-        // `hot` case then showed dec2 on skewed routing beats everything
-        // (40us at r=8: the hot slabs are L2-RESIDENT, so dec2's per-pair
-        // "re-reads" are L2 hits - the dedup dec3 streams for, the cache
-        // already gives dec2 for free, and evict_first bypasses it). Kept
-        // for the uniform/large-uniq regime study; the down half always
-        // stays dec2 (dn dec3 lost at every r).
-        let dec3_min: usize = paddock_models::dev_var!("PADDOCK_MOE_DEC3_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32);
-        let dec3 = r * k >= dec3_min
-            && exec.has_moe_dec3()
-            && paddock_models::dev_var_os!("PADDOCK_MOE_DEC3").is_some();
-        if dec3 {
-            let mb2 = (r * k + hp.n_expert).div_ceil(2);
-            exec.moe_align_bm(
-                &sc.moe_idx,
-                &mut sc.moe_srow,
-                &mut sc.moe_sslot,
-                &mut sc.moe_bexp,
-                r,
-                k,
-                hp.n_expert,
-                2,
-                mb2,
-            )?;
-            exec.q8_0_moe_gu_dec3_geglu(
-                &moe.gate_exps,
-                &moe.up_exps,
-                &sc.moe_bexp,
-                &sc.moe_srow,
-                &sc.moe_sslot,
-                &sc.moe_xq,
-                &sc.moe_xs,
-                &mut sc.moe_fused,
-                k,
-                mb2,
-                r * k,
-            )?;
-        } else {
-            exec.q8_0_moe_gu_dec2_geglu(
-                &moe.gate_exps,
-                &moe.up_exps,
-                &sc.moe_idx,
-                &sc.moe_xq,
-                &sc.moe_xs,
-                &mut sc.moe_fused,
-                k,
-                r,
-            )?;
-        }
-        exec.quantize_q8(&sc.moe_fused, &mut sc.moe_fq, &mut sc.moe_fs, r * k * ff)?;
-        exec.q8_0_moe_dn_dec2(
-            &moe.down_exps,
-            &sc.moe_idx,
-            &sc.moe_w,
-            &sc.moe_fq,
-            &sc.moe_fs,
-            &mut sc.moe_xn,
-            k,
-            r,
-        )?;
-    } else {
-        exec.q8_0_moe_gate_up_geglu(
-            &moe.gate_exps,
-            &moe.up_exps,
-            &sc.moe_idx,
-            &sc.moe_xq,
-            &sc.moe_xs,
-            &mut sc.moe_fused,
-            k,
-            r,
-        )?;
-        exec.quantize_q8(&sc.moe_fused, &mut sc.moe_fq, &mut sc.moe_fs, r * k * ff)?;
-        exec.q8_0_moe_down(
-            &moe.down_exps,
-            &sc.moe_idx,
-            &sc.moe_w,
-            &sc.moe_fq,
-            &sc.moe_fs,
-            &mut sc.moe_xn,
-            k,
-            r,
-        )?;
     }
     // Join the forked shared branch (no-op when not forked): the tail below
     // is the first consumer of both branches (proj + the routed dn output).
@@ -7670,11 +7738,3 @@ pub(super) fn attn_tc5_glb_on() -> bool {
 
 // backend bound on queued chunked prompts: crate::service::max_chunks_inflight()
 // (one shared value - a scheduler bound above the backend's fails admissions)
-
-/// A queued chunked prefill: the whole prompt, advanced by mixed ticks.
-/// (No `done` cursor - tails run whole through the coalesced batch pass,
-/// which already resumes from the prefix cache internally.)
-pub(crate) struct ChunkedPrefill {
-    pub slot: usize,
-    pub tokens: Vec<u32>,
-}

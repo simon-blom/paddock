@@ -112,7 +112,7 @@ export interface Estimate {
 export interface ModelEstimate {
   kv_dtype?: string
   known: boolean
-  kind?: 'generative' | 'encoder'
+  kind?: 'generative' | 'encoder' | 'image'
   weights: number
   /** the shared vision tower's bytes - the same for every weights choice, so
    *  it is repeated on each row rather than belonging to one of them. */
@@ -142,7 +142,7 @@ export interface ElectedSampling {
 /** A model's estimator answer (schema 3): one fit row per WEIGHTS artifact -
  *  Q8 and Q4 are different footprints of one model. */
 export interface ModelFit {
-  kind?: 'generative' | 'encoder'
+  kind?: 'generative' | 'encoder' | 'image'
   artifacts: Record<string, ModelEstimate>
   sampling?: ElectedSampling | null
 }

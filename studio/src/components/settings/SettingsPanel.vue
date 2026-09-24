@@ -3,51 +3,17 @@
 // Everything else was evicted: tools/search are model config (the Manager's
 // Start/Edit page), the DB export is manager admin (/manage/settings), theme
 // lives in the header, and model facts live on the model's page.
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
-import { useModelsStore } from '@/stores/models'
 import { useAudioDevices } from '@/composables/useAudioDevices'
-import { OSM_TILES, tileHost, tileTemplate } from '@/lib/maptiles'
-import Slider from '@/components/ui/Slider.vue'
+import { OSM_TILES } from '@/lib/maptiles'
+import ReplyLimitControl from './ReplyLimitControl.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Select, { type SelectOption } from '@/components/ui/Select.vue'
 import TextInput from '@/components/ui/TextInput.vue'
-import { replyLengthStops, replyStopLabel as fmtStop, formatReplyTokens as fmtTokens, TOOL_CALL_STOPS } from '@/lib/studio-settings-layout'
+import { TOOL_CALL_STOPS } from '@/lib/studio-settings-layout'
 
 const settings = useSettingsStore()
-const models = useModelsStore()
-
-onMounted(() => {
-  if (!models.maxCtx) void models.fetchLimits()
-})
-
-// Reply-length stops: powers of two from 512, then a final MODEL MAXIMUM stop
-// (null) that resolves per send to whatever the window has left after the
-// prompt. The old top stop was maxCtx itself, which is not a usable setting -
-// reserving the whole window for the reply leaves nothing for the prompt, and
-// the cap doubled as that reservation. Model maximum is
-// the default now; a numbered stop is an explicit ceiling the user chose.
-const stops = computed(() => replyLengthStops(models.maxCtx))
-
-const idx = computed<number>({
-  get: () => {
-    if (settings.maxTokens == null) return stops.value.length - 1
-    const want = settings.maxTokens
-    const i = stops.value.findIndex((s) => s != null && s >= want)
-    return i < 0 ? stops.value.length - 1 : i
-  },
-  set: (v) => {
-    settings.maxTokens = stops.value[Math.min(Math.max(0, v), stops.value.length - 1)]
-  },
-})
-
-// The stored value is never rewritten to fit the current model: this watch
-// used to clamp it destructively, so one small-context model being current
-// silently turned a 32K setting into 4096 - which then capped every send,
-// on every model, until noticed. A model whose context
-// is smaller than the setting bounds the OUTPUT at use time (the runner
-// clamps server-side; providers clamp themselves); the slider just shows
-// its top stop while such a model is current.
 
 // How many tools one reply may run. "Server default" (0 here, null on the
 // wire) sends nothing and leaves the server's own budget alone - the
@@ -112,7 +78,6 @@ const revealDenied = ref(false)
 // conversation does - whether opening a photo you attached makes a network
 // request, and to whom. The head names the host rather than echoing the
 // template, because the host is the part that matters here.
-const mapHost = computed(() => tileHost(tileTemplate(settings.mapTiles, settings.theme)))
 
 async function revealMics(): Promise<void> {
   revealing.value = true
@@ -132,23 +97,13 @@ async function revealMics(): Promise<void> {
 
     <section class="settings__card">
       <div class="settings__head">
-        <h2>Max reply length</h2>
-        <span class="settings__val">{{ fmtStop(stops[idx]) }}</span>
+        <h2>Reply limit</h2>
+        <ReplyLimitControl v-model="settings.maxTokens" class="settings__control" />
       </div>
       <p class="settings__sub">
-        The longest a single reply can be. Thinking and answer share this budget, and a reply
-        can't exceed the context window.
+        Applies to text replies, including thinking. Automatic uses each model’s available capacity.
+        A custom value is an upper limit, not a target length.
       </p>
-      <Slider v-model="idx" :min="0" :max="stops.length - 1" :step="1" class="settings__slider" />
-      <div class="settings__stops">
-        <span
-          v-for="(s, i) in stops"
-          :key="s ?? 'max'"
-          class="settings__stop"
-          :class="{ 'settings__stop--cur': i === idx }"
-          >{{ s == null ? 'Max' : fmtTokens(s) }}</span
-        >
-      </div>
     </section>
 
     <section class="settings__card">
@@ -212,7 +167,7 @@ async function revealMics(): Promise<void> {
     <section class="settings__card">
       <div class="settings__head">
         <h2>Map tiles</h2>
-        <span class="settings__val">{{ mapHost }}</span>
+        <TextInput v-model="settings.mapTiles" block placeholder="Follow the theme" aria-label="Map tiles" />
       </div>
       <p class="settings__sub">
         A photo with GPS shows a map drawn from an outline inside Paddock, which contacts nobody.
@@ -220,13 +175,13 @@ async function revealMics(): Promise<void> {
         the photo was taken. Leave it empty for a basemap that follows your theme, or name a
         server - your own, or OpenStreetMap's at {{ OSM_TILES }}.
       </p>
-      <TextInput v-model="settings.mapTiles" block placeholder="Follow the theme" />
     </section>
   </div>
 </template>
 
 <style scoped>
 .settings {
+  container-type: inline-size;
   max-width: var(--pk-panel-width);
   width: 100%;
   margin: 0 auto;
@@ -239,6 +194,9 @@ async function revealMics(): Promise<void> {
   margin-bottom: 20px;
 }
 .settings__card {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.9fr) minmax(0, 1.5fr);
+  gap: 8px 24px;
   border: 1px solid var(--pk-border-default);
   border-radius: var(--pk-radius-lg);
   background: var(--pk-bg-surface);
@@ -246,128 +204,38 @@ async function revealMics(): Promise<void> {
   margin-bottom: 14px;
 }
 .settings__head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
+  display: contents;
 }
 .settings__head h2 {
+  grid-column: 1;
+  padding-top: 7px;
   font-size: var(--pk-font-size-base);
   font-weight: 600;
   color: var(--pk-text-primary);
 }
-.settings__val {
-  font-family: var(--pk-font-mono);
-  font-size: var(--pk-font-size-sm);
-  color: var(--pk-accent-text);
-}
 .settings__sub {
+  grid-column: 2;
   font-size: var(--pk-font-size-sm);
   color: var(--pk-text-secondary);
   line-height: 1.5;
-  margin: 6px 0 16px;
+  margin: 0;
 }
 .settings__warn {
+  grid-column: 2;
   font-size: var(--pk-font-size-sm);
   color: var(--pk-status-warning);
   line-height: 1.5;
   margin: 6px 0 0;
 }
-.settings__sub code {
-  font-family: var(--pk-font-mono);
-  font-size: 0.9em;
-  background: var(--pk-bg-inset);
-  padding: 1px 5px;
-  border-radius: var(--pk-radius-sm);
-}
-.settings__slider {
-  margin: 4px 0 10px;
-}
 .settings__pick {
-  min-width: 168px;
-}
-.settings__stops {
-  display: flex;
-  justify-content: space-between;
-  gap: 4px;
-}
-.settings__stop {
-  font-family: var(--pk-font-mono);
-  font-size: 11px;
-  color: var(--pk-text-muted);
-}
-.settings__stop--cur {
-  color: var(--pk-accent-text);
-  font-weight: 600;
-}
-.seg {
-  display: inline-flex;
-  gap: 4px;
-  padding: 3px;
-  background: var(--pk-bg-inset);
-  border-radius: var(--pk-radius-md);
-  width: fit-content;
-}
-.seg__btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border: none;
-  border-radius: var(--pk-radius-sm);
-  background: transparent;
-  color: var(--pk-text-secondary);
-  font-size: var(--pk-font-size-sm);
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-.seg__btn--on {
-  background: var(--pk-bg-elevated);
-  color: var(--pk-text-primary);
-  box-shadow: var(--pk-shadow-sm);
-}
-.settings__searchrow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-}
-.settings__searchkey {
-  flex: 1;
   min-width: 0;
-  font-family: var(--pk-font-mono);
+  width: 100%;
 }
-.settings__testres {
-  margin-top: 10px;
-  font-size: var(--pk-font-size-sm);
-  color: var(--pk-status-success);
-}
-.settings__testres--bad {
-  color: var(--pk-text-danger);
-}
-.settings__stats {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 4px;
-}
-.settings__stats > div {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-}
-.settings__stats dt {
-  font-size: var(--pk-font-size-sm);
-  color: var(--pk-text-secondary);
-}
-.settings__stats dd {
-  font-family: var(--pk-font-mono);
-  font-size: var(--pk-font-size-xs);
-  color: var(--pk-text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.settings__head > :not(h2) { grid-column: 2; justify-self: start; max-width: 100%; }
+.settings__control { width: 100%; }
+@container (max-width: 520px) {
+  .settings__card { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .settings__head > :not(h2), .settings__sub, .settings__warn { grid-column: 1; }
+  .settings__head h2 { padding-top: 0; }
 }
 </style>

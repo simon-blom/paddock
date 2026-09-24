@@ -1,0 +1,7 @@
+[
+  {"name":"invoice","raw":"Invoice\n<table><tr><th>Item</th><th>Cost</th></tr><tr><td>Paper</td><td>42.00</td></tr></table>","display":"Invoice\n\n\n| Item | Cost |\n| --- | --- |\n| Paper | 42.00 |\n\n"},
+  {"name":"entities and whitespace","raw":"<table><tr><td>Å &amp; Ö</td><td>&#x1F98A;</td></tr><tr><td>one\n two&nbsp;three</td><td>x|y</td></tr></table>","display":"\n\n| Å & Ö | 🦊 |\n| --- | --- |\n| one two three | x\\|y |\n\n"},
+  {"name":"uneven rows and spans","raw":"<table><tbody><tr><td colspan=2>Heading</td></tr><tr><td>A</td><td>B</td></tr></tbody></table>","display":"\n\n| Heading |  |\n| --- | --- |\n| A | B |\n\n"},
+  {"name":"unclosed stream","raw":"<table><tr><td>Still reading","display":"<table><tr><td>Still reading"},
+  {"name":"formatted cell text","raw":"<table><tr><td><b>Bold</b> <i>label</i></td></tr><tr><td>Second</td></tr></table>","display":"\n\n| Bold label |\n| --- |\n| Second |\n\n"}
+]

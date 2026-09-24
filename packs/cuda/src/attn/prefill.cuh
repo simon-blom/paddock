@@ -22,6 +22,29 @@
 // across rows (true for every prefill path: all rows of one pass share one
 // KV slot) - the engine dispatch falls back to the decode kernel otherwise.
 #define PD_APF_TQ 16
+
+// SLIDING-WINDOW FLOOR (2026-09-23, the win_pos lane). `positions[b]` is a
+// row's attention BOUND - the last key it may read - and every arm below
+// used to derive the window's first key from it too (`bound + 1 - swa`).
+// That is right for a causal row, whose bound IS its position, and wrong for
+// a bidirectional span (the diffusion canvas, an image span, the DFlash
+// block): those rows carry a bound past their own position, so the first
+// rows of a 256-wide canvas lost up to 255 of their oldest 1024 keys on the
+// sliding layers. `win_pos` is the row's TRUE position, nullable: null means
+// "same as positions" (every causal caller, bit-identical to before), and a
+// span passes its real positions. Each arm stages both arrays and derives
+// the tile start and the per-row floor from `wp`, the bound from
+// `positions`.
+__device__ __forceinline__ const unsigned int* pd_pf_wp(
+    const unsigned int* __restrict__ positions,
+    const unsigned int* __restrict__ win_pos) {
+    return win_pos ? win_pos : positions;
+}
+// first key a row at true position `wpos` may read on a window-`swa` layer
+__device__ __forceinline__ uint32_t pd_pf_floor(uint32_t wpos, uint32_t swa) {
+    return (swa > 0 && wpos + 1u > swa) ? wpos + 1u - swa : 0u;
+}
+
 template<typename KV, uint32_t HD>
 __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
@@ -29,7 +52,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     float* __restrict__ out, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
     // TK sized so the f32 K/V/Q tiles fit the opt-in shared window; DPL =
     // dims per lane (the slice of the output vector each lane accumulates)
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
@@ -40,12 +64,14 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     extern __shared__ float pd_apf_sh[];
     float* sh_q = pd_apf_sh;                            // [TQ][QPAD]
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
+    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
 
     // stage the 16 queries (dead rows -> 0) and per-query key bounds
     #pragma unroll
@@ -54,8 +80,10 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
         const uint32_t b = row0 + qi;
         sh_q[qi * QPAD + dd] = b < n_rows ? q[((size_t)b * n_heads + h) * HD + dd] : 0.f;
     }
-    if (tid < PD_APF_TQ)
+    if (tid < PD_APF_TQ) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
@@ -67,8 +95,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const bool live0 = b0 < n_rows, live1 = b1 < n_rows;
     const uint32_t pos0 = live0 ? positions[b0] : 0u;
     const uint32_t pos1 = live1 ? positions[b1] : 0u;
-    const uint32_t fp0 = (swa_window > 0 && pos0 + 1u > swa_window) ? pos0 + 1u - swa_window : 0u;
-    const uint32_t fp1 = (swa_window > 0 && pos1 + 1u > swa_window) ? pos1 + 1u - swa_window : 0u;
+    const uint32_t fp0 = pd_pf_floor(live0 ? wp[b0] : 0u, swa_window);
+    const uint32_t fp1 = pd_pf_floor(live1 ? wp[b1] : 0u, swa_window);
     float m0 = sinks[h], l0 = 1.f, m1 = m0, l1 = 1.f;
     float a0[DPL] = {}, a1[DPL] = {};
 
@@ -86,7 +114,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < PD_APF_TQ; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -183,9 +211,10 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
 template<typename KV, uint32_t HD>
 static int pd_attn_prefill_launch(const void* q, const void* kc, const void* vc,
                                   const void* sinks, void* out, const void* positions,
-                                  const void* slots, uint32_t n_heads, uint32_t n_kv_heads,
-                                  uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window,
-                                  uint32_t batch, float scale, cudaStream_t stream) {
+                                  const void* win_pos, const void* slots, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
+                                  uint32_t swa_window, uint32_t batch, float scale,
+                                  cudaStream_t stream) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t QPAD = HD + 4u;
     constexpr uint32_t SMEM =
@@ -198,16 +227,20 @@ static int pd_attn_prefill_launch(const void* q, const void* kc, const void* vc,
     pd_attn_prefill_kernel<KV, HD><<<grid, 256, SMEM, stream>>>(
         (const float*)q, (const KV*)kc, (const KV*)vc, (const float*)sinks,
         (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale,
+        (const unsigned int*)win_pos);
     return pd_launch_status();
 }
 
-PD_EXPORT
-int pd_attn_prefill(const void* q, const void* kc, const void* vc, const void* sinks,
-                    void* out, const void* positions, const void* slots, uint32_t n_heads,
-                    uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
-                    uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
-                    void* stream) {
+// The dense scalar prefill entry, with the window floors from `win_pos`
+// (nullable - see pd_pf_wp). `pd_attn_prefill` is the original export
+// (null), `pd_attn_prefill_wp` the appended one that takes the array.
+static int pd_attn_prefill_impl(const void* q, const void* kc, const void* vc,
+                                const void* sinks, void* out, const void* positions,
+                                const void* win_pos, const void* slots, uint32_t n_heads,
+                                uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx,
+                                uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                float scale, uint32_t kv_dtype, void* stream) {
     if (n_heads == 0 || batch == 0) return 0;
     // 512 = gemma4's global-layer geometry; its smem (TQ 16, TK 16) is
     // 100,928 B - inside sm_120's 101,376 B opt-in cap with 448 B to spare
@@ -217,21 +250,48 @@ int pd_attn_prefill(const void* q, const void* kc, const void* vc, const void* s
     if (kv_dtype == PD_KV_FP8_E4M3) {
         return head_dim == 128u
             ? pd_attn_prefill_launch<__nv_fp8_e4m3, 128u>(q, kc, vc, sinks, out, positions,
-                  slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
+                  win_pos, slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch,
+                  scale, st)
             : head_dim == 256u
             ? pd_attn_prefill_launch<__nv_fp8_e4m3, 256u>(q, kc, vc, sinks, out, positions,
-                  slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
+                  win_pos, slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch,
+                  scale, st)
             : pd_attn_prefill_launch<__nv_fp8_e4m3, 512u>(q, kc, vc, sinks, out, positions,
-                  slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st);
+                  win_pos, slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch,
+                  scale, st);
     }
     return head_dim == 128u
-        ? pd_attn_prefill_launch<__half, 128u>(q, kc, vc, sinks, out, positions, slots,
-              n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
+        ? pd_attn_prefill_launch<__half, 128u>(q, kc, vc, sinks, out, positions, win_pos,
+              slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
         : head_dim == 256u
-        ? pd_attn_prefill_launch<__half, 256u>(q, kc, vc, sinks, out, positions, slots,
-              n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
-        : pd_attn_prefill_launch<__half, 512u>(q, kc, vc, sinks, out, positions, slots,
-              n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st);
+        ? pd_attn_prefill_launch<__half, 256u>(q, kc, vc, sinks, out, positions, win_pos,
+              slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st)
+        : pd_attn_prefill_launch<__half, 512u>(q, kc, vc, sinks, out, positions, win_pos,
+              slots, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, st);
+}
+
+PD_EXPORT
+int pd_attn_prefill(const void* q, const void* kc, const void* vc, const void* sinks,
+                    void* out, const void* positions, const void* slots, uint32_t n_heads,
+                    uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
+                    uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
+                    void* stream) {
+    return pd_attn_prefill_impl(q, kc, vc, sinks, out, positions, nullptr, slots, n_heads,
+                                n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, batch,
+                                scale, kv_dtype, stream);
+}
+
+// slot 651: pd_attn_prefill + `win_pos` after `positions`
+PD_EXPORT
+int pd_attn_prefill_wp(const void* q, const void* kc, const void* vc, const void* sinks,
+                       void* out, const void* positions, const void* win_pos,
+                       const void* slots, uint32_t n_heads, uint32_t n_kv_heads,
+                       uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
+                       uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
+                       void* stream) {
+    return pd_attn_prefill_impl(q, kc, vc, sinks, out, positions, win_pos, slots, n_heads,
+                                n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, batch,
+                                scale, kv_dtype, stream);
 }
 
 // ---------------------------------------- PAGED tiled prefill (P4b)
@@ -249,7 +309,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;  // 16B-aligned rows, conflict-free f4
@@ -258,12 +319,14 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     extern __shared__ float pd_apf_sh[];
     float* sh_q = pd_apf_sh;                            // [TQ][QPAD]
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
+    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
 
     #pragma unroll
     for (uint32_t it = 0; it < PD_APF_TQ * HD / 256u; ++it) {
@@ -271,8 +334,10 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
         const uint32_t b = row0 + qi;
         sh_q[qi * QPAD + dd] = b < n_rows ? q[((size_t)b * n_heads + h) * HD + dd] : 0.f;
     }
-    if (tid < PD_APF_TQ)
+    if (tid < PD_APF_TQ) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
@@ -283,8 +348,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
     const bool live0 = b0 < n_rows, live1 = b1 < n_rows;
     const uint32_t pos0 = live0 ? positions[b0] : 0u;
     const uint32_t pos1 = live1 ? positions[b1] : 0u;
-    const uint32_t fp0 = (swa_window > 0 && pos0 + 1u > swa_window) ? pos0 + 1u - swa_window : 0u;
-    const uint32_t fp1 = (swa_window > 0 && pos1 + 1u > swa_window) ? pos1 + 1u - swa_window : 0u;
+    const uint32_t fp0 = pd_pf_floor(live0 ? wp[b0] : 0u, swa_window);
+    const uint32_t fp1 = pd_pf_floor(live1 ? wp[b1] : 0u, swa_window);
     float m0 = sinks[h], l0 = 1.f, m1 = m0, l1 = 1.f;
     float a0[DPL] = {}, a1[DPL] = {};
 
@@ -297,7 +362,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < PD_APF_TQ; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -397,7 +462,8 @@ static int pd_attn_prefill_paged_launch(const void* q, const void* pool_k, const
                                         const void* slots, const void* block_tables,
                                         uint32_t blocks_per_slot, uint32_t n_heads,
                                         uint32_t n_kv_heads, uint32_t kv_dim, uint32_t swa_window,
-                                        uint32_t batch, float scale, cudaStream_t stream) {
+                                        uint32_t batch, float scale, cudaStream_t stream,
+                                        const void* win_pos = nullptr) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t QPAD = HD + 4u;
     constexpr uint32_t SMEM =
@@ -411,7 +477,7 @@ static int pd_attn_prefill_paged_launch(const void* q, const void* pool_k, const
         (const float*)q, (const KV*)pool_k, (const KV*)pool_v, (const float*)sinks,
         (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
         (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, kv_dim,
-        swa_window, batch, scale);
+        swa_window, batch, scale, (const unsigned int*)win_pos);
     return pd_launch_status();
 }
 
@@ -473,13 +539,15 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     const unsigned int* __restrict__ slots, const unsigned int* __restrict__ tile_row0,
     const unsigned int* __restrict__ tile_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;
     const uint32_t h = blockIdx.x;
     const uint32_t row0 = tile_row0[blockIdx.y];
     const uint32_t slot = tile_slot[blockIdx.y];
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
 
@@ -488,6 +556,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
+    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
 
     // stage the 16 queries; a row is live only if in range AND in this slot
     #pragma unroll
@@ -499,7 +568,9 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     }
     if (tid < PD_APF_TQ) {
         const uint32_t b = row0 + tid;
-        sh_hi[tid] = (b < n_rows && slots[b] == slot) ? positions[b] + 1u : 0u;
+        const bool live = b < n_rows && slots[b] == slot;
+        sh_hi[tid] = live ? positions[b] + 1u : 0u;
+        sh_lo[tid] = live ? wp[b] + 1u : 0u;
     }
     __syncthreads();
     uint32_t hi = 0;
@@ -513,8 +584,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     const bool live1 = b1 < n_rows && slots[b1] == slot;
     const uint32_t pos0 = live0 ? positions[b0] : 0u;
     const uint32_t pos1 = live1 ? positions[b1] : 0u;
-    const uint32_t fp0 = (swa_window > 0 && pos0 + 1u > swa_window) ? pos0 + 1u - swa_window : 0u;
-    const uint32_t fp1 = (swa_window > 0 && pos1 + 1u > swa_window) ? pos1 + 1u - swa_window : 0u;
+    const uint32_t fp0 = pd_pf_floor(live0 ? wp[b0] : 0u, swa_window);
+    const uint32_t fp1 = pd_pf_floor(live1 ? wp[b1] : 0u, swa_window);
     float m0 = sinks[h], l0 = 1.f, m1 = m0, l1 = 1.f;
     float a0[DPL] = {}, a1[DPL] = {};
 
@@ -532,7 +603,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < PD_APF_TQ; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -640,7 +711,8 @@ static int pd_attn_prefill_batch_launch(
         (const float*)q, (const KV*)kc, (const KV*)vc, (const float*)sinks,
         (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
         (const unsigned int*)tile_row0, (const unsigned int*)tile_slot,
-        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, n_rows, scale);
+        n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, n_rows, scale,
+        nullptr);  // causal rows only (the encoder's ragged batch): floors from positions
     return pd_launch_status();
 }
 
@@ -714,7 +786,8 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
     float* __restrict__ out, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     using namespace nvcuda;
     // D=512 (gemma4 global): halve the query tile - NC 32's static smem
@@ -738,6 +811,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     __shared__ half sh_q[NC * DP];
     __shared__ float sh_s[NC * KQP];   // scores f32; P overwrites as f16
@@ -745,6 +819,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
     __shared__ float sh_corr[NC];
     __shared__ float sh_onorm[NC];
     __shared__ uint32_t sh_hi[NC];
+    __shared__ uint32_t sh_lo[NC];     // window floors (+1), from wp
     half* sh_p = (half*)sh_s;          // P at half stride 2*KQP, in place
 
     // stage Q (f32 -> f16, pre-scaled; dead rows 0), zero O, key bounds
@@ -756,8 +831,10 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
             b < n_rows ? q[((size_t)b * n_heads + h) * D + dd] * scale : 0.f);
         sh_o[j * DP + dd] = __float2half(0.f);
     }
-    if (tid < NC)
+    if (tid < NC) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
@@ -791,7 +868,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NC; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -824,8 +901,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
             const uint32_t b = row0 + j;
             const bool live = b < n_rows;
             const uint32_t pos = live ? positions[b] : 0u;
-            const uint32_t fp =
-                (swa_window > 0 && pos + 1u > swa_window) ? pos + 1u - swa_window : 0u;
+            const uint32_t fp = pd_pf_floor(live ? wp[b] : 0u, swa_window);
             float s0 = -1e30f, s1 = -1e30f;
             const uint32_t k0 = t0 + lane, k1 = t0 + 32u + lane;
             if (live && k0 >= fp && k0 <= pos && k0 < hi) s0 = sh_s[j * KQP + lane];
@@ -947,7 +1023,8 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     using namespace nvcuda;
     // D=512 (gemma4 global): halve the query tile - NC 32's static smem
@@ -971,6 +1048,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     __shared__ half sh_q[NC * DP];
     __shared__ float sh_s[NC * KQP];   // scores f32; P overwrites as f16
@@ -978,6 +1056,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
     __shared__ float sh_corr[NC];
     __shared__ float sh_onorm[NC];
     __shared__ uint32_t sh_hi[NC];
+    __shared__ uint32_t sh_lo[NC];     // window floors (+1), from wp
     half* sh_p = (half*)sh_s;          // P at half stride 2*KQP, in place
 
     #pragma unroll
@@ -988,8 +1067,10 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
             b < n_rows ? q[((size_t)b * n_heads + h) * D + dd] * scale : 0.f);
         sh_o[j * DP + dd] = __float2half(0.f);
     }
-    if (tid < NC)
+    if (tid < NC) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
@@ -1016,7 +1097,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NC; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -1051,8 +1132,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
             const uint32_t b = row0 + j;
             const bool live = b < n_rows;
             const uint32_t pos = live ? positions[b] : 0u;
-            const uint32_t fp =
-                (swa_window > 0 && pos + 1u > swa_window) ? pos + 1u - swa_window : 0u;
+            const uint32_t fp = pd_pf_floor(live ? wp[b] : 0u, swa_window);
             float s0 = -1e30f, s1 = -1e30f;
             const uint32_t k0 = t0 + lane, k1 = t0 + 32u + lane;
             if (live && k0 >= fp && k0 <= pos && k0 < hi) s0 = sh_s[j * KQP + lane];
@@ -1197,7 +1277,8 @@ pd_attn_prefill_f16_v2_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     // D=512 (gemma4 global): halve the query tile - NC 32's static smem
     // (sh_q+sh_o = 2*32*520 half) would blow the 48 KB static window; NC 16
@@ -1216,12 +1297,14 @@ pd_attn_prefill_f16_v2_kernel(
     const uint32_t g8 = lane >> 2, t4 = lane & 3u;
     const uint32_t kvh = h / (n_heads / n_kv_heads);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     __shared__ half sh_q[NC * DP];
     __shared__ float sh_s[NC * KQP];  // scores f32; P overwrites as f16
     __shared__ float sh_corr[NC];
     __shared__ float sh_onorm[NC];
     __shared__ uint32_t sh_hi[NC];
+    __shared__ uint32_t sh_lo[NC];     // window floors (+1), from wp
     half* sh_p = (half*)sh_s;
 
     // stage Q (f32 -> f16 pre-scaled; dead rows zero) + key bounds
@@ -1232,8 +1315,10 @@ pd_attn_prefill_f16_v2_kernel(
         sh_q[j * DP + dd] = __float2half(
             b < n_rows ? q[((size_t)b * n_heads + h) * D + dd] * scale : 0.f);
     }
-    if (tid < NC)
+    if (tid < NC) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
@@ -1266,7 +1351,7 @@ pd_attn_prefill_f16_v2_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NC; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -1323,8 +1408,7 @@ pd_attn_prefill_f16_v2_kernel(
             const uint32_t b = row0 + j;
             const bool live = b < n_rows;
             const uint32_t pos = live ? positions[b] : 0u;
-            const uint32_t fp =
-                (swa_window > 0 && pos + 1u > swa_window) ? pos + 1u - swa_window : 0u;
+            const uint32_t fp = pd_pf_floor(live ? wp[b] : 0u, swa_window);
             float s0 = -1e30f, s1 = -1e30f;
             const uint32_t k0 = t0 + lane, k1 = t0 + 32u + lane;
             if (live && k0 >= fp && k0 <= pos && k0 < hi) s0 = sh_s[j * KQP + lane];
@@ -1488,7 +1572,8 @@ pd_attn_prefill_f16_v3_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     // 256 threads = 8 warps = the kv-head's 8 q-heads, one whole head per
     // warp: S, softmax, P and O all stay in that warp's registers (no P/corr
@@ -1506,26 +1591,31 @@ pd_attn_prefill_f16_v3_kernel(
     const uint32_t g8 = lane >> 2, t4 = lane & 3u;
     const uint32_t h = kvh * GH + warp;
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     extern __shared__ unsigned char af3sh[];
     __half* sh_k = reinterpret_cast<__half*>(af3sh);   // [TK][DPD]
     __half* sh_vt = sh_k + TK * DPD;                   // [D][KP] transposed
     __shared__ uint32_t sh_hi[NR];
+    __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
 
-    if (tid < NR)
+    if (tid < NR) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
     for (uint32_t i = 0; i < NR; ++i) hi = max(hi, sh_hi[i]);
 
     const uint32_t jr[2] = {g8, g8 + 8u};
-    uint32_t posr[2]; bool liver[2];
+    uint32_t posr[2], winr[2]; bool liver[2];
     #pragma unroll
     for (uint32_t e = 0; e < 2u; ++e) {
         const uint32_t b = row0 + jr[e];
         liver[e] = b < n_rows;
         posr[e] = liver[e] ? positions[b] : 0u;
+        winr[e] = liver[e] ? wp[b] : 0u;
     }
 
     // Q pinned in registers, pre-scaled
@@ -1568,7 +1658,7 @@ pd_attn_prefill_f16_v3_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NR; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -1616,8 +1706,7 @@ pd_attn_prefill_f16_v3_kernel(
             #pragma unroll
             for (uint32_t e = 0; e < 4u; ++e) {
                 const uint32_t r = e >> 1, kk = kbase + (e & 1u);
-                const uint32_t fp = (swa_window > 0 && posr[r] + 1u > swa_window)
-                                        ? posr[r] + 1u - swa_window : 0u;
+                const uint32_t fp = pd_pf_floor(winr[r], swa_window);
                 const bool ok = liver[r] && kk >= fp && kk <= posr[r] && kk < hi;
                 if (!ok) s_acc[nt][e] = -1e30f;
                 mn[r] = fmaxf(mn[r], s_acc[nt][e]);
@@ -1749,7 +1838,8 @@ pd_attn_prefill_f16_v3w_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     constexpr uint32_t NR = PD_AF3W_NR, TK = PD_AF3W_TK;
     constexpr uint32_t HB = 4u;        // heads per block (half the 8-group)
@@ -1766,6 +1856,7 @@ pd_attn_prefill_f16_v3w_kernel(
     const uint32_t h = kvh * 8u + pair * HB + hw;
     const uint32_t dbase = hf * DH;    // this warp's dim range [dbase, dbase+DH)
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     extern __shared__ unsigned char af3wsh[];
     __half* sh_k = reinterpret_cast<__half*>(af3wsh);   // [TK][DPD] full D
@@ -1780,21 +1871,25 @@ pd_attn_prefill_f16_v3w_kernel(
     // partial-S exchange panes: [HB][2][TK/8][4][32] f32, lane-owned words
     float* sh_sp = reinterpret_cast<float*>(sh_k + (size_t)TK * DPD);
     __shared__ uint32_t sh_hi[NR];
+    __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
 
-    if (tid < NR)
+    if (tid < NR) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
     for (uint32_t i = 0; i < NR; ++i) hi = max(hi, sh_hi[i]);
 
     const uint32_t jr[2] = {g8, g8 + 8u};
-    uint32_t posr[2]; bool liver[2];
+    uint32_t posr[2], winr[2]; bool liver[2];
     #pragma unroll
     for (uint32_t e = 0; e < 2u; ++e) {
         const uint32_t b = row0 + jr[e];
         liver[e] = b < n_rows;
         posr[e] = liver[e] ? positions[b] : 0u;
+        winr[e] = liver[e] ? wp[b] : 0u;
     }
 
     // Q-half pinned in registers, pre-scaled
@@ -1851,7 +1946,7 @@ pd_attn_prefill_f16_v3w_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NR; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -1950,8 +2045,7 @@ pd_attn_prefill_f16_v3w_kernel(
             #pragma unroll
             for (uint32_t e = 0; e < 4u; ++e) {
                 const uint32_t r = e >> 1, kk = kbase + (e & 1u);
-                const uint32_t fp = (swa_window > 0 && posr[r] + 1u > swa_window)
-                                        ? posr[r] + 1u - swa_window : 0u;
+                const uint32_t fp = pd_pf_floor(winr[r], swa_window);
                 const bool ok = liver[r] && kk >= fp && kk <= posr[r] && kk < hi;
                 if (!ok) s_acc[nt][e] = -1e30f;
                 mn[r] = fmaxf(mn[r], s_acc[nt][e]);
@@ -2095,7 +2189,8 @@ pd_attn_prefill_f16_v3s_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     constexpr uint32_t D = 256u;
     constexpr uint32_t NR = PD_AF3S_NR, TK = PD_AF3S_TK;
@@ -2110,25 +2205,30 @@ pd_attn_prefill_f16_v3s_kernel(
     const uint32_t kvh = kvb * KB + kvl;
     const uint32_t h = kvh * 2u + (warp & 1u);
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     extern __shared__ unsigned char af3ssh[];
     __half* sh_k = reinterpret_cast<__half*>(af3ssh);  // [KB][TK][DPD]
     __shared__ uint32_t sh_hi[NR];
+    __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
 
-    if (tid < NR)
+    if (tid < NR) {
         sh_hi[tid] = (row0 + tid) < n_rows ? positions[row0 + tid] + 1u : 0u;
+        sh_lo[tid] = (row0 + tid) < n_rows ? wp[row0 + tid] + 1u : 0u;
+    }
     __syncthreads();
     uint32_t hi = 0;
     #pragma unroll
     for (uint32_t i = 0; i < NR; ++i) hi = max(hi, sh_hi[i]);
 
     const uint32_t jr[2] = {g8, g8 + 8u};
-    uint32_t posr[2]; bool liver[2];
+    uint32_t posr[2], winr[2]; bool liver[2];
     #pragma unroll
     for (uint32_t e = 0; e < 2u; ++e) {
         const uint32_t b = row0 + jr[e];
         liver[e] = b < n_rows;
         posr[e] = liver[e] ? positions[b] : 0u;
+        winr[e] = liver[e] ? wp[b] : 0u;
     }
 
     uint32_t qa[D / 16u][4];
@@ -2180,7 +2280,7 @@ pd_attn_prefill_f16_v3s_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NR; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -2240,8 +2340,7 @@ pd_attn_prefill_f16_v3s_kernel(
             #pragma unroll
             for (uint32_t e = 0; e < 4u; ++e) {
                 const uint32_t r = e >> 1, kk = kbase + (e & 1u);
-                const uint32_t fp = (swa_window > 0 && posr[r] + 1u > swa_window)
-                                        ? posr[r] + 1u - swa_window : 0u;
+                const uint32_t fp = pd_pf_floor(winr[r], swa_window);
                 const bool ok = liver[r] && kk >= fp && kk <= posr[r] && kk < hi;
                 if (!ok) s_acc[nt][e] = -1e30f;
                 mn[r] = fmaxf(mn[r], s_acc[nt][e]);
@@ -2448,7 +2547,8 @@ pd_attn_prefill_f16_v3c_kernel(
     const unsigned int* __restrict__ slots,
     const uint32_t* __restrict__ block_tables, uint32_t blocks_per_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
-    uint32_t swa_window, uint32_t n_rows, float scale) {
+    uint32_t swa_window, uint32_t n_rows, float scale,
+    const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     constexpr uint32_t D = 256u;
     constexpr uint32_t NR = PD_AF3C_NR, TK = PD_AF3C_TK;
@@ -2462,6 +2562,7 @@ pd_attn_prefill_f16_v3c_kernel(
     const uint32_t h = kvh * 2u + qh;
     const uint32_t row0 = blockIdx.y * NR + rg * 16u;
     const uint32_t slot = slots ? slots[0] : 0u;
+    const unsigned int* wp = pd_pf_wp(positions, win_pos);
 
     // fp8 KV runs the cp.async pipe; f16 tiles are 2x the bytes
     // and would not fit a raw stage region under the smem cap
@@ -2473,10 +2574,12 @@ pd_attn_prefill_f16_v3c_kernel(
     // PIPE only: next tile's raw fp8 bytes land here via cp.async
     unsigned char* sh_raw = reinterpret_cast<unsigned char*>(sh_v + (size_t)TK * DPD);
     __shared__ uint32_t sh_hi[NR];
+    __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
 
     if (tid < NR) {
         const uint32_t b = blockIdx.y * NR + tid;
         sh_hi[tid] = b < n_rows ? positions[b] + 1u : 0u;
+        sh_lo[tid] = b < n_rows ? wp[b] + 1u : 0u;
     }
     __syncthreads();
     uint32_t hi = 0;
@@ -2484,12 +2587,13 @@ pd_attn_prefill_f16_v3c_kernel(
     for (uint32_t i = 0; i < NR; ++i) hi = max(hi, sh_hi[i]);
 
     const uint32_t jr[2] = {g8, g8 + 8u};
-    uint32_t posr[2]; bool liver[2];
+    uint32_t posr[2], winr[2]; bool liver[2];
     #pragma unroll
     for (uint32_t e = 0; e < 2u; ++e) {
         const uint32_t b = row0 + jr[e];
         liver[e] = b < n_rows;
         posr[e] = liver[e] ? positions[b] : 0u;
+        winr[e] = liver[e] ? wp[b] : 0u;
     }
 
     uint32_t qa[D / 16u][4];
@@ -2541,7 +2645,7 @@ pd_attn_prefill_f16_v3c_kernel(
         uint32_t lo1 = 0xFFFFFFFFu;
         #pragma unroll
         for (uint32_t i = 0; i < NR; ++i)
-            if (sh_hi[i]) lo1 = min(lo1, sh_hi[i]);
+            if (sh_lo[i]) lo1 = min(lo1, sh_lo[i]);
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
@@ -2662,8 +2766,7 @@ pd_attn_prefill_f16_v3c_kernel(
             #pragma unroll
             for (uint32_t e = 0; e < 4u; ++e) {
                 const uint32_t r = e >> 1, kk = kbase + (e & 1u);
-                const uint32_t fp = (swa_window > 0 && posr[r] + 1u > swa_window)
-                                        ? posr[r] + 1u - swa_window : 0u;
+                const uint32_t fp = pd_pf_floor(winr[r], swa_window);
                 const bool ok = liver[r] && kk >= fp && kk <= posr[r] && kk < hi;
                 if (!ok) s_acc[nt][e] = -1e30f;
                 mn[r] = fmaxf(mn[r], s_acc[nt][e]);
@@ -2790,16 +2893,19 @@ pd_attn_prefill_f16_v3c_kernel(
 #define PD_AF3_SMEM                                                            \
     ((PD_AF3_TK * (256u + 8u) + 256u * (PD_AF3_TK + 8u)) * 2u)
 
-PD_EXPORT
-int pd_attn_prefill_f16(const void* q, const void* kc, const void* vc, const void* sinks,
-                        void* out, const void* positions, const void* slots, uint32_t n_heads,
-                        uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
-                        uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
-                        void* stream) {
+// The dense WMMA prefill entry with nullable `win_pos` (see pd_pf_wp);
+// `pd_attn_prefill_f16` passes null, `pd_attn_prefill_f16_wp` the array.
+static int pd_attn_prefill_f16_impl(const void* q, const void* kc, const void* vc,
+                                    const void* sinks, void* out, const void* positions,
+                                    const void* win_pos, const void* slots, uint32_t n_heads,
+                                    uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx,
+                                    uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                    float scale, uint32_t kv_dtype, void* stream) {
     if (n_heads == 0 || batch == 0) return 0;
     if ((head_dim != 256u && head_dim != 64u && head_dim != 512u) ||
         kv_dtype == PD_KV_FP8_E4M3 || (max_ctx & 63u))
         return cudaErrorInvalidValue;
+    const unsigned int* wp = (const unsigned int*)win_pos;
     static bool carveout_done = false;
     if (!carveout_done) {
         pd_prefer_max_shared(pd_attn_prefill_f16_kernel<256u>);
@@ -2814,7 +2920,7 @@ int pd_attn_prefill_f16(const void* q, const void* kc, const void* vc, const voi
         pd_attn_prefill_f16_kernel<512u><<<grid, 128, 0, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     static const bool v3 = pd_env("PADDOCK_ATTN_PF_V3") != nullptr;
@@ -2829,7 +2935,7 @@ int pd_attn_prefill_f16(const void* q, const void* kc, const void* vc, const voi
         pd_attn_prefill_f16_v3_kernel<256u><<<g3, 256, PD_AF3_SMEM, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-            nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+            nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, wp);
         return pd_launch_status();
     }
     static const bool v2 = pd_env("PADDOCK_ATTN_PF_V2") != nullptr;
@@ -2838,25 +2944,51 @@ int pd_attn_prefill_f16(const void* q, const void* kc, const void* vc, const voi
             pd_attn_prefill_f16_v2_kernel<256u><<<grid, 128, 0, (cudaStream_t)stream>>>(
                 (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
                 (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-                nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+                nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale,
+                wp);
         else
             pd_attn_prefill_f16_v2_kernel<64u><<<grid, 128, 0, (cudaStream_t)stream>>>(
                 (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
                 (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-                nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+                nullptr, 0, n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale,
+                wp);
         return pd_launch_status();
     }
     if (head_dim == 256u) {
         pd_attn_prefill_f16_kernel<256u><<<grid, 128, 0, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, wp);
     } else {
         pd_attn_prefill_f16_kernel<64u><<<grid, 128, 0, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
-            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale);
+            n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, batch, scale, wp);
     }
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_attn_prefill_f16(const void* q, const void* kc, const void* vc, const void* sinks,
+                        void* out, const void* positions, const void* slots, uint32_t n_heads,
+                        uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
+                        uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
+                        void* stream) {
+    return pd_attn_prefill_f16_impl(q, kc, vc, sinks, out, positions, nullptr, slots, n_heads,
+                                    n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, batch,
+                                    scale, kv_dtype, stream);
+}
+
+// slot 652: pd_attn_prefill_f16 + `win_pos` after `positions`
+PD_EXPORT
+int pd_attn_prefill_f16_wp(const void* q, const void* kc, const void* vc, const void* sinks,
+                           void* out, const void* positions, const void* win_pos,
+                           const void* slots, uint32_t n_heads, uint32_t n_kv_heads,
+                           uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
+                           uint32_t swa_window, uint32_t batch, float scale,
+                           uint32_t kv_dtype, void* stream) {
+    return pd_attn_prefill_f16_impl(q, kc, vc, sinks, out, positions, win_pos, slots, n_heads,
+                                    n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, batch,
+                                    scale, kv_dtype, stream);
 }
 

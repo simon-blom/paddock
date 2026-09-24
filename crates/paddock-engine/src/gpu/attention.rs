@@ -2306,6 +2306,7 @@ impl GpuExecutor {
         sinks: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         positions: &CudaSlice<u32>,
+        win_pos: Option<&CudaSlice<u32>>,
         slots: &CudaSlice<u32>,
         n_heads: usize,
         n_kv_heads: usize,
@@ -2318,10 +2319,6 @@ impl GpuExecutor {
         scale: f32,
         kv_dtype: KvDtype,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .attn_prefill
-            .ok_or(GpuError::MissingOp("attn_prefill"))?;
         let q_bytes = (row_off * n_heads * head_dim * 4) as u64;
         let u_bytes = (row_off * 4) as u64;
         let (qp, _g1) = q.device_ptr(&self.stream);
@@ -2332,6 +2329,41 @@ impl GpuExecutor {
         let (pp, _g6) = positions.device_ptr(&self.stream);
         let (slp, _g7) = slots.device_ptr(&self.stream);
         // SAFETY: see attn_decode_batch_rows - same allocation, offset rows
+        if let Some(wpos) = win_pos {
+            // the window floors from the rows' TRUE positions (slot 651);
+            // a pack without it cannot express the span, so say so
+            let f = self
+                .kernels
+                .attn_prefill_wp
+                .ok_or(GpuError::MissingOp("attn_prefill_wp"))?;
+            let (wpp, _g8) = wpos.device_ptr(&self.stream);
+            return check(unsafe {
+                f(
+                    (qp + q_bytes) as *const _,
+                    kp as *const _,
+                    vp as *const _,
+                    sp as *const _,
+                    (op + q_bytes) as *mut _,
+                    (pp + u_bytes) as *const _,
+                    (wpp + u_bytes) as *const _,
+                    (slp + u_bytes) as *const _,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_dim as u32,
+                    swa_window as u32,
+                    rows as u32,
+                    scale,
+                    kv_dtype as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
+        let f = self
+            .kernels
+            .attn_prefill
+            .ok_or(GpuError::MissingOp("attn_prefill"))?;
         check(unsafe {
             f(
                 (qp + q_bytes) as *const _,
@@ -2365,6 +2397,7 @@ impl GpuExecutor {
         sinks: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         positions: &CudaSlice<u32>,
+        win_pos: Option<&CudaSlice<u32>>,
         slots: &CudaSlice<u32>,
         n_heads: usize,
         n_kv_heads: usize,
@@ -2377,10 +2410,6 @@ impl GpuExecutor {
         scale: f32,
         kv_dtype: KvDtype,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .attn_prefill_f16
-            .ok_or(GpuError::MissingOp("attn_prefill_f16"))?;
         let q_bytes = (row_off * n_heads * head_dim * 4) as u64;
         let u_bytes = (row_off * 4) as u64;
         let (qp, _g1) = q.device_ptr(&self.stream);
@@ -2391,6 +2420,40 @@ impl GpuExecutor {
         let (pp, _g6) = positions.device_ptr(&self.stream);
         let (slp, _g7) = slots.device_ptr(&self.stream);
         // SAFETY: see attn_decode_batch_rows
+        if let Some(wpos) = win_pos {
+            // window floors from the true positions (slot 652)
+            let f = self
+                .kernels
+                .attn_prefill_f16_wp
+                .ok_or(GpuError::MissingOp("attn_prefill_f16_wp"))?;
+            let (wpp, _g8) = wpos.device_ptr(&self.stream);
+            return check(unsafe {
+                f(
+                    (qp + q_bytes) as *const _,
+                    kp as *const _,
+                    vp as *const _,
+                    sp as *const _,
+                    (op + q_bytes) as *mut _,
+                    (pp + u_bytes) as *const _,
+                    (wpp + u_bytes) as *const _,
+                    (slp + u_bytes) as *const _,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    max_ctx as u32,
+                    kv_dim as u32,
+                    swa_window as u32,
+                    rows as u32,
+                    scale,
+                    kv_dtype as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
+        let f = self
+            .kernels
+            .attn_prefill_f16
+            .ok_or(GpuError::MissingOp("attn_prefill_f16"))?;
         check(unsafe {
             f(
                 (qp + q_bytes) as *const _,
@@ -2496,6 +2559,7 @@ impl GpuExecutor {
         sinks: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         positions: &CudaSlice<u32>,
+        win_pos: Option<&CudaSlice<u32>>,
         slots: &CudaSlice<u32>,
         block_tables: &CudaSlice<u32>,
         blocks_per_slot: usize,
@@ -2509,10 +2573,6 @@ impl GpuExecutor {
         scale: f32,
         kv_dtype: KvDtype,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .attn_prefill_f16_paged
-            .ok_or(GpuError::MissingOp("attn_prefill_f16_paged"))?;
         let q_bytes = (row_off * n_heads * head_dim * 4) as u64;
         let u_bytes = (row_off * 4) as u64;
         let (qp, _g1) = q.device_ptr(&self.stream);
@@ -2523,6 +2583,42 @@ impl GpuExecutor {
         let (pp, _g6) = positions.device_ptr(&self.stream);
         let (slp, _g7) = slots.device_ptr(&self.stream);
         let (btp, _g8) = block_tables.device_ptr(&self.stream);
+        if let Some(wpos) = win_pos {
+            // window floors from the true positions (slot 653); offset like
+            // positions - the two arrays are row-parallel
+            let f = self
+                .kernels
+                .attn_prefill_f16_paged_wp
+                .ok_or(GpuError::MissingOp("attn_prefill_f16_paged_wp"))?;
+            let (wpp, _g9) = wpos.device_ptr(&self.stream);
+            return check(unsafe {
+                f(
+                    (qp + q_bytes) as *const _,
+                    kp as *const _,
+                    vp as *const _,
+                    sp as *const _,
+                    (op + q_bytes) as *mut _,
+                    (pp + u_bytes) as *const _,
+                    (wpp + u_bytes) as *const _,
+                    (slp + u_bytes) as *const _,
+                    btp as *const _,
+                    blocks_per_slot as u32,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    kv_dim as u32,
+                    swa_window as u32,
+                    rows as u32,
+                    scale,
+                    kv_dtype as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
+        let f = self
+            .kernels
+            .attn_prefill_f16_paged
+            .ok_or(GpuError::MissingOp("attn_prefill_f16_paged"))?;
         check(unsafe {
             f(
                 (qp + q_bytes) as *const _,
@@ -3257,6 +3353,7 @@ impl GpuExecutor {
         sinks: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         positions: &CudaSlice<u32>,
+        win_pos: Option<&CudaSlice<u32>>,
         slots: &CudaSlice<u32>,
         block_tables: &CudaSlice<u32>,
         blocks_per_slot: usize,
@@ -3270,10 +3367,6 @@ impl GpuExecutor {
         scale: f32,
         kv_dtype: KvDtype,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .attn_prefill_f16_paged2
-            .ok_or(GpuError::MissingOp("attn_prefill_f16_paged2"))?;
         let q_bytes = (row_off * n_heads * head_dim * 2) as u64;
         let u_bytes = (row_off * 4) as u64;
         let (qp, _g1) = q.device_ptr(&self.stream);
@@ -3285,6 +3378,42 @@ impl GpuExecutor {
         let (slp, _g7) = slots.device_ptr(&self.stream);
         let (btp, _g8) = block_tables.device_ptr(&self.stream);
         // SAFETY: ABI contract; q/out hold f16 in the f32-typed scratch
+        if let Some(wpos) = win_pos {
+            // window floors from the true positions (slot 654)
+            let f = self
+                .kernels
+                .attn_prefill_f16_paged2_wp
+                .ok_or(GpuError::MissingOp("attn_prefill_f16_paged2_wp"))?;
+            let (wpp, _g9) = wpos.device_ptr(&self.stream);
+            return check(unsafe {
+                f(
+                    (qp + q_bytes) as *const _,
+                    kp as *const _,
+                    vp as *const _,
+                    sp as *const _,
+                    (op + q_bytes) as *mut _,
+                    (pp + u_bytes) as *const _,
+                    (wpp + u_bytes) as *const _,
+                    (slp + u_bytes) as *const _,
+                    btp as *const _,
+                    blocks_per_slot as u32,
+                    n_heads as u32,
+                    n_kv_heads as u32,
+                    head_dim as u32,
+                    kv_dim as u32,
+                    swa_window as u32,
+                    rows as u32,
+                    scale,
+                    kv_dtype as u32,
+                    1u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
+        let f = self
+            .kernels
+            .attn_prefill_f16_paged2
+            .ok_or(GpuError::MissingOp("attn_prefill_f16_paged2"))?;
         check(unsafe {
             f(
                 (qp + q_bytes) as *const _,

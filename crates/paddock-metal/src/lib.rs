@@ -77,6 +77,10 @@ pub use gemma4::Gemma4;
 #[cfg(target_os = "macos")]
 mod qwen3;
 #[cfg(target_os = "macos")]
+mod qwen_image;
+#[cfg(target_os = "macos")]
+pub use qwen_image::QwenImage;
+#[cfg(target_os = "macos")]
 pub use qwen3::Qwen3Encoder;
 #[cfg(target_os = "macos")]
 mod gpt_oss;

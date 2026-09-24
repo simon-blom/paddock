@@ -41,6 +41,11 @@ pub struct Identify {
     /// wire so an older runner still identifies.
     #[serde(default)]
     pub aligner: Option<String>,
+    /// Served image-generation model id, if one is loaded. Same story as
+    /// `asr` and `aligner`: an image runner carries only this. Optional on
+    /// the wire so an older runner still identifies.
+    #[serde(default)]
+    pub image: Option<String>,
     /// Unix seconds when the runner started. Reset DETECTION only (the
     /// `process_start_time_seconds` job) - never an identity key: it is
     /// second-resolution, and two generations on one port inside the same

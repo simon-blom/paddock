@@ -41,9 +41,11 @@ import io
 import json
 import math
 import mimetypes
+import os
 import pathlib
 import re
 import sys
+import tempfile
 import threading
 import time
 
@@ -54,10 +56,12 @@ from openai.types.chat import completion_create_params as chat_params
 from openai.types import completion_create_params as comp_params
 from openai.types.responses import response_create_params as resp_params
 from openai.types.audio import transcription_create_params as audio_params
+from openai.types import image_generate_params as img_gen_params
+from openai.types import image_edit_params as img_edit_params
 from anthropic.types import message_create_params as anth_params
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
-from openai.types import Completion
+from openai.types import Completion, ImageGenStreamEvent, ImagesResponse
 from openai.types.audio import Transcription, TranscriptionVerbose
 from openai.types.responses import Response as OaiResponse
 from openai.types.responses import ResponseStreamEvent
@@ -111,6 +115,12 @@ PROBE_400 = {
     "anthropic_messages": {
         "container": "c1",
     },
+    # every one refuses BEFORE a render, which is what keeps the probe cheap
+    "images_generations": {
+        "quality": "hd",
+        "response_format": "url",
+        "style": "vivid",
+    },
 }
 
 PROBE_200 = {
@@ -134,6 +144,12 @@ PROBE_200 = {
         "cache_control": {"type": "ephemeral"},
         "inference_geo": "eu",
         "user_profile_id": "p1",
+    },
+    # each of these is a real one-step render at the family's small base size
+    "images_generations": {
+        "model": "gpt-image-2.5",
+        "moderation": "low",
+        "user": "u1",
     },
 }
 
@@ -494,6 +510,8 @@ def sdk_params(family):
         "responses": resp_params.ResponseCreateParamsBase,
         "anthropic_messages": anth_params.MessageCreateParamsBase,
         "audio_transcriptions": audio_params.TranscriptionCreateParamsBase,
+        "images_generations": img_gen_params.ImageGenerateParamsBase,
+        "images_edits": img_edit_params.ImageEditParamsBase,
     }[family]
     return set(base.__annotations__.keys()) | {"stream"}
 
@@ -543,6 +561,25 @@ def families(model):
             "anthropic",
         ),
     ]
+
+
+def images_family(model):
+    """`/v1/images/generations` as a Family, so `sec_surface_audit` probes it
+    like the JSON lanes. Every accepted probe is a REAL render, so the base is
+    one step at a small size with a pinned seed - the audit stays under a
+    minute and its bytes are the same on every run."""
+    return Family(
+        "images_generations",
+        "/v1/images/generations",
+        {
+            "model": model,
+            "prompt": "a red circle on a white background",
+            "size": "512x512",
+            "steps": 1,
+            "seed": 7,
+        },
+        "openai",
+    )
 
 
 def assert_error_shape(fam, body):
@@ -806,6 +843,494 @@ def sec_audio_matrix(matrix):
         flush=True,
     )
     ok("audio_transcriptions matrix (static)")
+
+
+# ---------------------------------------------------------------------------
+# /v1/images/generations and /v1/images/edits
+#
+# Same split as audio, for the same reason: the surface needs a LOADED
+# image-generation model. The matrix audit is static and runs everywhere; the
+# probes and the functional cases run under --images-only
+# (sdk_conformance.rs::spec_gate_qwen_image starts a Qwen-Image server).
+# ---------------------------------------------------------------------------
+
+
+def sec_images_matrix(matrix):
+    """Completeness of both image matrices + a usable probe for every
+    generations disposition that claims a refusal; and the edits matrix is
+    ALL refused, because the endpoint is - a lone `implemented` there would
+    be a claim nothing serves."""
+    for family in ("images_generations", "images_edits"):
+        spec = sdk_params(family)
+        listed = set(matrix[family].keys())
+        missing = spec - listed
+        stale = listed - spec
+        assert not missing, f"{family}: spec params without a disposition: {sorted(missing)}"
+        assert not stale, f"{family}: stale matrix entries: {sorted(stale)}"
+    counts = {"implemented": 0, "partial": 0, "advisory": 0, "rejected": 0}
+    for param, disposition in sorted(matrix["images_generations"].items()):
+        assert disposition in counts, f"images_generations.{param}: bad disposition {disposition}"
+        counts[disposition] += 1
+        if disposition in ("rejected", "partial"):
+            assert param in PROBE_400["images_generations"], f"images_generations.{param}: no 400-probe"
+        elif disposition == "advisory":
+            assert param in PROBE_200["images_generations"], f"images_generations.{param}: no 200-probe"
+    unused = (set(PROBE_400["images_generations"]) | set(PROBE_200["images_generations"])) - set(
+        matrix["images_generations"]
+    )
+    assert not unused, f"images_generations: probes for params not in the matrix: {sorted(unused)}"
+    edit_counts = {"implemented": 0, "partial": 0, "advisory": 0, "rejected": 0}
+    for param, disposition in matrix["images_edits"].items():
+        assert disposition in edit_counts, f"images_edits.{param}: bad disposition {disposition}"
+        edit_counts[disposition] += 1
+        # every refusal the edits matrix claims is one sec_images_edits probes
+        if disposition == "rejected":
+            assert param in ("mask",), f"images_edits.{param}: refused with no probe for it"
+    declared = set(matrix["_extensions"]["images_generations"])
+    checked = set(IMAGES_EXTENSION_CHECKS)
+    assert declared == checked, (
+        "images_generations extensions and their checks disagree: "
+        f"declared {sorted(declared)}, checked {sorted(checked)}"
+    )
+    total = sum(counts.values())
+    print(
+        f"  images_generations: {total} spec params - {counts['implemented']} implemented, "
+        f"{counts['partial']} partial, {counts['advisory']} advisory, "
+        f"{counts['rejected']} rejected (+{len(declared)} extensions); "
+        f"images_edits: {len(matrix['images_edits'])} spec params - "
+        f"{edit_counts['implemented']} implemented, {edit_counts['partial']} partial, "
+        f"{edit_counts['advisory']} advisory, {edit_counts['rejected']} rejected",
+        flush=True,
+    )
+    ok("images matrices (static)")
+
+
+def image_post(client, body):
+    return client.post("/v1/images/generations", json=body)
+
+
+def decoded_image(resp_json, index=0):
+    """The image bytes out of a response, plus (format, width, height) read
+    off the container itself - a response that says png and ships a jpeg
+    fails here, not in a viewer."""
+    data = resp_json["data"][index]
+    assert data.get("b64_json"), f"image {index} carries no b64_json: {list(data)}"
+    raw = base64.b64decode(data["b64_json"])
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        assert raw[12:16] == b"IHDR", "PNG without an IHDR first"
+        return raw, ("png", int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big"))
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return raw, ("webp", None, None)
+    if raw[:2] == b"\xff\xd8":
+        return raw, ("jpeg", None, None)
+    raise AssertionError(f"image {index} is not a png, webp or jpeg: {raw[:16]!r}")
+
+
+def check_ext_size_pair(client, base):
+    """`width`/`height` - the pair form of `size`; the two together are refused
+    by name rather than one silently winning."""
+    body = {k: v for k, v in base.items() if k != "size"}
+    r = image_post(client, {**body, "width": 512, "height": 384})
+    assert r.status_code == 200, r.text[:200]
+    assert r.json()["size"] == "512x384", r.json().get("size")
+    _, (fmt, w, h) = decoded_image(r.json())
+    assert (fmt, w, h) == ("png", 512, 384), (fmt, w, h)
+    r = image_post(client, {**base, "width": 512, "height": 384})
+    assert r.status_code == 400, r.text[:200]
+    assert "size" in r.json()["error"]["message"], r.text[:200]
+    r = image_post(client, {**body, "width": 512})
+    assert r.status_code == 400, r.text[:200]
+    assert "height" in r.json()["error"]["message"], r.text[:200]
+
+
+def check_ext_seed(client, base):
+    """`seed` - same seed, same bytes; a different seed, different bytes; an
+    omitted seed is the documented default and reproducible too."""
+    a = image_post(client, {**base, "seed": 11})
+    b = image_post(client, {**base, "seed": 11})
+    c = image_post(client, {**base, "seed": 12})
+    for r in (a, b, c):
+        assert r.status_code == 200, r.text[:200]
+    assert a.json()["data"][0]["b64_json"] == b.json()["data"][0]["b64_json"], (
+        "the same seed rendered different bytes"
+    )
+    assert a.json()["data"][0]["b64_json"] != c.json()["data"][0]["b64_json"], (
+        "a different seed rendered the same bytes"
+    )
+    no_seed = {k: v for k, v in base.items() if k != "seed"}
+    d = image_post(client, no_seed)
+    e = image_post(client, no_seed)
+    assert d.status_code == 200 and e.status_code == 200, (d.text[:200], e.text[:200])
+    assert d.json()["data"][0]["b64_json"] == e.json()["data"][0]["b64_json"], (
+        "an omitted seed is not reproducible - the default must be a fixed seed"
+    )
+
+
+def check_ext_steps(client, base):
+    """`steps` - overrides the quality's count; 0 and over the ceiling are
+    refused by name."""
+    for bad in (0, 100_000):
+        r = image_post(client, {**base, "steps": bad})
+        assert r.status_code == 400, f"steps={bad}: {r.status_code} {r.text[:200]}"
+        assert "steps" in r.json()["error"]["message"], r.text[:200]
+    r = image_post(client, {**base, "steps": 2})
+    assert r.status_code == 200, r.text[:200]
+
+
+def check_ext_guidance(client, base):
+    """`guidance` - classifier-free guidance, off by default (the model's own
+    true_cfg_scale is 1); negative values are refused by name."""
+    r = image_post(client, {**base, "guidance": -1.0})
+    assert r.status_code == 400, r.text[:200]
+    assert "guidance" in r.json()["error"]["message"], r.text[:200]
+    r = image_post(client, {**base, "guidance": 1.0})
+    assert r.status_code == 200, r.text[:200]
+
+
+def check_ext_negative_prompt(client, base):
+    """`negative_prompt` - means nothing without guidance above 1, and says
+    so rather than being dropped on the floor."""
+    r = image_post(client, {**base, "negative_prompt": "blue"})
+    assert r.status_code == 400, r.text[:200]
+    assert "guidance" in r.json()["error"]["message"], r.text[:200]
+    r = image_post(client, {**base, "negative_prompt": "blue", "guidance": 2.0})
+    assert r.status_code == 200, r.text[:200]
+    assert r.json()["usage"]["input_tokens"] > 0, r.json().get("usage")
+
+
+IMAGES_EXTENSION_CHECKS = {
+    "width": check_ext_size_pair,
+    "height": check_ext_size_pair,
+    "seed": check_ext_seed,
+    "steps": check_ext_steps,
+    "guidance": check_ext_guidance,
+    "negative_prompt": check_ext_negative_prompt,
+}
+
+
+def sec_images_edits(client, matrix, model, base_url):
+    """`/v1/images/edits`: the GPT-image edit form, multipart. A reference
+    rendered by the server itself (one step, a pinned seed, so the bytes are
+    the same every run) is handed back with an instruction; the response is
+    the generations shape (validated against the SDK's `ImagesResponse`), the
+    output takes the LAST reference's shape at the output area unless `size`
+    says otherwise, and the usage tells picture tokens from text tokens. Two
+    references make two slots; the refusals - a mask, no image, a URL
+    response, a bad fidelity, an unknown field - answer by name after the
+    whole form is read. Without the vision tower the section reports itself
+    not run: the endpoint then refuses everything by name, checked here too."""
+    edits = matrix["images_edits"]
+    ref_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )
+    caps = client.get("/api/server").json().get("image_generation") or {}
+    if not caps.get("edit"):
+        r = client.post(
+            "/v1/images/edits",
+            data={"prompt": "make it blue", "model": model},
+            files={"image": ("a.png", ref_png, "image/png")},
+        )
+        assert r.status_code == 400, f"{r.status_code} {r.text[:200]}"
+        assert "tower" in r.json()["error"]["message"], r.text[:200]
+        print("  images edits NOT RUN: no vision tower wired (mmproj) - the refusal names it", flush=True)
+        return
+    # the reference: a small render, then its bytes as the upload
+    r = image_post(client, {**images_family(model).base, "size": "512x512"})
+    assert r.status_code == 200, r.text[:200]
+    ref, _ = decoded_image(r.json())
+    form = {"prompt": "Make it a pencil sketch on white paper", "model": model, "steps": "1", "seed": "7"}
+
+    def edit(data, files, expect=200):
+        # a form with no picture is still a multipart form (httpx would
+        # urlencode a bare `data`, which is a different refusal)
+        if not files:
+            files, data = {k: (None, str(v)) for k, v in data.items()}, None
+        r = client.post("/v1/images/edits", data=data, files=files)
+        assert r.status_code == expect, f"{data}: {r.status_code} {r.text[:300]}"
+        return r
+
+    # one reference, the output at the reference's aspect at the output area
+    # (a 512^2 reference is resized to 1024^2 by the pipeline's rule, so the
+    # output is the SDK's own square)
+    r = edit(form, {"image": ("ref.png", ref, "image/png")})
+    body = r.json()
+    spec = ImagesResponse.model_validate(body)
+    assert spec.size == "1024x1024" and spec.quality == "high", (spec.size, spec.quality)
+    assert spec.usage and spec.usage.input_tokens_details.image_tokens == 32 * 32, spec.usage
+    assert spec.usage.input_tokens_details.text_tokens > 0, spec.usage
+    assert spec.usage.output_tokens == 64 * 64, spec.usage
+    once, (fmt, w, h) = decoded_image(body)
+    assert (fmt, w, h) == ("png", 1024, 1024), (fmt, w, h)
+    # reproducible: the same form, the same bytes
+    again, _ = decoded_image(edit(form, {"image": ("ref.png", ref, "image/png")}).json())
+    assert again == once, "the same edit rendered different bytes"
+
+    # a chosen size wins over the reference's shape, and it also sets the
+    # reference area (the pipeline's one output_resolution sizes both), so
+    # a 1024^2 reference fitted at 512^2 is 16x16 tokens on the merged grid;
+    # the SDK's `image[]` spelling for two references makes two slots
+    r = edit(
+        {**form, "size": "512x512"},
+        [("image[]", ("a.png", ref, "image/png")), ("image[]", ("b.png", ref, "image/png"))],
+    )
+    body = r.json()
+    assert body["size"] == "512x512", body.get("size")
+    assert body["usage"]["input_tokens_details"]["image_tokens"] == 2 * 16 * 16, body["usage"]
+    _, (fmt, w, h) = decoded_image(body)
+    assert (fmt, w, h) == ("png", 512, 512), (fmt, w, h)
+
+    # the stream form, as generations: a preview then completed
+    events = []
+    with client.stream(
+        "POST",
+        "/v1/images/edits",
+        data={**form, "stream": "true", "partial_images": "1"},
+        files={"image": ("ref.png", ref, "image/png")},
+    ) as r:
+        assert r.status_code == 200, r.read()[:200]
+        for line in r.iter_lines():
+            if line.startswith("data:"):
+                payload = line[len("data:"):].strip()
+                events.append(payload if payload == "[DONE]" else json.loads(payload))
+    assert events and events[-1] == "[DONE]", events[-1:]
+    kinds = [e["type"] for e in events[:-1]]
+    assert kinds == ["image_generation.partial_image", "image_generation.completed"], kinds
+    adapter = TypeAdapter(ImageGenStreamEvent)
+    for e in events[:-1]:
+        adapter.validate_python(e)
+
+    # the refusals, by name
+    for data, files, needle in (
+        ({**form}, {"image": ("ref.png", ref, "image/png"), "mask": ("m.png", ref, "image/png")}, "mask"),
+        ({**form}, {}, "image"),
+        ({**form, "response_format": "url"}, {"image": ("ref.png", ref, "image/png")}, "response_format"),
+        ({**form, "input_fidelity": "ultra"}, {"image": ("ref.png", ref, "image/png")}, "input_fidelity"),
+        ({**form, "nonsense": "1"}, {"image": ("ref.png", ref, "image/png")}, "nonsense"),
+    ):
+        r = edit(data, files, 400)
+        msg = r.json()["error"]["message"]
+        assert needle in msg, f"{needle}: {msg!r}"
+    # not a form at all: the OpenAI error shape still, naming the form
+    r = client.post("/v1/images/edits", json={"prompt": "x"})
+    assert r.status_code == 400, f"{r.status_code} {r.text[:200]}"
+    assert "multipart" in r.json()["error"]["message"], r.text[:200]
+    assert edits["mask"] == "rejected" and edits["image"] == "implemented", edits
+
+    # the pinned SDK's own call
+    import openai  # noqa: PLC0415
+
+    sdk = openai.OpenAI(base_url=f"{base_url.rstrip('/')}/v1", api_key="conformance", timeout=600.0)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(ref)
+        path = f.name
+    try:
+        with open(path, "rb") as fh:
+            out = sdk.images.edit(
+                model=model,
+                image=fh,
+                prompt=form["prompt"],
+                size="1024x1024",
+                extra_body={"steps": 1, "seed": 7},
+            )
+    finally:
+        os.unlink(path)
+    assert out.data and out.data[0].b64_json, out
+    assert base64.b64decode(out.data[0].b64_json) == once, "the SDK's edit rendered different bytes"
+    ok("images edits: one and two references, stream, refusals, the SDK's images.edit")
+
+
+def sec_strict_images(client, matrix, model, base_url):
+    """The functional half: real renders validated against the SDK's
+    `ImagesResponse`, the container checked against what the response claims,
+    the extensions exercised, and one round trip through the pinned SDK."""
+    base = images_family(model).base
+
+    # a spec size, validated STRICTLY: the SDK's literals for size and quality
+    # are the three gpt-image sizes and low/medium/high, so this is the render
+    # a strict client can read whole
+    r = image_post(client, {**base, "size": "1024x1024"})
+    assert r.status_code == 200, r.text[:200]
+    body = r.json()
+    spec = ImagesResponse.model_validate(body)
+    assert spec.size == "1024x1024" and spec.quality == "high", (spec.size, spec.quality)
+    assert spec.output_format == "png" and spec.background in ("opaque", "transparent"), (
+        spec.output_format, spec.background,
+    )
+    assert spec.usage and spec.usage.output_tokens == 64 * 64, spec.usage
+    assert spec.usage.input_tokens > 0 and spec.usage.total_tokens == (
+        spec.usage.input_tokens + spec.usage.output_tokens
+    ), spec.usage
+    raw, (fmt, w, h) = decoded_image(body)
+    assert (fmt, w, h) == ("png", 1024, 1024), (fmt, w, h)
+
+    # the family's own base size (custom, on the grid): the response echoes the
+    # size generated, checked by hand because the SDK literal cannot hold it
+    r = image_post(client, base)
+    assert r.status_code == 200, r.text[:200]
+    body = r.json()
+    assert body["size"] == "512x512", body.get("size")
+    _, (fmt, w, h) = decoded_image(body)
+    assert (fmt, w, h) == ("png", 512, 512), (fmt, w, h)
+    assert body["usage"]["output_tokens"] == 32 * 32, body["usage"]
+
+    # n: one request, several images, each its own draw
+    r = image_post(client, {**base, "n": 2})
+    assert r.status_code == 200, r.text[:200]
+    imgs = r.json()["data"]
+    assert len(imgs) == 2 and imgs[0]["b64_json"] != imgs[1]["b64_json"], "n=2 must draw twice"
+
+    # off the grid: refused by name, with the grid in the message
+    r = image_post(client, {**base, "size": "1000x1000"})
+    assert r.status_code == 400, r.text[:200]
+    assert "grid" in r.json()["error"]["message"], r.text[:200]
+
+    # quality's echo is what the render used - low is low
+    r = image_post(client, {**base, "quality": "low"})
+    assert r.status_code == 200, r.text[:200]
+    assert r.json()["quality"] == "low", r.json().get("quality")
+
+    # formats: the container matches the claim; compression only where it means
+    # something
+    r = image_post(client, {**base, "output_format": "webp", "output_compression": 50})
+    assert r.status_code == 200, r.text[:200]
+    assert r.json()["output_format"] == "webp", r.json().get("output_format")
+    _, (fmt, _, _) = decoded_image(r.json())
+    assert fmt == "webp", fmt
+    r = image_post(client, {**base, "output_format": "jpeg"})
+    assert r.status_code == 200, r.text[:200]
+    _, (fmt, _, _) = decoded_image(r.json())
+    assert fmt == "jpeg", fmt
+    r = image_post(client, {**base, "output_format": "png", "output_compression": 50})
+    assert r.status_code == 400, r.text[:200]
+    assert "output_compression" in r.json()["error"]["message"], r.text[:200]
+
+    # background: transparent needs an alpha channel, and the echo says what
+    # was produced, never `auto`
+    r = image_post(client, {**base, "background": "transparent", "output_format": "jpeg"})
+    assert r.status_code == 400, r.text[:200]
+    assert "transparent" in r.json()["error"]["message"], r.text[:200]
+    r = image_post(client, {**base, "background": "transparent"})
+    assert r.status_code == 200, r.text[:200]
+    assert r.json()["background"] in ("transparent", "opaque"), r.json().get("background")
+
+    # the extensions, each exercised so a rename or a quiet removal fails
+    for name, check in IMAGES_EXTENSION_CHECKS.items():
+        assert name in matrix["_extensions"]["images_generations"], name
+    for check in dict.fromkeys(IMAGES_EXTENSION_CHECKS.values()):
+        check(client, base)
+
+    # the listing says what this is: text in, an image out, no window
+    entry = client.get("/v1/models").json()["data"][0]
+    arch = entry.get("architecture", {})
+    assert arch.get("output_modalities") == ["image"], arch
+    assert entry.get("capabilities", {}).get("image_generation") is True, entry.get("capabilities")
+
+    # and through the PINNED SDK, the arbiter of the wire format: a typed
+    # ImagesResponse with a decodable image, our extensions riding extra_body
+    import openai  # noqa: PLC0415
+
+    sdk = openai.OpenAI(base_url=f"{base_url.rstrip('/')}/v1", api_key="conformance")
+    via_sdk = sdk.images.generate(
+        model=model,
+        prompt=base["prompt"],
+        size="1024x1024",
+        output_format="png",
+        extra_body={"steps": 1, "seed": 7},
+    )
+    assert isinstance(via_sdk, ImagesResponse), type(via_sdk)
+    assert via_sdk.data and via_sdk.data[0].b64_json, "the SDK saw no image"
+    sdk_raw = base64.b64decode(via_sdk.data[0].b64_json)
+    assert sdk_raw == raw, "the SDK client and the raw client rendered different bytes for the same seed"
+    ok("strict validation: images generations (spec + custom sizes, n, formats, background, extensions, SDK)")
+
+
+def sec_images_stream(client, matrix, model, base_url):
+    """`stream: true` with `partial_images` previews.
+
+    Two invariants. The events are the SDK's - every one validates against
+    `ImageGenStreamEvent`, previews are indexed 0.. in order, `completed` comes
+    last and alone carries the usage. And streaming must not CHANGE the answer:
+    the completed image is byte-identical to the oneshot render of the same
+    seed and steps, because a preview is a decode of the render in flight,
+    never a different render."""
+    assert matrix["images_generations"]["stream"] == "implemented"
+    assert matrix["images_generations"]["partial_images"] == "implemented"
+    base = {**images_family(model).base, "steps": 4}
+
+    # the refusals, by name: several images per stream, previews without one,
+    # more previews than the API allows
+    for extra, needle in (
+        ({"stream": True, "n": 2}, "n"),
+        ({"partial_images": 2}, "stream"),
+        ({"stream": True, "partial_images": 4}, "partial_images"),
+    ):
+        r = image_post(client, {**base, **extra})
+        assert r.status_code == 400, f"{extra}: {r.status_code} {r.text[:200]}"
+        assert needle in r.json()["error"]["message"], r.text[:200]
+
+    # The streamed leg renders a SPEC size: the SDK's event models carry the
+    # same three-value size literal as ImagesResponse, and a custom size would
+    # fail their validation for the size alone (the refusal probes above keep
+    # the small base - nothing renders there).
+    base = {**base, "size": "1024x1024"}
+    events, ctype = [], None
+    with client.stream(
+        "POST", "/v1/images/generations", json={**base, "stream": True, "partial_images": 2}
+    ) as r:
+        assert r.status_code == 200, r.read()[:200]
+        ctype = r.headers.get("content-type", "")
+        for line in r.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                events.append("[DONE]")
+                continue
+            events.append(json.loads(payload))
+    assert ctype.startswith("text/event-stream"), f"streamed as {ctype!r}"
+    assert events and events[-1] == "[DONE]", events[-1:]
+    events = events[:-1]
+    adapter = TypeAdapter(ImageGenStreamEvent)
+    for e in events:
+        adapter.validate_python(e)
+    partials = [e for e in events if e["type"] == "image_generation.partial_image"]
+    assert [p["partial_image_index"] for p in partials] == [0, 1], (
+        f"previews out of order or missing: {[p.get('partial_image_index') for p in partials]}"
+    )
+    assert events[-1]["type"] == "image_generation.completed", events[-1]["type"]
+    assert len(events) == 3, f"{len(events)} events for 2 previews + completed"
+    done = events[-1]
+    assert done["usage"]["output_tokens"] == 64 * 64, done["usage"]
+    assert all("usage" not in p or p["usage"] is None for p in partials), "usage on a preview"
+    for e in events:
+        _, (fmt, w, h) = decoded_image({"data": [{"b64_json": e["b64_json"]}]})
+        assert (fmt, w, h) == ("png", 1024, 1024), (e["type"], fmt, w, h)
+        assert e["size"] == "1024x1024" and e["quality"] == "high", (e["size"], e["quality"])
+
+    # streaming must not change the answer
+    r = image_post(client, base)
+    assert r.status_code == 200, r.text[:200]
+    assert done["b64_json"] == r.json()["data"][0]["b64_json"], (
+        "the streamed final image differs from the oneshot render of the same seed"
+    )
+
+    # and through the PINNED SDK, whose stream class decides what an event is
+    import openai  # noqa: PLC0415
+    from openai.types import ImageGenCompletedEvent, ImageGenPartialImageEvent  # noqa: PLC0415
+
+    sdk = openai.OpenAI(base_url=f"{base_url.rstrip('/')}/v1", api_key="conformance")
+    seen = []
+    for ev in sdk.images.generate(
+        model=model,
+        prompt=base["prompt"],
+        size="1024x1024",
+        stream=True,
+        partial_images=1,
+        extra_body={"steps": 2, "seed": 7},
+    ):
+        seen.append(type(ev))
+    assert seen == [ImageGenPartialImageEvent, ImageGenCompletedEvent], seen
+    ok("images streaming: partial_image x2 + completed, byte-identical to the oneshot render")
 
 
 def audio_post(client, wav, fields):
@@ -2038,6 +2563,12 @@ def main():
              "else (a whisper family model has no chat surface at all)",
     )
     ap.add_argument("--audio-file", default=str(AUDIO_FIXTURE))
+    ap.add_argument(
+        "--images-only",
+        action="store_true",
+        help="the server under test serves /v1/images/* and nothing else (an "
+             "image-generation model has no text surface at all)",
+    )
     args = ap.parse_args()
 
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
@@ -2047,8 +2578,14 @@ def main():
     # Static, and therefore unconditional: this is the half that fails when the
     # SDK grows a param, and it must not depend on the box owning a checkpoint.
     sec_audio_matrix(matrix)
+    sec_images_matrix(matrix)
 
-    if args.audio_only:
+    if args.images_only:
+        sec_surface_audit(client, images_family(args.model), matrix)
+        sec_strict_images(client, matrix, args.model, args.base_url)
+        sec_images_stream(client, matrix, args.model, args.base_url)
+        sec_images_edits(client, matrix, args.model, args.base_url)
+    elif args.audio_only:
         clip = pathlib.Path(args.audio_file)
         wav = (clip.name, clip.read_bytes())
         sec_audio_surface(client, matrix, wav, args.model)
@@ -2068,6 +2605,11 @@ def main():
         print(
             "  audio_transcriptions probes NOT RUN here: they need a loaded ASR "
             "model - sdk_conformance.rs::spec_gate_whisper runs them --audio-only",
+            flush=True,
+        )
+        print(
+            "  images probes NOT RUN here: they need a loaded image model - "
+            "sdk_conformance.rs::spec_gate_qwen_image runs them --images-only",
             flush=True,
         )
         for fam in families(args.model):

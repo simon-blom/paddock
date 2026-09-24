@@ -382,6 +382,17 @@ impl Generator for Qwen35 {
     fn supports_chunked_prefill(&self) -> bool {
         true
     }
+    // the scheduler's tick pacer reads the FIFO queue from each offset
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.pending
+            .iter()
+            .map(|p| (p.slot, p.offset, p.tokens.len() - p.offset))
+            .collect()
+    }
+    // the mixed grant with riders aboard (the 2048-row wave is riderless)
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        crate::schedule::row_cap(decode_rows, CHUNK).saturating_sub(decode_rows)
+    }
     fn idle_admission_grace(&self, prompt: &[u32]) -> std::time::Duration {
         if self.stable_affine_contract() && self.slots.len() > 1 && prompt.len() > 32
             // No new hold for resident hits or persistent-cache instances;

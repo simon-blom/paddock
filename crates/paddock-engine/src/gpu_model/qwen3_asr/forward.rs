@@ -37,6 +37,18 @@ fn gen_err(e: GpuModelError) -> GenError {
     }
 }
 
+/// A vision tower's output spliced over its `<|image_pad|>` rows of a
+/// prompt: `embd` replaces rows `off .. off + n_tokens`, and `deepstack[i]`
+/// (same shape) is added to the residual at those rows after decoder layer
+/// `i`. What qwen-image's text encoder (Qwen3-VL-8B) reads a reference
+/// picture through.
+pub(crate) struct VisionSplice<'a> {
+    pub off: usize,
+    pub n_tokens: usize,
+    pub embd: &'a CudaSlice<f32>,
+    pub deepstack: &'a [CudaSlice<f32>],
+}
+
 /// Per-sequence decode state: dense per-layer KV at slot 0 (full attention
 /// on every layer - no rings, no recurrent state).
 pub(crate) struct DecodeState {
@@ -194,7 +206,7 @@ impl GpuQwen3Asr {
         splices: &[(usize, AudioOutput)],
     ) -> Result<Vec<f32>, GpuModelError> {
         let r = ids.len();
-        self.prefill_body(ids, splices)?;
+        self.prefill_body(ids, splices, &[], None)?;
         // last-row head
         let exec = self.exec.clone();
         let (embd, eps) = (self.hp.n_embd, self.hp.eps);
@@ -212,11 +224,20 @@ impl GpuQwen3Asr {
     /// decoder at slot 0, leaves the FINAL hidden states in the prefill
     /// scratch's `d_x` and advances `decode.pos`. The head is the caller's -
     /// the serving prefill reads the last row, the aligner (aligner.rs) reads
-    /// the `<timestamp>` rows.
+    /// the `<timestamp>` rows, qwen-image's text encoder reads them all.
+    ///
+    /// `vision` splices a vision tower's output over its `<|image_pad|>`
+    /// rows the way `splices` does an audio tower's, and adds each DeepStack
+    /// stream to the residual after the decoder layer of its index; `mrope`
+    /// (axis-major `[4][ids.len()]`, t / h / w / e) then rotates every row by
+    /// its own multi-axis position with the interleaved sections - text rows
+    /// with equal axes come out exactly as the plain rope they get otherwise.
     pub(crate) fn prefill_body(
         &mut self,
         ids: &[u32],
         splices: &[(usize, AudioOutput)],
+        vision: &[VisionSplice<'_>],
+        mrope: Option<&[u32]>,
     ) -> Result<(), GpuModelError> {
         let r = ids.len();
         assert!(r > 0);
@@ -254,10 +275,22 @@ impl GpuQwen3Asr {
             }
             super::TokEmbd::Kq(t) => exec.kquant_gather(t, &sc.up_tokens, &mut sc.d_x, embd, r)?,
         }
-        // audio splice: tower embeddings overwrite their placeholder rows
+        // audio / vision splice: tower embeddings overwrite their placeholder
+        // rows
         for (off, out) in splices {
             exec.copy_region(&out.embd, 0, &mut sc.d_x, off * embd, out.n_tokens * embd)?;
         }
+        for v in vision {
+            exec.copy_region(v.embd, 0, &mut sc.d_x, v.off * embd, v.n_tokens * embd)?;
+        }
+        let d_mrope = match mrope {
+            Some(m) => {
+                assert_eq!(m.len(), 4 * r, "mrope positions are [4][rows]");
+                Some(exec.to_device_u32(m)?)
+            }
+            None => None,
+        };
+        let (n_rot, sections) = (hp.n_rot, hp.sections);
 
         for (li, layer) in self.layers.iter().enumerate() {
             prefill_add_norm_quant(
@@ -328,8 +361,34 @@ impl GpuQwen3Asr {
                 eps,
                 r * n_kv_heads,
             )?;
-            exec.rope_yarn_batch(&mut sc.d_qn, &sc.up_pos, n_heads, head_dim, rope, r)?;
-            exec.rope_yarn_batch(&mut sc.d_kn, &sc.up_pos, n_kv_heads, head_dim, rope, r)?;
+            match &d_mrope {
+                Some(pos) => {
+                    exec.imrope(
+                        &mut sc.d_qn,
+                        pos,
+                        r,
+                        n_heads,
+                        head_dim,
+                        n_rot,
+                        rope,
+                        sections,
+                    )?;
+                    exec.imrope(
+                        &mut sc.d_kn,
+                        pos,
+                        r,
+                        n_kv_heads,
+                        head_dim,
+                        n_rot,
+                        rope,
+                        sections,
+                    )?;
+                }
+                None => {
+                    exec.rope_yarn_batch(&mut sc.d_qn, &sc.up_pos, n_heads, head_dim, rope, r)?;
+                    exec.rope_yarn_batch(&mut sc.d_kn, &sc.up_pos, n_kv_heads, head_dim, rope, r)?;
+                }
+            }
             exec.kv_append_batch(
                 &sc.d_kn,
                 &mut ds.kv_k[li],
@@ -440,6 +499,13 @@ impl GpuQwen3Asr {
                 r,
             )?;
             exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?;
+            // DeepStack: stream `li` joins the residual at the image rows
+            // after this layer, before the next layer's norm reads it
+            for v in vision {
+                if let Some(stream) = v.deepstack.get(li) {
+                    exec.add_at(&mut sc.d_x, v.off * embd, stream, 0, v.n_tokens * embd)?;
+                }
+            }
         }
 
         let ds = self.decode.as_mut().expect("decode");
@@ -657,6 +723,21 @@ impl Generator for GpuQwen3Asr {
 
     fn supports_chunked_prefill(&self) -> bool {
         self.batch.is_some()
+    }
+
+    // the mixed tick's FIFO over the queue, row-exact from each cursor
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.cursor, c.tokens.len() - c.cursor))
+            .collect()
+    }
+
+    // plan_chunk's cap under the pass's row capacity (the decode rows share it)
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.batch.as_ref().map_or(0, |bs| {
+            super::batch::pf_rows().min(bs.cap.saturating_sub(decode_rows))
+        })
     }
 
     /// Audio prompts join the chunked queue too: tower encodes run at

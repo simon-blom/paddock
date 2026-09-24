@@ -6,7 +6,19 @@ import PaddockConversationCore
 /// No NSApplication, viewer, JavaScript runtime or user model invocation.
 /// This executable deliberately does not link PaddockUI/PaddockStudio.
 @main struct NativeCoreCheck {
-  static func main() async throws {
+  static func main() async {
+    do {
+      try await run()
+    } catch {
+      // Failed checks and an accidental Finder/crash-dialog relaunch are
+      // ordinary diagnostic failures. Throwing out of async main turns them
+      // into SIGTRAP and a user-visible macOS crash report.
+      FileHandle.standardError.write(Data("FAIL: \(error.localizedDescription)\n".utf8))
+      exit(EXIT_FAILURE)
+    }
+  }
+
+  static func run() async throws {
     guard let root = ProcessInfo.processInfo.environment["PADDOCK_DATA"],
       root.hasPrefix("/tmp/paddock-native-core-check.")
     else {
@@ -42,12 +54,29 @@ import PaddockConversationCore
       try require(try await transport.listConversations().count == 1, "native history list")
       let urlSession = URLSession(configuration: .ephemeral)
       defer { urlSession.invalidateAndCancel() }
-      for path in ["/", "/studio", "/index.html", "/artifact-frame"] {
+      for path in ["/", "/studio", "/index.html"] {
         var request = URLRequest(url: host.origin.appending(path: path))
         request.setValue("\(host.cookieName)=\(host.session)", forHTTPHeaderField: "Cookie")
         let (_, response) = try await urlSession.data(for: request)
         try require((response as? HTTPURLResponse)?.statusCode == 404, "no HTML served at \(path)")
       }
+      // HTML artifacts are an explicit isolated viewer, not a web Studio.
+      // The shared empty frame is allowed; its network/origin restrictions
+      // must survive embedding the Rust host in a native app.
+      var frameRequest = URLRequest(url: host.origin.appending(path: "artifact-frame"))
+      frameRequest.setValue("\(host.cookieName)=\(host.session)", forHTTPHeaderField: "Cookie")
+      let (frame, frameResponse) = try await urlSession.data(for: frameRequest)
+      let frameHTTP = frameResponse as? HTTPURLResponse
+      let csp = frameHTTP?.value(forHTTPHeaderField: "Content-Security-Policy") ?? ""
+      try require(
+        frameHTTP?.statusCode == 200
+          && String(decoding: frame, as: UTF8.self).contains("paddock:artifact"),
+        "isolated artifact frame is available")
+      try require(
+        csp.contains("default-src 'none'") && csp.contains("connect-src 'none'")
+          && csp.contains("sandbox allow-scripts") && !csp.contains("allow-same-origin")
+          && csp.contains("frame-ancestors 'self'") && csp.contains("img-src data: blob:;"),
+        "artifact frame cannot inherit the app origin or access the network")
       let (_, unauthorized) = try await urlSession.data(
         from: host.origin.appending(path: "api/conversations"))
       try require(

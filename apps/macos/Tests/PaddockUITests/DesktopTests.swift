@@ -138,6 +138,13 @@ struct DesktopTests {
     #expect(model.desktopError?.contains("Nothing was discarded") == true)
     #expect(!model.desktopTransition)
   }
+  @Test func anotherDesktopActionClearsThePreviousReadinessError() async {
+    let model = WorkspaceModel(client: DesktopNoCore())
+    model.desktopError = "This model is not ready for chat. Check Settings > Instances."
+    await model.handleDesktopRequest(DesktopRequest(.studio))
+    #expect(model.desktopError == nil)
+    #expect(model.navigation.mode == .studio)
+  }
   @Test func quickQuestionKeepsBothDraftsOnConflict() async {
     let model = WorkspaceModel(client: DesktopNoCore())
     model.draft.message = "Main draft"

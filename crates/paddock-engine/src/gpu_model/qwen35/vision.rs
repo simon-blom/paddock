@@ -51,6 +51,19 @@ struct VBlock {
     down_b: CudaSlice<f32>,
 }
 
+/// A DeepStack merger (Qwen3-VL's `deepstack_merger_list`): the tower's
+/// residual after one of its blocks, read as [N/4, 4·embd] (post-shuffle
+/// norm), LayerNorm -> fc1 -> GELU -> fc2 into LLM space. Qwen3-VL-8B taps
+/// blocks 8, 16, 24 for LLM layers 0, 1, 2; the Qwen3.5 mmproj carries none.
+struct Merger {
+    ln_w: CudaSlice<f32>,
+    ln_b: CudaSlice<f32>,
+    fc1: HalfTensor,
+    fc1_b: CudaSlice<f32>,
+    fc2: HalfTensor,
+    fc2_b: CudaSlice<f32>,
+}
+
 /// The encoded image: merged-grid embeddings ready for LLM injection.
 pub struct VisionOutput {
     /// [n_tokens, llm_embd] device-resident image embeddings.
@@ -58,6 +71,10 @@ pub struct VisionOutput {
     /// Output grid (post 2×2 merge): the LLM M-RoPE h/w extents.
     pub nx: usize,
     pub ny: usize,
+    /// DeepStack streams, one `[n_tokens, llm_embd]` plane per tap in tap
+    /// order, ADDED to the LLM's residual at the image rows after decoder
+    /// layer 0, 1, 2, ... Empty for a tower without them.
+    pub deepstack: Vec<CudaSlice<f32>>,
 }
 
 pub struct VisionModel {
@@ -73,6 +90,13 @@ pub struct VisionModel {
     /// grid) - bilinearly resized + merge-reordered per image, then uploaded.
     pos_embd: Vec<f32>,
     n_side: usize,
+    /// Resize the pos-embd grid with `align_corners` (Qwen3-VL's
+    /// `interpolation_align_corners = True`, llama.cpp's qwen3vl graph)
+    /// instead of half-pixel centres. Off by default - the qwen35 lane was
+    /// gated at half-pixel and stays there.
+    align_corners: bool,
+    /// (tower block index the tap follows, its merger), in tap order
+    deepstack: Vec<(usize, Merger)>,
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
     /// Source pixels smart-resize may keep - Qwen's spec, or the file's own
@@ -226,6 +250,32 @@ impl VisionModel {
             });
         }
 
+        // DeepStack taps: `clip.vision.is_deepstack_layers` flags the tower
+        // blocks a merger follows; their tensors are named by that ABSOLUTE
+        // block index
+        let mut deepstack = Vec::new();
+        if let Some(Value::Array(flags)) =
+            map.gguf().metadata.get("clip.vision.is_deepstack_layers")
+        {
+            for (i, flag) in flags.iter().enumerate() {
+                if !matches!(flag, Value::Bool(true)) {
+                    continue;
+                }
+                let t = |s: &str| format!("v.deepstack.{i}.{s}");
+                deepstack.push((
+                    i,
+                    Merger {
+                        ln_w: vec1(&t("norm.weight"))?,
+                        ln_b: vec1(&t("norm.bias"))?,
+                        fc1: dt(&t("fc1.weight"))?,
+                        fc1_b: vec1(&t("fc1.bias"))?,
+                        fc2: dt(&t("fc2.weight"))?,
+                        fc2_b: vec1(&t("fc2.bias"))?,
+                    },
+                ));
+            }
+        }
+
         let me = Self {
             exec,
             n_layers,
@@ -236,6 +286,8 @@ impl VisionModel {
             eps,
             pos_embd: pos_host,
             n_side,
+            align_corners: false,
+            deepstack,
             image_mean: arr3("clip.vision.image_mean"),
             image_std: arr3("clip.vision.image_std"),
             budget: PixelBudget::from_gguf(map, patch),
@@ -252,9 +304,21 @@ impl VisionModel {
         };
         tracing::info!(
             weight_mib = me.weight_bytes() / (1 << 20),
+            deepstack_taps = me.deepstack.len(),
             "qwen35 mmproj resident at f16 (f32 accumulate)"
         );
         Ok(me)
+    }
+
+    /// Resize the learned pos-embd grid with `align_corners` from now on
+    /// (Qwen3-VL's tower; see the field).
+    pub fn set_align_corners(&mut self, on: bool) {
+        self.align_corners = on;
+    }
+
+    /// How many DeepStack streams an encode returns.
+    pub fn deepstack_taps(&self) -> usize {
+        self.deepstack.len()
     }
 
     /// Device bytes the f16 weight planes hold - everything the GEMMs read,
@@ -274,7 +338,16 @@ impl VisionModel {
                     + b.down_w.bytes()
             })
             .sum();
-        blk + self.patch_w0.bytes() + self.patch_w1.bytes() + self.mm0.bytes() + self.mm2.bytes()
+        let taps: usize = self
+            .deepstack
+            .iter()
+            .map(|(_, m)| m.fc1.bytes() + m.fc2.bytes())
+            .sum();
+        blk + self.patch_w0.bytes()
+            + self.patch_w1.bytes()
+            + self.mm0.bytes()
+            + self.mm2.bytes()
+            + taps
     }
 
     /// Bilinearly resize the learned pos-embd grid to (ph, pw), then reorder into
@@ -290,15 +363,26 @@ impl VisionModel {
         if pw == s && ph == s {
             grid.copy_from_slice(&self.pos_embd);
         } else {
-            // bilinear, half-pixel centers (ggml_interpolate bilinear semantics)
+            // bilinear: half-pixel centers (ggml_interpolate bilinear
+            // semantics), or corner-aligned when the tower says so
+            let src = |i: usize, n: usize| -> f32 {
+                if self.align_corners {
+                    if n > 1 {
+                        i as f32 * (s - 1) as f32 / (n - 1) as f32
+                    } else {
+                        0.0
+                    }
+                } else {
+                    ((i as f32 + 0.5) * s as f32 / n as f32 - 0.5).clamp(0.0, (s - 1) as f32)
+                }
+            };
             for y in 0..ph {
-                let sy = ((y as f32 + 0.5) * s as f32 / ph as f32 - 0.5).clamp(0.0, (s - 1) as f32);
+                let sy = src(y, ph);
                 let y0 = sy.floor() as usize;
                 let y1 = (y0 + 1).min(s - 1);
                 let fy = sy - y0 as f32;
                 for x in 0..pw {
-                    let sx =
-                        ((x as f32 + 0.5) * s as f32 / pw as f32 - 0.5).clamp(0.0, (s - 1) as f32);
+                    let sx = src(x, pw);
                     let x0 = sx.floor() as usize;
                     let x1 = (x0 + 1).min(s - 1);
                     let fx = sx - x0 as f32;
@@ -489,7 +573,12 @@ impl VisionModel {
                 }
             };
         }
-        for blk in &self.blocks {
+        // DeepStack streams, image-major: every tap's merger runs on the
+        // residual after its block, the same [rows/4, 4e] view + two GEMMs
+        // as the final merger, and the result is split per image like `embd`
+        let n4 = rows / 4;
+        let mut ds_per_image: Vec<Vec<CudaSlice<f32>>> = (0..b).map(|_| Vec::new()).collect();
+        for (bi, blk) in self.blocks.iter().enumerate() {
             exec.layernorm(&d_x, &blk.ln1_w, &blk.ln1_b, &mut d_n, rows, e, self.eps)?;
             mark!(0);
             // q, k and v all read the same normed rows - stage them once
@@ -550,6 +639,25 @@ impl VisionModel {
             exec.bias_add(&mut d_n, &blk.down_b, rows, e)?;
             exec.add(&mut d_x, &d_n, rows * e)?;
             mark!(5);
+            if let Some((_, m)) = self.deepstack.iter().find(|(at, _)| *at == bi) {
+                let (mid, out_dim) = (m.fc1.dims[1], m.fc2.dims[1]);
+                exec.layernorm(&d_x, &m.ln_w, &m.ln_b, &mut d_n, n4, 4 * e, self.eps)?;
+                exec.convert_f32_f16(&d_n, &mut s16, n4 * 4 * e)?;
+                let mut d_m = exec.alloc(n4 * mid)?;
+                exec.matvec_batch_f16(&m.fc1, &s16, &mut d_m, n4)?;
+                exec.bias_add(&mut d_m, &m.fc1_b, n4, mid)?;
+                exec.gelu(&mut d_m, n4 * mid)?;
+                exec.convert_f32_f16(&d_m, &mut s16, n4 * mid)?;
+                let mut d_o = exec.alloc(n4 * out_dim)?;
+                exec.matvec_batch_f16(&m.fc2, &s16, &mut d_o, n4)?;
+                exec.bias_add(&mut d_o, &m.fc2_b, n4, out_dim)?;
+                let per = (n / 4) * out_dim;
+                for (img, streams) in ds_per_image.iter_mut().enumerate() {
+                    let mut one = exec.alloc(per)?;
+                    exec.copy_region(&d_o, img * per, &mut one, 0, per)?;
+                    streams.push(one);
+                }
+            }
         }
         if phase_timing() {
             tracing::info!(
@@ -593,13 +701,14 @@ impl VisionModel {
         // split into per-image owned outputs
         let per = (n / 4) * out_dim;
         let mut outs = Vec::with_capacity(b);
-        for bi in 0..b {
+        for (bi, deepstack) in ds_per_image.into_iter().enumerate() {
             let mut embd = exec.alloc(per)?;
             exec.copy_region(&d_out, bi * per, &mut embd, 0, per)?;
             outs.push(VisionOutput {
                 embd,
                 nx: pw / 2,
                 ny: ph / 2,
+                deepstack,
             });
         }
         if phase_timing() {

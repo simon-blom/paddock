@@ -180,6 +180,29 @@ fn validate_job(registry: &Registry, id: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn qwen_image_mlx_native_plan_contains_the_complete_pipeline_without_gguf_companions() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path().into()).with_backend("metal");
+        assert_eq!(
+            selection(&registry, "qwen-image-2.1", "mlx-4bit").unwrap(),
+            ["mlx-4bit"]
+        );
+        let result: Value = serde_json::from_str(
+            &execute(
+                &registry,
+                Command::Plan {
+                    model: "qwen-image-2.1".into(),
+                    artifact: "mlx-4bit".into(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["plan"]["file_count"], 23);
+        assert_eq!(result["plan"]["selection"], json!(["mlx-4bit"]));
+        assert!(result["jobs"].as_array().unwrap().is_empty());
+    }
+    #[test]
     fn qwen_mlx_download_includes_default_dflash2_without_vision_or_mtp() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::new(dir.path().into()).with_backend("metal");

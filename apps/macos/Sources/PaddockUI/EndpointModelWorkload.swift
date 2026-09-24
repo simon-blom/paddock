@@ -95,69 +95,74 @@ struct EndpointModelWorkload: View {
         }
       }
     }
-    EndpointFormField("Workload") {
-      LazyVGrid(
-        columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: 6), count: 4), spacing: 6
-      ) {
-        ForEach(EndpointEditor.workloads, id: \.batch) { workload in
-          choice(
-            workload.label, subtitle: "\(workload.batch) at once",
-            selected: !editor.customWorkload && editor.effectiveConcurrency == workload.batch
-          ) {
-            editor.customWorkload = false
-            editor.concurrency = String(workload.batch)
-          }.disabled(workload.batch > editor.concurrencyCap)
+    if !editor.isImageGeneration {
+      EndpointFormField("Workload") {
+        LazyVGrid(
+          columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: 6), count: 4),
+          spacing: 6
+        ) {
+          ForEach(EndpointEditor.workloads, id: \.batch) { workload in
+            choice(
+              workload.label, subtitle: "\(workload.batch) at once",
+              selected: !editor.customWorkload && editor.effectiveConcurrency == workload.batch
+            ) {
+              editor.customWorkload = false
+              editor.concurrency = String(workload.batch)
+            }.disabled(workload.batch > editor.concurrencyCap)
+          }
+          choice("Custom", selected: editor.customWorkload) { editor.customWorkload = true }
         }
-        choice("Custom", selected: editor.customWorkload) { editor.customWorkload = true }
-      }
-      if editor.customWorkload {
-        HStack {
-          TextField("1", text: $editor.concurrency).textFieldStyle(StudioPopoverFieldStyle())
-            .frame(width: 110).accessibilityLabel("Concurrent requests")
-          Stepper(
-            "Concurrent requests",
-            value: Binding(
-              get: { editor.effectiveConcurrency }, set: { editor.concurrency = String($0) }),
-            in: 1...max(1, editor.concurrencyCap)
-          ).labelsHidden()
-        }
-      }
-    }
-    EndpointFormField(
-      editor.capabilities.contains("asr") ? "Decoder context" : "Context per conversation"
-    ) {
-      Dropdown(
-        title: "Context per conversation",
-        value: editor.context.isEmpty
-          ? "Runner default · \(contextLabel(editor.effectiveContext))"
-          : editor.customContext ? "Custom" : contextLabel(editor.effectiveContext),
-        fillsWidth: true
-      ) {
-        Button("Model default · \(contextLabel(editor.recommendedContext))") {
-          editor.context = String(editor.recommendedContext)
-          editor.customContext = false
-        }
-        ForEach(editor.contextOptions, id: \.self) { tokens in
-          Button(contextLabel(tokens)) {
-            editor.context = String(tokens)
-            editor.customContext = false
+        if editor.customWorkload {
+          HStack {
+            TextField("1", text: $editor.concurrency).textFieldStyle(StudioPopoverFieldStyle())
+              .frame(width: 110).accessibilityLabel("Concurrent requests")
+            Stepper(
+              "Concurrent requests",
+              value: Binding(
+                get: { editor.effectiveConcurrency }, set: { editor.concurrency = String($0) }),
+              in: 1...max(1, editor.concurrencyCap)
+            ).labelsHidden()
           }
         }
-        Button("Custom…") { editor.customContext = true }
-      }.accessibilityIdentifier("endpoint-context")
-      if editor.customContext {
-        TextField("Model default", text: $editor.context).textFieldStyle(StudioPopoverFieldStyle())
-          .frame(width: 160).accessibilityLabel("Context tokens")
       }
-    }
-    EndpointFormField("Conversation memory") {
-      Text(editor.kvLabel).font(.system(size: 12))
-      if !editor.kvChoices.contains(editor.kvDtype) {
-        Button("Use supported memory format") {
-          editor.kvDtype = editor.selectedArtifact?.runtime?.kvCacheDtype ?? "auto"
+      EndpointFormField(
+        editor.capabilities.contains("asr") ? "Decoder context" : "Context per conversation"
+      ) {
+        Dropdown(
+          title: "Context per conversation",
+          value: editor.context.isEmpty
+            ? "Runner default · \(contextLabel(editor.effectiveContext))"
+            : editor.customContext ? "Custom" : contextLabel(editor.effectiveContext),
+          fillsWidth: true
+        ) {
+          Button("Model default · \(contextLabel(editor.recommendedContext))") {
+            editor.context = String(editor.recommendedContext)
+            editor.customContext = false
+          }
+          ForEach(editor.contextOptions, id: \.self) { tokens in
+            Button(contextLabel(tokens)) {
+              editor.context = String(tokens)
+              editor.customContext = false
+            }
+          }
+          Button("Custom…") { editor.customContext = true }
+        }.accessibilityIdentifier("endpoint-context")
+        if editor.customContext {
+          TextField("Model default", text: $editor.context).textFieldStyle(
+            StudioPopoverFieldStyle()
+          )
+          .frame(width: 160).accessibilityLabel("Context tokens")
         }
-        .buttonStyle(FlatButtonStyle())
-        hint("Saved format \(editor.kvDtype) cannot run with these weights.")
+      }
+      EndpointFormField("Conversation memory") {
+        Text(editor.kvLabel).font(.system(size: 12))
+        if !editor.kvChoices.contains(editor.kvDtype) {
+          Button("Use supported memory format") {
+            editor.kvDtype = editor.selectedArtifact?.runtime?.kvCacheDtype ?? "auto"
+          }
+          .buttonStyle(FlatButtonStyle())
+          hint("Saved format \(editor.kvDtype) cannot run with these weights.")
+        }
       }
     }
     if editor.canSpeculate || (editor.selectedModel == nil && editor.endpoint.settings?.spec != nil)

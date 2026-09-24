@@ -2,7 +2,18 @@ import AppKit
 import Carbon
 import Observation
 import ServiceManagement
-import SwiftUI
+
+@MainActor struct DesktopLoginService {
+  var status: () -> SMAppService.Status
+  var register: () throws -> Void
+  var unregister: () async throws -> Void
+
+  static var system: Self {
+    Self(
+      status: { SMAppService.mainApp.status }, register: { try SMAppService.mainApp.register() },
+      unregister: { try await SMAppService.mainApp.unregister() })
+  }
+}
 
 @MainActor @Observable
 public final class DesktopPreferences {
@@ -14,19 +25,43 @@ public final class DesktopPreferences {
   }
   public private(set) var shortcut: String
   public private(set) var shortcutError: String?
-  public private(set) var loginStatus: String? = "Checking…"
-  public private(set) var loginEnabled = false
+  private(set) var loginState: SMAppService.Status?
+  // A registered item awaiting permission stays selected so it can also be removed.
+  public var loginEnabled: Bool { loginState == .enabled || loginState == .requiresApproval }
+  public var loginNeedsApproval: Bool { loginState == .requiresApproval }
   public private(set) var loginBusy = false
   public private(set) var loginError: String?
   @ObservationIgnored private let defaults: UserDefaults
-  @ObservationIgnored private let hotKey = QuestionHotKey()
+  @ObservationIgnored private let loginService: DesktopLoginService
+  @ObservationIgnored private let registerShortcut: (String, @escaping () -> Void) throws -> Void
+  private var rememberedShortcut: String
   @ObservationIgnored public var onQuestion: (() -> Void)?
   @ObservationIgnored public var onMenuBarChange: ((Bool) -> Void)?
 
-  public init(defaults: UserDefaults = .standard) {
+  public convenience init(defaults: UserDefaults = .standard) {
+    self.init(
+      defaults: defaults, loginService: .system, registerShortcut: QuestionHotKey().register)
+  }
+
+  init(
+    defaults: UserDefaults, loginService: DesktopLoginService,
+    registerShortcut: @escaping (String, @escaping () -> Void) throws -> Void
+  ) {
     self.defaults = defaults
+    self.loginService = loginService
+    self.registerShortcut = registerShortcut
     showMenuBar = defaults.object(forKey: "desktopShowMenuBar") as? Bool ?? true
     shortcut = defaults.string(forKey: "desktopQuestionShortcut") ?? "off"
+    if let remembered = defaults.string(forKey: "desktopLastQuestionShortcut"),
+      QuestionHotKey.choices.contains(where: { $0.0 == remembered })
+    {
+      rememberedShortcut = remembered
+    } else {
+      rememberedShortcut = "control-option-space"
+    }
+    if QuestionHotKey.choices.contains(where: { $0.0 == shortcut }) {
+      rememberedShortcut = shortcut
+    }
   }
   public func start() {
     configureShortcut(shortcut)
@@ -34,46 +69,44 @@ public final class DesktopPreferences {
   }
   public func configureShortcut(_ selection: String) {
     do {
-      try hotKey.register(selection) { [weak self] in self?.onQuestion?() }
+      try registerShortcut(selection) { [weak self] in self?.onQuestion?() }
       shortcut = selection
       defaults.set(selection, forKey: "desktopQuestionShortcut")
+      if selection != "off" {
+        rememberedShortcut = selection
+        defaults.set(selection, forKey: "desktopLastQuestionShortcut")
+      }
       shortcutError = nil
     } catch { shortcutError = error.localizedDescription }
   }
+  public var shortcutEnabled: Bool { shortcut != "off" }
+  public func setShortcutEnabled(_ enabled: Bool) {
+    configureShortcut(enabled ? rememberedShortcut : "off")
+  }
   public func refreshLogin() {
-    switch SMAppService.mainApp.status {
-    case .enabled:
-      loginEnabled = true
-      loginStatus = nil
-    case .requiresApproval:
-      loginEnabled = false
-      loginStatus = "Allow Paddock in System Settings > General > Login Items."
-    case .notRegistered:
-      loginEnabled = false
-      loginStatus = nil
-    case .notFound:
-      loginEnabled = false
-      loginStatus = "Install Paddock in Applications before enabling launch at login."
-    @unknown default:
-      loginEnabled = false
-      loginStatus = "Status unavailable"
-    }
+    let next = loginService.status()
+    if next != loginState { loginError = nil }
+    loginState = next
   }
   public func setLogin(_ enabled: Bool) async {
     guard !loginBusy else { return }
     loginBusy = true
-    defer {
-      loginBusy = false
-      refreshLogin()
-    }
+    defer { loginBusy = false }
     do {
       loginError = nil
       if enabled {
-        try SMAppService.mainApp.register()
+        try loginService.register()
       } else {
-        try await SMAppService.mainApp.unregister()
+        try await loginService.unregister()
       }
-    } catch { loginError = error.localizedDescription }
+      refreshLogin()
+      if loginEnabled != enabled {
+        loginError = "macOS couldn’t \(enabled ? "enable" : "disable") launch at login. Try again."
+      }
+    } catch {
+      refreshLogin()
+      loginError = "Couldn’t change launch at login: \(error.localizedDescription)"
+    }
   }
 }
 
@@ -87,12 +120,12 @@ public final class DesktopPreferences {
   private var selection = "off"
   private var serial: UInt32 = 0
   static let choices = [
-    ("off", "Off"), ("control-option-space", "⌃⌥Space"), ("command-shift-space", "⇧⌘Space"),
+    ("control-option-space", "⌃⌥Space"), ("command-shift-space", "⇧⌘Space"),
     ("command-option-j", "⌥⌘J"),
   ]
 
   func register(_ value: String, action: @escaping () -> Void) throws {
-    guard Self.choices.contains(where: { $0.0 == value }) else {
+    guard value == "off" || Self.choices.contains(where: { $0.0 == value }) else {
       throw DesktopShortcutError.invalid
     }
     if value == selection {
@@ -162,105 +195,5 @@ enum DesktopShortcutError: LocalizedError {
     self == .invalid
       ? "Choose a supported shortcut."
       : "This shortcut could not be registered. It may be used by another app. Choose another; the previous shortcut was kept."
-  }
-}
-
-public struct DesktopSettingsView: View {
-  @Bindable var preferences: DesktopPreferences
-  @Bindable var notifications: DesktopNotifications
-  var embedded: Bool
-  public init(
-    preferences: DesktopPreferences, notifications: DesktopNotifications, embedded: Bool = false
-  ) {
-    self.preferences = preferences
-    self.notifications = notifications
-    self.embedded = embedded
-  }
-  public var body: some View {
-    DesktopSettingsSurface(embedded: embedded) {
-      Section("System integration") {
-        Toggle("Show Paddock in the menu bar", isOn: $preferences.showMenuBar)
-        Toggle(
-          "Launch Paddock at login",
-          isOn: Binding(
-            get: { preferences.loginEnabled },
-            set: { value in Task { await preferences.setLogin(value) } })
-        )
-        .disabled(preferences.loginBusy)
-        if let status = preferences.loginStatus {
-          Text(status).font(.caption).foregroundStyle(.secondary)
-        }
-        if let error = preferences.loginError { Text(error).foregroundStyle(PaddockStyle.caution) }
-        Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
-        Dropdown(
-          title: "Quick Question shortcut",
-          value: QuestionHotKey.choices.first(where: { $0.0 == preferences.shortcut })?.1 ?? "Off"
-        ) {
-          ForEach(QuestionHotKey.choices, id: \.0) { choice in
-            Button(choice.1) { preferences.configureShortcut(choice.0) }
-          }
-        }
-        if let error = preferences.shortcutError {
-          Text(error).foregroundStyle(PaddockStyle.caution)
-        }
-      }.listRowBackground(PaddockStyle.surface)
-      Section("Notifications") {
-        Toggle(
-          "Notify me about background work",
-          isOn: Binding(
-            get: { notifications.enabled },
-            set: { value in
-              if value {
-                Task { await notifications.enable() }
-              } else {
-                notifications.enabled = false
-              }
-            })
-        ).disabled(notifications.requesting)
-        Toggle("Play notification sounds", isOn: $notifications.sounds).disabled(
-          !notifications.enabled)
-        Text(notifications.authorization).font(.caption).foregroundStyle(.secondary)
-        if let error = notifications.error { Text(error).foregroundStyle(PaddockStyle.caution) }
-      }.listRowBackground(PaddockStyle.surface)
-    }
-    .task {
-      preferences.refreshLogin()
-      await notifications.refreshAuthorization()
-    }
-    .onReceive(
-      NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
-    ) { _ in
-      preferences.refreshLogin()
-      Task { await notifications.refreshAuthorization() }
-    }
-  }
-}
-
-/// The Settings scene and its grouped form are separate paint surfaces. Keep
-/// both opaque; changing the scroll background alone leaves a tinted title bar.
-struct DesktopSettingsSurface<Content: View>: View {
-  @AppStorage("workspaceAppearance") private var appearance: WorkspaceAppearance = .system
-  var embedded = false
-  @ViewBuilder var content: Content
-  var body: some View {
-    if embedded {
-      VStack(alignment: .leading, spacing: 0) {
-        PageHeading(title: "Application") { EmptyView() }.padding(.horizontal, 32).padding(.top, 32)
-        PaddockScrollRegion {
-          Form { content }.formStyle(.grouped).scrollContentBackground(.hidden)
-        }
-      }.frame(maxWidth: 820, maxHeight: .infinity).frame(maxWidth: .infinity)
-        .background(PaddockStyle.canvas).buttonStyle(FlatButtonStyle())
-    } else {
-      PaddockScrollRegion {
-        Form { content }.formStyle(.grouped).scrollContentBackground(.hidden)
-      }.frame(width: 530, height: 580)
-        .desktopWindowSurface(appearance: appearance).buttonStyle(FlatButtonStyle())
-        // Settings' SwiftUI scene reapplies its native title-bar treatment after
-        // hosting. Declare the toolbar paint too, instead of racing its window setup.
-        .toolbarBackground(PaddockStyle.canvas, for: .windowToolbar)
-        .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
-        .preferredColorScheme(appearance.colorScheme)
-    }
   }
 }

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use paddock_runner::routes::{AppState, router};
-use paddock_runner::serving::{self, AsrModel, ServingModel};
+use paddock_runner::serving::{self, AsrModel, ImageModel, ServingModel};
 
 fn heavy() -> bool {
     if std::env::var_os("PADDOCK_HEAVY_TESTS").is_none() {
@@ -330,6 +330,48 @@ fn load_whisper() -> Option<AsrModel> {
     .ok()
 }
 
+/// Qwen-Image-2.1, the image-generation lane: the DiT GGUF, its Qwen3-VL
+/// text encoder and the official VAE, from the catalog's own dest paths
+/// (`QWEN_IMAGE_DIR` / `QWEN3_VL_DIR` / `QWEN_IMAGE_VAE` override each).
+fn load_qwen_image() -> Option<ImageModel> {
+    let root = models_root();
+    let dit = std::env::var("QWEN_IMAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("Qwen-Image-2.1-GGUF"))
+        .join("qwen-image-2.1-Q8_0.gguf");
+    let te = std::env::var("QWEN3_VL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("Qwen3-VL-8B-Instruct-GGUF"))
+        .join("Qwen3VL-8B-Instruct-Q8_0.gguf");
+    let vae = std::env::var("QWEN_IMAGE_VAE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("Qwen-Image-2.1/vae/diffusion_pytorch_model.safetensors"));
+    // the vision tower wires the editing lane; the gate runs the edits
+    // section only when it is on the box
+    let mmproj = std::env::var("QWEN3_VL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| root.join("Qwen3-VL-8B-Instruct-GGUF"))
+        .join("mmproj-Qwen3VL-8B-Instruct-F16.gguf");
+    let pack = pack_path();
+    if !dit.exists() || !te.exists() || !vae.exists() || !pack.exists() {
+        decline("qwen-image DiT, text encoder, VAE or kernel pack missing");
+        return None;
+    }
+    serving::load_image(
+        "qwen-image-2.1".into(),
+        &dit,
+        &te,
+        &vae,
+        mmproj.exists().then_some(mmproj.as_path()),
+        "cuda",
+        0,
+        Some(&pack),
+        None,
+    )
+    .map_err(|e| panic!("the model is on the box but would not load: {e}"))
+    .ok()
+}
+
 #[tokio::test]
 async fn openai_sdk_gate_qwen35() {
     if !heavy() || !python_ready("openai") {
@@ -395,6 +437,22 @@ async fn run_spec_audio(port: u16, model: &str) {
     .await;
 }
 
+/// The images half: `/v1/images/generations` probed and validated against a
+/// real Qwen-Image server, and `/v1/images/edits` held to its refusal. Alone
+/// for the same reason the audio half is - an image runner has no text
+/// surface for the other sections.
+async fn run_spec_images(port: u16, model: &str) {
+    run_gate(
+        "spec_conformance.py",
+        format!("http://127.0.0.1:{port}"),
+        model,
+        "qwen",
+        false,
+        &["--images-only"],
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn spec_gate_qwen35() {
     if !heavy() || !python_ready("openai") || !python_ready("anthropic") {
@@ -432,6 +490,23 @@ async fn spec_gate_whisper() {
 /// anything on. The python side reads the served granularity list and asserts
 /// accordingly, so this leg costs one `#[tokio::test]` and no forked
 /// expectations.
+/// The image surface of the spec gate against the first image-generation
+/// lane. Heavy twice over (three uploads, ~17 GB resident), and every
+/// functional render is one step at a small size - the gate asserts wire
+/// SHAPE, never picture quality; that is the parity script's job.
+#[tokio::test]
+async fn spec_gate_qwen_image() {
+    if !heavy() || !python_ready("openai") || !python_ready("anthropic") {
+        return;
+    }
+    let Some(image) = load_qwen_image() else {
+        return;
+    };
+    let (port, server) = serve_state(AppState::for_tests_image(image)).await;
+    run_spec_images(port, "qwen-image-2.1").await;
+    server.abort();
+}
+
 #[tokio::test]
 async fn spec_gate_granite_speech_plus() {
     if !heavy() || !python_ready("openai") || !python_ready("anthropic") {

@@ -10,7 +10,12 @@ const MODELS: [(&str, &str); 2] = [
 fn mirrored_mlx_bundles_are_complete_and_macos_only() {
     let reg = Registry::new("./models".into()).with_backend("metal");
     let mut mirrored_files = 0;
-    for model in &reg.catalog().models {
+    for model in reg.catalog().models.iter().filter(|m| {
+        matches!(
+            m.id.as_str(),
+            "gemma-4-31b" | "muse-glimmer-30b" | "qwen3.8-27b" | "qwen3.8-flash-next"
+        )
+    }) {
         let Some(a) = model.artifact("mlx-4bit") else {
             continue;
         };

@@ -89,6 +89,13 @@ pub(super) struct PrefixCache {
     side_v: Vec<Option<CudaSlice<u8>>>,
     row_bytes: usize,
     page_bytes: usize,
+    /// per layer, attention layers only: the QSA compressed index keys a page
+    /// covers - `[pages][BLOCK_TOKENS/4][128]` bf16 - so a resumed prefix
+    /// brings its indexer keys back with its KV. Empty without the indexer.
+    side_x: Vec<Option<CudaSlice<u8>>>,
+    /// bytes of one compressed row (0 = no indexer cache) and of one page's
+    x_row_bytes: usize,
+    x_page_bytes: usize,
     /// `[n_ckpt][ckpt_f32]`: per GDN layer the slot's recurrence then its conv
     /// window, then the PLE ring (if the model has one)
     state_pool: CudaSlice<f32>,
@@ -155,6 +162,8 @@ impl PrefixCache {
         slots: usize,
         max_tokens: usize,
         kv_bytes: usize,
+        // one QSA compressed-key row in bytes, 0 when the lane keeps none
+        x_row_bytes: usize,
     ) -> Result<Option<Self>, GpuModelError> {
         let n_attn = cfg
             .blocks
@@ -188,29 +197,38 @@ impl PrefixCache {
         let want_ckpt = env_usize!("PADDOCK_KV_STATE_CKPTS", (slots * 6).clamp(8, 64));
         let cap = env_usize!("PADDOCK_Q38FN_PREFIX_STATE_MB", 6144) << 20;
         let n_ckpt = want_ckpt.min(cap / ckpt_bytes.max(1)).max(2);
+        let x_page_bytes = x_row_bytes * (BLOCK_TOKENS / crate::gpu::qsa::QSA_BLOCK);
         let mut side_k = Vec::with_capacity(cfg.n_layer);
         let mut side_v = Vec::with_capacity(cfg.n_layer);
+        let mut side_x = Vec::with_capacity(cfg.n_layer);
         for b in &cfg.blocks {
             match b {
                 Qwen4ExpBlock::Attention => {
                     side_k.push(Some(exec.alloc_u8(pages * page_bytes)?));
                     side_v.push(Some(exec.alloc_u8(pages * page_bytes)?));
+                    side_x.push(if x_page_bytes > 0 {
+                        Some(exec.alloc_u8(pages * x_page_bytes)?)
+                    } else {
+                        None
+                    });
                 }
                 Qwen4ExpBlock::Gdn => {
                     side_k.push(None);
                     side_v.push(None);
+                    side_x.push(None);
                 }
             }
         }
         let state_pool = exec.alloc(n_ckpt * ckpt_f32)?;
-        let max_descs = (2 * n_attn * pages).max(2 * n_gdn + 2);
+        let per_page = if x_page_bytes > 0 { 3 } else { 2 };
+        let max_descs = (per_page * n_attn * pages).max(2 * n_gdn + 2);
         let descs = exec.alloc_u64(3 * max_descs)?;
         let mut radix = PagedRadix::new();
         radix.set_state_capacity(n_ckpt as u32);
         tracing::info!(
-            "qwen4exp prefix cache: {pages} side pages ({} MB over {n_attn} attention layers), \
-             {n_ckpt} state checkpoints ({} MB each)",
-            (2 * n_attn * pages * page_bytes) >> 20,
+            "qwen4exp prefix cache: {pages} side pages ({} MB over {n_attn} attention layers, \
+             QSA index keys included), {n_ckpt} state checkpoints ({} MB each)",
+            (n_attn * pages * (2 * page_bytes + x_page_bytes)) >> 20,
             ckpt_bytes >> 20
         );
         Ok(Some(Self {
@@ -220,6 +238,9 @@ impl PrefixCache {
             side_v,
             row_bytes,
             page_bytes,
+            side_x,
+            x_row_bytes,
+            x_page_bytes,
             state_pool,
             ckpt_f32,
             st_elems,
@@ -251,6 +272,7 @@ impl PrefixCache {
         max_tokens: usize,
         kv_k: &mut [Option<CudaSlice<u8>>],
         kv_v: &mut [Option<CudaSlice<u8>>],
+        idx_cache: &mut [Option<CudaSlice<half::bf16>>],
         recur: &mut [Option<CudaSlice<f32>>],
         gdn_win: &mut [Option<CudaSlice<f32>>],
         ple_win: Option<&mut CudaSlice<f32>>,
@@ -281,7 +303,17 @@ impl PrefixCache {
             return Ok(0);
         }
         let pages = &m.blocks[..pos / BLOCK_TOKENS];
-        self.copy_pages(exec, slot, 0, pages, max_tokens, kv_k, kv_v, Dir::Load)?;
+        self.copy_pages(
+            exec,
+            slot,
+            0,
+            pages,
+            max_tokens,
+            kv_k,
+            kv_v,
+            idx_cache,
+            Dir::Load,
+        )?;
         self.copy_state(exec, slot, idx, recur, gdn_win, ple_win, Dir::Load)?;
         self.last_reused[slot] = pos;
         if self.stats {
@@ -310,6 +342,7 @@ impl PrefixCache {
         max_tokens: usize,
         kv_k: &mut [Option<CudaSlice<u8>>],
         kv_v: &mut [Option<CudaSlice<u8>>],
+        idx_cache: &mut [Option<CudaSlice<half::bf16>>],
         recur: &mut [Option<CudaSlice<f32>>],
         gdn_win: &mut [Option<CudaSlice<f32>>],
         ple_win: Option<&mut CudaSlice<f32>>,
@@ -339,7 +372,17 @@ impl PrefixCache {
                         .map_err(|_| GpuError::Driver("prefix side store exhausted".into()))?,
                 );
             }
-            self.copy_pages(exec, slot, have, &new, max_tokens, kv_k, kv_v, Dir::Store)?;
+            self.copy_pages(
+                exec,
+                slot,
+                have,
+                &new,
+                max_tokens,
+                kv_k,
+                kv_v,
+                idx_cache,
+                Dir::Store,
+            )?;
             let mut all = m.blocks.clone();
             all.extend_from_slice(&new);
             self.radix.insert(prefix, &all, &mut self.pool);
@@ -433,9 +476,10 @@ impl PrefixCache {
         max_tokens: usize,
         kv_k: &mut [Option<CudaSlice<u8>>],
         kv_v: &mut [Option<CudaSlice<u8>>],
+        idx_cache: &mut [Option<CudaSlice<half::bf16>>],
         dir: Dir,
     ) -> Result<(), GpuModelError> {
-        let mut descs: Vec<u64> = Vec::with_capacity(3 * 2 * pages.len() * self.side_k.len());
+        let mut descs: Vec<u64> = Vec::with_capacity(3 * 3 * pages.len() * self.side_k.len());
         for li in 0..self.side_k.len() {
             let (Some(sk), Some(sv)) = (self.side_k[li].as_ref(), self.side_v[li].as_ref()) else {
                 continue;
@@ -461,6 +505,28 @@ impl PrefixCache {
                         descs.extend([kp + strip, skp + side, len]);
                         descs.extend([vp + strip, svp + side, len]);
                     }
+                }
+            }
+            // the page's QSA compressed keys ride with its K/V: 4 rows a page,
+            // slot-major like the strips (max_tokens / 4 rows per slot)
+            let (Some(sx), Some(xc)) = (
+                self.side_x.get(li).and_then(|x| x.as_ref()),
+                idx_cache.get(li).and_then(|x| x.as_ref()),
+            ) else {
+                continue;
+            };
+            let (sxp, _g5) = sx.device_ptr(&exec.stream);
+            let (xp, _g6) = xc.device_ptr(&exec.stream);
+            let rows_per_page = BLOCK_TOKENS / crate::gpu::qsa::QSA_BLOCK;
+            let rows_per_slot = max_tokens / crate::gpu::qsa::QSA_BLOCK;
+            for (i, &b) in pages.iter().enumerate() {
+                let strip = ((slot * rows_per_slot + (first_page + i) * rows_per_page)
+                    * self.x_row_bytes) as u64;
+                let side = (b as usize * self.x_page_bytes) as u64;
+                let len = self.x_page_bytes as u64;
+                match dir {
+                    Dir::Load => descs.extend([sxp + side, xp + strip, len]),
+                    Dir::Store => descs.extend([xp + strip, sxp + side, len]),
                 }
             }
         }

@@ -3384,6 +3384,12 @@ int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* 
         case PD_KQ_IQ4NL_ID: PD_KWH2_LAUNCH(PD_KQ_IQ4NL_ID); break;
         case PD_KQ_Q2K_ID: PD_KWH2_LAUNCH(PD_KQ_Q2K_ID); break;
         case PD_KQ_Q3K_ID: PD_KWH2_LAUNCH(PD_KQ_Q3K_ID); break;
+        // Q5_0 at a 256-aligned width (the gemma-4 A4B's shared down, padded
+        // to 2304 by its loader): its window unpack carries no mu term, so
+        // the f-only i-quant tile is exact for it. Q5_1 stays off the tile -
+        // its per-block m would need the per-32 min path the tile does not
+        // build - and a flat (non-256) width is refused above either way.
+        case PD_KQ_Q50_ID: PD_KWH2_LAUNCH(PD_KQ_Q50_ID); break;
         case PD_KQ_PQ2_ID: PD_KWH2_LAUNCH(PD_KQ_PQ2_ID); break;
         case PD_KQ_PTQ1_ID: PD_KWH2_LAUNCH(PD_KQ_PTQ1_ID); break;
         default: PD_KWH2_LAUNCH(PD_KQ_IQ4XS); break;

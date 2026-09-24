@@ -144,6 +144,21 @@ pub enum ToolSyntax {
     /// is free text and the rest is real JSON - and `muse::parse`'s `coerce`
     /// reads exactly that back.
     AtemXml,
+    /// MiniCPM5's attribute XML, no wrapper tag and no padding:
+    /// `<function name="NAME"><param name="KEY">VALUE</param>...</function>`.
+    ///
+    /// The opener carries the name inside a quoted attribute, so `<function
+    /// name="get"` vs `..."get_weather"` are told apart by the closing `">`
+    /// the literal runs through - prefix-free like the others.
+    ///
+    /// Values are typed like laguna's: the template writes a string bare
+    /// (CDATA-wrapped when it holds `<`, `&` or a newline - which the free-text
+    /// state accepts as ordinary bytes and `parsers::parse_minicpm_call`
+    /// unwraps) and everything else through `{{ param_value }}`, which
+    /// llama.cpp's grammar for this family pins to JSON for non-string
+    /// declared types. Same decision function as laguna, terminator
+    /// `</param>`.
+    MiniCpmXml,
 }
 
 /// Compiled tool set for `tool_choice: "required"` / named function. One call
@@ -247,7 +262,10 @@ impl ToolSet {
             // unspellable key to free-form args rather than refusing
             let mut values = Vec::new();
             let args = match syntax {
-                ToolSyntax::QwenXml | ToolSyntax::LagunaXml | ToolSyntax::AtemXml => {
+                ToolSyntax::QwenXml
+                | ToolSyntax::LagunaXml
+                | ToolSyntax::AtemXml
+                | ToolSyntax::MiniCpmXml => {
                     if params.len() > MAX_LAX_PROPS {
                         return Err(format!(
                             "function {name:?} has more than {MAX_LAX_PROPS} parameters"
@@ -258,10 +276,14 @@ impl ToolSet {
                             return Err(format!("tool parameter {k:?} contains grammar bytes"));
                         }
                     }
-                    // laguna and muse both spell values the way their template
-                    // writes them: declared string = bare text, anything else
-                    // `tojson`'d. Same decision function, different terminator.
-                    if matches!(syntax, ToolSyntax::LagunaXml | ToolSyntax::AtemXml) {
+                    // laguna, muse and minicpm all spell values the way their
+                    // template writes them: declared string = bare text,
+                    // anything else `tojson`'d. Same decision function,
+                    // different terminator.
+                    if matches!(
+                        syntax,
+                        ToolSyntax::LagunaXml | ToolSyntax::AtemXml | ToolSyntax::MiniCpmXml
+                    ) {
                         let props = f
                             .get("parameters")
                             .and_then(|p| p.get("properties"))
@@ -329,6 +351,12 @@ fn lag_value_grammar(schema: Option<&Value>) -> LagValue {
 
 const PARAM_END: &[u8] = b"\n</parameter>\n";
 const ARG_VALUE_END: &[u8] = b"</arg_value>";
+/// MiniCPM5 writes `</param>` straight after the value, no padding, and
+/// `parse_minicpm_call` cuts the value at the tag.
+const MINICPM_PARAM_END: &[u8] = b"</param>";
+/// MiniCPM5's opener through the quote that starts the tool name - the arming
+/// tag for its dispatcher and the prefix of every candidate literal.
+const MINICPM_OPEN: &[u8] = b"<function name=\"";
 /// muse's `render_atem` writes `'</atem:parameter>\n'` after every value, and
 /// `muse::parse` cuts the value at the tag - so the newline belongs to the
 /// SEPARATOR, not the value, and is spelled here rather than left optional.
@@ -363,6 +391,7 @@ fn value_end(syntax: ToolSyntax) -> &'static [u8] {
     match syntax {
         ToolSyntax::LagunaXml => ARG_VALUE_END,
         ToolSyntax::AtemXml => ATEM_PARAM_END,
+        ToolSyntax::MiniCpmXml => MINICPM_PARAM_END,
         _ => PARAM_END,
     }
 }
@@ -515,6 +544,12 @@ impl ToolMachine {
                     let mut lit = ToolSyntax::AtemXml.trigger().to_vec();
                     lit.extend_from_slice(f.name.as_bytes());
                     lit.extend_from_slice(b"\">\n");
+                    cands.push((lit, TNext::Boundary(i, 0)));
+                }
+                ToolSyntax::MiniCpmXml => {
+                    let mut lit = MINICPM_OPEN.to_vec();
+                    lit.extend_from_slice(f.name.as_bytes());
+                    lit.extend_from_slice(b"\">");
                     cands.push((lit, TNext::Boundary(i, 0)));
                 }
             }
@@ -697,6 +732,19 @@ impl ToolMachine {
                         b"</atem:invoke>\n</atem:function_calls>".to_vec(),
                         TNext::Finish,
                     ));
+                }
+            }
+            ToolSyntax::MiniCpmXml => {
+                for (i, (key, _)) in f.params.iter().enumerate() {
+                    if emitted & (1 << i) == 0 {
+                        let mut lit = b"<param name=\"".to_vec();
+                        lit.extend_from_slice(key.as_bytes());
+                        lit.extend_from_slice(b"\">");
+                        cands.push((lit, TNext::LagValue(fn_idx, emitted | (1 << i), i)));
+                    }
+                }
+                if all_required_done {
+                    cands.push((b"</function>".to_vec(), TNext::Finish));
                 }
             }
             ToolSyntax::Json => unreachable!("the json syntax has no parameter boundary"),
@@ -915,6 +963,10 @@ impl ToolSyntax {
             // pins it (`p.tool_name` sits inside `<atem:invoke name="`), so
             // header and body cannot disagree about which tool was called.
             ToolSyntax::AtemXml => b"<atem:function_calls>\n<atem:invoke name=\"",
+            // minicpm has no wrapper tag at all: the call IS `<function
+            // name="`, so the opener arms through the quote and the name lands
+            // inside the constrained region, as with muse
+            ToolSyntax::MiniCpmXml => MINICPM_OPEN,
         }
     }
 
@@ -1986,6 +2038,165 @@ mod tests {
         assert_eq!(p.content, None, "the whole generation is the call");
     }
 
+    // -------------------------------------------- minicpm (attribute XML) --
+
+    fn minicpm_set() -> Arc<ToolSet> {
+        ToolSet::compile(ToolSyntax::MiniCpmXml, &[laguna_tool()], None).expect("compile tools")
+    }
+
+    /// The exact bytes MiniCPM5's template renders for a call: no wrapper
+    /// tag, no padding, the name and keys in quoted attributes.
+    #[test]
+    fn minicpm_tool_grammar_matches_the_template_shape() {
+        let mut m = ToolMachine::new(minicpm_set());
+        assert!(tool_feed(
+            &mut m,
+            "<function name=\"get_weather\"><param name=\"city\">Paris</param></function>"
+        ));
+        assert!(m.may_stop());
+        assert!(!m.feed(b'x'), "nothing after the call");
+    }
+
+    /// `get` vs `get_weather`: the closing `">` in the opener literal keeps the
+    /// candidate set prefix-free.
+    #[test]
+    fn minicpm_tool_grammar_disambiguates_prefix_named_functions() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "get"}}),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ];
+        let set = ToolSet::compile(ToolSyntax::MiniCpmXml, &tools, None).expect("compile");
+        for name in ["get", "get_weather"] {
+            let mut m = ToolMachine::new(set.clone());
+            assert!(
+                tool_feed(&mut m, &format!("<function name=\"{name}\"></function>")),
+                "{name}"
+            );
+            assert!(m.may_stop(), "{name}");
+        }
+    }
+
+    #[test]
+    fn minicpm_tool_grammar_requires_required_params_and_rejects_bad_keys() {
+        let mut m = ToolMachine::new(minicpm_set());
+        assert!(tool_feed(&mut m, "<function name=\"get_weather\">"));
+        assert!(
+            !tool_feed(&mut m.clone(), "</function>"),
+            "closed without city"
+        );
+        assert!(
+            !tool_feed(&mut m.clone(), "<param name=\"z"),
+            "undeclared key"
+        );
+        let mut n = m.clone();
+        assert!(tool_feed(&mut n, "<param name=\"days\">3</param>"));
+        assert!(
+            !tool_feed(&mut n.clone(), "</function>"),
+            "closed without city"
+        );
+        assert!(
+            !tool_feed(&mut n, "<param name=\"days"),
+            "days already emitted"
+        );
+        assert!(tool_feed(
+            &mut m,
+            "<param name=\"city\">Paris</param><param name=\"days\">3</param></function>"
+        ));
+        assert!(m.may_stop());
+    }
+
+    /// Values are typed the way the template writes them: a declared string
+    /// is bare text (a CDATA wrapper is ordinary bytes to the grammar and the
+    /// parser unwraps it), an integer is JSON, an enum stays on its variants.
+    #[test]
+    fn minicpm_tool_grammar_types_values_the_way_the_template_writes_them() {
+        let mut m = ToolMachine::new(minicpm_set());
+        assert!(tool_feed(
+            &mut m,
+            "<function name=\"get_weather\"><param name=\"city\"><![CDATA[a <b>\n& c]]></param></function>"
+        ));
+        assert!(
+            m.may_stop(),
+            "free text must accept CDATA and angle brackets"
+        );
+
+        let mut m = ToolMachine::new(minicpm_set());
+        assert!(tool_feed(
+            &mut m,
+            "<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"days\">3"
+        ));
+        assert!(!m.clone().feed(b'.'), "integer must reject a fraction");
+        assert!(!m.clone().feed(b'x'), "integer must reject a word");
+        assert!(tool_feed(&mut m, "</param></function>"));
+        assert!(m.may_stop());
+
+        let mut m = ToolMachine::new(minicpm_set());
+        assert!(tool_feed(
+            &mut m,
+            "<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"units\">"
+        ));
+        assert!(
+            !m.clone().feed(b'x'),
+            "enum must reject an unlisted variant"
+        );
+        assert!(tool_feed(&mut m, "c</param></function>"));
+        assert!(m.may_stop());
+    }
+
+    /// Whatever the grammar emits, `parsers::minicpm_parse` reads back as a
+    /// typed call - the contract every syntax here is held to.
+    #[test]
+    fn minicpm_tool_grammar_output_round_trips_through_the_parser() {
+        let mut m = ToolMachine::new(minicpm_set());
+        let text = "<function name=\"get_weather\"><param name=\"city\"><![CDATA[Paris <3]]></param>\
+                    <param name=\"days\">3</param><param name=\"units\">c</param></function>";
+        assert!(tool_feed(&mut m, text));
+        assert!(m.may_stop());
+        let hints = crate::parsers::tool_hints(Some(&[laguna_tool()]));
+        let p = crate::parsers::parse(
+            crate::parsers::Dialect::MiniCpmXml,
+            text,
+            false,
+            hints.as_ref(),
+        );
+        assert_eq!(p.tool_calls.len(), 1, "{p:?}");
+        assert_eq!(p.complete_calls, 1);
+        assert_eq!(p.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(&p.tool_calls[0].arguments).expect("args parse"),
+            json!({"city": "Paris <3", "days": 3, "units": "c"})
+        );
+        assert_eq!(p.content, None, "the whole generation is the call");
+    }
+
+    /// `tool_choice: "auto"`: prose runs free, the opener arms the grammar
+    /// mid-turn, and the turn is free again after the call closes - so two
+    /// calls back to back (the template's parallel-call shape) both constrain.
+    #[test]
+    fn minicpm_dispatch_arms_on_the_opener_and_releases_after_the_call() {
+        let mut m = DispatchMachine::new(minicpm_set(), false);
+        assert!(dfeed(
+            &mut m,
+            "Let me check.\n<function name=\"get_weather\">"
+        ));
+        assert!(m.in_call());
+        assert!(
+            !m.clone().feed(b'z'),
+            "inside the call only grammar bytes are legal"
+        );
+        assert!(dfeed(
+            &mut m,
+            "<param name=\"city\">Paris</param></function>"
+        ));
+        assert!(!m.in_call());
+        assert!(m.may_stop());
+        assert!(dfeed(
+            &mut m,
+            "<function name=\"get_weather\"><param name=\"city\">Berlin</param></function>"
+        ));
+        assert!(!m.in_call() && m.may_stop());
+    }
+
     // ---------------------------------------------------- dispatch --
 
     /// feed a whole string; true = every byte was legal
@@ -2388,6 +2599,7 @@ mod tests {
             ToolSyntax::QwenXml,
             ToolSyntax::LagunaXml,
             ToolSyntax::AtemXml,
+            ToolSyntax::MiniCpmXml,
         ] {
             assert!(s.bare_trigger().is_none(), "{s:?} must not arm bare");
             assert!(ToolMachine::bare(tool_set_for(s)).is_none());

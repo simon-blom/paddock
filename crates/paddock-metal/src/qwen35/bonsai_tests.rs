@@ -686,7 +686,7 @@ fn bonsai_model_smoke() {
 
 #[test]
 #[ignore = "requires PADDOCK_METAL_BONSAI_MODEL and PADDOCK_BONSAI_REFERENCE"]
-fn bonsai_complete_generation_reference() {
+pub(super) fn bonsai_complete_generation_reference() {
     let path = std::env::var("PADDOCK_METAL_BONSAI_MODEL").unwrap();
     let reference = std::path::PathBuf::from(std::env::var("PADDOCK_BONSAI_REFERENCE").unwrap());
     let data: serde_json::Value =

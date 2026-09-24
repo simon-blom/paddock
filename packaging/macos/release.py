@@ -198,10 +198,17 @@ def snapshot(root, source, allow_dirty):
                 ["git", "-C", str(source), "diff", "--binary", "HEAD"])).hexdigest()}
 
 
-def swift_args(source):
+def swift_args(source, sdk_version):
+    require(bool(re.fullmatch(r"\d+\.\d+(?:\.\d+)?", sdk_version))
+            and int(sdk_version.split(".")[0]) >= 26, "A macOS 26+ SDK is required.")
     return ["xcrun", "swift", "build", "--package-path", str(source / "apps/macos"),
             "--configuration", "release", "--product", "PaddockMac", "--triple", SWIFT_TARGET,
             "--force-resolved-versions", "-Xswiftc", "-warnings-as-errors",
+            # Swift Build must not substitute the deployment floor for the SDK;
+            # AppKit uses the latter to enable native scroll-edge behavior.
+            "-Xlinker", "-platform_version", "-Xlinker", "macos", "-Xlinker", MIN_OS,
+            "-Xlinker", sdk_version,
+            "-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
             # Map source inputs, not .build/out's SDK module cache: dsymutil
             # must still resolve those binary modules while linking symbols.
             "-Xswiftc", "-file-prefix-map", "-Xswiftc",
@@ -210,16 +217,20 @@ def swift_args(source):
             str(source / "apps/macos/.build/checkouts") + "=/src/dependencies"]
 
 
-def assemble(source, work, stage, release_version, build_number, env):
+def assemble(source, work, stage, release_version, build_number, env, sdk_version):
     app = stage / "Paddock.app"
     contents = app / "Contents"
     resources = contents / "Resources"
     rust = work / "cargo" / TARGET / "release"
-    swift = Path(run(*swift_args(source), "--show-bin-path", env=env, capture=True))
+    swift = Path(run(*swift_args(source, sdk_version), "--show-bin-path", env=env, capture=True))
+    run("bash", source / "apps/macos/scripts/check-linked-sdk.sh", swift / "PaddockMac", sdk_version)
     copy_file(swift / "PaddockMac", contents / "MacOS/Paddock")
     copy_file(rust / "paddock-runner", contents / "Helpers/paddock-runner")
     library = contents / "Frameworks/libpaddock_desktop.dylib"
     copy_file(rust / library.name, library)
+    sparkle = source / "apps/macos/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+    require(sparkle.is_dir(), "Pinned Sparkle framework is missing.")
+    shutil.copytree(sparkle, contents / "Frameworks/Sparkle.framework", symlinks=True)
     run("install_name_tool", "-id", "@rpath/" + library.name, library)
     resources.mkdir(parents=True)
     bundles = sorted(swift.glob("*.bundle"))
@@ -233,11 +244,13 @@ def assemble(source, work, stage, release_version, build_number, env):
             and not audit["forbiddenWebUI"] and audit["auditedModules"] > 0,
             "The native viewer boundary audit failed.")
     shutil.copytree(viewers, resources / "StudioWorkspace")
+    copy_file(source / "packaging/macos/Paddock.icns", resources / "Paddock.icns")
     checkouts = source / "apps/macos/.build/checkouts"
     notices = resources / "NativeMarkdownNotices"
     deps = {name: name + "/LICENSE" for name in
             ("MarkdownView", "beautiful-mermaid-swift", "elk-swift", "RichText", "Highlightr", "SwiftMath")}
     deps.update({"swift-markdown": "swift-markdown/LICENSE.txt", "swift-cmark": "swift-cmark/COPYING",
+                 "Sparkle": "Sparkle/LICENSE",
                  "highlight-js": "Highlightr/src/assets/highlighter/LICENSE",
                  "math-fonts": "SwiftMath/Sources/SwiftMath/mathFonts.bundle/LICENSE"})
     for name, path in deps.items():
@@ -267,6 +280,10 @@ def sign(stage, identity):
     # exceptions. Ad-hoc is allowed ONLY for the explicitly unsigned candidate.
     options = ["--force", "--sign", identity, "--options", "runtime"]
     options += ["--timestamp"] if identity != "-" else ["--timestamp=none"]
+    sparkle = stage / "Paddock.app/Contents/Frameworks/Sparkle.framework"
+    for nested in ("Autoupdate", "XPCServices/Downloader.xpc", "XPCServices/Installer.xpc", "Updater.app"):
+        run("codesign", *options, "--preserve-metadata=entitlements", sparkle / "Versions/B" / nested)
+    run("codesign", *options, sparkle)
     for binary in binaries(stage):
         if binary.name != "Paddock":
             run("codesign", *options, binary)
@@ -384,10 +401,21 @@ def build(args):
     run("cargo", "build", "--locked", "--release", "--target", TARGET,
         "-p", "paddock-manager", "-p", "paddock-desktop", "-p", "paddock-runner",
         "--no-default-features", "--features", FEATURES, cwd=source, env=env)
-    run(*swift_args(source), env=env)
+    run(*swift_args(source, tools["SDK"]), env=env)
     require(hashes == {name: digest(source / name) for name in locks}, "A dependency lockfile changed.")
     stage = output / "stage"
-    assemble(source, work, stage, release_version, args.build_number, env)
+    assemble(source, work, stage, release_version, args.build_number, env, tools["SDK"])
+    if args.update_public_key:
+        import base64
+        try:
+            require(len(base64.b64decode(args.update_public_key, validate=True)) == 32,
+                    "The Sparkle public key must decode to 32 bytes.")
+        except ValueError as error:
+            raise ReleaseError("Invalid Sparkle public key.") from error
+        info_path = stage / "Paddock.app/Contents/Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        info["SUPublicEDKey"] = args.update_public_key
+        info_path.write_bytes(plistlib.dumps(info))
     sign(stage, "-")
     smoke(stage, env)
     name = "Paddock-" + release_version + "-macos-arm64-UNSIGNED"
@@ -491,6 +519,7 @@ def main():
     build_parser.add_argument("--output", type=Path, required=True)
     build_parser.add_argument("--build-number", required=True, help="Monotonically increasing app build number, N[.N[.N]]")
     build_parser.add_argument("--allow-dirty", action="store_true", help="Unsigned local candidate only; cannot finalize")
+    build_parser.add_argument("--update-public-key", help="Public Ed25519 key for the signed Sparkle appcast (never a private key)")
     final_parser = commands.add_parser("finalize")
     final_parser.add_argument("--input", type=Path, required=True)
     final_parser.add_argument("--application-identity", required=True)

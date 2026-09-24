@@ -12,13 +12,16 @@ extension NativeStudioRuntime {
     for row in rows {
       guard
         let id = row["model"]?.string ?? row["asr"]?.string ?? row["embedder"]?.string
-          ?? row["aligner"]?.string
+          ?? row["aligner"]?.string ?? row["image"]?.string
       else { continue }
       let kind =
         row["model"]?.string != nil
         ? "chat"
         : row["asr"]?.string != nil
-          ? "transcriber" : row["embedder"]?.string != nil ? "encoder" : "aligner"
+          ? "transcriber"
+          : row["embedder"]?.string != nil
+            ? "encoder"
+            : row["image"]?.string != nil ? "image" : "aligner"
       var value: O = [
         "id": .string(id), "title": row["display"] ?? .string(id), "provider": .string("Local"),
         "vendor": row["vendor"] ?? .string(""), "port": row["port"] ?? .null,
@@ -108,6 +111,10 @@ extension NativeStudioRuntime {
   }
   func canChat(_ id: String) -> Bool {
     models.first { $0["id"]?.string == id }?["kind"]?.string == "chat"
+  }
+  func canImagine(_ id: String) -> Bool {
+    models.first { $0["id"]?.string == id }?["kind"]?.string == "image"
+      && caps[id]?["image_generation"]?.object != nil
   }
   var contextLimit: Int {
     selected.compactMap { caps[$0]?["max_ctx"]?.integer }.filter { $0 > 0 }.min() ?? 0

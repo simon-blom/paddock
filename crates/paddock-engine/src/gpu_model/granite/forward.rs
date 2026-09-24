@@ -445,6 +445,21 @@ impl Generator for GpuGranite {
         self.batch.is_some()
     }
 
+    // the mixed tick's FIFO over the queue, row-exact from each cursor
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.cursor, c.tokens.len() - c.cursor))
+            .collect()
+    }
+
+    // plan_chunk's cap under the pass's row capacity (the decode rows share it)
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.batch.as_ref().map_or(0, |bs| {
+            super::batch::pf_rows().min(bs.cap.saturating_sub(decode_rows))
+        })
+    }
+
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
         self.prefill_begin_impl(slot, tokens).map_err(gen_err)
     }

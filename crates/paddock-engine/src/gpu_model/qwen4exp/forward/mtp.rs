@@ -724,10 +724,12 @@ impl Qwen4ExpGpu {
             stage,
             kv_k,
             kv_v,
+            None, // the MTP head's attention is dense: it drafts, the model verifies
             *max_tokens,
             n,
             phase,
             &[],
+            0,
             false,
         )?;
         let (mlp_pre, _, _) = combine(

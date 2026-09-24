@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
+import { parseReplyLimit } from '@/lib/reply-limit'
 
 type Theme = 'light' | 'dark'
 
@@ -27,8 +28,7 @@ function initialMaxTokens(): number | null {
   }
   const raw = localStorage.getItem('pk_max_tokens')
   if (raw == null || raw === 'max') return null
-  const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : null
+  return parseReplyLimit(raw)
 }
 
 /** null = send no `max_tool_calls` at all, so the server's own budget applies.

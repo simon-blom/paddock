@@ -12,10 +12,15 @@ import WebKit
   let webView: WKWebView
   private let page: StudioPageDelegate
   private weak var owner: StudioWorkspace?
+  private let role: NativeViewerRole
+  // Admission supplies the graph before its new user turn is persisted. The
+  // startup task must not overwrite that source with the preceding document.
+  var preparedForAdmission = false
   private var host: StudioHost?
   private var loaded = false, closed = false
-  init(owner: StudioWorkspace) {
+  init(owner: StudioWorkspace, role: NativeViewerRole) {
     self.owner = owner
+    self.role = role
     let configuration = WKWebViewConfiguration()
     configuration.websiteDataStore = .nonPersistent()
     configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
@@ -59,7 +64,7 @@ import WebKit
     -> String
   {
     guard !closed, loaded else { return "" }
-    let bytes = try JSONEncoder().encode(fields)
+    let bytes = try JSONEncoder().encode(role.project(fields))
     guard bytes.count <= 8 * 1024 * 1024 else {
       throw ManagerError.core("The viewer projection is too large")
     }

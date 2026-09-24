@@ -14,7 +14,8 @@ struct StudioAttachmentChip: View {
       || current.mime.hasPrefix("image/")
   }
   private var configurable: Bool {
-    current.supportsPageSelection || current.mime.hasPrefix("image/")
+    chat.state?.composer?.imageMode != true
+      && (current.supportsPageSelection || current.mime.hasPrefix("image/"))
   }
   private var summary: String {
     if let error = current.error { return error }
@@ -22,10 +23,15 @@ struct StudioAttachmentChip: View {
     if current.supportsPageSelection {
       return current.pageSummary + (current.isPDF && current.textOnly ? " · Text only" : "")
     }
-    return current.width.flatMap { w in
-      current.height.map { "\(w) × \($0) · \(current.detail.capitalized)" }
+    if current.mime.hasPrefix("image/") {
+      if chat.state?.composer?.imageMode == true {
+        return ByteCountFormatter.string(fromByteCount: Int64(current.size), countStyle: .file)
+      }
+      let label = StudioAttachment.imageDetailOptions.first { $0.value == current.detail }?.title
+      return [label, StudioImageEstimate.label(chat.imageEstimates(for: current))]
+        .compactMap { $0 }.joined(separator: " · ")
     }
-      ?? ByteCountFormatter.string(fromByteCount: Int64(current.size), countStyle: .file)
+    return ByteCountFormatter.string(fromByteCount: Int64(current.size), countStyle: .file)
   }
   var body: some View {
     HStack(spacing: 8) {
@@ -85,6 +91,7 @@ struct StudioAttachmentChip: View {
             }),
           canRasterPDF: chat.state?.capabilities.vision == true
             && chat.state?.capabilities.pdfRaster == true,
+          capabilities: chat.state?.capabilities,
           onDone: { options = false })
       }
       .onChange(of: chat.busy) { _, busy in if busy { options = false } }

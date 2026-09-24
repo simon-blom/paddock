@@ -356,6 +356,11 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       { key: 'catalog', kind: 'json', hint: 'which catalog model the weights are · {"model": "qwen3.5-9b", "artifact": "q8", "drafter": "drafter2"}' },
       { key: 'mmproj', kind: 'file', src: 'mmproj', hint: 'image encoder GGUF - enables image input' },
       { key: 'mtp', kind: 'file', src: 'mtp', hint: 'drafter GGUF for speculative decode (models without in-file MTP)' },
+      // The image lane's two companions (config.rs `text_encoder` / `vae`).
+      // The encoder is a GGUF, so the gguf picker suits it; the VAE is a
+      // safetensors file no picker lists, so it is a plain path.
+      { key: 'text_encoder', kind: 'file', src: 'gguf', hint: 'text-encoder GGUF (Qwen3-VL) for an image-generation model - required with a DiT model' },
+      { key: 'vae', kind: 'text', hint: 'VAE safetensors for an image-generation model - required with a DiT model' },
       { key: 'fp8_native', kind: 'file', src: 'fp8_dirs', hint: 'official FP8 safetensors folder - sources the fp8 planes directly' },
       { key: 'model_dirs', kind: 'file', src: 'model_dirs', multi: true, hint: 'where a bare model NAME is looked up - unused when model is a path' },
       { key: 'kernel_pack', kind: 'file', src: 'kernel_packs', hint: 'the GPU kernel pack the engine loads' },
@@ -1185,6 +1190,16 @@ const canTools = computed(
 // let the runner be the judge.
 const canSpeculate = computed(
   () => !catModel.value || selectedCapabilities.value.includes('speculative'),
+)
+// A model that answers in ONE pass - a picture out (image generation) or a
+// raster out (dense prediction) - keeps nothing between calls: no context
+// window, no conversation cache, no concurrency to size a pool for. The
+// estimator already prices these flat (max_ctx "not applicable"); the form
+// has to stop offering the knobs, or it draws a context slider for a thing
+// that has no context. Encoders and speech models are NOT in this set: an
+// embedder batches inputs and bounds their length, whisper windows a clip.
+const singlePass = computed(() =>
+  selectedCapabilities.value.some((c) => c === 'image-generation' || c === 'segmentation'),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
 watch(selectedWeights, (weights, previous) => {
@@ -2343,7 +2358,9 @@ function start(): void {
           </label>
         </template>
 
-        <!-- the one real decision -->
+        <!-- the one real decision - for a model that decodes. A single-pass
+             model has no workload or context to set (see `singlePass`). -->
+        <template v-if="!singlePass">
         <label class="sf__lbl">Workload</label>
         <ToggleGroup v-model="workload" class="sf__wl" label="Workload">
           <ToggleGroupItem
@@ -2428,9 +2445,10 @@ function start(): void {
             Uses {{ drafterSummary }}.
           </p>
         </template>
+        </template>
         </div>
 
-        <div class="sf__card">
+        <div v-if="!singlePass" class="sf__card">
         <p class="sf__card-hd">KV offloading</p>
         <label class="sf__check">
           <Switch v-model="kvOn" :disabled="!canOffload && !kvOn" label="KV offloading" />
@@ -2884,6 +2902,7 @@ function start(): void {
             v-if="fitData"
             :est="fitData.e"
             :device="fitData.d"
+            :kind="est?.kind"
             :ctx="ctx"
             :batch="batch"
             :kv="est?.kv_dtype ?? reg.envelope?.kv_dtype"

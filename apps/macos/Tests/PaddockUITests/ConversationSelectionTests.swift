@@ -19,7 +19,10 @@ struct ConversationSelectionTests {
     let end = point(last, character: (last.string as NSString).length)
     // Hit testing, not just setSelectedRange: the old implementation selected
     // only the first NSTextView, even though range-only unit checks passed.
-    #expect(root.hitTest(root.superview!.convert(start, from: nil)) === root)
+    #expect(
+      root.hitTest(
+        root.superview!.convert(start, from: nil),
+        event: mouse(.leftMouseDown, point: start, window: fixture.window)) === root)
     root.mouseDown(with: mouse(.leftMouseDown, point: start, window: fixture.window))
     root.mouseDragged(with: mouse(.leftMouseDragged, point: end, window: fixture.window))
     root.mouseUp(with: mouse(.leftMouseUp, point: end, window: fixture.window))
@@ -41,6 +44,32 @@ struct ConversationSelectionTests {
     #expect(NSPasteboard.general.string(forType: .string) == copy)
   }
 
+  @Test func hoverHitTestingLeavesTextWithItsNativeOwner() async throws {
+    let fixture = try await mount()
+    defer { fixture.window.close() }
+    let root = fixture.selection
+    let text = try #require(texts(root).first { $0.string.contains("Before code") })
+    let start = point(text, character: 0)
+    let local = root.superview!.convert(start, from: nil)
+    // SwiftUI asks for hit targets during hover/layout, including without an
+    // active event. Neither path may resolve a TextKit insertion point or
+    // redirect an embedded Markdown attachment to the selection responder.
+    #expect(root.hitTest(local, event: nil) === text)
+    for type: NSEvent.EventType in [.mouseMoved, .leftMouseUp] {
+      let event = try #require(
+        NSEvent.mouseEvent(
+          with: type, location: start, modifierFlags: [],
+          timestamp: 1, windowNumber: fixture.window.windowNumber, context: nil,
+          eventNumber: 1, clickCount: 0, pressure: 0))
+      #expect(root.hitTest(local, event: event) === text)
+    }
+    let wheel = try #require(
+      CGEvent(
+        scrollWheelEvent2Source: nil, units: .pixel,
+        wheelCount: 1, wheel1: 120, wheel2: 0, wheel3: 0))
+    #expect(root.hitTest(local, event: NSEvent(cgEvent: wheel)) === text)
+  }
+
   @Test func selectAllIncludesUnmountedMessagesButNotFoldedThinkingOrComposer() async throws {
     let f = try await mount()
     defer { f.window.close() }
@@ -58,6 +87,39 @@ struct ConversationSelectionTests {
     #expect(!copied.contains("**"))
     let draft = try #require(texts(f.host).first { $0.isEditable })
     #expect(draft.selectedRange().length == 0)
+  }
+
+  @Test func pointerHitTestingNeverMeasuresTextAndLinksReachTheirTextOwner() async throws {
+    let f = try await mount()
+    defer { f.window.close() }
+    let storage = NSTextStorage(string: "A linked word")
+    let manager = HitTestLayoutManager()
+    storage.addLayoutManager(manager)
+    let container = NSTextContainer(containerSize: NSSize(width: 300, height: 80))
+    manager.addTextContainer(container)
+    let text = LinkPressTextView(
+      frame: NSRect(x: 30, y: 30, width: 300, height: 80), textContainer: container)
+    text.isEditable = false
+    text.isSelectable = true
+    text.identifier = .init("link-fixture")
+    f.selection.items.append(.init(id: "link-fixture", text: storage.string))
+    storage.addAttribute(
+      .link, value: URL(string: "https://example.com")!,
+      range: NSRange(location: 0, length: storage.length))
+    f.selection.addSubview(text)
+    let location = point(text, character: 0)
+    let local = f.selection.superview!.convert(location, from: nil)
+    let before = manager.measurements
+    // A hover/layout query can observe an old currentEvent of any type.
+    // Even a mouse-down hit test must not measure the attachment tree.
+    for type: NSEvent.EventType in [.leftMouseDown, .leftMouseDragged, .rightMouseDown] {
+      let target = f.selection.hitTest(local, event: mouse(type, point: location, window: f.window))
+      #expect(target === f.selection || target === text)
+      #expect(manager.measurements == before)
+    }
+    f.selection.mouseDown(with: mouse(.leftMouseDown, point: location, window: f.window))
+    #expect(text.presses == 1)
+    #expect(!f.selection.selecting)
   }
 
   @Test func dragRetainsLogicalOrderWhenTheAnchorLosesItsHostingAncestor() async throws {
@@ -109,7 +171,12 @@ struct ConversationSelectionTests {
       ]))
     let host = NSHostingView(
       rootView: NativeStudioTranscript(
-        transcript: transcript, columnWidth: 944, composerHeight: 120
+        transcript: transcript, columnWidth: 944, composerHeight: 120,
+        composer: AnyView(
+          VStack {
+            TextField("Draft", text: .constant("Do not select the draft"))
+            NativeSelectableText("Do not select this audio preview")
+          }.frame(height: 120))
       ).frame(width: 1000, height: 700))
     let window = NSWindow(
       contentRect: NSRect(x: -12000, y: -12000, width: 1000, height: 700), styleMask: [.borderless],
@@ -135,6 +202,15 @@ struct ConversationSelectionTests {
     selection.mouseUp(with: mouse(.leftMouseUp, point: end, window: window))
     selection.copy(nil)
     #expect(NSPasteboard.general.string(forType: .string) == "Left answer\n\nRight answer")
+    selection.selectAll(nil)
+    selection.copy(nil)
+    #expect(NSPasteboard.general.string(forType: .string) == "Left answer\n\nRight answer")
+    let preview = try #require(
+      texts(host).first { $0.string == "Do not select this audio preview" })
+    let previewPoint = point(preview, character: 4)
+    let previewEvent = mouse(.leftMouseDown, point: previewPoint, window: window)
+    let hitPoint = selection.superview?.convert(previewPoint, from: nil) ?? previewPoint
+    #expect(selection.hitTest(hitPoint, event: previewEvent) === preview)
   }
   @Test func unmountedMarkdownCopyIsCompleteAndRenderedOffMain() async throws {
     let f = try await mount()
@@ -232,4 +308,17 @@ struct ConversationSelectionTests {
     }
     return false
   }
+}
+
+private final class HitTestLayoutManager: NSLayoutManager {
+  var measurements = 0
+  override func ensureLayout(for container: NSTextContainer) {
+    measurements += 1
+    super.ensureLayout(for: container)
+  }
+}
+
+@MainActor private final class LinkPressTextView: NSTextView {
+  var presses = 0
+  override func mouseDown(with event: NSEvent) { presses += 1 }
 }

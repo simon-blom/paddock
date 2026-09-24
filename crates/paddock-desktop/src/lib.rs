@@ -19,6 +19,7 @@ mod connections;
 mod downloads;
 mod integrations;
 mod logs;
+mod maintenance;
 mod studio;
 
 const MAX_SNAPSHOT: usize = 8 * 1024 * 1024;
@@ -32,6 +33,7 @@ struct Desktop {
     connections: connections::Sessions,
     integrations: integrations::Sessions,
     logs: logs::Sessions,
+    maintenance: maintenance::Sessions,
 }
 
 impl Desktop {
@@ -61,6 +63,7 @@ impl Desktop {
             connections: Default::default(),
             integrations: Default::default(),
             logs: Default::default(),
+            maintenance: Default::default(),
         })
     }
 
@@ -225,6 +228,7 @@ impl Drop for Desktop {
             self.connections.cancel_checks();
             self.integrations.cancel_reads();
             self.logs.close_all();
+            self.maintenance.close_all();
             runtime.block_on(async {
                 let _ = tokio::time::timeout(Duration::from_secs(2), async {
                     while self.chats.active() {
@@ -404,6 +408,7 @@ fn project_for_ui(key: &str, value: &mut serde_json::Value) -> Result<(), String
                         "embedder",
                         "asr",
                         "aligner",
+                        "image",
                         "display",
                         "endpoint",
                         "version",
@@ -437,7 +442,44 @@ fn project_for_ui(key: &str, value: &mut serde_json::Value) -> Result<(), String
 
 #[unsafe(no_mangle)]
 pub extern "C" fn paddock_desktop_abi_version() -> u32 {
-    11
+    12
+}
+
+/// # Safety
+/// Same serial lifetime as snapshot. Typed input 1..16 KiB. Background reads
+/// return bounded, credential-free JSON; polling never waits for runner I/O.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn paddock_desktop_maintenance(
+    core: *mut c_void,
+    bytes: *const u8,
+    len: usize,
+    error: *mut *mut c_char,
+) -> *mut c_char {
+    match boundary(|| {
+        let core = unsafe { core.cast::<Desktop>().as_ref() }.ok_or("Core is not open")?;
+        if bytes.is_null() || len == 0 || len > 16 * 1024 {
+            return Err("Invalid management command length".into());
+        }
+        let command = serde_json::from_slice(unsafe { std::slice::from_raw_parts(bytes, len) })
+            .map_err(|_| "Invalid native management command")?;
+        let _entered = core.runtime.as_ref().ok_or("Core is closed")?.enter();
+        let json = core
+            .maintenance
+            .execute(core.core.state.clone(), command)?
+            .to_string();
+        if json.len() > MAX_SNAPSHOT {
+            return Err("Management response exceeds its size limit.".into());
+        }
+        CString::new(json).map_err(|_| "Invalid management response".into())
+    }) {
+        Ok(value) => value.into_raw(),
+        Err(message) => {
+            unsafe {
+                report(error, message);
+            }
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// # Safety
@@ -837,7 +879,7 @@ mod tests {
     }
     #[test]
     fn abi_null_and_panic_paths_do_not_cross_boundary() {
-        assert_eq!(paddock_desktop_abi_version(), 11);
+        assert_eq!(paddock_desktop_abi_version(), 12);
         assert!(boundary::<()>(|| panic!("test-only")).is_err());
         unsafe {
             let mut error = std::ptr::null_mut();

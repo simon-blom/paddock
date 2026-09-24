@@ -4,11 +4,11 @@ import { copyText } from '@/lib/clipboard'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import type { AudioPart, ContentPart, FilePart, ImagePart, Message } from '@/types/chat'
-import { messageText } from '@/types/chat'
+import { imageParamsOf, messageText } from '@/types/chat'
 import { taskLabel } from '@/lib/tasks'
 import { cleanOcrText, htmlTablesToMarkdown, ocrModeLabel } from '@/lib/ocr'
 import { fleetLabel, fleetVendor, messageStamp } from '@/lib/model-name'
-import { answerMetrics, answerMetricsHint, tokenLimitNote } from '@/lib/message-presentation'
+import { answerMetrics, answerMetricsHint, imageMetrics, imageMetricsHint, tokenLimitNote } from '@/lib/message-presentation'
 import VendorLogo from '@/components/manage/VendorLogo.vue'
 import { clock, srt, vtt } from '@/lib/subtitles'
 import { languageName } from '@/lib/languages'
@@ -267,9 +267,48 @@ const renderText = computed(() => {
   }
   return t
 })
+// A person's attached pictures render as thumbnails above the bubble; the
+// pictures a MODEL made (`gen` on the part) are the answer itself and render
+// as the answer - full width, with their recipe - below.
 const images = computed(
-  () => props.message.content.filter((p): p is ImagePart => p.type === 'image'),
+  () => props.message.content.filter((p): p is ImagePart => p.type === 'image' && !p.gen),
 )
+const generated = computed(
+  () => props.message.content.filter((p): p is ImagePart => p.type === 'image' && !!p.gen),
+)
+/** The picture to show: a preview is only ever its inline data URL; a
+ *  finished one is the stored full-resolution bytes, or the inline copy
+ *  when there was no store to put them in. */
+function genSrc(img: ImagePart): string {
+  if (img.gen?.preview) return img.dataUrl ?? ''
+  if (img.attachmentId) return attachmentsApi.url(img.attachmentId)
+  return img.dataUrl || img.thumbUrl || ''
+}
+/** "Use this seed": pin the next pictures to this one's draw, so a change to
+ *  the words changes only what the words changed. */
+function pinSeed(img: ImagePart): void {
+  const c = chat.active
+  if (!c || !img.gen) return
+  c.imageParams = { ...imageParamsOf(c), seed: img.gen.seed }
+  chat.persist(c)
+}
+const seedPinned = computed(() => chat.active?.imageParams?.seed)
+// a running clock on a render, ticked only while one is going: the wait is
+// tens of seconds, and a spinner alone says nothing about how long
+const now = ref(Date.now())
+let renderTick: number | undefined
+watch(
+  () => !!props.message.streaming && !!props.message.imageGen,
+  (on) => {
+    clearInterval(renderTick)
+    renderTick = on ? window.setInterval(() => (now.value = Date.now()), 250) : undefined
+  },
+  { immediate: true },
+)
+const renderClock = computed(() => {
+  const at = props.message.run?.at
+  return at ? `${((now.value - at) / 1000).toFixed(1)} s` : ''
+})
 const files = computed(
   () => props.message.content.filter((p): p is FilePart => p.type === 'file'),
 )
@@ -321,9 +360,20 @@ const pending = computed(
 
 // Shared with the native message footer: answer speed, total send-to-done
 // latency, provider cost and reasoning-aware output-limit explanation.
-const answerMeta = computed(() => answerMetrics(props.message.usage, realtime.value))
+// a picture turn's footer is the render's clock, not a token count - see
+// imageMetrics for why the API's output tokens would mislead here
+const answerMeta = computed(() =>
+  props.message.imageGen
+    ? imageMetrics(props.message.imageGen)
+    : answerMetrics(props.message.usage, realtime.value),
+)
 const cutNote = computed(() => tokenLimitNote(props.message.usage))
-const answerMetaTip = computed(() => answerMetricsHint(props.message.usage) || undefined)
+const answerMetaTip = computed(
+  () =>
+    (props.message.imageGen
+      ? imageMetricsHint(props.message.imageGen, props.message.usage)
+      : answerMetricsHint(props.message.usage)) || undefined,
+)
 
 // The three-dot "typing" pill only appears after a short delay, so a fast reply
 // never flashes it (Ollama does the same to avoid flicker).
@@ -378,7 +428,9 @@ function downloadSrc(img: ImagePart): string {
 // turns predate run-recording but still have usage).
 const showRun = ref(false)
 const hasRun = computed(
-  () => !isUser.value && (!!props.message.run || !!props.message.usage),
+  () =>
+    !isUser.value &&
+    (!!props.message.run || !!props.message.usage || !!props.message.imageGen),
 )
 
 // ── transcription turns  ──────────────────────────────────────
@@ -763,7 +815,10 @@ async function copy(): Promise<void> {
   }
 }
 
-onBeforeUnmount(() => clearTimeout(dotTimer))
+onBeforeUnmount(() => {
+  clearTimeout(dotTimer)
+  clearInterval(renderTick)
+})
 </script>
 
 <template>
@@ -916,6 +971,64 @@ onBeforeUnmount(() => clearTimeout(dotTimer))
       <div v-else-if="isUser && text" class="msg__bubble">{{ text }}</div>
 
       <template v-else-if="!isUser">
+        <!-- An image-generation answer: the pictures ARE the answer. While the
+             render runs, the latest preview stands in (the render converging,
+             decoded part way) under a clock; finished, each picture carries the
+             recipe that made it - seed, size, steps - and the two actions that
+             matter: keep this seed, save the file. -->
+        <div v-if="generated.length" class="gen" :class="{ 'gen--grid': generated.length > 1 }">
+          <figure v-for="(g, i) in generated" :key="i" class="gen__pic">
+            <img
+              :src="genSrc(g)"
+              :alt="message.imageGen?.prompt || g.name"
+              class="gen__img"
+              :class="{ 'gen__img--preview': g.gen?.preview }"
+              :width="g.width"
+              :height="g.height"
+            />
+            <div v-if="g.gen?.preview" class="gen__progress">
+              <Icon name="spinner" :size="13" class="gen__spin" />
+              <span>preview {{ (g.gen.previewIndex ?? 0) + 1 }} · {{ renderClock }}</span>
+            </div>
+            <figcaption v-else class="gen__bar">
+              <span class="gen__facts">
+                <span>seed {{ g.gen?.seed }}</span>
+                <span>{{ g.gen?.size }}</span>
+                <span>{{ g.gen?.steps }} steps</span>
+                <span v-if="g.gen?.background === 'transparent'">transparent</span>
+              </span>
+              <span class="gen__acts">
+                <Tooltip
+                  :label="seedPinned === g.gen?.seed ? 'This seed is pinned for the next picture' : 'Use this seed for the next picture'"
+                >
+                  <button
+                    class="pk-icon-btn msg__act"
+                    :class="{ 'gen__act--on': seedPinned === g.gen?.seed }"
+                    type="button"
+                    aria-label="Use this seed"
+                    @click="pinSeed(g)"
+                  >
+                    <Icon name="pin" :size="14" />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Save">
+                  <a
+                    class="pk-icon-btn msg__act"
+                    :href="downloadSrc(g)"
+                    :download="g.name || 'image'"
+                    aria-label="Save picture"
+                  >
+                    <Icon name="download" :size="14" />
+                  </a>
+                </Tooltip>
+              </span>
+            </figcaption>
+          </figure>
+        </div>
+        <div v-else-if="message.streaming && message.imageGen" class="gen__wait">
+          <Icon name="spinner" :size="14" class="gen__spin" />
+          <span>Rendering {{ message.imageGen.size }} · {{ renderClock }}</span>
+        </div>
         <!-- A transcription answer: the words the model heard, marked by how
              sure it was of each one. It sits on a surface card of its own - a
              transcript is a structured artifact, not prose, and left bare it
@@ -924,7 +1037,7 @@ onBeforeUnmount(() => clearTimeout(dotTimer))
 
              The transport lives on the USER's turn, where the audio is, and
              drives every lane at once. -->
-        <div v-if="transcript" class="tx" :class="{ 'tx--flat': inLane }">
+        <div v-else-if="transcript" class="tx" :class="{ 'tx--flat': inLane }">
           <ul v-if="transcript.guards?.length" class="tx__guards">
             <li v-for="(g, i) in transcript.guards" :key="i">
               <span class="tx__guard-span">{{ clock(g.start) }}-{{ clock(g.end) }}</span>
@@ -1276,6 +1389,96 @@ onBeforeUnmount(() => clearTimeout(dotTimer))
   gap: 8px;
   margin-bottom: 8px;
   justify-content: flex-end;
+}
+/* generated pictures: the answer, at reading width. A checkerboard behind
+   the picture so a transparent one shows its transparency rather than the
+   page; a preview stays sharp (it is a real decode of the render so far) and
+   only its clock says it is not done. */
+.gen {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  max-width: 640px;
+}
+.gen--grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.gen__pic {
+  margin: 0;
+  position: relative;
+  border: 1px solid var(--pk-border-subtle);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--pk-bg-surface);
+  line-height: 0;
+}
+.gen__img {
+  display: block;
+  width: 100%;
+  height: auto;
+  background:
+    linear-gradient(45deg, var(--pk-bg-inset) 25%, transparent 25%, transparent 75%, var(--pk-bg-inset) 75%),
+    linear-gradient(45deg, var(--pk-bg-inset) 25%, transparent 25%, transparent 75%, var(--pk-bg-inset) 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    8px 8px;
+}
+.gen__img--preview {
+  opacity: 0.92;
+}
+.gen__progress,
+.gen__wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--pk-font-size-xs);
+  color: var(--pk-text-muted);
+  line-height: 1.4;
+}
+.gen__progress {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  padding: 4px 8px;
+  border-radius: var(--pk-radius-full);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+}
+.gen__wait {
+  padding: 6px 0;
+}
+.gen__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  border-top: 1px solid var(--pk-border-subtle);
+  line-height: 1.4;
+}
+.gen__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-family: var(--pk-font-mono);
+  font-size: var(--pk-font-size-xs);
+  color: var(--pk-text-muted);
+}
+.gen__acts {
+  display: flex;
+  gap: 2px;
+}
+.gen__act--on {
+  color: var(--pk-accent);
+}
+.gen__spin {
+  animation: gen-spin 0.8s linear infinite;
+}
+@keyframes gen-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .msg__image-wrap {
   position: relative;

@@ -13,6 +13,7 @@ import GpuSupportPanel from '@/components/manage/GpuSupportPanel.vue'
 import TrustPanel from '@/components/manage/TrustPanel.vue'
 import PromptsPanel from '@/components/prompts/PromptsPanel.vue'
 import EmbeddingsPanel from '@/components/embeddings/EmbeddingsPanel.vue'
+import ReadsPanel from '@/components/reads/ReadsPanel.vue'
 import CloudPanel from '@/components/cloud/CloudPanel.vue'
 import ConnectorsPanel from '@/components/connectors/ConnectorsPanel.vue'
 import SettingsPanel from '@/components/settings/SettingsPanel.vue'
@@ -106,6 +107,17 @@ const router = createRouter({
         // it does; the Studio itself is the playground.
         { path: 'embeddings', name: 'embeddings', component: EmbeddingsPanel },
         { path: 'playground', redirect: '/studio/embeddings' },
+        // Reads: fixed questions asked of a text in one pass, answered with
+        // probabilities (POST /v1/systemone on a block-diffusion model). A
+        // read yields a table, not a reply, so it is a page beside
+        // embeddings and never a chat lane. The nav shows it only while a
+        // running model advertises the capability.
+        { path: 'reads', name: 'reads', component: ReadsPanel },
+        // Pictures are made in a CONVERSATION: an image model holds a lane in
+        // the chat like a speech model does, the prompt is the turn and the
+        // picture the reply, with its seed and settings on the record. The
+        // standalone page it briefly had lands here.
+        { path: 'images', redirect: '/studio' },
         // Transcription used to be a page here. It is a CONVERSATION now
         // a speech model holds a lane in the chat like any other
         // model, the composer switches to audio, and the turn persists with
@@ -144,7 +156,7 @@ const router = createRouter({
 //
 // /manage/models itself stays reachable deliberately - it is where the readiness
 // notice lives, so "why can't I start anything" has somewhere to be answered.
-const NEEDS_A_GPU = new Set(['server-new', 'server-new-config', 'embeddings'])
+const NEEDS_A_GPU = new Set(['server-new', 'server-new-config', 'embeddings', 'reads'])
 
 router.beforeEach(async (to) => {
   if (!NEEDS_A_GPU.has(String(to.name))) return true
@@ -154,7 +166,7 @@ router.beforeEach(async (to) => {
   const readiness = useReadinessStore()
   await readiness.ensureLoaded()
   if (!readiness.blocked) return true
-  return to.name === 'embeddings' ? { name: 'home' } : { name: 'servers' }
+  return to.name === 'embeddings' || to.name === 'reads' ? { name: 'home' } : { name: 'servers' }
 })
 
 export default router

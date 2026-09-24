@@ -46,8 +46,13 @@ pub struct ResponsesRequest {
     /// logprobs include DELIVERS, and does nothing without that include.
     #[serde(default)]
     pub top_logprobs: Option<u8>,
-    #[serde(default = "default_max")]
-    pub max_output_tokens: usize,
+    /// Absent = the server's default: its configured `max_tokens`, else the
+    /// rest of the context window - the "until the model stops" every other
+    /// engine and OpenAI itself mean by an omitted cap. It used to default to
+    /// 1024 here, which a reasoning model spends on thinking alone: the
+    /// response came back `incomplete` with reasoning and no answer.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
     /// How many BUILT-IN tool calls this response may run - the MCP tools, the
     /// catalog search and web search, i.e. the ones the server executes. The
     /// caller's own function tools are not built-in and are not counted (their
@@ -174,14 +179,4 @@ pub struct CompactRequest {
     pub prompt_cache_retention: Option<String>,
     #[serde(default)]
     pub service_tier: Option<String>,
-}
-
-fn default_max() -> usize {
-    // Server default; overridable via PADDOCK_MAX_OUTPUT_TOKENS, which the
-    // server sets from `--max-output-tokens` / config at startup.
-    std::env::var("PADDOCK_MAX_OUTPUT_TOKENS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1024)
 }

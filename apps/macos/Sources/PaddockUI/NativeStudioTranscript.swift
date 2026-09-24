@@ -11,6 +11,19 @@ extension EnvironmentValues {
 @Observable @MainActor final class TranscriptScrollIntent {
   var pinned = true
   var readingDisclosure = false
+  var awayFromBottom = false
+  var layoutRevision = 0
+  @ObservationIgnored private var measuredRows: [String: CGSize] = [:]
+
+  func didLayout(_ id: String, size: CGSize) {
+    guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height >= 0,
+      measuredRows[id] != size
+    else { return }
+    measuredRows[id] = size
+    // A remounted row of the same size is not new content. Keep this cache
+    // outside lazy row state, which SwiftUI may discard when scrolling away.
+    if pinned { layoutRevision &+= 1 }
+  }
   func reveal() {
     readingDisclosure = true
     pinned = false
@@ -22,82 +35,70 @@ struct NativeStudioTranscript: View {
   let transcript: StudioState.NativeTranscript
   let columnWidth: CGFloat
   let composerHeight: CGFloat
+  var composer: AnyView?
   var workspace: StudioWorkspace?
   var onOpenDocument: ((String, String) -> Void)?
-  @Environment(\.workspaceLeadingPaneInset) private var titlebarInset
   @State private var scrollIntent = TranscriptScrollIntent()
-  @State private var scrollSize = CGSize.zero
-  @State private var tailDistance: CGFloat = 0
   var body: some View {
     ConversationSelectionSurface(items: selectionItems) {
       ScrollViewReader { proxy in
         ZStack(alignment: .bottom) {
           PaddockScrollView(centersContent: true) {
-            LazyVStack(alignment: .leading, spacing: 28) {
+            // Rich-text rows report their height across an AppKit boundary.
+            // LazyVStack's offscreen estimates can oscillate while a tall row
+            // straddles this viewport, trapping macOS in repeated layout passes.
+            // Use real row sizes; never feed those estimates back into AppKit.
+            VStack(alignment: .leading, spacing: 28) {
               ForEach(transcript.blocks) { block in
-                if block.comparison {
-                  NativeCompareBlock(
-                    block: block, transcript: transcript, width: columnWidth, workspace: workspace)
-                } else if let message = block.messages.first {
-                  NativeStudioMessage(
-                    message: message, workspace: workspace,
-                    target: StudioMessageTarget(transcript: transcript, messageId: message.id),
-                    onOpenDocument: onOpenDocument
-                  ).equatable()
+                VStack(alignment: .leading, spacing: 28) {
+                  if let context = transcript.context,
+                    block.messages.contains(where: { $0.id == context.before })
+                  {
+                    NativeContextBoundary(context: context)
+                  }
+                  if block.comparison {
+                    NativeCompareBlock(
+                      block: block, transcript: transcript, width: columnWidth, workspace: workspace
+                    )
+                  } else if let message = block.messages.first {
+                    NativeStudioMessage(
+                      message: message, workspace: workspace,
+                      target: StudioMessageTarget(transcript: transcript, messageId: message.id),
+                      onOpenDocument: onOpenDocument
+                    ).equatable()
+                  }
+                }
+                .onGeometryChange(for: CGSize.self) {
+                  $0.size
+                } action: { size in
+                  scrollIntent.didLayout(block.id, size: size)
                 }
               }
-              // Content clearance, not a safe-area inset: the viewport stays full
-              // height and scrolls behind the floating composer, like web Studio.
-              // The stack already contributes 28 points before this final item.
-              Color.clear.frame(height: max(1, composerHeight + 24 - 28)).id("native-bottom")
+              VStack(alignment: .leading, spacing: 28) {
+                if let context = transcript.context, context.before == nil {
+                  NativeContextBoundary(context: context)
+                }
+                // The native bar reserves composer clearance. This is only a
+                // stable follow anchor, never a second copy of the bar's height.
+                Color.clear.frame(height: 1)
+              }
+              .onGeometryChange(for: CGSize.self) {
+                $0.size
+              } action: { size in
+                scrollIntent.didLayout("native-bottom", size: size)
+              }
+              .id("native-bottom")
             }
             .frame(width: columnWidth, alignment: .leading)
-            .padding(
-              .top,
-              StudioConversationSpacing.topInset(
-                windowControls: titlebarInset,
-                hasGraphAction: workspace?.state?.nativeGraph?.available == true)
-            )
+            .padding(.top, StudioConversationSpacing.edgeInset)
             .frame(maxWidth: .infinity)
           }
-          .contentMargins(.vertical, 0, for: .scrollIndicators)
-          .defaultScrollAnchor(.bottom, for: .initialOffset)
-          .defaultScrollAnchor(scrollIntent.pinned ? .bottom : nil, for: .sizeChanges)
-          .onScrollPhaseChange { oldPhase, phase, context in
-            if phase == .tracking || phase == .interacting {
-              scrollIntent.readingDisclosure = false
-              scrollIntent.pinned = false
-            } else if phase == .idle && oldPhase != .idle && !scrollIntent.readingDisclosure {
-              scrollIntent.pinned =
-                context.geometry.contentSize.height - context.geometry.visibleRect.maxY <= 24
-            }
-          }
-          .onScrollGeometryChange(for: TranscriptScrollGeometry.self) {
-            TranscriptScrollGeometry(
-              height: $0.contentSize.height, viewport: $0.containerSize.height,
-              offset: $0.contentOffset.y, bottom: $0.visibleRect.maxY)
-          } action: { old, new in
-            tailDistance = max(0, new.height - new.bottom)
-            // A taller answer/composer temporarily hides the bottom marker. That
-            // is layout, not the user choosing to stop following the answer.
-            if old.height != new.height || old.viewport != new.viewport {
-              scrollSize = CGSize(width: new.viewport, height: new.height)
-            } else if new.height - new.bottom <= 24 && !scrollIntent.readingDisclosure {
-              scrollIntent.pinned = true
-            } else if new.offset < old.offset && old.bottom <= old.height + 1 {
-              // Keyboard, accessibility and scrollbar jumps may have no wheel
-              // phase. Ignore the initial out-of-range offset being clamped.
-              scrollIntent.pinned = false
-            }
-          }
-          .task(id: scrollSize) {
-            // TextKit can finish measuring during this same layout pass. Resolve
-            // the tail anchor after that pass, not against its previous estimate.
-            await Task.yield()
-            if scrollIntent.pinned && !Task.isCancelled && scrollSize.width > 0 {
-              proxy.scrollTo("native-bottom", anchor: .bottom)
-            }
-          }
+          // The viewport starts below the header; the bottom still reaches
+          // the window edge behind the floating composer.
+          .contentMargins(
+            .vertical, StudioConversationSpacing.scrollIndicatorInset, for: .scrollIndicators
+          )
+          .modifier(NativeTranscriptScrolling(intent: scrollIntent, proxy: proxy))
           .onChange(of: transcript.leafId) { _, _ in
             // A branch swap is deliberate navigation, not a request to jump to
             // the bottom. Keep the branch point being operated on in view.
@@ -112,18 +113,38 @@ struct NativeStudioTranscript: View {
               proxy.scrollTo(id, anchor: .top)
             }
           }
-          if !scrollIntent.pinned && tailDistance > 24 {
-            NativeTranscriptLatestButton(columnWidth: columnWidth, composerHeight: composerHeight) {
-              scrollIntent.readingDisclosure = false
-              scrollIntent.pinned = true
-              proxy.scrollTo("native-bottom", anchor: .bottom)
+          .modifier(
+            StudioConversationBars {
+              if workspace?.state?.nativeGraph?.available == true {
+                graphControl
+              }
+            } footer: {
+              // An erased EmptyView accepts the bar's full-height proposal.
+              // A genuinely absent footer must reserve no content clearance.
+              if let composer { composer }
             }
-          }
+          )
+          NativeTranscriptLatestControl(
+            intent: scrollIntent, columnWidth: columnWidth, composerHeight: composerHeight,
+            proxy: proxy)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .environment(\.transcriptDisclosure, scrollIntent)
       }.background(PaddockStyle.canvas).accessibilityIdentifier("native-studio-transcript")
     }
+  }
+  private var graphControl: some View {
+    HStack {
+      Spacer()
+      Button("Graph", systemImage: "point.3.connected.trianglepath.dotted") {
+        guard let workspace else { return }
+        workspace.selectedArtifactId = nil
+        Task {
+          await workspace.perform(
+            "graphPanel", ["open": .bool(workspace.state?.nativeGraph?.visible != true)])
+        }
+      }.buttonStyle(.plain).font(.system(size: 12))
+    }.padding(.horizontal, 28).padding(.vertical, 8)
   }
   private var selectionItems: [ConversationSelectionItem] {
     transcript.messages.flatMap { message in
@@ -178,13 +199,6 @@ struct NativeTranscriptLatestButton: View {
   }
 }
 
-private struct TranscriptScrollGeometry: Equatable {
-  let height: CGFloat
-  let viewport: CGFloat
-  let offset: CGFloat
-  let bottom: CGFloat
-}
-
 struct NativeStudioMessage: View, Equatable {
   let message: StudioState.NativeTranscript.Message
   var workspace: StudioWorkspace?
@@ -235,6 +249,13 @@ struct NativeStudioMessage: View, Equatable {
         }
       } else {
         if !inLane { NativeMessageHeader(message: message) }
+        if let workspace {
+          ForEach(message.pictures ?? []) { picture in
+            NativeGeneratedImage(picture: picture, workspace: workspace) {
+              onOpenDocument?(message.id, picture.id)
+            }
+          }
+        }
         if !message.reasoning.isEmpty {
           NativeThinkingBlock(message: message)
             .environment(\.conversationTextID, message.id + "/reasoning")
@@ -248,7 +269,9 @@ struct NativeStudioMessage: View, Equatable {
           }
         }
         if let result = message.documentResult {
-          NativeDocumentResult(result: result, selectionPrefix: message.id)
+          NativeDocumentResult(
+            result: result, selectionPrefix: message.id, onOpenDocument: onOpenDocument,
+            workspace: workspace)
         } else if let speech = message.speech {
           NativeSpeechView(speech: speech, workspace: workspace)
             .environment(\.conversationTextID, message.id + "/body")
@@ -257,7 +280,10 @@ struct NativeStudioMessage: View, Equatable {
             .environment(\.conversationTextID, message.id + "/body")
             .font(.system(size: 15)).frame(maxWidth: .infinity, alignment: .leading)
         }
-        if message.streaming && message.text.isEmpty && message.reasoning.isEmpty {
+        if message.streaming && message.text.isEmpty && message.reasoning.isEmpty
+          && message.documentResult == nil
+          && (message.pictures ?? []).isEmpty
+        {
           NativeResponseWaiting()
         }
         if !message.error.isEmpty {

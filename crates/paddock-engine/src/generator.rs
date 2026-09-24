@@ -321,6 +321,120 @@ pub trait Generator: Send {
         Ok(None)
     }
 
+    // ── block diffusion (DiffusionGemma): a backend that generates a whole
+    // canvas of positions per round instead of one token per step. The
+    // serial service drives it after the prompt is in the single-stream
+    // slot (`forward_prefill_stream` / `forward_multimodal`): one
+    // `canvas_block` per block, `canvas_commit` when the answer continues.
+
+    /// The canvas width this backend denoises in; 0 = a next-token backend
+    /// (every method below then stays at its refusing default).
+    fn canvas_width(&self) -> usize {
+        0
+    }
+
+    /// Denoise ONE block of `w` positions at `[base, base + w)` past the
+    /// committed rows and return its ids (the argmax canvas) plus the number
+    /// of denoising steps it took. `temperature`: `Some(0.0)` is
+    /// deterministic, `Some(t)` a fixed temperature, `None` the model's own
+    /// schedule. The block's K/V are scratch until `canvas_commit`.
+    fn canvas_block(
+        &mut self,
+        _base: usize,
+        _w: usize,
+        _temperature: Option<f32>,
+        _seed: u64,
+    ) -> Result<(Vec<u32>, u32), GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// Commit a block at `[base, base + ids.len())`: the ids re-run causally
+    /// so the next block reads their real K/V.
+    fn canvas_commit(&mut self, _base: usize, _ids: &[u32]) -> Result<(), GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// The structured read: `canvas` (seeded ids) at `[base, base +
+    /// canvas.len())`, one forward at temperature 1, no acceptance, no
+    /// commit. Returns each position's probability of every `label_ids`
+    /// entry (row-major `[len][k]`), its entropy, and its argmax.
+    fn canvas_read(
+        &mut self,
+        _base: usize,
+        _canvas: &[u32],
+        _label_ids: &[u32],
+    ) -> Result<CanvasReadOut, GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    // ── batched block diffusion: canvases held by the backend as handles,
+    // denoised several at a time in ONE forward (`run_batched_diffusion`).
+    // Each canvas sits in its own batch slot past that slot's committed rows;
+    // the tick concatenates them into one prefill-shaped pass, then samples,
+    // accepts and re-noises each canvas on its own.
+
+    /// The model's denoising step cap per block (its authors' setting); 0 on
+    /// a next-token backend.
+    fn canvas_max_steps(&self) -> u32 {
+        0
+    }
+
+    /// How many full-width canvases one `canvas_tick` can carry (the
+    /// prefill scratch's row budget over the canvas width); 0 = none.
+    fn canvas_tick_max(&self) -> usize {
+        0
+    }
+
+    /// Open a canvas of `w` positions and return its handle. The ids are
+    /// unset until `canvas_set`.
+    fn canvas_open(&mut self, _w: usize) -> Result<usize, GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// Set canvas `h`'s ids for its next step (a fresh random canvas, a
+    /// seeded template, or a pin on top of the last step's output).
+    fn canvas_set(&mut self, _h: usize, _ids: &[u32]) -> Result<(), GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// Release canvas `h` (its device planes go back with it).
+    fn canvas_close(&mut self, _h: usize) {}
+
+    /// A uniformly random canvas of `w` ids the way the model's reference
+    /// draws one, from the backend's own Philox stream so a seeded run is
+    /// reproducible.
+    fn canvas_noise(&self, _w: usize, _seed: u64, _offset: u32) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// One denoising step of every listed canvas in one forward. Per entry:
+    /// the sampled/accepted/re-noised ids become that canvas' next input
+    /// (`accept`), or - for a structured READ - the probs are left in place
+    /// and nothing is accepted. Returns one status per entry, in order.
+    fn canvas_tick(&mut self, _ticks: &[CanvasTickReq]) -> Result<Vec<CanvasStatus>, GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// The last tick's result for canvas `h`: the argmax canvas (the block a
+    /// converged canvas emits), the per-position entropy, and - when
+    /// `label_ids` is non-empty - each position's probability of every
+    /// label id, from the normalized plane the tick left behind.
+    fn canvas_result(&self, _h: usize, _label_ids: &[u32]) -> Result<CanvasReadOut, GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// `canvas_commit` for batch slot `slot`: the block's ids re-run
+    /// causally at `[base, base + ids.len())` so the slot's next canvas
+    /// reads their real K/V.
+    fn canvas_commit_slot(
+        &mut self,
+        _slot: usize,
+        _base: usize,
+        _ids: &[u32],
+    ) -> Result<(), GenError> {
+        Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
     /// One speculative batched decode round over ragged per-slot chunks:
     /// `reqs[i] = (slot, start_pos, chunk)` with `chunk[0]` the slot's
     /// committed pending token and `chunk[1..]` drafts. Returns each row's
@@ -604,6 +718,27 @@ pub trait Generator: Send {
         Ok(())
     }
 
+    /// `slot`'s reply has just started its first tool call (its constraint
+    /// left the free phase on the last committed token): hold the reply
+    /// checkpoint the slot has RIGHT NOW - every token it covers precedes the
+    /// call - through the rest of the reply, instead of recycling it when the
+    /// next page's snapshot replaces it.
+    ///
+    /// Why: the next agent turn resends this reply, and a client's round trip
+    /// re-serializes the tool call rather than echoing it (Claude Code
+    /// reorders an Edit's inputs, Qwen's template trims the text before the
+    /// call), so the resent tokens part from the generated ones inside the
+    /// call. A hybrid model resumes only where a state checkpoint sits, and
+    /// the one live reply checkpoint is by then past the parting point - the
+    /// whole reply, thinking included, was re-prefilled (measured: 12.4K
+    /// tokens, 27 s at 110K depth). With this checkpoint held, the resume
+    /// lands at the call and re-prefills only the call.
+    ///
+    /// The scheduler calls this before the slot's next forward or commit, so
+    /// the checkpoint in hand is still the pre-call one. Default: no reply
+    /// checkpoints, nothing to hold.
+    fn reply_pin(&mut self, _slot: usize) {}
+
     /// Prompt tokens the last prefill of `slot` served from a prefix cache
     /// (usage reporting; taken - resets to 0). 0 = no cache / no reuse.
     fn take_prefill_reused(&mut self, _slot: usize) -> usize {
@@ -668,6 +803,42 @@ pub trait Generator: Send {
     /// taking the mixed path.
     fn supports_chunked_prefill(&self) -> bool {
         false
+    }
+
+    /// The in-flight chunked-prefill queue, in the order the next mixed tick
+    /// spends its row budget: `(slot, depth, remaining)` per prompt. `depth`
+    /// is the ABSOLUTE KV position its next prefill row sits at (a prefix-
+    /// cache hit starts it past zero) and `remaining` the rows still to go.
+    /// The scheduler's tick pacer (crate::pacing) prices a tick's prefill
+    /// from it - a chunk's cost grows with its depth - and learns what a tick
+    /// actually executed by comparing the queue before and after it, so no
+    /// backend reports anything else. A prompt whose resume point is not
+    /// known yet (see `prefill_prepare`) is left out; a tick must not run
+    /// one. Default: empty, and the budget stays a plain row count.
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        Vec::new()
+    }
+
+    /// Resolve the resume point of every queued prompt a mixed tick given
+    /// `budget` rows would run, before the scheduler sizes that tick. Only a
+    /// backend that matches the prefix cache lazily - when a prompt first
+    /// RUNS, not at `prefill_begin` - has work here (gemma4: a burst sharing
+    /// a prefix resumes off whatever its siblings landed by then). The tick
+    /// that follows gets `budget` or less and must pick a subset of what was
+    /// resolved. Errors are the tick's own (PoolExhausted included).
+    /// Default: nothing to resolve.
+    fn prefill_prepare(&mut self, _budget: usize) -> Result<(), GenError> {
+        Ok(())
+    }
+
+    /// The most prefill rows one mixed tick of this backend takes while
+    /// `decode_rows` decode rows ride it: its OWN per-tick ceiling, under any
+    /// scheduler budget (qwen35's unified span cap, laguna/granite's pass
+    /// rows, nemotron's prefill chunk...). The pacer's time target is the cost
+    /// of a full tick of exactly this size at depth zero, so it must be what
+    /// an unpaced tick really takes. Default: no ceiling of its own.
+    fn prefill_tick_cap(&self, _decode_rows: usize) -> usize {
+        usize::MAX
     }
 
     /// Optional idle text-burst grace before committing the first GPU wave.
@@ -1092,6 +1263,67 @@ pub enum RowSample {
     Host,
 }
 
+/// One canvas' share of a batched denoising tick (`Generator::canvas_tick`).
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasTickReq {
+    /// the canvas (`canvas_open`)
+    pub handle: usize,
+    /// the batch slot whose K/V the canvas reads and scratches past
+    pub slot: usize,
+    /// the slot's committed rows: the canvas sits at `[base, base + w)`
+    pub base: usize,
+    /// `None` = the model's own schedule at this canvas' step, `Some(0.0)`
+    /// = deterministic (argmax), `Some(t)` = a fixed temperature (a read
+    /// passes 1.0)
+    pub temperature: Option<f32>,
+    /// the request's seed; the backend folds in slot and step
+    pub seed: u64,
+    /// true = generation (accept, re-noise, stability); false = a read
+    /// (the probs stay for `canvas_result`, the ids are untouched)
+    pub accept: bool,
+}
+
+/// What one canvas' accept step reports back, decoded from the kernel's
+/// four-word status: whether the canvas converged this step (stable argmax
+/// AND mean entropy under the confidence threshold), how many positions
+/// the entropy bound accepted, the mean entropy, and the stability bit
+/// alone. Defined HERE and not in the gpu module: `generator` builds for
+/// every backend, `gpu` only under the cuda feature, and a re-export from
+/// the latter broke the Metal build.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanvasStatus {
+    pub converged: bool,
+    pub n_accepted: u32,
+    pub mean_entropy: f32,
+    pub stable: bool,
+}
+
+impl CanvasStatus {
+    /// The kernel writes `{converged, n_accepted, f32 bits of mean, stable}`.
+    pub fn from_words(w: [u32; 4]) -> Self {
+        Self {
+            converged: w[0] != 0,
+            n_accepted: w[1],
+            mean_entropy: f32::from_bits(w[2]),
+            stable: w[3] != 0,
+        }
+    }
+}
+
+/// What a block-diffusion structured read returns (`Generator::canvas_read`).
+#[derive(Debug, Clone, Default)]
+pub struct CanvasReadOut {
+    /// row-major `[canvas.len()][label_ids.len()]`: each position's
+    /// probability of each label id, from the full-vocab softmax at
+    /// temperature 1 (so `1 - sum` over a position is the mass outside the
+    /// label set)
+    pub probs: Vec<f32>,
+    /// per-position entropy of that distribution, nats
+    pub entropy: Vec<f32>,
+    /// per-position argmax over the whole vocab
+    pub argmax: Vec<u32>,
+}
+
 /// Result of one device-sampled decode step.
 pub struct SampledStep {
     /// per-row sampled token; meaningful only where the plan was `Device`
@@ -1312,6 +1544,12 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn supports_chunked_prefill(&self) -> bool {
         crate::gpu_model::qwen35::GpuQwen35::supports_chunked_prefill(self)
     }
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        crate::gpu_model::qwen35::GpuQwen35::prefill_queue(self)
+    }
+    fn prefill_tick_cap(&self, _decode_rows: usize) -> usize {
+        crate::gpu_model::qwen35::GpuQwen35::prefill_tick_cap(self)
+    }
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
         crate::gpu_model::qwen35::GpuQwen35::prefill_begin(self, slot, tokens)
             .map_err(|e| GenError::Backend(e.to_string()))
@@ -1453,6 +1691,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn spec_commit(&mut self, committed: &[u32]) -> Result<(), GenError> {
         crate::gpu_model::qwen35::GpuQwen35::spec_commit_mtp(self, committed).map_err(to_gen_err)
+    }
+    fn reply_pin(&mut self, slot: usize) {
+        crate::gpu_model::qwen35::GpuQwen35::reply_pin(self, slot)
     }
     fn forward_prefill_batch(
         &mut self,
@@ -1670,6 +1911,12 @@ impl Generator for crate::gpu_model::gpt_oss::GpuGptOss {
     }
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        crate::gpu_model::gpt_oss::GpuGptOss::prefill_queue(self)
+    }
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        crate::gpu_model::gpt_oss::GpuGptOss::prefill_tick_cap(self, decode_rows)
     }
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
         crate::gpu_model::gpt_oss::GpuGptOss::prefill_begin(self, slot, tokens)

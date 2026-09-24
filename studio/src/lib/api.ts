@@ -716,6 +716,29 @@ export const promptsApi = {
   remove: (id: string, revision?: string) => jbody(`/api/prompts/${encodeURIComponent(id)}${revision === undefined ? '' : `?revision=${encodeURIComponent(revision)}`}`, 'DELETE'),
 }
 
+// ── saved read sets (the Reads page's question sets, /api/reads) ────────────
+
+export interface SavedReadSet {
+  id: string
+  name: string
+  /** JSON text: `{ questions, samples }` in the /v1/systemone shape. */
+  body: string
+  createdAt?: number
+  updatedAt?: number
+  revision?: string
+}
+
+export const readsApi = {
+  list: () => jget<SavedReadSet[]>('/api/reads'),
+  // POST upserts, exactly as prompts do (INSERT ... ON CONFLICT(id) UPDATE).
+  save: (r: SavedReadSet) => jbody<{ ok: boolean; set?: SavedReadSet }>('/api/reads', 'POST', r),
+  remove: (id: string, revision?: string) =>
+    jbody(
+      `/api/reads/${encodeURIComponent(id)}${revision === undefined ? '' : `?revision=${encodeURIComponent(revision)}`}`,
+      'DELETE',
+    ),
+}
+
 // ── MCP tool approvals ──────────────────────────────────────────────────────
 // NOTE: there is no MCP/search CRUD here anymore - web search and
 // MCP servers are MODEL configuration (each endpoint's config file, edited on

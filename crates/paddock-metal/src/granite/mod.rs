@@ -1,8 +1,15 @@
-//! Granite's Metal model graph. Metadata controls every scale and rotary
-//! convention; physical KV pages are owned here, logical sharing by KvPool.
+//! Dense Granite/Llama Metal graph, including the MiniCPM5 MLX checkpoint.
+//! Metadata controls scales and rotary conventions; physical KV pages are
+//! owned here, logical sharing by KvPool.
 use crate::device::Commands;
 use crate::device::{Buffer, MetalDevice, MetalError, Result};
+mod llama;
+#[cfg(test)]
+mod minicpm_tests;
+mod mlx;
 mod multimodal;
+mod projection;
+mod source;
 mod speech;
 #[cfg(test)]
 mod tests;
@@ -71,6 +78,7 @@ struct Pending {
 }
 
 pub struct Granite {
+    mlx: bool,
     cold: Option<crate::paged_offload::PagedTier>,
     source_versions: Vec<crate::offload::FileVersion>,
     device: MetalDevice,
@@ -126,8 +134,17 @@ impl Granite {
                 "enable KV offload once before inference".into(),
             ));
         }
+        // MLX's sequence-owned projection tree and probability contraction
+        // must not reuse KV persisted by the earlier physical-batch graph.
+        let namespace = if self.mlx {
+            "llama-mlx-v2"
+        } else if self.direct_prefill() {
+            "llama-gguf-paged-v2"
+        } else {
+            "granite-v1"
+        };
         let layout = format!(
-            "granite-v1:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{namespace}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.context,
             self.layers.len(),
             self.width,
@@ -137,7 +154,8 @@ impl Granite {
             self.embedding_scale.to_bits(),
             self.residual_scale.to_bits(),
             self.attention_scale.to_bits(),
-            self.device.checkpoint_platform()
+            self.device.checkpoint_platform(),
+            self.mlx
         );
         let planes = self
             .layers
@@ -159,8 +177,9 @@ impl Granite {
         )?);
         Ok(())
     }
-    /// Load the selected GGUF without changing its quantization. The context and
-    /// concurrency grant must fit before allocating physical KV or running work.
+    /// Load GGUF or the elected MLX checkpoint without requantizing weights.
+    /// The context and concurrency grant must fit before allocating physical KV
+    /// or running work.
     pub fn load(
         path: &Path,
         context: usize,
@@ -168,11 +187,16 @@ impl Granite {
         budget: Option<u64>,
     ) -> Result<Self> {
         let source_versions = crate::offload::versions(path)?;
-        let map = MappedGguf::open(path).map_err(|e| MetalError::Model(e.to_string()))?;
-        if map.gguf().architecture() != Some("granite") {
+        let map = source::Source::open(path)?;
+        let mlx = map.is_mlx();
+        let arch = map.gguf().architecture().unwrap_or("");
+        if !matches!(arch, "granite" | "llama") {
             return Err(MetalError::Model(
-                "Metal Granite requires general.architecture=granite".into(),
+                "Metal dense decoder requires general.architecture=granite or llama".into(),
             ));
+        }
+        if arch == "llama" {
+            llama::validate(map.gguf())?;
         }
         let u = |key: &str| -> Result<usize> {
             map.gguf()
@@ -180,14 +204,14 @@ impl Granite {
                 .and_then(Value::as_u64)
                 .and_then(|n| usize::try_from(n).ok())
                 .filter(|&n| n > 0 && n <= u32::MAX as usize)
-                .ok_or_else(|| MetalError::Model(format!("invalid/missing granite.{key}")))
+                .ok_or_else(|| MetalError::Model(format!("invalid/missing {arch}.{key}")))
         };
         let f = |key: &str| -> Result<f32> {
             map.gguf()
                 .arch_field(key)
                 .and_then(Value::as_f32)
                 .filter(|n| n.is_finite())
-                .ok_or_else(|| MetalError::Model(format!("invalid/missing granite.{key}")))
+                .ok_or_else(|| MetalError::Model(format!("invalid/missing {arch}.{key}")))
         };
         let width = u("embedding_length")?;
         let heads = u("attention.head_count")?;
@@ -309,10 +333,16 @@ impl Granite {
             }
         }
         let rope = f("rope.freq_base")?;
-        let embedding_scale = f("embedding_scale")?;
-        let residual_scale = f("residual_scale")?;
-        let logit_scale = f("logit_scale")?;
-        let attention_scale = f("attention.scale")?;
+        let (embedding_scale, residual_scale, logit_scale, attention_scale) = if arch == "llama" {
+            (1.0, 1.0, 1.0, 1.0 / (head_dim as f32).sqrt())
+        } else {
+            (
+                f("embedding_scale")?,
+                f("residual_scale")?,
+                f("logit_scale")?,
+                f("attention.scale")?,
+            )
+        };
         if eps <= 0.0 || rope <= 0.0 || logit_scale == 0.0 {
             return Err(MetalError::Model(
                 "invalid normalization or rotary scale".into(),
@@ -366,9 +396,24 @@ impl Granite {
                 "activation workspace exceeds Metal index range".into(),
             ));
         }
-        let gemm_bytes = gemm_elements * 2;
+        let gemm_bytes = if mlx {
+            [
+                (width, width),
+                (width, kv_width),
+                (width, ff),
+                (ff, width),
+                (width, vocab),
+            ]
+            .into_iter()
+            .map(|(k, n)| crate::affine::workspace_bytes(k, n, CHUNK))
+            .max()
+            .unwrap_or(0)
+            .max(gemm_elements * 2)
+        } else {
+            gemm_elements * 2
+        };
         let required = map
-            .total_len()
+            .weight_budget_bytes()
             .saturating_add(kv_bytes)
             .saturating_add(scratch_bytes)
             .saturating_add(gemm_bytes as u64);
@@ -379,22 +424,17 @@ impl Granite {
                 device.budget_bytes() as f64 / (1u64 << 30) as f64
             )));
         }
-        let embedding = Weight::load(&device, &map, "token_embd.weight", &[width, vocab])?;
-        let output_norm = Weight::load(&device, &map, "output_norm.weight", &[width])?;
+        let embedding = map.load(&device, "token_embd.weight", &[width, vocab])?;
+        let output_norm = map.load(&device, "output_norm.weight", &[width])?;
         let head = if map.tensor_info("output.weight").is_some() {
-            Some(Weight::load(
-                &device,
-                &map,
-                "output.weight",
-                &[width, vocab],
-            )?)
+            Some(map.load(&device, "output.weight", &[width, vocab])?)
         } else {
             None
         };
         let mut layers = Vec::with_capacity(count);
         for i in 0..count {
             let w = |name: &str, dims: &[usize]| {
-                Weight::load(&device, &map, &format!("blk.{i}.{name}.weight"), dims)
+                map.load(&device, &format!("blk.{i}.{name}.weight"), dims)
             };
             layers.push(Layer {
                 norm: w("attn_norm", &[width])?,
@@ -433,14 +473,16 @@ impl Granite {
             attn_parts: a(heads * MAX_SPLITS * (head_dim + 2))?,
         };
         tracing::info!(
+            arch,
             layers = count,
             width,
             vocab,
             weight_bytes,
             kv_bytes,
-            "Granite weights loaded on Metal"
+            "Dense decoder weights loaded on Metal"
         );
         Ok(Self {
+            mlx,
             cold: None,
             source_versions,
             device,
@@ -634,7 +676,13 @@ impl Granite {
                 })
             })
             .collect();
-        let grouped_decode = self.head_dim == 64 || self.heads == self.kv_heads * 4;
+        let gqa8 = self.head_dim == 128
+            && self.heads == self.kv_heads * 8
+            && self.attention_scale.to_bits() == (1.0 / 128f32.sqrt()).to_bits();
+        #[cfg(test)]
+        let gqa8 = gqa8 && !minicpm_tests::BASELINE_ATTENTION.get();
+        let grouped_decode =
+            self.mlx || self.head_dim == 64 || self.heads == self.kv_heads * 4 || gqa8;
         let attention_rows: Vec<u32> = if grouped_decode {
             attention_plan
                 .iter()
@@ -672,18 +720,36 @@ impl Granite {
             s.attention_tiles.write_u32(&attention_tiles);
         }
         let cmd = self.device.begin()?;
+        let projection_spans: Vec<_> = attention_plan
+            .iter()
+            .filter(|_| self.mlx)
+            .map(|&(first, count, _)| (first, count, count))
+            .collect();
+        let cmd = if self.mlx {
+            cmd.with_projection_rows(&projection_spans)
+        } else {
+            cmd
+        };
         let norm = |input: &Buffer, w: &Weight, out: &Buffer| {
             cmd.dispatch(
-                "rms",
+                if self.mlx { "mlx_rms" } else { "rms" },
                 &[input, &w.buffer, out],
                 &[self.width as u32, w.ty, self.eps.to_bits()],
                 [m, 1, 1],
-                256,
+                if self.mlx {
+                    (self.width.div_ceil(128) * 32).min(1024)
+                } else {
+                    256
+                },
             )
         };
         let residual_norm = |w: &Weight| {
             cmd.dispatch(
-                "residual_rms",
+                if self.mlx {
+                    "mlx_residual_rms"
+                } else {
+                    "residual_rms"
+                },
                 &[&s.x, &s.delta, &w.buffer, &s.norm],
                 &[
                     self.width as u32,
@@ -692,16 +758,24 @@ impl Granite {
                     self.residual_scale.to_bits(),
                 ],
                 [m, 1, 1],
-                256,
+                if self.mlx {
+                    (self.width.div_ceil(128) * 32).min(1024)
+                } else {
+                    256
+                },
             );
         };
         cmd.dispatch(
-            "embed",
+            if self.mlx { "mlx_embed" } else { "embed" },
             &[&self.embedding.buffer, &s.ids, &s.x],
             &[
                 self.width as u32,
                 m as u32,
-                self.embedding.ty,
+                if self.mlx {
+                    self.vocab as u32
+                } else {
+                    self.embedding.ty
+                },
                 self.embedding_scale.to_bits(),
             ],
             [(m * self.width).div_ceil(256), 1, 1],
@@ -714,173 +788,212 @@ impl Granite {
         self.inject_audio(&cmd, rows);
         norm(&s.x, &self.layers[0].norm, &s.norm);
         for (index, layer) in self.layers.iter().enumerate() {
-            projections(
+            self.project(
                 &cmd,
                 &[(&layer.q, &s.q), (&layer.k, &s.k), (&layer.v, &s.v)],
                 &s.norm,
                 m,
-                &s.gemm_input,
+                1.0,
             );
-            cmd.dispatch(
-                "rope_store",
-                &[
-                    &s.q,
-                    &s.k,
-                    &s.v,
-                    &layer.keys,
-                    &layer.values,
-                    &s.meta,
-                    &s.pages,
-                ],
-                &[
-                    self.width as u32,
-                    self.kv_width as u32,
-                    self.head_dim as u32,
-                    m as u32,
-                    self.page_stride as u32,
-                    self.rope.to_bits(),
-                ],
-                [(m * (self.width + self.kv_width) / 2).div_ceil(256), 1, 1],
-                256,
-            );
-            if !attention_tiles.is_empty() {
+            if self.mlx {
+                self.mlx_attention(
+                    &cmd,
+                    layer,
+                    m,
+                    attention_tiles.len() / 2,
+                    attention_rows.len(),
+                    attention_splits,
+                );
+            } else {
                 cmd.dispatch(
-                    "attention_query",
-                    &[&s.q, &s.gemm_input],
-                    &[self.width as u32, 0, m as u32],
-                    [((m + 32) * self.width).div_ceil(256), 1, 1],
+                    "rope_store",
+                    &[
+                        &s.q,
+                        &s.k,
+                        &s.v,
+                        &layer.keys,
+                        &layer.values,
+                        &s.meta,
+                        &s.pages,
+                    ],
+                    &[
+                        self.width as u32,
+                        self.kv_width as u32,
+                        self.head_dim as u32,
+                        m as u32,
+                        self.page_stride as u32,
+                        self.rope.to_bits(),
+                    ],
+                    [(m * (self.width + self.kv_width) / 2).div_ceil(256), 1, 1],
                     256,
                 );
-                cmd.dispatch(
-                    if self.head_dim == 64 {
-                        "attention_prefill_batched64"
-                    } else {
-                        "granite_attention_prefill128"
-                    },
-                    &[
-                        &s.gemm_input,
-                        &layer.keys,
-                        &layer.values,
-                        &s.meta,
-                        &s.pages,
-                        &s.attn,
-                        &s.attention_tiles,
-                    ],
-                    &[
-                        self.heads as u32,
-                        self.kv_heads as u32,
-                        self.page_stride as u32,
-                        self.attention_scale.to_bits(),
-                    ],
-                    [self.heads, attention_tiles.len() / 2, 1],
-                    128,
-                );
-            }
-            for &(first, count, splits) in &attention_plan {
-                if count >= 16 {
-                    continue;
-                }
-                if grouped_decode {
-                    continue;
-                }
-                cmd.dispatch(
-                    "attention",
-                    &[
-                        &s.q,
-                        &layer.keys,
-                        &layer.values,
-                        &s.meta,
-                        &s.pages,
-                        if splits == 1 { &s.attn } else { &s.attn_parts },
-                    ],
-                    &[
-                        self.heads as u32,
-                        self.kv_heads as u32,
-                        128,
-                        first as u32,
-                        self.page_stride as u32,
-                        self.attention_scale.to_bits(),
-                        splits as u32,
-                    ],
-                    [self.heads, count, splits],
-                    32,
-                );
-                if splits > 1 {
+                if !attention_tiles.is_empty() {
                     cmd.dispatch(
-                        "attention_merge",
-                        &[&s.attn_parts, &s.attn],
-                        &[splits as u32, (first * self.heads) as u32],
-                        [count * self.heads, 1, 1],
-                        32,
+                        "attention_query",
+                        &[&s.q, &s.gemm_input],
+                        &[self.width as u32, 0, m as u32],
+                        [((m + 32) * self.width).div_ceil(256), 1, 1],
+                        256,
+                    );
+                    cmd.dispatch(
+                        if self.direct_prefill() {
+                            "llama_prefill_direct"
+                        } else if self.head_dim == 64 {
+                            "attention_prefill_batched64"
+                        } else {
+                            "granite_attention_prefill128"
+                        },
+                        &[
+                            &s.gemm_input,
+                            &layer.keys,
+                            &layer.values,
+                            &s.meta,
+                            &s.pages,
+                            &s.attn,
+                            &s.attention_tiles,
+                        ],
+                        &[
+                            self.heads as u32,
+                            self.kv_heads as u32,
+                            self.page_stride as u32,
+                            self.attention_scale.to_bits(),
+                        ],
+                        [self.heads, attention_tiles.len() / 2, 1],
+                        128,
                     );
                 }
-            }
-            if !attention_rows.is_empty() {
-                cmd.dispatch(
-                    if self.head_dim == 64 {
-                        "attention_gqa5_64"
-                    } else {
-                        "attention_gqa4"
-                    },
-                    &[
-                        &s.q,
-                        &layer.keys,
-                        &layer.values,
-                        &s.meta,
-                        &s.pages,
-                        &s.attention_rows,
-                        if attention_splits == 1 {
-                            &s.attn
-                        } else {
-                            &s.attn_parts
-                        },
-                    ],
-                    &[
-                        self.heads as u32,
-                        self.kv_heads as u32,
-                        self.page_stride as u32,
-                        self.attention_scale.to_bits(),
-                        attention_rows.len() as u32,
-                        attention_splits as u32,
-                    ],
-                    [self.kv_heads, attention_rows.len(), attention_splits],
-                    128,
-                );
-                if attention_splits > 1 {
+                for &(first, count, splits) in &attention_plan {
+                    if count >= 16 {
+                        continue;
+                    }
+                    if grouped_decode {
+                        continue;
+                    }
+                    cmd.dispatch(
+                        "attention",
+                        &[
+                            &s.q,
+                            &layer.keys,
+                            &layer.values,
+                            &s.meta,
+                            &s.pages,
+                            if splits == 1 { &s.attn } else { &s.attn_parts },
+                        ],
+                        &[
+                            self.heads as u32,
+                            self.kv_heads as u32,
+                            128,
+                            first as u32,
+                            self.page_stride as u32,
+                            self.attention_scale.to_bits(),
+                            splits as u32,
+                        ],
+                        [self.heads, count, splits],
+                        32,
+                    );
+                    if splits > 1 {
+                        cmd.dispatch(
+                            "attention_merge",
+                            &[&s.attn_parts, &s.attn],
+                            &[splits as u32, (first * self.heads) as u32],
+                            [count * self.heads, 1, 1],
+                            32,
+                        );
+                    }
+                }
+                if !attention_rows.is_empty() && gqa8 {
+                    cmd.dispatch(
+                        "llama_decode",
+                        &[
+                            &s.q,
+                            &layer.keys,
+                            &layer.values,
+                            &s.meta,
+                            &s.pages,
+                            &s.attention_rows,
+                            &s.attn_parts,
+                        ],
+                        &[
+                            self.heads as u32,
+                            self.kv_heads as u32,
+                            self.page_stride as u32,
+                            0,
+                            0,
+                            attention_splits as u32,
+                        ],
+                        [self.kv_heads, attention_rows.len(), attention_splits],
+                        128,
+                    );
+                    cmd.dispatch(
+                        "muse_merge",
+                        &[&s.attn_parts, &s.attn, &s.attention_rows],
+                        &[self.heads as u32, attention_splits as u32, 128],
+                        [self.heads * attention_rows.len(), 1, 1],
+                        32,
+                    );
+                } else if !attention_rows.is_empty() {
                     cmd.dispatch(
                         if self.head_dim == 64 {
-                            "attention_gqa_merge64"
+                            "attention_gqa5_64"
                         } else {
-                            "attention_gqa_merge"
+                            "attention_gqa4"
                         },
-                        &[&s.attn_parts, &s.attn, &s.attention_rows],
-                        &[attention_splits as u32, self.heads as u32],
-                        [attention_rows.len() * self.heads, 1, 1],
-                        32,
+                        &[
+                            &s.q,
+                            &layer.keys,
+                            &layer.values,
+                            &s.meta,
+                            &s.pages,
+                            &s.attention_rows,
+                            if attention_splits == 1 {
+                                &s.attn
+                            } else {
+                                &s.attn_parts
+                            },
+                        ],
+                        &[
+                            self.heads as u32,
+                            self.kv_heads as u32,
+                            self.page_stride as u32,
+                            self.attention_scale.to_bits(),
+                            attention_rows.len() as u32,
+                            attention_splits as u32,
+                        ],
+                        [self.kv_heads, attention_rows.len(), attention_splits],
+                        128,
                     );
+                    if attention_splits > 1 {
+                        cmd.dispatch(
+                            if self.head_dim == 64 {
+                                "attention_gqa_merge64"
+                            } else {
+                                "attention_gqa_merge"
+                            },
+                            &[&s.attn_parts, &s.attn, &s.attention_rows],
+                            &[attention_splits as u32, self.heads as u32],
+                            [attention_rows.len() * self.heads, 1, 1],
+                            32,
+                        );
+                    }
                 }
             }
-            layer
-                .o
-                .linear(&cmd, &s.attn, &s.delta, m, 1.0, &s.gemm_input);
+            self.project(&cmd, &[(&layer.o, &s.delta)], &s.attn, m, 1.0);
             residual_norm(&layer.ffn_norm);
-            projections(
+            self.project(
                 &cmd,
                 &[(&layer.gate, &s.gate), (&layer.up, &s.up)],
                 &s.norm,
                 m,
-                &s.gemm_input,
+                1.0,
             );
             cmd.dispatch(
-                "swiglu",
+                if self.mlx { "mlx_swiglu" } else { "swiglu" },
                 &[&s.gate, &s.up],
                 &[(m * self.ff) as u32],
                 [(m * self.ff).div_ceil(256), 1, 1],
                 256,
             );
-            layer
-                .down
-                .linear(&cmd, &s.gate, &s.delta, m, 1.0, &s.gemm_input);
+            self.project(&cmd, &[(&layer.down, &s.delta)], &s.gate, m, 1.0);
             if let Some(next) = self.layers.get(index + 1) {
                 if image_rows && let Some(stream) = self.deepstack.get(index + 1).copied().flatten()
                 {
@@ -900,7 +1013,7 @@ impl Granite {
                 }
             } else {
                 cmd.dispatch(
-                    "residual",
+                    if self.mlx { "mlx_residual" } else { "residual" },
                     &[&s.x, &s.delta],
                     &[(m * self.width) as u32, self.residual_scale.to_bits()],
                     [(m * self.width).div_ceil(256), 1, 1],
@@ -910,20 +1023,39 @@ impl Granite {
         }
         if !output_rows.is_empty() {
             cmd.dispatch(
-                "rms_selected",
+                if self.mlx {
+                    "mlx_rms_selected"
+                } else {
+                    "rms_selected"
+                },
                 &[&s.x, &self.output_norm.buffer, &s.output_rows, &s.norm],
                 &[self.width as u32, self.output_norm.ty, self.eps.to_bits()],
                 [output_rows.len(), 1, 1],
-                256,
+                if self.mlx {
+                    (self.width.div_ceil(128) * 32).min(1024)
+                } else {
+                    256
+                },
             );
-            self.head.as_ref().unwrap_or(&self.embedding).linear(
-                &cmd,
-                &s.norm,
-                &s.logits,
-                output_rows.len(),
-                1.0 / self.logit_scale,
-                &s.gemm_input,
-            );
+            let head = self.head.as_ref().unwrap_or(&self.embedding);
+            if self.mlx {
+                crate::affine::project_verify(
+                    &cmd,
+                    &[(head, &s.logits)],
+                    &s.norm,
+                    output_rows.len(),
+                    &s.gemm_input,
+                    true,
+                );
+            } else {
+                self.project(
+                    &cmd,
+                    &[(head, &s.logits)],
+                    &s.norm,
+                    output_rows.len(),
+                    1.0 / self.logit_scale,
+                );
+            }
         }
         self.last_gpu_seconds = cmd.finish()?;
         for &(slot, tok, _) in rows {
@@ -1155,6 +1287,17 @@ impl Generator for Granite {
     }
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+    // the scheduler's tick pacer reads the FIFO queue from each offset
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.pending
+            .iter()
+            .map(|p| (p.slot, p.offset, p.tokens.len() - p.offset))
+            .collect()
+    }
+    // the mixed grant: row_cap less the decode rows sharing it
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        crate::schedule::row_cap(decode_rows, CHUNK).saturating_sub(decode_rows)
     }
     fn prefill_begin(
         &mut self,

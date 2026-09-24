@@ -60,6 +60,64 @@ impl GpuExecutor {
         self.kernels.kquant_flat32.is_some()
     }
 
+    /// True when the flat 32-weight lanes also serve Q5_0 (slot 655) - the
+    /// third flat type, on the rows a Q4_K_M recipe cannot encode in a
+    /// 256-block format. Same reason again: it rides slot 600's entry points.
+    pub fn has_kquant_q50(&self) -> bool {
+        self.kernels.kquant_flat32.is_some() && self.kernels.kquant_q50.is_some()
+    }
+
+    /// True when the pack carries the GEGLU instantiations of the k-quant
+    /// MoE gate+up kernels (slots 657-660, landed together): the pair, the
+    /// grouped pair, the register-tiled pair and the sorted tensor-core pair
+    /// with `gelu_tanh(gate) * up` as the epilogue - what a gemma-4 A4B's
+    /// routed experts need on k-quant seats.
+    pub fn has_kquant_moe_geglu(&self) -> bool {
+        self.kernels.kquant_moe_gate_up_geglu.is_some()
+            && self.kernels.kquant_moe_gate_up_grp_geglu.is_some()
+            && self.kernels.kquant_moe_gate_up_tile_geglu.is_some()
+            && self.kernels.kquant_moe_gate_up_mma_geglu.is_some()
+    }
+
+    /// E^T as a bf16 `[embd][vocab]` plane straight off a REPACKED k-quant
+    /// embedding (slot 656) - the k-quant twin of `q8_embed_transpose_bf16`.
+    /// `dst` holds `vocab * embd` bf16; `embd % 256 == 0`.
+    pub fn kq_embed_transpose_bf16(
+        &self,
+        w: &RepackedKQ,
+        dst: &mut CudaSlice<u8>,
+        vocab: usize,
+        embd: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kq_embed_transpose_bf16
+            .ok_or(GpuError::MissingOp("kq_embed_transpose_bf16"))?;
+        let (did, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
+        if w.dims[0] != embd || w.dims[1] < vocab || dst.len() < vocab * embd * 2 {
+            return Err(GpuError::Unsupported(format!(
+                "kq_embed_transpose_bf16: plane {:?} / dst {} B against [{vocab} x {embd}]",
+                w.dims,
+                dst.len()
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp, _g2) = w.scales.device_ptr(&self.stream);
+        let (op, _g3) = dst.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract; pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp as *const _,
+                op as *mut _,
+                vocab as u32,
+                embd as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// True when the pack serves the i-quant family (IQ1/IQ2/IQ3, IQ4_NL)
     /// on the k-quant streams - repack, dequant and the token-batched MoE
     /// pair. Capability marker slot 577.
@@ -288,6 +346,21 @@ impl GpuExecutor {
             name: what.to_owned(),
             ty,
         })?;
+        // The flat 32-weight seats ride slot 600's entry points, and Q5_0
+        // slot 655's on top: an older pack would repack the bytes into a
+        // layout its lanes then misread, so the marker is checked at the
+        // one place every k-quant plane passes through.
+        if matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0) && !self.has_kquant_flat32() {
+            return Err(GpuError::Unsupported(format!(
+                "{what} is {ty:?} but the kernel pack has no flat 32-weight lanes (slot 600) - \
+                 rebuild packs/cuda"
+            )));
+        }
+        if ty == GgmlType::Q5_0 && !self.has_kquant_q50() {
+            return Err(GpuError::Unsupported(format!(
+                "{what} is Q5_0 but the kernel pack has no Q5_0 seat (slot 655) - rebuild packs/cuda"
+            )));
+        }
         let f = self
             .kernels
             .kquant_repack
@@ -930,10 +1003,47 @@ impl GpuExecutor {
         n_active: usize,
         batch: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .kquant_moe_gate_up
-            .ok_or(GpuError::MissingOp("kquant_moe_gate_up"))?;
+        self.kquant_moe_gate_up_act(
+            GluAct::Silu,
+            gate,
+            up,
+            idx,
+            xq,
+            xs,
+            xsums,
+            out,
+            n_active,
+            batch,
+        )
+    }
+
+    /// [`Self::kquant_moe_gate_up`] with the epilogue chosen by `act`: SwiGLU
+    /// is the pair itself, GEGLU its slot-657 instantiation (the gemma-4
+    /// A4B's routed experts on k-quant seats).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_act(
+        &self,
+        act: GluAct,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        idx: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = match act {
+            GluAct::Silu => self
+                .kernels
+                .kquant_moe_gate_up
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up"))?,
+            GluAct::Gelu => self
+                .kernels
+                .kquant_moe_gate_up_geglu
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_geglu"))?,
+        };
         let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
         let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
@@ -1164,10 +1274,54 @@ impl GpuExecutor {
         max_blocks: usize,
         group: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .kquant_moe_gate_up_grp
-            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_grp"))?;
+        self.kquant_moe_gate_up_grp_act(
+            GluAct::Silu,
+            gate,
+            up,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            xq,
+            xs,
+            xsums,
+            out,
+            n_active,
+            batch,
+            max_blocks,
+            group,
+        )
+    }
+
+    /// [`Self::kquant_moe_gate_up_grp`] with the epilogue chosen by `act`
+    /// (GEGLU = slot 658).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_grp_act(
+        &self,
+        act: GluAct,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        max_blocks: usize,
+        group: usize,
+    ) -> Result<(), GpuError> {
+        let f = match act {
+            GluAct::Silu => self
+                .kernels
+                .kquant_moe_gate_up_grp
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_grp"))?,
+            GluAct::Gelu => self
+                .kernels
+                .kquant_moe_gate_up_grp_geglu
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_grp_geglu"))?,
+        };
         let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
         let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
@@ -1252,10 +1406,52 @@ impl GpuExecutor {
         batch: usize,
         max_blocks: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .kquant_moe_gate_up_tile
-            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_tile"))?;
+        self.kquant_moe_gate_up_tile_act(
+            GluAct::Silu,
+            gate,
+            up,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            xq,
+            xs,
+            xsums,
+            out,
+            n_active,
+            batch,
+            max_blocks,
+        )
+    }
+
+    /// [`Self::kquant_moe_gate_up_tile`] with the epilogue chosen by `act`
+    /// (GEGLU = slot 659).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_tile_act(
+        &self,
+        act: GluAct,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = match act {
+            GluAct::Silu => self
+                .kernels
+                .kquant_moe_gate_up_tile
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_tile"))?,
+            GluAct::Gelu => self
+                .kernels
+                .kquant_moe_gate_up_tile_geglu
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_tile_geglu"))?,
+        };
         let (gid, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
         let (uid, _, _) = kq_layout(up.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
@@ -1384,6 +1580,13 @@ impl GpuExecutor {
     /// and the slot fold its partials go through (slot 590).
     pub fn has_kquant_moe_down_mma_e(&self) -> bool {
         self.kernels.kquant_moe_down_mma_e.is_some() && self.kernels.moe_part_fold_at.is_some()
+    }
+
+    /// True when slot 603 also takes a flat down whose width is a multiple of
+    /// 32 but not of 128 - a partial last 128-weight stage (marker slot 668).
+    /// An older pack refuses that width, so the marker is what elects it.
+    pub fn has_kquant_moe_down_mma_e_tail(&self) -> bool {
+        self.has_kquant_moe_down_mma_e() && self.kernels.kquant_moe_down_mma_e_tail.is_some()
     }
 
     /// The routed down on the tensor cores over one column chunk (slot 603),
@@ -1718,10 +1921,48 @@ impl GpuExecutor {
         fs: &mut CudaSlice<f32>,
         max_blocks: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .kquant_moe_gate_up_mma
-            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_mma"))?;
+        self.kquant_moe_gate_up_mma_act(
+            GluAct::Silu,
+            gate,
+            up,
+            sorted_row,
+            block_expert,
+            xq,
+            xs,
+            xsums,
+            fq,
+            fs,
+            max_blocks,
+        )
+    }
+
+    /// [`Self::kquant_moe_gate_up_mma`] with the epilogue chosen by `act`
+    /// (GEGLU = slot 660).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_mma_act(
+        &self,
+        act: GluAct,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        fq: &mut CudaSlice<i8>,
+        fs: &mut CudaSlice<f32>,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = match act {
+            GluAct::Silu => self
+                .kernels
+                .kquant_moe_gate_up_mma
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_mma"))?,
+            GluAct::Gelu => self
+                .kernels
+                .kquant_moe_gate_up_mma_geglu
+                .ok_or(GpuError::MissingOp("kquant_moe_gate_up_mma_geglu"))?,
+        };
         assert_eq!(gate.ty, up.ty, "sorted kq pair shares one dtype");
         let (did, _, _) = kq_layout(gate.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, ff) = (gate.dims[0], gate.dims[1]);

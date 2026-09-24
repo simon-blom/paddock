@@ -15,9 +15,71 @@ use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::{GpuError, GpuExecutor};
 
-use super::{Arch, GpuGemma4, Hparams, LayerWeights, MoeWeights, Plane};
-use crate::gpu::RepackedQ8;
+use super::{Arch, ExpertPlanes, GpuGemma4, Hparams, LayerWeights, MoeWeights, Plane};
+use crate::gpu::{RepackedKQ, RepackedQ8};
 use paddock_models::ggml_type::GgmlType;
+
+/// The Q8 plane behind a seat, for the arms that convert FROM repacked Q8
+/// (the fp8 twin builders, the reclaim pass). Those arms are elected off
+/// when the file carries a k-quant plane, so this is a contract check, not
+/// a dispatch: reaching it with another class is a loader defect, reported
+/// as one rather than served.
+fn q8_of(w: &Plane) -> Result<&RepackedQ8, LoadError> {
+    w.q8().ok_or_else(|| {
+        LoadError::Tensor(
+            format!("plane {:?}", w.dims()),
+            "an fp8-twin or reclaim arm reached a non-Q8 plane".into(),
+        )
+    })
+}
+
+/// Which tensor types the family's dense planes may take, and which class
+/// each lands in. Anything else is a loud `NoKernel` from the repack.
+fn plane_class(ty: GgmlType) -> Option<PlaneClass> {
+    match ty {
+        GgmlType::Bf16 => Some(PlaneClass::Bf16),
+        GgmlType::Q8_0 => Some(PlaneClass::Q8),
+        t if crate::gpu::kq_params(t).is_some() => Some(PlaneClass::Kq),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaneClass {
+    Q8,
+    Bf16,
+    Kq,
+}
+
+/// Zero-extend a k-quant plane's OUT dim (its rows) with zero super-blocks:
+/// the raw block stream is row-major, so the pad is a zero tail. Exact -
+/// an all-zero Q4_K/Q5_K/Q6_K super-block dequants to 0 (d = dmin = 0).
+fn kq_pad_out_raw(bytes: &[u8], row_b: usize, out: usize, out_p: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(out_p * row_b);
+    v.extend_from_slice(&bytes[..out * row_b]);
+    v.resize(out_p * row_b, 0);
+    v
+}
+
+/// Zero-extend a flat 32-weight plane's IN dim (its K axis) with zero blocks
+/// at each row's tail. Exact: a zero Q5_0 / Q8_0 block has d = 0. Only the
+/// flat types can be padded this way (a 256-block row is whole super-blocks
+/// by construction, and never needs it).
+fn kq_pad_in_raw_flat(
+    bytes: &[u8],
+    blk_b: usize,
+    in_dim: usize,
+    in_p: usize,
+    out: usize,
+) -> Vec<u8> {
+    let (bpr, bpr_p) = (in_dim / 32, in_p / 32);
+    let mut v = vec![0u8; out * bpr_p * blk_b];
+    for r in 0..out {
+        v[r * bpr_p * blk_b..r * bpr_p * blk_b + bpr * blk_b]
+            .copy_from_slice(&bytes[r * bpr * blk_b..(r + 1) * bpr * blk_b]);
+    }
+    v
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -152,13 +214,14 @@ pub(super) fn swa_pattern(
 
 /// Plain-rope param tuple for the shared yarn-shaped kernels: ext_factor 0
 /// disables the ramp, so only theta_scale (from the freq base) matters.
-/// Pad a repacked Q8 weight's out dim (dims[1]) up to a 128 multiple with
-/// zero rows. Out-major repack layout makes this one contiguous prefix copy
-/// (data and scale). No-op when already aligned. Exact: zero rows produce
-/// zero outputs, which the A4B's padded consumers cancel by construction.
-fn pad_ffn_out(exec: &GpuExecutor, w: RepackedQ8) -> Result<RepackedQ8, GpuError> {
+/// Pad a repacked Q8 weight's out dim (dims[1]) up to an `align` multiple
+/// with zero rows. Out-major repack layout makes this one contiguous prefix
+/// copy (data and scale). No-op when already aligned. Exact: zero rows
+/// produce zero outputs, which the A4B's padded consumers cancel by
+/// construction.
+fn pad_ffn_out(exec: &GpuExecutor, w: RepackedQ8, align: usize) -> Result<RepackedQ8, GpuError> {
     let (in_dim, out) = (w.dims[0], w.dims[1]);
-    let out_p = out.next_multiple_of(128);
+    let out_p = out.next_multiple_of(align);
     if out_p == out {
         return Ok(w);
     }
@@ -183,12 +246,12 @@ fn pad_ffn_out(exec: &GpuExecutor, w: RepackedQ8) -> Result<RepackedQ8, GpuError
     })
 }
 
-/// Pad a repacked Q8 weight's in dim (dims[0], the K axis) up to a 128
+/// Pad a repacked Q8 weight's in dim (dims[0], the K axis) up to an `align`
 /// multiple with zero blocks at each row's tail. Row-strided copies (one per
 /// out-row); zero K-blocks accumulate exactly 0.0.
-fn pad_ffn_in(exec: &GpuExecutor, w: RepackedQ8) -> Result<RepackedQ8, GpuError> {
+fn pad_ffn_in(exec: &GpuExecutor, w: RepackedQ8, align: usize) -> Result<RepackedQ8, GpuError> {
     let (in_dim, out) = (w.dims[0], w.dims[1]);
-    let in_p = in_dim.next_multiple_of(128);
+    let in_p = in_dim.next_multiple_of(align);
     if in_p == in_dim {
         return Ok(w);
     }
@@ -222,6 +285,93 @@ fn pad_ffn_in(exec: &GpuExecutor, w: RepackedQ8) -> Result<RepackedQ8, GpuError>
         scale,
         dims: vec![in_p, out],
     })
+}
+
+/// An FFN plane (the shared gate/up/down, the diffusion self-cond MLP) in
+/// its file class, padded to the served width: rows (`pad_out`, gate/up) or
+/// the K axis (down). The Q8 pads move repacked blocks on the device; a
+/// k-quant plane is padded in its raw bytes and repacked once - its rows are
+/// whole super-blocks (in = n_embd) for the row pad, and the K pad exists
+/// only for the flat 32-weight types, which are the only ones the quantizer
+/// puts on a ragged K.
+pub(super) fn ffn_plane(
+    exec: &GpuExecutor,
+    map: &MappedGguf,
+    name: &str,
+    pad_out: bool,
+    align: usize,
+) -> Result<Plane, LoadError> {
+    let (info, bytes) = map.tensor_bytes(name).map_err(GpuError::from)?;
+    let (in_dim, out) = (info.dims[0] as usize, info.dims[1] as usize);
+    match plane_class(info.ggml_type) {
+        Some(PlaneClass::Q8) => {
+            let w = exec.repack_q8(map, name)?;
+            Ok(Plane::Q8(if pad_out {
+                pad_ffn_out(exec, w, align)?
+            } else {
+                pad_ffn_in(exec, w, align)?
+            }))
+        }
+        Some(PlaneClass::Kq) => {
+            let ty = info.ggml_type;
+            let (_, raw_b, _) = crate::gpu::kq_params(ty).expect("k-quant class");
+            if pad_out {
+                let out_p = out.next_multiple_of(align);
+                if out_p == out {
+                    return Ok(Plane::Kq(exec.repack_kquant(map, name)?));
+                }
+                if !in_dim.is_multiple_of(256) {
+                    return Err(LoadError::Tensor(
+                        name.into(),
+                        format!("{ty:?} row of {in_dim} is not whole super-blocks"),
+                    ));
+                }
+                let row_b = in_dim / 256 * raw_b;
+                let raw = kq_pad_out_raw(bytes, row_b, out, out_p);
+                Ok(Plane::Kq(exec.repack_kquant_raw(
+                    &raw,
+                    vec![in_dim, out_p],
+                    ty,
+                    name,
+                )?))
+            } else {
+                let in_p = in_dim.next_multiple_of(align);
+                if in_p == in_dim {
+                    return Ok(Plane::Kq(exec.repack_kquant(map, name)?));
+                }
+                if !crate::gpu::kq_flat32(ty) {
+                    return Err(LoadError::Tensor(
+                        name.into(),
+                        format!("{ty:?} row of {in_dim} is not whole super-blocks"),
+                    ));
+                }
+                let raw = kq_pad_in_raw_flat(bytes, raw_b / 8, in_dim, in_p, out);
+                Ok(Plane::Kq(exec.repack_kquant_raw(
+                    &raw,
+                    vec![in_p, out],
+                    ty,
+                    name,
+                )?))
+            }
+        }
+        Some(PlaneClass::Bf16) => {
+            if !exec.has_bf16_dense() {
+                return Err(GpuError::MissingOp("bf16 dense plane lane").into());
+            }
+            if (if pad_out { out } else { in_dim }) % align != 0 {
+                return Err(LoadError::Tensor(
+                    name.into(),
+                    format!("bf16 FFN plane at a ragged width ({in_dim} x {out})"),
+                ));
+            }
+            Ok(Plane::Bf16(exec.upload_raw(map, name)?))
+        }
+        None => Err(GpuError::NoKernel {
+            name: name.to_owned(),
+            ty: info.ggml_type,
+        }
+        .into()),
+    }
 }
 
 pub(crate) fn plain_rope(freq_base: f32, head_dim: usize) -> (f32, f32, f32, f32, f32, f32) {
@@ -302,6 +452,7 @@ impl GpuGemma4 {
         let arch = match map.gguf().architecture() {
             Some("gemma4") => Arch::Gemma4,
             Some("muse-glimmer") => Arch::MuseGlimmer,
+            Some("diffusion-gemma") => Arch::DiffusionGemma,
             other => {
                 return Err(LoadError::BadKey(format!(
                     "general.architecture {other:?} is not served by this family"
@@ -550,12 +701,63 @@ impl GpuGemma4 {
         let n_layer = key_u64(map, &format!("{ak}.block_count"))? as usize;
         let n_embd = key_u64(map, &format!("{ak}.embedding_length"))? as usize;
         let n_head = key_u64(map, &format!("{ak}.attention.head_count"))? as usize;
+        // Which class the file's dense planes are in, read off the tensor
+        // types before anything is uploaded: the fp8 twin builders and the
+        // Q8 reclaim convert FROM repacked Q8 and stay off on a k-quant file
+        // (its planes serve as loaded, on the W4A8 lanes), and the shared
+        // FFN's pad alignment depends on it.
+        let class_of = |name: &str| -> Option<PlaneClass> {
+            map.tensor_info(name).and_then(|t| plane_class(t.ggml_type))
+        };
+        let dense_planes: Vec<String> = (0..n_layer)
+            .flat_map(|i| {
+                [
+                    "attn_q",
+                    "attn_k",
+                    "attn_v",
+                    "attn_output",
+                    "attn_gate",
+                    "ffn_gate",
+                    "ffn_up",
+                    "ffn_down",
+                ]
+                .into_iter()
+                .map(move |t| format!("blk.{i}.{t}.weight"))
+            })
+            .chain(
+                [
+                    "token_embd.weight",
+                    "output.weight",
+                    "self_cond_gate.weight",
+                    "self_cond_up.weight",
+                    "self_cond_down.weight",
+                ]
+                .map(str::to_string),
+            )
+            .collect();
+        let file_kq = dense_planes
+            .iter()
+            .any(|n| class_of(n) == Some(PlaneClass::Kq));
+        let ffn_kq = (0..n_layer).any(|i| {
+            ["ffn_gate", "ffn_up", "ffn_down"]
+                .iter()
+                .any(|t| class_of(&format!("blk.{i}.{t}.weight")) == Some(PlaneClass::Kq))
+        });
+        if file_kq && !exec.has_kquant() {
+            return Err(LoadError::Gpu(GpuError::MissingOp(
+                "k-quant lanes (the file carries k-quant planes)",
+            )));
+        }
         // SERVED shared-FFN width: the repacks pad ragged widths up to the
-        // 128-tile alignment the fp8 ladder needs (A4B: 2112 -> 2176; dense
-        // models unchanged). Every scratch plane and arm sizes from this -
-        // the raw metadata value would under-size them against dims[1].
-        let n_ff =
-            (key_u64(map, &format!("{ak}.feed_forward_length"))? as usize).next_multiple_of(128);
+        // alignment the lanes need - 128 (the fp8 ladder's tile) on a Q8
+        // file, 256 (a whole k-quant super-block, so the tile GEMM applies
+        // to every plane) when the shared FFN is k-quant (A4B: 2112 -> 2176
+        // / 2304; dense models unchanged). Every scratch plane and arm sizes
+        // from this - the raw metadata value would under-size them against
+        // dims[1].
+        let ffn_align = if ffn_kq { 256 } else { 128 };
+        let n_ff = (key_u64(map, &format!("{ak}.feed_forward_length"))? as usize)
+            .next_multiple_of(ffn_align);
         let hd_global = key_u64(map, &format!("{ak}.attention.key_length"))? as usize;
         // gemma4 sizes its SWA heads independently; muse-glimmer has one head
         // dim for both classes and omits the _swa key entirely.
@@ -573,12 +775,26 @@ impl GpuGemma4 {
             map,
             &format!("{ak}.rope.freq_base_swa"),
             Some(match arch {
-                Arch::Gemma4 => 10_000.0,
+                Arch::Gemma4 | Arch::DiffusionGemma => 10_000.0,
                 Arch::MuseGlimmer => base_global,
             }),
         )?;
         let final_softcap = key_f32(map, &format!("{ak}.final_logit_softcapping"), Some(0.0))?;
         let logit_scale = key_f32(map, &format!("{ak}.logit_scale"), Some(1.0))?;
+        // The canvas width a block-diffusion file denoises in. The key has
+        // no arch prefix (`diffusion.canvas_length`, the converter's
+        // spelling); required on the diffusion arch, meaningless elsewhere.
+        let canvas_len = if arch.is_diffusion() {
+            let w = key_u64(map, "diffusion.canvas_length")? as usize;
+            if w == 0 || w > 1024 {
+                return Err(LoadError::BadKey(format!(
+                    "diffusion.canvas_length {w}: this engine denoises 1..=1024 positions"
+                )));
+            }
+            w
+        } else {
+            0
+        };
 
         // gemma4 spells these per-layer; muse-glimmer spells them as a scalar
         // window PERIOD and a scalar KV head count. Both readers below accept
@@ -661,23 +877,42 @@ impl GpuGemma4 {
         };
         // PER-TENSOR QUANT DISPATCH. UD files are MIXED: muse-glimmer's
         // UD-Q8_K_XL ships token_embd / output / attn_k / attn_v at bf16 next
-        // to Q8_0 everything else. The project's seam for that is the TENSOR, not
-        // the model, and the correctness spine is same-weights parity on the
-        // identical GGUF - so a bf16 tensor keeps its class instead of being
-        // down-quantized into the Q8 lane on the way in. Anything that is
-        // neither bf16 nor Q8_0 still lands in repack_q8's loud NoKernel.
+        // to Q8_0 everything else; the A4B Q4_K_M holds Q4_K attention beside
+        // Q6_K attn_v and Q5_0 / Q8_0 downs. The project's seam for that is
+        // the TENSOR, not the model, and the correctness spine is same-weights
+        // parity on the identical GGUF - so a tensor keeps its class instead
+        // of being requantized into another lane on the way in. Anything
+        // outside the three classes still lands in a loud NoKernel.
         let plane = |name: &str| -> Result<Plane, GpuError> {
             let (info, _) = map.tensor_bytes(name)?;
-            if info.ggml_type != GgmlType::Bf16 {
-                return Ok(Plane::Q8(exec.repack_q8(map, name)?));
+            match plane_class(info.ggml_type) {
+                Some(PlaneClass::Q8) => Ok(Plane::Q8(exec.repack_q8(map, name)?)),
+                Some(PlaneClass::Bf16) => {
+                    if !exec.has_bf16_dense() {
+                        return Err(GpuError::MissingOp("bf16 dense plane lane"));
+                    }
+                    Ok(Plane::Bf16(exec.upload_raw(map, name)?))
+                }
+                Some(PlaneClass::Kq) => Ok(Plane::Kq(exec.repack_kquant(map, name)?)),
+                None => Err(GpuError::NoKernel {
+                    name: name.to_owned(),
+                    ty: info.ggml_type,
+                }),
             }
-            if !exec.has_bf16_dense() {
-                return Err(GpuError::MissingOp("bf16 dense plane lane"));
-            }
-            Ok(Plane::Bf16(exec.upload_raw(map, name)?))
         };
-        let token_embd = exec.upload_raw(map, "token_embd.weight")?;
-        let n_vocab = token_embd.dims[1];
+        let ffn_plane = |name: &str, pad_out: bool| -> Result<Plane, LoadError> {
+            ffn_plane(&exec, map, name, pad_out, ffn_align)
+        };
+        // The raw embedding table for row gathers. A k-quant embedding keeps
+        // no raw copy: its repacked head is the table (planes::EmbdTable).
+        let embd_info = map
+            .tensor_info("token_embd.weight")
+            .ok_or_else(|| LoadError::Tensor("token_embd.weight".into(), "missing".into()))?;
+        let n_vocab = embd_info.dims[1] as usize;
+        let token_embd = match plane_class(embd_info.ggml_type) {
+            Some(PlaneClass::Kq) => None,
+            _ => Some(exec.upload_raw(map, "token_embd.weight")?),
+        };
         // The LM head. gemma4 TIES it to the embedding (no `output.weight` in
         // the file, so the repacked embedding doubles as the head); muse-glimmer
         // does not (config tie_word_embeddings=false, and `output.weight` is a
@@ -688,6 +923,17 @@ impl GpuGemma4 {
             Ok(_) => plane("output.weight")?,
             Err(_) => plane("token_embd.weight")?,
         };
+        if token_embd.is_none() && head.kq().is_none() {
+            // an UNTIED head over a k-quant embedding: the gathers would
+            // need a second repacked table; no file ships the pairing today
+            return Err(LoadError::Tensor(
+                "token_embd.weight".into(),
+                format!(
+                    "{:?} embedding under a separate output.weight - not served",
+                    embd_info.ggml_type
+                ),
+            ));
+        }
         if head.dims()[1] != n_vocab {
             return Err(LoadError::BadKey(format!(
                 "lm head out dim {} != vocab {n_vocab}",
@@ -767,7 +1013,11 @@ impl GpuGemma4 {
         // depend only on env and device capability -- nothing the loop
         // produces -- so they are the same values the phase gates below use;
         // the bindings are moved, not copied, so there is nothing to drift.
-        let f8_pf_on = paddock_models::dev_var_os!("PADDOCK_G4_NO_F8ROW").is_none()
+        // Every fp8 twin lane converts FROM repacked Q8 - none of them
+        // engages on a file with k-quant planes (`file_kq`), which serve as
+        // loaded on the W4A8 lanes.
+        let f8_pf_on = !file_kq
+            && paddock_models::dev_var_os!("PADDOCK_G4_NO_F8ROW").is_none()
             && (paddock_models::dev_var_os!("PADDOCK_G4_F8ROW").is_some()
                 || exec.compute_capability().0 == 10);
         let qkvfuse = paddock_models::dev_var_os!("PADDOCK_G4_NO_QKVFUSE").is_none()
@@ -877,6 +1127,28 @@ impl GpuGemma4 {
                 Ok((_, bytes)) => f32::from_le_bytes(bytes[..4].try_into().expect("f32 scalar")),
                 Err(_) => 1.0,
             };
+            // diffusion-gemma files carry a second scalar, `enc_layer_output_
+            // scale`, next to this one - the converter writes the encoder
+            // (causal) pass's copy separately although HF ties the two to
+            // ONE `layer_scalar` per layer. Read off the shipped Q8_0 file
+            // they are identical on all 30 layers, so the one graph serves
+            // both passes. A checkpoint where they diverge would need a
+            // per-pass scale in the layer walk; refuse rather than serve one
+            // of the two silently.
+            if let Ok((_, bytes)) =
+                map.tensor_bytes(&format!("blk.{i}.enc_layer_output_scale.weight"))
+            {
+                let enc = f32::from_le_bytes(bytes[..4].try_into().expect("f32 scalar"));
+                if enc != out_scale {
+                    return Err(LoadError::Tensor(
+                        format!("blk.{i}.enc_layer_output_scale.weight"),
+                        format!(
+                            "{enc} differs from layer_output_scale {out_scale}: this engine \
+                             runs the encoder and the canvas through one scale"
+                        ),
+                    ));
+                }
+            }
             // 26B-A4B routed-expert group.
             // All folds here are load-time exact: see MoeWeights.
             let moe = if n_expert != 0 {
@@ -893,58 +1165,160 @@ impl GpuGemma4 {
                     .stream
                     .clone_htod(&gamma)
                     .map_err(|e| LoadError::BadKey(e.to_string()))?;
-                // fused [n_embd, 2*ff_exp, n_expert] Q8: repack whole, split
-                // per expert into gate rows [0,ff) / up rows [ff,2ff) - pure
-                // row copies (Q8 blocks run along the input dim), exact; the
-                // forward then sees the qwen-MoE separate-plane layout.
-                let fused = exec.repack_q8(map, &format!("blk.{i}.ffn_gate_up_exps.weight"))?;
-                let bpr = n_embd / 32; // Q8 blocks per row
-                let half_blocks = ff_exp * bpr; // one half-plane, per expert
-                let fr_blocks = 2 * half_blocks; // fused rows, per expert
-                let mut gdata = exec.alloc_u8(n_expert * half_blocks * 32)?;
-                let mut gscale = exec.alloc_u8(n_expert * half_blocks * 2)?;
-                let mut udata = exec.alloc_u8(n_expert * half_blocks * 32)?;
-                let mut uscale = exec.alloc_u8(n_expert * half_blocks * 2)?;
-                for e in 0..n_expert {
-                    let sg = e * fr_blocks; // expert's gate rows (block idx)
-                    let su = sg + half_blocks; // expert's up rows
-                    let dm = e * half_blocks;
-                    d2d(&fused.data, sg * 32, &mut gdata, dm * 32, half_blocks * 32)?;
-                    d2d(&fused.data, su * 32, &mut udata, dm * 32, half_blocks * 32)?;
-                    d2d(&fused.scale, sg * 2, &mut gscale, dm * 2, half_blocks * 2)?;
-                    d2d(&fused.scale, su * 2, &mut uscale, dm * 2, half_blocks * 2)?;
+                // The expert trio takes ONE class per layer off the fused
+                // gate_up's type: a Q8_0 file's experts stay on the s8 lanes
+                // below; a k-quant file's ride the W4A8 expert lanes, with a
+                // Q8_0 `ffn_down_exps` (the Q4_K_M's 14 such layers) repacked
+                // as the flat Q8_0 seat so the layer's gate+up -> down
+                // handshake stays inside one kernel family.
+                let fused_name = format!("blk.{i}.ffn_gate_up_exps.weight");
+                let down_name = format!("blk.{i}.ffn_down_exps.weight");
+                let fused_ty = map
+                    .tensor_info(&fused_name)
+                    .ok_or_else(|| LoadError::Tensor(fused_name.clone(), "missing".into()))?
+                    .ggml_type;
+                if fused_ty != GgmlType::Q8_0 && crate::gpu::kq_params(fused_ty).is_none() {
+                    return Err(GpuError::NoKernel {
+                        name: fused_name,
+                        ty: fused_ty,
+                    }
+                    .into());
                 }
+                let kq_experts = fused_ty != GgmlType::Q8_0;
+                if kq_experts && !exec.has_kquant_moe() {
+                    return Err(LoadError::Gpu(GpuError::MissingOp(
+                        "k-quant MoE expert lanes (the file's experts are k-quant)",
+                    )));
+                }
+                // fused [n_embd, 2*ff_exp, n_expert]: repack whole, split per
+                // expert into gate rows [0,ff) / up rows [ff,2ff) - pure row
+                // copies (blocks run along the input dim, and a row is whole
+                // blocks - whole super-blocks on the k-quant streams, which
+                // are position-independent), exact; the forward then sees the
+                // qwen-MoE separate-plane layout.
                 let dims = vec![n_embd, ff_exp, n_expert];
-                let gate_exps = RepackedQ8 {
-                    data: gdata,
-                    scale: gscale,
-                    dims: dims.clone(),
+                let (experts, fused_q8) = if kq_experts {
+                    let fused = exec.repack_kquant(map, &fused_name)?;
+                    let (_, _, data_b) = crate::gpu::kq_params(fused.ty).expect("k-quant class");
+                    let scb = crate::gpu::kq_scb(fused.ty);
+                    let spr = n_embd / 256; // super-blocks per row
+                    let half = ff_exp * spr; // one half-plane, per expert
+                    let fr = 2 * half; // fused rows, per expert
+                    let mut gdata = exec.alloc_u8(n_expert * half * data_b)?;
+                    let mut gscale = exec.alloc_u8(n_expert * half * scb)?;
+                    let mut udata = exec.alloc_u8(n_expert * half * data_b)?;
+                    let mut uscale = exec.alloc_u8(n_expert * half * scb)?;
+                    for e in 0..n_expert {
+                        let sg = e * fr;
+                        let su = sg + half;
+                        let dm = e * half;
+                        d2d(
+                            &fused.data,
+                            sg * data_b,
+                            &mut gdata,
+                            dm * data_b,
+                            half * data_b,
+                        )?;
+                        d2d(
+                            &fused.data,
+                            su * data_b,
+                            &mut udata,
+                            dm * data_b,
+                            half * data_b,
+                        )?;
+                        d2d(&fused.scales, sg * scb, &mut gscale, dm * scb, half * scb)?;
+                        d2d(&fused.scales, su * scb, &mut uscale, dm * scb, half * scb)?;
+                    }
+                    let ty = fused.ty;
+                    drop(fused);
+                    // the down at its own width: a flat 32-weight type when
+                    // the row is not whole super-blocks (704 on the A4B)
+                    let down = match map.tensor_info(&down_name).map(|t| t.ggml_type) {
+                        Some(GgmlType::Q8_0) => {
+                            let (info, bytes) =
+                                map.tensor_bytes(&down_name).map_err(GpuError::from)?;
+                            let d: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
+                            exec.repack_kquant_raw(bytes, d, GgmlType::Q8_0, &down_name)?
+                        }
+                        _ => exec.repack_kquant(map, &down_name)?,
+                    };
+                    (
+                        ExpertPlanes::Kq {
+                            gate: RepackedKQ {
+                                data: gdata,
+                                scales: gscale,
+                                dims: dims.clone(),
+                                ty,
+                            },
+                            up: RepackedKQ {
+                                data: udata,
+                                scales: uscale,
+                                dims,
+                                ty,
+                            },
+                            down,
+                        },
+                        None,
+                    )
+                } else {
+                    let fused = exec.repack_q8(map, &fused_name)?;
+                    let bpr = n_embd / 32; // Q8 blocks per row
+                    let half_blocks = ff_exp * bpr; // one half-plane, per expert
+                    let fr_blocks = 2 * half_blocks; // fused rows, per expert
+                    let mut gdata = exec.alloc_u8(n_expert * half_blocks * 32)?;
+                    let mut gscale = exec.alloc_u8(n_expert * half_blocks * 2)?;
+                    let mut udata = exec.alloc_u8(n_expert * half_blocks * 32)?;
+                    let mut uscale = exec.alloc_u8(n_expert * half_blocks * 2)?;
+                    for e in 0..n_expert {
+                        let sg = e * fr_blocks; // expert's gate rows (block idx)
+                        let su = sg + half_blocks; // expert's up rows
+                        let dm = e * half_blocks;
+                        d2d(&fused.data, sg * 32, &mut gdata, dm * 32, half_blocks * 32)?;
+                        d2d(&fused.data, su * 32, &mut udata, dm * 32, half_blocks * 32)?;
+                        d2d(&fused.scale, sg * 2, &mut gscale, dm * 2, half_blocks * 2)?;
+                        d2d(&fused.scale, su * 2, &mut uscale, dm * 2, half_blocks * 2)?;
+                    }
+                    (
+                        ExpertPlanes::Q8 {
+                            gate: RepackedQ8 {
+                                data: gdata,
+                                scale: gscale,
+                                dims: dims.clone(),
+                            },
+                            up: RepackedQ8 {
+                                data: udata,
+                                scale: uscale,
+                                dims,
+                            },
+                            down: exec.repack_q8(map, &down_name)?,
+                        },
+                        Some(fused),
+                    )
                 };
-                let up_exps = RepackedQ8 {
-                    data: udata,
-                    scale: uscale,
-                    dims,
-                };
-                let down_exps = exec.repack_q8(map, &format!("blk.{i}.ffn_down_exps.weight"))?;
                 // tcgen05 e4m3 expert planes (a4b-expert-tcgen05.md): the
                 // FUSED repack converts as-is (1408 rows/expert = 11 exact
                 // tiles - this is why the f8 lane keeps the fused layout the
                 // GGUF shipped); the down stream K-pads 704 -> 768 with zero
                 // blocks in the converter. Q8 originals stay for the decode
                 // band. Kill: PADDOCK_G4_NO_MOE_F8.
-                let moe_f8 = exec.has_f8bs_moe()
+                // e4m3 twins convert from the Q8 planes only - k-quant
+                // experts serve as loaded
+                let moe_f8 = fused_q8.is_some()
+                    && exec.has_f8bs_moe()
                     && paddock_models::dev_var_os!("PADDOCK_G4_NO_MOE_F8").is_none()
                     && n_embd.is_multiple_of(128)
                     && (2 * ff_exp).is_multiple_of(128);
-                let (gu_f8, dn_f8) = if moe_f8 {
-                    let ffp = ff_exp.next_multiple_of(128);
-                    let gu = exec.q8_0_to_f8w(&fused)?;
-                    let dn = exec.q8_0_to_f8w_pad(&down_exps, ff_exp / 32, ffp / 32)?;
-                    moe_f8_dup_bytes +=
-                        (gu.data.len() + gu.scale.len() + dn.data.len() + dn.scale.len()) as u64;
-                    (Some(gu), Some(dn))
-                } else {
-                    (None, None)
+                let (gu_f8, dn_f8) = match (&fused_q8, experts.q8()) {
+                    (Some(fused), Some((_, _, down_exps))) if moe_f8 => {
+                        let ffp = ff_exp.next_multiple_of(128);
+                        let gu = exec.q8_0_to_f8w(fused)?;
+                        let dn = exec.q8_0_to_f8w_pad(down_exps, ff_exp / 32, ffp / 32)?;
+                        moe_f8_dup_bytes +=
+                            (gu.data.len() + gu.scale.len() + dn.data.len() + dn.scale.len())
+                                as u64;
+                        (Some(gu), Some(dn))
+                    }
+                    _ => (None, None),
                 };
                 // Flat-scale e4m3 expert planes (change A). Built
                 // from the SPLIT halves so the row stream is (e*ff + o) - the
@@ -954,27 +1328,31 @@ impl GpuGemma4 {
                 // band still needs the q8 originals.
                 let f8row_on = paddock_models::dev_var_os!("PADDOCK_MOE_F8ROW").is_some()
                     && exec.has_f8row_moe();
-                let (gate_f8r, up_f8r) = if f8row_on {
-                    let rows = n_expert * ff_exp;
-                    (
-                        Some(exec.q8_0_to_f8row_rows(&gate_exps, rows)?),
-                        Some(exec.q8_0_to_f8row_rows(&up_exps, rows)?),
-                    )
-                } else {
-                    (None, None)
+                let (gate_f8r, up_f8r) = match experts.q8() {
+                    Some((gate_exps, up_exps, _)) if f8row_on => {
+                        let rows = n_expert * ff_exp;
+                        (
+                            Some(exec.q8_0_to_f8row_rows(gate_exps, rows)?),
+                            Some(exec.q8_0_to_f8row_rows(up_exps, rows)?),
+                        )
+                    }
+                    _ => (None, None),
                 };
                 // The down half is separately killable (PADDOCK_MOE_F8ROW_DN=0)
                 // so the two halves stay independently measurable -- the whole
                 // point of this task is one change at a time.
-                let down_f8r = if f8row_on
-                    && exec.has_f8row_moe_down()
-                    && paddock_models::dev_var!("PADDOCK_MOE_F8ROW_DN").as_deref() != Ok("0")
-                {
-                    Some(exec.q8_0_to_f8row_rows(&down_exps, n_expert * n_embd)?)
-                } else {
-                    None
+                let down_f8r = match experts.q8() {
+                    Some((_, _, down_exps))
+                        if f8row_on
+                            && exec.has_f8row_moe_down()
+                            && paddock_models::dev_var!("PADDOCK_MOE_F8ROW_DN").as_deref()
+                                != Ok("0") =>
+                    {
+                        Some(exec.q8_0_to_f8row_rows(down_exps, n_expert * n_embd)?)
+                    }
+                    _ => None,
                 };
-                drop(fused); // the fused repack was staging only
+                drop(fused_q8); // the fused repack was staging only
                 let down_scale_h = host_f32(format!("blk.{i}.ffn_down_exps.scale"))?;
                 let down_scale = exec
                     .stream
@@ -983,9 +1361,7 @@ impl GpuGemma4 {
                 Some(MoeWeights {
                     router_w,
                     router_gamma,
-                    gate_exps,
-                    up_exps,
-                    down_exps,
+                    experts,
                     down_scale,
                     gu_f8,
                     dn_f8,
@@ -1043,9 +1419,9 @@ impl GpuGemma4 {
                 f8w_wo: None,
                 attn_norm: norm(format!("blk.{i}.attn_norm.weight"))?,
                 wq: if skip_attn {
-                    stub_q8(&exec, dims_of(&format!("blk.{i}.attn_q.weight"))?)?
+                    Plane::Q8(stub_q8(&exec, dims_of(&format!("blk.{i}.attn_q.weight"))?)?)
                 } else {
-                    exec.repack_q8(map, &format!("blk.{i}.attn_q.weight"))?
+                    plane(&format!("blk.{i}.attn_q.weight"))?
                 },
                 wk: if skip_attn {
                     Plane::Q8(stub_q8(&exec, dims_of(&format!("blk.{i}.attn_k.weight"))?)?)
@@ -1054,38 +1430,33 @@ impl GpuGemma4 {
                 },
                 wv,
                 wo: if skip_attn {
-                    stub_q8(&exec, dims_of(&format!("blk.{i}.attn_output.weight"))?)?
+                    Plane::Q8(stub_q8(
+                        &exec,
+                        dims_of(&format!("blk.{i}.attn_output.weight"))?,
+                    )?)
                 } else {
-                    exec.repack_q8(map, &format!("blk.{i}.attn_output.weight"))?
+                    plane(&format!("blk.{i}.attn_output.weight"))?
                 },
                 // muse-glimmer only; gemma4 files have no such tensor
                 attn_gate: match map.tensor_bytes(&format!("blk.{i}.attn_gate.weight")) {
-                    Ok(_) => Some(exec.repack_q8(map, &format!("blk.{i}.attn_gate.weight"))?),
+                    Ok(_) => Some(plane(&format!("blk.{i}.attn_gate.weight"))?),
                     Err(_) => None,
                 },
                 q_norm: norm(format!("blk.{i}.attn_q_norm.weight"))?,
                 k_norm: norm(format!("blk.{i}.attn_k_norm.weight"))?,
                 attn_post_norm: norm(format!("blk.{i}.post_attention_norm.weight"))?,
                 ffn_norm: norm(format!("blk.{i}.ffn_norm.weight"))?,
-                // A4B shared-FFN width (2112) is not 128-tile-aligned - the
-                // whole fp8 ladder (f8t tile images, f8w TMA GEMMs) needs
-                // out%128. Pad the REPACKS to 2176 once at load: zero out-rows
-                // on gate/up, zero K-tail blocks on down. Exact by
-                // construction (gelu(0)*0 = 0 feeds zero down columns; f32
-                // x+0.0 == x), and every consumer just reads dims[1] = 2176.
-                // Dense models (n_ff already aligned) pass through untouched.
-                ffn_gate: pad_ffn_out(
-                    &exec,
-                    exec.repack_q8(map, &format!("blk.{i}.ffn_gate.weight"))?,
-                )?,
-                ffn_up: pad_ffn_out(
-                    &exec,
-                    exec.repack_q8(map, &format!("blk.{i}.ffn_up.weight"))?,
-                )?,
-                ffn_down: pad_ffn_in(
-                    &exec,
-                    exec.repack_q8(map, &format!("blk.{i}.ffn_down.weight"))?,
-                )?,
+                // A4B shared-FFN width (2112) is ragged - the fp8 ladder (f8t
+                // tile images, f8w TMA GEMMs) needs out%128, the k-quant tile
+                // GEMM whole 256-super-blocks. Pad the planes once at load
+                // (2176 / 2304, `ffn_align`): zero out-rows on gate/up, zero
+                // K-tail blocks on down. Exact by construction (gelu(0)*0 = 0
+                // feeds zero down columns; f32 x+0.0 == x), and every
+                // consumer just reads dims[1]. Dense models (n_ff already
+                // aligned) pass through untouched.
+                ffn_gate: ffn_plane(&format!("blk.{i}.ffn_gate.weight"), true)?,
+                ffn_up: ffn_plane(&format!("blk.{i}.ffn_up.weight"), true)?,
+                ffn_down: ffn_plane(&format!("blk.{i}.ffn_down.weight"), false)?,
                 ffn_post_norm: norm(format!("blk.{i}.post_ffw_norm.weight"))?,
                 out_scale,
                 is_swa: swa,
@@ -1139,6 +1510,7 @@ impl GpuGemma4 {
         // explicit deployment mode, never the default and never the
         // benchmark basis vs same-class rivals.
         let fp4 = paddock_models::dev_var_os!("PADDOCK_G4_FP4").is_some()
+            && !file_kq
             && n_expert == 0
             && exec.has_fp4_ladder()
             && gufuse
@@ -1158,6 +1530,7 @@ impl GpuGemma4 {
         // sitting on the int8 pipe this die serves slowly. Experts stay on
         // the s8-mma sorted class until the tcgen05 grouped GEMM lands.
         let f8r = n_expert == 0
+            && !file_kq
             && paddock_models::dev_var_os!("PADDOCK_G4_NO_F8R").is_none()
             && (paddock_models::dev_var_os!("PADDOCK_G4_F8R").is_some()
                 || (exec.has_f8_gemm_mma_ks() && exec.compute_capability().0 == 12));
@@ -1260,7 +1633,7 @@ impl GpuGemma4 {
                 "gemma4: building per-32 f8w prefill planes (attn + FFN duplicates, {n_layer} layers)"
             );
             for lw in layers.iter_mut() {
-                lw.f8w_wq = Some(exec.q8_0_to_f8w(&lw.wq)?);
+                lw.f8w_wq = Some(exec.q8_0_to_f8w(q8_of(&lw.wq)?)?);
                 // k/v only when they are Q8 - every fp8 converter here reads a
                 // repacked Q8 plane. A bf16 k/v keeps its own class and its
                 // consumers fall through to Plane::gemv/gemm; the direct
@@ -1276,10 +1649,10 @@ impl GpuGemma4 {
                     Some(wv) => Some(exec.q8_0_to_f8w(wv)?),
                     None => None,
                 };
-                lw.f8w_wo = Some(exec.q8_0_to_f8w(&lw.wo)?);
-                lw.f8_gate = Some(exec.q8_0_to_f8w(&lw.ffn_gate)?);
-                lw.f8_up = Some(exec.q8_0_to_f8w(&lw.ffn_up)?);
-                lw.f8_down = Some(exec.q8_0_to_f8w(&lw.ffn_down)?);
+                lw.f8w_wo = Some(exec.q8_0_to_f8w(q8_of(&lw.wo)?)?);
+                lw.f8_gate = Some(exec.q8_0_to_f8w(q8_of(&lw.ffn_gate)?)?);
+                lw.f8_up = Some(exec.q8_0_to_f8w(q8_of(&lw.ffn_up)?)?);
+                lw.f8_down = Some(exec.q8_0_to_f8w(q8_of(&lw.ffn_down)?)?);
             }
             vram_mark("f8w prefill planes", &mut vram_prev);
         }
@@ -1296,15 +1669,15 @@ impl GpuGemma4 {
             );
             let gu_fuse = exec.has_quantize_e4m3_glu2_row(super::glu_act_of(arch));
             for lw in layers.iter_mut() {
-                let (gi, go) = (lw.ffn_gate.dims[0], lw.ffn_gate.dims[1]);
+                let (gi, go) = (lw.ffn_gate.dims()[0], lw.ffn_gate.dims()[1]);
                 if gu_fuse {
                     // fused gate|up plane: the two tile streams concatenate
                     // exactly (tile index = (row/128)*nkt + kt is relative to
                     // each plane, and up's stream lands at gate's byte size).
                     // Built instead of the split planes - VRAM-flat.
-                    let g = exec.q8_0_to_f8row(&lw.ffn_gate)?;
+                    let g = exec.q8_0_to_f8row(q8_of(&lw.ffn_gate)?)?;
                     let g = exec.f8_repack_tiles(g, gi, go)?;
-                    let u = exec.q8_0_to_f8row(&lw.ffn_up)?;
+                    let u = exec.q8_0_to_f8row(q8_of(&lw.ffn_up)?)?;
                     let u = exec.f8_repack_tiles(u, gi, go)?;
                     let te = |e: cudarc::driver::DriverError| {
                         LoadError::Tensor("f8t_gu".into(), e.to_string())
@@ -1344,13 +1717,13 @@ impl GpuGemma4 {
                     };
                     lw.f8t_gu = Some(pgu);
                 } else {
-                    let g = exec.q8_0_to_f8row(&lw.ffn_gate)?;
+                    let g = exec.q8_0_to_f8row(q8_of(&lw.ffn_gate)?)?;
                     lw.f8t_gate = Some(exec.f8_repack_tiles(g, gi, go)?);
-                    let u = exec.q8_0_to_f8row(&lw.ffn_up)?;
+                    let u = exec.q8_0_to_f8row(q8_of(&lw.ffn_up)?)?;
                     lw.f8t_up = Some(exec.f8_repack_tiles(u, gi, go)?);
                 }
-                let (di, dn) = (lw.ffn_down.dims[0], lw.ffn_down.dims[1]);
-                let d = exec.q8_0_to_f8row(&lw.ffn_down)?;
+                let (di, dn) = (lw.ffn_down.dims()[0], lw.ffn_down.dims()[1]);
+                let d = exec.q8_0_to_f8row(q8_of(&lw.ffn_down)?)?;
                 let pdown = exec.f8_repack_tiles(d, di, dn)?;
                 lw.f8t_down = Some(pdown);
             }
@@ -1393,7 +1766,7 @@ impl GpuGemma4 {
                         let te = |e: cudarc::driver::DriverError| {
                             LoadError::Tensor("f8t_qkv".into(), e.to_string())
                         };
-                        let q = mk(&lw.wq)?;
+                        let q = mk(q8_of(&lw.wq)?)?;
                         let k = mk(lw.wk.q8().expect("kv_q8"))?;
                         let v = match lw.wv.as_ref().and_then(|v| v.q8()) {
                             Some(wv) => Some(mk(wv)?),
@@ -1439,7 +1812,7 @@ impl GpuGemma4 {
                         };
                         lw.f8t_qkv = Some(pqkv);
                     } else {
-                        lw.f8t_wq = Some(mk(&lw.wq)?);
+                        lw.f8t_wq = Some(mk(q8_of(&lw.wq)?)?);
                         lw.f8t_wk = match lw.wk.q8() {
                             Some(wk) => Some(mk(wk)?),
                             None => None,
@@ -1449,7 +1822,7 @@ impl GpuGemma4 {
                             None => None,
                         };
                     }
-                    lw.f8t_wo = Some(mk(&lw.wo)?);
+                    lw.f8t_wo = Some(mk(q8_of(&lw.wo)?)?);
                     // muse-glimmer o-gate e4m3 tile plane (opt-).
                     // The Q8 attn_gate is kept (prefill rides it; the reclaim
                     // never stubs it), so this is pure add - VRAM +~1.4 GiB on
@@ -1457,7 +1830,7 @@ impl GpuGemma4 {
                     if crate::envset::env_on("PADDOCK_MUSE_OGATE_F8T")
                         && let Some(ag) = &lw.attn_gate
                     {
-                        lw.f8t_attn_gate = Some(mk(ag)?);
+                        lw.f8t_attn_gate = Some(mk(q8_of(ag)?)?);
                     }
                 }
             }
@@ -1578,7 +1951,7 @@ impl GpuGemma4 {
                 "gemma4: building rowwise-e4m3 prefill planes (attn + FFN duplicates, {n_layer} layers)"
             );
             for lw in layers.iter_mut() {
-                lw.f8_wq = Some(exec.q8_0_to_f8row(&lw.wq)?);
+                lw.f8_wq = Some(exec.q8_0_to_f8row(q8_of(&lw.wq)?)?);
                 lw.f8_wk = match lw.wk.q8() {
                     Some(wk) => Some(exec.q8_0_to_f8row(wk)?),
                     None => None,
@@ -1587,10 +1960,10 @@ impl GpuGemma4 {
                     Some(wv) => Some(exec.q8_0_to_f8row(wv)?),
                     None => None,
                 };
-                lw.f8_wo = Some(exec.q8_0_to_f8row(&lw.wo)?);
-                lw.f8r_gate = Some(exec.q8_0_to_f8row(&lw.ffn_gate)?);
-                lw.f8r_up = Some(exec.q8_0_to_f8row(&lw.ffn_up)?);
-                lw.f8r_down = Some(exec.q8_0_to_f8row(&lw.ffn_down)?);
+                lw.f8_wo = Some(exec.q8_0_to_f8row(q8_of(&lw.wo)?)?);
+                lw.f8r_gate = Some(exec.q8_0_to_f8row(q8_of(&lw.ffn_gate)?)?);
+                lw.f8r_up = Some(exec.q8_0_to_f8row(q8_of(&lw.ffn_up)?)?);
+                lw.f8r_down = Some(exec.q8_0_to_f8row(q8_of(&lw.ffn_down)?)?);
             }
         }
         // Tile-linear conversion of the F8R/F8A replace planes (qwen35's
@@ -1867,9 +2240,12 @@ impl GpuGemma4 {
                 if !gufuse {
                     lw.f8_gate = Some(f8w_native(
                         &format!("blk.{li}.ffn_gate.weight"),
-                        &lw.ffn_gate,
+                        q8_of(&lw.ffn_gate)?,
                     )?);
-                    lw.f8_up = Some(f8w_native(&format!("blk.{li}.ffn_up.weight"), &lw.ffn_up)?);
+                    lw.f8_up = Some(f8w_native(
+                        &format!("blk.{li}.ffn_up.weight"),
+                        q8_of(&lw.ffn_up)?,
+                    )?);
                 }
                 // The FFN pair converts to lin ALL-OR-NOTHING: the r==1 arm
                 // branches on gu's layout for both GEMMs, so a split verdict
@@ -1879,13 +2255,13 @@ impl GpuGemma4 {
                 // n_ff), down (in=n_ff%128, out=n_embd%16).
                 let ffn_lin = f8lin_ffn
                     && gufuse
-                    && lw.ffn_gate.dims[0] % 128 == 0
-                    && lw.ffn_gate.dims[1] % 128 == 0
-                    && lw.ffn_down.dims[1] % 16 == 0;
+                    && lw.ffn_gate.dims()[0] % 128 == 0
+                    && lw.ffn_gate.dims()[1] % 128 == 0
+                    && lw.ffn_down.dims()[1] % 16 == 0;
                 lw.f8_down = Some(match (fp4, ffn_lin) {
-                    (true, _) => exec.q8_0_to_mxfp4(&lw.ffn_down)?,
+                    (true, _) => exec.q8_0_to_mxfp4(q8_of(&lw.ffn_down)?)?,
                     (false, true) => {
-                        match f8w_pc(&format!("blk.{li}.ffn_down.weight"), &lw.ffn_down)? {
+                        match f8w_pc(&format!("blk.{li}.ffn_down.weight"), q8_of(&lw.ffn_down)?)? {
                             Some((plane, ws)) => {
                                 lw.down_ws = Some(exec.stream.clone_htod(&ws).map_err(|e| {
                                     LoadError::Tensor("down_ws".into(), e.to_string())
@@ -1894,24 +2270,27 @@ impl GpuGemma4 {
                                     exec.f8w_build_lin_rw(
                                         plane.data,
                                         &wse_of(&ws),
-                                        lw.ffn_down.dims[0],
-                                        lw.ffn_down.dims[1],
+                                        lw.ffn_down.dims()[0],
+                                        lw.ffn_down.dims()[1],
                                         false,
                                     )?
                                 } else {
-                                    lin(true, plane, lw.ffn_down.dims[0], lw.ffn_down.dims[1])?
+                                    lin(true, plane, lw.ffn_down.dims()[0], lw.ffn_down.dims()[1])?
                                 }
                             }
                             None => lin(
                                 true,
-                                f8w_native(&format!("blk.{li}.ffn_down.weight"), &lw.ffn_down)?,
-                                lw.ffn_down.dims[0],
-                                lw.ffn_down.dims[1],
+                                f8w_native(
+                                    &format!("blk.{li}.ffn_down.weight"),
+                                    q8_of(&lw.ffn_down)?,
+                                )?,
+                                lw.ffn_down.dims()[0],
+                                lw.ffn_down.dims()[1],
                             )?,
                         }
                     }
                     (false, false) => {
-                        f8w_native(&format!("blk.{li}.ffn_down.weight"), &lw.ffn_down)?
+                        f8w_native(&format!("blk.{li}.ffn_down.weight"), q8_of(&lw.ffn_down)?)?
                     }
                 });
                 if gufuse {
@@ -1923,30 +2302,31 @@ impl GpuGemma4 {
                     };
                     let mut pc_ws: Option<(Vec<f32>, Vec<f32>)> = None;
                     let g = if fp4 {
-                        exec.q8_0_to_mxfp4(&lw.ffn_gate)?
+                        exec.q8_0_to_mxfp4(q8_of(&lw.ffn_gate)?)?
                     } else if let Some((plane, ws)) =
-                        f8w_pc(&format!("blk.{li}.ffn_gate.weight"), &lw.ffn_gate)?
+                        f8w_pc(&format!("blk.{li}.ffn_gate.weight"), q8_of(&lw.ffn_gate)?)?
                     {
                         pc_ws = Some((ws, Vec::new()));
                         plane
                     } else {
-                        f8w_native(&format!("blk.{li}.ffn_gate.weight"), &lw.ffn_gate)?
+                        f8w_native(&format!("blk.{li}.ffn_gate.weight"), q8_of(&lw.ffn_gate)?)?
                     };
                     let u = if fp4 {
-                        exec.q8_0_to_mxfp4(&lw.ffn_up)?
+                        exec.q8_0_to_mxfp4(q8_of(&lw.ffn_up)?)?
                     } else if pc_ws.is_some() {
                         // gate went pc -> up must too (one plane, one class)
-                        let (plane, ws) = f8w_pc(&format!("blk.{li}.ffn_up.weight"), &lw.ffn_up)?
-                            .ok_or_else(|| {
-                            LoadError::Tensor(
-                                "gu pc".into(),
-                                "gate pc-quantized but up unavailable".into(),
-                            )
-                        })?;
+                        let (plane, ws) =
+                            f8w_pc(&format!("blk.{li}.ffn_up.weight"), q8_of(&lw.ffn_up)?)?
+                                .ok_or_else(|| {
+                                    LoadError::Tensor(
+                                        "gu pc".into(),
+                                        "gate pc-quantized but up unavailable".into(),
+                                    )
+                                })?;
                         pc_ws.as_mut().expect("set above").1 = ws;
                         plane
                     } else {
-                        f8w_native(&format!("blk.{li}.ffn_up.weight"), &lw.ffn_up)?
+                        f8w_native(&format!("blk.{li}.ffn_up.weight"), q8_of(&lw.ffn_up)?)?
                     };
                     let (g, u) = (&g, &u);
                     let mut data = exec
@@ -1971,7 +2351,7 @@ impl GpuGemma4 {
                     exec.stream.memcpy_dtod(&u.scale, &mut v).map_err(te)?;
                     // lin conversion rides the shared ffn_lin verdict (see
                     // the down plane above) so gu and down always agree
-                    let (gin, gout) = (lw.ffn_gate.dims[0], lw.ffn_gate.dims[1]);
+                    let (gin, gout) = (lw.ffn_gate.dims()[0], lw.ffn_gate.dims()[1]);
                     let gu = crate::gpu::RepackedMxfp4 { data, scale };
                     // gu-interleave election (the epilogue-fusion door):
                     // permuted rows are invisible to the lin
@@ -2009,8 +2389,8 @@ impl GpuGemma4 {
                         );
                     }
                     if paddock_models::dev_var_os!("PADDOCK_G4_FP4_PROBE").is_some() {
-                        let g4 = exec.q8_0_to_mxfp4(&lw.ffn_gate)?;
-                        let u4 = exec.q8_0_to_mxfp4(&lw.ffn_up)?;
+                        let g4 = exec.q8_0_to_mxfp4(q8_of(&lw.ffn_gate)?)?;
+                        let u4 = exec.q8_0_to_mxfp4(q8_of(&lw.ffn_up)?)?;
                         let mut d4 = exec
                             .alloc_u8(g4.data.len() + u4.data.len())
                             .map_err(|e| LoadError::Tensor("fp4_gu".into(), e.to_string()))?;
@@ -2037,8 +2417,8 @@ impl GpuGemma4 {
                     // drop the q8 planes (stubs keep dims for n_ff lookups;
                     // no consumer touches their data in F8R mode)
                     for w in [&mut lw.ffn_gate, &mut lw.ffn_up, &mut lw.ffn_down] {
-                        let dims = w.dims.clone();
-                        *w = crate::gpu::RepackedQ8 {
+                        let dims = w.dims().to_vec();
+                        *w = Plane::Q8(crate::gpu::RepackedQ8 {
                             data: exec
                                 .alloc_u8(32)
                                 .map_err(|e| LoadError::Tensor("f8r stub".into(), e.to_string()))?,
@@ -2046,7 +2426,7 @@ impl GpuGemma4 {
                                 .alloc_u8(32)
                                 .map_err(|e| LoadError::Tensor("f8r stub".into(), e.to_string()))?,
                             dims,
-                        };
+                        });
                     }
                 }
             }
@@ -2080,7 +2460,8 @@ impl GpuGemma4 {
         // inside the 18% dense-GEMM block on a die whose int8 pipe is the
         // slow path. The original bring-up NaN was the pf_e4q stub sizing
         // (fixed: the alloc predicate includes f8a), not F8A itself.
-        let f8a = paddock_models::dev_var_os!("PADDOCK_G4_NO_F8A").is_none()
+        let f8a = !file_kq
+            && paddock_models::dev_var_os!("PADDOCK_G4_NO_F8A").is_none()
             && exec.has_f8_gemm_w8()
             && exec.has_f8_gemv()
             && exec.has_f8_gemm_mma_ks()
@@ -2118,7 +2499,7 @@ impl GpuGemma4 {
                 // fp8-native snapshot from bf16, and `g4_pc` requires a
                 // snapshot, so this condition also rules the pc arms out.
                 if qkvfuse && lw.kv_q8() && !fp4 && fp8_native.is_none() {
-                    let (qin, qd) = (lw.wq.dims[0], lw.wq.dims[1]);
+                    let (qin, qd) = (lw.wq.dims()[0], lw.wq.dims()[1]);
                     let kvd = lw.wk.dims()[1];
                     let qkv_out = qd + kvd * if lw.wv.is_some() { 2 } else { 1 };
                     // both segment boundaries must be box-aligned or the
@@ -2147,7 +2528,7 @@ impl GpuGemma4 {
                         exec.q8_0_to_f8w_lin(&srcs, qin, qkv_out, use_lin)?
                     } else {
                         let mut srcs: Vec<&crate::gpu::RepackedQ8> =
-                            vec![&lw.wq, lw.wk.q8().expect("kv_q8")];
+                            vec![q8_of(&lw.wq)?, lw.wk.q8().expect("kv_q8")];
                         if let Some(wv) = lw.wv.as_ref().and_then(|v| v.q8()) {
                             srcs.push(wv);
                         }
@@ -2165,7 +2546,7 @@ impl GpuGemma4 {
                     let mut qkv_pc: Option<Vec<f32>> = None;
                     let (q, k, v);
                     if !fp4 {
-                        let qp = f8w_pc(&format!("blk.{li}.attn_q.weight"), &lw.wq)?;
+                        let qp = f8w_pc(&format!("blk.{li}.attn_q.weight"), q8_of(&lw.wq)?)?;
                         let kp = f8w_pc(&format!("blk.{li}.attn_k.weight"), wk_q8)?;
                         let vp = match lw.wv.as_ref().and_then(|v| v.q8()) {
                             Some(wv) => f8w_pc(&format!("blk.{li}.attn_v.weight"), wv)?.map(Some),
@@ -2186,7 +2567,7 @@ impl GpuGemma4 {
                             k = kpl;
                             v = vpl;
                         } else {
-                            q = conv(&format!("blk.{li}.attn_q.weight"), &lw.wq)?;
+                            q = conv(&format!("blk.{li}.attn_q.weight"), q8_of(&lw.wq)?)?;
                             k = conv(&format!("blk.{li}.attn_k.weight"), wk_q8)?;
                             v = match lw.wv.as_ref().and_then(|v| v.q8()) {
                                 Some(wv) => Some(conv(&format!("blk.{li}.attn_v.weight"), wv)?),
@@ -2194,7 +2575,7 @@ impl GpuGemma4 {
                             };
                         }
                     } else {
-                        q = conv(&format!("blk.{li}.attn_q.weight"), &lw.wq)?;
+                        q = conv(&format!("blk.{li}.attn_q.weight"), q8_of(&lw.wq)?)?;
                         k = conv(&format!("blk.{li}.attn_k.weight"), wk_q8)?;
                         v = match lw.wv.as_ref().and_then(|v| v.q8()) {
                             Some(wv) => Some(conv(&format!("blk.{li}.attn_v.weight"), wv)?),
@@ -2226,7 +2607,7 @@ impl GpuGemma4 {
                     // lin conversion: the serial lane row-slices this plane
                     // at q_dim and q_dim+kv_dim, so both segment boundaries
                     // must be box-aligned or the layout stays row-major
-                    let (qin, qd) = (lw.wq.dims[0], lw.wq.dims[1]);
+                    let (qin, qd) = (lw.wq.dims()[0], lw.wq.dims()[1]);
                     let kvd = lw.wk.dims()[1];
                     let qkv_out = qd + kvd * if lw.wv.is_some() { 2 } else { 1 };
                     let qkv = crate::gpu::RepackedMxfp4 { data, scale };
@@ -2247,7 +2628,10 @@ impl GpuGemma4 {
                         );
                     }
                 } else {
-                    lw.f8a_wq = Some(f8w_native(&format!("blk.{li}.attn_q.weight"), &lw.wq)?);
+                    lw.f8a_wq = Some(f8w_native(
+                        &format!("blk.{li}.attn_q.weight"),
+                        q8_of(&lw.wq)?,
+                    )?);
                     lw.f8a_wk = match lw.wk.q8() {
                         Some(wk) => Some(f8w_native(&format!("blk.{li}.attn_k.weight"), wk)?),
                         None => None,
@@ -2274,48 +2658,35 @@ impl GpuGemma4 {
                     });
                     Ok(())
                 };
-                let stub = |w: &mut crate::gpu::RepackedQ8| -> Result<(), LoadError> {
-                    let dims = w.dims.clone();
-                    *w = crate::gpu::RepackedQ8 {
-                        data: exec
-                            .alloc_u8(32)
-                            .map_err(|e| LoadError::Tensor("f8a stub".into(), e.to_string()))?,
-                        scale: exec
-                            .alloc_u8(32)
-                            .map_err(|e| LoadError::Tensor("f8a stub".into(), e.to_string()))?,
-                        dims,
-                    };
-                    Ok(())
-                };
                 // Same one-call treatment for wo on the Q8-derived route: one
                 // allocation, no transient to free. See the qkv arm above.
                 if !fp4 && fp8_native.is_none() {
-                    let (win, wout) = (lw.wo.dims[0], lw.wo.dims[1]);
+                    let (win, wout) = (lw.wo.dims()[0], lw.wo.dims()[1]);
                     let use_lin = f8lin_attn && win % 128 == 0 && wout % 16 == 0;
                     lw.f8a_wo = Some(if attn_skipped[li] {
                         let src = exec.repack_q8(map, &format!("blk.{li}.attn_output.weight"))?;
                         exec.q8_0_to_f8w_lin(&[&src], win, wout, use_lin)?
                     } else {
-                        exec.q8_0_to_f8w_lin(&[&lw.wo], win, wout, use_lin)?
+                        exec.q8_0_to_f8w_lin(&[q8_of(&lw.wo)?], win, wout, use_lin)?
                     });
                     // Already seats, not planes, where the upload was skipped -
                     // stubbing again would allocate a second pair per tensor.
                     if attn_skipped[li] {
                         continue;
                     }
-                    stub(&mut lw.wq)?;
+                    stub_plane(&mut lw.wq)?;
                     if lw.f8a_wqkv.is_some() || lw.f8a_wk.is_some() {
                         stub_plane(&mut lw.wk)?;
                         if let Some(wv) = &mut lw.wv {
                             stub_plane(wv)?;
                         }
                     }
-                    stub(&mut lw.wo)?;
+                    stub_plane(&mut lw.wo)?;
                     continue;
                 }
                 let mut wo_pc_ws: Option<Vec<f32>> = None;
                 let wo_plane = if !fp4 {
-                    match f8w_pc(&format!("blk.{li}.attn_output.weight"), &lw.wo)? {
+                    match f8w_pc(&format!("blk.{li}.attn_output.weight"), q8_of(&lw.wo)?)? {
                         Some((plane, ws)) => {
                             lw.wo_ws =
                                 Some(exec.stream.clone_htod(&ws).map_err(|e| {
@@ -2324,27 +2695,27 @@ impl GpuGemma4 {
                             wo_pc_ws = Some(ws);
                             plane
                         }
-                        None => conv(&format!("blk.{li}.attn_output.weight"), &lw.wo)?,
+                        None => conv(&format!("blk.{li}.attn_output.weight"), q8_of(&lw.wo)?)?,
                     }
                 } else {
-                    conv(&format!("blk.{li}.attn_output.weight"), &lw.wo)?
+                    conv(&format!("blk.{li}.attn_output.weight"), q8_of(&lw.wo)?)?
                 };
                 lw.f8a_wo = Some(match wo_pc_ws {
                     Some(ws)
                         if rowvec
                             && f8lin_attn
-                            && lw.wo.dims[0] % 128 == 0
-                            && lw.wo.dims[1] % 16 == 0 =>
+                            && lw.wo.dims()[0] % 128 == 0
+                            && lw.wo.dims()[1] % 16 == 0 =>
                     {
                         exec.f8w_build_lin_rw(
                             wo_plane.data,
                             &wse_of(&ws),
-                            lw.wo.dims[0],
-                            lw.wo.dims[1],
+                            lw.wo.dims()[0],
+                            lw.wo.dims()[1],
                             false,
                         )?
                     }
-                    _ => lin(f8lin_attn, wo_plane, lw.wo.dims[0], lw.wo.dims[1])?,
+                    _ => lin(f8lin_attn, wo_plane, lw.wo.dims()[0], lw.wo.dims()[1])?,
                 });
                 // muse-glimmer's attention output gate. Built exactly like the
                 // split-branch q above (same `conv`, no lin pass) because it is
@@ -2357,14 +2728,14 @@ impl GpuGemma4 {
                 // wq/wo always have an f8a twin here, k/v only when they were
                 // in the Q8 class to begin with (a bf16 k/v is the serving
                 // plane - freeing it would leave nothing behind)
-                stub(&mut lw.wq)?;
+                stub_plane(&mut lw.wq)?;
                 if lw.f8a_wqkv.is_some() || lw.f8a_wk.is_some() {
                     stub_plane(&mut lw.wk)?;
                     if let Some(wv) = &mut lw.wv {
                         stub_plane(wv)?;
                     }
                 }
-                stub(&mut lw.wo)?;
+                stub_plane(&mut lw.wo)?;
             }
         }
 
@@ -2430,23 +2801,9 @@ impl GpuGemma4 {
                 // family, never validated here - it ILLEGAL_ADDRESSed on the
                 // first cut). 48 keeps every prefill/decode route exactly as
                 // pre-reclaim; only the serial gemv arms test for it.
-                let stub = |w: &mut crate::gpu::RepackedQ8| -> Result<u64, LoadError> {
-                    let bytes = (w.data.len() + w.scale.len()) as u64;
-                    let dims = w.dims.clone();
-                    *w = crate::gpu::RepackedQ8 {
-                        data: exec.alloc_u8(48).map_err(|e| {
-                            LoadError::Tensor("q8 reclaim stub".into(), e.to_string())
-                        })?,
-                        scale: exec.alloc_u8(48).map_err(|e| {
-                            LoadError::Tensor("q8 reclaim stub".into(), e.to_string())
-                        })?,
-                        dims,
-                    };
-                    Ok(bytes)
-                };
-                // Plane twin. A bf16 plane returns 0 and keeps its bytes -
-                // it is the serving plane for its tensor, so there is nothing
-                // to reclaim to. (The `ok` guard above already refuses a layer
+                // A bf16 or k-quant plane returns 0 and keeps its bytes - it
+                // is the serving plane for its tensor, so there is nothing to
+                // reclaim to. (The `ok` guard above already refuses a layer
                 // whose f8t k/v twins are missing, which is exactly that case;
                 // this keeps the property local to the stub rather than
                 // load-bearing on a predicate 40 lines up.)
@@ -2494,17 +2851,17 @@ impl GpuGemma4 {
                 let do_attn = set == "all" || set == "attn";
                 let do_ffn = set == "all" || set == "ffn";
                 if do_attn {
-                    freed += stub(&mut lw.wq)?;
+                    freed += stub_plane(&mut lw.wq)?;
                     freed += stub_plane(&mut lw.wk)?;
                     if let Some(wv) = &mut lw.wv {
                         freed += stub_plane(wv)?;
                     }
-                    freed += stub(&mut lw.wo)?;
+                    freed += stub_plane(&mut lw.wo)?;
                 }
                 if do_ffn {
-                    freed += stub(&mut lw.ffn_gate)?;
-                    freed += stub(&mut lw.ffn_up)?;
-                    freed += stub(&mut lw.ffn_down)?;
+                    freed += stub_plane(&mut lw.ffn_gate)?;
+                    freed += stub_plane(&mut lw.ffn_up)?;
+                    freed += stub_plane(&mut lw.ffn_down)?;
                 }
             }
             tracing::info!(
@@ -2585,6 +2942,10 @@ impl GpuGemma4 {
             f8w_pf,
             f8a,
             f8t_dec,
+            kq_dense: file_kq,
+            kq_moe: layers
+                .iter()
+                .any(|l| l.moe.as_ref().is_some_and(|m| m.experts.kq().is_some())),
             // uniq-routing diagnostic (PADDOCK_MOE_UNIQ, MoE models only): raw
             // non-pool accumulator + detached dumper thread - see the Scratch
             // field comment for the two measured constraints. Armed once here
@@ -2605,6 +2966,23 @@ impl GpuGemma4 {
             &format!("serial scratch ({pf_rows} pf rows)"),
             &mut vram_prev,
         );
+        // DiffusionGemma: the self-conditioning MLP and the transposed
+        // embedding, on top of the body every other arch stops at.
+        let diffusion = if arch.is_diffusion() {
+            let lane = super::diffusion::DiffusionLane::load(
+                &exec,
+                map,
+                super::EmbdTable::of(&token_embd, &head),
+                n_embd,
+                n_vocab,
+                canvas_len,
+                ffn_align,
+            )?;
+            vram_mark("diffusion lane (self-cond MLP + E^T bf16)", &mut vram_prev);
+            Some(lane)
+        } else {
+            None
+        };
         Ok(Self {
             hp: Hparams {
                 arch,
@@ -2617,7 +2995,7 @@ impl GpuGemma4 {
                 // pins the two POST norms to 1e-8 and leaves the pre-norms at
                 // the header's 1e-5. Not a metadata key on either file.
                 post_norm_eps: match arch {
-                    Arch::Gemma4 => eps,
+                    Arch::Gemma4 | Arch::DiffusionGemma => eps,
                     Arch::MuseGlimmer => 1e-8,
                 },
                 swa_window,
@@ -2625,7 +3003,7 @@ impl GpuGemma4 {
                 // NoPE on the full-attention layers: freq_scale 0 makes the
                 // shared yarn kernels a bit-exact identity (see Hparams).
                 rope_global: match arch {
-                    Arch::Gemma4 => plain_rope(base_global, hd_global),
+                    Arch::Gemma4 | Arch::DiffusionGemma => plain_rope(base_global, hd_global),
                     Arch::MuseGlimmer => {
                         let (ts, _, cl, ch, ef, ms) = plain_rope(base_global, hd_global);
                         (ts, 0.0, cl, ch, ef, ms)
@@ -2637,6 +3015,7 @@ impl GpuGemma4 {
                 n_expert,
                 n_expert_used,
                 ff_exp,
+                canvas_len,
             },
             exec,
             layers,
@@ -2676,6 +3055,7 @@ impl GpuGemma4 {
             fin_tpar: None,
             d_tokens: None,
             d_slots: None,
+            canvases: Vec::new(),
             gpool: None,
             decode_graphs: std::collections::HashMap::new(),
             graph_seen: std::collections::HashSet::new(),
@@ -2711,6 +3091,7 @@ impl GpuGemma4 {
             spec_shallow: false,
             mtp_graphs: std::collections::HashMap::new(),
             pf_side: None,
+            diffusion,
         })
     }
 }

@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_stream::stream;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_api::chat::{
@@ -876,17 +876,15 @@ pub(crate) fn decode_image_url(
         img.apply_orientation(orientation);
         img.to_rgb8()
     };
-    // Down only, and only for `detail: low`. Low is the one level whose cap
-    // can bind below the family's own budget resample; Auto's cap
-    // (AUTO_MAX_TOKENS) and High's (the published max) are >= every family
-    // budget in practice, so pre-shrinking for them made the ordinary path a
-    // double resample (Triangle here, then the family's bit-exact bicubic) -
-    // measured at ~100ms inline per A4-class request, and a
-    // divergence from the reference processors, which resample exactly once
-    // from the original. The family's own preprocessing is that single
-    // resample; upsampling small images stays the tower's job (it knows its
-    // alignment grid).
-    if let (Some(b), ImageDetail::Low) = (budget, detail) {
+    // Down only when the request's allowance is smaller than the tower's.
+    // Auto can bind too: Bonsai permits 16,384 image tokens, while the default
+    // request budget is 4,096. Passing a camera photo through unchanged here
+    // accidentally elected the full-resolution tower and minute-long encodes.
+    // High ("Original" in Studio) and families already below the allowance
+    // retain their original pixels for the family's single, exact resample.
+    // The attachment itself is never modified, and metadata extraction still
+    // sees the original bytes. Small images are never upsampled here.
+    if let Some(b) = budget.filter(|b| detail.token_cap(b) < b.max_tokens) {
         let (tw, th) = b.fit_tokens(rgb.width(), rgb.height(), detail.token_cap(&b));
         if tw < rgb.width() || th < rgb.height() {
             // Triangle, not Lanczos3: the `image` crate widens a filter's
@@ -1301,7 +1299,7 @@ fn adopt_legacy_functions(req: &mut ChatCompletionRequest) -> Result<(), String>
 fn prepare(
     model: &ServingModel,
     req: &ChatCompletionRequest,
-    output_ceiling: Option<usize>,
+    caps: crate::routes::OutputCaps,
     sd: &crate::routes::SamplingDefaults,
 ) -> Result<Prepared, String> {
     let template = model
@@ -1310,21 +1308,21 @@ fn prepare(
         .ok_or("this model has no chat template; use /v1/completions")?;
 
     // token cap: max_completion_tokens is the current spelling, max_tokens
-    // the deprecated one; both at once is ambiguous (matches OpenAI's error)
-    let max_tokens = match (req.max_tokens, req.max_completion_tokens) {
+    // the deprecated one; both at once is ambiguous (matches OpenAI's error).
+    // Neither = the server default (the window unless configured), then the
+    // deployment ceiling over whichever it was - the same resolution
+    // /v1/responses applies.
+    let asked = match (req.max_tokens, req.max_completion_tokens) {
         (Some(_), Some(_)) => {
             return Err(
                 "specify either max_completion_tokens or the deprecated max_tokens, not both"
                     .into(),
             );
         }
-        (Some(m), None) | (None, Some(m)) => m,
-        (None, None) => 1024,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (None, None) => None,
     };
-    // Server-wide output ceiling (PADDOCK_MAX_OUTPUT_CEILING) - the same
-    // clamp /v1/responses applies; a request can't demand more than the
-    // deployment allows.
-    let max_tokens = output_ceiling.map_or(max_tokens, |c| max_tokens.min(c));
+    let max_tokens = caps.resolve(asked);
 
     // persistence / modality knobs this server truthfully does not have
     if req.store == Some(true) {
@@ -1548,7 +1546,10 @@ fn prepare(
     // validate_content_parts for why a template is the wrong place to find out.
     chat_template::validate_roles(&req.messages)?;
     chat_template::validate_content_parts(&req.messages)?;
-    let mut messages = chat_template::normalize_messages(&req.messages);
+    // system/developer turns past the opening run render in place - no
+    // template we serve takes one there
+    let inlined = chat_template::inline_late_system_messages(&req.messages)?;
+    let mut messages = chat_template::normalize_messages(&inlined);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -1573,7 +1574,13 @@ fn prepare(
     } else {
         None
     };
-    let mut prompt = chat_template::render(template, &messages, tools, kwargs.as_ref())?;
+    let mut prompt = chat_template::render_with_specials(
+        template,
+        &messages,
+        tools,
+        kwargs.as_ref(),
+        &model.template_specials(),
+    )?;
     if trace {
         tracing::info!(
             "req-trace: render {:.1} ms ({} chars)",
@@ -2308,7 +2315,7 @@ pub async fn handle(
         }
     }
     let t_prep = std::time::Instant::now();
-    let prepared = match prepare(model, &req, state.max_output_ceiling, &state.sampling) {
+    let prepared = match prepare(model, &req, state.output_caps(), &state.sampling) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
@@ -2365,6 +2372,7 @@ pub async fn handle(
             constraint: prepared.make_constraint(model),
             logprobs: prepared.logprobs,
             submitted: None, // stamped by Engine::submit
+            canvas_read: None,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -2828,7 +2836,12 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
         }
         yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
     };
-    Sse::new(sse).into_response()
+    // SSE comments while the model works in silence (a long cold prefill, a
+    // tool call that is emitted whole): client idle timeouts count them,
+    // parsers skip them - the Responses surface's rule (responses.rs)
+    Sse::new(sse)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Logprob entries accumulated since the last emitted chunk for this choice.
@@ -2894,6 +2907,7 @@ mod tests {
         assert!(Dialect::Laguna.tool_syntax().is_some(), "laguna");
         assert!(Dialect::QwenXml.tool_syntax().is_some());
         assert!(Dialect::MuseChannel.tool_syntax().is_some(), "muse");
+        assert!(Dialect::MiniCpmXml.tool_syntax().is_some(), "minicpm");
     }
 
     /// The two INTERPOLATING families use different template variables and
@@ -3495,21 +3509,9 @@ mod tests {
         );
     }
 
-    /// `detail: low` is fitted here, and the other two levels are deliberately
-    /// not - which is the narrowing `decode_image_url` documents and this test
-    /// exists to hold.
-    ///
-    /// The reasoning, restated because it is what makes the asymmetry correct
-    /// rather than an oversight: Low is the one level whose cap can bind below
-    /// the family's own budget resample, so it has something to do. Auto's cap
-    /// (AUTO_MAX_TOKENS) and High's (the published max) are at or above every
-    /// family budget in practice, so shrinking for them made the ordinary path
-    /// a double resample - Triangle here, then the family's bit-exact bicubic
-    /// - which cost ~100 ms inline per A4-class request and diverged from the
-    ///   reference processors, which resample exactly once from the original.
-    ///
-    /// This test asserted the old fit-every-level behaviour and went red when
-    /// that narrowed; it was the test that was out of date, not the code.
+    /// Auto and Low enforce their smaller allowances; Original/High leaves
+    /// pixels to the tower. This must hold even when the checkpoint supports
+    /// far more image tokens than the default request policy.
     #[test]
     fn a_large_image_is_fitted_only_where_the_cap_can_bind() {
         let uri = data_uri(&png_of(900, 600));
@@ -3518,15 +3520,14 @@ mod tests {
             let i = decode_image_url(&uri, Some(b), d).expect("decode");
             (i.w, i.h)
         };
-        // High and Auto reach the family's preprocessing at full size, and
-        // byte-identically to a decode with no budget at all - that is what
-        // "a single resample" means here.
         let plain = decode_image_url(&uri, None, ImageDetail::Auto).expect("decode");
-        for d in [ImageDetail::High, ImageDetail::Auto] {
-            let img = decode_image_url(&uri, Some(b), d).expect("decode");
-            assert_eq!((img.w, img.h), (900, 600), "{d:?} pre-shrank");
-            assert_eq!(img.rgb, plain.rgb, "{d:?} resampled without needing to");
-        }
+        let high = decode_image_url(&uri, Some(b), ImageDetail::High).expect("decode");
+        assert_eq!((high.w, high.h), (900, 600));
+        assert_eq!(high.rgb, plain.rgb, "Original must retain decoded pixels");
+        let auto = dims(ImageDetail::Auto);
+        assert!(auto.0 * auto.1 <= 4_096 * 16, "{auto:?}");
+        assert!(auto.0 < 900 && auto.1 < 600, "{auto:?}");
+        assert!((auto.0 as f64 / auto.1 as f64 - 1.5).abs() < 0.02);
         // Low is the level with work to do: 64 rows x 16 px is 1024 pixels,
         // far under the source, so it fits and holds the aspect.
         let lo = dims(ImageDetail::Low);
@@ -3534,6 +3535,39 @@ mod tests {
         assert!(lo.0 < 900 && lo.1 < 600, "{lo:?}");
         let r = lo.0 as f64 / lo.1 as f64;
         assert!((r - 1.5).abs() < 0.05, "aspect drifted: {}x{}", lo.0, lo.1);
+    }
+
+    #[test]
+    fn auto_does_not_pre_resize_when_the_tower_already_has_a_smaller_budget() {
+        let uri = data_uri(&png_of(900, 600));
+        let mut b = test_budget();
+        b.max_tokens = 1024;
+        b.max_pixels = 1024 * b.pixels_per_token;
+        let plain = decode_image_url(&uri, None, ImageDetail::Auto).expect("decode");
+        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto).expect("decode");
+        assert_eq!((auto.w, auto.h), (plain.w, plain.h));
+        assert_eq!(auto.rgb, plain.rgb, "do not double-resize ordinary towers");
+    }
+
+    #[test]
+    fn bonsai_camera_photo_auto_is_bounded_and_original_remains_available() {
+        let b = paddock_engine::generator::VisionBudget {
+            max_pixels: 16_777_216,
+            min_pixels: 65_536,
+            max_edge: None,
+            pixels_per_token: 1024,
+            max_tokens: 16_384,
+            min_tokens: 64,
+        };
+        // The dimensions of the reported 17.3 MiB JPEG. A generated image
+        // keeps this regression independent of anyone's private photograph.
+        let uri = data_uri(&png_of(6720, 4480));
+        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto).expect("decode");
+        assert_eq!((auto.w, auto.h), (2508, 1672));
+        assert!(b.tokens_for(auto.w as u32, auto.h as u32) <= 4096);
+        drop(auto);
+        let high = decode_image_url(&uri, Some(b), ImageDetail::High).expect("decode");
+        assert_eq!((high.w, high.h), (6720, 4480));
     }
 
     /// An image already inside the allowance is passed through byte-identical.

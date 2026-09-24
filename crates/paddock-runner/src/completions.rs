@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_stream::stream;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_api::completions::{CompletionChoice, CompletionRequest, CompletionResponse, Usage};
@@ -259,6 +259,7 @@ pub async fn handle(
             constraint: None,
             logprobs: gen_logprobs,
             submitted: None, // stamped by Engine::submit
+            canvas_read: None,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -625,7 +626,12 @@ fn stream_response(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Sse::new(sse).into_response()
+    // SSE comments while the model works in silence (a long cold prefill, a
+    // tool call that is emitted whole): client idle timeouts count them,
+    // parsers skip them - the Responses surface's rule (responses.rs)
+    Sse::new(sse)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn chunk_json(

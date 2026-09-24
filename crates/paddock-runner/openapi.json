@@ -176,6 +176,23 @@
         }
       }
     },
+    "/v1/systemone": {
+      "post": {
+        "tags": ["paddock"],
+        "summary": "Structured read: fixed questions about a text, answered with probabilities",
+        "description": "Paddock-native, in the Jev `/v1/systemone` shape. Served only by a block-diffusion model (DiffusionGemma): `GET /api/server` carries `structured_read` with the canvas width and the per-call caps, and every other model answers 400. `state` is the text; `questions` maps an id (one word, no `:`) to a typed question - `noul` (also `bool`/`boolean`: a yes/no probability, optional `criteria: {true, false}` descriptions), `choice` (`criteria` maps option names to descriptions), `score` (`criteria` is the ordered list of level names). Every question is read in ONE denoising pass over the seeded answer template, so each answer is a full distribution over its labels rather than a sampled token, and the mass the model put OUTSIDE the label set comes back as `outside`. `samples` is `\"auto\"` (one read, then re-reads with fresh slot noise while any slot's entropy is above `auto_threshold`, up to `auto_max` in all) or an integer 1..max_samples. Labels must be single tokens that change exactly one template position; a label set that does not is refused by name (422), as is a state whose prompt plus canvas exceeds the window. Refused: `images`, `steps` other than 1, conditional questions (`depends_on`, `ask_if`, `alone`).",
+        "operationId": "systemone",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SystemOneRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "One typed answer per question, plus the read's diagnostics", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SystemOneResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "422": { "description": "The question set or the state was refused; the message names the question, or the window", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/v1/audio/transcriptions": {
       "post": {
         "tags": ["openai"],
@@ -216,6 +233,99 @@
           "200": { "description": "Word-level alignment", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AlignmentResponse" } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "503": { "description": "No forced-alignment model is loaded on this runner", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/images/generations": {
+      "post": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "Text-to-image (OpenAI Images API, GPT-image form)",
+        "description": "Served by image-generation models (`image_generation` capability in `/v1/models`; today Qwen-Image-2.1). The GPT-image-model form of the OpenAI Images API: images always come back as `b64_json`, `size` is any `WIDTHxHEIGHT` on the model's grid (`image_generation.size_multiple` in `GET /api/server`, 32 here) up to `max_side`, `output_format` selects png (default, keeps alpha) / webp / jpeg, `background: transparent` asks the model for an RGBA image, `quality` picks the step count (`low` 20, `medium` 30, otherwise the model's own 40). DALL-E fields (`style`, `response_format: url`) are refused by name; streaming and partial images are not served yet.\n\nPaddock extras on the same object: `seed` (default 42), `steps` (1..100), `guidance` (classifier-free guidance scale, off at <= 1, the model's default), `negative_prompt` (with guidance > 1), and `width` / `height` instead of `size`. Same seed, same request, same server: the same bytes.",
+        "operationId": "createImage",
+        "externalDocs": {
+          "url": "https://platform.openai.com/docs/api-reference/images/create"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "prompt"
+                ],
+                "properties": {
+                  "prompt": { "type": "string" },
+                  "model": { "type": "string" },
+                  "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+                  "size": { "type": "string", "description": "WIDTHxHEIGHT or auto (1024x1024)" },
+                  "quality": { "type": "string", "enum": ["auto", "low", "medium", "high", "xhigh", "max"] },
+                  "output_format": { "type": "string", "enum": ["png", "webp", "jpeg"], "default": "png" },
+                  "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
+                  "background": { "type": "string", "enum": ["transparent", "opaque", "auto"] },
+                  "moderation": { "type": "string", "enum": ["low", "auto"] },
+                  "response_format": { "type": "string", "enum": ["b64_json"] },
+                  "user": { "type": "string" },
+                  "seed": { "type": "integer" },
+                  "steps": { "type": "integer", "minimum": 1, "maximum": 100 },
+                  "guidance": { "type": "number" },
+                  "negative_prompt": { "type": "string" },
+                  "width": { "type": "integer" },
+                  "height": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The generated images",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "created": { "type": "integer" },
+                    "data": { "type": "array", "items": { "type": "object", "properties": { "b64_json": { "type": "string" } } } },
+                    "background": { "type": "string", "enum": ["transparent", "opaque"] },
+                    "output_format": { "type": "string" },
+                    "quality": { "type": "string" },
+                    "size": { "type": "string" },
+                    "usage": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid request (an off-grid size, a DALL-E-only field, an unsupported option)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "No image-generation model is loaded on this runner", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/images/edits": {
+      "post": {
+        "tags": [
+          "openai"
+        ],
+        "summary": "Image editing (OpenAI Images API) - not served yet",
+        "description": "The route exists so a client learns the truth in one round trip: this build serves text-to-image only. Editing with reference images (the model supports up to 10) is the next phase of the image lane; until then every request here is refused with 400.",
+        "operationId": "createImageEdit",
+        "externalDocs": {
+          "url": "https://platform.openai.com/docs/api-reference/images/createEdit"
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": { "type": "object" }
+            }
+          }
+        },
+        "responses": {
+          "400": { "description": "Image editing is not served by this build", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "503": { "description": "No image-generation model is loaded on this runner", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -672,6 +782,108 @@
           }
         }
       },
+      "SystemOneRequest": {
+        "type": "object",
+        "required": ["state", "questions"],
+        "properties": {
+          "state": { "type": "string", "description": "The text the questions are about" },
+          "questions": {
+            "type": "object",
+            "description": "id -> question. Ids are single words without ':' (they are written into the answer template); at most `max_questions` per call (advertised in `structured_read`).",
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": { "type": "string", "enum": ["noul", "bool", "boolean", "choice", "score"] },
+                "instructions": { "type": "string", "description": "What to decide about the state" },
+                "criteria": {
+                  "description": "noul: optional {true, false} descriptions; choice: option name -> description (2 to 26 options); score: the ordered list of level names (2 to 26)",
+                  "oneOf": [
+                    { "type": "object", "additionalProperties": { "type": "string" } },
+                    { "type": "array", "items": { "type": "string" } }
+                  ]
+                }
+              }
+            }
+          },
+          "samples": {
+            "description": "\"auto\" (the default) or a fixed number of reads per question, 1..max_samples",
+            "oneOf": [{ "type": "string", "const": "auto" }, { "type": "integer", "minimum": 1 }]
+          },
+          "auto_threshold": { "type": "number", "default": 0.1, "description": "auto re-reads while any slot's entropy is above this" },
+          "auto_max": { "type": "integer", "default": 4, "description": "auto reads at most this many times in all" },
+          "seed": { "type": "integer", "default": 42, "description": "Slot-noise seed; read k noises with seed + 7919 k" },
+          "steps": { "type": "integer", "const": 1, "description": "Only a single denoising read is served" }
+        }
+      },
+      "SystemOneResponse": {
+        "type": "object",
+        "required": ["model", "answers", "diagnostics"],
+        "properties": {
+          "model": { "type": "string" },
+          "answers": {
+            "type": "object",
+            "description": "id -> answer, one per question. Every answer carries `confidence` (the mean probability of the reported label over the reads), `agreement` (the share of reads that picked it) and `outside` (the mass the model put outside the label set at that slot - the calibration signal a top-k logprobs read cannot see).",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["type", "confidence", "agreement", "outside"],
+              "properties": {
+                "type": { "type": "string", "enum": ["noul", "choice", "score"] },
+                "noul": { "type": "number", "description": "noul: p(yes)" },
+                "choice": { "type": "string", "description": "choice: the option with the most mass" },
+                "score": { "type": "number", "description": "score: the probability-weighted level index, 0 to levels - 1" },
+                "level": { "type": "string", "description": "score: the level with the most mass" },
+                "legend": { "type": "object", "additionalProperties": { "type": "string" }, "description": "score: level index -> name" },
+                "probabilities": { "type": "object", "additionalProperties": { "type": "number" }, "description": "choice: option -> mean probability; score: level index -> mean probability" },
+                "confidence": { "type": "number" },
+                "agreement": { "type": "number" },
+                "outside": { "type": "number" }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "input_tokens": { "type": "integer" },
+              "output_tokens": { "type": "integer", "description": "Always 0 - nothing is generated" }
+            }
+          },
+          "diagnostics": {
+            "type": "object",
+            "properties": {
+              "reads": { "type": "integer", "description": "How many reads were taken" },
+              "canvas": { "type": "integer", "description": "Canvas positions used by the answer template" },
+              "timing": { "type": "object", "properties": { "total_ms": { "type": "number" } } },
+              "questions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "label": { "type": "string", "description": "The template label that won (\"yes\", \"B\", \"3\")" },
+                    "position": { "type": "integer", "description": "The slot's position in the canvas" },
+                    "entropy": { "type": "number", "description": "Mean slot entropy over the full vocabulary, in nats" },
+                    "label_mass": { "type": "number", "description": "Mean raw mass on the label set (1 - outside)" },
+                    "reads": {
+                      "type": "array",
+                      "description": "One entry per read: what this slot picked and how surely - which reads disagreed, not only that some did",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "pick": { "type": "string" },
+                          "confidence": { "type": "number" },
+                          "entropy": { "type": "number" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "ServerCard": {
         "type": "object",
         "description": "Keys are additive across versions; the ones below are stable. Absent means the capability is absent.",
@@ -686,6 +898,7 @@
           "asr": { "type": ["string", "null"], "description": "Served speech-to-text model id" },
           "aligner": { "type": ["string", "null"], "description": "Served forced-alignment model id - POST /v1/audio/alignments works iff set" },
           "alignment_max_clip_s": { "type": ["number", "null"], "description": "Longest clip one alignment call can address" },
+          "structured_read": { "type": ["object", "null"], "description": "POST /v1/systemone works iff set (a block-diffusion model): {canvas_width, max_questions, max_samples, types}" },
           "reranker": { "type": ["boolean", "null"] },
           "vision": { "type": ["boolean", "null"] },
           "audio": { "type": "boolean", "description": "POST /v1/audio/transcriptions works iff true" },

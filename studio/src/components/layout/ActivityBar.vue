@@ -4,9 +4,10 @@
 // switching between areas; the rail never mixes them - that is the
 // manager/studio split. There is no Models item: the catalog lives
 // inside the deploy flow, and downloads happen there too.
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
+import { useModelsStore } from '@/stores/models'
 import { useReadinessStore } from '@/stores/readiness'
 import Icon from '@/components/Icon.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
@@ -32,6 +33,24 @@ const noChats = computed(() => chat.loaded && chat.conversations.length === 0)
 // it disappears on a bad one, which is the right way round. An untested card
 // is not a bad one - it serves, under a warning.
 const canRunHere = computed(() => !readiness.blocked)
+
+// Reads is a page for a running model that READS (a block-diffusion model
+// answering fixed questions in one pass) - the first entry gated on what a
+// server advertises rather than on which kind of model it is. The probe
+// asks each local chat runner once, into the same caps cache the composer
+// uses; the entry appears when one answers `structured_read` and goes with
+// it when that model stops.
+const models = useModelsStore()
+watch(
+  () =>
+    models.models
+      .filter((m) => m.kind === 'chat' && !m.cloud)
+      .map((m) => `${m.id}:${m.port ?? ''}`)
+      .join(','),
+  () => void models.probeReaders(),
+  { immediate: true },
+)
+const canRead = computed(() => canRunHere.value && models.readers.length > 0)
 
 function go(name: string): void {
   // instrument's route requires a :tab param - a bare { name } push aborts
@@ -110,6 +129,15 @@ function active(name: string): boolean {
           @click="go('embeddings')"
         >
           <Icon name="sliders" :size="20" />
+        </button>
+      </Tooltip>
+      <Tooltip v-if="canRead" label="Reads" side="right">
+        <button
+          class="activity-bar__btn"
+          :class="{ 'activity-bar__btn--active': active('reads') }"
+          @click="go('reads')"
+        >
+          <Icon name="list-checks" :size="20" />
         </button>
       </Tooltip>
       <Tooltip label="Prompts" side="right">

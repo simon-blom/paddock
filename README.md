@@ -101,6 +101,7 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **GPT-OSS** - 20B and 120B
 - **Granite** - 4.1 8B/30B, 4.2 8B/30B, and 4.1 Vision 4B
 - **Laguna 2.1** - XS (33B-A3B) and S (118B-A8B)
+- **MiniCPM5** - 2B
 - **Muse Glimmer** - 30B
 - **Nemotron 3.5 Lightning** - 30B-A3B
 

@@ -8,13 +8,14 @@ extension NativeStudioRuntime {
     let cap = capability(id)
     let params = fields["params"]?.object ?? Self.defaultParams
     let modelRows: [V] = models.filter {
-      ["chat", "transcriber"].contains($0["kind"]?.string ?? "")
+      ["chat", "transcriber", "image"].contains($0["kind"]?.string ?? "")
     }.map { m in
       var row = m
       let id = m["id"]!.string!
       row["vision"] = .bool(caps[id]?["vision"]?.bool == true)
       row["audio"] = .bool(canAudio(id))
       row["chat"] = .bool(canChat(id))
+      row["image"] = .bool(canImagine(id))
       return .object(row)
     }
     let ordered = history.sorted { a, b in
@@ -80,8 +81,25 @@ extension NativeStudioRuntime {
       "webSearch": cap["web_search"] ?? .bool(false), "vision": cap["vision"] ?? .bool(false),
       "context": .number(Decimal(contextLimit)),
       "ocrModes": cap["ocr"]?["modes"] ?? .array([]),
+      "ocrGrounding": cap["ocr"]?["grounding"] ?? .bool(false),
       "docParser": cap["document_parser"] ?? .bool(false),
+      "hasDocument": .bool(
+        document?.activeMessages.contains { !NativeDocumentPlan.rasterParts($0).isEmpty } == true),
       "pdfRaster": cap["pdf"]?["raster"] ?? .bool(false),
+      "imageLanes": .array(
+        selected.compactMap { id in
+          let lane = capability(id)
+          guard lane["vision"]?.bool == true else { return nil }
+          return .object([
+            "id": .string(id),
+            "name": models.first { $0["id"]?.string == id }?["title"] ?? .string(id),
+            "context": lane["max_ctx"] ?? .number(0),
+            "documentParser": lane["document_parser"] ?? .bool(false),
+            "taskTags": .array((lane["task_tags"]?.array ?? []).compactMap { $0["tag"] }),
+            "budget": NativeVisionBudget(value: lane["vision_budget"]) == nil
+              ? .null : lane["vision_budget"]!,
+          ])
+        }),
     ]
     let dials: [(String, String, Double, Double, Double, Double)] = [
       ("temperature", "Temperature", 0, 2, 0.05, 0.8), ("topP", "Top P", 0.01, 1, 0.01, 0.95),
@@ -125,10 +143,16 @@ extension NativeStudioRuntime {
     var settings = fields.filter {
       [
         "systemPrompt", "params", "toolSelection", "connectorIds", "webSearchEnabled", "ocrMode",
-        "audioLanguage",
+        "audioLanguage", "ocrRegions", "imageParams",
       ].contains($0.key)
     }
     settings["maxTokens"] = maxTokens
+    settings["imageParams"] = .object(
+      NativeImageGeneration.defaults.merging(fields["imageParams"]?.object ?? [:]) { _, new in new }
+    )
+    settings["lastImageSeed"] =
+      document?.activeMessages.reversed()
+      .compactMap { $0["imageGen"]?["seed"] }.first ?? .null
     settings["summarize"] = .bool(preferenceBool("summarize", fallback: true))
     settings["toolSelection"] = settings["toolSelection"] ?? .object(["mode": .string("all")])
     settings["webSearchEnabled"] = settings["webSearchEnabled"] ?? .bool(true)
@@ -165,6 +189,13 @@ extension NativeStudioRuntime {
       "settings": .object(settings), "capabilities": .object(capabilities),
       "tools": .array(projectTools()),
       "composer": .object([
+        "imageMode": .bool(!selected.isEmpty && selected.allSatisfy(canImagine)),
+        "imageCaps": cap["image_generation"] ?? .null,
+        "imageEditing": .bool(
+          !selected.isEmpty
+            && selected.allSatisfy {
+              canImagine($0) && capability($0)["image_generation"]?["edit"]?.bool == true
+            }),
         "reasoning": .array(choices), "reasoningChoice": .string(selectedChoice),
         "preserveThinking": capabilities["preserveThinking"]!,
         "thinkingBudget": capabilities["thinkingBudget"]!,
@@ -181,14 +212,16 @@ extension NativeStudioRuntime {
           Decimal(active.reduce(0.0) { $0 + ($1["usage"]?["costUsd"]?.double ?? 0) })),
         "contextUsed": .number(
           Decimal(
-            (active.reduce(0) { $0 + ConversationDocument.text($1).utf8.count }
-              + draftText.utf8.count) / 3)),
+            document.map {
+              NativeContextPlan.contextTokens($0, draft: draftText)
+            } ?? NativeContextPlan.tokens(draftText))),
       ]),
       "nativeArtifactsPaneOpen": fields["artifactsPaneOpen"] ?? .bool(true),
       "nativeTranscript": .object([
         "available": .bool(true), "notice": .string(""),
         "conversationId": draft ? .null : fields["id"]!, "leafId": fields["leafId"] ?? .null,
         "messages": .array(transcript),
+        "context": contextPresentation(),
       ]),
       "nativeDocument": previewPart.flatMap(Self.documentBadge).map(V.object) ?? .null,
       "nativeAudioPreview": previewPart.flatMap(Self.audioBadge).map(V.object) ?? .null,
@@ -295,6 +328,9 @@ extension NativeStudioRuntime {
       ?? run?["vendor"]?.string.flatMap { $0.isEmpty ? nil : $0 }
       ?? CloudModelIdentity.vendor(CloudModelIdentity.bareModel(author)) ?? ""
     var footer = NativeMessagePresentation.footer(usage)
+    if let image = m["imageGen"]?.object {
+      footer = NativeImageGeneration.footer(image)
+    }
     if let speech = m["transcript"]?.object, let ms = usage["ms"]?.double, ms.isFinite, ms > 0 {
       let parent = document?.messages.first { $0["id"] == m["parentId"] }
       let duration =
@@ -306,7 +342,9 @@ extension NativeStudioRuntime {
         if m["run"]?["contended"]?.bool == true { footer += " · shared GPU" }
       }
     }
-    return .object([
+    // Typed before it is returned: as a bare .object([...]) argument the literal
+    // is more than Swift 6.3.3's type checker solves in time.
+    let presentation: O = [
       "id": m["id"]!, "role": m["role"]!, "text": .string(ConversationDocument.text(m)),
       "reasoning": m["reasoning"] ?? .string(""),
       "model": m["model"] ?? .string(""), "streaming": m["streaming"] ?? .bool(false),
@@ -316,7 +354,22 @@ extension NativeStudioRuntime {
       "contended": run?["contended"] ?? m["contended"] ?? .bool(false),
       "automatic": m["auto"] ?? .bool(false),
       "attachments": .array(
-        parts.compactMap { $0.object.flatMap(Self.documentBadge).map(V.object) }),
+        parts.filter { $0["gen"] == nil }.compactMap {
+          $0.object.flatMap(Self.documentBadge).map(V.object)
+        }),
+      "pictures": .array(
+        parts.enumerated().compactMap { index, part in
+          guard
+            let id = NativeImageGeneration.pictureID(
+              part.object ?? [:], messageID: m["id"]!.string!, index: index)
+          else { return nil }
+          return .object([
+            "id": .string(id), "name": part["name"] ?? .string("Generated image"),
+            "preview": .bool(false),
+            "dataURL": part["dataUrl"] ?? .null,
+          ])
+        } + (imagePreviews[m["id"]!.string!].map { [.object($0)] } ?? [])),
+      "imageGeneration": .bool(m["imageGen"] != nil),
       "audioClips": .array(parts.compactMap { $0.object.flatMap(Self.audioBadge).map(V.object) }),
       "toolCalls": .array(
         (m["toolCalls"]?.array ?? []).filter(Self.visibleToolCall).map { call in
@@ -345,7 +398,7 @@ extension NativeStudioRuntime {
       "files": .array(
         parts.compactMap { part in
           guard let object = part.object, part["type"]?.string != "text",
-            Self.documentBadge(object) == nil, Self.audioBadge(object) == nil
+            Self.documentBadge(object) == nil, Self.audioBadge(object) == nil, part["gen"] == nil
           else { return nil }
           let id = part["attachmentId"]?.string ?? ""
           return .object([
@@ -360,7 +413,10 @@ extension NativeStudioRuntime {
         "spec": .string(Self.recordedSpec(run)),
         "tools": .array(run?["tools"]?.array?.filter { $0.string != nil } ?? []),
         "fastest": .bool(fastest),
-        "footer": .string(footer), "footerHint": .string(NativeMessagePresentation.hint(usage)),
+        "footer": .string(footer),
+        "footerHint": .string(
+          m["imageGen"]?.object.map { NativeImageGeneration.hint($0, usage: usage) }
+            ?? NativeMessagePresentation.hint(usage)),
         "thinkingLabel": .string(
           m["streaming"]?.bool == true && ConversationDocument.text(m).isEmpty
             ? "Thinking..."
@@ -375,10 +431,13 @@ extension NativeStudioRuntime {
               NativeMessagePresentation.speed(usage["reasoningTps"]?.double),
             ])),
         "cutNote": .string(Self.tokenLimitNote(usage)),
-        "sections": .array(NativeMessagePresentation.sections(run: run, usage: usage)),
+        "sections": .array(
+          m["imageGen"]?.object.map { NativeImageGeneration.sections($0, run: run) }
+            ?? NativeMessagePresentation.sections(run: run, usage: usage)),
         "promptText": run?["systemPrompt"] ?? .string(""),
       ]),
-    ])
+    ]
+    return .object(presentation)
   }
   func inputIssue() -> String {
     guard !selected.isEmpty else { return "Choose a running model" }
@@ -388,6 +447,23 @@ extension NativeStudioRuntime {
       return "A selected model is not reachable"
     }
     let parts = Array(staged.values)
+    if selected.contains(where: canImagine) {
+      if !selected.allSatisfy(canImagine) { return "Compare image models with other image models" }
+      for id in selected {
+        do {
+          try NativeImageGeneration.validateReferences(
+            parts, caps: capability(id)["image_generation"]?.object ?? [:])
+        } catch { return error.localizedDescription }
+      }
+      return ""
+    }
+    if selected.contains(where: { capability($0)["document_parser"]?.bool == true }),
+      !parts.contains(where: { $0["type"]?.string == "image" || NativeDocumentPlan.isPDF($0) }),
+      document?.activeMessages.contains(where: { !NativeDocumentPlan.rasterParts($0).isEmpty })
+        != true
+    {
+      return "Attach an image or PDF to read"
+    }
     let clips = parts.filter { $0["type"]?.string == "audio" }
     if clips.count > 1 { return "Attach one recording per turn" }
     if !clips.isEmpty && !selected.allSatisfy(canAudio) {

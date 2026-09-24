@@ -76,6 +76,7 @@ extension WorkspaceModel {
 
   public func handleDesktopRequest(_ request: DesktopRequest) async {
     guard !desktopTransition else { return }
+    desktopError = nil
     switch request.action {
     case .settings:
       navigation.showSettings()
@@ -120,16 +121,7 @@ extension WorkspaceModel {
       case .conversation(let id): try await chat.command("open", ["id": .string(id)])
       case .newChat: try await chat.command("newChat")
       case .chat(let port):
-        try await chat.command("refresh")
-        guard
-          let model = chat.state?.models.first(where: {
-            $0.port == port && $0.chat && $0.status == "ok"
-          })
-        else {
-          throw ManagerError.core("This model is not ready for chat. Check Settings > Instances.")
-        }
-        try await chat.command("newChat")
-        try await chat.command("models", ["ids": .array([.string(model.id)])])
+        try await chat.command("openEndpoint", ["port": .number(Double(port))])
       default: break
       }
     } catch { desktopError = error.localizedDescription }

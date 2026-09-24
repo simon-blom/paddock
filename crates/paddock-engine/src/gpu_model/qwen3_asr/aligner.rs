@@ -274,6 +274,9 @@ impl GpuQwen3Asr {
                     n_vocab: cfg.n_labels,
                     eps: cfg.eps,
                     rope,
+                    // plain rope over the full head: one temporal section
+                    n_rot: hd,
+                    sections: [(hd / 2) as u32, 0, 0, 0],
                 },
                 max_ctx,
                 kv_dtype: KvDtype::Fp16,
@@ -324,7 +327,7 @@ impl GpuQwen3Asr {
                 out.n_tokens
             )));
         }
-        self.prefill_body(ids, &[(splice_at, out)])?;
+        self.prefill_body(ids, &[(splice_at, out)], &[], None)?;
 
         // ── the timestamp head ──
         // Stage the <timestamp> rows compactly, one norm+quant, one head GEMM

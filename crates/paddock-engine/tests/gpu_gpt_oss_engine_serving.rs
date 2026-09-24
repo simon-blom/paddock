@@ -98,6 +98,7 @@ fn engine_scheduler_specs_gpt_oss() {
                     constraint: None,
                     logprobs: None,
                     submitted: None,
+                    canvas_read: None,
                 })
                 .expect("submit");
             rxs.push(rx);
@@ -119,6 +120,7 @@ fn engine_scheduler_specs_gpt_oss() {
                     constraint: None,
                     logprobs: None,
                     submitted: None,
+                    canvas_read: None,
                 })
                 .expect("submit temp");
             temp_rx = Some(rx);

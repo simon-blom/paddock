@@ -176,7 +176,8 @@ pub(super) const PREFILL_CHUNK_ROWS_MIN: usize = 512;
 
 /// One in-flight prompt queued for chunked prefill on `slot`. The unified tick
 /// (`forward_unified_sampled`) advances it a budgeted SPAN per tick from `done`
-/// (intra-prompt chunking); the legacy `advance_chunks` path prefills it whole.
+/// (intra-prompt chunking); the split tick's `advance_chunks` prefills a tail
+/// that fits its cap whole, and spans a longer one the same way.
 struct ChunkedPrefill {
     slot: usize,
     tokens: Vec<u32>,
@@ -2167,6 +2168,10 @@ struct BatchState {
     seq: Vec<Vec<u32>>,
     /// Stage F: the slot's live reply checkpoint (cut, pool index).
     reply_ckpt: Vec<Option<(usize, u32)>>,
+    /// Stage F: the reply checkpoint held when the reply started its first
+    /// tool call (`reply_pin`) - the live one moves on past the call, this
+    /// one stays so the next turn can resume at the call.
+    reply_pinned: Vec<Option<(usize, u32)>>,
     /// P5 budget pool: a shared free-list of physical blocks + a per-slot block
     /// table that grows from it on demand, so total full-attn KV follows a block
     /// budget (`PADDOCK_KV_POOL_BLOCKS`) rather than `max_batch × max_ctx`. `None`

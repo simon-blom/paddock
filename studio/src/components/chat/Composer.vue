@@ -21,6 +21,7 @@ import { activeMessages } from '@/lib/tree'
 import { ARTIFACTS_LABEL, toolSelection } from '@/composables/useChatStream'
 import { DICTATION_IDLE_MS, useMicTranscribe } from '@/composables/useMicTranscribe'
 import { audioPolicy, type MicMode } from '@/lib/audio-policy'
+import { imagePolicy } from '@/lib/image-policy'
 import { useAudioDevices } from '@/composables/useAudioDevices'
 import { useLiveTurn } from '@/composables/useLiveTurn'
 import { RECORD_MAX_S, useRecorder } from '@/composables/useRecorder'
@@ -76,6 +77,7 @@ import SpeechModels from './SpeechModels.vue'
 import { DICTATION_SETUP, microphoneMenu } from '@/lib/speech-models'
 import SystemPromptPanel from './SystemPromptPanel.vue'
 import SamplerMenu from './SamplerMenu.vue'
+import ImageOptions from './ImageOptions.vue'
 import AudioPlayer from './AudioPlayer.vue'
 
 // `docked` = we are in a chat, floating over the thread rather than sitting as
@@ -494,7 +496,11 @@ const MAX_LANES = 4
  *  no pointer events so it could not have been a tooltip either. The rows
  *  themselves already carry the mic mark that explains which is which. */
 function sharesAnInput(ids: string[]): boolean {
-  return ids.every((x) => models.canChat(x)) || ids.every((x) => models.canTranscribe(x))
+  return (
+    ids.every((x) => models.canChat(x)) ||
+    ids.every((x) => models.canTranscribe(x)) ||
+    ids.every((x) => models.canImagine(x))
+  )
 }
 function laneBlocked(id: string): boolean {
   if (sendTo.value.includes(id) || !sendTo.value.length) return false
@@ -558,6 +564,23 @@ const audioOk = computed(
 )
 /** One clip per turn - a transcription answers one piece of audio. */
 const audioFile = computed(() => files.value.find((f) => isAudioFile(f)))
+
+// ── Image mode ───────────────────────────────────────────────────────────
+// The composer is in IMAGE mode when every lane makes pictures and at least
+// one cannot chat. The text box STAYS - the prompt is text, and it is the
+// whole request - but it now describes a picture: attachments have nowhere
+// to go (editing with a reference image is the next lane), the sampler gives
+// way to the picture's own controls, and send needs a description. Same
+// `sendTo` rule as audio mode: compare only changes how many lanes take the
+// one prompt, and on the SAME seed - which is what makes two models'
+// pictures comparable.
+const imageMode = computed(() => {
+  const ids = sendTo.value
+  if (!ids.length) return false
+  return imagePolicy(
+    ids.map((id) => ({ chat: models.canChat(id), image: models.canImagine(id) })),
+  ).imageMode
+})
 const audioDragging = ref(false)
 function onAudioDrop(e: DragEvent): void {
   audioDragging.value = false
@@ -668,7 +691,9 @@ const visionOk = computed(() => {
 })
 // Only IMAGES are blocked without vision. PDFs work on any model - the server
 // extracts their text (sift) when it can't (or shouldn't) rasterize pages.
-const hasBlockedImage = computed(() => !visionOk.value && files.value.some((f) => isImageFile(f)))
+const hasBlockedImage = computed(
+  () => !visionOk.value && !imageEditOk.value && files.value.some((f) => isImageFile(f)),
+)
 // A staged photo nothing here can decode - HEIC, in practice, which is what an
 // iPhone writes. Said before send, not after: the server's refusal is clear but
 // finding out there costs an upload and a turn, and "convert it" has to be done
@@ -928,6 +953,9 @@ const docParser = computed(() => activeCaps.value?.docParser ?? false)
 // what is actually happening and follows the caps when they settle
 // (/studio kept the plain-chat composer while PaddleOCR loaded).
 const modelStarting = computed(() => models.capsPending.has(activeModelId.value))
+// the image endpoint edits (its vision tower is wired): pictures may be
+// attached as references, and the paperclip stays
+const imageEditOk = computed(() => activeCaps.value?.imageGeneration?.edit ?? false)
 const activeModelName = computed(() => {
   const id = activeModelId.value
   return models.models.find((m) => m.id === id)?.display ?? id
@@ -1128,6 +1156,20 @@ async function addFiles(list: File[]): Promise<void> {
     if (!isAttachableFile(f) || isTooLarge(f)) {
       tooLarge++
       continue
+    }
+    // An image model takes pictures to edit when its tower is wired, and
+    // nothing else. Refusing by name beats staging a file that would never
+    // reach it.
+    if (imageMode.value) {
+      if (!imageEditOk.value) {
+        refused =
+          'This model makes pictures from a description - editing with a reference picture needs its vision tower, which is not running.'
+        continue
+      }
+      if (!isImageFile(f)) {
+        refused = 'An image model takes pictures to edit - not other files.'
+        continue
+      }
     }
     if (isAudioFile(f)) {
       // Audio needs a model that can hear it. Refusing by name beats staging
@@ -1742,6 +1784,8 @@ const canSend = computed(() => {
   if (!hasTurnModel.value) return false
   // In audio mode the clip is the message - there is nothing else to send.
   if (audioMode.value) return !!audioFile.value
+  // In image mode the description is the whole request.
+  if (imageMode.value) return !empty.value
   // A document parser needs a page to read; with one staged (or sticky in
   // the conversation) the mode-driven send needs no text at all.
   if (docParser.value) return hasImage.value || hasStickyDoc.value
@@ -2119,7 +2163,18 @@ onBeforeUnmount(() => {
               </template>
             </MenuContent>
           </Menu>
-          <Tooltip :label="audioMode ? 'Choose a sound file' : 'Attach files'">
+          <!-- no paperclip in image mode: a description is the whole request
+               until editing with a reference image lands -->
+          <Tooltip
+            v-if="!imageMode || imageEditOk"
+            :label="
+              imageMode
+                ? 'Attach a picture to edit'
+                : audioMode
+                  ? 'Choose a sound file'
+                  : 'Attach files'
+            "
+          >
             <button class="composer__tool" type="button" @click="pick">
               <Icon name="paperclip" :size="18" />
             </button>
@@ -2359,7 +2414,7 @@ onBeforeUnmount(() => {
                available) and forensics (only where the endpoint serves
                it on a vision model). Per-request overrides of the endpoint
                defaults; `@select.prevent` keeps the menu open while toggling. -->
-          <Menu v-if="showEnrichment">
+          <Menu v-if="showEnrichment && !imageMode">
             <MenuTrigger>
               <Tooltip label="Context enrichment - what the model reads from your attachments">
                 <button
@@ -2386,8 +2441,11 @@ onBeforeUnmount(() => {
               </MenuItem>
             </MenuContent>
           </Menu>
-          <!-- Web search: per-chat, off by default; unconfigured hands off to Settings -->
-          <Tooltip v-if="!audioMode && !docParser" :label="webLabel">
+          <!-- Web search: per-chat, off by default; unconfigured hands off to Settings.
+               Not on an image lane: nothing but the description reaches that
+               endpoint, so search, tools and a system prompt would be switches
+               wired to nothing. -->
+          <Tooltip v-if="!audioMode && !docParser && !imageMode" :label="webLabel">
             <button
               class="composer__tool"
               :class="{ 'composer__tool--active': webOn }"
@@ -2399,7 +2457,7 @@ onBeforeUnmount(() => {
               <Icon name="globe" :size="17" />
             </button>
           </Tooltip>
-          <Popover v-if="!audioMode && !docParser" v-model:open="pickerOpen" side="top" align="start">
+          <Popover v-if="!audioMode && !docParser && !imageMode" v-model:open="pickerOpen" side="top" align="start">
             <template #trigger>
               <Tooltip label="Tools for this chat">
                 <button
@@ -2481,7 +2539,7 @@ onBeforeUnmount(() => {
             </div>
           </Popover>
           <Tooltip
-            v-if="!audioMode && !docParser"
+            v-if="!audioMode && !docParser && !imageMode"
             label="System prompt - instructions for this chat"
           >
             <button
@@ -2494,7 +2552,7 @@ onBeforeUnmount(() => {
               <Icon name="sliders" :size="17" />
             </button>
           </Tooltip>
-          <SamplerMenu v-if="!audioMode && !docParser">
+          <SamplerMenu v-if="!audioMode && !docParser && !imageMode">
             <MenuTrigger>
               <Tooltip label="Sampling">
                 <button
@@ -2508,6 +2566,17 @@ onBeforeUnmount(() => {
               </Tooltip>
             </MenuTrigger>
           </SamplerMenu>
+          <!-- the picture's own controls take the sampler's place: size,
+               quality, steps, seed, count, format, previews -->
+          <ImageOptions v-if="imageMode" :lanes="sendTo">
+            <MenuTrigger>
+              <Tooltip label="Picture settings">
+                <button class="composer__tool" type="button" aria-label="Picture settings">
+                  <Icon name="image" :size="17" />
+                </button>
+              </Tooltip>
+            </MenuTrigger>
+          </ImageOptions>
           <!-- Compare: send to several running models, answers side by side.
                Needs a second running model to mean anything. -->
           <Menu v-if="runningTurns.length > 1">
@@ -2569,7 +2638,10 @@ onBeforeUnmount(() => {
               </div>
             </MenuContent>
           </Menu>
-          <ContextMeter v-if="models.maxCtx && !audioMode" :used="contextUsed" :max="models.maxCtx" />
+          <!-- no meter on an image lane: every send is a fresh render of the
+               latest description, nothing from earlier turns reaches the
+               model, and the API's output tokens are latent patches -->
+          <ContextMeter v-if="models.maxCtx && !audioMode && !imageMode" :used="contextUsed" :max="models.maxCtx" />
           <Tooltip
             v-if="convCost > 0"
             label="What this conversation has cost so far - the provider's own per-reply prices, summed"

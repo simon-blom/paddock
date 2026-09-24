@@ -306,6 +306,19 @@ impl Generator for Gemma4 {
     fn supports_chunked_prefill(&self) -> bool {
         true
     }
+    // the scheduler's tick pacer reads the FIFO queue from each offset
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.pending
+            .iter()
+            .map(|p| (p.slot, p.offset, p.tokens.len() - p.offset))
+            .collect()
+    }
+    // the text mixed grant with riders aboard (image and admission caps
+    // are riderless or image-head ticks)
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        crate::schedule::row_cap(decode_rows, self.scratch.rows.min(CHUNK))
+            .saturating_sub(decode_rows)
+    }
     fn prefill_begin(
         &mut self,
         slot: usize,

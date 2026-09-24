@@ -111,7 +111,7 @@ class ReleaseTests(unittest.TestCase):
         with patch.object(release, "run") as command:
             release.sign(self.root, "Developer ID Application: Example (ABCDEFGHIJ)")
         signing = [call.args for call in command.call_args_list if "--sign" in call.args]
-        self.assertEqual(len(signing), 5)
+        self.assertEqual(len(signing), 10)
         self.assertEqual(signing[-1][-1], self.root / "Paddock.app")
         for args in signing:
             self.assertNotIn("--deep", args)
@@ -121,6 +121,12 @@ class ReleaseTests(unittest.TestCase):
     def test_minimal_microphone_entitlement(self):
         value = plistlib.loads(Path(__file__).with_name("App.entitlements").read_bytes())
         self.assertEqual(value, {"com.apple.security.device.audio-input": True})
+
+    def test_app_icon_is_the_packaged_icns(self):
+        info = plistlib.loads(Path(__file__).with_name("Info.plist").read_bytes())
+        icon = Path(__file__).with_name(info["CFBundleIconFile"] + ".icns")
+        self.assertTrue(icon.is_file())
+        self.assertEqual(icon.read_bytes()[:4], b"icns")
 
     def candidate(self, dirty=False):
         stage = self.root / "stage"
@@ -177,12 +183,22 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn("launchctl", call.args)
 
     def test_swift_only_builds_release_product(self):
-        args = release.swift_args(self.root)
+        args = release.swift_args(self.root, "27.0")
         self.assertEqual(args[args.index("--product") + 1], "PaddockMac")
         self.assertIn("release", args)
         self.assertIn("--force-resolved-versions", args)
         self.assertNotIn("--skip-update", args)
         self.assertNotIn(str(self.root) + "=/src/paddock", args)
+
+    def test_swift_records_sdk_separately_from_deployment_floor(self):
+        args = release.swift_args(self.root, "27.0")
+        start = args.index("-platform_version")
+        self.assertEqual(args[start:start + 7],
+                         ["-platform_version", "-Xlinker", "macos", "-Xlinker",
+                          release.MIN_OS, "-Xlinker", "27.0"])
+        for invalid in ("15.0", "", "27.0 extra"):
+            with self.assertRaises(release.ReleaseError):
+                release.swift_args(self.root, invalid)
 
     def test_binary_deployment_floor_matches_package(self):
         release.verify_load_commands("Load command 1\n cmd LC_BUILD_VERSION\n minos 26.0\n")

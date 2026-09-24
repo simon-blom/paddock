@@ -36,7 +36,12 @@ extension NativeCoreCheck {
     do {
       _ = try await transport.responses(endpoint: .runner(3), body: body) { _ in }
       throw ConversationFailure.invalid("Redirect was followed")
-    } catch ConversationFailure.http(302) {}
+    } catch ConversationFailure.invalid(let message) {
+      // Responses retains structured provider errors for the native recovery
+      // UI. A redirect must still surface as 302, never follow its Location.
+      let error = try JSONDecoder().decode(ConversationValue.self, from: Data(message.utf8))
+      try require(error["code"]?.integer == 302, "redirect status retained without following")
+    }
     // A task cancelled by its consumer closes its underlying URLSession task.
     let waiting = Task {
       try await transport.responses(endpoint: .runner(4), body: body) { _ in

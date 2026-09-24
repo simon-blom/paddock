@@ -9,23 +9,28 @@ public struct NativeMarkdown: View, Equatable {
   public let text: String
   public let streaming: Bool
   public let textSize: CGFloat
+  public let unsureWords: [String]
   @State private var source = StreamingMarkdownSource()
   @State private var finished = false
   @State private var renderedHeight: CGFloat?
 
-  public init(_ text: String, streaming: Bool = false, textSize: CGFloat = 15) {
+  public init(
+    _ text: String, streaming: Bool = false, textSize: CGFloat = 15, unsureWords: [String] = []
+  ) {
     self.text = text
     self.streaming = streaming
     self.textSize = textSize
+    self.unsureWords = unsureWords
   }
   public nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.text == rhs.text && lhs.streaming == rhs.streaming && lhs.textSize == rhs.textSize
+      && lhs.unsureWords == rhs.unsureWords
   }
   public var body: some View {
     StreamingMarkdownReader(source) { result in
       // A single AppKit text surface, rather than independently selectable
       // SwiftUI blocks. Embedded code, math and diagrams keep their renderers.
-      SelectableMarkdownSurface {
+      SelectableMarkdownSurface(unsureWords: streaming ? [] : unsureWords) {
         MarkdownText(result)
           .markdownCodeBlockStyle(NativeCodeBlockStyle(streaming: streaming))
           .textSelection(.enabled)

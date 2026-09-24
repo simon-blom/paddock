@@ -26,25 +26,25 @@ const PER_MESSAGE_OVERHEAD = 4 // role + delimiter tokens per message
 const IMAGE_TOKENS = 512 // rough per-image vision cost
 const SAFETY_MARGIN = 1024 // slack so an under-estimate never overflows the server
 
-/** Headroom kept for the reply when the user has not capped it ("Model
- *  maximum"). The cap and this reserve used to be one number, so raising the
- *  ceiling shrank the usable prompt one-for-one and lowering it truncated long
- *  answers - one knob doing two jobs. They are separate now:
- *  an explicit cap is a promise we make room for, while "model maximum" only
- *  needs enough slack that compaction is not planning against a whole window
- *  the reply will almost never use. */
+/** Prompt-planning headroom, separate from the generation ceiling. */
 export const REPLY_RESERVE = 4096
 
-/** What to set aside for the reply when planning the prompt. An explicit cap
- *  reserves exactly itself; "model maximum" reserves the default headroom. */
-export function replyReserve(cap: number | null): number {
-  return cap != null && cap > 0 ? cap : REPLY_RESERVE
+/** Bounded headroom works even when the saved cap exceeds this model's window.
+ *  It never limits generation: the remaining capacity is resolved at send. */
+export function replyReserve(cap: number | null, context = 0, outputCeiling?: number): number {
+  // A reply cap is not a reservation for that many tokens. Keep history space
+  // on small models and don't disable compaction with an oversized preference.
+  const headroom = context > 0 ? Math.max(1, Math.floor(context / 4)) : REPLY_RESERVE
+  return Math.min(cap != null && cap > 0 ? cap : REPLY_RESERVE, REPLY_RESERVE, headroom,
+    outputCeiling != null && outputCeiling > 0 ? outputCeiling : Infinity)
 }
 
 /** Local Paddock clamps against exact prompt/vision token counts at admission.
- * Send an explicit window-sized ceiling instead of either electing the API's
- * 1024 default or wasting an additional estimated safety margin. Cloud providers
- * may reject input+output overflow and still need windowRemaining below. */
+ * Send an explicit window-sized ceiling rather than an estimated safety margin
+ * (the runner's own default for an omitted cap is the window too since
+ * 2026-09-22; it was a flat 1024 before, which is why this was explicit). Cloud
+ * providers may reject input+output overflow and still need windowRemaining
+ * below. */
 export function localOutputMaximum(maxCtx: number): number {
   return maxCtx > 0 ? maxCtx : REPLY_RESERVE
 }

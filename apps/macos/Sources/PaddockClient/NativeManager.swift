@@ -5,6 +5,7 @@ public protocol ManagerLoading: Sendable {
   func prepareEndpoint(model: String, artifact: String) async throws -> ConfiguredEndpoint
   func snapshot() async throws -> ManagerSnapshot
   func logs(_ command: LogCommand) async throws -> LogReply
+  func maintenance(_ command: MaintenanceCommand) async throws -> MaintenanceReply
   func submit(_ command: ModelCommand) async throws -> ManagementJob
   func chat(_ command: ChatCommand) async throws -> ChatReply
   func studio(assets: URL) async throws -> StudioHost
@@ -16,6 +17,9 @@ public protocol ManagerLoading: Sendable {
 }
 
 extension ManagerLoading {
+  public func maintenance(_ command: MaintenanceCommand) async throws -> MaintenanceReply {
+    throw ManagerError.core("Management insights are unavailable from this source.")
+  }
   public func prepareEndpoint(model: String, artifact: String) async throws -> ConfiguredEndpoint {
     throw ManagerError.core("Model settings are unavailable from this management source.")
   }
@@ -72,6 +76,14 @@ public enum ManagerError: Error, LocalizedError, Sendable, Equatable {
 public final class NativeManager: ManagerLoading, Sendable {
   private let queue = DispatchQueue(label: "io.truespar.paddock.management", qos: .userInitiated)
   private let storage: CoreStorage
+
+  public func maintenance(_ command: MaintenanceCommand) async throws -> MaintenanceReply {
+    try await withCheckedThrowingContinuation { continuation in
+      queue.async { [storage] in
+        continuation.resume(with: Result { try storage.maintenance(command) })
+      }
+    }
+  }
 
   public func prepareEndpoint(model: String, artifact: String) async throws -> ConfiguredEndpoint {
     try Task.checkCancellation()
@@ -257,6 +269,20 @@ private final class CoreStorage: @unchecked Sendable {
     return try JSONDecoder().decode(LogReply.self, from: Data(bytes: json, count: strlen(json)))
   }
 
+  func maintenance(_ command: MaintenanceCommand) throws -> MaintenanceReply {
+    let library = try open()
+    let data = try JSONEncoder().encode(command)
+    var error: UnsafeMutablePointer<CChar>?
+    let json = data.withUnsafeBytes { bytes in
+      library.maintenance(
+        core, bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bytes.count, &error)
+    }
+    guard let json else { throw library.consumeError(error) }
+    defer { library.free(json) }
+    return try JSONDecoder().decode(
+      MaintenanceReply.self, from: Data(bytes: json, count: strlen(json)))
+  }
+
   func close() {
     if let core { library?.close(core) }
     core = nil
@@ -371,6 +397,7 @@ struct CoreLibrary {
   let connections: Submit
   let integrations: Submit
   let logs: Submit
+  let maintenance: Submit
 
   init(url: URL?) throws {
     guard let url, url.isFileURL, FileManager.default.fileExists(atPath: url.path) else {
@@ -390,7 +417,7 @@ struct CoreLibrary {
       return unsafeBitCast(pointer, to: type)
     }
     let version = try symbol("paddock_desktop_abi_version", as: Version.self)
-    guard version() == 11 else { throw ManagerError.incompatibleABI }
+    guard version() == 12 else { throw ManagerError.incompatibleABI }
     open = try symbol("paddock_desktop_open", as: Open.self)
     snapshot = try symbol("paddock_desktop_snapshot", as: Snapshot.self)
     submit = try symbol("paddock_desktop_submit", as: Submit.self)
@@ -403,6 +430,7 @@ struct CoreLibrary {
     connections = try symbol("paddock_desktop_connections", as: Submit.self)
     integrations = try symbol("paddock_desktop_integrations", as: Submit.self)
     logs = try symbol("paddock_desktop_logs", as: Submit.self)
+    maintenance = try symbol("paddock_desktop_maintenance", as: Submit.self)
   }
 
   func consumeError(_ pointer: UnsafeMutablePointer<CChar>?) -> ManagerError {

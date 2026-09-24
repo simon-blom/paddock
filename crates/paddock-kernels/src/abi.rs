@@ -545,6 +545,82 @@ pub type AttnPrefillPagedFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
+/// `AttnDecodeBatchFn` + `win_pos` right after `positions` (slots 651/652):
+/// the row's TRUE position, from which a sliding layer's window floor is
+/// derived, where `positions` is the attention BOUND. Null = same as
+/// positions (every causal row); a bidirectional span - the diffusion
+/// canvas, an image span, the DFlash block - passes its real positions so
+/// its first rows keep their oldest keys.
+pub type AttnPrefillWpFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    kc: *const core::ffi::c_void,
+    vc: *const core::ffi::c_void,
+    sinks: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    win_pos: *const core::ffi::c_void,
+    slots: *const core::ffi::c_void,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    max_ctx: u32,
+    kv_dim: u32,
+    swa_window: u32,
+    batch: u32,
+    scale: f32,
+    kv_dtype: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `AttnPrefillPagedFn` + `win_pos` after `positions` (slot 653) - see
+/// `AttnPrefillWpFn`.
+pub type AttnPrefillPagedWpFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    pool_k: *const core::ffi::c_void,
+    pool_v: *const core::ffi::c_void,
+    sinks: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    win_pos: *const core::ffi::c_void,
+    slots: *const core::ffi::c_void,
+    block_tables: *const core::ffi::c_void,
+    blocks_per_slot: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    swa_window: u32,
+    batch: u32,
+    scale: f32,
+    kv_dtype: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `attn_prefill_f16_paged2` + `win_pos` after `positions` (slot 654):
+/// the a16 election with the floors from the true positions.
+pub type AttnPrefillPaged2WpFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    pool_k: *const core::ffi::c_void,
+    pool_v: *const core::ffi::c_void,
+    sinks: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    win_pos: *const core::ffi::c_void,
+    slots: *const core::ffi::c_void,
+    block_tables: *const core::ffi::c_void,
+    blocks_per_slot: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    swa_window: u32,
+    batch: u32,
+    scale: f32,
+    kv_dtype: u32,
+    a16: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
 /// Batched fused MoE gate+up+swiglu: grid (ff, n_active, batch); block (o,slot,b)
 /// drives expert idx[b][slot] for token b's activation x[b] -> out [batch,n_active,ff].
 #[allow(clippy::too_many_arguments)]
@@ -6917,7 +6993,528 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
+    /// Slot 632: `pd_dit_rope` - 3-axis rotary embedding in the complex
+    /// (adjacent-pair) form over `[rows][n_heads][hd]` f32, in place, with
+    /// per-token int32 (frame, h, w) positions and the axis split
+    /// (d0, d1, d2), theta as given. The image DiT's rope; text tokens carry
+    /// the same position on all three axes.
+    /// (x, pos, rows, n_heads, hd, d0, d1, d2, theta, stream)
+    pub dit_rope: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 633: `pd_dit_philox_randn` - the initial latent noise in
+    /// torch's CUDA `randn` layout (Philox4x32-10, one element per counter,
+    /// first Box-Muller output), written packed `[token][channel]` from the
+    /// `[channel][y][x]` draw. Seed parity with diffusers on a CUDA
+    /// generator and with stable-diffusion.cpp `--rng cuda`.
+    /// (out, seed_lo, seed_hi, offset, n_tokens, channels, stream)
+    pub dit_philox_randn: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 634: `pd_dit_gated_add` - `x[r][c] += g[c] * y[r][c]`, the
+    /// DiT block's tanh-gated residual with a per-channel gate. f32.
+    /// (x, y, g, rows, n, stream)
+    pub dit_gated_add: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 635: `pd_dit_silu` - bare SiLU in place, f32. (x, n, stream)
+    pub dit_silu:
+        Option<unsafe extern "C" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void) -> i32>,
+    /// Slot 636: `pd_dit_softmax_rows` - row softmax in place over an f32
+    /// `[rows][n]` plane, `scale` applied before the max, fixed-order sums.
+    /// (x, rows, n, scale, stream)
+    pub dit_softmax_rows: Option<
+        unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, f32, *mut core::ffi::c_void) -> i32,
+    >,
+    /// Slot 637: `pd_dit_transpose_f16` - `[rows][cols]` -> `[cols][rows]`
+    /// f16. (src, dst, rows, cols, stream)
+    pub dit_transpose_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 638: `pd_dit_split3_f16` - an f32 `[rows][3C]` qkv landing into
+    /// three f16 `[rows][C]` planes, q scaled by `qscale` before its round.
+    /// (src, q, k, v, rows, C, qscale, stream)
+    pub dit_split3_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 639: `pd_dit_affine_cols` - `x[r][c] = x[r][c] * a[c] + b[c]`,
+    /// f32 (the latent de-normalisation). (x, a, b, rows, n, stream)
+    pub dit_affine_cols: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 640: `pd_dit_to_u8` - decoded f32 samples (clamped to [-1, 1])
+    /// to 8-bit: round((x / 2 + 0.5) * 255), interleaved channels kept.
+    /// (x, out, n, stream)
+    pub dit_to_u8: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 641: `pd_vae_norm_f16` - per-pixel channel RMSNorm of an NHWC
+    /// f32 `[rows][C]` plane (`normalize(x, dim=C) * sqrt(C) * gamma`),
+    /// SiLU when `act` is 1, written f16 for the next conv's im2row.
+    /// (x, gamma, out, rows, C, act, stream)
+    pub vae_norm_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 642: `pd_vae_im2row3` - 3x3 / stride 1 / pad 1 im2row of one
+    /// STRIPE of output rows (`y0`, `ny`) from an f16 NHWC `[H][W][C]`
+    /// source into `[ny * W_out][9C]` f16 tap-outer staging; `up2` reads the
+    /// source through a nearest-exact 2x upsample (output grid 2H x 2W).
+    /// (src, out, H, W, C, y0, ny, up2, stream)
+    pub vae_im2row3: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 643: `pd_vae_dupup_add` - the Wan residual VAE's DupUp
+    /// shortcut (channel repeat + 2x spatial duplication, last temporal
+    /// copy) added into an f32 NHWC `[2H][2W][C_out]` plane from
+    /// `[H][W][C_in]`. Refuses a (C_in, C_out, ft, repeats) that does not
+    /// tile. (out, in, H, W, C_in, C_out, ft, repeats, stream)
+    pub vae_dupup_add: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 644: `pd_vae_im2row3_down` - the VAE encoder's downsampler:
+    /// 3x3 / stride 2 im2row with diffusers' ZeroPad2d((0, 1, 0, 1)) (one
+    /// zero column right, one zero row below, none top/left) of output rows
+    /// `y0 .. y0 + ny` of the H/2 x W/2 grid from an f16 NHWC `[H][W][C]`
+    /// source into `[ny * W/2][9C]` tap-outer staging. Even H and W only.
+    /// (src, out, H, W, C, y0, ny, stream)
+    pub vae_im2row3_down: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 645: `pd_vae_avgdown_add` - diffusers' `AvgDown3D` shortcut of
+    /// the encoder's residual down blocks (front-padded zero frame, (c, t,
+    /// hy, wx) channel order, group mean) added into an f32 NHWC
+    /// `[H/fs][W/fs][C_out]` plane from `[H][W][C_in]`. Refuses a shape
+    /// that does not tile. (out, in, H, W, C_in, C_out, ft, fs, stream)
+    pub vae_avgdown_add: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 646: `pd_imrope` - `pd_mrope` with INTERLEAVED sections (ggml
+    /// ROPE_TYPE_IMROPE, HF `mrope_interleaved`): rotation pair p reads h
+    /// when p % 3 == 1, w when p % 3 == 2, t otherwise, each within its
+    /// section's 3x reach. What Qwen3-VL's text stack applies to image
+    /// tokens; indistinguishable from `mrope` on a text-only prompt.
+    pub imrope: Option<MropeF32Fn>,
+    /// Slot 647: `pd_q8_embed_transpose_bf16` - the raw Q8_0 embedding
+    /// `[vocab][embd]` dequantized straight into a TRANSPOSED bf16 plane
+    /// `[embd][vocab]`: the NT weight the self-conditioning matmul
+    /// (`softmax(logits) @ E`) runs through `bf16_gemm`. embd % 32 == 0.
+    /// (q8, dst, vocab, embd, stream)
+    pub q8_embed_transpose_bf16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 648: `pd_canvas_sample` - the block-diffusion row sampler over
+    /// softcapped `[rows][vocab]` logits: per row a Gumbel-max categorical
+    /// draw at `inv_t[row]` (0 = the one-hot limit; NEGATIVE = the greedy
+    /// draw: sample = argmax, entropy and probs at |inv_t|), the raw argmax,
+    /// the entropy of the temperature-scaled distribution, and the
+    /// normalized probs written back IN PLACE (the next step's
+    /// self-conditioning input). Philox4x32-10 draws keyed (seed, offset,
+    /// row * vocab + i); rows * vocab must fit a u32.
+    /// (logits, inv_t, seed_lo, seed_hi, offset, out_sample, out_argmax,
+    ///  out_entropy, rows, vocab, stream)
+    pub canvas_sample: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 649: `pd_canvas_accept` - one canvas's entropy-bounded step:
+    /// sort the `w` entropies, accept the prefix where `cumsum - e <=
+    /// bound` (recomputed every step), write the sampled token at accepted
+    /// positions and a fresh uniform id elsewhere into `canvas`, compare the
+    /// argmax canvas with the `stab`-deep history then replace its oldest
+    /// entry, and report `status[4] = {converged, n_accepted, mean_entropy
+    /// bits, stable}` with converged = stable && mean < conf. w <= 1024.
+    /// (entropy, sampled, argmax, canvas, hist, status, w, vocab, stab,
+    ///  step, bound, conf, seed_lo, seed_hi, offset, stream)
+    pub canvas_accept: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 650: `pd_gather_cols` - `out[r][j] = src[r][ids[j]]` over `k`
+    /// column ids of an `[rows][n]` f32 plane (the structured read's label
+    /// probabilities; an id past `n` reads 0). (src, ids, out, rows, n, k,
+    /// stream)
+    pub gather_cols: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 651: `pd_attn_prefill_wp` - `attn_prefill` with the sliding
+    /// window's floor derived from `win_pos` (the row's TRUE position)
+    /// instead of `positions` (its attention bound). Null win_pos =
+    /// `attn_prefill` exactly. The four `_wp` entries landed together
+    /// (2026-09-23, the DiffusionGemma canvas): a pack with some of them is
+    /// a mismatched build.
+    pub attn_prefill_wp: Option<AttnPrefillWpFn>,
+    /// Slot 652: `pd_attn_prefill_f16_wp` - `attn_prefill_f16` + `win_pos`.
+    pub attn_prefill_f16_wp: Option<AttnPrefillWpFn>,
+    /// Slot 653: `pd_attn_prefill_f16_paged_wp` - `attn_prefill_f16_paged`
+    /// with `win_pos`; every arm of the election stages both arrays, and
+    /// the fa tile (arithmetic masks, no per-row floor) is skipped when a
+    /// window is in force and win_pos is set.
+    pub attn_prefill_f16_paged_wp: Option<AttnPrefillPagedWpFn>,
+    /// Slot 654: `pd_attn_prefill_f16_paged2_wp` - the a16 election with
+    /// `win_pos`.
+    pub attn_prefill_f16_paged2_wp: Option<AttnPrefillPaged2WpFn>,
+    /// Slot 655: capability marker - the flat 32-weight lanes of slot 600
+    /// also serve Q5_0 (GGUF raw id 6), the third flat type: what a Q4_K_M
+    /// recipe puts on rows the 256-block types cannot encode (the gemma-4
+    /// A4B's 704-wide expert down and 2112-wide shared down). Rides the
+    /// existing entry points, so slot 600 alone cannot vouch for it.
+    pub kquant_q50: Option<unsafe extern "C" fn() -> i32>,
+    /// Slot 656: `pd_kq_embed_transpose_bf16` - E^T as a bf16 `[embd][vocab]`
+    /// plane off a REPACKED k-quant embedding: (data, scales, dst, vocab,
+    /// embd, dtype, stream); embd % 256 == 0. The Q8_0 twin is slot 647.
+    pub kq_embed_transpose_bf16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 657: `pd_kquant_moe_gate_up_geglu` - `kquant_moe_gate_up` with
+    /// the GEGLU epilogue (`gelu_tanh(gate) * up`, pd_geglu's constants):
+    /// the gemma-4 A4B's routed experts on k-quant seats. Same parameters.
+    pub kquant_moe_gate_up_geglu: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 658: `pd_kquant_moe_gate_up_grp_geglu` - the grouped pair
+    /// (slot 586) with the GEGLU epilogue. Same parameters.
+    pub kquant_moe_gate_up_grp_geglu: Option<KquantMoeGateUpGrpFn>,
+    /// Slot 659: `pd_kquant_moe_gate_up_tile_geglu` - the register-tiled
+    /// pair (slot 592) with the GEGLU epilogue. Same parameters.
+    pub kquant_moe_gate_up_tile_geglu: Option<KquantMoeGateUpTileFn>,
+    /// Slot 660: `pd_kquant_moe_gate_up_mma_geglu` - the sorted tensor-core
+    /// pair (`kquant_moe_gate_up_mma`) with the GEGLU epilogue. Same
+    /// parameters.
+    pub kquant_moe_gate_up_mma_geglu: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 661: `pd_q4x_idx_q` - Flash-Next QSA indexer query: per-head
+    /// (1+w) RMSNorm off the fused q|k projection rows, bf16-rounded, into a
+    /// contiguous [rows, heads, hd] plane for the rotary (attn/qsa.cuh).
+    pub q4x_idx_q: Option<Q4xIdxQFn>,
+    /// Slot 662: `pd_q4x_idx_pool` - rows closing a 4-token block pool its raw
+    /// keys (this launch's rows, else the slot's ring), (1+w)-normalize and
+    /// stage them with the block's first position for the rotary.
+    pub q4x_idx_pool: Option<Q4xIdxPoolFn>,
+    /// Slot 663: `pd_q4x_idx_store` - rotated staged keys to the compressed
+    /// cache (bf16), every row's raw key to the slot's ring.
+    pub q4x_idx_store: Option<Q4xIdxStoreFn>,
+    /// Slot 664: `pd_q4x_qsa_logits` - every visible block's score for each
+    /// row of a batch (relu-sum over the indexer heads), into a [rows, cap]
+    /// scratch; rows that select everything are skipped.
+    pub q4x_qsa_logits: Option<Q4xQsaLogitsFn>,
+    /// Slot 665: `pd_q4x_qsa_topk` - per row, the top-k block ids (radix
+    /// select, lowest ids win ties) in ascending order, and the count.
+    pub q4x_qsa_topk: Option<Q4xQsaTopkFn>,
+    /// Slot 666: `pd_q4x_qsa_attn` - each row's attention over its selected
+    /// blocks + tail, split-K partials (acc, m, l) per kv group's heads.
+    pub q4x_qsa_attn: Option<Q4xQsaAttnFn>,
+    /// Slot 667: `pd_q4x_qsa_combine` - merge the split partials into the
+    /// [rows, heads, hd] attention output.
+    pub q4x_qsa_combine: Option<Q4xQsaCombineFn>,
+    /// Slot 668: capability marker - the expert-major tensor-core down (slot
+    /// 603) takes a flat down at any 32-multiple width, staging a partial
+    /// last 128-weight slice (the gemma-4 A4B's 704-wide expert down: 22
+    /// blocks, 5.5 stages). Rides the existing entry point, which on an
+    /// older pack refuses that width with cudaErrorInvalidValue.
+    pub kquant_moe_down_mma_e_tail: Option<unsafe extern "C" fn() -> i32>,
 }
+
+/// QSA attention over the selection (see `KernelTableV1::q4x_qsa_attn`).
+pub type Q4xQsaAttnFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA split combine (see `KernelTableV1::q4x_qsa_combine`).
+pub type Q4xQsaCombineFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA block scores (see `KernelTableV1::q4x_qsa_logits`).
+pub type Q4xQsaLogitsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA radix top-k (see `KernelTableV1::q4x_qsa_topk`).
+pub type Q4xQsaTopkFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA indexer query norm (see `KernelTableV1::q4x_idx_q`).
+pub type Q4xIdxQFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA compressed-key pool (see `KernelTableV1::q4x_idx_pool`).
+pub type Q4xIdxPoolFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// QSA compressed-key store + raw-key ring (see `KernelTableV1::q4x_idx_store`).
+pub type Q4xIdxStoreFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
 
 /// Pre-normed single-sequence GDN walk (see `KernelTableV1::gated_delta_recurrent_pn`).
 pub type GatedDeltaRecurrentPnFn = unsafe extern "C" fn(
@@ -7534,7 +8131,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 617;
+pub const KERNEL_TABLE_SLOTS: usize = 654;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

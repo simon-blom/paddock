@@ -476,6 +476,7 @@ static inline uint32_t pd_iqd_grid(uint32_t rows_needed, uint32_t warps_per_bloc
         case PD_KQ_IQ4NL_ID: X(PD_KQ_IQ4NL_ID); break;    \
         case PD_KQ_Q2K_ID: X(PD_KQ_Q2K_ID); break;        \
         case PD_KQ_Q3K_ID: X(PD_KQ_Q3K_ID); break;        \
+        case PD_KQ_Q50_ID: X(PD_KQ_Q50_ID); break;        \
         case PD_KQ_Q51_ID: X(PD_KQ_Q51_ID); break;        \
         case PD_KQ_Q80_ID: X(PD_KQ_Q80_ID); break;        \
         case PD_KQ_PQ2_ID: X(PD_KQ_PQ2_ID); break;        \

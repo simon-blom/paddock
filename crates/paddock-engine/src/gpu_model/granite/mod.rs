@@ -48,6 +48,15 @@
 //! Shapes are read from the file, never hard-coded: the same code serves 3b
 //! (32 layers), 8b (40) and 30b (64 layers, ff 32768) - the 4.1 sizes differ
 //! only in depth and FFN width.
+//!
+//! PLAIN `llama` FILES ride this family too (2026-09-22, MiniCPM5-2B first):
+//! granite IS the llama stack plus the four scalars, which is how llama.cpp
+//! defines it as well, so a `general.architecture = llama` file loads here
+//! with every multiplier at identity (attention at 1/sqrt(head_dim)) and the
+//! same NORM rope. The loader is the gate on what "llama" means: no rope
+//! scaling (Llama 3.1's `rope_freqs` included), no attention biases, full
+//! rotary, a pre-tokenizer we carry - anything else refuses by name instead
+//! of serving a different model fluently.
 
 use std::sync::Arc;
 

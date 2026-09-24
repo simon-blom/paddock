@@ -18,6 +18,8 @@ mod geometry;
 mod offload;
 mod ternary;
 #[cfg(test)]
+mod ternary_add_tests;
+#[cfg(test)]
 mod ternary_tests;
 use geometry::Geometry;
 mod load;

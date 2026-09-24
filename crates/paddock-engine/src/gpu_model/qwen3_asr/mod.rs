@@ -28,6 +28,7 @@ pub mod aligner;
 pub mod audio;
 mod batch;
 mod forward;
+pub(crate) use forward::VisionSplice;
 mod load;
 
 pub use aligner::AlignerMeta;
@@ -83,6 +84,12 @@ pub(crate) struct Hparams {
     pub eps: f32,
     /// YaRN/rope kernel params (ext_factor 0 => plain NEOX rope).
     pub rope: (f32, f32, f32, f32, f32, f32),
+    /// Rotary width, and the file's `rope.dimension_sections` [t, h, w, e]
+    /// (t alone when unstamped): what image rows rotate by when a vision
+    /// tower puts them in the prompt (qwen-image's text encoder); text and
+    /// audio rows feed every axis the same position, which is plain rope.
+    pub n_rot: usize,
+    pub sections: [u32; 4],
 }
 
 pub struct GpuQwen3Asr {

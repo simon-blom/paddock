@@ -3187,6 +3187,135 @@ struct KernelTableV1 {
                                  const void*, const void*, const void*, const void*,
                                  const void*, const void*, void*, void*, uint32_t,
                                  uint32_t, uint32_t, void*);
+    // 632-640: diffusion-transformer glue (dit.cuh). Pure appends.
+    // (x, pos, rows, n_heads, hd, d0, d1, d2, theta, stream)
+    int (*dit_rope)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                    uint32_t, float, void*);
+    // (out, seed_lo, seed_hi, offset, n_tokens, channels, stream)
+    int (*dit_philox_randn)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // (x, y, g, rows, n, stream)
+    int (*dit_gated_add)(void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // (x, n, stream)
+    int (*dit_silu)(void*, uint32_t, void*);
+    // (x, rows, n, scale, stream)
+    int (*dit_softmax_rows)(void*, uint32_t, uint32_t, float, void*);
+    // (src, dst, rows, cols, stream)
+    int (*dit_transpose_f16)(const void*, void*, uint32_t, uint32_t, void*);
+    // (src, q, k, v, rows, C, qscale, stream)
+    int (*dit_split3_f16)(const void*, void*, void*, void*, uint32_t, uint32_t, float, void*);
+    // (x, a, b, rows, n, stream)
+    int (*dit_affine_cols)(void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // (x, out, n, stream)
+    int (*dit_to_u8)(const void*, void*, uint32_t, void*);
+    // 641-643: image VAE conv glue (conv/vae.cuh). Pure appends.
+    // (x, gamma, out, rows, C, act, stream)
+    int (*vae_norm_f16)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // (src, out, H, W, C, y0, ny, up2, stream)
+    int (*vae_im2row3)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                       uint32_t, void*);
+    // (out, in, H, W, C_in, C_out, ft, repeats, stream)
+    int (*vae_dupup_add)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // 644-646: the image VAE encoder's two pieces (conv/vae.cuh) and the
+    // interleaved-section M-RoPE (deltanet/core.cuh). Pure appends.
+    // (src, out, H, W, C, y0, ny, stream)
+    int (*vae_im2row3_down)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, void*);
+    // (out, in, H, W, C_in, C_out, ft, fs, stream)
+    int (*vae_avgdown_add)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                           uint32_t, void*);
+    // pd_mrope's signature, interleaved sections
+    int (*imrope)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, float, float,
+                  float, float, float, float, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 647-650: block-diffusion canvas ops (diffusion/canvas.cuh). Pure appends.
+    // (q8, dst, vocab, embd, stream) - Q8_0 [vocab][embd] -> bf16 [embd][vocab]
+    int (*q8_embed_transpose_bf16)(const void*, void*, uint32_t, uint32_t, void*);
+    // (logits in/out, inv_t, seed_lo, seed_hi, offset, out_sample, out_argmax,
+    //  out_entropy, rows, vocab, stream)
+    int (*canvas_sample)(void*, const void*, uint32_t, uint32_t, uint32_t, void*, void*, void*,
+                         uint32_t, uint32_t, void*);
+    // (entropy, sampled, argmax, canvas, hist, status, w, vocab, stab, step,
+    //  bound, conf, seed_lo, seed_hi, offset, stream)
+    int (*canvas_accept)(const void*, const void*, const void*, void*, void*, void*, uint32_t,
+                         uint32_t, uint32_t, uint32_t, float, float, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // (src, ids, out, rows, n, k, stream)
+    int (*gather_cols)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 651-654: the prefill attention entries + `win_pos` right after
+    // `positions` (attn/prefill.cuh pd_pf_wp: the row's TRUE position, from
+    // which a sliding layer's window floor is derived; null = positions).
+    // Same parameter lists as attn_prefill / attn_prefill_f16 /
+    // attn_prefill_f16_paged / attn_prefill_f16_paged2 otherwise.
+    int (*attn_prefill_wp)(const void*, const void*, const void*, const void*, void*,
+                           const void*, const void*, const void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                           uint32_t, void*);
+    int (*attn_prefill_f16_wp)(const void*, const void*, const void*, const void*, void*,
+                               const void*, const void*, const void*, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                               uint32_t, void*);
+    int (*attn_prefill_f16_paged_wp)(const void*, const void*, const void*, const void*,
+                                     void*, const void*, const void*, const void*,
+                                     const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                     uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    int (*attn_prefill_f16_paged2_wp)(const void*, const void*, const void*, const void*,
+                                      void*, const void*, const void*, const void*,
+                                      const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, float, uint32_t,
+                                      uint32_t, void*);
+    // 655: kquant_q50 - capability marker: the flat 32-weight lanes (slot
+    // 600's set) also serve Q5_0 (GGUF raw id 6) - quant/iquant.cuh.
+    int (*kquant_q50)(void);
+    // 656: kq_embed_transpose_bf16 - E^T bf16 [embd][vocab] off a REPACKED
+    // k-quant embedding plane: (data, scales, dst, vocab, embd, dtype, stream);
+    // embd % 256 == 0 (diffusion/canvas.cuh).
+    int (*kq_embed_transpose_bf16)(const void*, const void*, void*, uint32_t, uint32_t,
+                                   uint32_t, void*);
+    // 657-660: the GEGLU (gelu_tanh(gate) * up) instantiations of the k-quant
+    // MoE gate+up kernels - the gemma-4 A4B's routed experts on k-quant seats.
+    // Same parameter lists as kquant_moe_gate_up / _grp / _tile / _mma.
+    int (*kquant_moe_gate_up_geglu)(const void*, const void*, const void*, const void*,
+                                    const void*, const void*, const void*, const void*,
+                                    void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, void*);
+    int (*kquant_moe_gate_up_grp_geglu)(const void*, const void*, const void*, const void*,
+                                        const void*, const void*, const void*, const void*,
+                                        const void*, const void*, void*, uint32_t, uint32_t,
+                                        uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                        void*);
+    int (*kquant_moe_gate_up_tile_geglu)(const void*, const void*, const void*, const void*,
+                                         const void*, const void*, const void*, const void*,
+                                         const void*, const void*, void*, uint32_t, uint32_t,
+                                         uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*kquant_moe_gate_up_mma_geglu)(const void*, const void*, const void*,
+                                        const void*, const void*, const void*,
+                                        const void*, const void*, const void*,
+                                        void*, void*, uint32_t, uint32_t, uint32_t,
+                                        uint32_t, void*);
+    // 661-663: QSA indexer (attn/qsa.cuh). Pure append - no PD_ABI_VERSION bump.
+    int (*q4x_idx_q)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                     uint32_t, float, void*);
+    int (*q4x_idx_pool)(const void*, const void*, const void*, const void*, const void*,
+                        void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                        uint32_t, float, void*);
+    int (*q4x_idx_store)(const void*, const void*, const void*, const void*, void*, void*,
+                         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // 664-665: QSA selection (attn/qsa.cuh). Pure append - no PD_ABI_VERSION bump.
+    int (*q4x_qsa_logits)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*q4x_qsa_topk)(const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t,
+                        uint32_t, uint32_t, void*);
+    // 666-667: QSA attention (attn/qsa.cuh). Pure append - no PD_ABI_VERSION bump.
+    int (*q4x_qsa_attn)(const void*, const void*, const void*, const void*, const void*,
+                        const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t,
+                        uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    int (*q4x_qsa_combine)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                           uint32_t, uint32_t, void*);
+    // 668: kquant_moe_down_mma_e_tail - capability marker: the expert-major
+    // tensor-core down (slot 603) takes a flat down at any 32-multiple width
+    // (a partial last 128-weight stage), not only whole stages - moe/kquant.cuh.
+    int (*kquant_moe_down_mma_e_tail)(void);
 };
 
 } // extern "C"

@@ -30,6 +30,23 @@
 // file's token-batched pair is built on) moved to quant/kquant_w4a8.cuh - the
 // W4A8 b=1 GEMV there consumes them too, and 19 precedes this file.
 
+// The gate+up epilogue, chosen at compile time per instantiation: SwiGLU
+// (`silu(g) * u`, the qwen/laguna experts) or GEGLU (`gelu_tanh(g) * u`, the
+// gemma-4 A4B's routed experts - the same constants as pd_geglu_kernel, so the
+// routed branch and the dense shared branch apply one nonlinearity). Every
+// gate+up kernel below takes the GELU flag as a template parameter and the
+// `_geglu` exports (slots 657-660) are the GELU instantiations of the same
+// bodies - one dot walk, one fold order, one epilogue switch.
+template <bool GELU>
+__device__ __forceinline__ float pd_kq_glu_epi(float g, float u) {
+    if (GELU) {
+        const float gelu = 0.5f * g * (1.0f + tanhf(0.79788456080286535587989211986876f * g
+                                                    * (1.0f + 0.044715f * g * g)));
+        return gelu * u;
+    }
+    return (g / (1.0f + __expf(-g))) * u;
+}
+
 // Fused gate+up+SwiGLU over routed k-quant experts, token-batched: grid
 // (ff, n_active, batch), one block per (out row, slot, token) - the Q8
 // pair's geometry (512 x 8 x B blocks fills the die from B=1). Weight row
@@ -48,7 +65,7 @@
 // form launches P blocks per output row and does only the wave's work.
 // Same body, same per-pair math and fold order (a pair's output does not
 // depend on which block computed it).
-template <bool LIST>
+template <bool LIST, bool GELU>
 __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     // cascade (laguna chain): xq/idx are the quantize and
     // topk predecessors' outputs - armed at top, launched via pd_pdl_go
@@ -138,8 +155,8 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     if (tid == 0) {
         float g = 0.0f, u = 0.0f;
         for (uint32_t w = 0; w < nwarps; ++w) { g += wsum[0][w]; u += wsum[1][w]; }
-        // silu(g) * u - same epilogue as the Q8 pair
-        out[((size_t)b * n_active + slot) * ff + o] = (g / (1.0f + __expf(-g))) * u;
+        // silu(g) * u (or gelu(g) * u) - same epilogue as the Q8 pair
+        out[((size_t)b * n_active + slot) * ff + o] = pd_kq_glu_epi<GELU>(g, u);
     }
     // LIST: wsum is reused by the next pair this block takes - tid 0 must be
     // done reading it before any lane writes again
@@ -147,13 +164,13 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     }
 }
 
-PD_EXPORT
-int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
-                          const void* up_data, const void* up_scales,
-                          const void* idx, const void* xq, const void* xs,
-                          const void* xsums, void* out, uint32_t in_dim,
-                          uint32_t ff, uint32_t n_active, uint32_t batch,
-                          uint32_t gdt, uint32_t udt, void* stream) {
+template <bool GELU>
+static int pd_kquant_moe_gate_up_impl(const void* gate_data, const void* gate_scales,
+                                      const void* up_data, const void* up_scales,
+                                      const void* idx, const void* xq, const void* xs,
+                                      const void* xsums, void* out, uint32_t in_dim,
+                                      uint32_t ff, uint32_t n_active, uint32_t batch,
+                                      uint32_t gdt, uint32_t udt, void* stream) {
     if (ff == 0 || n_active == 0 || batch == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
     if ((in_dim & 255u) != 0 && !(pd_kq_flat32(gdt) && pd_kq_flat32(udt)))
@@ -176,13 +193,38 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
     // while costing a summation-order change - not worth the parity vetting.
     uint32_t nth = (in_dim >> 4) < 256u ? (((in_dim >> 4) + 31u) & ~31u) : 256u;
     if (nth < 32u) nth = 32u;
-    pd_pdl_go(pd_kquant_moe_gate_up_kernel<false>, grid, nth, 0u, (cudaStream_t)stream,
+    pd_pdl_go(pd_kquant_moe_gate_up_kernel<false, GELU>, grid, nth, 0u, (cudaStream_t)stream,
         (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
         (const uint8_t*)up_data, (const uint8_t*)up_scales,
         (const unsigned int*)idx, (const int8_t*)xq, (const float*)xs,
         (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt,
         (const unsigned int*)nullptr, (const unsigned int*)nullptr);
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
+                          const void* up_data, const void* up_scales,
+                          const void* idx, const void* xq, const void* xs,
+                          const void* xsums, void* out, uint32_t in_dim,
+                          uint32_t ff, uint32_t n_active, uint32_t batch,
+                          uint32_t gdt, uint32_t udt, void* stream) {
+    return pd_kquant_moe_gate_up_impl<false>(gate_data, gate_scales, up_data, up_scales,
+                                             idx, xq, xs, xsums, out, in_dim, ff, n_active,
+                                             batch, gdt, udt, stream);
+}
+
+// slot 657: the GEGLU instantiation of the pair (gemma-4 A4B routed experts).
+PD_EXPORT
+int pd_kquant_moe_gate_up_geglu(const void* gate_data, const void* gate_scales,
+                                const void* up_data, const void* up_scales,
+                                const void* idx, const void* xq, const void* xs,
+                                const void* xsums, void* out, uint32_t in_dim,
+                                uint32_t ff, uint32_t n_active, uint32_t batch,
+                                uint32_t gdt, uint32_t udt, void* stream) {
+    return pd_kquant_moe_gate_up_impl<true>(gate_data, gate_scales, up_data, up_scales,
+                                            idx, xq, xs, xsums, out, in_dim, ff, n_active,
+                                            batch, gdt, udt, stream);
 }
 
 // slot 583: the LIST form (see the kernel note). `pairs`/`n_pairs` are the
@@ -208,7 +250,7 @@ int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
     dim3 grid(ff, PD_KQ_MOE_LIST_P, 1u);
     uint32_t nth = (in_dim >> 4) < 256u ? (((in_dim >> 4) + 31u) & ~31u) : 256u;
     if (nth < 32u) nth = 32u;
-    pd_pdl_go(pd_kquant_moe_gate_up_kernel<true>, grid, nth, 0u, (cudaStream_t)stream,
+    pd_pdl_go(pd_kquant_moe_gate_up_kernel<true, false>, grid, nth, 0u, (cudaStream_t)stream,
         (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
         (const uint8_t*)up_data, (const uint8_t*)up_scales,
         (const unsigned int*)idx, (const int8_t*)xq, (const float*)xs,
@@ -232,7 +274,7 @@ int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
 // BIT-IDENTICAL to the pair kernel: same per-window math in the same order,
 // same 32-lane shuffle tree per row, same ascending-warp fold. A row's output
 // does not depend on which block computed it, and PAD lanes write nothing.
-template <uint32_t T>
+template <uint32_t T, bool GELU>
 __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_grp_kernel(
     const uint8_t* __restrict__ gd, const uint8_t* __restrict__ gsc,
     const uint8_t* __restrict__ ud_, const uint8_t* __restrict__ usc,
@@ -318,8 +360,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_grp_kernel(
                 g += wsum[0][tid][w2];
                 u += wsum[1][tid][w2];
             }
-            out[((size_t)b * n_active + sslot_sh[tid]) * ff + o] =
-                (g / (1.0f + __expf(-g))) * u;
+            out[((size_t)b * n_active + sslot_sh[tid]) * ff + o] = pd_kq_glu_epi<GELU>(g, u);
         }
     }
 }
@@ -329,15 +370,15 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_grp_kernel(
 // `group` is 8, 16 or 32 (the caller elects it from rows/n_expert - a whole
 // expert per block is the point). Output layout is the pair kernel's, so the
 // down kernel and the quantize between them are unchanged.
-PD_EXPORT
-int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
-                              const void* up_data, const void* up_scales,
-                              const void* sorted_row, const void* sorted_slot,
-                              const void* block_expert, const void* xq,
-                              const void* xs, const void* xsums, void* out,
-                              uint32_t in_dim, uint32_t ff, uint32_t n_active,
-                              uint32_t max_blocks, uint32_t group, uint32_t gdt,
-                              uint32_t udt, void* stream) {
+template <bool GELU>
+static int pd_kquant_moe_gate_up_grp_impl(const void* gate_data, const void* gate_scales,
+                                          const void* up_data, const void* up_scales,
+                                          const void* sorted_row, const void* sorted_slot,
+                                          const void* block_expert, const void* xq,
+                                          const void* xs, const void* xsums, void* out,
+                                          uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                                          uint32_t max_blocks, uint32_t group, uint32_t gdt,
+                                          uint32_t udt, void* stream) {
     if (ff == 0 || n_active == 0 || max_blocks == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
     if ((in_dim & 255u) != 0 && !(pd_kq_flat32(gdt) && pd_kq_flat32(udt)))
@@ -352,7 +393,7 @@ int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
     if (nth < 32u) nth = 32u;
     dim3 grid(max_blocks, ff);
 #define PD_KQ_GRP_GO(TV)                                                       \
-    pd_pdl_go(pd_kquant_moe_gate_up_grp_kernel<TV>, grid, nth, 0u,             \
+    pd_pdl_go(pd_kquant_moe_gate_up_grp_kernel<TV, GELU>, grid, nth, 0u,       \
         (cudaStream_t)stream, (const uint8_t*)gate_data,                       \
         (const uint8_t*)gate_scales, (const uint8_t*)up_data,                  \
         (const uint8_t*)up_scales, (const unsigned int*)sorted_row,            \
@@ -367,6 +408,37 @@ int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
     }
 #undef PD_KQ_GRP_GO
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
+                              const void* up_data, const void* up_scales,
+                              const void* sorted_row, const void* sorted_slot,
+                              const void* block_expert, const void* xq,
+                              const void* xs, const void* xsums, void* out,
+                              uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                              uint32_t max_blocks, uint32_t group, uint32_t gdt,
+                              uint32_t udt, void* stream) {
+    return pd_kquant_moe_gate_up_grp_impl<false>(gate_data, gate_scales, up_data, up_scales,
+                                                 sorted_row, sorted_slot, block_expert, xq,
+                                                 xs, xsums, out, in_dim, ff, n_active,
+                                                 max_blocks, group, gdt, udt, stream);
+}
+
+// slot 658: the GEGLU instantiation of the grouped pair.
+PD_EXPORT
+int pd_kquant_moe_gate_up_grp_geglu(const void* gate_data, const void* gate_scales,
+                                    const void* up_data, const void* up_scales,
+                                    const void* sorted_row, const void* sorted_slot,
+                                    const void* block_expert, const void* xq,
+                                    const void* xs, const void* xsums, void* out,
+                                    uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                                    uint32_t max_blocks, uint32_t group, uint32_t gdt,
+                                    uint32_t udt, void* stream) {
+    return pd_kquant_moe_gate_up_grp_impl<true>(gate_data, gate_scales, up_data, up_scales,
+                                                sorted_row, sorted_slot, block_expert, xq,
+                                                xs, xsums, out, in_dim, ff, n_active,
+                                                max_blocks, group, gdt, udt, stream);
 }
 
 // Routed k-quant down + weighted combine: out[b][o] = sum_slot topk_w *
@@ -609,7 +681,7 @@ int pd_kquant_moe_down_cols(const void* down_data, const void* down_scales,
 #define PD_KQT_XW (PD_KQT_BK + 16u)   // padded row strides: a 128-byte stride
 #define PD_KQT_WW (PD_KQT_BK + 16u)   // puts every lane in the same bank set
 
-template <bool MU>
+template <bool MU, bool GELU>
 __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_tile_kernel(
     const uint8_t* __restrict__ gd, const uint8_t* __restrict__ gsc,
     const uint8_t* __restrict__ ud_, const uint8_t* __restrict__ usc,
@@ -739,7 +811,7 @@ __global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_tile_kernel(
         const uint32_t o = o0 + c0 + cc;
         if (o >= ff) continue;
         const float g = accg[cc], u = accu[cc];
-        out[((size_t)b * n_active + sslt[r]) * ff + o] = (g / (1.0f + __expf(-g))) * u;
+        out[((size_t)b * n_active + sslt[r]) * ff + o] = pd_kq_glu_epi<GELU>(g, u);
     }
 }
 
@@ -903,15 +975,15 @@ int pd_kquant_moe_down_tile(const void* down_data, const void* down_scales,
 // (BM is the tile, so the group size is the kernel's, not the caller's) and
 // writes the token-batched kernel's PAIR-major output, so the quantize and
 // the down half after it are unchanged.
-PD_EXPORT
-int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
-                               const void* up_data, const void* up_scales,
-                               const void* sorted_row, const void* sorted_slot,
-                               const void* block_expert, const void* xq,
-                               const void* xs, const void* xsums, void* out,
-                               uint32_t in_dim, uint32_t ff, uint32_t n_active,
-                               uint32_t max_blocks, uint32_t gdt, uint32_t udt,
-                               void* stream) {
+template <bool GELU>
+static int pd_kquant_moe_gate_up_tile_impl(const void* gate_data, const void* gate_scales,
+                                           const void* up_data, const void* up_scales,
+                                           const void* sorted_row, const void* sorted_slot,
+                                           const void* block_expert, const void* xq,
+                                           const void* xs, const void* xsums, void* out,
+                                           uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                                           uint32_t max_blocks, uint32_t gdt, uint32_t udt,
+                                           void* stream) {
     if (ff == 0 || n_active == 0 || max_blocks == 0) return 0;
     if ((in_dim % PD_KQT_BK) != 0) return cudaErrorInvalidValue;
     if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
@@ -923,14 +995,14 @@ int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
     dim3 grid(max_blocks, (ff + PD_KQT_BN - 1u) / PD_KQT_BN);
     cudaStream_t st = (cudaStream_t)stream;
     if (mu) {
-        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<true>, grid, 256u, 0u, st,
+        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<true, GELU>, grid, 256u, 0u, st,
             (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
             (const uint8_t*)up_data, (const uint8_t*)up_scales,
             (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
             (const unsigned int*)block_expert, (const int8_t*)xq, (const float*)xs,
             (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt);
     } else {
-        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<false>, grid, 256u, 0u, st,
+        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<false, GELU>, grid, 256u, 0u, st,
             (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
             (const uint8_t*)up_data, (const uint8_t*)up_scales,
             (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
@@ -938,6 +1010,37 @@ int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
             (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt);
     }
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
+                               const void* up_data, const void* up_scales,
+                               const void* sorted_row, const void* sorted_slot,
+                               const void* block_expert, const void* xq,
+                               const void* xs, const void* xsums, void* out,
+                               uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                               uint32_t max_blocks, uint32_t gdt, uint32_t udt,
+                               void* stream) {
+    return pd_kquant_moe_gate_up_tile_impl<false>(gate_data, gate_scales, up_data, up_scales,
+                                                  sorted_row, sorted_slot, block_expert, xq,
+                                                  xs, xsums, out, in_dim, ff, n_active,
+                                                  max_blocks, gdt, udt, stream);
+}
+
+// slot 659: the GEGLU instantiation of the register-tiled pair.
+PD_EXPORT
+int pd_kquant_moe_gate_up_tile_geglu(const void* gate_data, const void* gate_scales,
+                                     const void* up_data, const void* up_scales,
+                                     const void* sorted_row, const void* sorted_slot,
+                                     const void* block_expert, const void* xq,
+                                     const void* xs, const void* xsums, void* out,
+                                     uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                                     uint32_t max_blocks, uint32_t gdt, uint32_t udt,
+                                     void* stream) {
+    return pd_kquant_moe_gate_up_tile_impl<true>(gate_data, gate_scales, up_data, up_scales,
+                                                 sorted_row, sorted_slot, block_expert, xq,
+                                                 xs, xsums, out, in_dim, ff, n_active,
+                                                 max_blocks, gdt, udt, stream);
 }
 
 // ---- expert-GROUPED down + slot fold (the prefill class, slots 589/590) ----
@@ -1439,8 +1542,13 @@ __global__ void __launch_bounds__(NTH, BPS) pd_kquant_moe_down_mma_e_kernel(
 // slot 603: the expert-major tensor-core down over column chunk [o0, o0 +
 // ocols). The layout is the tensor-core gate/up's (bm = 32 moe_align, sorted
 // sfq/sfs); emap is u32 [2 * n_expert] scratch the launcher fills first. A flat
-// 32-weight down whose ff stages whole 128-weight slices, chunks on 64-row
-// strips.
+// 32-weight down at any 32-multiple ff, chunks on 64-row strips. The walk is
+// in 128-weight stages and ff need not fill the last one: every window past
+// ff lands as zeros in both shared operands (the weight loop skips the read,
+// the activation copy takes the zero) and the mma loop stops at nb32, so a
+// 704-wide row (22 blocks, 5.5 stages - the gemma-4 A4B's expert down) costs
+// the unpack and copy passes of one half-empty stage and no extra bytes.
+// Until 2026-09-24 the launcher refused those widths (marker slot 668).
 PD_EXPORT
 int pd_kquant_moe_down_mma_e(const void* down_data, const void* down_scales,
                              const void* sorted_row, const void* sorted_slot,
@@ -1450,7 +1558,7 @@ int pd_kquant_moe_down_mma_e(const void* down_data, const void* down_scales,
                              uint32_t n_active, uint32_t n_expert, uint32_t max_blocks,
                              uint32_t ddt, void* stream) {
     if (embd == 0 || ocols == 0 || n_expert == 0 || max_blocks == 0) return 0;
-    if ((ff % 128u) != 0 || (o0 % 64u) != 0 || o0 >= embd || !pd_kq_flat32(ddt))
+    if ((ff & 31u) != 0 || (o0 % 64u) != 0 || o0 >= embd || !pd_kq_flat32(ddt))
         return cudaErrorInvalidValue;
     if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr ||
         emap == nullptr || sfq == nullptr || sfs == nullptr)
@@ -1478,6 +1586,13 @@ int pd_kquant_moe_down_mma_e(const void* down_data, const void* down_scales,
     }
     return pd_launch_status();
 }
+
+// Capability marker (slot 668): present iff slot 603 takes a flat down at any
+// 32-multiple width - a partial last 128-weight stage - and not only whole
+// stages. Same reason as slots 600 / 655: the entry point predates the tail,
+// and an older pack answers those widths with cudaErrorInvalidValue.
+PD_EXPORT
+int pd_kquant_moe_down_mma_e_tail(void) { return 0; }
 
 // Fold a column chunk's per-(token, slot) partials into `out` in ASCENDING
 // slot order - the same order the ungrouped down kernel summed inside its
@@ -1692,7 +1807,7 @@ int pd_kquant_moe_down_list(const void* down_data, const void* down_scales,
 // Numeric class: identical expressions in identical K-fold order as the
 // dense ks v2 (super-ascending, kk 0..7) - exact int8 dots, f32 scale
 // application, deterministic for a fixed sorted layout.
-template <uint32_t DT, bool GU>
+template <uint32_t DT, bool GU, bool GELU>
 __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
         const uint8_t* __restrict__ wd0, const uint8_t* __restrict__ ws0,
         const uint8_t* __restrict__ wd1, const uint8_t* __restrict__ ws1,
@@ -2007,7 +2122,7 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
                 const uint32_t c = c0 + (q & 1u);
                 const uint32_t rl = wr + g + (q & 2u ? 8u : 0u);
                 const float gv = acc_g[sub][q], uv = acc_u[sub][q];
-                sf[c * 65u + rl] = (gv / (1.0f + __expf(-gv))) * uv;
+                sf[c * 65u + rl] = pd_kq_glu_epi<GELU>(gv, uv);
             }
         }
         __syncthreads();
@@ -2059,25 +2174,25 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
 
 // dynamic-smem opt-in per instantiation (Q5K/Q6K rings exceed the 48 KB
 // static window; Q4K/IQ4 stay under -> 2 CTA/SM)
-#define PD_KQM_LAUNCH(DTV, GUV, ...)                                          \
+#define PD_KQM_LAUNCH(DTV, GUV, GEV, ...)                                     \
     do {                                                                      \
         constexpr uint32_t smem = pd_km_smem_bytes(DTV, 32u, 2u);             \
         if (smem > 48u * 1024u) {                                             \
             static cudaError_t attr = cudaFuncSetAttribute(                   \
-                (const void*)pd_kq_moe_mma_kernel<DTV, GUV>,                  \
+                (const void*)pd_kq_moe_mma_kernel<DTV, GUV, GEV>,             \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
             if (attr != cudaSuccess) return attr;                             \
         }                                                                     \
-        pd_kq_moe_mma_kernel<DTV, GUV><<<grid, 256, smem, st>>>(__VA_ARGS__); \
+        pd_kq_moe_mma_kernel<DTV, GUV, GEV><<<grid, 256, smem, st>>>(__VA_ARGS__); \
     } while (0)
 
-PD_EXPORT
-int pd_kquant_moe_gate_up_mma(const void* gate_data, const void* gate_scales,
-                              const void* up_data, const void* up_scales,
-                              const void* sorted_row, const void* block_expert,
-                              const void* xq, const void* xs, const void* xsums,
-                              void* fq, void* fs, uint32_t in_dim, uint32_t ff,
-                              uint32_t max_blocks, uint32_t dtype, void* stream) {
+template <bool GELU>
+static int pd_kquant_moe_gate_up_mma_impl(const void* gate_data, const void* gate_scales,
+                                          const void* up_data, const void* up_scales,
+                                          const void* sorted_row, const void* block_expert,
+                                          const void* xq, const void* xs, const void* xsums,
+                                          void* fq, void* fs, uint32_t in_dim, uint32_t ff,
+                                          uint32_t max_blocks, uint32_t dtype, void* stream) {
     if (ff == 0 || max_blocks == 0) return 0;
     if ((in_dim & 255u) != 0 || (ff & 31u) != 0) return cudaErrorInvalidValue;
     if (!pd_kq_valid(dtype)) return cudaErrorInvalidValue;
@@ -2087,7 +2202,7 @@ int pd_kquant_moe_gate_up_mma(const void* gate_data, const void* gate_scales,
     cudaStream_t st = (cudaStream_t)stream;
     switch (dtype) {
         #define PD_KQM_GU(DTV)                                                \
-            PD_KQM_LAUNCH(DTV, true, (const uint8_t*)gate_data,               \
+            PD_KQM_LAUNCH(DTV, true, GELU, (const uint8_t*)gate_data,         \
                 (const uint8_t*)gate_scales, (const uint8_t*)up_data,         \
                 (const uint8_t*)up_scales, (const unsigned int*)sorted_row,   \
                 nullptr, (const unsigned int*)block_expert, nullptr,          \
@@ -2101,6 +2216,31 @@ int pd_kquant_moe_gate_up_mma(const void* gate_data, const void* gate_scales,
         #undef PD_KQM_GU
     }
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_kquant_moe_gate_up_mma(const void* gate_data, const void* gate_scales,
+                              const void* up_data, const void* up_scales,
+                              const void* sorted_row, const void* block_expert,
+                              const void* xq, const void* xs, const void* xsums,
+                              void* fq, void* fs, uint32_t in_dim, uint32_t ff,
+                              uint32_t max_blocks, uint32_t dtype, void* stream) {
+    return pd_kquant_moe_gate_up_mma_impl<false>(gate_data, gate_scales, up_data, up_scales,
+                                                 sorted_row, block_expert, xq, xs, xsums, fq,
+                                                 fs, in_dim, ff, max_blocks, dtype, stream);
+}
+
+// slot 660: the GEGLU instantiation of the sorted tensor-core pair.
+PD_EXPORT
+int pd_kquant_moe_gate_up_mma_geglu(const void* gate_data, const void* gate_scales,
+                                    const void* up_data, const void* up_scales,
+                                    const void* sorted_row, const void* block_expert,
+                                    const void* xq, const void* xs, const void* xsums,
+                                    void* fq, void* fs, uint32_t in_dim, uint32_t ff,
+                                    uint32_t max_blocks, uint32_t dtype, void* stream) {
+    return pd_kquant_moe_gate_up_mma_impl<true>(gate_data, gate_scales, up_data, up_scales,
+                                                sorted_row, block_expert, xq, xs, xsums, fq,
+                                                fs, in_dim, ff, max_blocks, dtype, stream);
 }
 
 PD_EXPORT
@@ -2120,7 +2260,7 @@ int pd_kquant_moe_down_mma(const void* down_data, const void* down_scales,
     cudaStream_t st = (cudaStream_t)stream;
     switch (dtype) {
         #define PD_KQM_DN(DTV)                                                \
-            PD_KQM_LAUNCH(DTV, false, (const uint8_t*)down_data,              \
+            PD_KQM_LAUNCH(DTV, false, false, (const uint8_t*)down_data,       \
                 (const uint8_t*)down_scales, nullptr, nullptr,                \
                 (const unsigned int*)sorted_row,                              \
                 (const unsigned int*)sorted_slot,                             \

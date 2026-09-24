@@ -958,6 +958,26 @@ fn embedded_manifest_parses_and_is_well_formed() {
                 assert!(a.runtime.checkpoint_dir);
                 assert_eq!(first, "Qwen3.8-27B-Splash/manifest.json");
                 assert_eq!(a.files[0].sha256, paddock_models::splash::MANIFEST_SHA256);
+            } else if a.runtime.checkpoint_dir
+                && a.capabilities(m).iter().any(|c| c == "image-generation")
+            {
+                // A diffusion directory has multiple component subfolders;
+                // its root index, not a nested shard's parent, is the entry.
+                assert!(first.ends_with("/model_index.json"));
+                let root = first.strip_suffix("model_index.json").unwrap();
+                assert!(a.files.iter().all(|f| f.dest.starts_with(root)));
+                for component in [
+                    "transformer/config.json",
+                    "text_encoder/config.json",
+                    "vae/config.json",
+                    "processor/tokenizer.json",
+                ] {
+                    assert!(
+                        a.files
+                            .iter()
+                            .any(|f| f.dest == format!("{root}{component}"))
+                    );
+                }
             } else if sharded {
                 assert!(
                     first.contains("-00001-of-"),

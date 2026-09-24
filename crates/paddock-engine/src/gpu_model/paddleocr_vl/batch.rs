@@ -591,13 +591,13 @@ impl GpuPaddleOcrVl {
             let sc = &mut bs.sc;
             exec.rmsnorm_batch(&sc.x, &layer.attn_norm.buf, &mut sc.xn, embd, eps, r)?;
             if r1 {
-                layer.wq.gemv(&exec, &sc.xn, &mut sc.q)?;
-                layer.wk.gemv(&exec, &sc.xn, &mut sc.k)?;
-                layer.wv.gemv(&exec, &sc.xn, &mut sc.v)?;
+                layer.wq.gemv_exact(&exec, &sc.xn, &mut sc.q)?;
+                layer.wk.gemv_exact(&exec, &sc.xn, &mut sc.k)?;
+                layer.wv.gemv_exact(&exec, &sc.xn, &mut sc.v)?;
             } else {
-                layer.wq.gemm(&exec, &sc.xn, &mut sc.q, r)?;
-                layer.wk.gemm(&exec, &sc.xn, &mut sc.k, r)?;
-                layer.wv.gemm(&exec, &sc.xn, &mut sc.v, r)?;
+                layer.wq.gemm_exact(&exec, &sc.xn, &mut sc.q, r)?;
+                layer.wk.gemm_exact(&exec, &sc.xn, &mut sc.k, r)?;
+                layer.wv.gemm_exact(&exec, &sc.xn, &mut sc.v, r)?;
             }
             // sectioned 3-axis rope on the M-RoPE stream; KV lands at the
             // SEQUENCE position (d_pos) - the two diverge past any image.
@@ -795,23 +795,25 @@ impl GpuPaddleOcrVl {
                 }
             }
             if r1 {
-                layer.wo.gemv(&exec, &sc.attn, &mut sc.proj)?;
+                layer.wo.gemv_exact(&exec, &sc.attn, &mut sc.proj)?;
             } else {
-                layer.wo.gemm(&exec, &sc.attn, &mut sc.proj, r)?;
+                layer.wo.gemm_exact(&exec, &sc.attn, &mut sc.proj, r)?;
             }
             exec.add(&mut sc.x, &sc.proj, r * embd)?;
 
             exec.rmsnorm_batch(&sc.x, &layer.ffn_norm.buf, &mut sc.xn, embd, eps, r)?;
             if r1 {
-                layer.gate.gemv(&exec, &sc.xn, &mut sc.ffn_gate)?;
-                layer.up.gemv(&exec, &sc.xn, &mut sc.ffn_up)?;
+                layer.gate.gemv_exact(&exec, &sc.xn, &mut sc.ffn_gate)?;
+                layer.up.gemv_exact(&exec, &sc.xn, &mut sc.ffn_up)?;
                 exec.swiglu(&mut sc.ffn_gate, &sc.ffn_up, n_ff)?;
-                layer.down.gemv(&exec, &sc.ffn_gate, &mut sc.proj)?;
+                layer.down.gemv_exact(&exec, &sc.ffn_gate, &mut sc.proj)?;
             } else {
-                layer.gate.gemm(&exec, &sc.xn, &mut sc.ffn_gate, r)?;
-                layer.up.gemm(&exec, &sc.xn, &mut sc.ffn_up, r)?;
+                layer.gate.gemm_exact(&exec, &sc.xn, &mut sc.ffn_gate, r)?;
+                layer.up.gemm_exact(&exec, &sc.xn, &mut sc.ffn_up, r)?;
                 exec.swiglu(&mut sc.ffn_gate, &sc.ffn_up, r * n_ff)?;
-                layer.down.gemm(&exec, &sc.ffn_gate, &mut sc.proj, r)?;
+                layer
+                    .down
+                    .gemm_exact(&exec, &sc.ffn_gate, &mut sc.proj, r)?;
             }
             exec.add(&mut sc.x, &sc.proj, r * embd)?;
         }
@@ -826,10 +828,11 @@ impl GpuPaddleOcrVl {
         let sc = &mut bs.sc;
         exec.rmsnorm_batch(&sc.x, &self.output_norm.buf, &mut sc.xn, embd, eps, rows)?;
         if rows == 1 {
-            self.lm_head.gemv(&exec, &sc.xn, &mut sc.head_logits)?;
+            self.lm_head
+                .gemv_exact(&exec, &sc.xn, &mut sc.head_logits)?;
         } else {
             self.lm_head
-                .gemm(&exec, &sc.xn, &mut sc.head_logits, rows)?;
+                .gemm_exact(&exec, &sc.xn, &mut sc.head_logits, rows)?;
         }
         Ok(())
     }

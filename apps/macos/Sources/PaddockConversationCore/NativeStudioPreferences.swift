@@ -2,19 +2,6 @@ import Foundation
 
 extension NativeStudioRuntime {
   func preferencePresentation() -> O {
-    var stops: [V] = []
-    var n = 512
-    while n < (contextLimit > 0 ? contextLimit : 8192) {
-      let label = n < 1024 ? String(n) : "\(n / 1024)K"
-      stops.append(
-        .object([
-          "value": .number(Decimal(n)), "label": .string("\(label) tokens"),
-          "shortLabel": .string(label),
-        ]))
-      n *= 2
-    }
-    stops.append(
-      .object(["value": .null, "label": .string("Model maximum"), "shortLabel": .string("Max")]))
     return [
       "maxTokens": maxTokens,
       "maxToolCalls": preferences["pk_max_tool_calls"]?.string.flatMap(Int.init).map {
@@ -27,11 +14,11 @@ extension NativeStudioRuntime {
       "layout": .object([
         "sections": .array(
           [
-            ("maxTokens", "Max reply length"), ("maxToolCalls", "Tools per reply"),
+            ("maxTokens", "Reply limit"), ("maxToolCalls", "Tools per reply"),
             ("summarize", "Summarize older messages"), ("microphone", "Microphone"),
             ("mapTiles", "Map tiles"),
           ].map { .object(["id": .string($0.0), "title": .string($0.1)]) }),
-        "replyStops": .array(stops),
+        "replyLimit": .object(["maximum": .number(1_048_576)]),
         "toolStops": .array(
           [0, 5, 10, 25, 50, 100].map {
             .object([

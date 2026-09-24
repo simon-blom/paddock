@@ -605,6 +605,91 @@ kv_default = "fp8_e4m3"
     sha256 = "6326fb9f5e487aa8dcdd313a091e3c67724cb2a666ec3b7d2895b5b26d93ed1b"
     size = 461766816
 
+# DiffusionGemma 26B-A4B (Google, 2026-06): the Gemma 4 26B-A4B body
+# generating by BLOCK DIFFUSION - a 256-token canvas denoised in parallel
+# (up to 48 steps, ~15-20 tokens per forward), committed, then the next
+# block. Same family module as gemma-4-26b-a4b (gpu_model/gemma4, arch
+# `diffusion-gemma`), plus the self-conditioning MLP and a transposed
+# embedding the lane holds resident. Google ships no GGUF; unsloth's is the
+# only one, and the engine was gated on it (2026-09-23, A6000: a sentence in
+# 11 steps / 4.2 s; the yes/no structured read at 80 % label mass). Text
+# only: the tower is Gemma 4's class but no mmproj ships for this file.
+# Sampling: the file's own schedule (temperature 0.8 -> 0.4 over the steps,
+# entropy bound 0.1, stop at mean entropy < 0.005) - not a customer knob.
+[[model]]
+id = "diffusiongemma-26b-a4b"
+vendor = "Google"
+display = "DiffusionGemma 26B A4B"
+family = "gemma-4"
+capability = ["chat", "reasoning"]
+license = "apache-2.0"
+revision = "2026-09-23"
+kv_default = "fp8_e4m3"
+
+  [model.specs]
+  params = "26B-A4B"
+  context = "256K"
+  published_at = "2026-06-10"
+  published_source = "https://developers.googleblog.com/diffusiongemma-the-developer-guide/"
+  homepage = "https://huggingface.co/google/diffusiongemma-26B-A4B-it"
+  about = "Gemma 4's 26B mixture-of-experts, rewritten to write a whole block of text at once: it refines 256 words in parallel instead of one after another, so long answers arrive several times faster on the same card."
+  strengths = [
+    "Whole blocks of text per step - up to 4x the words per second of Gemma 4 26B",
+    "Reads a fixed set of yes/no, multiple-choice and scored questions with a calibrated probability each",
+    "Apache 2.0",
+  ]
+  tradeoffs = [
+    "Trails Gemma 4 26B on hard reasoning (MMLU Pro 77.6 vs 82.6, AIME 69 vs 88)",
+    "27 GB of weights plus 1.5 GB for the block sampler and ~6 GB of expert working memory",
+    "Text only for now",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  # the 26B-A4B MoE scratch (gemma-4-26b-a4b's measured 6.07 GiB at 32
+  # slots) plus one canvas' logits plane (256 x 262144 x 4 B)
+  workspace = 6338927036
+  runtime = { backends = ["cuda"] }
+
+  [model.artifact.shape]
+  # file bytes + the lane's resident planes (E^T bf16 1,476,395,008 B + the
+  # self-cond MLP), as weights_mem_bytes reports them
+  weight_bytes = 29140980736
+  kind = "generative"
+  vocab = 262144
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q8_0.gguf"
+    dest = "diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q8_0.gguf"
+    sha256 = "dd43baf2fb49a842ea7c106a7f3ce8d2e862e7d28d798d1d86bf94b48e50a607"
+    size = 26878831200
+
+  # No compact (Q4_K_M) row yet: unsloth's Q4_K_M carries a Q6_K
+  # `token_embd.weight`, and the lane's embedding consumers (the row gathers
+  # and the transposed-embedding build) read Q8_0/bf16 only - the file
+  # (16,806,810,208 B, sha 24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a1036
+  # 45353114c8028bc5) loads once a k-quant embedding path lands.
+
 # Qwen3.5/3.6 sourcing: official + unsloth only.
 # Elected line = the unsloth *-MTP-GGUF repos - the MTP/nextn tensors are
 # IN-FILE (built-in speculative decoding, no drafter artifact needed) and the
@@ -2151,6 +2236,174 @@ revision = "2026-09-21"
     sha256 = "187aca6e2e8d01daa77e6faf64189ba015a5616f1627fdf2f4f2392d592bf5da"
     size = 22732
 
+# MiniCPM5-2B: OpenBMB's own GGUF conversion (official repo, Apache-2.0), a
+# plain `llama`-arch dense stack that the engine serves through the granite
+# graph with its scalars at identity. Both files are the upstream bytes -
+# sha256 = the repo's LFS oid, re-verified after download. Same-weights greedy
+# parity against llama.cpp b11095 on both: step-0 18/18, delta-margin median
+# 0.155 nats (Q8_0) / 0.222 (Q4_K_M), the long streams parting only at
+# sub-0.1-nat ties (A6000, 2026-09-22). The GGUF stamps the card's own
+# sampling (temperature 1.0, top_p 0.95), which the runner reads off the file.
+
+[[model]]
+id = "minicpm5-2b"
+vendor = "OpenBMB"
+display = "MiniCPM5 2B"
+family = "minicpm"
+capability = ["chat", "tools", "reasoning"]
+license = "apache-2.0"
+revision = "2026-09-22"
+
+  [model.specs]
+  params = "2.5B"
+  context = "128K"
+  homepage = "https://huggingface.co/openbmb/MiniCPM5-2B"
+  published_at = "2026-09-06"
+  published_source = "https://huggingface.co/openbmb/MiniCPM5-2B-GGUF"
+  about = "OpenBMB's small model for phones, laptops and edge boxes: a 2.5B dense model with a thinking mode and tool calling, in a 2.7 GB download."
+  strengths = [
+    "Small: 2.7 GB at full quality, 1.6 GB compact - room for a very long context on any card",
+    "Thinking mode that can be switched off per request",
+    "Tool calling with parallel calls",
+  ]
+  tradeoffs = [
+    "Text only - no image input",
+    "A 2.5B model: quick and capable for its size, not a match for the 9B and 27B models here",
+    "DSpark draft is available upstream; Paddock does not yet serve that speculative path",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  runtime = { backends = ["cuda", "metal"], companions = [], backend_overrides = { metal = { kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 2674565120, source = "measured", max_ctx = 32768, max_batch = 4, full_paged_kv = true, kv_reserve_sequences = 1, workspace_bytes = 201326592 } } } }
+
+  [model.artifact.shape]
+  weight_bytes = 2674565120
+  kind = "generative"
+  vocab = 130560
+  max_ctx = 131072
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 256, v_dim = 256, count = 42 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/MiniCPM5-2B-GGUF/MiniCPM5-2B-Q8_0.gguf"
+    dest = "MiniCPM5-2B-GGUF/MiniCPM5-2B-Q8_0.gguf"
+    sha256 = "c5415f8989bf88a8288f1b55a3cc371af53c07b0faa220a63bd7a990cfaba078"
+    size = 2679710688
+
+  [[model.artifact]]
+  id = "q4"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact"
+  quant = "Q4_K_M"
+  runtime = { backends = ["cuda", "metal"], companions = [], backend_overrides = { metal = { kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 1556172800, source = "measured", max_ctx = 32768, max_batch = 4, full_paged_kv = true, kv_reserve_sequences = 1, workspace_bytes = 201326592 } } } }
+
+  [model.artifact.shape]
+  weight_bytes = 1630576640
+  kind = "generative"
+  vocab = 130560
+  max_ctx = 131072
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 256, v_dim = 256, count = 42 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/MiniCPM5-2B-GGUF/MiniCPM5-2B-Q4_K_M.gguf"
+    dest = "MiniCPM5-2B-GGUF/MiniCPM5-2B-Q4_K_M.gguf"
+    sha256 = "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd"
+    size = 1561318368
+
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 4-bit"
+  quant = "MLX-AFFINE-4-G64"
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  companions = []
+  checkpoint_dir = true
+  kv_cache_dtype = "auto"
+  default_max_batch = 1
+  note = "Native packed-affine Metal with BF16 KV. Text, thinking and tool calling; no vision or DSpark. Complete-generation numerical parity and rival performance remain under qualification."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 1416273920
+  source = "probed"
+  max_ctx = 32768
+  max_batch = 4
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 201326592
+
+  [model.artifact.shape]
+  weight_bytes = 1416273920
+  kind = "generative"
+  vocab = 130560
+  max_ctx = 131072
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [{ k_dim = 256, v_dim = 256, count = 42 }]
+
+  [model.artifact.source]
+  repo = "openbmb/MiniCPM5-2B-MLX"
+  revision = "8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3"
+  base_model = "openbmb/MiniCPM5-2B"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/blob/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/README.md"
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/model.safetensors"
+    dest = "MiniCPM5-2B-MLX/model.safetensors"
+    sha256 = "c207798696a4a454e7ac211b25227625466c693335941cee8904fb922f295cc1"
+    size = 1416035216
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/config.json"
+    dest = "MiniCPM5-2B-MLX/config.json"
+    sha256 = "deb9ca33e863cbc84a9ab7209cd924fc05505dc33270c807d47f1b78fbd53a50"
+    size = 886
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/generation_config.json"
+    dest = "MiniCPM5-2B-MLX/generation_config.json"
+    sha256 = "9ac4f32e5f32358697a9f438a3ea89ef80e6ba786c72c49e932f9f21c122fdb1"
+    size = 213
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/model.safetensors.index.json"
+    dest = "MiniCPM5-2B-MLX/model.safetensors.index.json"
+    sha256 = "ccf202e0a06fe3c7eb8f354cfb29412a5e64956ad895413d4d9267ae4b3a6045"
+    size = 68721
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/tokenizer.json"
+    dest = "MiniCPM5-2B-MLX/tokenizer.json"
+    sha256 = "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81"
+    size = 9894271
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/tokenizer_config.json"
+    dest = "MiniCPM5-2B-MLX/tokenizer_config.json"
+    sha256 = "b89503c3e5070c6b6d33daf2e20cb4a5c88537c1670d9b7e0cfb4506a61448a9"
+    size = 435
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/openbmb/MiniCPM5-2B-MLX/resolve/8a9ad7539ac86281d0ac2b017ba04a5de53fe9a3/chat_template.jinja"
+    dest = "MiniCPM5-2B-MLX/chat_template.jinja"
+    sha256 = "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c"
+    size = 9060
 
 # Qwen3.8-Flash-Next sourcing: the weights are unsloth's UD export of
 # Qwen/Qwen3.8-Flash-Next (quantiser repo huggingface.co/unsloth, recorded in
@@ -6159,3 +6412,391 @@ revision = "2026-08-09"
     dest = "roest-v3-whisper-1.5b/LICENSE.txt"
     sha256 = "f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e"
     size = 16554
+
+# ── image generation ─────────────────────────────────────────────────────────
+#
+# Qwen-Image-2.1 (released 2026-09-20): the first image-generation model here,
+# and the first under a NON-COMMERCIAL licence - the Qwen Research License
+# (research and evaluation only; commercial use needs a licence from Qwen), so
+# "non-commercial / preview" is its honest name everywhere it shows. Served by
+# gpu_model/qwen_image over POST /v1/images/generations: a 7B single-stream
+# DiT (the weights), the Qwen3-VL-8B text encoder (companion, required - the
+# DiT conditions on its hidden states; the compact DiT pairs with the compact
+# encoder) and the official 64-channel VAE (companion, required - it turns
+# latents into pixels). No KV cache, no context window: priced as a single
+# pass - weights + companions + the render's workspace. Text to image only;
+# editing (the encoder's vision tower, the VAE encoder) is the next phase.
+#
+# Qwen ships no GGUF of the DiT; unsloth's conversion is the elected line
+# (Q8_0 default, Q4_K_M compact - no UD-Q4_K_XL exists for it). The text
+# encoder is the OFFICIAL Qwen/Qwen3-VL-8B-Instruct-GGUF (Apache-2.0), the VAE
+# the official safetensors from Qwen/Qwen-Image-2.1 (F32 on disk; resident as
+# f16 GEMM planes). LICENSE sits beside the DiT bytes and beside the VAE on
+# R2, as the agreement's s.3(a) requires.
+#
+# Numbers (A6000, 2026-09-22, tests/gpu_qwen_image_t2i.rs): resident weights
+# are the loader's own ledger; `workspace` is the render's transient at the
+# default 1024^2 (the nvidia-smi peak less weights and the CUDA context). It
+# grows with the output - ~9 GB at 1280^2, ~22 GB at 2048^2, ~31 GB at the
+# 2752 ceiling, most of it the whole-plane VAE decode - so a bigger render on
+# a smaller card fails with an allocation error, never silently. A tiled VAE
+# decode is the target that removes that growth.
+
+[[model]]
+id = "qwen-image-2.1"
+vendor = "Alibaba"
+display = "Qwen-Image 2.1"
+family = "qwen-image"
+capability = ["image-generation"]
+license = "qwen-research"
+revision = "2026-09-22"
+
+  [model.specs]
+  params = "7B DiT + 8B text encoder"
+  homepage = "https://huggingface.co/Qwen/Qwen-Image-2.1"
+  published_at = "2026-09-20"
+  published_source = "https://huggingface.co/Qwen/Qwen-Image-2.1/commit/790c92633540aa0cb11d9abf19eb46d861714758"
+  about = "Alibaba's image model: a picture from a text prompt, with any text in the picture rendered legibly. Non-commercial, and a preview here."
+  strengths = [
+    "Renders text inside images well - signs, labels, posters",
+    "Any size on a 32-pixel grid up to 2752 a side, transparent backgrounds, and every render seeded and reproducible",
+    "Prompts are read by a full 8B language model, so long descriptions hold together",
+  ]
+  tradeoffs = [
+    "Non-commercial: the Qwen Research License allows research and evaluation only",
+    "Reference-image editing uses the optional GGUF vision tower or the MLX package's embedded tower",
+    "Three downloads and 17 GB of VRAM at full quality (10 GB compact), plus room that grows with the picture: about 6 GB more at 1024 x 1024",
+    "About 40 seconds per 1024 x 1024 image on an A6000 at the model's 40 steps",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality (non-commercial / preview)"
+  quant = "Q8_0"
+  default = true
+  runtime = { backends = ["cuda"], companions = ["text-encoder", "vae", "mmproj"] }
+  # the render's transient at 1024^2 - see the section note
+  workspace = 6300000000
+
+  # The export is unsloth's conversion of Qwen's release, under Qwen's licence.
+  [model.artifact.source]
+  repo = "unsloth/Qwen-Image-2.1-GGUF"
+  revision = "84582aba1e469f790658baa440ec53022a465609"
+  base_model = "Qwen/Qwen-Image-2.1"
+  license = "qwen-research"
+  license_url = "https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE"
+
+  # the DiT alone; its two companions carry their own bytes below
+  [model.artifact.shape]
+  weight_bytes = 7641563136
+  kind = "image"
+  source = "measured"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q8_0.gguf"
+    dest = "Qwen-Image-2.1-GGUF/qwen-image-2.1-Q8_0.gguf"
+    sha256 = "c0ed4b2ffd56cbe9c3df1e4a4098045256484ebe94ba5a7e4338d35ec046baa5"
+    size = 7640860384
+
+    # the agreement travels with the bytes, in the same artifact
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1-GGUF/LICENSE"
+    dest = "Qwen-Image-2.1-GGUF/LICENSE"
+    sha256 = "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
+    size = 7831
+
+  [[model.artifact]]
+  id = "q4"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact (non-commercial / preview)"
+  quant = "Q4_K_M"
+  runtime = { backends = ["cuda", "metal"], companions = ["text-encoder-q4", "vae", "mmproj"], backend_overrides = { metal = { default = false, kv_cache_dtype = "f16", default_max_batch = 1, note = "Native Metal generation and reference-image editing with the Qwen3-VL vision companion. Independent full-generation parity and performance qualification remain open." } } }
+  workspace = 6300000000
+
+  [model.artifact.source]
+  repo = "unsloth/Qwen-Image-2.1-GGUF"
+  revision = "84582aba1e469f790658baa440ec53022a465609"
+  base_model = "Qwen/Qwen-Image-2.1"
+  license = "qwen-research"
+  license_url = "https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE"
+
+  [model.artifact.shape]
+  weight_bytes = 4419813376
+  kind = "image"
+  source = "measured"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf"
+    dest = "Qwen-Image-2.1-GGUF/qwen-image-2.1-Q4_K_M.gguf"
+    sha256 = "631d532e7ca71e8d90a87c71d3699761a812039d22e3370e87498d87754660fe"
+    size = 4199565024
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1-GGUF/LICENSE"
+    dest = "Qwen-Image-2.1-GGUF/LICENSE"
+    sha256 = "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
+    size = 7831
+
+  # Self-contained pinned MLX export; no GGUF companion inheritance.
+  [[model.artifact]]
+  id = "mlx-4bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 4-bit (macOS, non-commercial)"
+  quant = "MLX-AFFINE-4-G64"
+  default = false
+  workspace = 6300000000
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  capability = ["image-generation"]
+  companions = []
+  checkpoint_dir = true
+  embedded_vision = true
+  kv_cache_dtype = "auto"
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native Metal generation and reference-image editing from the complete MLX checkpoint, including vision and DeepStack. Packed affine-4/group-64 projections; no Python runtime or GGUF conversion. Full image-quality/performance qualification remains open."
+  backend_overrides = { metal = { default = true } }
+
+  [model.artifact.source]
+  repo = "mlx-community/Qwen-Image-2.1-MLX-4bit"
+  revision = "4db4e8c0c0e7a1debf0320415bec8388e888494c"
+  base_model = "Qwen/Qwen-Image-2.1"
+  license = "qwen-research"
+  license_url = "https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/790c92633540aa0cb11d9abf19eb46d861714758/LICENSE"
+
+  [model.artifact.shape]
+  weight_bytes = 8766210512
+  kind = "image"
+  source = "measured"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/model_index.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/model_index.json"
+    sha256 = "cf1ecd104ea090855d60d8cec0895c1e9d6ee41b2f87e231b678beecd1cf7809"
+    size = 447
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/LICENSE"
+    dest = "Qwen-Image-2.1-MLX-4bit/LICENSE"
+    sha256 = "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
+    size = 7831
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/Notice"
+    dest = "Qwen-Image-2.1-MLX-4bit/Notice"
+    sha256 = "7973e08f5c492afc1f2ad3a17735c074c268d44bcb09eab1e8c70a00d67620b7"
+    size = 574
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/added_tokens.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/added_tokens.json"
+    sha256 = "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+    size = 707
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/chat_template.jinja"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/chat_template.jinja"
+    sha256 = "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4"
+    size = 5292
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/merges.txt"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/merges.txt"
+    sha256 = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+    size = 1671853
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/preprocessor_config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/preprocessor_config.json"
+    sha256 = "93585062a80db5e8ca038efc7726a3e6411d9db948472d81d63c6303993be8c5"
+    size = 782
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/special_tokens_map.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/special_tokens_map.json"
+    sha256 = "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+    size = 613
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/tokenizer_config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/tokenizer_config.json"
+    sha256 = "81ec7bb9530159b326c0bef1d0b6c33d392090524014ea3f0123a3c1eb9c2af5"
+    size = 5445
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/tokenizer.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/tokenizer.json"
+    sha256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    size = 11422654
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/video_preprocessor_config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/video_preprocessor_config.json"
+    sha256 = "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1"
+    size = 817
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/processor/vocab.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/processor/vocab.json"
+    sha256 = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    size = 2776833
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/README.md"
+    dest = "Qwen-Image-2.1-MLX-4bit/README.md"
+    sha256 = "a2844dcd9b9636f7a0c32dfa62662f50fd28be307b0dc9881213ec408fac3676"
+    size = 438
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/scheduler/scheduler_config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/scheduler/scheduler_config.json"
+    sha256 = "5895f3a167c14a967fe9ac70c64924ae5acc79799e0679fd12907e594a713cd1"
+    size = 485
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/text_encoder/config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/text_encoder/config.json"
+    sha256 = "bfde5542ec2bba8fe16c611c273f711831eb35d91df7559984239fab427b523a"
+    size = 1621
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/text_encoder/model.safetensors"
+    dest = "Qwen-Image-2.1-MLX-4bit/text_encoder/model.safetensors"
+    sha256 = "d3a6131dfba2f78edc8ba84f235b08dcbf59c730b5024940b902b6a5c821b4cf"
+    size = 5127776247
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/text_encoder/model.safetensors.index.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/text_encoder/model.safetensors.index.json"
+    sha256 = "b96dadd4af6b8f9ed79a13d907aad75171f7a2d56ee9c5248fc30c371562bef4"
+    size = 115988
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/transformer/config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/transformer/config.json"
+    sha256 = "bf9f97db481b7e9545b80923dae79dad5ed3de60988020e252f441b51b32dbc2"
+    size = 474
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/transformer/model.safetensors"
+    dest = "Qwen-Image-2.1-MLX-4bit/transformer/model.safetensors"
+    sha256 = "5b4ba8be14ca1e35cfcde20960ed2e0764ed51c7ddd74018222975c289fcbd5a"
+    size = 4002363691
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/transformer/model.safetensors.index.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/transformer/model.safetensors.index.json"
+    sha256 = "ce26fb02303b39e22770e025dfc6c095c5b68dbad83df8dcd46ebcdbf550bce9"
+    size = 55344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/vae/config.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/vae/config.json"
+    sha256 = "38c2429ce8251ff92f074d499b774e10779fbd217b22af553db9006069954c5b"
+    size = 2100
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/vae/model.safetensors"
+    dest = "Qwen-Image-2.1-MLX-4bit/vae/model.safetensors"
+    sha256 = "6e082a9cf22e3fb0f3d947328ea2ed67e54b11ea3901a96127389177474c3302"
+    size = 1350988930
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/4db4e8c0c0e7a1debf0320415bec8388e888494c/Qwen-Image-2.1-MLX-4bit/vae/model.safetensors.index.json"
+    dest = "Qwen-Image-2.1-MLX-4bit/vae/model.safetensors.index.json"
+    sha256 = "2de8a0f5bd929b8c04ffee563f96649d5960482b6b87ceaae900f4cbc83bd021"
+    size = 17786
+
+  # Required, not optional: the DiT conditions on this encoder's hidden states
+  # and refuses to start without it. The official Qwen3-VL-8B GGUF, text stack
+  # only - its vision tower (the mmproj) is the editing lane's and is not
+  # pulled until that lane serves. Two of them, one per DiT: the full DiT
+  # pairs with the Q8_0 encoder, the compact one with the Q4_K_M encoder, and
+  # each weights artifact's `companions` list says which.
+  [[model.artifact]]
+  id = "text-encoder"
+  kind = "text-encoder"
+  format = "gguf"
+  label = "Text encoder (Qwen3-VL-8B, Q8_0)"
+  quant = "Q8_0"
+  default = true
+  required = true
+  runtime = { backends = ["cuda"] }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q8_0.gguf"
+    dest = "Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q8_0.gguf"
+    sha256 = "0d264b3941185d00a74f75c4245521dae088ff1efc90ab8d1754e83f5844adb0"
+    size = 8709519456
+
+  [[model.artifact]]
+  id = "text-encoder-q4"
+  kind = "text-encoder"
+  format = "gguf"
+  label = "Text encoder (Qwen3-VL-8B, Q4_K_M)"
+  quant = "Q4_K_M"
+  default = true
+  required = true
+  runtime = { backends = ["cuda", "metal"] }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+    dest = "Qwen3-VL-8B-Instruct-GGUF/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+    sha256 = "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"
+    size = 5027784800
+
+  # The editing lane: the official Qwen3-VL-8B vision tower (F16 - never the
+  # quantized siblings, the tower rule on every row). Default, so a download
+  # brings it, but not required: text-to-image serves without it, and the
+  # runner advertises `edit` only when it is wired. With it, `/v1/images/edits`
+  # takes up to ten reference pictures.
+  [[model.artifact]]
+  id = "mmproj"
+  kind = "vision"
+  format = "gguf"
+  label = "Vision tower for editing (Qwen3-VL-8B, F16)"
+  default = true
+  runtime = { backends = ["cuda", "metal"] }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+    dest = "Qwen3-VL-8B-Instruct-GGUF/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+    sha256 = "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38"
+    size = 1159029824
+
+  # Required too: latents are not a picture until this decodes them. The
+  # official F32 file with its geometry beside it (the loader reads the
+  # weights; config.json is the file's own description of them, kept so the
+  # directory is Qwen's, not a bare tensor blob) and the licence.
+  [[model.artifact]]
+  id = "vae"
+  kind = "vae"
+  format = "safetensors"
+  label = "VAE (official, F32)"
+  default = true
+  required = true
+  runtime = { backends = ["cuda", "metal"] }
+
+    # file[0] is what the runner is handed
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1/vae/diffusion_pytorch_model.safetensors"
+    dest = "Qwen-Image-2.1/vae/diffusion_pytorch_model.safetensors"
+    sha256 = "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"
+    size = 1350989512
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1/vae/config.json"
+    dest = "Qwen-Image-2.1/vae/config.json"
+    sha256 = "9785d527b278cb8b210e9f48a8028d92a4190968ce7e24c8fc85d9d1b82f6ba2"
+    size = 2079
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen-Image-2.1/LICENSE"
+    dest = "Qwen-Image-2.1/LICENSE"
+    sha256 = "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
+    size = 7831

@@ -7,32 +7,48 @@ import UniformTypeIdentifiers
 import WebKit
 
 /// App-lifetime native Studio. Swift owns state, networking, capture and UI.
-/// A web view exists only while an allowed document/graph viewer is open.
+/// Independent web views exist only for allowed document/graph viewers.
 @MainActor @Observable
 public final class StudioWorkspace: NSObject {
   @ObservationIgnored var runtime: NativeStudioRuntime?
   @ObservationIgnored var nativeTransport: NativeConversationTransport?
-  @ObservationIgnored private var viewer: StudioViewerHost?
+  @ObservationIgnored private var viewers: [NativeViewerRole: StudioViewerHost] = [:]
   @ObservationIgnored private var preparingGraph = false
   @ObservationIgnored var microphone: NativeMicrophoneSession?
-  /// Created only by an explicitly opened Lector/Scriptor/Traverse pane.
-  public var webView: WKWebView {
-    if let viewer { return viewer.webView }
-    let value = StudioViewerHost(owner: self)
-    viewer = value
+  /// Compatibility for document diagnostics. Shipping slots select a role.
+  public var webView: WKWebView { webView(for: .document) }
+  public func webView(for role: NativeViewerRole) -> WKWebView {
+    viewer(for: role).webView
+  }
+  private func viewer(for role: NativeViewerRole) -> StudioViewerHost {
+    if let viewer = viewers[role] { return viewer }
+    let value = StudioViewerHost(owner: self, role: role)
+    viewers[role] = value
     Task { [weak self, weak value] in
       guard let self, let value else { return }
       do {
         let root = Bundle.main.resourceURL!.appending(path: "StudioWorkspace")
         let host = try await client.studio(assets: root)
+        guard viewers[role] === value, !closed else { return }
         try await value.start(host: host)
-        if !preparingGraph { await updateViewer() }
-      } catch { self.error = error.localizedDescription }
+        if viewers[role] === value, !value.preparedForAdmission { await updateViewer(role) }
+      } catch {
+        if viewers[role] === value, !closed { self.error = error.localizedDescription }
+      }
     }
-    return value.webView
+    return value
   }
-  public var hasWebViewer: Bool { viewer != nil }
-  var viewerWindow: NSWindow? { viewer?.webView.window }
+  public var hasWebViewer: Bool { !viewers.isEmpty }
+  public func hasWebViewer(for role: NativeViewerRole) -> Bool { viewers[role] != nil }
+  var viewerWindow: NSWindow? {
+    viewers[.document]?.webView.window ?? viewers[.graph]?.webView.window
+  }
+  private func closeViewer(_ role: NativeViewerRole) {
+    viewers.removeValue(forKey: role)?.close()
+  }
+  private func closeViewers() {
+    for role in NativeViewerRole.allCases { closeViewer(role) }
+  }
   /// Native panels belong to the composer window even while the WebKit split
   /// item is collapsed and its view is temporarily outside the window tree.
   @ObservationIgnored public weak var presentationWindow: NSWindow?
@@ -70,6 +86,7 @@ public final class StudioWorkspace: NSObject {
   public var hasArtifactEdits: Bool { artifactDrafts.values.contains { $0.saved != $0.text } }
   public let audioPlayback = StudioAudioPlayback()
   public let audioMedia = StudioAudioMedia()
+  public let documentMedia = StudioDocumentMedia()
   public let microphoneMeter = StudioMicrophoneMeter()
   public internal(set) var microphoneStarting = false
   @ObservationIgnored var captureRequested = false
@@ -133,6 +150,7 @@ public final class StudioWorkspace: NSObject {
           },
           rasterPDF: { bytes, part in try await NativePDFInput.shared.parts(bytes, metadata: part)
           },
+          openPDF: { bytes in try await NativePDFInput.shared.source(bytes) },
           publish: { [weak self] fields in
             await self?.receiveNative(fields)
           })
@@ -167,19 +185,29 @@ public final class StudioWorkspace: NSObject {
       NSLog("Paddock native presentation failed: %@", String(describing: error))
     }
   }
-  private func updateViewer() async {
-    guard !preparingGraph, let viewer, let runtime else { return }
-    let state = await runtime.viewerState()
-    do { try await viewer.update(state, dark: dark) } catch {
-      if self.viewer === viewer { self.error = error.localizedDescription }
+  private func updateViewer(_ role: NativeViewerRole) async {
+    guard !(role == .graph && preparingGraph), let viewer = viewers[role], let runtime else {
+      return
     }
+    let state = await runtime.viewerState()
+    guard viewers[role] === viewer else { return }
+    do { try await viewer.update(state, dark: dark) } catch {
+      if viewers[role] === viewer { self.error = error.localizedDescription }
+    }
+  }
+  private func updateViewers() async {
+    // A loading Traverse must not delay an independent document/theme update.
+    async let document: Void = updateViewer(.document)
+    async let graph: Void = updateViewer(.graph)
+    _ = await (document, graph)
   }
   private func prepareGraph(_ fields: [String: ConversationValue]) async throws -> String {
     preparingGraph = true
     defer { preparingGraph = false }
-    _ = webView
-    guard let viewer else { throw ManagerError.core("Traverse could not open") }
+    let viewer = viewer(for: .graph)
+    viewer.preparedForAdmission = true
     try await viewer.waitUntilReady()
+    guard viewers[.graph] === viewer else { throw CancellationError() }
     return try await viewer.update(fields, dark: dark)
   }
   public static func validHost(_ host: StudioHost) -> Bool {
@@ -193,10 +221,12 @@ public final class StudioWorkspace: NSObject {
     guard value.version == 1, value.revision > receivedRevision else { return }
     receivedRevision = value.revision
     if value.conversation?.id != state?.conversation?.id {
+      if state?.conversation?.id != nil { closeViewers() }
       selectedArtifactId = nil
       artifactPicks = [:]
       dismissedArtifactIDs = []
       audioMedia.reset()
+      documentMedia.reset()
     }
     if value.conversation?.id != state?.conversation?.id || value.audio?.busy == true {
       audioPlayback.reset()
@@ -219,11 +249,10 @@ public final class StudioWorkspace: NSObject {
     } else {
       selectedArtifactId = nil
     }
-    if !value.busy, !preparingGraph, value.nativeDocument == nil, value.nativeGraph?.visible != true
-    {
-      viewer?.close()
-      viewer = nil
-    }
+    if !["pdf", "docx"].contains(value.nativeDocument?.kind ?? "") { closeViewer(.document) }
+    // Keep the model's graph bridge alive through a turn even if its panel
+    // closes. Closing the left pane must never cancel that bridge.
+    if !value.busy, !preparingGraph, value.nativeGraph?.visible != true { closeViewer(.graph) }
     if let audio = value.audio {
       if dictationSession != audio.session {
         dictationSession = audio.session
@@ -246,7 +275,7 @@ public final class StudioWorkspace: NSObject {
     guard ready, !closed else {
       throw ManagerError.core("Wait for the content workspace to finish opening")
     }
-    if hasMessageEdit && ["newChat", "open", "renderer", "send"].contains(kind) {
+    if hasMessageEdit && ["newChat", "open", "openEndpoint", "renderer", "send"].contains(kind) {
       throw ManagerError.core("Send or cancel the message edit first. Nothing was discarded.")
     }
     if hasMessageEdit, kind == "deleteChats",
@@ -255,7 +284,9 @@ public final class StudioWorkspace: NSObject {
       throw ManagerError.core("Send or cancel the message edit before deleting this conversation.")
     }
     if kind == "documentAction" {
-      guard let viewer else { throw ManagerError.core("Open a document first") }
+      guard let viewer = viewers[.document] else {
+        throw ManagerError.core("Open a document first")
+      }
       try await viewer.action(payload["action"]?.text ?? "")
       return [:]
     }
@@ -266,16 +297,12 @@ public final class StudioWorkspace: NSObject {
       return try await audioCommand(kind, native)
     }
     let reply = try await runtime.command(kind, native, id: id)
-    if ["preview", "openDocument", "graphArtifact", "graphPanel", "closePreview"].contains(kind) {
-      await updateViewer()
-    }
-    if ["newChat", "open"].contains(kind)
-      || ((kind == "closePreview" || kind == "graphPanel" && payload["open"]?.boolean == false)
-        && state?.busy != true)
+    if ["preview", "openDocument", "graphArtifact", "graphPanel", "closePreview", "messageAction"]
+      .contains(kind)
     {
-      viewer?.close()
-      viewer = nil
+      await updateViewers()
     }
+    if ["newChat", "open", "openEndpoint"].contains(kind) { closeViewers() }
     return try JSONDecoder().decode([String: StudioValue].self, from: JSONEncoder().encode(reply))
   }
   public func perform(_ kind: String, _ payload: [String: StudioValue] = [:]) async {
@@ -324,6 +351,10 @@ public final class StudioWorkspace: NSObject {
     } catch { self.error = describe(error) }
   }
   public func send(_ text: String) async -> Bool {
+    if let issue = attachmentBudgetIssue(for: text) {
+      error = issue
+      return false
+    }
     guard !busy, !uploading, attachments.allSatisfy({ $0.ready && $0.selectionError == nil }) else {
       return false
     }
@@ -358,7 +389,7 @@ public final class StudioWorkspace: NSObject {
   }
   public func setDark(_ value: Bool) async {
     dark = value
-    await updateViewer()
+    await updateViewers()
   }
   public func setComposerInset(_ height: Double) async {
     composerInset = height
@@ -606,9 +637,27 @@ public final class StudioWorkspace: NSObject {
       attachments.contains(where: { $0.id == id }) || state?.nativeDocument?.id == id
         || state?.nativeTranscript?.messages.contains(where: { m in
           m.attachments?.contains(where: { $0.id == id }) == true
+            || m.pictures?.contains(where: { $0.id == id && !$0.preview }) == true
             || m.files?.contains(where: { $0.id == id && $0.stored }) == true
         }) == true
     else { throw ManagerError.core("This attachment is no longer on the displayed branch") }
+    if let inline = state?.nativeTranscript?.messages.flatMap({ $0.pictures ?? [] })
+      .first(where: { $0.id == id && !$0.preview })?.dataURL
+    {
+      return try await Task.detached(priority: .userInitiated) {
+        guard inline.utf8.count <= 64 * 1024 * 1024,
+          ["png", "jpeg", "webp"].contains(where: { inline.hasPrefix("data:image/\($0);base64,") }),
+          let comma = inline.firstIndex(of: ","),
+          let bytes = Data(base64Encoded: String(inline[inline.index(after: comma)...])),
+          !bytes.isEmpty
+        else { throw ManagerError.core("The saved image is invalid") }
+        try Task.checkCancellation()
+        let file = FileManager.default.temporaryDirectory.appending(
+          path: "Paddock-preview-\(UUID().uuidString)")
+        try bytes.write(to: file, options: [.atomic, .completeFileProtectionUnlessOpen])
+        return file
+      }.value
+    }
     let request = try localRequest("api/attachments/\(id)")
     let (file, response) = try await network.download(for: request)
     defer { try? FileManager.default.removeItem(at: file) }
@@ -649,6 +698,7 @@ public final class StudioWorkspace: NSObject {
   public func shutdown() async {
     audioPlayback.reset()
     audioMedia.reset()
+    documentMedia.reset()
     captureRequested = false
     microphoneEpoch += 1
     for task in incomingDrops.values { task.cancel() }
@@ -663,8 +713,7 @@ public final class StudioWorkspace: NSObject {
     closed = true
     ready = false
     network.invalidateAndCancel()
-    viewer?.close()
-    viewer = nil
+    closeViewers()
   }
   private func describe(_ error: any Error) -> String { error.localizedDescription }
 }

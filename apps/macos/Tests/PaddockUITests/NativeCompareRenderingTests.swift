@@ -145,10 +145,13 @@ struct NativeCompareRenderingTests {
       "streaming": false, "stopped": false, "error": "", "incomplete": false,
     ]
     let lanes: [[String: Any]] = (0..<count).map { i in
-      [
+      // Outside the literal: inline, Swift 6.3.3 cannot type-check it in time.
+      let text: String =
+        "## Lane \(i)\n\nSelectable **Markdown**.\n\n```swift\nlet x = \(i)\n```"
+        + (i == 0 ? delta : "")
+      return [
         "id": "lane-\(i)", "group": "lane-0", "role": "assistant",
-        "text": "## Lane \(i)\n\nSelectable **Markdown**.\n\n```swift\nlet x = \(i)\n```"
-          + (i == 0 ? delta : ""), "model": i == 0 ? "qwen" : "cloud:account:meta/muse@meta",
+        "text": text, "model": i == 0 ? "qwen" : "cloud:account:meta/muse@meta",
         "reasoning": "", "streaming": i == 0, "stopped": false, "error": "", "incomplete": false,
         "contended": i == 0,
         "chrome": [

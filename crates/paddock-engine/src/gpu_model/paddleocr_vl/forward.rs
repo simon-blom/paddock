@@ -282,9 +282,9 @@ impl GpuPaddleOcrVl {
 
             for (li, layer) in layers.iter().enumerate() {
                 exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-                layer.wq.gemv(&exec, &sc.d_xn, &mut sc.d_q)?;
-                layer.wk.gemv(&exec, &sc.d_xn, &mut sc.d_k)?;
-                layer.wv.gemv(&exec, &sc.d_xn, &mut sc.d_v)?;
+                layer.wq.gemv_exact(&exec, &sc.d_xn, &mut sc.d_q)?;
+                layer.wk.gemv_exact(&exec, &sc.d_xn, &mut sc.d_k)?;
+                layer.wv.gemv_exact(&exec, &sc.d_xn, &mut sc.d_v)?;
                 exec.mrope(
                     &mut sc.d_q,
                     &ds.d_mrope,
@@ -344,14 +344,16 @@ impl GpuPaddleOcrVl {
                     scale,
                     kv_dtype,
                 )?;
-                layer.wo.gemv(&exec, &sc.d_attn, &mut sc.d_proj)?;
+                layer.wo.gemv_exact(&exec, &sc.d_attn, &mut sc.d_proj)?;
                 exec.add(&mut sc.d_x, &sc.d_proj, embd)?;
 
                 exec.rmsnorm_batch(&sc.d_x, &layer.ffn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-                layer.gate.gemv(&exec, &sc.d_xn, &mut sc.d_ffn_gate)?;
-                layer.up.gemv(&exec, &sc.d_xn, &mut sc.d_ffn_up)?;
+                layer.gate.gemv_exact(&exec, &sc.d_xn, &mut sc.d_ffn_gate)?;
+                layer.up.gemv_exact(&exec, &sc.d_xn, &mut sc.d_ffn_up)?;
                 exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, n_ff)?;
-                layer.down.gemv(&exec, &sc.d_ffn_gate, &mut sc.d_proj)?;
+                layer
+                    .down
+                    .gemv_exact(&exec, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 exec.add(&mut sc.d_x, &sc.d_proj, embd)?;
             }
             ds.pos += 1;
@@ -374,7 +376,7 @@ impl GpuPaddleOcrVl {
             hp.eps,
             1,
         )?;
-        self.lm_head.gemv(&exec, &sc.d_xn, &mut sc.d_logits)?;
+        self.lm_head.gemv_exact(&exec, &sc.d_xn, &mut sc.d_logits)?;
         Ok(exec.to_host(&sc.d_logits)?)
     }
 
@@ -505,9 +507,9 @@ impl GpuPaddleOcrVl {
             }
             for (li, layer) in layers.iter().enumerate() {
                 exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-                layer.wq.gemv(&exec, &sc.d_xn, &mut sc.d_q)?;
-                layer.wk.gemv(&exec, &sc.d_xn, &mut sc.d_k)?;
-                layer.wv.gemv(&exec, &sc.d_xn, &mut sc.d_v)?;
+                layer.wq.gemv_exact(&exec, &sc.d_xn, &mut sc.d_q)?;
+                layer.wk.gemv_exact(&exec, &sc.d_xn, &mut sc.d_k)?;
+                layer.wv.gemv_exact(&exec, &sc.d_xn, &mut sc.d_v)?;
                 exec.mrope(
                     &mut sc.d_q,
                     &ds.d_mrope,
@@ -566,13 +568,15 @@ impl GpuPaddleOcrVl {
                     scale,
                     kv_dtype,
                 )?;
-                layer.wo.gemv(&exec, &sc.d_attn, &mut sc.d_proj)?;
+                layer.wo.gemv_exact(&exec, &sc.d_attn, &mut sc.d_proj)?;
                 exec.add(&mut sc.d_x, &sc.d_proj, embd)?;
                 exec.rmsnorm_batch(&sc.d_x, &layer.ffn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-                layer.gate.gemv(&exec, &sc.d_xn, &mut sc.d_ffn_gate)?;
-                layer.up.gemv(&exec, &sc.d_xn, &mut sc.d_ffn_up)?;
+                layer.gate.gemv_exact(&exec, &sc.d_xn, &mut sc.d_ffn_gate)?;
+                layer.up.gemv_exact(&exec, &sc.d_xn, &mut sc.d_ffn_up)?;
                 exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, n_ff)?;
-                layer.down.gemv(&exec, &sc.d_ffn_gate, &mut sc.d_proj)?;
+                layer
+                    .down
+                    .gemv_exact(&exec, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 exec.add(&mut sc.d_x, &sc.d_proj, embd)?;
                 if let Some(sink) = taps.layers.get_mut(&li) {
                     sink.extend(exec.to_host(&sc.d_x)?);
@@ -783,6 +787,21 @@ impl crate::generator::Generator for GpuPaddleOcrVl {
 
     fn supports_chunked_prefill(&self) -> bool {
         self.batch.is_some()
+    }
+
+    // the mixed tick's FIFO over the queue, row-exact from each cursor
+    fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
+        self.chunked
+            .iter()
+            .map(|c| (c.slot, c.cursor, c.rows.len() - c.cursor))
+            .collect()
+    }
+
+    // plan_chunk's cap under the pass's row capacity (the decode rows share it)
+    fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        self.batch.as_ref().map_or(0, |bs| {
+            crate::gpu_model::granite::batch::pf_rows().min(bs.cap.saturating_sub(decode_rows))
+        })
     }
 
     fn prefill_begin(

@@ -501,6 +501,17 @@ watch([mainEl, nativeColumnEl], ([main, column], [oldMain, oldColumn]) => {
   if (column) composerRo?.observe(column)
   watchThread()
 }, { flush: 'post' })
+// The composer is an async component: on a cold load its ref is still empty
+// when onMounted measures, so the element was neither observed nor measured
+// and the thread kept the 96px fallback under a 160px+ composer - the last
+// message's footer sat behind it until something else happened to resize the
+// thread. Bind when the ref resolves.
+watch(composerRef, () => {
+  const el = composerEl()
+  if (!el || !composerRo) return
+  composerRo.observe(el)
+  measureComposer()
+}, { flush: 'post' })
 // Back/forward + sidebar clicks change the URL; follow it. Watch the route NAME
 // too, not just the id: `/` ⇄ `/chat/:id` is a name change, and going home has
 // to mint a fresh draft.

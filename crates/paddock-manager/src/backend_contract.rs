@@ -9,19 +9,29 @@ pub fn metal_kv_offload(model: &CatalogModel, weights: &CatalogArtifact) -> bool
         && weights.capabilities(model).iter().any(|c| c == "chat")
         && matches!(
             model.family.as_deref(),
-            Some("qwen3.5" | "qwen3.6" | "qwen3.8" | "bonsai" | "granite" | "gpt-oss" | "laguna")
+            Some(
+                "qwen3.5"
+                    | "qwen3.6"
+                    | "qwen3.8"
+                    | "bonsai"
+                    | "granite"
+                    | "minicpm"
+                    | "gpt-oss"
+                    | "laguna"
+            )
         )
 }
 
 pub fn path_kv_offload(path: &Path) -> bool {
     if path.is_dir() {
         return paddock_models::mlx::QwenConfig::read(path).is_ok()
+            || paddock_models::mlx::MiniCpmConfig::read(path).is_ok()
             || paddock_models::bonsai::BonsaiConfig::read(path).is_ok();
     }
     paddock_models::probe::probe_path(path).is_ok_and(|p| {
         matches!(
             p.architecture.as_deref(),
-            Some("qwen35" | "qwen35moe" | "granite" | "gpt-oss" | "laguna")
+            Some("qwen35" | "qwen35moe" | "granite" | "llama" | "gpt-oss" | "laguna")
         )
     })
 }
@@ -102,6 +112,9 @@ mod tests {
             ("bonsai-2-27b", "mlx-2bit", true),
             ("bonsai-2-27b", "ptq1", true),
             ("qwen3.8-27b", "mlx-4bit", true),
+            ("minicpm5-2b", "q8", true),
+            ("minicpm5-2b", "q4", true),
+            ("minicpm5-2b", "mlx-4bit", true),
             ("gemma-4-31b", "mlx-4bit", false),
             ("muse-glimmer-30b", "mlx-4bit", false),
             ("qwen3.8-flash-next", "mlx-4bit", false),

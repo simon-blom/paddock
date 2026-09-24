@@ -353,7 +353,7 @@ impl Qwen4ExpGpu {
             .iter()
             .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
             .collect();
-        self.stage_inputs_runs_ids(&ids, &runs)?;
+        self.stage_inputs_runs_ids(&ids, &runs, 0)?;
         self.cur_runs = runs.clone();
         self.verify.as_mut().expect("built").active = true;
         let walked = self.device_walk(total, Phase::PrefillRuns);

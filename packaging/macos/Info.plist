@@ -6,12 +6,17 @@
     <key>CFBundleName</key><string>Paddock</string>
     <key>CFBundleDisplayName</key><string>Paddock</string>
     <key>CFBundleExecutable</key><string>Paddock</string>
+    <key>CFBundleIconFile</key><string>Paddock</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>SUFeedURL</key><string>https://github.com/truespar/paddock/releases/latest/download/appcast.xml</string>
+    <key>SUShowReleaseNotes</key><false/>
+    <key>SUEnableAutomaticChecks</key><false/>
+    <key>SUAllowsAutomaticUpdates</key><false/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Use model endpoints you configure on your local network.</string>
     <key>NSMicrophoneUsageDescription</key>

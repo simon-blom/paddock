@@ -40,10 +40,16 @@ const stoppedHere = computed(() => fleet.stopped.find((c) => c.port === port.val
 const boots = computed(() => fleet.bootPorts.has(port.value))
 
 /** What this page calls the model: catalog display first, id as fallback.
- *  A row carries exactly one of model/embedder/asr/aligner - all four are in
- *  the chain so a speech or aligner runner is never nameless here. */
+ *  A row carries exactly one of model/embedder/asr/aligner/image - all five
+ *  are in the chain so a speech, aligner or image runner is never nameless
+ *  here. */
 const servedId = computed(
-  () => row.value?.model ?? row.value?.embedder ?? row.value?.asr ?? row.value?.aligner,
+  () =>
+    row.value?.model ??
+    row.value?.embedder ??
+    row.value?.asr ??
+    row.value?.aligner ??
+    row.value?.image,
 )
 const title = computed(() => {
   const t = row.value?.display ?? modelLabel(servedId.value)
@@ -140,7 +146,9 @@ async function copyKey(): Promise<void> {
 }
 
 function openInStudio(): void {
-  const id = row.value?.model ?? row.value?.embedder
+  // an image model takes turns in the chat surface like any other, so it
+  // opens there too - selected, on a fresh draft
+  const id = row.value?.model ?? row.value?.embedder ?? row.value?.image
   if (id) selectStudioModel(id)
   void router.push({ name: 'home' })
 }

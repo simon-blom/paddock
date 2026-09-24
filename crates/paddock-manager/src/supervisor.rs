@@ -141,6 +141,12 @@ pub struct RunnerView {
     /// surface it cannot answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aligner: Option<String>,
+    /// Served image-generation model id - the fifth serving role, for the
+    /// same reason the others are: an image runner answers `/v1/images/*`
+    /// and refuses every text surface, so it must not be offered as any of
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     /// The catalog's human name for the served model ("Qwen 3.5 9B") + its
     /// maker - the labels every UI surface shows, with the technical id kept
     /// for tooltips. Absent when the catalog doesn't know the model.
@@ -253,6 +259,8 @@ pub const OWNED_CONFIG_KEYS: &[&str] = &[
     "model",
     "catalog",
     "mmproj",
+    "text_encoder",
+    "vae",
     "mtp",
     "fp8_native",
     "device",
@@ -374,12 +382,25 @@ pub struct ConfiguredEndpoint {
     pub running: bool,
 }
 
+/// An image lane's resident companions as resolved for one spawn: the text
+/// encoder and the VAE the DiT loads beside itself (`--text-encoder`,
+/// `--vae`). Carried as a pair because they are set and cleared together -
+/// a config with one and not the other cannot start - and empty for every
+/// other kind of model.
+#[derive(Debug, Clone, Default)]
+pub struct LanePaths {
+    pub text_encoder: Option<PathBuf>,
+    pub vae: Option<PathBuf>,
+}
+
 /// What a model name resolves to on disk for one spawn. Was a 4-tuple; the
 /// drafter identity made it worth naming, because "which drafter did On
 /// actually wire" is a question the UI now has to answer.
 pub struct Resolution {
     pub weights: PathBuf,
     pub mmproj: Option<PathBuf>,
+    /// An image lane's text encoder and VAE, resolved beside its DiT.
+    pub lane: LanePaths,
     pub mtp: Option<PathBuf>,
     pub fp8: Option<PathBuf>,
     /// `(artifact id, label)` of the drafter actually wired, when one was.
@@ -399,6 +420,7 @@ impl Resolution {
         Self {
             weights,
             mmproj: None,
+            lane: LanePaths::default(),
             mtp: None,
             fp8: None,
             drafter: None,
@@ -961,6 +983,17 @@ impl Supervisor {
             .and_then(|r| r.api_key.clone())
     }
 
+    /// Explicit native credential export names a process, not just a reusable
+    /// port. Read identity and credential under the same record lock.
+    pub async fn runner_key_checked(&self, port: u16, pid: u32) -> Result<Option<String>, String> {
+        let records = self.records.lock().await;
+        let runner = records
+            .get(&port)
+            .filter(|runner| runner.pid == pid)
+            .ok_or("The selected instance changed or stopped.")?;
+        Ok(runner.api_key.clone())
+    }
+
     /// Toggle §10.1 pinning on a recorded runner. Updates the live record and
     /// the election (when one exists), so the pin survives a manager restart.
     pub async fn set_pinned(&self, port: u16, pinned: bool) -> Result<(), String> {
@@ -1428,7 +1461,7 @@ impl Supervisor {
                 spec.runner_version = old.runner_version.clone();
             }
         }
-        let (weights, mmproj, mtp, fp8_dir, drafter_pick) = match self
+        let (weights, mmproj, lane, mtp, fp8_dir, drafter_pick) = match self
             .resolve_model(
                 &spec.model,
                 spec.artifact.as_deref(),
@@ -1438,7 +1471,7 @@ impl Supervisor {
             )
             .await
         {
-            Ok(r) => (r.weights, r.mmproj, r.mtp, r.fp8, r.drafter),
+            Ok(r) => (r.weights, r.mmproj, r.lane, r.mtp, r.fp8, r.drafter),
             // A model that is simply not downloaded yet still renders, with the
             // paths its files will land on - same rule as `preview_config`, and
             // the reason is the same: the edit page has to be able to show and
@@ -1451,7 +1484,7 @@ impl Supervisor {
                 .registry
                 .planned_paths(&spec.model, spec.artifact.as_deref())
             {
-                Some((w, mm, mt)) => (w, mm, mt, None, None),
+                Some((w, mm, mt)) => (w, mm, self.planned_lane(&spec), mt, None, None),
                 None => return Err(e.to_string()),
             },
         };
@@ -1476,6 +1509,17 @@ impl Supervisor {
                 ),
             });
         }
+        // same rule for an image lane's text encoder and VAE, which have no
+        // switch at all
+        if let Some(label) = self
+            .registry
+            .missing_required_lane_companion(&spec.model, spec.artifact.as_deref())
+        {
+            return Err(format!(
+                "{}: this model cannot serve without its {label}, which is not downloaded - get it on the Models page",
+                spec.model
+            ));
+        }
         let fp8 = if spec.fp8_native {
             match &fp8_dir {
                 Some(dir) => Some(dir.clone()),
@@ -1495,12 +1539,24 @@ impl Supervisor {
             port,
             &weights,
             &mmproj,
+            &lane,
             &mtp,
             spec.gpu.as_deref(),
             fp8.as_deref(),
             &spec,
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// An image lane's planned companion paths for a spec - where the text
+    /// encoder and VAE will land once pulled - for the save and preview paths
+    /// that render a not-yet-downloaded model. Empty for every other kind of
+    /// model.
+    fn planned_lane(&self, spec: &SpawnSpec) -> LanePaths {
+        let (text_encoder, vae) = self
+            .registry
+            .planned_lane_companions(&spec.model, spec.artifact.as_deref());
+        LanePaths { text_encoder, vae }
     }
 
     /// Reconstruct a SpawnSpec from an endpoint's config FILE alone - the file
@@ -2075,10 +2131,11 @@ impl Supervisor {
                                 r.pinned,
                                 r.spec_desc.clone(),
                                 r.spec.as_ref().map(RunnerConfig::from_spec),
+                                r.spec.as_ref().map(|s| s.model.clone()),
                             )
                         })
                     };
-                    let (origin, pinned, spec_desc, config) = match cached {
+                    let (origin, pinned, spec_desc, config, declared) = match cached {
                         Some(t) => t,
                         // Not adopted yet - the next reconcile pass will take
                         // it. Render what its config file says in the meantime
@@ -2094,9 +2151,10 @@ impl Supervisor {
                                     false,
                                     desc,
                                     Some(RunnerConfig::from_spec(&spec)),
+                                    Some(spec.model.clone()),
                                 )
                             }
-                            Err(_) => (Origin::Adopted, false, None, None),
+                            Err(_) => (Origin::Adopted, false, None, None, None),
                         },
                     };
                     let labels = id
@@ -2105,7 +2163,20 @@ impl Supervisor {
                         .or(id.embedder.as_deref())
                         .or(id.asr.as_deref())
                         .or(id.aligner.as_deref())
-                        .and_then(|n| self.registry.display_of(n));
+                        .or(id.image.as_deref())
+                        .and_then(|n| self.registry.display_of(n))
+                        // The runner names its weights FILE. When the catalog
+                        // does not know that file - a copy, a rename, a quant
+                        // the catalog lacks - the endpoint's own declaration
+                        // (its `[catalog]` block, reconciled at load into the
+                        // spec's model id) still names the model, so the row
+                        // keeps its name and its vendor mark. Same rule
+                        // `identity_for` states for /api/servers.
+                        .or_else(|| {
+                            declared
+                                .as_deref()
+                                .and_then(|m| self.registry.display_of(m))
+                        });
                     out.push(RunnerView {
                         port,
                         pid: id.pid,
@@ -2118,6 +2189,7 @@ impl Supervisor {
                         embedder: id.embedder,
                         asr: id.asr,
                         aligner: id.aligner,
+                        image: id.image,
                         display: labels.as_ref().map(|(d, _)| d.clone()),
                         vendor: labels.and_then(|(_, v)| v),
                         version: Some(id.version),
@@ -2150,6 +2222,7 @@ impl Supervisor {
                             embedder: None,
                             asr: None,
                             aligner: None,
+                            image: None,
                             display: labels.as_ref().map(|(d, _)| d.clone()),
                             vendor: labels.and_then(|(_, v)| v),
                             version: None,
@@ -2180,6 +2253,7 @@ impl Supervisor {
                             embedder: None,
                             asr: None,
                             aligner: None,
+                            image: None,
                             display: None,
                             vendor: None,
                             version: None,
@@ -2323,6 +2397,10 @@ impl Supervisor {
                 return Ok(Resolution {
                     weights: r.weights,
                     mmproj: r.mmproj,
+                    lane: LanePaths {
+                        text_encoder: r.text_encoder,
+                        vae: r.vae,
+                    },
                     mtp,
                     fp8: r.fp8_snapshot,
                     drafter: pick,
@@ -2448,11 +2526,13 @@ impl Supervisor {
     ///   standalone (`paddock-runner --config <file>`). The runner's
     ///   deny_unknown_fields is the drift guard: a key this writer gets wrong
     ///   refuses at spawn with a clear parse error, never silently.
+    #[allow(clippy::too_many_arguments)]
     fn write_server_config(
         &self,
         port: u16,
         weights: &Path,
         mmproj: &Option<PathBuf>,
+        lane: &LanePaths,
         mtp: &Option<PathBuf>,
         gpu: Option<&str>,
         fp8: Option<&Path>,
@@ -2461,7 +2541,7 @@ impl Supervisor {
         let dir = self.defaults.work_dir.join("servers");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{port}.toml"));
-        let text = self.render_server_config(port, weights, mmproj, mtp, gpu, fp8, spec)?;
+        let text = self.render_server_config(port, weights, mmproj, lane, mtp, gpu, fp8, spec)?;
         let mut options = std::fs::OpenOptions::new();
         options.create(true).write(true).truncate(true);
         // The file carries runner and connector credentials. New native
@@ -2482,11 +2562,13 @@ impl Supervisor {
     /// The config-file TEXT for a spec - Save writes exactly this, and the
     /// Start/Edit page's preview shows exactly this (one serializer; a
     /// preview that could drift from the file would be worse than none).
+    #[allow(clippy::too_many_arguments)]
     fn render_server_config(
         &self,
         port: u16,
         weights: &Path,
         mmproj: &Option<PathBuf>,
+        lane: &LanePaths,
         mtp: &Option<PathBuf>,
         gpu: Option<&str>,
         fp8: Option<&Path>,
@@ -2498,12 +2580,24 @@ impl Supervisor {
             model.artifact(art.as_deref()?).map(|a| (model, a))
         });
         let fixed_kv = selected.and_then(|(_, a)| a.runtime.kv_cache_dtype.as_deref());
-        let max_ctx = spec
-            .max_ctx
-            .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().0));
-        let max_batch = spec
-            .max_batch
-            .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().1));
+        // An image lane has no token envelope - a picture is one pass, nothing
+        // batched or windowed - so the keys stay out of its file instead of
+        // carrying the chat defaults as if the runner read them.
+        let image = selected.is_some_and(|(model, _)| {
+            crate::estimate::kind_for(&model.capability) == paddock_estimator::ModelKind::Image
+        });
+        let max_ctx = if image {
+            None
+        } else {
+            spec.max_ctx
+                .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().0))
+        };
+        let max_batch = if image {
+            None
+        } else {
+            spec.max_batch
+                .or_else(|| selected.map(|(_, a)| a.runtime.default_envelope().1))
+        };
         let no_spec = selected.is_some_and(|(model, a)| {
             (self.defaults.device == "metal" || a.runtime.capability.is_some())
                 && !a.capabilities(model).iter().any(|c| c == "speculative")
@@ -2646,6 +2740,14 @@ impl Supervisor {
         }
         if let Some(mm) = mmproj {
             t.insert("mmproj".into(), mm.display().to_string().into());
+        }
+        // an image lane's two pieces beside its DiT (`model`); absent on every
+        // other kind of model, and absent-in-render means removed
+        if let Some(p) = &lane.text_encoder {
+            t.insert("text_encoder".into(), p.display().to_string().into());
+        }
+        if let Some(p) = &lane.vae {
+            t.insert("vae".into(), p.display().to_string().into());
         }
         let spec_off = spec.spec_policy.as_deref().is_some_and(|s| {
             matches!(
@@ -2803,7 +2905,7 @@ impl Supervisor {
     /// download.
     pub async fn preview_config(&self, spec: SpawnSpec) -> Result<String, SpawnError> {
         let port = spec.port.unwrap_or(self.defaults.base_port);
-        let (weights, mmproj, mtp, fp8_dir) = match self
+        let (weights, mmproj, lane, mtp, fp8_dir) = match self
             .resolve_model(
                 &spec.model,
                 spec.artifact.as_deref(),
@@ -2813,7 +2915,7 @@ impl Supervisor {
             )
             .await
         {
-            Ok(r) => (r.weights, r.mmproj, r.mtp, r.fp8),
+            Ok(r) => (r.weights, r.mmproj, r.lane, r.mtp, r.fp8),
             // A model that simply is not downloaded yet still previews -
             // show where its files will land. A policy refusal does not:
             // previewing a config the spawn will reject would hand back a
@@ -2823,7 +2925,7 @@ impl Supervisor {
                 .registry
                 .planned_paths(&spec.model, spec.artifact.as_deref())
             {
-                Some((w, mm, mt)) => (w, mm, mt, None),
+                Some((w, mm, mt)) => (w, mm, self.planned_lane(&spec), mt, None),
                 None => return Err(e),
             },
         };
@@ -2842,6 +2944,7 @@ impl Supervisor {
             port,
             &weights,
             &mmproj,
+            &lane,
             &mtp,
             gpu.as_deref(),
             fp8.as_deref(),
@@ -2912,7 +3015,7 @@ impl Supervisor {
             )
             .await?;
         let spec_desc = r.spec_desc.clone();
-        let (weights, mmproj, mtp, fp8_dir) = (r.weights, r.mmproj, r.mtp, r.fp8);
+        let (weights, mmproj, lane, mtp, fp8_dir) = (r.weights, r.mmproj, r.lane, r.mtp, r.fp8);
         // Vision is a default companion; Some(false) is the deliberate
         // text-only serve (the tower's VRAM back).
         let mmproj = if spec.vision == Some(false) {
@@ -2941,6 +3044,18 @@ impl Supervisor {
                     spec.model
                 )),
             });
+        }
+        // The same rule for an image lane's text encoder and VAE - pieces
+        // with no switch, so there is no "off" that would excuse their
+        // absence.
+        if let Some(label) = self
+            .registry
+            .missing_required_lane_companion(&spec.model, spec.artifact.as_deref())
+        {
+            return Err(SpawnError::ModelNotFound(format!(
+                "{}: this model cannot serve without its {label}, which is not downloaded - get it on the Models page",
+                spec.model
+            )));
         }
         // FP8-native planes are opt-in (the official checkpoints' coarse block
         // scales measured worse than our bf16-derived planes - operator's
@@ -3006,6 +3121,7 @@ impl Supervisor {
             port,
             &weights,
             &mmproj,
+            &lane,
             &mtp,
             spec.gpu.as_deref(),
             fp8.as_deref(),

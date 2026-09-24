@@ -219,12 +219,20 @@ extension NativeStudioRuntime {
     let shared =
       selected.filter { id in models.contains { $0["id"]?.string == id && $0["port"] != nil } }
       .count > 1
-    return [
+    var record: O = [
       "model": .string(modelID), "modelName": model?["title"] ?? .string(modelID),
       "vendor": model?["vendor"] ?? .string(""),
       "systemPrompt": document?.fields["systemPrompt"] ?? .string(""),
       "params": .object(params), "spec": model?["spec"] ?? .string(""), "tools": .array(tools),
       "contended": .bool(shared && model?["port"] != nil), "at": Self.now,
     ]
+    if let input = body["input"]?.array,
+      let key = NativeContextPlan.prefixKey(body, count: input.count)
+    {
+      record["nativeContext"] = .object([
+        "count": .number(Decimal(input.count)), "key": .string(key),
+      ])
+    }
+    return record
   }
 }

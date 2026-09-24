@@ -23,6 +23,7 @@ fn test_router(port: u16) -> Router {
                     embedder: None,
                     asr: None,
                     aligner: None,
+                    image: None,
                     started_at_unix: 0,
                     instance_id: "itest-instance".into(),
                     capabilities: vec!["stats".into()],

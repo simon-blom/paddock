@@ -66,16 +66,28 @@
 // a 24-byte record, no codebook
 #define PD_KQ_Q2K_ID 10u
 #define PD_KQ_Q3K_ID 11u
-// Two 32-weight BLOCK formats that UD-Q4_K_XL exports put on routed expert
-// planes (Qwen3.8-Flash-Next: Q5_1 down on 43 layers, Q8_0 down on 5). Their
-// rows are laid flat like IQ4_NL - an expert down row of 640 weights is 2.5
-// super-blocks - so both streams are per-BLOCK contiguous:
+// Three 32-weight BLOCK formats that the quantizers put on planes whose row
+// is not a whole number of 256-weight super-blocks - routed expert downs
+// (Qwen3.8-Flash-Next: Q5_1 down on 43 layers, Q8_0 down on 5; the gemma-4
+// A4B's 704-wide expert down and its 2112-wide shared down come out Q5_0 or
+// Q8_0 in a Q4_K_M file, where the 256-block types the recipe names cannot
+// encode the row). Their rows are laid flat like IQ4_NL - an expert down row
+// of 640 weights is 2.5 super-blocks - so both streams are per-BLOCK
+// contiguous:
 //   Q5_1 {f16 d, f16 m, u32 qh, u8 qs[16]} (24 B): data = qs (16 B / block),
 //        record = d | m | qh (8 B / block). weight = d*q + m, q = nib | hbit<<4,
 //        served as f*(q-16) + g with f = d, g = m + 16*d (the mu term).
+//   Q5_0 {f16 d, u32 qh, u8 qs[16]} (22 B): data = qs (16 B / block), record
+//        = d | 0 | qh (8 B / block - Q5_1's record shape with the m half
+//        zero, so both read through one window). weight = d*(q-16): the
+//        centre is in the value, so f = d and g = 0 - no mu term, no sums
+//        plane (pd_kq_has_mu stays false for it).
 //   Q8_0 {f16 d, s8 qs[32]} (34 B): data = qs (32 B / block), record = d.
 // Exact repacks (every weight byte and scale kept), same resident bytes as
-// the file.
+// the file. Q5_0 landed 2026-09-24 behind its own marker (slot 655,
+// kquant_q50): it rides the same entry points, so an older pack's presence
+// of slot 600 cannot vouch for it.
+#define PD_KQ_Q50_ID 6u
 #define PD_KQ_Q51_ID 7u
 #define PD_KQ_Q80_ID 8u
 // PrismML ternary, 128-weight blocks (see the layout note above)
@@ -89,14 +101,15 @@ __host__ __device__ constexpr bool pd_kq_valid_iq(uint32_t dt) {
            dt == PD_KQ_IQ3XXS || dt == PD_KQ_IQ3S || dt == PD_KQ_IQ1S ||
            dt == PD_KQ_IQ1M || dt == PD_KQ_IQ4NL_ID ||
            dt == PD_KQ_Q2K_ID || dt == PD_KQ_Q3K_ID ||
-           dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID ||
+           dt == PD_KQ_Q50_ID || dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID ||
            dt == PD_KQ_PQ2_ID || dt == PD_KQ_PTQ1_ID;
 }
 
 // 32-weight block formats whose rows lie flat (no whole-super-block rule):
 // row r of in_dim weights starts at r * (in_dim/32) blocks in both streams.
 __host__ __device__ constexpr bool pd_kq_flat32(uint32_t dt) {
-    return dt == PD_KQ_IQ4NL_ID || dt == PD_KQ_Q51_ID || dt == PD_KQ_Q80_ID;
+    return dt == PD_KQ_IQ4NL_ID || dt == PD_KQ_Q50_ID || dt == PD_KQ_Q51_ID ||
+           dt == PD_KQ_Q80_ID;
 }
 
 // raw (GGUF) bytes per 256-weight super-block
@@ -111,6 +124,7 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_srcb(uint32_t dt) {
         case PD_KQ_IQ1M: return 56u;
         case PD_KQ_Q2K_ID: return 84u;   // scales[16] qs[64] d dmin
         case PD_KQ_Q3K_ID: return 110u;  // hmask[32] qs[64] scales[12] d
+        case PD_KQ_Q50_ID: return 176u;  // 8 x 22
         case PD_KQ_Q51_ID: return 192u;  // 8 x 24
         case PD_KQ_Q80_ID: return 272u;  // 8 x 34
         case PD_KQ_PQ2_ID: return 68u;   // 2 x {d, qs[32]}
@@ -135,6 +149,7 @@ __host__ __device__ constexpr uint32_t pd_iq_scb(uint32_t dt) {
         case PD_KQ_IQ1M: return 12u;    // d (folded) + scales[8]
         case PD_KQ_Q2K_ID: return 24u;  // d, dmin + scales[16] (4|4-bit sc|m per 16)
         case PD_KQ_Q3K_ID: return 24u;  // d + 16 unpacked int8 scales (6-bit, -32 applied)
+        case PD_KQ_Q50_ID: return 64u;  // 8 x {f16 d, u16 0, u32 qh}
         case PD_KQ_Q51_ID: return 64u;  // 8 x {f16 d, f16 m, u32 qh}
         case PD_KQ_Q80_ID: return 16u;  // 8 x f16 d
         case PD_KQ_PQ2_ID: return 4u;   // d0, d1
@@ -155,6 +170,7 @@ __host__ __device__ constexpr uint32_t pd_iq_datab(uint32_t dt) {
         case PD_KQ_IQ1M: return 48u;
         case PD_KQ_Q2K_ID: return 64u;   // qs
         case PD_KQ_Q3K_ID: return 96u;   // qs[64] + hmask[32]
+        case PD_KQ_Q50_ID: return 128u;  // 8 x qs[16]
         case PD_KQ_Q51_ID: return 128u;  // 8 x qs[16]
         case PD_KQ_Q80_ID: return 256u;  // 8 x qs[32]
         case PD_KQ_PQ2_ID: return 64u;   // 2 x qs[32]
@@ -297,6 +313,17 @@ __device__ __forceinline__ void pd_iq_repack_super(uint32_t dt, const uint8_t* _
                 const uint32_t o = j * 24u;
                 for (uint32_t i = 0; i < 8u; ++i) rec[8u * j + i] = s[o + i];     // d | m | qh
                 for (uint32_t i = 0; i < 16u; ++i) d[16u * j + i] = s[o + 8u + i]; // qs
+            }
+            break;
+        case PD_KQ_Q50_ID:
+            // {d, qh, qs} -> the Q5_1 record shape with m = 0: d at 0, two
+            // zero bytes, qh at 4 - so the window unpack reads one layout
+            for (uint32_t j = 0; j < 8u; ++j) {
+                const uint32_t o = j * 22u;
+                rec[8u * j] = s[o]; rec[8u * j + 1u] = s[o + 1u];                  // d
+                rec[8u * j + 2u] = 0; rec[8u * j + 3u] = 0;                        // (m = 0)
+                for (uint32_t i = 0; i < 4u; ++i) rec[8u * j + 4u + i] = s[o + 2u + i];  // qh
+                for (uint32_t i = 0; i < 16u; ++i) d[16u * j + i] = s[o + 6u + i];        // qs
             }
             break;
         case PD_KQ_PQ2_ID:
@@ -612,13 +639,18 @@ __device__ __forceinline__ void pd_iq_win_unpack_t(uint32_t dt, const uint8_t* _
             }
             break;
         }
+        case PD_KQ_Q50_ID:
         case PD_KQ_Q51_ID: {
             // block ib's lo (w even: weights 0-15) / hi (w odd: 16-31) half;
-            // the fifth bit of weight k is bit k of the block's qh
+            // the fifth bit of weight k is bit k of the block's qh. The two
+            // formats share the record and the nibble walk: Q5_1's weight is
+            // d*q + m = d*(q-16) + (m + 16 d), Q5_0's is d*(q-16) outright,
+            // so only the mu term differs (zero for Q5_0, whose record holds
+            // no m at all).
             const uint8_t* br = rec + 8u * ib;
             const float dd = pd_iq_f16a(br);
             *f = dd;
-            *g = pd_iq_f16a(br + 2u) + 16.0f * dd;
+            *g = dt == PD_KQ_Q51_ID ? pd_iq_f16a(br + 2u) + 16.0f * dd : 0.0f;
             const bool hi = (w & 1u) != 0u;
             const uint32_t hb = hi ? (pd_iq_u32a(br + 4u) >> 16u) : pd_iq_u32a(br + 4u);
             const uint4 qa = pd_iq_ld16((sb + ib * 16u));
@@ -727,7 +759,7 @@ __device__ __forceinline__ void pd_iq_win_unpack(uint32_t dt, const uint8_t* __r
 __device__ __forceinline__ void pd_iq_dequant_super(uint32_t dt, const uint8_t* __restrict__ s,
                                                     float* __restrict__ y) {
     __align__(16) uint8_t payload[256];  // pd_iq_datab max (Q8_0)
-    __align__(16) uint8_t rec[64];       // pd_iq_scb max (Q5_1)
+    __align__(16) uint8_t rec[64];       // pd_iq_scb max (Q5_0 / Q5_1)
     pd_iq_repack_super(dt, s, payload, rec);
     #pragma unroll 1
     for (uint32_t w = 0; w < 16u; ++w) {

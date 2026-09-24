@@ -1,0 +1,10 @@
+[
+  {"name":"ordinary cloud window","context":8192,"reply":4096,"summarize":true,"server":false,"from":1,"threshold":0,"used":3816,"target":2},
+  {"name":"saved cloud summary","context":8192,"reply":4096,"summarize":true,"server":false,"saved":true,"from":2,"summary":"Brief","threshold":0,"used":3816,"target":0},
+  {"name":"summary disabled","context":8192,"reply":4096,"summarize":false,"server":false,"saved":true,"from":1,"threshold":0,"used":3816,"target":0},
+  {"name":"stale summary","context":8192,"reply":4096,"summarize":true,"server":false,"stale":true,"from":1,"threshold":0,"used":3816,"target":2},
+  {"name":"ample room","context":32768,"reply":4096,"summarize":true,"server":false,"saved":true,"from":0,"threshold":0,"used":3816,"target":0},
+  {"name":"local bootstrap","context":8192,"reply":4096,"summarize":true,"server":true,"from":1,"threshold":2150,"used":3816,"target":2},
+  {"name":"local retained compaction","context":8192,"reply":4096,"summarize":true,"server":true,"item":true,"from":2,"threshold":2150,"used":3816,"target":2},
+  {"name":"small window","context":4096,"reply":4096,"summarize":true,"server":true,"from":0,"threshold":0,"used":3816,"target":0}
+]

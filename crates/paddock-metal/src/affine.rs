@@ -10,6 +10,7 @@ pub(crate) const AFFINE4: u32 = 0x100;
 #[derive(Clone, Copy)]
 enum Arithmetic {
     Adaptive,
+    Llama(usize),
     Verify(bool),
     StablePrefill,
     StableDecode,
@@ -164,6 +165,92 @@ pub(crate) fn project(
     );
 }
 
+/// Plain MLX Llama's small projections retain vector arithmetic through 32
+/// rows on M5. Keep this graph-local: hybrid Qwen has its own qualified tree.
+pub(crate) fn project_llama(
+    cmd: &Commands<'_>,
+    planes: &[(&Weight, &Buffer)],
+    input: &Buffer,
+    rows: usize,
+    workspace: &Buffer,
+) {
+    let Some(spans) = cmd.projection_rows() else {
+        return project_inner(
+            cmd,
+            planes,
+            input,
+            rows,
+            workspace,
+            (Arithmetic::Llama(rows), 0),
+        );
+    };
+    let limit = llama_vector_limit(cmd.tensor_accelerated(), planes);
+    let key = |logical: usize| {
+        (
+            logical == 1,
+            logical >= limit,
+            if logical >= limit {
+                logical.div_ceil(32)
+            } else {
+                0
+            },
+        )
+    };
+    let mut i = 0;
+    let mut end = 0;
+    while i < spans.len() {
+        let (first, mut count, logical) = spans[i];
+        assert!(first == end && count > 0 && logical > 0 && first + count <= rows);
+        i += 1;
+        // Join compatible request spans without changing their numerical
+        // contract or rereading weights once per request. Split only at a
+        // different contraction tree or the existing scratch grant's limit.
+        while let Some(&(next, extra, other)) = spans.get(i) {
+            assert!(next == first + count && extra > 0 && next + extra <= rows);
+            if key(logical) != key(other)
+                || planes.iter().any(|(w, _)| {
+                    let m = count + extra;
+                    let parts = if logical >= limit {
+                        partitions(w.k, w.n, logical)
+                    } else {
+                        1
+                    };
+                    let needed = if logical >= limit {
+                        (w.k.div_ceil(128) * 128 * m.div_ceil(128) * 128
+                            + if parts > 1 { parts * m * w.n } else { 0 })
+                            * 2
+                    } else {
+                        m * w.k * 2
+                    };
+                    needed > workspace.len()
+                })
+            {
+                break;
+            }
+            count += extra;
+            i += 1;
+        }
+        project_inner(
+            cmd,
+            planes,
+            input,
+            count,
+            workspace,
+            (Arithmetic::Llama(logical), first),
+        );
+        end = first + count;
+    }
+    assert_eq!(end, rows);
+}
+
+fn llama_vector_limit(accelerated: bool, planes: &[(&Weight, &Buffer)]) -> usize {
+    if accelerated && planes.iter().all(|(w, _)| w.k <= 2048 && w.n <= 2048) {
+        33
+    } else {
+        13
+    }
+}
+
 /// Phase belongs to the sequence, not the number of physical rows. Every
 /// selected vocabulary row is a vector contraction; body prompt rows keep
 /// their tensor contraction even in a one-token cache suffix.
@@ -313,15 +400,27 @@ fn project_group(
     assert!(planes.iter().all(|(w, _)| w.ty == AFFINE4 && w.k == k));
     let decode = match arithmetic {
         Arithmetic::Verify(single) => Some(single),
+        Arithmetic::Llama(logical) => Some(logical == 1),
         _ => None,
     };
+    let logical_rows = if let Arithmetic::Llama(logical) = arithmetic {
+        logical
+    } else {
+        rows
+    };
+    let vector_limit = if matches!(arithmetic, Arithmetic::Llama(_)) {
+        llama_vector_limit(cmd.tensor_accelerated(), planes)
+    } else {
+        13
+    };
     let prefill = matches!(arithmetic, Arithmetic::StablePrefill)
-        || (matches!(arithmetic, Arithmetic::Adaptive) && rows >= 13);
+        || (matches!(arithmetic, Arithmetic::Adaptive | Arithmetic::Llama(_))
+            && logical_rows >= vector_limit);
     let fast_contract = matches!(arithmetic, Arithmetic::StableDecode);
     let contraction_rows = if matches!(arithmetic, Arithmetic::StablePrefill) {
         512
     } else {
-        cmd.affine_prefill_rows().unwrap_or(rows)
+        cmd.affine_prefill_rows().unwrap_or(logical_rows)
     };
     let single = decode.unwrap_or(rows == 1) && k.is_multiple_of(512) && !fast_contract;
     // Minimize weight re-reads, then balance the last vector tile: six rows

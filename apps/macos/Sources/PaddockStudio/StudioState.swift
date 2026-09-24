@@ -217,6 +217,14 @@ public struct StudioState: Decodable, Sendable {
       public let audioPending: Bool?
       public let speech: Speech?
       public let automatic: Bool?
+      public struct Picture: Decodable, Sendable, Identifiable, Equatable {
+        public let id: String
+        public let name: String
+        public let preview: Bool
+        public let dataURL: String?
+      }
+      public let pictures: [Picture]?
+      public let imageGeneration: Bool?
       public struct ToolCall: Decodable, Sendable, Identifiable, Equatable {
         public let id: String
         public let name: String
@@ -261,6 +269,11 @@ public struct StudioState: Decodable, Sendable {
           public let note: String
           public let regions: [Region]
           public let unsure: [Speech.Fact]
+          public let number: Int?
+          public let pdfPage: Int?
+          public let sourceID: String?
+          public let attachmentID: String?
+          public let name: String?
         }
         public let facts: [Speech.Fact]
         public let pages: [Page]
@@ -278,6 +291,14 @@ public struct StudioState: Decodable, Sendable {
     public let conversationId: String?
     public let leafId: String?
     public let messages: [Message]
+    public struct Context: Decodable, Sendable {
+      public let before: String?
+      public let title: String
+      public let summary: String
+      public let working: Bool
+      public let error: String
+    }
+    public var context: Context? = nil
     public struct Block: Identifiable, Sendable {
       public let id: String
       public let comparison: Bool
@@ -338,6 +359,7 @@ public struct StudioState: Decodable, Sendable {
     public let vision: Bool
     public let audio: Bool
     public let chat: Bool
+    public let image: Bool?
   }
   public struct Viewport: Decodable, Sendable {
     public let left: Double
@@ -354,8 +376,11 @@ public struct StudioState: Decodable, Sendable {
     public let vision: Bool
     public let context: Int
     public let ocrModes: [String]
+    public let ocrGrounding: Bool?
     public let docParser: Bool
+    public let hasDocument: Bool?
     public let pdfRaster: Bool
+    public let imageLanes: [ImageLane]?
   }
   public struct ToolGroup: Decodable, Sendable, Identifiable {
     public struct Tool: Decodable, Sendable, Identifiable {
@@ -374,6 +399,9 @@ public struct StudioState: Decodable, Sendable {
     public let selectedCount: Int?
   }
   public struct Composer: Decodable, Sendable {
+    public let imageMode: Bool?
+    public let imageCaps: [String: StudioValue]?
+    public let imageEditing: Bool?
     public struct Choice: Decodable, Sendable, Identifiable {
       public let value: String
       public let label: String
@@ -482,6 +510,16 @@ public struct StudioAttachment: Identifiable, Sendable {
   public var width: Int?
   public var height: Int?
   public var detail = "auto"
+  // Keep the API's interoperable auto/low/high values in saved conversations.
+  // Originals stay in the attachment store; only model input is resized.
+  public static let imageDetailOptions: [(value: String, title: String, help: String)] = [
+    ("auto", "Auto-resize", "Fit large images for analysis. Your original is kept."),
+    (
+      "high", "Original",
+      "Use full-detail input. Model limits still apply; processing can take longer."
+    ),
+    ("low", "Smaller", "Use the model's smallest image size for a quick overview."),
+  ]
   public var textOnly = false
   public var isAudio: Bool {
     mime.hasPrefix("audio/")

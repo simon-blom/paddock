@@ -252,14 +252,17 @@ describe('a provider that states its numbers gets one corrected resend', () => {
     expect(lastAssistant(conv).error).toBe(full)
   })
 
-  it('leaves a cap the user set alone', async () => {
+  it('bounds a custom cap to the provider refusal without rewriting the preference', async () => {
     mock.settings.maxTokens = 8000
     const conv = draft()
-    replies = [{ error: OVER }]
+    replies = [{ error: OVER }, {}]
     await useChatStream().send([{ type: 'text', text: ASK }])
-    expect(captured).toHaveLength(1)
+    expect(captured).toHaveLength(2)
     expect(captured[0].max_output_tokens).toBe(8000)
-    expect(lastAssistant(conv).error).toBe(OVER)
+    expect(captured[1].max_output_tokens).toBe(1000)
+    expect(mock.settings.maxTokens).toBe(8000)
+    expect(lastAssistant(conv).run?.params.maxTokens).toBe(1000)
+    expect(lastAssistant(conv).error).toBeUndefined()
   })
 
   it('shows any other error untouched', async () => {
@@ -268,5 +271,12 @@ describe('a provider that states its numbers gets one corrected resend', () => {
     await useChatStream().send([{ type: 'text', text: ASK }])
     expect(captured).toHaveLength(1)
     expect(lastAssistant(conv).error).toBe('Invalid API key')
+  })
+  it('never retries a rate limit just because its message mentions context', async () => {
+    const conv = draft()
+    replies = [{ status: 429, error: OVER }]
+    await useChatStream().send([{ type: 'text', text: ASK }])
+    expect(captured).toHaveLength(1)
+    expect(lastAssistant(conv).error).toBe(OVER)
   })
 })

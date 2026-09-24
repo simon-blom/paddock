@@ -96,7 +96,8 @@ struct StudioLibraryTests {
     let m = StudioPreferencesModel()
     m.command = f.command
     await m.load()
-    m.replyLimit = "abc"
+    m.reply = ReplyLimitDraft(value: 1000)
+    m.reply.text = "abc"
     m.save()
     await m.settle()
     #expect(m.validation != nil && !m.saving && f.calls.count == 1)
@@ -113,13 +114,13 @@ struct StudioLibraryTests {
         "maxTokens", "maxToolCalls", "summarize", "microphone", "mapTiles",
       ])
     #expect(layout.toolStops.map(\.value) == [0, 5, 10, 25, 50, 100])
-    #expect(layout.replyIndex(m.replyLimit) == layout.replyStops.count - 1)
-    #expect(m.replyLimit == "32768" && !m.dirty)
+    #expect(layout.replyLimit.maximum == ReplyLimitDraft.maximum)
+    #expect(m.reply.text == "32768" && !m.reply.automatic && !m.dirty)
     m.summarize = false
     m.save()
     await m.settle()
     #expect(f.calls.last?.1["changes"]?.object == ["summarize": .bool(false)])
-    #expect(m.replyLimit == "32768" && !m.dirty)
+    #expect(m.reply.text == "32768" && !m.dirty)
     #expect(f.prefs["autoTitle"] == .bool(true) && f.prefs["markUnsure"] == .bool(true))
   }
   @Test func malformedStoredLimitIsReportedWithoutNativeIntegerOverflow() async {
@@ -129,6 +130,40 @@ struct StudioLibraryTests {
     m.command = f.command
     await m.load()
     #expect(!m.loaded && m.error != nil)
+  }
+  @Test func customReplyIsExactAndAutomaticCanBeRestoredWithoutLosingTheDraft() async {
+    let f = LibraryFixture()
+    let m = StudioPreferencesModel()
+    m.command = f.command
+    await m.load()
+    m.reply.automatic = false
+    #expect(m.validation != nil)
+    m.reply.text = "5000"
+    m.save()
+    await m.settle()
+    #expect(m.reply.text == "5000" && !m.reply.automatic && !m.dirty)
+    #expect(f.prefs["maxTokens"] == .number(5000))
+    m.reply.automatic = true
+    m.reply.automatic = false
+    #expect(m.reply.text == "5000" && !m.dirty)
+    m.reply.automatic = true
+    m.save()
+    await m.settle()
+    #expect(f.prefs["maxTokens"] == .null && m.reply.automatic && !m.dirty)
+  }
+  @Test func customReplyInputRejectsFractionsExponentSignsAndOverflow() {
+    for text in [
+      "", "0", "-1", "+100", "1.5", "1e4", "5,000", "1048577", String(repeating: "9", count: 100),
+    ] {
+      var draft = ReplyLimitDraft(value: 1)
+      draft.text = text
+      #expect(draft.validation != nil && draft.value == nil)
+    }
+    for text in ["1", "5000", "1048576", " 512 \n"] {
+      var draft = ReplyLimitDraft(value: 1)
+      draft.text = text
+      #expect(draft.validation == nil)
+    }
   }
   @Test func instructionsKeepDraftAcrossCloseAndOnlyApplyToReviewedConversation() async {
     let f = LibraryFixture()
@@ -150,32 +185,39 @@ struct StudioLibraryTests {
   }
   @Test func nativeSurfacesFitOffscreenInBothThemes() async throws {
     for dark in [false, true] {
-      let f = LibraryFixture()
-      let library = StudioLibraryModel()
-      let settings = StudioPreferencesModel()
-      library.command = f.command
-      settings.command = f.command
-      await library.open("p")
-      await settings.load()
-      for (name, content) in [
-        ("prompts", AnyView(StudioLibraryView(model: library))),
-        ("preferences", AnyView(StudioPreferencesView(model: settings, busy: false))),
-      ] {
-        let host = NSHostingView(
-          rootView: content.frame(width: 680, height: 780).environment(
-            \.colorScheme, dark ? .dark : .light))
-        host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-        host.frame = NSRect(x: 0, y: 0, width: 680, height: 780)
-        host.layoutSubtreeIfNeeded()
-        #expect(host.fittingSize.width == 680)
-        if let folder = ProcessInfo.processInfo.environment["PADDOCK_PROMPT_SNAPSHOTS"],
-          let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds)
-        {
-          host.cacheDisplay(in: host.bounds, to: bitmap)
-          let url = URL(fileURLWithPath: folder)
-          try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-          try bitmap.representation(using: .png, properties: [:])?.write(
-            to: url.appending(path: "\(name)-\(dark ? "dark" : "light").png"))
+      for width: CGFloat in [420, 680] {
+        let f = LibraryFixture()
+        let library = StudioLibraryModel()
+        let settings = StudioPreferencesModel()
+        library.command = f.command
+        settings.command = f.command
+        await library.open("p")
+        await settings.load()
+        settings.reply = ReplyLimitDraft(value: 5000)
+        let workspace = WorkspaceModel()
+        for (name, content) in [
+          ("prompts", AnyView(StudioLibraryView(model: library))),
+          (
+            "preferences",
+            AnyView(StudioPreferencesView(model: settings, busy: false, chat: workspace.chat))
+          ),
+        ] {
+          let host = NSHostingView(
+            rootView: content.frame(width: width, height: 900).environment(
+              \.colorScheme, dark ? .dark : .light))
+          host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+          host.frame = NSRect(x: 0, y: 0, width: width, height: 900)
+          host.layoutSubtreeIfNeeded()
+          #expect(host.fittingSize.width == width)
+          if let folder = ProcessInfo.processInfo.environment["PADDOCK_PROMPT_SNAPSHOTS"],
+            let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds)
+          {
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let url = URL(fileURLWithPath: folder)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try bitmap.representation(using: .png, properties: [:])?.write(
+              to: url.appending(path: "\(name)-\(Int(width))-\(dark ? "dark" : "light").png"))
+          }
         }
       }
     }

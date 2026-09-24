@@ -223,8 +223,14 @@ struct RenderingTests {
           }
           let scrolls = scrollViews(in: controller.view)
           #expect(
-            scrolls.count == 2,
-            "\(destination), \(width), dark=\(dark): both list and detail must be mounted")
+            scrolls.count == 3,
+            "\(destination), \(width), dark=\(dark): Settings sidebar, list and detail must be mounted"
+          )
+          let workspaceScrolls = scrolls.filter {
+            $0.convert($0.bounds, to: controller.view).minX >= 220
+          }
+          #expect(
+            workspaceScrolls.count == 2, "Catalog list and detail remain separate scroll lanes")
           for scroll in scrolls {
             // A scroll backing view may extend behind chrome, but its content
             // must be inset. Unlike HSplitView, NSScrollView reports that inset.

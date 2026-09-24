@@ -840,6 +840,14 @@ int pd_kquant_q40(void) { return 0; }
 PD_EXPORT
 int pd_kquant_flat32(void) { return 0; }
 
+// Capability marker (slot 655): present iff the flat 32-weight lanes above
+// also serve Q5_0 (GGUF raw id 6) - the third flat type, which the quantizer
+// puts on rows a 256-block recipe cannot encode (the gemma-4 A4B's 704-wide
+// expert down and 2112-wide shared down in a Q4_K_M file). Same reason as
+// slot 600: the dtype rides existing entry points.
+PD_EXPORT
+int pd_kquant_q50(void) { return 0; }
+
 // Capability marker (slot 577): present iff the k-quant repack, dequant and
 // token-batched MoE pair serve the ggml i-quant family (IQ1_S/M, IQ2_XXS/XS/S,
 // IQ3_XXS/S) and IQ4_NL - see quant/iquant.cuh. Same reason as the Q4_0

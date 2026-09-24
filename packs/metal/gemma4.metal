@@ -340,7 +340,7 @@ kernel void gemma_merge_shared(device const float* parts [[buffer(0)]],device fl
 // MPP online-softmax prefill, with a smaller key tile for global HD=512.
 // The SWA lower bound is per query, not per chunk; partial tiles never read
 // sequence-neighbour metadata. Rings include CHUNK slack before all KV writes.
-template<uint HD,uint KT,uint BM=32,typename T=half,bool Image=false,bool Muse=false,typename KV=half>
+template<uint HD,uint KT,uint BM=32,typename T=half,bool Image=false,bool Muse=false,typename KV=half,bool Relaxed=false>
 inline void gemma_prefill(device T* q,device const KV* k,device const KV* v,device const uint* meta,
     device const uint* pages,device float* out,constant uint* p,uint head,uint first,uint count,uint tid,
     threadgroup T* kv,threadgroup T* probability,threadgroup float* scores,
@@ -358,7 +358,9 @@ inline void gemma_prefill(device T* q,device const KV* k,device const KV* v,devi
     auto tp=tensor(probability,extents<int,KT,BM>(),array<int,2>{1,KT});
     auto ts=tensor(scores,extents<int,KT,BM>(),array<int,2>{1,KT});
     constexpr auto qkd=matmul2d_descriptor(BM,KT,Panel,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
-    constexpr auto pvd=matmul2d_descriptor(BM,Panel,KT,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    // The MLX Llama graph opts into its reference's reduced-precision F32
+    // probability contraction. All other model arithmetic stays unchanged.
+    constexpr auto pvd=matmul2d_descriptor(BM,Panel,KT,false,true,Relaxed,matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qkd,execution_simdgroups<4>> qk;matmul2d<pvd,execution_simdgroups<4>> pv;
     static_assert(HD/Panel<=4);
     auto acc0=pv.template get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();

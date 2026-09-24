@@ -206,11 +206,13 @@ extension NativeStudioRuntime {
   func applyOutputItem(_ item: O, messageID: String, done: Bool) throws {
     let type = item["type"]?.string ?? ""
     if type == "compaction", done, let id = item["id"], let content = item["encrypted_content"],
+      selected.count == 1,
       let anchor = document?.activeMessages.last(where: { $0["role"]?.string == "user" })?["id"]
     {
       try change {
         $0["serverCompaction"] = .object([
           "id": id, "content": content, "tailStartId": anchor, "at": Self.now,
+          "model": $0["model"] ?? .null,
         ])
       }
       return

@@ -67,33 +67,18 @@ export function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k` : String(n)
 }
 
-// How large a copy the Studio UPLOADS at each level, as a longest-edge cap.
-//
-// This is upload policy, not the model's limit: the server fits every image to
-// the budget above whatever we send, so these only decide how many bytes cross
-// the wire and how big the stored conversation gets. `auto` deliberately keeps
-// the 1024px the Studio has always sent - the default must not silently start
-// spending six times the context - while `high` sends the same 4096px copy the
-// lightbox already stores, which for ordinary aspect ratios is at or near what
-// the widest tower (qwen, 16.7 Mpx) can even use.
-export const DETAIL_EDGE: Record<ImageDetail, number> = {
-  low: 512,
-  auto: 1024,
-  high: 4096,
-}
-
 /** Plain-language menu labels. No jargon: a person picking a picture size
  *  should not have to know what a vision token is to choose well. */
 export const DETAIL_LABEL: Record<ImageDetail, string> = {
-  high: 'Full detail',
-  auto: 'Standard',
+  high: 'Original',
+  auto: 'Auto-resize',
   low: 'Smaller',
 }
 
 export const DETAIL_HINT: Record<ImageDetail, string> = {
-  high: 'Sends the most this model can use. Best for dense text and charts.',
-  auto: 'The usual size. Good for photos and screenshots.',
+  high: 'Use full-detail input. Model limits still apply; processing can take longer.',
+  auto: 'Fit large images for analysis. Your original is kept.',
   low: 'Fewest tokens, fastest. Fine when you only need the gist.',
 }
 
-export const DETAIL_ORDER: ImageDetail[] = ['high', 'auto', 'low']
+export const DETAIL_ORDER: ImageDetail[] = ['auto', 'high', 'low']

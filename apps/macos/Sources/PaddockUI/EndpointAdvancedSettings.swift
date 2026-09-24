@@ -8,9 +8,7 @@ struct EndpointAdvancedSettings: View {
       ForEach(editor.runtimeGroups, id: \.self) { group in
         EndpointFormCard(group) {
           ForEach(editor.visibleRuntimeOptions.filter { $0.group == group }) { field in
-            HStack(alignment: .top, spacing: 24) {
-              Text(field.label).font(.system(size: 12, weight: .medium))
-                .frame(maxWidth: .infinity, alignment: .leading).help(field.help)
+            SettingsRow(title: field.label) {
               VStack(alignment: .leading, spacing: 5) {
                 if field.kind == "boolean" {
                   Dropdown(title: field.label, value: boolLabel(field), fillsWidth: true) {
@@ -35,9 +33,9 @@ struct EndpointAdvancedSettings: View {
                   Button("Use default") { editor.runtimeDraft[field.id] = "" }
                     .buttonStyle(QuietButtonStyle()).font(.system(size: 10))
                 }
-              }.frame(width: field.kind == "text" ? 240 : 190)
-                .accessibilityIdentifier("endpoint-option-\(field.id)")
-                .help(field.help)
+              }
+              .accessibilityIdentifier("endpoint-option-\(field.id)")
+              .help(field.help)
             }
           }
         }

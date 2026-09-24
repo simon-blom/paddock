@@ -105,6 +105,7 @@ extension EndpointEditor {
     selectedArtifact?.runtime?.capability ?? selectedModel?.capability ?? []
   }
   var canSpeculate: Bool { capabilities.contains("speculative") }
+  var isImageGeneration: Bool { capabilities.contains("image-generation") }
   var canTools: Bool { selectedModel == nil || capabilities.contains("tools") }
   var embeddedVision: Bool { selectedArtifact?.runtime?.embeddedVision == true }
   var visionArtifact: CatalogArtifact? {

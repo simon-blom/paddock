@@ -19,6 +19,11 @@
 //! > even without `thinking: enabled`; thinking blocks carry an empty
 //! > `signature` (we do not sign reasoning). Streams emit one keep-alive `ping`
 //! > right after `message_start`, like the live API.
+//!
+//! Mid-conversation `role: "system"` messages (Claude Code ends every request
+//! with one) render in place, as a `<system-reminder>` in the user turn they
+//! follow; their `output_config.effort` and tool changes apply to the request.
+//! See `messages_system`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,7 +32,7 @@ use std::time::Duration;
 use async_stream::stream;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use paddock_api::messages::{CountTokensRequest, MessagesRequest};
 use paddock_engine::sampler::SamplingParams;
@@ -66,6 +71,24 @@ fn anthropic_kind(class: ErrorClass) -> &'static str {
     }
 }
 
+/// The message text an engine error carries on this surface.
+///
+/// A context overflow speaks Anthropic's own words, byte for byte:
+/// `prompt is too long: N tokens > M maximum`. Claude Code recognizes exactly
+/// that, reads both numbers out of it, compacts the conversation and retries;
+/// our engine's wording ("the prompt is N tokens but the model's context window
+/// is M ...") reached it as a plain `API Error: 400` and ended the session. Even
+/// a hint appended after Anthropic's text cost Claude Code its reading of the
+/// numbers (measured against a stub, 2026-09-23), so the image variant's
+/// levers (pages, detail) are not carried here - Anthropic's API does not add
+/// them either.
+fn anthropic_message(e: &EngineError) -> String {
+    match e.overflow {
+        Some((got, max)) => format!("prompt is too long: {got} tokens > {max} maximum"),
+        None => e.message.clone(),
+    }
+}
+
 /// Map a classified engine error to the Anthropic error envelope: 400 for the
 /// caller's fault, 529 `overloaded_error` for capacity, 500 `api_error` for ours.
 fn engine_err(e: &EngineError) -> Response {
@@ -74,7 +97,7 @@ fn engine_err(e: &EngineError) -> Response {
         ErrorClass::Overloaded => StatusCode::from_u16(529).expect("529 is a valid status"),
         ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    err(status, anthropic_kind(e.class), &e.message)
+    err(status, anthropic_kind(e.class), anthropic_message(e))
 }
 
 /// Flatten a block `content` (string | [{type:text,...}]) to text.
@@ -146,11 +169,20 @@ fn convert_messages(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Va
     if let Some(sys) = system {
         msgs.push(json!({"role": "system", "content": block_text(sys)}));
     }
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
         let role = m
             .get("role")
             .and_then(Value::as_str)
             .ok_or("message needs a role")?;
+        // Mid-conversation system messages: the text renders in place, riding
+        // the user turn it follows; their effort and tool changes are request
+        // controls, applied by the callers through `system_controls`.
+        if role == "system" {
+            if let Some(text) = crate::messages_system::render_text(messages, i)? {
+                crate::messages_system::append_system_reminder(&mut msgs, &text);
+            }
+            continue;
+        }
         if role != "user" && role != "assistant" {
             return Err(format!("invalid message role {role:?}"));
         }
@@ -262,8 +294,17 @@ fn convert_messages(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Va
             if !text.is_empty() {
                 msg["content"] = Value::String(text);
             }
+            // The chat-completions spelling, the one the Responses and chat
+            // surfaces already hand the template - `normalize_messages`
+            // mirrors it to `thinking` for the one family that reads that
+            // (gpt-oss). This used to write `thinking` alone, so every
+            // template reading `reasoning_content` - Qwen 3.5-3.8, Flash
+            // Next, gemma4, laguna, muse - never saw an Anthropic caller's
+            // prior thinking: Claude Code's history arrived with the model's
+            // own reasoning cut out, where Qwen3.8's template keeps it by
+            // default (preserve_thinking) and llama.cpp renders it.
             if !thinking.is_empty() {
-                msg["thinking"] = Value::String(thinking);
+                msg["reasoning_content"] = Value::String(thinking);
             }
             if !tool_calls.is_empty() {
                 msg["tool_calls"] = Value::Array(tool_calls);
@@ -399,7 +440,9 @@ struct CompactPlan {
 /// it has no `response_format`"; `format` is that, so schema-shaped output no
 /// longer needs the forced-tool detour, and reaches families whose dialect has
 /// a JSON grammar but no tool syntax.
-fn parse_output_config(v: Option<&Value>) -> Result<(Option<String>, Option<Value>), String> {
+pub(crate) fn parse_output_config(
+    v: Option<&Value>,
+) -> Result<(Option<String>, Option<Value>), String> {
     let Some(cfg) = v else {
         return Ok((None, None));
     };
@@ -587,7 +630,13 @@ fn render_prompt(
         None
     };
 
-    let mut prompt = chat_template::render(template, &msgs, tools, kwargs.as_ref())?;
+    let mut prompt = chat_template::render_with_specials(
+        template,
+        &msgs,
+        tools,
+        kwargs.as_ref(),
+        &model.template_specials(),
+    )?;
     // thinking-mode detection is dialect-shaped - see Dialect::thinking_open
     // (qwen pre-opens "<think>\n", laguna a bare "<think>", gemma4 pre-closes
     // when off)
@@ -688,6 +737,12 @@ fn prepare(
     // response's content must always be valid.
     let rewritten = crate::context_management::resend_rewrite(&req.messages);
     let messages: &[Value] = rewritten.as_deref().unwrap_or(&req.messages);
+
+    // Mid-conversation system messages: a per-message effort outranks the
+    // top-level one, and a tool_removal takes that tool out of the render.
+    let controls = crate::messages_system::system_controls(messages, req.tools.as_deref())?;
+    crate::messages_system::drop_removed_tools(&mut tools, &controls.removed);
+    let effort = controls.effort.as_deref().or(effort);
 
     // Server-side context management: parse before the render so
     // a malformed config is a 400 even when its trigger would not fire, apply
@@ -1562,6 +1617,7 @@ pub async fn handle(
         constraint,
         logprobs: None,
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -1670,21 +1726,22 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
     ctx.scope.usage(ctx.prompt_len, output_tokens);
     ctx.scope.cached(cached);
     ctx.scope.finish(stop_reason);
-    let mut usage = json!({"input_tokens": ctx.prompt_len, "output_tokens": output_tokens});
-    if cached > 0 {
-        // truthful: those prompt tokens were served from the prefix cache
-        // (Paddock's caching is implicit - no cache_control needed)
-        usage["cache_read_input_tokens"] = json!(cached);
-    }
+    // Paddock's caching is implicit - no cache_control needed
+    let mut usage = anth_usage(ctx.prompt_len, cached, output_tokens);
     if let Some(c) = &ctx.compaction {
         // the compaction block leads the content; top-level usage stays the
         // final message's (per spec), iterations carries both passes
         content.insert(0, compaction_block(&c.summary));
-        usage["iterations"] = json!([c.usage, {
-            "type": "message", "model": ctx.model_id,
-            "input_tokens": ctx.prompt_len, "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
-        }]);
+        usage["iterations"] = json!([
+            c.usage,
+            anth_iteration(
+                "message",
+                &ctx.model_id,
+                ctx.prompt_len,
+                cached,
+                output_tokens
+            )
+        ]);
     }
     let mut body = json!({
         "id": ctx.id,
@@ -1709,8 +1766,43 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
 /// deltas; tool_use blocks emit atomically on completion (one
 /// input_json_delta with the full arguments - fragmenting a non-JSON
 /// dialect's arguments is not prefix-stable, same policy as chat).
+/// Anthropic `usage` for one generation: a prompt of `prompt_len` tokens,
+/// `cached` of them served from Paddock's prefix cache, `output` generated.
+///
+/// The Messages API splits the prompt three ways: `input_tokens` is only the
+/// part neither read from nor written to the cache, and the whole prompt is
+/// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
+/// Clients size the context from that sum - Claude Code's context meter and
+/// its auto-compact trigger are exactly it - so reporting the whole prompt as
+/// `input_tokens` beside the cached part (what this did until 2026-09-23)
+/// counted every cached turn twice, and a long agent session compacted at
+/// about half its real window. Paddock's cache writes are implicit and
+/// unbilled: `cache_creation_input_tokens` is 0.
+fn anth_usage(prompt_len: usize, cached: usize, output: usize) -> Value {
+    let cached = cached.min(prompt_len);
+    json!({
+        "input_tokens": prompt_len - cached,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": cached,
+        "output_tokens": output,
+    })
+}
+
+/// One `usage.iterations` entry: [`anth_usage`] tagged with its kind and model.
+fn anth_iteration(
+    kind: &str,
+    model: &str,
+    prompt_len: usize,
+    cached: usize,
+    output: usize,
+) -> Value {
+    let mut u = anth_usage(prompt_len, cached, output);
+    u["type"] = json!(kind);
+    u["model"] = json!(model);
+    u
+}
+
 fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
-    let start_input_tokens = ctx.prompt_len;
     let sse = stream! {
         yield ev("message_start", json!({"type": "message_start", "message": {
             "id": ctx.id, "type": "message", "role": "assistant",
@@ -1815,7 +1907,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
                 None => break,
                 Some(TokenEvent::Error(e)) => {
                     yield ev("error", json!({"type": "error",
-                        "error": {"type": anthropic_kind(e.class), "message": e.message}}));
+                        "error": {"type": anthropic_kind(e.class), "message": anthropic_message(&e)}}));
                     return;
                 }
             }
@@ -1851,25 +1943,19 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
         ctx.scope.usage(ctx.prompt_len, output_tokens);
         ctx.scope.cached(cached);
         ctx.scope.finish(stop_reason);
-        let mut usage = json!({"output_tokens": output_tokens});
-        if cached > 0 {
-            usage["cache_read_input_tokens"] = json!(cached);
-        }
-        // message_start went out before the engine had prefilled anything, so
-        // its input_tokens could only be the TOKENIZED length - one `<image>`
-        // per picture. Once the prefill reports its real row count, restate it
-        // here: message_delta's usage is the cumulative one, and leaving the
-        // stream's only input figure short by an image's ~500 rows is the kind
-        // of silent under-report a billing or context-budget client acts on.
-        if ctx.prompt_len > start_input_tokens {
-            usage["input_tokens"] = json!(ctx.prompt_len);
-        }
+        // message_start went out before the engine had prefilled anything,
+        // so its input_tokens could only be the TOKENIZED length (one
+        // `<image>` per picture) and nothing was known about the cache yet.
+        // message_delta's usage is the cumulative one - clients overwrite
+        // every field it carries (Claude Code's stream accumulator does,
+        // field by field) - so it restates the whole split: the real row
+        // count, and how much of it the prefix cache served.
+        let mut usage = anth_usage(ctx.prompt_len, cached, output_tokens);
         if let Some(c) = &ctx.compaction {
-            usage["iterations"] = json!([c.usage, {
-                "type": "message", "model": ctx.model_id,
-                "input_tokens": ctx.prompt_len, "output_tokens": output_tokens,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
-            }]);
+            usage["iterations"] = json!([
+                c.usage,
+                anth_iteration("message", &ctx.model_id, ctx.prompt_len, cached, output_tokens)
+            ]);
         }
         let mut delta_ev = json!({
             "type": "message_delta",
@@ -1887,7 +1973,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
         yield ev("message_delta", delta_ev);
         yield ev("message_stop", json!({"type": "message_stop"}));
     };
-    Sse::new(sse).into_response()
+    anth_sse(sse)
 }
 
 /// One summarization generation over the compact span of `messages`, shared
@@ -1941,6 +2027,13 @@ async fn anth_summary_pass(
             Err(e) => return Err(bad(e)),
         }
     };
+    // tool removals from mid-conversation system messages too, folded over the
+    // whole conversation exactly as the live render folds them - same reason
+    let mut tools = tools;
+    match crate::messages_system::system_controls(messages, req.tools.as_deref()) {
+        Ok(c) => crate::messages_system::drop_removed_tools(&mut tools, &c.removed),
+        Err(e) => return Err(bad(e)),
+    }
     // thinking off for the summary (suffix-only in every template family, so
     // the span prefix still matches): the budget goes to the summary itself,
     // and an effort rung is passed as None for the same reason - grading a
@@ -1995,6 +2088,7 @@ async fn anth_summary_pass(
         constraint: instantiate_constraint(&ConstraintSpec::None, GateSpec::Immediate, model, None),
         logprobs: None,
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e));
@@ -2029,11 +2123,8 @@ async fn anth_summary_pass(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let usage = json!({
-        "type": "compaction",
-        "input_tokens": p1_len, "output_tokens": ids1.len() + terminal_tokens,
-        "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached1,
-    });
+    let mut usage = anth_usage(p1_len, cached1, ids1.len() + terminal_tokens);
+    usage["type"] = json!("compaction");
     Ok(SummaryPass {
         summary,
         usage,
@@ -2134,11 +2225,10 @@ fn agent_iterations(
     out_tokens: usize,
     cached: usize,
 ) -> Value {
-    json!([c.usage, {
-        "type": "message", "model": model_id,
-        "input_tokens": prompt_len, "output_tokens": out_tokens,
-        "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached,
-    }])
+    json!([
+        c.usage,
+        anth_iteration("message", model_id, prompt_len, cached, out_tokens)
+    ])
 }
 
 /// The compact_20260112 orchestration (plan:
@@ -2214,10 +2304,8 @@ async fn run_compacting(
                     "type": "content_block_delta", "index": 0,
                     "delta": {"type": "compaction_delta", "content": summary}}));
                 yield ev("content_block_stop", json!({"type": "content_block_stop", "index": 0}));
-                let mut usage = json!({"output_tokens": out1, "iterations": [usage1]});
-                if cached1 > 0 {
-                    usage["cache_read_input_tokens"] = json!(cached1);
-                }
+                let mut usage = anth_usage(p1_len, cached1, out1);
+                usage["iterations"] = json!([usage1]);
                 let mut delta_ev = json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "compaction", "stop_sequence": null},
@@ -2229,15 +2317,10 @@ async fn run_compacting(
                 yield ev("message_delta", delta_ev);
                 yield ev("message_stop", json!({"type": "message_stop"}));
             };
-            return Sse::new(sse).into_response();
+            return anth_sse(sse);
         }
-        let mut usage = json!({
-            "input_tokens": p1_len, "output_tokens": out1,
-            "iterations": [usage1],
-        });
-        if cached1 > 0 {
-            usage["cache_read_input_tokens"] = json!(cached1);
-        }
+        let mut usage = anth_usage(p1_len, cached1, out1);
+        usage["iterations"] = json!([usage1]);
         let mut body = json!({
             "id": id, "type": "message", "role": "assistant", "model": model.id,
             "content": [block], "stop_reason": "compaction", "stop_sequence": null,
@@ -2305,6 +2388,7 @@ async fn run_compacting(
         constraint,
         logprobs: None,
         submitted: None, // stamped by Engine::submit
+        canvas_read: None,
     };
     if let Err(e) = model.engine.submit(gen2) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -2718,15 +2802,24 @@ fn strip_our_tools(
 /// consecutive user turns is a shape some chat templates render badly and
 /// Anthropic's own wire rejects. Text after tool_result in the same turn is
 /// exactly what their docs show.
+///
+/// Trailing `role: "system"` messages stay last: they belong after the user
+/// turn they follow (Claude Code ends every request with one), and a user
+/// turn appended behind them would break their placement rule - so the text
+/// lands in, or just before, that run.
 fn append_user_text(messages: &mut Vec<Value>, text: &str) {
-    if let Some(last) = messages.last_mut()
+    let at = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .map_or(0, |i| i + 1);
+    if let Some(last) = at.checked_sub(1).map(|i| &mut messages[i])
         && last.get("role").and_then(Value::as_str) == Some("user")
         && let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut)
     {
         blocks.push(json!({"type": "text", "text": text}));
         return;
     }
-    messages.push(json!({"role": "user", "content": text}));
+    messages.insert(at, json!({"role": "user", "content": text}));
 }
 
 /// True when a tool call is one paddock handles internally (search / generic
@@ -3080,6 +3173,7 @@ async fn run_mcp_agent(
             constraint,
             logprobs: None,
             submitted: None, // stamped by Engine::submit
+            canvas_read: None,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -3206,10 +3300,7 @@ async fn run_mcp_agent(
             scope.usage(prompt_len, out_tokens);
             scope.cached(cached);
             scope.finish(stop_reason);
-            let mut usage = json!({"input_tokens": prompt_len, "output_tokens": out_tokens});
-            if cached > 0 {
-                usage["cache_read_input_tokens"] = json!(cached);
-            }
+            let mut usage = anth_usage(prompt_len, cached, out_tokens);
             if web.is_some() {
                 usage["server_tool_use"] = json!({"web_search_requests": web_requests, "web_fetch_requests": fetch_requests});
             }
@@ -3430,7 +3521,7 @@ async fn run_mcp_agent(
     scope.usage(prompt_len, out_tokens);
     scope.cached(cached);
     scope.finish("end_turn");
-    let mut usage = json!({"input_tokens": prompt_len, "output_tokens": out_tokens});
+    let mut usage = anth_usage(prompt_len, cached, out_tokens);
     if web.is_some() {
         usage["server_tool_use"] =
             json!({"web_search_requests": web_requests, "web_fetch_requests": fetch_requests});
@@ -3577,7 +3668,7 @@ fn stream_mcp_agent(
                 prepared.mm_chunks.as_deref(),
                 state.max_ctx,
             ) {
-                yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(ge.class),"message":ge.message}}));
+                yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(ge.class),"message":anthropic_message(&ge)}}));
                 return;
             }
             if round == 0 { prompt_len = prepared.prompt_ids.len(); }
@@ -3592,7 +3683,7 @@ fn stream_mcp_agent(
             let gen_req = GenRequest {
                 prompt: prepared.engine_prompt, max_tokens: prepared.max_tokens, sampler: prepared.sampler,
                 stop_tokens: prepared.stop_tokens, events: tx, mm_chunks: prepared.mm_chunks, constraint, logprobs: None,
-                submitted: None };
+                submitted: None, canvas_read: None };
             if let Err(e) = model.engine.submit(gen_req) {
                 yield ev("error", json!({"type":"error","error":{"type":"api_error","message":e}}));
                 return;
@@ -3662,7 +3753,7 @@ fn stream_mcp_agent(
                     Some(TokenEvent::Done(r, stats)) => { finish = Some(r); out_tokens += stats.terminal_tokens(); scope.phases(&stats); break; }
                     None => break,
                     Some(TokenEvent::Error(e)) => {
-                        yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(e.class),"message":e.message}}));
+                        yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(e.class),"message":anthropic_message(&e)}}));
                         return;
                     }
                 }
@@ -3848,7 +3939,9 @@ fn stream_mcp_agent(
 
         scope.usage(prompt_len, out_tokens);
         scope.finish(final_stop_reason);
-        let mut usage = json!({"input_tokens": prompt_len, "output_tokens": out_tokens});
+        // this streamed loop does not track the cache split (its rounds
+        // report no reuse), so the whole prompt is uncached input
+        let mut usage = anth_usage(prompt_len, 0, out_tokens);
         if web.is_some() {
             usage["server_tool_use"] = json!({"web_search_requests": web_requests, "web_fetch_requests": fetch_requests});
         }
@@ -3863,7 +3956,32 @@ fn stream_mcp_agent(
         yield ev("message_delta", delta_ev);
         yield ev("message_stop", json!({"type":"message_stop"}));
     };
-    Sse::new(sse).into_response()
+    anth_sse(sse)
+}
+
+/// Every Messages stream goes out through here: the spec's `ping` event is
+/// sent whenever the stream has been silent for 15 s.
+///
+/// A stream can be silent for minutes while the model works - a cold prefill
+/// of a long prompt (173K tokens took 309 s on the Spark), a tool call being
+/// generated (it is emitted whole, on completion) - and clients abort a
+/// silent stream: Claude Code's idle watchdog (CLAUDE_STREAM_IDLE_TIMEOUT_MS,
+/// 300 s) hung up on exactly that prefill and paid for a retry. Anthropic's
+/// own streams carry `ping` events for this ("event streams may also include
+/// any number of ping events"), and every Anthropic SDK passes over them. The
+/// timer restarts on every real event, so a stream that is producing never
+/// sees one.
+fn anth_sse<S>(stream: S) -> Response
+where
+    S: futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static,
+{
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .event(Event::default().event("ping").data(r#"{"type": "ping"}"#)),
+        )
+        .into_response()
 }
 
 fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {
@@ -3925,7 +4043,7 @@ pub async fn count_tokens(
             return err(code, kind, msg);
         }
     }
-    let tools = match req.tools.as_ref().map(|ts| convert_tools(ts)).transpose() {
+    let mut tools = match req.tools.as_ref().map(|ts| convert_tools(ts)).transpose() {
         Ok(t) => t,
         Err(e) => return bad(e),
     };
@@ -3933,6 +4051,14 @@ pub async fn count_tokens(
     // collapses everything before it, and the count must price that reality
     let rewritten = crate::context_management::resend_rewrite(&req.messages);
     let messages: &[Value] = rewritten.as_deref().unwrap_or(&req.messages);
+    // and the same mid-conversation system controls: the effort rung is a
+    // template kwarg and a removed tool leaves the header, so both move the count
+    let controls = match crate::messages_system::system_controls(messages, req.tools.as_deref()) {
+        Ok(c) => c,
+        Err(e) => return bad(e),
+    };
+    crate::messages_system::drop_removed_tools(&mut tools, &controls.removed);
+    let effort = controls.effort.as_deref().or(effort);
     // context_management on the count: apply the same edits generation would,
     // so the number a budget-watching client acts on matches the bill. The
     // response carries original_input_tokens for the before/after picture.
@@ -4034,6 +4160,41 @@ mod tests {
     /// Lever 1 on the Anthropic lane: the same call twice comes off the
     /// ledger, a third time is refused, and the wrapper spelling is the same
     /// call as the direct one.
+    /// The Messages API's prompt split: `input_tokens` is the UNCACHED part
+    /// and the three fields sum to the prompt - the sum Claude Code sizes its
+    /// context (and its auto-compact trigger) from. A cached turn must not
+    /// count twice.
+    #[test]
+    fn usage_splits_the_prompt_by_cache() {
+        let sum = |u: &Value| {
+            [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .iter()
+            .map(|k| u[*k].as_u64().unwrap())
+            .sum::<u64>()
+        };
+        let u = anth_usage(150_000, 149_000, 42);
+        assert_eq!(u["input_tokens"], 1_000);
+        assert_eq!(u["cache_read_input_tokens"], 149_000);
+        assert_eq!(u["cache_creation_input_tokens"], 0);
+        assert_eq!(u["output_tokens"], 42);
+        assert_eq!(sum(&u), 150_000);
+        // cold: all input, nothing cached
+        let u = anth_usage(1_645, 0, 7);
+        assert_eq!((u["input_tokens"].as_u64(), sum(&u)), (Some(1_645), 1_645));
+        // a cache report can never exceed the prompt it came from
+        assert_eq!(sum(&anth_usage(100, 250, 0)), 100);
+        let it = anth_iteration("message", "m", 10, 4, 1);
+        assert_eq!(
+            (it["type"].as_str(), it["model"].as_str()),
+            (Some("message"), Some("m"))
+        );
+        assert_eq!(sum(&it), 10);
+    }
+
     #[test]
     fn a_repeated_anthropic_call_replays_then_is_refused() {
         let routing = one_server_routing();
@@ -4290,6 +4451,129 @@ mod tests {
         assert_eq!(msgs[1]["role"], "user");
     }
 
+    /// Claude Code ends every request with a system message. The nudge lands
+    /// before it - a user turn behind it would break its placement rule and
+    /// 400 the answer round.
+    #[test]
+    fn the_answer_nudge_keeps_a_trailing_system_message_last() {
+        let sys = json!({"role":"system","content":"# Environment"});
+        let mut msgs = vec![
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}),
+            sys.clone(),
+        ];
+        append_user_text(&mut msgs, "answer now");
+        assert_eq!(msgs.len(), 2, "joins the tool-result turn");
+        assert_eq!(msgs[0]["content"][1]["text"], "answer now");
+        assert_eq!(msgs[1], sys);
+
+        let mut after_asst = vec![json!({"role":"assistant","content":"hm"}), sys.clone()];
+        append_user_text(&mut after_asst, "answer now");
+        assert_eq!(after_asst[1]["role"], "user");
+        assert_eq!(after_asst[2], sys);
+    }
+
+    /// A Messages stream silent past the interval (a long cold prefill) sends
+    /// the spec's ping event - an SSE event Anthropic's SDKs parse and pass
+    /// over, not a comment - so Claude Code's idle watchdog sees traffic.
+    #[tokio::test]
+    async fn a_silent_messages_stream_pings() {
+        use http_body_util::BodyExt;
+        let mut body = anth_sse(futures::stream::pending()).into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(30), body.frame())
+            .await
+            .expect("a silent stream must not stay silent")
+            .expect("stream stays open")
+            .expect("body frame");
+        let bytes = frame.into_data().expect("ping data");
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+        );
+    }
+
+    /// Claude Code's tool loop as it resends it: the model's thinking, a line
+    /// of text and a tool call, then the tool's result.
+    fn tool_loop_history() -> Vec<Value> {
+        vec![
+            json!({"role": "user", "content": "read the ledger"}),
+            json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "PRIOR-THOUGHT: start with ledger_01", "signature": ""},
+                {"type": "text", "text": "Reading it."},
+                {"type": "tool_use", "id": "toolu_1", "name": "Read",
+                 "input": {"file_path": "ledger_01.txt"}},
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "REC 01-0001"},
+            ]}),
+        ]
+    }
+
+    /// An Anthropic caller's prior thinking has to reach the template the way
+    /// a chat-completions caller's `reasoning_content` does. It didn't: the
+    /// conversion wrote `thinking`, which only gpt-oss reads, so Qwen3.8 - whose
+    /// template keeps prior reasoning by default - was served Claude Code's
+    /// history with the model's own reasoning cut out, 11K tokens shorter than
+    /// llama.cpp's prompt for the same request.
+    #[test]
+    fn anthropic_thinking_renders_on_qwen38_like_chat_reasoning_content() {
+        let qwen = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let converted = convert_messages(None, &tool_loop_history()).expect("convert");
+        let msgs = crate::chat_template::normalize_messages(&converted);
+        let out = crate::chat_template::render(qwen, &msgs, None, None).expect("render");
+        assert!(
+            out.contains("<think>\nPRIOR-THOUGHT: start with ledger_01\n</think>"),
+            "prior thinking dropped:\n{out}"
+        );
+
+        // byte-for-byte what a chat-completions caller gets for the same loop
+        let chat = [
+            json!({"role": "user", "content": "read the ledger"}),
+            json!({"role": "assistant", "content": "Reading it.",
+                   "reasoning_content": "PRIOR-THOUGHT: start with ledger_01",
+                   "tool_calls": [{"id": "toolu_1", "type": "function", "function": {
+                       "name": "Read", "arguments": {"file_path": "ledger_01.txt"}}}]}),
+            json!({"role": "tool", "content": "REC 01-0001", "tool_call_id": "toolu_1"}),
+        ];
+        let chat_out = crate::chat_template::render(
+            qwen,
+            &crate::chat_template::normalize_messages(&chat),
+            None,
+            None,
+        )
+        .expect("render");
+        assert_eq!(out, chat_out, "surfaces diverged");
+    }
+
+    /// gpt-oss reads `thinking`, and its Harmony template refuses `thinking`
+    /// beside `content` on a tool-calling turn - which is exactly what Claude
+    /// Code resends (thinking + text + tool_use), so the old conversion made
+    /// this history a 400 on gpt-oss. It renders now, with the turn's text as
+    /// its analysis (what the template does with content alone); a turn with
+    /// thinking and no text still carries its thinking to the template.
+    #[test]
+    fn anthropic_tool_loop_renders_on_gpt_oss() {
+        let gptoss = include_str!("../tests/fixtures/gptoss_chat_template.jinja");
+        let converted = convert_messages(None, &tool_loop_history()).expect("convert");
+        let msgs = crate::chat_template::normalize_messages(&converted);
+        let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
+        assert!(
+            out.contains("<|channel|>analysis<|message|>Reading it.<|end|>"),
+            "rendered:\n{out}"
+        );
+
+        let mut quiet = tool_loop_history();
+        quiet[1]["content"].as_array_mut().unwrap().remove(1); // drop the text block
+        let converted = convert_messages(None, &quiet).expect("convert");
+        let msgs = crate::chat_template::normalize_messages(&converted);
+        let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
+        assert!(
+            out.contains(
+                "<|channel|>analysis<|message|>PRIOR-THOUGHT: start with ledger_01<|end|>"
+            ),
+            "thinking dropped:\n{out}"
+        );
+    }
+
     /// The real granite-vision template, the same fixture the integration
     /// test renders. Lives under tests/ because that is where the rest of the
     /// template gates read it from; this is `cfg(test)` so it never ships.
@@ -4448,13 +4732,81 @@ mod tests {
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["content"], "hi");
         assert_eq!(out[2]["role"], "assistant");
-        assert_eq!(out[2]["thinking"], "hmm");
+        assert_eq!(out[2]["reasoning_content"], "hmm");
         assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "f");
         // tool_result becomes its own tool message before the user text
         assert_eq!(out[3]["role"], "tool");
         assert_eq!(out[3]["tool_call_id"], "toolu_1");
         assert_eq!(out[4]["role"], "user");
         assert_eq!(out[4]["content"], "thanks");
+    }
+
+    /// The shape Claude Code sends (captured from 2.1.280): the trailing
+    /// system message used to 400 the whole request with `invalid message
+    /// role "system"`. It rides the user turn now, and the leading system
+    /// prompt - the front of every cached prefix - is untouched.
+    #[test]
+    fn a_trailing_system_message_rides_the_user_turn() {
+        let messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "Say hi"}]}),
+            json!({"role": "system", "output_config": {"effort": "medium"}, "content": [
+                {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}},
+            ]}),
+        ];
+        let out = convert_messages(Some(&json!("sys")), &messages).unwrap();
+        assert_eq!(out.len(), 2, "no system turn past the first");
+        assert_eq!(out[0]["content"], "sys");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(
+            out[1]["content"],
+            "Say hi\n\n<system-reminder>\n# Environment\n</system-reminder>"
+        );
+    }
+
+    /// Positional: after a tool round the reminder opens its own user turn
+    /// behind the results, and the history before it converts byte-for-byte
+    /// as it did without it - the radix prefix does not move.
+    #[test]
+    fn a_system_message_after_tool_results_keeps_the_prefix() {
+        let head = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {}},
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
+            ]}),
+        ];
+        let mut with = head.clone();
+        with.push(json!({"role": "system", "content": "tests are flaky here"}));
+        let base = convert_messages(None, &head).unwrap();
+        let out = convert_messages(None, &with).unwrap();
+        assert_eq!(out[..base.len()], base[..]);
+        assert_eq!(out.len(), base.len() + 1);
+        assert_eq!(out[base.len()]["role"], "user");
+    }
+
+    /// Claude Code compacts on Anthropic's exact overflow wording - and only on
+    /// that, numbers included - so both overflow flavours speak it here, while
+    /// every other error keeps its own text.
+    #[test]
+    fn a_context_overflow_speaks_anthropics_words() {
+        let want = "prompt is too long: 270000 tokens > 262144 maximum";
+        let text = EngineError::context_overflow(270_000, 262_144);
+        assert_eq!(anthropic_message(&text), want);
+        let images = EngineError::context_overflow_images(270_000, 262_144, 200_000, 3);
+        assert_eq!(anthropic_message(&images), want);
+        assert_eq!(anthropic_message(&EngineError::invalid("nope")), "nope");
+    }
+
+    #[test]
+    fn a_misplaced_system_message_is_a_400_not_a_render() {
+        let first = vec![
+            json!({"role": "system", "content": "x"}),
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let e = convert_messages(None, &first).unwrap_err();
+        assert!(e.contains("must follow a user message"), "{e}");
     }
 
     #[test]

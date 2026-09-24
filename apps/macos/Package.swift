@@ -20,6 +20,7 @@ let package = Package(
   dependencies: [
     .package(url: "https://github.com/LiYanan2004/MarkdownView.git", from: "3.0.0"),
     .package(url: "https://github.com/lukilabs/beautiful-mermaid-swift.git", from: "1.0.4"),
+    .package(url: "https://github.com/sparkle-project/Sparkle.git", exact: "2.10.0"),
   ],
   targets: [
     .target(name: "PaddockClient"),
@@ -50,6 +51,7 @@ let package = Package(
       name: "PaddockUI",
       dependencies: [
         "PaddockClient", "PaddockStudio", "PaddockNativeMarkdown", "PaddockDesign",
+        .product(name: "Sparkle", package: "Sparkle"),
       ],
       resources: [.process("Resources")]),
     .executableTarget(name: "PaddockMac", dependencies: ["PaddockUI"]),

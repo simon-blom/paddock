@@ -6,7 +6,9 @@ import UserNotifications
 
 @MainActor @Observable
 public final class DesktopNotifications: NSObject, UNUserNotificationCenterDelegate {
-  public private(set) var authorization = "Not requested"
+  public private(set) var authorization: UNAuthorizationStatus?
+  public var permissionBlocked: Bool { authorization == .denied }
+  public var effectiveEnabled: Bool { enabled && Self.allowsDelivery(authorization) }
   public private(set) var error: String?
   public private(set) var requesting = false
   @ObservationIgnored private let center: UNUserNotificationCenter
@@ -41,12 +43,17 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   }
 
   public func refreshAuthorization() async {
-    let status = await center.notificationSettings().authorizationStatus
-    switch status {
-    case .authorized, .provisional: authorization = "Allowed by macOS"
-    case .denied: authorization = "Disabled in macOS Notification Settings"
-    case .notDetermined: authorization = "Not requested"
-    default: authorization = "Managed by macOS"
+    authorization = await center.notificationSettings().authorizationStatus
+  }
+
+  static func allowsDelivery(_ authorization: UNAuthorizationStatus?) -> Bool {
+    authorization == .authorized || authorization == .provisional
+  }
+
+  public func openSettings() {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+    {
+      NSWorkspace.shared.open(url)
     }
   }
 
@@ -56,6 +63,14 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
     defer { requesting = false }
     do {
       error = nil
+      await refreshAuthorization()
+      if permissionBlocked {
+        // Remember the user's choice; macOS still gates delivery. On return
+        // from System Settings the switch reflects the refreshed permission.
+        enabled = true
+        openSettings()
+        return
+      }
       enabled = try await center.requestAuthorization(options: [.alert, .sound])
       await refreshAuthorization()
     } catch { self.error = error.localizedDescription }
@@ -78,8 +93,7 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
         defer { if pending[key]?.0 == generation { pending[key] = nil } }
         let settings = await center.notificationSettings()
         guard !Task.isCancelled, enabled, isVisible?(event.route) != true,
-          settings.authorizationStatus == .authorized
-            || settings.authorizationStatus == .provisional
+          Self.allowsDelivery(settings.authorizationStatus)
         else { return }
         let content = UNMutableNotificationContent()
         content.title = event.title

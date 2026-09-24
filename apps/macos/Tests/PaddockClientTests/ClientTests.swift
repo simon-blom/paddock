@@ -48,7 +48,7 @@ struct ContractTests {
       from: Data(
         #"{"backend":"metal","state":"untested","os":"macos","card":null,"new_field":true}"#.utf8))
     #expect(readiness.card == nil)
-    #expect(readiness.title == "Hardware support not confirmed")
+    #expect(readiness.warning == nil)
     let runner = try ManagerWire.decode(
       RunnerInfo.self,
       from: Data(
@@ -57,6 +57,19 @@ struct ContractTests {
     #expect(runner.title == "align-model")
     #expect(runner.inFlight == nil)
     #expect(runner.id == "11540:42")
+  }
+
+  @Test func hardwareOverviewOnlyReportsActionableFailures() throws {
+    for (state, warning): (String, String?) in [
+      ("ready", nil), ("untested", nil), ("future-state", nil),
+      ("driver-too-old", "Driver update needed"), ("no-card", "Local serving unavailable"),
+    ] {
+      let readiness = try ManagerWire.decode(
+        Readiness.self,
+        from: Data(
+          "{\"backend\":\"metal\",\"state\":\"\(state)\",\"os\":\"macos\"}".utf8))
+      #expect(readiness.warning == warning)
+    }
   }
 
   @Test func artifactAvailabilityUsesBackendNotLegacyQualification() throws {

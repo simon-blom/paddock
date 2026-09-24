@@ -1,0 +1,27 @@
+{
+  "budgets": {
+    "bonsai": {"max_pixels":16777216,"min_pixels":65536,"max_edge":null,"pixels_per_token":1024,"max_tokens":16384,"min_tokens":64,"auto_max_tokens":4096},
+    "edge": {"max_pixels":4194304,"min_pixels":1024,"max_edge":3840,"pixels_per_token":784,"max_tokens":5350,"min_tokens":4,"auto_max_tokens":4096},
+    "small": {"max_pixels":250880,"min_pixels":250880,"max_edge":null,"pixels_per_token":896,"max_tokens":280,"min_tokens":280,"auto_max_tokens":280}
+  },
+  "cases": [
+    {"family":"bonsai","width":6720,"height":4480,"detail":"auto","expected":4096},
+    {"family":"bonsai","width":6720,"height":4480,"detail":"high","expected":16381},
+    {"family":"bonsai","width":6720,"height":4480,"detail":"low","expected":64},
+    {"family":"bonsai","width":4480,"height":6720,"detail":"auto","expected":4096},
+    {"family":"bonsai","width":4480,"height":6720,"detail":"high","expected":16381},
+    {"family":"bonsai","width":4480,"height":6720,"detail":"low","expected":64},
+    {"family":"bonsai","width":320,"height":200,"detail":"auto","expected":64},
+    {"family":"bonsai","width":320,"height":200,"detail":"high","expected":64},
+    {"family":"bonsai","width":320,"height":200,"detail":"low","expected":64},
+    {"family":"bonsai","width":1,"height":1,"detail":"auto","expected":64},
+    {"family":"bonsai","width":1,"height":1,"detail":"high","expected":64},
+    {"family":"bonsai","width":1,"height":1,"detail":"low","expected":64},
+    {"family":"edge","width":12000,"height":600,"detail":"auto","expected":941},
+    {"family":"edge","width":12000,"height":600,"detail":"high","expected":941},
+    {"family":"edge","width":12000,"height":600,"detail":"low","expected":4},
+    {"family":"small","width":8000,"height":6000,"detail":"auto","expected":280},
+    {"family":"small","width":8000,"height":6000,"detail":"high","expected":280},
+    {"family":"small","width":8000,"height":6000,"detail":"low","expected":280}
+  ]
+}

@@ -16,6 +16,7 @@
 #include "src/attn/lagd.cuh"        // hd128 v5-class decode partial (needs decode's ldm/mma/cpa helpers; f32_qkv launches it)
 #include "src/gemm/f32_qkv.cuh"
 #include "src/qwen4exp.cuh"   // qwen4_exp (Qwen3.8-Flash-Next) new math: grouped (1+w) norm, hyper-connection mix/combine, PLE gate, dilated conv, GDN sigmoid gated-norm + repeat-interleave split; plain CUDA, needs f32_qkv's pd_launch_status
+#include "src/attn/qsa.cuh"        // QSA (Flash-Next sparse attention) part 1: indexer query norm, compressed-key pool/store + raw-key ring; plain CUDA, needs f32_qkv's pd_launch_status
 #include "src/gemm/bf16_dense.cuh"
 #include "src/gemm/exp_lt.cuh"
 #include "src/gemm/lowm.cuh"  // bf16 weight planes (mixed UD files); abi.cuh helpers only
@@ -62,6 +63,9 @@
 #include "src/asr/whisper.cuh"      // whisper decode lane (flash-decoding attn + fused decode epilogues)
 #include "src/asr/granite_speech.cuh"  // granite-speech conformer tower (macaron FFN, GLU, centered dwconv, Shaw-RPE attention)
 #include "src/dense_pred.cuh"     // dense prediction: DINOv3 LayerScale ViT epilogues + conv decoder ops (needs whisper.cuh's staged LayerNorm)
+#include "src/dit.cuh"            // diffusion-transformer glue (qwen-image): 3-axis rope, Philox noise, gated residual, row softmax; plain CUDA, abi.cuh helpers only
+#include "src/conv/vae.cuh"       // image VAE conv glue: per-pixel channel RMSNorm, stripe/upsample im2row, DupUp shortcut; plain CUDA
+#include "src/diffusion/canvas.cuh" // block-diffusion canvas (DiffusionGemma): E^T bf16 plane, row sampler, EB accept/re-noise, label gather; needs dit.cuh's Philox
 #include "src/moe/kquant.cuh"       // k-quant MoE expert seats (needs the two kquant segments)
 #include "src/moe/offload.cuh"      // MoE expert offload: device-managed LRU slot cache over host-mapped expert planes (needs kquant.cuh layouts; plain CUDA)
 #include "src/dflash.cuh"        // DFlash2 drafter grouped dynamic conv (abi.cuh helpers only)

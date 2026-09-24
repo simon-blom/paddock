@@ -103,9 +103,26 @@ pub enum ArtifactKind {
     /// source over a GGUF base (PADDOCK_FP8_NATIVE); becomes a weights
     /// alternative when the engine serves it directly.
     Fp8Snapshot,
+    /// The text encoder an image-generation lane conditions on (Qwen-Image's
+    /// Qwen3-VL GGUF). Required, resident from startup, never switchable -
+    /// the DiT has nothing to draw from without it. Its own kind rather than
+    /// a weights alternative because a server picks ONE weights artifact and
+    /// this loads beside it; not Vision, because it rides `--text-encoder`
+    /// and implies no image input.
+    TextEncoder,
+    /// The VAE that turns an image lane's latents into pixels (the official
+    /// safetensors). Required and resident like the text encoder; rides
+    /// `--vae`.
+    Vae,
 }
 
 impl ArtifactKind {
+    /// An image lane's resident companions - the pieces a DiT cannot serve
+    /// without, resolved and charged beside it. Neither has a switch.
+    pub fn is_lane_companion(self) -> bool {
+        matches!(self, ArtifactKind::TextEncoder | ArtifactKind::Vae)
+    }
+
     /// Does this ride the runner's `--mmproj` flag? Vision and Audio are
     /// separate KINDS because they imply different input capabilities, but
     /// they are the same KIND of FILE and the runner takes them through one
@@ -1030,6 +1047,11 @@ pub struct Resolved {
     pub weights: PathBuf,
     /// The vision tower (mmproj), when a vision artifact is installed.
     pub mmproj: Option<PathBuf>,
+    /// An image lane's text encoder and VAE, when installed - the DiT is
+    /// `weights`, these ride `--text-encoder` / `--vae`. Restricted to what
+    /// the chosen weights allow, so the compact DiT gets the compact encoder.
+    pub text_encoder: Option<PathBuf>,
+    pub vae: Option<PathBuf>,
     /// The drafter to wire in without being asked: installed AND marked
     /// default in the catalog - e.g. gemma-4-31b's 470M assistant.
     pub mtp: Option<PathBuf>,
@@ -1134,6 +1156,92 @@ impl Registry {
         } else {
             Err(a.label.clone())
         })
+    }
+
+    /// The weights artifact a bare model id means: the backend's default if
+    /// installed, else any installed weights for the backend, else the
+    /// default - so a not-yet-downloaded model still names its plan.
+    fn elect_weights<'a>(&self, model: &'a CatalogModel) -> Option<&'a CatalogArtifact> {
+        model
+            .default_weights_for_backend(&self.backend, self.cc)
+            .filter(|a| self.is_artifact_installed(a))
+            .or_else(|| {
+                model.weights().find(|a| {
+                    a.runtime.supports_backend(&self.backend) && self.is_artifact_installed(a)
+                })
+            })
+            .or_else(|| model.default_weights_for_backend(&self.backend, self.cc))
+    }
+
+    /// The weights artifact a spawn spec names - an explicit id, else the
+    /// election above.
+    fn weights_for<'a>(
+        &self,
+        model: &'a CatalogModel,
+        artifact: Option<&str>,
+    ) -> Option<&'a CatalogArtifact> {
+        match artifact {
+            Some(a) => model
+                .artifacts
+                .iter()
+                .find(|x| x.id == a && x.kind == ArtifactKind::Weights),
+            None => self.elect_weights(model),
+        }
+    }
+
+    /// Where an image lane's text encoder and VAE live, or will: the default
+    /// of each kind the chosen weights allow, installed or not - the preview's
+    /// and the save's planned paths for a model whose download has not run.
+    pub fn planned_lane_companions(
+        &self,
+        id: &str,
+        artifact: Option<&str>,
+    ) -> (Option<PathBuf>, Option<PathBuf>) {
+        let Some(m) = self.catalog.models.iter().find(|m| m.id == id) else {
+            return (None, None);
+        };
+        let Some(w) = self.weights_for(m, artifact) else {
+            return (None, None);
+        };
+        let planned = |kind: ArtifactKind| {
+            m.artifacts
+                .iter()
+                .find(|a| {
+                    a.kind == kind
+                        && a.default
+                        && w.runtime.allows_companion(&a.id)
+                        && a.runtime.supports_backend(&self.backend)
+                })
+                .and_then(|a| a.files.first().map(|f| self.models_dir.join(&f.dest)))
+        };
+        (
+            planned(ArtifactKind::TextEncoder),
+            planned(ArtifactKind::Vae),
+        )
+    }
+
+    /// The label of a required text encoder or VAE the chosen weights need
+    /// and the disk does not have; None when the model needs none, or has
+    /// them all. `required_companion`'s contract for the lane pieces, which
+    /// unlike a vision tower have no switch: a config missing one is a start
+    /// that cannot succeed, so the save refuses and names the download.
+    pub fn missing_required_lane_companion(
+        &self,
+        id: &str,
+        artifact: Option<&str>,
+    ) -> Option<String> {
+        let m = self.catalog.models.iter().find(|m| m.id == id)?;
+        let w = self.weights_for(m, artifact)?;
+        m.artifacts
+            .iter()
+            .filter(|a| {
+                a.kind.is_lane_companion()
+                    && a.required
+                    && w.runtime.allows_companion(&a.id)
+                    && a.runtime.supports_backend(&self.backend)
+            })
+            .find(|a| !self.is_artifact_installed(a))
+            .map(|a| a.label.clone())
     }
 
     /// Parse the embedded manifest. It ships with the binary and is author-
@@ -1514,15 +1622,8 @@ impl Registry {
                 }
                 a.clone()
             }
-            None => model
-                .default_weights_for_backend(&self.backend, self.cc)
-                .filter(|a| self.is_artifact_installed(a))
-                .or_else(|| {
-                    model.weights().find(|a| {
-                        a.runtime.supports_backend(&self.backend) && self.is_artifact_installed(a)
-                    })
-                })
-                .or_else(|| model.default_weights_for_backend(&self.backend, self.cc))
+            None => self
+                .elect_weights(&model)
                 .ok_or_else(|| {
                     DlError::Http(format!(
                         "model {name} has no compatible weights for backend {}",
@@ -1678,6 +1779,8 @@ impl Registry {
         Ok(Some(Resolved {
             weights: weights_path,
             mmproj: installed_mmproj(),
+            text_encoder: installed_path(ArtifactKind::TextEncoder),
+            vae: installed_path(ArtifactKind::Vae),
             // What wires without being asked: the pin (an explicit choice is
             // the same consent that marking it default expresses), else the
             // installed default - never a non-default sibling.

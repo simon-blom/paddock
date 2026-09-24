@@ -11,6 +11,10 @@ public actor NativeStudioRuntime {
   let publish: Presentation
   let prepareGraph: @Sendable (O) async throws -> String
   let rasterPDF: @Sendable (Data, O) async throws -> [V]
+  let openPDF: @Sendable (Data) async throws -> NativeDocumentSource
+  var documentRuns: [String: NativeDocumentRunState] = [:]
+  var imagePreviews: [String: O] = [:]
+  var documentDisplay = NativeOCRDisplayCache()
   var graphGrounding = ""
   var document: ConversationDocument?
   var draft = true
@@ -29,6 +33,8 @@ public actor NativeStudioRuntime {
   var previewPart: O?
   var graphVisible = false
   var graphArtifact: O?
+  var graphSelectionRevision = 0
+  var documentSelectionRevision = 0
   var audio: O = [:]
   var search = "", sort = "newest", page = 1
   var draftText = "", error = ""
@@ -39,11 +45,16 @@ public actor NativeStudioRuntime {
   var reducers: [String: ResponseAccumulator] = [:]
   var starts: [String: ContinuousClock.Instant] = [:]
   var responseMetrics: [String: NativeResponseMetrics] = [:]
+  var requestEvents = Set<String>()
   var continuationPrefixes: [String: String] = [:]
   var completedTurn: V = .null
   var publication: Task<Void, Never>?
   var polling: Task<Void, Never>?
   var titleTask: Task<Void, Never>?
+  var compactionTask: Task<Void, Never>?
+  var compactionEpoch = 0
+  var compactionTimeout: Duration = .seconds(600)
+  var compactionNotice = ""
   var writeTail: Task<Void, Error>?
   var receipts: [String: O] = [:]
   var receiptOrder: [String] = []
@@ -57,12 +68,16 @@ public actor NativeStudioRuntime {
     rasterPDF: @escaping @Sendable (Data, O) async throws -> [V] = { _, _ in
       throw ConversationFailure.invalid("Native PDF rasterization is not available")
     },
+    openPDF: @escaping @Sendable (Data) async throws -> NativeDocumentSource = { _ in
+      throw ConversationFailure.invalid("Native PDF document processing is not available")
+    },
     publish: @escaping Presentation
   ) {
     self.transport = transport
     self.publish = publish
     self.prepareGraph = prepareGraph
     self.rasterPDF = rasterPDF
+    self.openPDF = openPDF
   }
   public func start() async throws {
     let settings = try await transport.api("api/settings")
@@ -89,6 +104,8 @@ public actor NativeStudioRuntime {
     }
   }
   func newDocument() throws {
+    documentSelectionRevision += 1
+    graphSelectionRevision += 1
     let selected = document?.fields["model"]?.string
     let model =
       selected.flatMap { id in
@@ -186,6 +203,8 @@ public actor NativeStudioRuntime {
     await publish(presentation())
   }
   public func close() async {
+    let summarizing = compactionTask
+    cancelCompaction()
     artifactRefreshTask?.cancel()
     artifactRefreshTask = nil
     closed = true
@@ -195,6 +214,7 @@ public actor NativeStudioRuntime {
     let running = Array(tasks.values)
     for task in running { task.cancel() }
     for task in running { await task.value }
+    await summarizing?.value
     _ = try? await writeTail?.value
     await transport.close()
   }
@@ -211,6 +231,7 @@ public actor NativeStudioRuntime {
       "document": documentPreview.map(V.object) ?? .null,
       "graph": graphArtifact.map(V.object) ?? .null,
       "graphSource": graph ?? .null, "visibleGraph": .bool(graphVisible),
+      "graphHistory": .array(document.map(Self.graphHistory) ?? []),
       "conversationId": document.map { .string($0.id) } ?? .null,
     ]
   }

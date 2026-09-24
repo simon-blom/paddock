@@ -230,6 +230,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // chat - the manager is the CLIENT (it holds the runner key)
         .route("/api/runners/{port}/v1/embeddings", post(relay_embeddings))
         .route("/api/runners/{port}/v1/rerank", post(relay_rerank))
+        .route("/api/runners/{port}/v1/systemone", post(relay_systemone))
         // Transcribe: an audio FILE goes up, so this relay carries the
         // caller's multipart content-type (boundary and all) rather than the
         // JSON every other relay assumes.
@@ -243,6 +244,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/runners/{port}/v1/audio/alignments",
             post(relay_alignments),
+        )
+        // Images: generations is JSON like chat; edits carries image FILES
+        // (multipart), so it forwards the content-type verbatim the way
+        // transcriptions does.
+        .route(
+            "/api/runners/{port}/v1/images/generations",
+            post(relay_image_generations),
+        )
+        .route(
+            "/api/runners/{port}/v1/images/edits",
+            post(relay_image_edits),
         )
         // Composer attachment costing: the Studio asks the runner's own
         // count_tokens what a staged file will really cost (real extraction,
@@ -986,6 +998,11 @@ const RUNNER_DEFAULT_MAX_BATCH: usize = 32;
 /// Only fills what is absent: an explicit choice (CLI flag, Studio form, or a
 /// hand-edited file on a verbatim start) always wins.
 fn pin_envelope(spec: &mut crate::supervisor::SpawnSpec, registry: &crate::registry::Registry) {
+    // An image lane has no envelope to pin: nothing is priced per token or
+    // per slot, and the runner reads neither key for it.
+    if crate::estimate::is_image_lane(registry, &spec.model) {
+        return;
+    }
     let (ctx, batch) = registry.default_envelope(&spec.model, spec.artifact.as_deref());
     spec.max_ctx.get_or_insert(ctx);
     spec.max_batch.get_or_insert(batch);
@@ -1265,17 +1282,32 @@ async fn vram_admission(
         // on every vision start. Only when vision is actually on: the
         // supervisor drops the mmproj on `spec.vision == Some(false)`, and
         // charging it anyway refused starts that would have fit.
-        shape.tower_bytes = if req.vision {
-            state
-                .registry
-                .catalog()
-                .models
-                .iter()
-                .find(|m| m.id == req.model)
-                .map_or(0, |m| crate::estimate::tower_bytes(m, &state.registry))
-        } else {
-            0
-        };
+        //
+        // An image lane's text encoder and VAE ride the same term with no
+        // switch at all - resident from load, for the endpoint's life - and
+        // are priced for the DiT actually resolved, since the compact DiT
+        // pairs with the compact encoder. The first image start was granted
+        // 15.6 GB against 16.85 GB of weights alone because this was missing.
+        let row = state
+            .registry
+            .catalog()
+            .models
+            .iter()
+            .find(|m| m.id == req.model);
+        let lane = row.map_or(0, |m| {
+            let weights_artifact = m.weights().find(|a| {
+                a.files
+                    .first()
+                    .is_some_and(|f| state.registry.models_dir().join(&f.dest) == path)
+            });
+            crate::estimate::lane_companion_bytes_for(m, &state.registry, weights_artifact)
+        });
+        shape.tower_bytes = lane
+            + if req.vision {
+                row.map_or(0, |m| crate::estimate::tower_bytes(m, &state.registry))
+            } else {
+                0
+            };
         // A speculating endpoint holds its drafter resident for its whole life,
         // so it comes out of the same budget as the weights. In-file MTP adds
         // no drafter bytes (already inside `weights`) but still widens the
@@ -1392,22 +1424,27 @@ async fn vram_admission(
     // arithmetic - exact weights + the vision tower's file size + a
     // conservative floor - admits or refuses, and no budget is written (the
     // runner sizes free-at-load; committed accounting falls back to its live
-    // ledger). The mmproj bytes are known from the catalog even here: the file
-    // does not have to exist for its size to be a fact.
+    // ledger). The companion bytes - the mmproj, an image lane's text
+    // encoder and VAE - are known from the catalog even here: the file does
+    // not have to exist for its size to be a fact.
     let mmproj = state
         .registry
         .catalog()
         .models
         .iter()
         .find(|m| m.id == req.model)
-        .map_or(0, |m| crate::estimate::tower_bytes(m, &state.registry));
+        .map_or(0, |m| {
+            crate::estimate::tower_bytes(m, &state.registry)
+                + crate::estimate::lane_companion_bytes_for(m, &state.registry, None)
+        });
     // Unprobeable + a configured budget: bar 1 already cleared it against the
     // fleet, and there is no shape to price bar 2 with. The engine's own load
     // gate is the remaining guard, as it was before budgets.
     if req.fixed_need.is_some() {
         return Ok(None);
     }
-    let need = weights + mmproj + ADMIT_FLOOR;
+    // the declared serving workspace is pinned at load like the companions
+    let need = weights + mmproj + workspace + ADMIT_FLOOR;
     if need > residual {
         tracing::warn!(model = %req.model, need, residual, total, "VRAM admission refused a spawn");
         return Err(AdmissionRefusal {
@@ -1512,7 +1549,7 @@ async fn metal_admission(
             },
         );
         if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. })
-            || (shape.kind != paddock_estimator::ModelKind::Encoder
+            || (shape.kind == paddock_estimator::ModelKind::Generative
                 && estimate.max_ctx < shape.max_ctx)
         {
             return Err(refuse(format!(
@@ -1630,6 +1667,16 @@ async fn relay_rerank(
     relay_v1(state, port, "v1/rerank", body).await
 }
 
+/// Structured reads (the Studio's Reads page): one JSON body in, one JSON
+/// answer out, on a block-diffusion runner - the same relay shape as rerank.
+async fn relay_systemone(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/systemone", body).await
+}
+
 async fn relay_count_tokens(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
@@ -1678,6 +1725,33 @@ async fn relay_alignments(
         .unwrap_or("application/octet-stream")
         .to_owned();
     relay_raw(state, port, "v1/audio/alignments", &ct, body).await
+}
+
+/// The Studio's Images page: JSON in, base64 images out, same verbatim
+/// contract as chat.
+async fn relay_image_generations(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/images/generations", body).await
+}
+
+/// Edits carry the source image(s) as multipart parts - the transcriptions
+/// rule: the boundary lives in the caller's content-type, so it is forwarded
+/// as sent.
+async fn relay_image_edits(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    relay_raw(state, port, "v1/images/edits", &ct, body).await
 }
 
 async fn relay_v1(
@@ -2117,11 +2191,15 @@ async fn runners_spawn(
         Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
     }
     // every-server connectors join a new endpoint's config at birth (existing
-    // configs were rewritten when the checkbox flipped)
-    spec.mcp_servers.extend(crate::connectors::system_entries(
-        &state.db,
-        &spec.mcp_servers,
-    ));
+    // configs were rewritten when the checkbox flipped) - a chat feature, so
+    // not on an image lane, which serves no tool-calling surface to wire
+    // them into
+    if !crate::estimate::is_image_lane(&state.registry, &spec.model) {
+        spec.mcp_servers.extend(crate::connectors::system_entries(
+            &state.db,
+            &spec.mcp_servers,
+        ));
+    }
     // A user asked for this start - note it for the lifecycle band the
     // collector opens (auto-allocated ports miss the note; the band then
     // honestly reads "cause unobserved" rather than guessing).
@@ -3201,6 +3279,44 @@ mod tests {
         assert_eq!(before, after);
         assert!(pinned.starts_with("# operator settings"));
         assert_eq!(pin_budget_text(&pinned, 99999), pinned);
+    }
+
+    /// An image lane gets no envelope pinned: the first image endpoint's
+    /// file carried `max_ctx = 4096` / `max_batch = 32` for a runner that
+    /// reads neither, and the Studio then drew a context meter from them.
+    #[test]
+    fn an_image_lane_gets_no_token_envelope_pinned() {
+        let registry = crate::registry::Registry::new(std::env::temp_dir());
+        let mut lanes = 0;
+        for model in &registry.catalog().models {
+            let mut spec = crate::supervisor::SpawnSpec {
+                model: model.id.clone(),
+                ..Default::default()
+            };
+            pin_envelope(&mut spec, &registry);
+            let image = model.capability.iter().any(|c| c == "image-generation");
+            assert_eq!(
+                crate::estimate::is_image_lane(&registry, &model.id),
+                image,
+                "{}",
+                model.id
+            );
+            if image {
+                lanes += 1;
+                assert!(
+                    spec.max_ctx.is_none() && spec.max_batch.is_none(),
+                    "{}: an image lane carries no max_ctx / max_batch",
+                    model.id
+                );
+            } else {
+                assert!(
+                    spec.max_ctx.is_some() && spec.max_batch.is_some(),
+                    "{}: every other model is pinned to its envelope",
+                    model.id
+                );
+            }
+        }
+        assert!(lanes > 0, "the catalog carries an image lane to check");
     }
 
     #[test]

@@ -5,8 +5,9 @@ import type { TaskTag } from '@/lib/tasks'
 import { ocrCapsFrom, type OcrCaps } from '@/lib/ocr'
 import { isHarmony, isVisionModel } from '@/lib/model-caps'
 import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
+import { DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_SAMPLES, type StructuredReadCaps } from '@/lib/reads'
 
-export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner'
+export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image'
 
 /** Can this kind hold a lane in the chat surface - i.e. does it ANSWER a user
  *  turn? Chat models reply in text, transcribers reply with a transcript; both
@@ -20,9 +21,14 @@ export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner'
  *
  *  An ALIGNER never takes a turn either: it annotates an existing transcript
  *  with word times (the enrichment pass), it does not answer anything - so
- *  like an encoder it stays out of the header picker. */
+ *  like an encoder it stays out of the header picker.
+ *
+ *  An IMAGE model takes turns too: a prompt in, a picture out, is a turn the
+ *  same way a clip in, a transcript out, is one - and that is what gives it
+ *  history, compare and a persisted record for free. What it cannot do is
+ *  share a conversation with a chat model, which the lane guard enforces. */
 export function takesTurns(kind: ModelKind): boolean {
-  return kind === 'chat' || kind === 'transcriber'
+  return kind === 'chat' || kind === 'transcriber' || kind === 'image'
 }
 
 export interface ModelInfo {
@@ -243,6 +249,15 @@ export interface ModelCaps {
    *  400s text-only chat on it, so the composer requires an attached
    * image/PDF before send. */
   docParser?: boolean
+  /** This endpoint serves /v1/images/generations: its grid and ceilings,
+   *  which are the model's, so the composer's size and step controls never
+   *  offer what the endpoint would refuse. Absent on every other model. */
+  imageGeneration?: ImageGenCaps
+  /** This endpoint reads a text against fixed questions in one pass
+   *  (`POST /v1/systemone`, a block-diffusion model): the caps the runner
+   *  advertises. Absent on every model that generates one token at a time,
+   *  which is what keeps the Reads page from existing for a chat model. */
+  structuredRead?: StructuredReadCaps
   /** This endpoint serves /v1/audio/transcriptions. True for both shapes: a
    *  whisper-family runner (speech in, text out, no chat at all) and a
    *  generative model with its audio mmproj loaded (Qwen3-ASR,
@@ -292,9 +307,36 @@ export interface ModelCaps {
   maxCtx?: number
 }
 
+/** What an image-generation endpoint advertises about itself (the runner's
+ *  `/api/server` `image_generation` block): sides must be multiples of
+ *  `sizeMultiple` up to `maxSide`; `defaultSteps` is the model's own count
+ *  (what `quality: auto` means), `maxPartialImages` how many progressive
+ *  previews a streamed render can send. */
+export interface ImageGenCaps {
+  sizeMultiple: number
+  maxSide: number
+  defaultSize: string
+  defaultSteps: number
+  maxSteps: number
+  maxN: number
+  stream: boolean
+  maxPartialImages: number
+  outputFormats: string[]
+  /** editing with reference images is served */
+  edit: boolean
+  /** reference pictures per edit */
+  maxReferences: number
+}
+
 /** The /api/server (or relayed /runners/{port}/server) body, as far as the
  *  Studio reads it. */
 interface ServerBody {
+  structured_read?: {
+    canvas_width?: number
+    max_questions?: number
+    max_samples?: number
+    types?: string[]
+  } | null
   web_search?: boolean
   mcp_servers?: string[]
   forensics?: { auto?: string; tool?: boolean; vision?: boolean } | null
@@ -313,8 +355,23 @@ interface ServerBody {
   document_parser?: boolean | null
   current_time?: boolean | null
   audio?: boolean
+  image_generation?: {
+    size_multiple?: number
+    max_side?: number
+    default_size?: string
+    default_steps?: number
+    max_steps?: number
+    max_n?: number
+    stream?: boolean
+    max_partial_images?: number
+    output_formats?: string[]
+    edit?: boolean
+    max_references?: number
+  } | null
   realtime_transcription?: RealtimeTranscriptionCaps | null
   aligner?: string | null
+  /** image-generation runner: the picture model it serves, its only role */
+  image_model?: string | null
   alignment_max_clip_s?: number | null
   transcription_max_clip_s?: number | null
   timestamp_granularities?: string[] | null
@@ -355,6 +412,29 @@ function parseCaps(body: ServerBody): ModelCaps {
     ocr: ocrCapsFrom(body.ocr),
     docParser: body.document_parser ?? undefined,
     audio: body.audio ?? undefined,
+    imageGeneration: body.image_generation
+      ? {
+          sizeMultiple: body.image_generation.size_multiple ?? 32,
+          maxSide: body.image_generation.max_side ?? 1024,
+          defaultSize: body.image_generation.default_size ?? '1024x1024',
+          defaultSteps: body.image_generation.default_steps ?? 40,
+          maxSteps: body.image_generation.max_steps ?? 100,
+          maxN: body.image_generation.max_n ?? 1,
+          stream: body.image_generation.stream ?? false,
+          maxPartialImages: body.image_generation.max_partial_images ?? 0,
+          outputFormats: body.image_generation.output_formats ?? ['png'],
+          edit: body.image_generation.edit ?? false,
+          maxReferences: body.image_generation.max_references ?? 0,
+        }
+      : undefined,
+    structuredRead: body.structured_read
+      ? {
+          canvasWidth: body.structured_read.canvas_width ?? 0,
+          maxQuestions: body.structured_read.max_questions ?? DEFAULT_MAX_QUESTIONS,
+          maxSamples: body.structured_read.max_samples ?? DEFAULT_MAX_SAMPLES,
+          types: body.structured_read.types ?? ['noul', 'choice', 'score'],
+        }
+      : undefined,
     realtimeTranscription: body.realtime_transcription ?? undefined,
     aligner: body.aligner ? true : undefined,
     alignmentMaxClipS: body.alignment_max_clip_s ?? undefined,
@@ -385,6 +465,8 @@ interface RunnerRow {
   /** forced-alignment runner: word times for an existing transcript, and
    *  nothing else - the same only-role story as `asr` */
   aligner?: string | null
+  /** image-generation runner: /v1/images/* and nothing else */
+  image?: string | null
   display?: string | null
   vendor?: string | null
   status?: string
@@ -584,7 +666,7 @@ export const useModelsStore = defineStore('models', () => {
       // and there is none while the runner just loads. `capsPending` is the
       // composer's honest signal for this exact window: confirmed loading,
       // not merely unfetched.
-      if (!(body.model || body.asr || body.embedder || body.aligner)) {
+      if (!(body.model || body.asr || body.embedder || body.aligner || body.image_model)) {
         retry()
         return hit ?? c
       }
@@ -599,6 +681,37 @@ export const useModelsStore = defineStore('models', () => {
     } catch {
       return retry()
     }
+  }
+
+  /** The advertised read caps of one endpoint, once its /server has been
+   *  asked (undefined until then, and for every model that cannot read). */
+  function structuredReadFor(id: string): StructuredReadCaps | undefined {
+    return caps.value[id]?.structuredRead
+  }
+
+  /** Running models that READ - the Reads page exists for these and no
+   *  other. A capability gate on what the server says, never on the model
+   *  id: a chat model cannot read, and an id heuristic would have to know
+   *  every block-diffusion family by name. */
+  const readers = computed(() =>
+    models.value.filter((m) => m.kind === 'chat' && !m.cloud && caps.value[m.id]?.structuredRead),
+  )
+  /** True once every local chat runner has been asked (or is being retried
+   *  through capsFor's own loop) - the Reads page's "still looking" state
+   *  ends here rather than on a timer. */
+  const readersProbed = ref(false)
+
+  /** Ask every local chat runner for its caps once, so `readers` can answer.
+   *  The answers land in the same cache the composer reads - nothing is
+   *  fetched twice. A runner still loading retries on capsFor's own
+   *  schedule and joins `readers` when it names its model. */
+  async function probeReaders(): Promise<void> {
+    // before the first runner list there is nothing to probe, and saying
+    // "probed, none found" now would flash the empty state on every load
+    if (!loadedOnce) return
+    const local = models.value.filter((m) => m.kind === 'chat' && !m.cloud)
+    await Promise.all(local.filter((m) => !caps.value[m.id]).map((m) => capsFor(m.id)))
+    readersProbed.value = true
   }
 
   /** One lane-aware answer to "which thinking control": fetched caps win;
@@ -681,7 +794,7 @@ export const useModelsStore = defineStore('models', () => {
     const hit = caps.value[want]?.maxCtx
     if (hit) return hit
     const info = models.value.find((m) => m.id === want)
-    if (info?.cloud) return info.cloud.ctx ?? 131072
+    if (info?.cloud) return info.cloud.ctx ?? 0
     return want === currentId.value ? maxCtx.value : 0
   }
 
@@ -736,10 +849,45 @@ export const useModelsStore = defineStore('models', () => {
   /** Whether this model can hold a TEXT conversation. A whisper-family runner
    *  cannot - it serves transcription and nothing else - so the composer
    *  switches to audio input rather than offering a text box that would earn
-   *  a refusal. An aligner cannot either: it annotates transcripts, full stop. */
+   *  a refusal. An aligner cannot either: it annotates transcripts, full stop.
+   *  Nor can an image model: it answers a prompt with a picture, on its own
+   *  page. */
   function canChat(id: string): boolean {
     const kind = models.value.find((m) => m.id === id)?.kind
-    return kind !== 'transcriber' && kind !== 'aligner'
+    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image'
+  }
+
+  /** Whether this model makes pictures from a prompt: the endpoint's fetched
+   *  caps win, and an image runner falls back to true while its caps are
+   *  still in flight (it is what the runner is). A capability question like
+   *  `canTranscribe`, so a future model that both chats and draws joins
+   *  either panel. */
+  function canImagine(id: string): boolean {
+    const hit = caps.value[id]?.imageGeneration
+    if (hit !== undefined) return true
+    return models.value.find((m) => m.id === id)?.kind === 'image'
+  }
+
+  /** Where a PROMPT goes to become a picture, same two-sided shape as
+   *  [`transcribeUrl`]: a local runner through the manager relay. Cloud image
+   *  models are not wired yet - the seam is here for them. `undefined` means
+   *  nothing serves this id right now. */
+  function imageUrl(id?: string): string | undefined {
+    const want = id || currentId.value
+    const hit = models.value.find((m) => m.id === want)
+    if (hit?.cloud) return undefined
+    return hit?.port ? `/api/runners/${hit.port}/v1/images/generations` : undefined
+  }
+
+  /** Where a picture goes to be EDITED (reference pictures + an
+   *  instruction), beside [`imageUrl`]; undefined when the endpoint does
+   *  not edit (no vision tower) or nothing serves the id. */
+  function imageEditUrl(id?: string): string | undefined {
+    const want = id || currentId.value
+    const hit = models.value.find((m) => m.id === want)
+    if (hit?.cloud || !hit?.port) return undefined
+    if (!caps.value[want]?.imageGeneration?.edit) return undefined
+    return `/api/runners/${hit.port}/v1/images/edits`
   }
 
   /** The running forced-aligner lane, if the fleet has one - what the
@@ -819,9 +967,9 @@ export const useModelsStore = defineStore('models', () => {
   function integrateRunnerRows(rows: RunnerRow[]): void {
     const prevById = new Map(models.value.map((m) => [m.id, m]))
     const local: ModelInfo[] = rows
-      .filter((r) => r.model || r.embedder || r.asr || r.aligner)
+      .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image)
       .map((r) => {
-        const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner) as string
+        const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image) as string
         const prev = prevById.get(id)
         const raw = r.status ?? 'unknown'
         return {
@@ -836,7 +984,9 @@ export const useModelsStore = defineStore('models', () => {
               ? ('encoder' as const)
               : r.asr
                 ? ('transcriber' as const)
-                : ('aligner' as const),
+                : r.aligner
+                  ? ('aligner' as const)
+                  : ('image' as const),
           status: raw === 'unreachable' && prev?.status ? prev.status : raw,
           vision: prev?.vision,
           spec: r.spec ?? undefined,
@@ -905,9 +1055,9 @@ export const useModelsStore = defineStore('models', () => {
       // whose tools never changed - smooth it over with the last real status.
       const prevById = new Map(models.value.map((m) => [m.id, m]))
       const local: ModelInfo[] = rows
-        .filter((r) => r.model || r.embedder || r.asr || r.aligner)
+        .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image)
         .map((r) => {
-          const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner) as string
+          const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image) as string
           const prev = prevById.get(id)
           const raw = r.status ?? 'unknown'
           return {
@@ -922,7 +1072,9 @@ export const useModelsStore = defineStore('models', () => {
                 ? ('encoder' as const)
                 : r.asr
                   ? ('transcriber' as const)
-                  : ('aligner' as const),
+                  : r.aligner
+                    ? ('aligner' as const)
+                    : ('image' as const),
             status: raw === 'unreachable' && prev?.status ? prev.status : raw,
             vision: prev?.vision,
             spec: r.spec ?? undefined,
@@ -1078,13 +1230,13 @@ export const useModelsStore = defineStore('models', () => {
     const cur = models.value.find((x) => x.id === currentId.value)
     if (cur?.cloud) {
       // no /api/server to ask a provider - the provider's own context length
-      // when its list reported one, a roomy default otherwise. PDFs are read
+      // when its list reported one, unknown otherwise. PDFs are read
       // natively (as pages) on the big providers. The reasoning control is
       // the lane-aware resolution: effort for the always-thinking OpenAI
       // families, the on/off toggle for everything else capable (the relay
       // translates per provider - OpenRouter reasoning{enabled}, Anthropic
       // extended thinking), none otherwise.
-      maxCtx.value = cur.cloud.ctx ?? 131072
+      maxCtx.value = cur.cloud.ctx ?? 0
       reasoningStyle.value = reasoningStyleFor(currentId.value)
       pdfEnabled.value = true
       pdfRaster.value = true
@@ -1145,6 +1297,9 @@ export const useModelsStore = defineStore('models', () => {
     ocrFor,
     canTranscribe,
     canChat,
+    canImagine,
+    imageUrl,
+    imageEditUrl,
     alignerLane,
     canTimeSegments,
     canTimeWords,
@@ -1162,5 +1317,9 @@ export const useModelsStore = defineStore('models', () => {
     responsesUrl,
     countTokensUrl,
     extractUrl,
+    structuredReadFor,
+    readers,
+    readersProbed,
+    probeReaders,
   }
 })

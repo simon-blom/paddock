@@ -813,7 +813,7 @@ fn attn_rows_subrange_matches_full_pass() {
             )
             .expect("full-range reference");
             exec.attn_prefill_f16_rows(
-                &d_q, &d_k, &d_v, &d_s, &mut d_out, &d_pos, &d_slots, n_heads, n_kv_heads,
+                &d_q, &d_k, &d_v, &d_s, &mut d_out, &d_pos, None, &d_slots, n_heads, n_kv_heads,
                 head_dim, max_ctx, kv_dim, swa, 0, g0, scale, dt,
             )
             .expect("f16 rows group 0");
@@ -2155,6 +2155,7 @@ fn f16_class_prefill_refuses_an_fp8_cache() {
         &d_s,
         &mut d_out,
         &d_pos,
+        None,
         &d_slots,
         n_heads,
         n_kv_heads,
