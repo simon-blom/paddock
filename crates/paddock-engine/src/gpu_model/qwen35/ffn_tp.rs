@@ -117,10 +117,35 @@ impl FfnTpRank {
                 "group or normalized input width changed".into(),
             ));
         }
+        self.run(exec, input)?;
+        group.after_compute(&exec.stream)?;
+        group.all_reduce(&self.partial, &mut self.reduced)?;
+        group.before_compute(&exec.stream)?;
+        Ok(&self.reduced)
+    }
+
+    /// The collective-free compute run: gate/up GEMVs, SwiGLU, down GEMV.
+    /// `forward` runs this between its NCCL fences; Phase 11 graph capture
+    /// records exactly this run so a replay enqueues the identical kernels
+    /// over the identical buffers (only their contents vary per token).
+    pub(crate) fn run(
+        &mut self,
+        exec: &GpuExecutor,
+        input: &CudaSlice<f32>,
+    ) -> Result<(), FfnTpError> {
         gemv_any(exec, &self.gate, input, &mut self.gate_buf)?;
         gemv_any(exec, &self.up, input, &mut self.up_buf)?;
         exec.swiglu(&mut self.gate_buf, &self.up_buf, self.local_ff)?;
         gemv_any(exec, &self.down, &self.gate_buf, &mut self.partial)?;
+        Ok(())
+    }
+
+    /// The post-run NCCL fences + all-reduce; returns the reduced output.
+    pub(crate) fn finish<'a, C: Communicator>(
+        &'a mut self,
+        exec: &GpuExecutor,
+        group: &C,
+    ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
         group.after_compute(&exec.stream)?;
         group.all_reduce(&self.partial, &mut self.reduced)?;
         group.before_compute(&exec.stream)?;

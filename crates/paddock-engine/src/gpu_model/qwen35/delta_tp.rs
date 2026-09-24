@@ -432,6 +432,27 @@ impl DeltaTpRank {
             Ok(())
         }
     }
+    /// Swap a slot's persistent state pair into the home buffers so the
+    /// collective-free run (and any capture of it) addresses this slot's
+    /// state. Slot 0 lives in place and is a no-op. Mirrors `decode_slot`'s
+    /// eager swap exactly; `swap_state_out` is its inverse.
+    pub(crate) fn swap_state_in(&mut self, slot: usize) -> Result<(), DeltaTpError> {
+        if slot == 0 {
+            return Ok(());
+        }
+        let state = self
+            .slot_states
+            .get_mut(slot - 1)
+            .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+        std::mem::swap(&mut self.recurrent, &mut state.0);
+        std::mem::swap(&mut self.conv, &mut state.1);
+        Ok(())
+    }
+    /// Swap the (advanced) state pair back to its slot's storage. The swap
+    /// is its own inverse given the same slot.
+    pub(crate) fn swap_state_out(&mut self, slot: usize) -> Result<(), DeltaTpError> {
+        self.swap_state_in(slot)
+    }
     pub fn decode_slot<'a, C: Communicator>(
         &'a mut self,
         e: &GpuExecutor,
@@ -461,8 +482,7 @@ impl DeltaTpRank {
 
     /// A slot's persistent state buffers: slot 0 works in place on the home
     /// pair, other slots on their `slot_states` entry.
-    pub fn slot_state(&self, slot: usize) -> Option<(&CudaSlice<f32>, &CudaSlice<f32>)> {
-        if slot == 0 {
+    pub fn slot_state(&self, slot: usize) -> Option<(&CudaSlice<f32>, &CudaSlice<f32>)> {        if slot == 0 {
             Some((&self.recurrent, &self.conv))
         } else {
             self.slot_states
@@ -519,6 +539,70 @@ impl DeltaTpRank {
         {
             return Err(DeltaTpError::Shape("rank, input, or span mismatch".into()));
         }
+        self.decode_run(e, input, rows)?;
+        self.finish_partial(e, rows)?;
+        group.after_compute(&e.stream)?;
+        group.all_reduce(&self.span.partial, &mut self.span.reduced)?;
+        group.before_compute(&e.stream)?;
+        Ok(&self.span.reduced)
+    }
+
+    /// Stage the out-projection into the capacity-sized `partial`: zero the
+    /// whole buffer first (the unused suffix rides every all-reduce), then
+    /// the row-parallel down GEMV per row. `forward` runs this before its
+    /// collective; the graphed path bakes it into the capture.
+    pub(crate) fn finish_partial(
+        &mut self,
+        e: &GpuExecutor,
+        rows: usize,
+    ) -> Result<(), DeltaTpError> {
+        let g = &self.geometry;
+        let s = &mut self.span;
+        // The capacity-sized NCCL buffer includes an unused suffix for short
+        // spans. Initialize that suffix before reducing the entire buffer.
+        e.stream
+            .memset_zeros(&mut s.partial)
+            .map_err(GpuError::from)?;
+        if rows == 1 {
+            gemv_any(e, &self.weights[2], &s.core, &mut s.partial)?;
+        } else {
+            for t in 0..rows {
+                e.copy_region(&s.core, t * g.value_dim(), &mut s.input, 0, g.value_dim())?;
+                gemv_any(e, &self.weights[2], &s.input, &mut s.convolved)?;
+                e.copy_region(&s.convolved, 0, &mut s.partial, t * WIDTH, WIDTH)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The post-run NCCL fences + all-reduce over the staged `partial`;
+    /// returns the reduced output. `forward` calls this after
+    /// `finish_partial`; the graphed path runs the fences + all-reduce
+    /// inline (its capture already staged `partial`).
+    pub(crate) fn finish<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+    ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
+        let s = &mut self.span;
+        group.after_compute(&e.stream)?;
+        group.all_reduce(&s.partial, &mut s.reduced)?;
+        group.before_compute(&e.stream)?;
+        Ok(&s.reduced)
+    }
+
+    /// The pre-collective DeltaNet run through `core` (mixed projection,
+    /// causal conv, QKV split + norms, alpha/beta gate, gated recurrent
+    /// state, gated norm). `forward` stages `partial` from `core` and runs
+    /// the NCCL reduce after it; Phase 11 graph capture records exactly this
+    /// run - the recurrent/conv buffers it bakes are whatever the caller
+    /// swapped in, so per-slot captures key on the swapped state pair.
+    pub(crate) fn decode_run(
+        &mut self,
+        e: &GpuExecutor,
+        input: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
         // One-token decode uses the exact serial conv_step arithmetic.
@@ -634,24 +718,7 @@ impl DeltaTpRank {
             S,
             self.eps,
         )?;
-        // The capacity-sized NCCL buffer includes an unused suffix for short
-        // spans. Initialize that suffix before reducing the entire buffer.
-        e.stream
-            .memset_zeros(&mut s.partial)
-            .map_err(GpuError::from)?;
-        if rows == 1 {
-            gemv_any(e, &self.weights[2], &s.core, &mut s.partial)?;
-        } else {
-            for t in 0..rows {
-                e.copy_region(&s.core, t * g.value_dim(), &mut s.input, 0, g.value_dim())?;
-                gemv_any(e, &self.weights[2], &s.input, &mut s.convolved)?;
-                e.copy_region(&s.convolved, 0, &mut s.partial, t * WIDTH, WIDTH)?;
-            }
-        }
-        group.after_compute(&e.stream)?;
-        group.all_reduce(&s.partial, &mut s.reduced)?;
-        group.before_compute(&e.stream)?;
-        Ok(&s.reduced)
+        Ok(())
     }
 }
 
