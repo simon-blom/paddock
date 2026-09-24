@@ -49,6 +49,12 @@ struct TpLayer {
     ffn: FfnTpRank,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TpSlotSnapshot {
+    pub blocks: Vec<u32>,
+    pub layers: Vec<Vec<u8>>,
+}
+
 /// One process's rank-local model path for deterministic TP=2 parity.
 /// Inputs are fed one token at a time; CUDA graphs, speculation, scheduler
 /// concurrency, and offload are deliberately not part of this API. The
@@ -74,6 +80,38 @@ pub struct Qwen35TpRank {
     // Two one-ID planes per slot. The coordinator owns plane reuse/draining;
     // token and logits scratch are shared and compute-stream ordered.
     feedback_ids: Vec<[CudaSlice<u32>; 2]>,
+    /// Cross-lane sampler fence: the last event recorded after a `sample_rows`
+    /// call on ANY lane. Every later sampler first waits it (process-global
+    /// `pd_sr_*` pack scratch - see PreFillLane). None until the first device
+    /// sample.
+    sample_chain: Option<CudaEvent>,
+    /// Second execution lane for overlapped prefill spans: a forked executor
+    /// (own stream) plus per-lane backbone scratch re-allocated beside the
+    /// decode lane's. Immutable weights (`tok_embd`, `layers`, `out_norm`,
+    /// `output`) are shared; GQA KV, DeltaNet recurrent/conv and all working
+    /// buffers stay single-lane. `None` until `enable_prefill_lane`.
+    prefill: Option<Box<PreFillLane>>,
+}
+
+/// Prefill-lane execution state. `model` is a structural re-home of the same
+/// weight/geometry onto the forked executor: every `CudaSlice` it holds is
+/// reallocated on the prefill stream (weights re-uploaded from the mapped
+/// GGUF, scratch re-`alloc`'d), never copied or shared with the decode lane.
+/// KV and recurrent payloads are fresh zeroed allocations - a prefill lane
+/// slot is only ever written by prefill steps.
+pub(super) struct PreFillLane {
+    exec: Arc<GpuExecutor>,
+    model: Box<Qwen35TpRank>,
+    /// Slot currently owned by the prefill lane (decoded there), if any.
+    owner: Option<usize>,
+    /// Event recorded after the latest finisher enqueue (rank 0); the
+    /// non-blocking `prefill_lane_done` probe polls it.
+    event: CudaEvent,
+    /// Decode-stream event recorded after an in-flight slot promotion's
+    /// copies (see `promote_lane_slot`). The next lane enqueue waits it so
+    /// relaunched spans cannot race the promotion's reads of this lane's
+    /// slabs. `None` when no promotion is outstanding.
+    drained: Option<CudaEvent>,
 }
 
 impl Qwen35TpRank {
@@ -221,6 +259,8 @@ impl Qwen35TpRank {
             sample_params: exec.alloc_u32(4)?,
             sample_id: exec.alloc_u32(1)?,
             feedback_ids,
+            sample_chain: None,
+            prefill: None,
             exec,
             rank: group.rank(),
             hidden,
@@ -300,12 +340,70 @@ impl Qwen35TpRank {
             .memcpy_htod(&params, &mut self.sample_params)
             .map_err(GpuError::from)?;
         self.forward_token_gpu(group, logical_kv, token, position, slot)?;
-        self.exec.sample_rows(
+        Self::sample_resident(
+            &self.exec,
+            &mut self.sample_chain,
+            self.vocab,
             &self.logits,
             &self.sample_params,
             &mut self.sample_id,
-            1,
+        )?;
+        Ok(self
+            .exec
+            .stream
+            .clone_dtoh(&self.sample_id)
+            .map_err(GpuError::from)?[0])
+    }
+
+    /// Rank 0 enqueues one token forward WITHOUT any logits readback or
+    /// device sample: rank 1 must execute the matching `forward_token_worker_slot`
+    /// for the collectives to pair. Logits stay in `self.logits`; a separate
+    /// sampled pass reads them (see `sample_logits_slot`).
+    pub fn forward_token_enqueue<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
+        if group.world_size() != 2
+            || group.rank() != self.rank
+            || position >= self.max_ctx
+            || slot >= self.slots
+        {
+            return Err(Qwen35TpError::Shape("rank or position changed".into()));
+        }
+        self.exec
+            .stream
+            .memcpy_htod(&[token], &mut self.token)
+            .map_err(GpuError::from)?;
+        self.forward_token_body(group, logical_kv, position, slot)
+    }
+
+    /// Sample the resident `self.logits` row on device after a
+    /// `forward_token_enqueue`. Rank 1 must run the matching step via
+    /// `forward_token_worker_slot` (its state advance pairs the collectives;
+    /// it never samples).
+    pub fn sample_logits_slot(
+        &mut self,
+        plan: crate::sampler::DevicePlan,
+    ) -> Result<u32, Qwen35TpError> {
+        if self.rank != 0 || !self.exec.has_sample_rows() {
+            return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
+        }
+        let params = tp_sample_params(plan)?;
+        self.exec
+            .stream
+            .memcpy_htod(&params, &mut self.sample_params)
+            .map_err(GpuError::from)?;
+        Self::sample_resident(
+            &self.exec,
+            &mut self.sample_chain,
             self.vocab,
+            &self.logits,
+            &self.sample_params,
+            &mut self.sample_id,
         )?;
         Ok(self
             .exec
@@ -443,14 +541,38 @@ impl Qwen35TpRank {
     }
 
     fn sample_feedback(&mut self, slot: usize, plane: usize) -> Result<CudaEvent, Qwen35TpError> {
-        self.exec.sample_rows(
+        Self::sample_resident(
+            &self.exec,
+            &mut self.sample_chain,
+            self.vocab,
             &self.logits,
             &self.sample_params,
             &mut self.feedback_ids[slot][plane],
-            1,
-            self.vocab,
-        )?;
-        Ok(self.exec.record_event()?)
+        )
+    }
+
+    /// One `sample_rows` call joined into the cross-lane sampler chain: the
+    /// pack's sample_rows A/B/C kernels share process-global pd_sr_* scratch,
+    /// so every sampler waits the previous lane's in-flight sampler (device-
+    /// side event chain - no host block) and fences itself for the next one.
+    /// Returns an event marking this sampler's completion (for later
+    /// event-ordered readback). An associated function so the caller can pass
+    /// disjoint fields of one struct (receiver + args would conflict).
+    fn sample_resident(
+        exec: &GpuExecutor,
+        chain: &mut Option<CudaEvent>,
+        vocab: usize,
+        logits: &CudaSlice<f32>,
+        params: &CudaSlice<u32>,
+        out: &mut CudaSlice<u32>,
+    ) -> Result<CudaEvent, Qwen35TpError> {
+        if let Some(prev) = chain.take() {
+            exec.stream.wait(&prev).map_err(GpuError::from)?;
+        }
+        exec.sample_rows(logits, params, out, 1, vocab)?;
+        let event = exec.record_event()?;
+        *chain = Some(exec.record_event()?);
+        Ok(event)
     }
 
     fn forward_device_feedback<C: Communicator>(
@@ -553,6 +675,479 @@ impl Qwen35TpRank {
             if let TpMixer::Linear(delta) = &mut layer.mixer {
                 delta.reset_slot(&self.exec, slot)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Build the second execution lane for overlapped prefill spans.
+    ///
+    /// The decode lane's `Qwen35TpRank` keeps every weight it loaded; the
+    /// prefill lane gets a structural re-home of the same weight/geometry
+    /// onto a forked executor: weight planes are re-uploaded from the mapped
+    /// GGUF onto the fork's stream (never shared with, or copied from, the
+    /// decode lane's device buffers), and every scratch plane is freshly
+    /// allocated there. GQA paged KV, DeltaNet recurrent/conv payloads and
+    /// per-layer working buffers are lane-local, indexed by the SAME slot
+    /// ids the coordinator authorizes; they start zeroed. Both ranks build
+    /// a lane so the prefill collectives pair; only rank 0 ever samples.
+    pub fn enable_prefill_lane<C: Communicator>(
+        &mut self,
+        group: &C,
+        map: &MappedGguf,
+    ) -> Result<(), Qwen35TpError> {
+        if self.prefill.is_some() {
+            return Ok(());
+        }
+        if group.rank() != self.rank {
+            return Err(Qwen35TpError::Shape(
+                "rank changed under the lane fork".into(),
+            ));
+        }
+        // fork_stream synchronizes the decode stream internally before
+        // creating the lane's streams; no queued decode work races them.
+        let lane_exec = Arc::new(self.exec.fork_stream()?);
+        let emb_name = "token_embd.weight";
+        let lane_embd = {
+            let ty = map
+                .tensor_info(emb_name)
+                .ok_or_else(|| Qwen35TpError::Shape("missing token embeddings".into()))?
+                .ggml_type;
+            if crate::gpu::kq_params(ty).is_some() {
+                TokEmbd::Kq(lane_exec.repack_kquant(map, emb_name)?)
+            } else {
+                let tensor = lane_exec.upload_raw(map, emb_name)?;
+                if tensor.ty != paddock_models::ggml_type::GgmlType::Q8_0 {
+                    return Err(Qwen35TpError::Shape(format!(
+                        "unsupported embedding type {:?}",
+                        tensor.ty
+                    )));
+                }
+                TokEmbd::Q8(tensor)
+            }
+        };
+        let blocks = u32::try_from(
+            self.max_ctx
+                .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
+                .checked_mul(self.slots)
+                .ok_or_else(|| Qwen35TpError::Shape("paged KV capacity overflow".into()))?,
+        )
+        .map_err(|_| Qwen35TpError::Shape("paged KV block count overflow".into()))?;
+        let mut lane = Qwen35TpRank {
+            exec: lane_exec.clone(),
+            rank: self.rank,
+            hidden: self.hidden,
+            vocab: self.vocab,
+            max_ctx: self.max_ctx,
+            slots: self.slots,
+            eps: self.eps,
+            tok_embd: lane_embd,
+            layers: Vec::with_capacity(self.layers.len()),
+            out_norm: lane_exec.upload(map, "output_norm.weight")?,
+            output: lane_exec.load_quantw(map, "output.weight")?,
+            token: lane_exec.alloc_u32(1)?,
+            x: lane_exec.alloc(self.hidden)?,
+            xn: lane_exec.alloc(self.hidden)?,
+            logits: lane_exec.alloc(self.vocab)?,
+            sample_params: lane_exec.alloc_u32(4)?,
+            sample_id: lane_exec.alloc_u32(1)?,
+            feedback_ids: (0..self.slots)
+                .map(|_| Ok([lane_exec.alloc_u32(1)?, lane_exec.alloc_u32(1)?]))
+                .collect::<Result<Vec<_>, GpuError>>()?,
+            sample_chain: None,
+            prefill: None,
+        };
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("blk.{i}.");
+            let attn_norm = lane_exec.upload(map, &format!("{prefix}attn_norm.weight"))?;
+            let post_norm =
+                lane_exec.upload(map, &format!("{prefix}post_attention_norm.weight"))?;
+            let mixer = match &layer.mixer {
+                TpMixer::Full(_) => TpMixer::Full(
+                    GqaTpRank::load_paged(
+                        &lane_exec,
+                        map,
+                        i,
+                        group,
+                        self.max_ctx,
+                        KvDtype::Fp16,
+                        blocks,
+                        self.slots,
+                    )
+                    .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
+                ),
+                TpMixer::Linear(_) => {
+                    let mut delta = DeltaTpRank::load(&lane_exec, map, i, group)
+                        .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
+                    if self.slots > 1 {
+                        delta
+                            .enable_slots(&lane_exec, self.slots)
+                            .map_err(Qwen35TpError::from)?;
+                    }
+                    TpMixer::Linear(delta)
+                }
+            };
+            let ffn = FfnTpRank::load(&lane_exec, map, i, group).map_err(Qwen35TpError::from)?;
+            lane.layers.push(TpLayer {
+                attn_norm,
+                post_norm,
+                mixer,
+                ffn,
+            });
+        }
+        self.prefill = Some(Box::new(PreFillLane {
+            exec: lane_exec.clone(),
+            model: Box::new(lane),
+            owner: None,
+            event: lane_exec.record_event()?,
+            drained: None,
+        }));
+        Ok(())
+    }
+
+    /// True when the prefill lane exists and runs on a stream distinct from
+    /// the decode lane's.
+    pub fn has_prefill_lane(&self) -> bool {
+        self.prefill
+            .as_ref()
+            .is_some_and(|lane| lane.exec.stream.cu_stream() != self.exec.stream.cu_stream())
+    }
+
+    /// Fence any outstanding promotion copies: the lane stream waits the
+    /// decode-stream `drained` event device-side (no host block). Every
+    /// lane enqueue path calls this first so new lane work cannot touch
+    /// slabs a promotion is still reading.
+    fn fence_lane_drained(lane: &mut PreFillLane) -> Result<(), Qwen35TpError> {
+        if let Some(prev) = lane.drained.take() {
+            lane.model.exec.stream.wait(&prev).map_err(GpuError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Run one prefill-lane prompt row: `(slot, token, position)` on this
+    /// rank's lane executor. No sampling and no host synchronization - the
+    /// row's kernels and collectives are enqueued and the call returns. The
+    /// caller must have validated the position and mirrored the KV event on
+    /// BOTH ranks in the same order (the collectives pair across ranks).
+    pub fn prefill_lane_step<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        token: u32,
+        position: usize,
+    ) -> Result<(), Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        if slot >= self.slots || position >= self.max_ctx {
+            return Err(Qwen35TpError::Shape(
+                "prefill slot or position invalid".into(),
+            ));
+        }
+        Self::fence_lane_drained(lane)?;
+        lane.owner = Some(slot);
+        lane.model
+            .exec
+            .stream
+            .memcpy_htod(&[token], &mut lane.model.token)
+            .map_err(GpuError::from)?;
+        lane.model
+            .forward_token_body(group, logical_kv, position, slot)
+    }
+
+    /// Enqueue the span finisher for `slot`'s final prefill row on the lane:
+    /// `Some(plan)` samples the lane's resident logits on device (rank 0,
+    /// fenced against every other lane's sampler via the process sample
+    /// chain); `None` leaves the full logits for the host readback. Either
+    /// way an event marking the lane's completion is returned.
+    pub fn prefill_lane_finisher(
+        &mut self,
+        slot: usize,
+        plan: Option<crate::sampler::DevicePlan>,
+    ) -> Result<CudaEvent, Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("finisher slot out of range".into()));
+        }
+        Self::fence_lane_drained(lane)?;
+        let Some(plan) = plan else {
+            // Host-finisher path (rank 1, or planless): park a probe event
+            // so `prefill_lane_done` tracks this enqueue on every rank.
+            let probe = lane.model.exec.record_event()?;
+            let ev = lane.model.exec.record_event()?;
+            lane.event = probe;
+            return Ok(ev);
+        };
+        if self.rank != 0 || !self.exec.has_sample_rows() {
+            return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
+        }
+        let params = tp_sample_params(plan)?;
+        // Cross-lane sampler serialization: the pack's sample_rows A/B/C
+        // kernels use process-global pd_sr_* scratch, so this lane's sampler
+        // must not overlap any other lane's in-flight sampler. Device-side
+        // event chain - no host block.
+        if let Some(prev) = self.sample_chain.take() {
+            lane.model
+                .exec
+                .stream
+                .wait(&prev)
+                .map_err(GpuError::from)?;
+        }
+        lane.model
+            .exec
+            .stream
+            .memcpy_htod(&params, &mut lane.model.sample_params)
+            .map_err(GpuError::from)?;
+        lane.model.exec.sample_rows(
+            &lane.model.logits,
+            &lane.model.sample_params,
+            &mut lane.model.feedback_ids[slot][0],
+            1,
+            self.vocab,
+        )?;
+        // Three events at the same point: one parks in the sample chain
+        // (waited by the next sampler anywhere in the process), one is
+        // returned to the flight for readback, one stays in the lane for
+        // the non-blocking `prefill_lane_done` probe.
+        let chain = lane.model.exec.record_event()?;
+        let ev = lane.model.exec.record_event()?;
+        let probe = lane.model.exec.record_event()?;
+        lane.event = probe;
+        self.sample_chain = Some(chain);
+        Ok(ev)
+    }
+
+    /// Non-blocking: has the lane's latest finisher (and everything enqueued
+    /// before it) completed? True when the lane has no finisher event yet.
+    pub fn prefill_lane_done(&self) -> bool {
+        match self.prefill.as_ref() {
+            Some(lane) => lane.exec.event_done(&lane.event),
+            None => true,
+        }
+    }
+
+    /// Read the sampled finisher ID after `ev` fires (lane copy stream).
+    pub fn prefill_lane_sampled_id_after(
+        &self,
+        ev: &CudaEvent,
+        slot: usize,
+    ) -> Result<u32, Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_ref()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        Ok(lane
+            .model
+            .exec
+            .to_host_u32_after(ev, &lane.model.feedback_ids[slot][0], 0, 1)?[0])
+    }
+
+    /// Read the full logits row after `ev` fires (lane copy stream).
+    pub fn prefill_lane_logits_after(&self, ev: &CudaEvent) -> Result<Vec<f32>, Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_ref()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        Ok(lane
+            .model
+            .exec
+            .to_host_len_after(ev, &lane.model.logits, self.vocab)?)
+    }
+
+    /// Join the prefill lane: block until all lane GPU work (and the
+    /// collectives it entered) completes. The span finish fence.
+    pub fn prefill_lane_join(&self) -> Result<(), Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_ref()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        lane.model.exec.synchronize()?;
+        Ok(())
+    }
+
+    /// Record an event on the lane stream marking everything enqueued so
+    /// far. Both ranks call this after `prefill_lane_join` to hand
+    /// `promote_lane_slot` a completion marker (the join already guarantees
+    /// it fires immediately; the device-side wait keeps the promotion
+    /// contract uniform across ranks).
+    pub fn prefill_lane_mark(&mut self) -> Result<CudaEvent, Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        Ok(lane.model.exec.record_event().map_err(GpuError::from)?)
+    }
+
+    /// Promote one finished prefill slot's lane-local state onto the decode
+    /// executor (rank 0, after the span join; both ranks in identical order
+    /// on their own executors).
+    ///
+    /// The lane's KV slab and DeltaNet slot state are private allocations
+    /// (cudarc slices cannot share a handle), so a finished prompt's context
+    /// would be stranded on the lane. This copies it: on the DECODE stream,
+    /// waiting the lane's finisher event device-side (cross-stream ordered,
+    /// no host sync). Per GQA layer, each of the slot's live physical blocks
+    /// (K and V, block-strided slices at the same pool-wide block id - the
+    /// paged pool layout is `[n_blocks, 16, kv_dim]` on every rank's slab);
+    /// plus the DeltaNet recurrent/conv pair. The lane's dtype is Fp16,
+    /// matching both executors' KV loads. Host cost is a few cudaMemcpy D2D
+    /// launches (~1-3 ms per finished prompt) - the TTFT win survives.
+    ///
+    /// Leaves a decode-stream event in the lane's `drained` slot: the next
+    /// lane enqueue waits it so a relaunched span (or a released slot's
+    /// reallocated blocks) cannot write the lane slabs while promotion
+    /// copies are still reading them.
+    pub fn promote_lane_slot(
+        &mut self,
+        lane_done: &CudaEvent,
+        slot: usize,
+        live: &[u32],
+    ) -> Result<(), Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("promotion slot out of range".into()));
+        }
+        let dec = &self.exec;
+        // Decode stream idles behind the lane's finisher: everything the
+        // copies below read is complete before any copy launches.
+        dec.stream.wait(lane_done).map_err(GpuError::from)?;
+        // Lane and decode layers cannot borrow in one pass through the
+        // mixer enum, so promote per layer by index.
+        let lane_model = &lane.model;
+        for i in 0..self.layers.len() {
+            let (lane_mixer, dec_mixer) = {
+                let lane_ref = &lane_model.layers[i].mixer;
+                let dec_ref = &mut self.layers[i].mixer;
+                (lane_ref, dec_ref)
+            };
+            match (lane_mixer, dec_mixer) {
+                (TpMixer::Full(src), TpMixer::Full(dst)) => {
+                    let (src_k, src_v) = src.kv_slabs();
+                    let (dst_k, dst_v) = dst.kv_slabs_mut();
+                    let stride = src.block_stride();
+                    for &blk in live {
+                        let base = blk
+                            .checked_mul(stride as u32)
+                            .and_then(|off| usize::try_from(off).ok())
+                            .ok_or_else(|| {
+                                Qwen35TpError::Shape("promotion block offset overflow".into())
+                            })?;
+                        if base + stride > src_k.len() {
+                            return Err(Qwen35TpError::Shape(
+                                "promotion block outside lane KV pool".into(),
+                            ));
+                        }
+                        dec.copy_region(src_k, base, dst_k, base, stride)?;
+                        dec.copy_region(src_v, base, dst_v, base, stride)?;
+                    }
+                }
+                (TpMixer::Linear(src), TpMixer::Linear(dst)) => {
+                    let (src_rec, src_conv) = src
+                        .slot_state(slot)
+                        .ok_or_else(|| Qwen35TpError::Shape("lane slot missing".into()))?;
+                    let (dst_rec, dst_conv) = dst
+                        .slot_state_mut(slot)
+                        .ok_or_else(|| Qwen35TpError::Shape("decode slot missing".into()))?;
+                    if src_rec.len() != dst_rec.len() || src_conv.len() != dst_conv.len() {
+                        return Err(Qwen35TpError::Shape(
+                            "lane and decode DeltaNet state shapes differ".into(),
+                        ));
+                    }
+                    dec.stream
+                        .memcpy_dtod(src_rec, dst_rec)
+                        .map_err(GpuError::from)?;
+                    dec.stream
+                        .memcpy_dtod(src_conv, dst_conv)
+                        .map_err(GpuError::from)?;
+                }
+                _ => {
+                    return Err(Qwen35TpError::Shape(
+                        "lane and decode mixer kinds diverge".into(),
+                    ))
+                }
+            }
+        }
+        lane.drained = Some(dec.record_event()?);
+        Ok(())
+    }
+
+    /// Probe-only, rank-local readback. Call only after decode, prefill, and
+    /// collective streams have drained; never read stale unowned KV pages.
+    pub(super) fn slot_snapshot(
+        &self,
+        slot: usize,
+        position: usize,
+        blocks: &[u32],
+    ) -> Result<TpSlotSnapshot, Qwen35TpError> {
+        let page = crate::kv_pool::BLOCK_TOKENS;
+        if slot >= self.slots || position > self.max_ctx || blocks.len() != position.div_ceil(page) {
+            return Err(Qwen35TpError::Shape("TP snapshot membership invalid".into()));
+        }
+        self.exec.synchronize()?;
+        let mut layers = Vec::new();
+        for layer in &self.layers {
+            match &layer.mixer {
+                TpMixer::Full(gqa) => {
+                    let (k, v) = gqa.kv_slabs();
+                    let stride = gqa.block_stride();
+                    for (i, &block) in blocks.iter().enumerate() {
+                        let offset = (block as usize).checked_mul(stride).ok_or_else(|| {
+                            Qwen35TpError::Shape("TP snapshot offset overflow".into())
+                        })?;
+                        let n = stride * (position - i * page).min(page) / page;
+                        layers.push(self.exec.to_host_range_u8(k, offset, n)?);
+                        layers.push(self.exec.to_host_range_u8(v, offset, n)?);
+                    }
+                }
+                TpMixer::Linear(delta) => {
+                    let (rec, conv) = delta.slot_state(slot).ok_or_else(|| {
+                        Qwen35TpError::Shape("TP snapshot state missing".into())
+                    })?;
+                    layers.push(self.exec.to_host(rec)?.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect());
+                    layers.push(self.exec.to_host(conv)?.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect());
+                }
+            }
+        }
+        Ok(TpSlotSnapshot { blocks: blocks.to_vec(), layers })
+    }
+
+    pub(super) fn lane_slot_snapshot(
+        &self,
+        slot: usize,
+        position: usize,
+        blocks: &[u32],
+    ) -> Result<Option<TpSlotSnapshot>, Qwen35TpError> {
+        self.prefill
+            .as_ref()
+            .map(|lane| lane.model.slot_snapshot(slot, position, blocks))
+            .transpose()
+    }
+
+    /// Reset one logical slot's lane-local state (DeltaNet recurrent/conv;
+    /// paged KV is masked by position and rewritten from zero). Called on
+    /// slot release/reuse in addition to the decode lane's reset.
+    pub fn reset_lane_slot(&mut self, slot: usize) -> Result<(), Qwen35TpError> {
+        if let Some(lane) = self.prefill.as_mut() {
+            Self::fence_lane_drained(lane)?;
+            lane.model.reset_slot(slot)?;
+            lane.model.exec.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// Clear every lane slot's state (full flush).
+    pub fn reset_lane(&mut self) -> Result<(), Qwen35TpError> {
+        if let Some(lane) = self.prefill.as_mut() {
+            Self::fence_lane_drained(lane)?;
+            lane.model.reset()?;
+            lane.model.exec.synchronize()?;
         }
         Ok(())
     }

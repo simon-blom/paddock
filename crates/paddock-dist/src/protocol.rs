@@ -53,6 +53,20 @@ pub fn receive_nccl_id(stream: &mut TcpStream) -> Result<[u8; NCCL_ID_BYTES], Pr
     }
 }
 
+/// The wire form of a span finisher's sampling plan. `paddock-dist` depends
+/// on no engine crate (the standing Phase 2 architectural rule), so rank 0
+/// converts its engine `DevicePlan` to this enum and the worker converts
+/// back. Only plans the TP rank's device sampler can execute appear here;
+/// anything else arrives as `Host` (full-logit finish).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TpSpanFinisherPlan {
+    /// pure argmax
+    Greedy,
+    /// temperature-only categorical
+    Categorical { inv_t: f32, u: f32 },
+}
+
 /// A control-plane message. Bootstrap messages only, per the phase scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -104,6 +118,16 @@ pub enum ControlMessage {
         rows: Vec<(usize, u32, usize)>,
         kv_events: Vec<serde_json::Value>,
     },
+    /// Mixed decode+chunked-prefill tick: like `TpBatch` but rows may exceed
+    /// the slot count (a prompt chunk advances multiple rows per tick alongside
+    /// the decode rows). Same execution contract: the worker mirrors every KV
+    /// event, then runs one eager forward per row in order (no logits, no
+    /// sampling - rank 0 owns both).
+    TpMixed {
+        sequence: u64,
+        rows: Vec<(usize, u32, usize)>,
+        kv_events: Vec<serde_json::Value>,
+    },
     /// Start an ordered device-feedback decode segment with host tokens.
     TpPipeBegin {
         sequence: u64,
@@ -119,7 +143,31 @@ pub enum ControlMessage {
         kv_events: Vec<serde_json::Value>,
     },
     /// Fence the final tick on both ranks before slot release or reuse.
-    TpPipeDrain { sequence: u64 },
+    TpPipeDrain {
+        sequence: u64,
+    },
+    /// Rank-0-authorized chunked prefill span on the prefill lane: rows are
+    /// ordered `(slot, token, position)` prompt steps validated against the
+    /// coordinator's mirrored KV. Chunks of the SAME slot must be contiguous
+    /// and ascending by position; each finishing chunk's last row may device-
+    /// sample or read logits back. The wire finisher plan is a plain enum
+    /// because paddock-dist depends on no engine crate: rank 0 converts its
+    /// `DevicePlan` to this, the worker converts back.
+    TpSpanLaunch {
+        sequence: u64,
+        rows: Vec<(usize, u32, usize)>,
+        /// `(slot, plan)` per finishing chunk, in chunk order; `None` = that
+        /// chunk reads full logits for the host sampler. Rank 1 promotes
+        /// exactly these slots' lane-local state at the span finish.
+        finishers: Vec<(usize, Option<TpSpanFinisherPlan>)>,
+        kv_events: Vec<serde_json::Value>,
+    },
+    /// Fence the in-flight span: join both lanes, promote each finished
+    /// slot's lane-local state lane->decode (both ranks, own executors), and
+    /// read the finisher result on rank 0 before any release/reset/reuse.
+    TpSpanFinish {
+        sequence: u64,
+    },
     /// Release completed/cancelled slots before the next admission.
     TpRelease {
         sequence: u64,

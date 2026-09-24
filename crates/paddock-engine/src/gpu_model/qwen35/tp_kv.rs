@@ -78,6 +78,12 @@ impl MirroredKv {
         host
     }
 
+    /// One slot's physical block ids in logical order (the lane->decode
+    /// promotion walks exactly these pool offsets on both ranks' slabs).
+    pub fn slot_blocks(&self, slot: usize) -> Option<&[u32]> {
+        self.tables.get(slot).map(|t| t.blocks())
+    }
+
     /// Serialize only a live slot whose entire read prefix is backed by
     /// allocated pages, in precisely the geometry of the GPU payload.
     pub fn checked_device_table(

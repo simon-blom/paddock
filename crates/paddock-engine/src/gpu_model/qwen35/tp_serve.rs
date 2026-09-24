@@ -1,19 +1,28 @@
 //! Rank-0-authoritative TP=2 serving over the distributed control channel.
 //! The production scheduler owns rank 0's dense slot plan; rank 1 replays the
 //! ordered live rows and mirrored KV operations. Each row uses eager kernels.
-use std::{io::Read, net::TcpStream, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    io::Read,
+    net::TcpStream,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use cudarc::driver::CudaEvent;
 use paddock_dist::{
     config::Resolved,
-    protocol::{ControlMessage, receive_nccl_id, send_nccl_id},
+    protocol::{
+        ControlMessage, TpSpanFinisherPlan, receive_nccl_id, send_nccl_id,
+    },
     worker::shutdown_worker,
 };
 use paddock_models::mapped::MappedGguf;
 
 use super::{
-    tp_kv::{Event, MirroredKv, Operation},
-    tp_model::Qwen35TpRank,
+    tp_kv::{Event, MirroredKv, Operation, Snapshot},
+    tp_model::{Qwen35TpRank, TpSlotSnapshot},
 };
 use crate::{
     generator::{GenError, Generator, RowSample, SampledStep},
@@ -79,6 +88,21 @@ fn prepared(stream: &mut TcpStream, sequence: u64) -> Result<(), String> {
     }
 }
 
+fn validate_multistep_positions(
+    rows: &[(usize, u32, usize)],
+    positions: &[usize],
+    max_ctx: usize,
+) -> Result<(), String> {
+    let mut cursor = positions.to_vec();
+    for &(slot, _, position) in rows {
+        if slot >= cursor.len() || position >= max_ctx || position != cursor[slot] {
+            return Err("TP multirow position diverged".into());
+        }
+        cursor[slot] += 1;
+    }
+    Ok(())
+}
+
 // The scheduler sends dense rows through its high-water slot; position 0 is
 // a hole, including a newly admitted slot that has not finished prefill.
 fn active_rows(
@@ -134,10 +158,196 @@ fn logical(max_ctx: usize, slots: usize) -> Result<MirroredKv, String> {
 }
 
 struct PipeFlight {
+    /// Member slots in WIRE order (TpPipeBegin/Next rows must ascend by
+    /// slot; identity rows for plain pipes).
     slots: Vec<usize>,
     width: usize,
     plane: usize,
     events: Vec<(usize, CudaEvent)>,
+    /// Wire position -> scheduler row index. Identity for plain pipes; for
+    /// slot-mapped pipes the scheduler's row i drives slots[i] in ITS order,
+    /// which the wire sort permuted.
+    row_of: Vec<usize>,
+    /// Slot-mapped pipe (overlap path): readback ids are indexed by ROW;
+    /// plain pipes keep the dense contract (ids indexed by slot).
+    mapped: bool,
+}
+
+/// Probe-only rank-local oracle for the fixed direct Stage-2 example. No
+/// checkpoint bytes cross ranks: each rank compares its own TP shard against
+/// its own reset-eager replay after the actual GPU/NCCL drain boundary.
+struct TpAcceptanceProbe {
+    eager: Option<(Snapshot, Vec<TpSlotSnapshot>)>,
+    reuse: Option<(Snapshot, Vec<TpSlotSnapshot>)>,
+    survivor: Option<TpSlotSnapshot>,
+    overlap_checked: bool,
+    reuse_checked: bool,
+    completed_logged: bool,
+    releases: usize,
+    pipe_drained: bool,
+    span_finished: bool,
+}
+
+impl TpAcceptanceProbe {
+    fn enabled() -> Option<Self> {
+        std::env::var_os("PADDOCK_TP_STATE_PROBE").map(|_| Self {
+            eager: None,
+            reuse: None,
+            survivor: None,
+            overlap_checked: false,
+            reuse_checked: false,
+            completed_logged: false,
+            releases: 0,
+            pipe_drained: false,
+            span_finished: false,
+        })
+    }
+
+    fn capture(
+        model: &Qwen35TpRank,
+        logical: &MirroredKv,
+        group: &NcclCommunicator,
+        positions: &[usize],
+    ) -> Result<(Snapshot, Vec<TpSlotSnapshot>), String> {
+        group.stream().synchronize().map_err(|e| e.to_string())?;
+        model.synchronize().map_err(|e| e.to_string())?;
+        let state = logical.snapshot();
+        let slots = positions
+            .iter()
+            .enumerate()
+            .map(|(slot, &pos)| {
+                model
+                    .slot_snapshot(slot, pos, logical.slot_blocks(slot).ok_or("probe slot invalid")?)
+                    .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((state, slots))
+    }
+
+    fn compare(
+        rank: usize,
+        label: &str,
+        expected: &(Snapshot, Vec<TpSlotSnapshot>),
+        got: &(Snapshot, Vec<TpSlotSnapshot>),
+    ) -> Result<(), String> {
+        // Reset-eager and span enqueue allocate blocks in a different order.
+        // Compare each slot's logical table and refcount sequence, not raw
+        // physical block numbers; the owned payload below uses slot order.
+        let logical_shape = |s: &Snapshot| {
+            (s.free, s.tables.iter().map(|table| {
+                table.iter().map(|&block| s.refcounts[block as usize]).collect::<Vec<_>>()
+            }).collect::<Vec<_>>())
+        };
+        if logical_shape(&expected.0) != logical_shape(&got.0) {
+            return Err(format!("rank {rank} {label}: mirrored KV table/refcount shape diverged"));
+        }
+        for (slot, (a, b)) in expected.1.iter().zip(&got.1).enumerate() {
+            if a.blocks.len() != b.blocks.len() || a.layers.len() != b.layers.len() {
+                return Err(format!("rank {rank} {label}: slot {slot} KV membership/state shape diverged"));
+            }
+            for (layer, (x, y)) in a.layers.iter().zip(&b.layers).enumerate() {
+                if x != y {
+                    return Err(format!("rank {rank} {label}: slot {slot} payload component {layer} diverged ({} vs {})", blake3::hash(x), blake3::hash(y)));
+                }
+            }
+        }
+        println!("TP rank {rank} probe {label}: KV table and owned payload/DeltaNet state bit-identical");
+        Ok(())
+    }
+
+    fn after_batch(
+        &mut self,
+        rank: usize,
+        model: &Qwen35TpRank,
+        logical: &MirroredKv,
+        group: &NcclCommunicator,
+        positions: &[usize],
+        rows: &[(usize, u32, usize)],
+    ) -> Result<(), String> {
+        if positions.len() != 2 {
+            return Err("TP acceptance probe requires two slots".into());
+        }
+        if rows == [(1, 23, 19)] && positions == [3, 20] && self.eager.is_none() {
+            self.eager = Some(Self::capture(model, logical, group, positions)?);
+            println!("TP rank {rank} probe eager baseline captured");
+        }
+        if rows == [(1, 302, 1)] && positions == [4, 2] {
+            let got = Self::capture(model, logical, group, positions)?;
+            if let Some(expected) = &self.reuse {
+                Self::compare(rank, "release/reuse", expected, &got)?;
+                self.reuse_checked = true;
+            } else {
+                self.reuse = Some(got);
+                println!("TP rank {rank} probe reuse baseline captured");
+            }
+        }
+        if rows.len() == 2 && rows[0].0 == 0 && rows[0].2 == 3 && rows[1].0 == 1 && rows[1].2 == 20 && self.releases < 2 {
+            self.survivor = Some(Self::capture(model, logical, group, positions)?.1.remove(0));
+        }
+        if self.reuse_checked && !self.completed_logged {
+            self.complete(rank)?;
+            println!("TP rank {rank} probe complete: promotion, drain, release, and reuse verified");
+            self.completed_logged = true;
+        }
+        Ok(())
+    }
+
+    fn after_span(
+        &mut self,
+        rank: usize,
+        model: &Qwen35TpRank,
+        logical: &MirroredKv,
+        group: &NcclCommunicator,
+        positions: &[usize],
+    ) -> Result<(), String> {
+        if !self.overlap_checked && positions == [3, 20] {
+            let eager = self.eager.as_ref().ok_or("missing rank-local eager baseline")?;
+            let got = Self::capture(model, logical, group, positions)?;
+            Self::compare(rank, "span finish/promotion", eager, &got)?;
+            self.overlap_checked = true;
+        }
+        self.span_finished = true;
+        Ok(())
+    }
+
+    fn after_release(
+        &mut self,
+        rank: usize,
+        model: &Qwen35TpRank,
+        logical: &MirroredKv,
+        group: &NcclCommunicator,
+        positions: &[usize],
+    ) -> Result<(), String> {
+        if positions != [4, 0] || self.releases >= 2 {
+            return Ok(());
+        }
+        if self.releases == 1 && (!self.pipe_drained || !self.span_finished || !model.prefill_lane_done()) {
+            return Err(format!("rank {rank}: released before pipe, span, and prefill lane drained"));
+        }
+        let saved = self.survivor.take().ok_or("missing pre-release survivor snapshot")?;
+        let (_, slots) = Self::capture(model, logical, group, positions)?;
+        if saved != slots[0] || !logical.slot_blocks(1).ok_or("missing slot")?.is_empty() {
+            return Err(format!("rank {rank}: survivor/slot table changed on release"));
+        }
+        if slots[1].layers.iter().any(|bytes| bytes.iter().any(|&byte| byte != 0)) {
+            return Err(format!("rank {rank}: released decode DeltaNet state not zeroed"));
+        }
+        let lane = model.lane_slot_snapshot(1, 0, &[]).map_err(|e| e.to_string())?
+            .ok_or("missing prefill lane")?;
+        if lane.layers.iter().any(|bytes| bytes.iter().any(|&byte| byte != 0)) {
+            return Err(format!("rank {rank}: released prefill DeltaNet state not zeroed"));
+        }
+        self.releases += 1;
+        println!("TP rank {rank} probe release {}: survivor unchanged, slot table empty, both DeltaNet lanes reset after drain", self.releases);
+        Ok(())
+    }
+
+    fn complete(&self, rank: usize) -> Result<(), String> {
+        if !self.overlap_checked || !self.reuse_checked || self.releases != 2 {
+            return Err(format!("rank {rank}: incomplete direct state assertions (promotion={}, reuse={}, releases={})", self.overlap_checked, self.reuse_checked, self.releases));
+        }
+        Ok(())
+    }
 }
 
 /// Runs on the production engine thread; owns the control stream until drop.
@@ -150,7 +360,61 @@ pub struct TpCoordinator {
     occupied: Vec<bool>,
     sequence: u64,
     pipe: Option<PipeFlight>,
+    /// Queued prompt chunks (FIFO) the scheduler advances with mixed ticks.
+    chunks: VecDeque<PrefillChunk>,
+    /// In-flight prefill span: its finishing chunks plus the rank-0 events
+    /// marking each finisher's GPU completion (chunk order).
+    span: Option<SpanFlight>,
+    /// Shared span-done flag for the send-only proxy's `unified_span_done`
+    /// (`&self`, no request round-trip). Published after every command.
+    span_done: Option<Arc<std::sync::atomic::AtomicBool>>,
+    probe: Option<TpAcceptanceProbe>,
     poisoned: Option<String>,
+}
+
+/// One queued prompt chunk: the remaining ordered rows (slot, token,
+/// position) plus the finishing chunk's device plan, if its first token
+/// samples on device (`None` = full-logit host readback).
+struct PrefillChunk {
+    slot: usize,
+    rows: Vec<(usize, u32, usize)>,
+    fin_plan: Option<crate::sampler::DevicePlan>,
+}
+
+/// A finishing chunk's summary, kept from launch until the span drains so
+/// `span_finish` can read each finisher's result in chunk order.
+struct SpanFinisher {
+    slot: usize,
+    plan: Option<crate::sampler::DevicePlan>,
+    rows: usize,
+}
+
+struct SpanFlight {
+    /// The span's finishing chunks, in chunk order (outer = oldest).
+    finishing: Vec<SpanFinisher>,
+    /// Rank-0 events recorded after each finisher's GPU work was enqueued,
+    /// in chunk order (front = oldest = first readback).
+    events: VecDeque<CudaEvent>,
+    /// Distinct slots with rows inside this span, row order. A prefill
+    /// abort must not drop a slot whose rows are in flight here.
+    slots: Vec<usize>,
+}
+
+/// Engine `DevicePlan` -> wire plan. Unsupported plans fail closed before
+/// any KV authorization or worker message. The reverse conversion does not
+/// exist: rank 1 never samples (the finisher sampler has no collectives and
+/// runs only on rank 0), it only reads the finisher slot ids to promote
+/// lane-local state.
+fn wire_finisher_plan(
+    plan: crate::sampler::DevicePlan,
+) -> Result<TpSpanFinisherPlan, String> {
+    match plan {
+        crate::sampler::DevicePlan::Greedy => Ok(TpSpanFinisherPlan::Greedy),
+        crate::sampler::DevicePlan::Categorical { inv_t, u } => {
+            Ok(TpSpanFinisherPlan::Categorical { inv_t, u })
+        }
+        other => Err(format!("TP span finisher plan unsupported: {other:?}")),
+    }
 }
 
 impl TpCoordinator {
@@ -162,6 +426,7 @@ impl TpCoordinator {
         gpu: usize,
         max_ctx: usize,
         slots: usize,
+        span_done: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         if !resolved.is_coordinator() || max_ctx == 0 || !(1..=2).contains(&slots) {
             return Err("Phase 9 requires TP=2 rank 0 and nonzero context".into());
@@ -190,8 +455,15 @@ impl TpCoordinator {
             .map_err(|e| e.to_string())?
             .ok_or("TP group absent")?;
         let map = MappedGguf::open(model).map_err(|e| e.to_string())?;
-        let model = Qwen35TpRank::load_slots(exec, &map, &group, max_ctx, KvDtype::Fp16, slots)
+        let mut model =
+            Qwen35TpRank::load_slots(exec, &map, &group, max_ctx, KvDtype::Fp16, slots)
+                .map_err(|e| e.to_string())?;
+        // The lane's weights re-upload from the same mapped file, so the map
+        // must outlive load.
+        model
+            .enable_prefill_lane(&group, &map)
             .map_err(|e| e.to_string())?;
+        drop(map);
         ready(&mut stream, 1)?;
         stream
             .set_read_timeout(Some(STEP_TIMEOUT))
@@ -205,8 +477,24 @@ impl TpCoordinator {
             occupied: vec![false; slots],
             sequence: 1,
             pipe: None,
+            chunks: VecDeque::new(),
+            span: None,
+            span_done: Some(span_done),
+            probe: TpAcceptanceProbe::enabled(),
             poisoned: None,
         })
+    }
+
+    /// Publish the prefill lane's GPU event status after every command. The
+    /// span may still be in flight on the host while its queued GPU work has
+    /// finished; the scheduler uses this flag to drain the decode pipe.
+    fn publish_span_done(&mut self) {
+        if let Some(flag) = self.span_done.as_ref() {
+            flag.store(
+                self.span.is_none() || self.model.prefill_lane_done(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
     }
 
     fn exchange(&mut self, msg: ControlMessage) -> Result<(), String> {
@@ -226,6 +514,11 @@ impl TpCoordinator {
             kv_event,
         })?;
         self.model.reset().map_err(|e| e.to_string())?;
+        // The prefill lane mirrors the flush: its KV/DeltaNet state must not
+        // outlive the logical tables it was built from.
+        self.model.reset_lane().map_err(|e| e.to_string())?;
+        self.chunks.clear();
+        self.span = None;
         self.positions.fill(0);
         self.occupied.fill(false);
         Ok(())
@@ -248,6 +541,14 @@ impl TpCoordinator {
         if slots.is_empty() {
             return Ok(());
         }
+        if self.probe.is_some() {
+            if self.pipe.is_some() || self.span.is_some() || !self.model.prefill_lane_done() {
+                return Err("TP probe: release before GPU flight drained".into());
+            }
+            self.model.prefill_lane_join().map_err(|e| e.to_string())?;
+            self.group.stream().synchronize().map_err(|e| e.to_string())?;
+            self.model.synchronize().map_err(|e| e.to_string())?;
+        }
         let kv_events = slots
             .iter()
             .map(|&slot| {
@@ -264,8 +565,12 @@ impl TpCoordinator {
         })?;
         for slot in slots {
             self.model.reset_slot(slot).map_err(|e| e.to_string())?;
+            self.model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
             self.positions[slot] = 0;
             self.occupied[slot] = false;
+        }
+        if let Some(probe) = self.probe.as_mut() {
+            probe.after_release(0, &self.model, &self.logical, &self.group, &self.positions)?;
         }
         Ok(())
     }
@@ -379,19 +684,136 @@ impl TpCoordinator {
             self.occupied[slot] = true;
         }
         self.sequence = seq;
+        let n = slots.len();
         self.pipe = Some(PipeFlight {
             slots,
             width: tokens.len(),
             plane: 0,
             events,
+            row_of: (0..n).collect(),
+            mapped: false,
         });
         tracing::info!(sequence = seq, "TP decode pipe began");
+        Ok(())
+    }
+    /// Slot-mapped pipe begin (overlap path): scheduler row i drives
+    /// `slots[i]` - the churn-phase decode set, never contiguous. The wire
+    /// stays canonical (TpPipeBegin rows ascending, the worker validates and
+    /// stores them), so rows are sorted by slot and the flight keeps the
+    /// wire->scheduler-row map for readback. Dead members ride as greedy
+    /// dummies (Hole) with their ids discarded.
+    fn pipe_begin_slots(
+        &mut self,
+        slots_v: &[u32],
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<(), String> {
+        if self.pipe.is_some() || !self.model.supports_device_sampling() {
+            return Err("TP pipe unavailable or already in flight".into());
+        }
+        if slots_v.is_empty()
+            || slots_v.len() != tokens.len()
+            || slots_v.len() != positions.len()
+            || plans.len() != slots_v.len()
+        {
+            return Err("TP slot-mapped pipe width mismatch".into());
+        }
+        let slots: Vec<usize> = slots_v.iter().map(|&s| s as usize).collect();
+        if slots.iter().any(|&s| s >= self.positions.len())
+            || slots.windows(2).any(|w| w[0] == w[1])
+        {
+            return Err("TP slot-mapped pipe membership invalid".into());
+        }
+        let mut devices = Vec::with_capacity(slots.len());
+        for plan in plans {
+            match plan {
+                RowSample::Device(p) => {
+                    super::tp_model::tp_sample_params(*p).map_err(|e| e.to_string())?;
+                    devices.push(*p);
+                }
+                RowSample::Hole => devices.push(crate::sampler::DevicePlan::Greedy),
+                RowSample::Host => return Err("TP pipe cannot read host logits".into()),
+            }
+        }
+        for (i, &slot) in slots.iter().enumerate() {
+            let pos = positions[i] as usize;
+            if pos != self.positions[slot] || pos >= self.model.max_ctx() {
+                return Err("TP slot-mapped pipe position invalid".into());
+            }
+        }
+        // Wire order: ascending by slot; remember each wire row's scheduler row.
+        let mut order: Vec<usize> = (0..slots.len()).collect();
+        order.sort_by_key(|&i| slots[i]);
+        let wire_slots: Vec<usize> = order.iter().map(|&i| slots[i]).collect();
+        let wire_rows: Vec<(usize, u32, usize)> = order
+            .iter()
+            .map(|&i| (slots[i], tokens[i], positions[i] as usize))
+            .collect();
+        let wire_plans: Vec<crate::sampler::DevicePlan> =
+            order.iter().map(|&i| devices[i]).collect();
+        let kv_events = wire_rows
+            .iter()
+            .map(|&(slot, _, position)| {
+                self.logical
+                    .authorize(Operation::Ensure { slot, position })
+                    .map_err(str::to_owned)
+                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPipeBegin {
+            sequence: seq,
+            rows: wire_rows.clone(),
+            kv_events,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        let mut events = Vec::with_capacity(wire_rows.len());
+        for (&(slot, token, position), plan) in wire_rows.iter().zip(wire_plans) {
+            let event = self
+                .model
+                .forward_host_to_feedback(&self.group, &self.logical, token, position, slot, 0, plan)
+                .map_err(|e| e.to_string())?;
+            events.push((slot, event));
+            self.positions[slot] += 1;
+            self.occupied[slot] = true;
+        }
+        self.sequence = seq;
+        self.pipe = Some(PipeFlight {
+            slots: wire_slots,
+            width: slots.len(),
+            plane: 0,
+            events,
+            row_of: order,
+            mapped: true,
+        });
+        tracing::info!(sequence = seq, rows = slots.len(), "TP slot-mapped pipe began");
         Ok(())
     }
 
     fn pipe_next(&mut self, plans: &[RowSample]) -> Result<Vec<u32>, String> {
         let flight = self.pipe.as_ref().ok_or("TP pipe next without begin")?;
-        let devices = Self::pipe_plans(&flight.slots, flight.width, plans)?;
+        let devices = if flight.mapped {
+            // Slot-mapped rows: plan per SCHEDULER row, executed per WIRE row
+            // via row_of; dead members ride as greedy dummies (their ids are
+            // discarded by the scheduler).
+            flight
+                .row_of
+                .iter()
+                .map(|&row| match plans[row] {
+                    RowSample::Device(plan) => {
+                        super::tp_model::tp_sample_params(plan).map_err(|e| e.to_string())?;
+                        Ok(plan)
+                    }
+                    RowSample::Hole => Ok(crate::sampler::DevicePlan::Greedy),
+                    RowSample::Host => Err("TP pipe cannot read host logits".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            Self::pipe_plans(&flight.slots, flight.width, plans)?
+        };
         let rows = flight
             .slots
             .iter()
@@ -442,14 +864,11 @@ impl TpCoordinator {
         }
         // Rank 1 has enqueued the next tick before acknowledging the old one.
         ready(&mut self.stream, self.sequence)?;
+        let ids = {
+            let old = self.pipe.as_ref().ok_or("TP pipe disappeared")?;
+            self.pipe_readback(old, source_plane)?
+        };
         let old = self.pipe.as_mut().ok_or("TP pipe disappeared")?;
-        let mut ids = vec![0; old.width];
-        for (slot, event) in &old.events {
-            ids[*slot] = self
-                .model
-                .feedback_id_after(event, *slot, source_plane)
-                .map_err(|e| e.to_string())?;
-        }
         old.events = events;
         old.plane = next_plane;
         self.sequence = seq;
@@ -464,13 +883,7 @@ impl TpCoordinator {
             .map_err(|e| e.to_string())?;
         ready(&mut self.stream, self.sequence)?;
         ready(&mut self.stream, seq)?;
-        let mut ids = vec![0; flight.width];
-        for (slot, event) in &flight.events {
-            ids[*slot] = self
-                .model
-                .feedback_id_after(event, *slot, flight.plane)
-                .map_err(|e| e.to_string())?;
-        }
+        let ids = self.pipe_readback(flight, flight.plane)?;
         self.group
             .stream()
             .synchronize()
@@ -478,8 +891,543 @@ impl TpCoordinator {
         self.model.synchronize().map_err(|e| e.to_string())?;
         self.sequence = seq;
         self.pipe = None;
+        if let Some(probe) = self.probe.as_mut() {
+            probe.pipe_drained = true;
+        }
         tracing::info!(sequence = seq, "TP decode pipe drained");
         Ok(ids)
+    }
+
+    /// Collect the in-flight tick's ids. Plain pipes keep the dense contract
+    /// (`ids[slot]`, identity rows); slot-mapped pipes (overlap path, never
+    /// contiguous) index by SCHEDULER row - the scheduler reads ids[i]
+    /// against its row plan. Per-row plan gates which entries are meaningful.
+    fn pipe_readback(&self, flight: &PipeFlight, plane: usize) -> Result<Vec<u32>, String> {
+        let mut ids = vec![0; flight.width];
+        for (wire, (slot, event)) in flight.events.iter().enumerate() {
+            let id = self
+                .model
+                .feedback_id_after(event, *slot, plane)
+                .map_err(|e| e.to_string())?;
+            if flight.mapped {
+                ids[flight.row_of[wire]] = id;
+            } else {
+                ids[*slot] = id;
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Abandon `slot`'s queued chunked prefill (client hung up). False when
+    /// the slot's rows are inside the in-flight span ("not now") or its
+    /// chunk is already popped for launch (in flight by definition); the
+    /// scheduler retries next tick and drops the chunk at finish.
+    fn chunk_abort(&mut self, slot: usize) -> bool {
+        if self
+            .span
+            .as_ref()
+            .is_some_and(|span| span.slots.contains(&slot))
+        {
+            return false;
+        }
+        let before = self.chunks.len();
+        self.chunks.retain(|chunk| chunk.slot != slot);
+        self.chunks.len() != before
+    }
+
+    /// One mixed tick: decode rows + the next chunk budget's rows in one
+    /// weight pass. The two row groups' slots are disjoint by scheduler
+    /// construction (chunking slots never ride `dec`), so the tick executes
+    /// in SLOT order: both row sets merge into one ascending-slot sequence
+    /// (the worker's `TpMixed` rule), each slot's rows keeping their relative
+    /// order. Plans are ROW-position-indexed per service.rs:4606 and
+    /// hole-free (dec is built compactly); a decode row samples on device
+    /// (its id lands in `step.ids[dec_row]`) or returns host logits. A
+    /// finishing chunk's LAST row is its finisher: with a supported
+    /// `Device` plan it samples that row on device (`FinishSample::Sampled`,
+    /// no readback); otherwise the row's full logits are returned
+    /// (`FinishSample::Logits`, peeked uniforms stay uncommitted per the
+    /// scheduler's rule).
+    #[allow(clippy::type_complexity)]
+    fn forward_mixed(
+        &mut self,
+        decodes: &[(usize, u32, u32)],
+        budget: usize,
+        plans: &[RowSample],
+        fin_plans: &[(usize, RowSample)],
+    ) -> Result<(
+        crate::generator::SampledStep,
+        Vec<(usize, crate::generator::FinishSample, usize)>,
+    ), String> {
+        // A span owns the lane; the scheduler only pumps decode-pipe ticks
+        // over an in-flight span (or finishes it). Mixed vs span launch are
+        // exclusive by scheduler design; guard it anyway.
+        if self.span.is_some() {
+            return Err("TP span in flight; finish or drain it first".into());
+        }
+        self.chunk_plans(fin_plans);
+        let (chunk_rows, mut finishers) = self.chunk_take(budget);
+        let dec_n = decodes.len();
+        if plans.len() != dec_n {
+            return Err("TP mixed plan width mismatch".into());
+        }
+        // service builds dec slot-ascending; enforce it so the slot-sorted
+        // execution order matches the host_rows push order the scheduler
+        // pops in dec-iteration order.
+        if decodes.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err("TP mixed decode rows must be strictly ascending by slot".into());
+        }
+        if dec_n + !chunk_rows.is_empty() as usize == 0 {
+            return Ok((
+                crate::generator::SampledStep {
+                    ids: Vec::new(),
+                    host_rows: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
+        for plan in plans {
+            if matches!(plan, RowSample::Hole) {
+                return Err("TP mixed tick cannot carry holes".into());
+            }
+            if let RowSample::Device(p) = plan {
+                super::tp_model::tp_sample_params(*p).map_err(|e| e.to_string())?;
+            }
+        }
+        // Validate the whole tick before any KV authorization.
+        for &(slot, _, pos) in decodes {
+            if slot >= self.positions.len()
+                || pos as usize != self.positions[slot]
+                || pos as usize >= self.model.max_ctx()
+            {
+                return Err("TP mixed decode position invalid".into());
+            }
+        }
+        let mut cursor: Vec<usize> = self.positions.clone();
+        for &(s, _, pos) in &chunk_rows {
+            if s >= cursor.len() || pos != cursor[s] || pos >= self.model.max_ctx() {
+                return Err("TP mixed chunk position invalid".into());
+            }
+            cursor[s] += 1;
+        }
+        if chunk_rows
+            .iter()
+            .any(|&(s, _, _)| decodes.iter().any(|&(d, _, _)| d == s))
+        {
+            return Err("TP mixed tick slot overlap between decode and chunk rows".into());
+        }
+        // Finisher plans: supported Device -> device-sampled first token;
+        // Host or an unsupported plan -> full-logit readback.
+        for fin in &mut finishers {
+            fin.plan = fin_plans.iter().find_map(|(s, p)| match p {
+                RowSample::Device(p)
+                    if *s == fin.slot && super::tp_model::tp_sample_params(*p).is_ok() =>
+                {
+                    Some(*p)
+                }
+                _ => None,
+            });
+        }
+        // Merge into one ascending-slot row sequence (stable: same-slot rows
+        // keep their relative order; groups are slot-disjoint anyway).
+        let mut rows: Vec<(usize, u32, usize)> =
+            decodes.iter().map(|&(s, t, p)| (s, t, p as usize)).collect();
+        rows.extend(chunk_rows.iter().copied());
+        rows.sort_by_key(|&(slot, _, _)| slot);
+        // Each finisher's last row (its chunk's final prefill row) produces
+        // the finisher result; row index -> (finisher index, plan).
+        let fin_last_row: std::collections::HashMap<usize, (usize, Option<crate::sampler::DevicePlan>)> =
+            finishers
+                .iter()
+                .enumerate()
+                .filter_map(|(fi, fin)| {
+                    rows.iter()
+                        .rposition(|&(s, _, _)| s == fin.slot)
+                        .map(|ri| (ri, (fi, fin.plan)))
+                })
+                .collect();
+        let kv_events = rows
+            .iter()
+            .map(|&(slot, _, position)| {
+                self.logical
+                    .authorize(Operation::Ensure { slot, position })
+                    .map_err(str::to_owned)
+                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ControlMessage::TpMixed {
+            sequence: self.sequence + 1,
+            rows: rows.clone(),
+            kv_events,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, self.sequence + 1)?;
+        let mut step = crate::generator::SampledStep {
+            ids: vec![0; dec_n],
+            host_rows: Vec::new(),
+        };
+        let mut fin_ids = vec![0u32; finishers.len()];
+        let mut fin_logits: Vec<Option<Vec<f32>>> = vec![None; finishers.len()];
+        for (ri, &(slot, token, position)) in rows.iter().enumerate() {
+            if let Some(di) = decodes.iter().position(|&(s, _, _)| s == slot) {
+                // Decode row: route by the ROW-position plan.
+                match plans[di] {
+                    RowSample::Device(plan) => {
+                        step.ids[di] = self
+                            .model
+                            .forward_token_sampled_slot(
+                                &self.group, &self.logical, token, position, slot, plan,
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
+                    _ => {
+                        let logits = self
+                            .model
+                            .forward_token_slot(&self.group, &self.logical, token, position, slot)
+                            .map_err(|e| e.to_string())?;
+                        step.host_rows.push((slot, logits));
+                    }
+                }
+            } else if let Some(&(fi, plan)) = fin_last_row.get(&ri) {
+                // Finisher row: the chunk's final prefill forward.
+                match plan {
+                    Some(plan) => {
+                        fin_ids[fi] = self
+                            .model
+                            .forward_token_sampled_slot(
+                                &self.group, &self.logical, token, position, slot, plan,
+                            )
+                            .map_err(|e| e.to_string())?;
+                    }
+                    None => {
+                        let logits = self
+                            .model
+                            .forward_token_slot(&self.group, &self.logical, token, position, slot)
+                            .map_err(|e| e.to_string())?;
+                        fin_logits[fi] = Some(logits);
+                    }
+                }
+            } else {
+                // Interior chunk row: no readback, no sample.
+                self.model
+                    .forward_token_enqueue(&self.group, &self.logical, token, position, slot)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        self.sequence += 1;
+        ready(&mut self.stream, self.sequence)?;
+        for &(slot, _, _) in decodes {
+            self.positions[slot] += 1;
+            self.occupied[slot] = true;
+        }
+        for &(slot, _, _) in &chunk_rows {
+            self.positions[slot] += 1;
+            self.occupied[slot] = true;
+        }
+        let mut results = Vec::with_capacity(finishers.len());
+        for (fi, fin) in finishers.iter().enumerate() {
+            let sample = match fin.plan {
+                Some(_) => crate::generator::FinishSample::Sampled(fin_ids[fi]),
+                None => crate::generator::FinishSample::Logits(
+                    fin_logits[fi].take().unwrap_or_default(),
+                ),
+            };
+            results.push((fin.slot, sample, fin.rows));
+        }
+        Ok((step, results))
+    }
+
+    /// Queue a prompt for chunked prefill (scheduler-side admission). No
+    /// worker message and no KV change: rows flow out through mixed ticks'
+    /// `chunk_take` and span ticks' `span_take`.
+    fn chunk_enqueue(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), String> {
+        if slot >= self.positions.len() || tokens.is_empty() {
+            return Err("TP chunked prefill slot or prompt invalid".into());
+        }
+        if self
+            .chunks
+            .iter()
+            .map(|c| c.slot)
+            .chain(
+                self.span
+                    .as_ref()
+                    .map(|s| &s.finishing)
+                    .into_iter()
+                    .flatten()
+                    .map(|f| f.slot),
+            )
+            .any(|s| s == slot)
+        {
+            return Err("TP slot already has a chunked prefill in flight".into());
+        }
+        if tokens.len() >= self.model.max_ctx() {
+            return Err("TP prompt exceeds the context window".into());
+        }
+        self.chunks.push_back(PrefillChunk {
+            slot,
+            rows: tokens
+                .into_iter()
+                .enumerate()
+                .map(|(pos, token)| (slot, token, pos))
+                .collect(),
+            fin_plan: None,
+        });
+        Ok(())
+    }
+
+    /// Fill `fin_plan` for queued chunks from the scheduler's finisher plans.
+    fn chunk_plans(&mut self, fin_plans: &[(usize, RowSample)]) {
+        for chunk in &mut self.chunks {
+            if chunk.fin_plan.is_some() {
+                continue;
+            }
+            for &(slot, plan) in fin_plans {
+                if slot == chunk.slot {
+                    if let RowSample::Device(p) = plan {
+                        chunk.fin_plan = Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pop up to `budget` ordered rows from the queue front, recording every
+    /// finishing chunk (its plan if any; `None` = host-logit readback). A
+    /// chunk finishes when its last row is popped.
+    fn chunk_take(
+        &mut self,
+        budget: usize,
+    ) -> (Vec<(usize, u32, usize)>, Vec<SpanFinisher>) {
+        let mut rows = Vec::new();
+        let mut finishers = Vec::new();
+        while rows.len() < budget {
+            // Continue only within the chunk already open this tick.
+            let go = match self.chunks.front() {
+                Some(chunk) => {
+                    rows.is_empty() || rows.last().is_some_and(|&(s, _, _)| s == chunk.slot)
+                }
+                None => false,
+            };
+            if !go {
+                break;
+            }
+            let (slot, take, finishing, plan) = {
+                let chunk = self.chunks.front().unwrap();
+                let take = chunk.rows.len().min(budget - rows.len());
+                (chunk.slot, take, chunk.rows.len() == take, chunk.fin_plan)
+            };
+            let drained: Vec<_> = {
+                let chunk = self.chunks.front_mut().unwrap();
+                chunk.rows.drain(..take).collect()
+            };
+            rows.extend(drained);
+            if finishing {
+                self.chunks.pop_front();
+                finishers.push(SpanFinisher {
+                    slot,
+                    plan,
+                    rows: take,
+                });
+            }
+        }
+        (rows, finishers)
+    }
+
+    /// Authorize and enqueue one span: validate the whole row plan, mirror
+    /// each KV Ensure, send the launch with the finishers, wait for the
+    /// worker's Prepared, then enqueue the rows and every finisher on the
+    /// prefill lane without host-synchronizing. The caller pumps decode-pipe
+    /// ticks while the lane's kernels run.
+    fn span_begin(
+        &mut self,
+        rows: Vec<(usize, u32, usize)>,
+        finishers: Vec<SpanFinisher>,
+    ) -> Result<(), String> {
+        if self.span.is_some() {
+            return Err("TP span already in flight".into());
+        }
+        if self.pipe.is_some() {
+            return Err("TP pipe must drain before a span launch".into());
+        }
+        if !self.model.has_prefill_lane() {
+            return Err("TP prefill lane unavailable".into());
+        }
+        if rows.is_empty() {
+            return Err("TP span launch has no rows".into());
+        }
+        // Chunks of one slot are contiguous in the queue, so the slice must
+        // be too: equal slot => adjacent.
+        if rows
+            .windows(2)
+            .any(|w| w[0].0 != w[1].0 && w[1].0 == rows[0].0)
+        {
+            return Err("TP span chunk rows must be contiguous per slot".into());
+        }
+        // Finishers: supported Device -> device-sampled first token; Host or
+        // an unsupported plan -> full-logit readback. The wire carries EVERY
+        // finishing chunk (plan or None): rank 1 promotes exactly these
+        // slots' lane-local state at the span finish.
+        let wire_finishers = finishers
+            .iter()
+            .map(|f| f.plan.map(wire_finisher_plan).transpose().map(|w| (f.slot, w)))
+            .collect::<Result<Vec<_>, String>>()?;
+        // Validate the entire tick BEFORE authorizing any KV mutation. Within
+        // a chunk the position advances per enqueued row; across chunks the
+        // next chunk of the same slot continues exactly at the running pos.
+        let mut cursor: Vec<usize> = self.positions.clone();
+        for &(s, _, pos) in &rows {
+            if s >= cursor.len() || pos != cursor[s] || pos >= self.model.max_ctx() {
+                return Err("TP span position disagrees with rank-0 plan".into());
+            }
+            cursor[s] += 1;
+        }
+        // Authorize + mirror every KV Ensure first: failed validation must
+        // not leave the ranks' logical tables diverged mid-span.
+        let kv_events = rows
+            .iter()
+            .map(|&(slot, _, position)| {
+                self.logical
+                    .authorize(Operation::Ensure { slot, position })
+                    .map_err(str::to_owned)
+                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpSpanLaunch {
+            sequence: seq,
+            rows: rows.clone(),
+            finishers: wire_finishers,
+            kv_events,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        // Both ranks now hold the authorized plan. Enqueue the whole span on
+        // the prefill lane, then each finishing chunk's finisher in chunk
+        // order. `positions` advance as each row is enqueued so a later tick
+        // sees the new state.
+        for &(slot, token, pos) in &rows {
+            self.model
+                .prefill_lane_step(&self.group, &self.logical, slot, token, pos)
+                .map_err(|e| e.to_string())?;
+            self.positions[slot] += 1;
+        }
+        let mut events = VecDeque::with_capacity(finishers.len());
+        for fin in &finishers {
+            let event = self
+                .model
+                .prefill_lane_finisher(fin.slot, fin.plan)
+                .map_err(|e| e.to_string())?;
+            events.push_back(event);
+        }
+        // The worker sends exactly one tail Ready after enqueuing its rows.
+        // Consume it before another command (pipe begin or span finish) can
+        // expect its own ACK. This is an enqueue ACK, not a GPU fence.
+        ready(&mut self.stream, seq)?;
+        self.sequence = seq;
+        tracing::info!(
+            sequence = seq,
+            rows = rows.len(),
+            finishers = finishers.len(),
+            "TP prefill span launched"
+        );
+        let mut span_slots: Vec<usize> = Vec::new();
+        for &(s, _, _) in &rows {
+            if !span_slots.contains(&s) {
+                span_slots.push(s);
+            }
+        }
+        self.span = Some(SpanFlight {
+            finishing: finishers,
+            events,
+            slots: span_slots,
+        });
+        Ok(())
+    }
+
+    /// Pull the next span's rows from the chunk queue and launch it. Returns
+    /// false when the queue is empty (nothing launched).
+    fn span_take(
+        &mut self,
+        budget: usize,
+        fin_plans: &[(usize, RowSample)],
+    ) -> Result<bool, String> {
+        if self.chunks.is_empty() || self.span.is_some() || self.pipe.is_some() {
+            return Ok(false);
+        }
+        self.chunk_plans(fin_plans);
+        let (rows, finishers) = self.chunk_take(budget);
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        self.span_begin(rows, finishers)?;
+        Ok(true)
+    }
+
+    /// Fence the in-flight span: join the lane on both ranks, then read each
+    /// finisher's result on rank 0, chunk order. Returns the scheduler's
+    /// `(slot, FinishSample, rows)` contract directly.
+    fn span_finish(
+        &mut self,
+    ) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, String> {
+        let seq = self.sequence + 1;
+        ControlMessage::TpSpanFinish { sequence: seq }
+            .to_stream(&mut self.stream)
+            .map_err(|e| e.to_string())?;
+        ready(&mut self.stream, seq)?;
+        let flight = self.span.take().ok_or("TP span finish without launch")?;
+        self.group
+            .stream()
+            .synchronize()
+            .map_err(|e| e.to_string())?;
+        self.model.prefill_lane_join().map_err(|e| e.to_string())?;
+        self.sequence = seq;
+        tracing::info!(
+            sequence = seq,
+            finishers = flight.finishing.len(),
+            "TP prefill span finished"
+        );
+        // Promote each finished slot's lane-local state lane->decode (locked
+        // decision 1): the lane's KV slab and DeltaNet slot state are private
+        // allocations, so a finished prompt's context would otherwise be
+        // stranded. One lane-stream mark covers all slots (the join already
+        // guarantees it fires); each promotion waits it device-side on the
+        // decode stream. ~1-3 ms per finished prompt; the TTFT win survives.
+        let mark = self.model.prefill_lane_mark().map_err(|e| e.to_string())?;
+        for fin in &flight.finishing {
+            let live = self
+                .logical
+                .slot_blocks(fin.slot)
+                .ok_or("TP span finish slot out of range")?
+                .to_vec();
+            self.model
+                .promote_lane_slot(&mark, fin.slot, &live)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(probe) = self.probe.as_mut() {
+            probe.after_span(0, &self.model, &self.logical, &self.group, &self.positions)?;
+        }
+        let mut results = Vec::with_capacity(flight.finishing.len());
+        for (fin, ev) in flight.finishing.into_iter().zip(flight.events) {
+            match fin.plan {
+                Some(_) => {
+                    let id = self
+                        .model
+                        .prefill_lane_sampled_id_after(&ev, fin.slot)
+                        .map_err(|e| e.to_string())?;
+                    results.push((fin.slot, crate::generator::FinishSample::Sampled(id), fin.rows));
+                }
+                None => {
+                    let logits = self
+                        .model
+                        .prefill_lane_logits_after(&ev)
+                        .map_err(|e| e.to_string())?;
+                    results.push((fin.slot, crate::generator::FinishSample::Logits(logits), fin.rows));
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn sampled(
@@ -595,6 +1543,9 @@ impl TpCoordinator {
             self.positions[slot] += 1;
             self.occupied[slot] = true;
         }
+        if let Some(probe) = self.probe.as_mut() {
+            probe.after_batch(0, &self.model, &self.logical, &self.group, &self.positions, rows)?;
+        }
         Ok(step)
     }
 }
@@ -609,12 +1560,35 @@ enum Command {
     PipeNext(Vec<RowSample>),
     PipeDrain,
     Release(Vec<bool>),
+    /// Chunked prefill admission: queue the prompt on the coordinator.
+    ChunkBegin(usize, Vec<u32>),
+    /// Abandon a slot's queued chunked prefill (client hangup).
+    PrefillAbort(usize),
+    /// Mixed tick: decode rows + chunked-prefill budget.
+    Mixed(
+        Vec<(usize, u32, u32)>,
+        usize,
+        Vec<RowSample>,
+        Vec<(usize, RowSample)>,
+    ),
+    /// Span ticks (overlap path): take from the same queue as mixed ticks.
+    SpanLaunch(usize, Vec<(usize, RowSample)>),
+    SpanFinish,
+    /// Slot-mapped decode pipe (overlap path).
+    PipeBeginSlots(Vec<u32>, Vec<u32>, Vec<u32>, Vec<RowSample>),
 }
 
 enum Response {
     Logits(Vec<f32>),
     Sampled(SampledStep),
     Ids(Vec<u32>),
+    Launched(bool),
+    Aborted(bool),
+    Mixed(
+        SampledStep,
+        Vec<(usize, crate::generator::FinishSample, usize)>,
+    ),
+    SpanFinished(Vec<(usize, crate::generator::FinishSample, usize)>),
 }
 
 /// Send-only proxy on the engine scheduler thread. The NCCL communicator and
@@ -625,6 +1599,10 @@ pub struct TpGenerator {
     max_ctx: usize,
     slots: usize,
     device_sampling: bool,
+    overlap: bool,
+    /// Shared with the coordinator thread: false while a prefill span is in
+    /// flight (published after every command). `unified_span_done` polls it.
+    span_done: Arc<std::sync::atomic::AtomicBool>,
     poisoned: Option<String>,
 }
 
@@ -645,18 +1623,27 @@ impl TpGenerator {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let path = path.to_owned();
         let pack = pack.to_owned();
+        let span_done = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let lane_flag = Arc::clone(&span_done);
         std::thread::Builder::new()
             .name("qwen35-tp-rank0".into())
             .spawn(move || {
-                let mut coordinator =
-                    match TpCoordinator::load(stream, &resolved, &path, &pack, gpu, max_ctx, slots)
-                    {
-                        Ok(coordinator) => coordinator,
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                let mut coordinator = match TpCoordinator::load(
+                    stream,
+                    &resolved,
+                    &path,
+                    &pack,
+                    gpu,
+                    max_ctx,
+                    slots,
+                    lane_flag,
+                ) {
+                    Ok(coordinator) => coordinator,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
                 if ready_tx
                     .send(Ok((
                         coordinator.model.vocab(),
@@ -671,7 +1658,26 @@ impl TpGenerator {
                     let result = if coordinator.pipe.is_some()
                         && !matches!(cmd, Command::PipeNext(_) | Command::PipeDrain)
                     {
-                        Err("TP pipe must drain before release, reset or forward".into())
+                        Err("TP pipe must drain before another command".into())
+                    } else if coordinator.span.is_some()
+                        && !matches!(
+                            cmd,
+                            Command::PipeBegin(..)
+                                | Command::PipeBeginSlots(..)
+                                | Command::PipeNext(_)
+                                | Command::PipeDrain
+                                | Command::SpanFinish
+                                | Command::PrefillAbort(_)
+                        )
+                    {
+                        // The span owns the lane: the scheduler may begin/
+                        // pump the decode pipe over it (the overlap pump
+                        // starts after the launch), finish it, or abort a
+                        // QUEUED chunk (client hangup; in-flight span slots
+                        // refuse inside chunk_abort). SpanFinish requires
+                        // the pipe drained first - the worker refuses
+                        // TpSpanFinish mid-pipe.
+                        Err("TP span in flight; only pipe ticks or the span finish may run".into())
                     } else {
                         match cmd {
                             Command::Reset => coordinator
@@ -690,6 +1696,9 @@ impl TpGenerator {
                             Command::PipeBegin(tokens, positions, plans) => coordinator
                                 .pipe_begin(&tokens, &positions, &plans)
                                 .map(|_| Response::Logits(Vec::new())),
+                            Command::PipeBeginSlots(slots, tokens, positions, plans) => coordinator
+                                .pipe_begin_slots(&slots, &tokens, &positions, &plans)
+                                .map(|_| Response::Logits(Vec::new())),
                             Command::PipeNext(plans) => {
                                 coordinator.pipe_next(&plans).map(Response::Ids)
                             }
@@ -697,11 +1706,27 @@ impl TpGenerator {
                             Command::Release(occupied) => coordinator
                                 .release(&occupied)
                                 .map(|_| Response::Logits(Vec::new())),
+                            Command::ChunkBegin(slot, tokens) => coordinator
+                                .chunk_enqueue(slot, tokens)
+                                .map(|_| Response::Logits(Vec::new())),
+                            Command::PrefillAbort(slot) => {
+                                Ok(Response::Aborted(coordinator.chunk_abort(slot)))
+                            }
+                            Command::Mixed(decodes, budget, plans, fin_plans) => coordinator
+                                .forward_mixed(&decodes, budget, &plans, &fin_plans)
+                                .map(|(step, finished)| Response::Mixed(step, finished)),
+                            Command::SpanLaunch(budget, fin_plans) => coordinator
+                                .span_take(budget, &fin_plans)
+                                .map(Response::Launched),
+                            Command::SpanFinish => {
+                                coordinator.span_finish().map(Response::SpanFinished)
+                            }
                         }
                     };
                     if let Err(e) = &result {
                         coordinator.poisoned = Some(e.clone());
                     }
+                    coordinator.publish_span_done();
                     let failed = result.is_err();
                     let _ = reply.send(result);
                     if failed {
@@ -717,6 +1742,9 @@ impl TpGenerator {
             max_ctx,
             slots,
             device_sampling,
+            // The mapped decode pipe requires resident device sampling.
+            overlap: device_sampling,
+            span_done,
             poisoned: None,
         })
     }
@@ -805,6 +1833,90 @@ impl Generator for TpGenerator {
         {
             Response::Ids(ids) => Ok(ids),
             _ => Err(GenError::Backend("TP pipe reply kind mismatch".into())),
+        }
+    }
+    fn supports_overlap(&self) -> bool {
+        self.overlap
+    }
+    fn decode_pipe_begin_slots(
+        &mut self,
+        slots: &[u32],
+        tokens: &[u32],
+        positions: &[u32],
+        plans: &[RowSample],
+    ) -> Result<(), GenError> {
+        self.request_logits(Command::PipeBeginSlots(
+            slots.to_vec(),
+            tokens.to_vec(),
+            positions.to_vec(),
+            plans.to_vec(),
+        ))
+        .map(|_| ())
+        .map_err(GenError::Backend)
+    }
+    fn unified_span_launch(
+        &mut self,
+        budget: usize,
+        fin_plans: &[(usize, RowSample)],
+    ) -> Result<bool, GenError> {
+        match self
+            .request(Command::SpanLaunch(budget, fin_plans.to_vec()))
+            .map_err(GenError::Backend)?
+        {
+            Response::Launched(launched) => Ok(launched),
+            _ => Err(GenError::Backend("TP span reply kind mismatch".into())),
+        }
+    }
+    fn unified_span_done(&self) -> bool {
+        self.span_done
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn unified_span_finish(&mut self) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, GenError> {
+        match self
+            .request(Command::SpanFinish)
+            .map_err(GenError::Backend)?
+        {
+            Response::SpanFinished(finished) => Ok(finished),
+            _ => Err(GenError::Backend("TP span reply kind mismatch".into())),
+        }
+    }
+    fn supports_chunked_prefill(&self) -> bool {
+        true
+    }
+    fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
+        self.request_logits(Command::ChunkBegin(slot, tokens))
+            .map(|_| ())
+            .map_err(GenError::Backend)
+    }
+    fn prefill_abort(&mut self, slot: usize) -> bool {
+        match self.request(Command::PrefillAbort(slot)) {
+            Ok(Response::Aborted(aborted)) => aborted,
+            _ => {
+                // A failed abort poisons the pair (request marks it); report
+                // "not now" so the scheduler keeps the chunk and retries -
+                // but the pair is gone, so make it a hard false.
+                false
+            }
+        }
+    }
+    fn forward_mixed_sampled(
+        &mut self,
+        decodes: &[(usize, u32, u32)],
+        budget: usize,
+        plans: &[RowSample],
+        fin_plans: &[(usize, RowSample)],
+    ) -> Result<(SampledStep, Vec<(usize, crate::generator::FinishSample, usize)>), GenError> {
+        match self
+            .request(Command::Mixed(
+                decodes.to_vec(),
+                budget,
+                plans.to_vec(),
+                fin_plans.to_vec(),
+            ))
+            .map_err(|e| GenError::Backend(format!("TP rank lost: {e}")))?
+        {
+            Response::Mixed(step, finished) => Ok((step, finished)),
+            _ => Err(GenError::Backend("TP mixed reply kind mismatch".into())),
         }
     }
     fn forward_prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, GenError> {
@@ -909,9 +2021,20 @@ pub fn run_worker(
         let mut model =
             Qwen35TpRank::load_slots(exec.clone(), &map, &group, max_ctx, KvDtype::Fp16, slots)
                 .map_err(|e| e.to_string())?;
+        // The lane's weights re-upload from the same mapped file (same
+        // map-lifetime reorder as the coordinator's load).
+        model
+            .enable_prefill_lane(&group, &map)
+            .map_err(|e| e.to_string())?;
+        drop(map);
         let mut logical = logical(max_ctx, slots)?;
         let mut positions = vec![0; slots];
+        let mut probe = TpAcceptanceProbe::enabled();
         let mut pipe_slots: Option<Vec<usize>> = None;
+        let mut span_in_flight = false;
+        // Finishing chunks of the in-flight span (wire shape, chunk order):
+        // rank 1 promotes exactly these slots at the span finish.
+        let mut span_finishers: Vec<(usize, Option<TpSpanFinisherPlan>)> = Vec::new();
         let mut pipe_plane = 0usize;
         let mut pending_pipe: Option<u64> = None;
         let mut sequence = 1;
@@ -929,12 +2052,20 @@ pub fn run_worker(
                 | ControlMessage::TpPipeBegin { sequence, .. }
                 | ControlMessage::TpPipeNext { sequence, .. }
                 | ControlMessage::TpPipeDrain { sequence }
-                | ControlMessage::TpRelease { sequence, .. } => *sequence,
-                ControlMessage::Shutdown { graceful: true } if pipe_slots.is_none() => {
+                | ControlMessage::TpRelease { sequence, .. }
+                | ControlMessage::TpMixed { sequence, .. }
+                | ControlMessage::TpSpanLaunch { sequence, .. }
+                | ControlMessage::TpSpanFinish { sequence } => *sequence,
+                ControlMessage::Shutdown { graceful: true }
+                    if pipe_slots.is_none() && !span_in_flight =>
+                {
+                    if let Some(probe) = &probe {
+                        probe.complete(1)?;
+                    }
                     return Ok(());
                 }
                 ControlMessage::Shutdown { graceful: true } => {
-                    return Err("TP pipe must drain before shutdown".into());
+                    return Err("TP pipe or span must drain before shutdown".into());
                 }
                 ControlMessage::Shutdown { graceful: false } => return Err("rank 0 aborted".into()),
                 other => return Err(format!("unexpected TP command: {other:?}")),
@@ -952,6 +2083,19 @@ pub fn run_worker(
                 )
             {
                 return Err("TP pipe must drain before another command".into());
+            }
+            if span_in_flight
+                && !matches!(
+                    msg,
+                    ControlMessage::TpPipeBegin { .. }
+                        | ControlMessage::TpPipeNext { .. }
+                        | ControlMessage::TpPipeDrain { .. }
+                        | ControlMessage::TpSpanFinish { .. }
+                )
+            {
+                return Err(
+                    "TP span in flight: only pipe ticks or the span finish may run".into(),
+                );
             }
             match msg {
                 ControlMessage::TpPipeBegin {
@@ -1047,6 +2191,9 @@ pub fn run_worker(
                     }
                     exec.synchronize().map_err(|e| e.to_string())?;
                     group.stream().synchronize().map_err(|e| e.to_string())?;
+                    if let Some(probe) = probe.as_mut() {
+                        probe.pipe_drained = true;
+                    }
                     pipe_slots = None;
                     let previous = pending_pipe.take().ok_or("TP pipe missing pending tick")?;
                     ControlMessage::TpReady { sequence: previous }
@@ -1061,6 +2208,9 @@ pub fn run_worker(
                     }
                     logical.mirror(&event).map_err(str::to_owned)?;
                     model.reset().map_err(|e| e.to_string())?;
+                    // The prefill lane mirrors the flush: its KV/DeltaNet
+                    // state must not outlive the logical tables.
+                    model.reset_lane().map_err(|e| e.to_string())?;
                     positions.fill(0);
                 }
                 ControlMessage::TpRelease {
@@ -1073,6 +2223,14 @@ pub fn run_worker(
                         || freed.windows(2).any(|w| w[0] >= w[1])
                     {
                         return Err("invalid TP release membership".into());
+                    }
+                    if probe.is_some() {
+                        if pipe_slots.is_some() || span_in_flight || !model.prefill_lane_done() {
+                            return Err("TP worker probe: release before GPU flight drained".into());
+                        }
+                        model.prefill_lane_join().map_err(|e| e.to_string())?;
+                        group.stream().synchronize().map_err(|e| e.to_string())?;
+                        model.synchronize().map_err(|e| e.to_string())?;
                     }
                     for (&slot, value) in freed.iter().zip(kv_events) {
                         if slot >= slots || positions[slot] == 0 {
@@ -1087,7 +2245,11 @@ pub fn run_worker(
                     }
                     for slot in freed {
                         model.reset_slot(slot).map_err(|e| e.to_string())?;
+                        model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
                         positions[slot] = 0;
+                    }
+                    if let Some(probe) = probe.as_mut() {
+                        probe.after_release(1, &model, &logical, &group, &positions)?;
                     }
                 }
                 ControlMessage::TpBatch {
@@ -1114,12 +2276,119 @@ pub fn run_worker(
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
+                    for &(slot, token, position) in &rows {
+                        model
+                            .forward_token_worker_slot(&group, &logical, token, position, slot)
+                            .map_err(|e| e.to_string())?;
+                        positions[slot] += 1;
+                    }
+                    if let Some(probe) = probe.as_mut() {
+                        probe.after_batch(1, &model, &logical, &group, &positions, &rows)?;
+                    }
+                }
+                ControlMessage::TpMixed {
+                    rows, kv_events, ..
+                } => {
+                    // Mixed tick (decode + chunk rows in one pass): rows may
+                    // exceed the slot count - a chunk advances multiple rows
+                    // of one slot per tick. Same execution contract as
+                    // TpBatch: mirror KV, Prepared, then one eager forward
+                    // per row in wire order (no logits, no sampling - rank 0
+                    // owns both).
+                    if rows.is_empty() || rows.len() != kv_events.len() {
+                        return Err("TP mixed tick membership invalid".into());
+                    }
+                    validate_multistep_positions(&rows, &positions, max_ctx)?;
+                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
+                        let event: Event =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        if event.operation != (Operation::Ensure { slot, position }) {
+                            return Err("TP mixed KV event mismatch".into());
+                        }
+                        logical.mirror(&event).map_err(str::to_owned)?;
+                    }
+                    ControlMessage::TpPrepared { sequence: got }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
                     for (slot, token, position) in rows {
                         model
                             .forward_token_worker_slot(&group, &logical, token, position, slot)
                             .map_err(|e| e.to_string())?;
                         positions[slot] += 1;
                     }
+                }
+                ControlMessage::TpSpanLaunch {
+                    rows,
+                    finishers,
+                    kv_events,
+                    ..
+                } => {
+                    // The whole prompt span enqueues on rank 1's prefill lane:
+                    // the lane steps enter the same collectives in the same
+                    // order as rank 0's lane. No finisher enqueue here - the
+                    // finisher sampler has no collectives and runs only on
+                    // rank 0; the finisher list exists so this rank promotes
+                    // the same slots at the span finish.
+                    if rows.is_empty() || rows.len() != kv_events.len() {
+                        return Err("TP span launch membership invalid".into());
+                    }
+                    validate_multistep_positions(&rows, &positions, max_ctx)?;
+                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
+                        let event: Event =
+                            serde_json::from_value(value).map_err(|e| e.to_string())?;
+                        if event.operation != (Operation::Ensure { slot, position }) {
+                            return Err("TP span KV event mismatch".into());
+                        }
+                        logical.mirror(&event).map_err(str::to_owned)?;
+                    }
+                    ControlMessage::TpPrepared { sequence: got }
+                        .to_stream(&mut stream)
+                        .map_err(|e| e.to_string())?;
+                    for (slot, token, position) in &rows {
+                        model
+                            .prefill_lane_step(&group, &logical, *slot, *token, *position)
+                            .map_err(|e| e.to_string())?;
+                        positions[*slot] += 1;
+                    }
+                    // Rank 1 does not sample, but its completion probe must
+                    // track this span even when no chunk finishes in this tick.
+                    model
+                        .prefill_lane_finisher(rows.last().unwrap().0, None)
+                        .map_err(|e| e.to_string())?;
+                    span_in_flight = true;
+                    span_finishers = finishers;
+                }
+                ControlMessage::TpSpanFinish { .. } => {
+                    if !span_in_flight {
+                        return Err("TP span finish without launch".into());
+                    }
+                    if pipe_slots.is_some() {
+                        return Err("TP span finish with pipe in flight".into());
+                    }
+                    // Join both streams (collectives + lane), then promote
+                    // each finished slot's lane-local state onto this rank's
+                    // decode executor - same chunk order as rank 0. The lane
+                    // slab and DeltaNet slot state are private allocations on
+                    // every rank, so rank 1's decode executor would otherwise
+                    // never see the prompt's context.
+                    exec.synchronize().map_err(|e| e.to_string())?;
+                    group.stream().synchronize().map_err(|e| e.to_string())?;
+                    model.prefill_lane_join().map_err(|e| e.to_string())?;
+                    let mark = model.prefill_lane_mark().map_err(|e| e.to_string())?;
+                    for (slot, _) in &span_finishers {
+                        let live = logical
+                            .slot_blocks(*slot)
+                            .ok_or("TP span finish slot out of range")?
+                            .to_vec();
+                        model
+                            .promote_lane_slot(&mark, *slot, &live)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if let Some(probe) = probe.as_mut() {
+                        probe.after_span(1, &model, &logical, &group, &positions)?;
+                    }
+                    span_in_flight = false;
+                    span_finishers.clear();
                 }
                 _ => unreachable!("message shape checked above"),
             }
@@ -1280,6 +2549,16 @@ mod tests {
         worker.mirror(&event).unwrap();
         assert_eq!(head.snapshot(), worker.snapshot());
         assert!(head.snapshot().tables.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn multirow_positions_validate_before_prepared() {
+        let start = [0, 7];
+        assert!(validate_multistep_positions(&[(1, 10, 7), (1, 11, 8)], &start, 32).is_ok());
+        assert!(validate_multistep_positions(&[(1, 10, 7), (1, 11, 7)], &start, 32).is_err());
+        assert!(validate_multistep_positions(&[(1, 10, 7), (1, 11, 9)], &start, 32).is_err());
+        assert!(validate_multistep_positions(&[(2, 10, 0)], &start, 32).is_err());
+        assert!(validate_multistep_positions(&[(1, 10, 32)], &start, 32).is_err());
     }
 
     #[test]
