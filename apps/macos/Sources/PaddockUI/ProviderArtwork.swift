@@ -15,7 +15,8 @@ import Foundation
     "Exa": "Exa", "Tavily": "Tavily", "Firecrawl": "Firecrawl", "Brave": "Brave",
   ]
 
-  private static let resources: Bundle? = {
+  /// PaddockUI's resource bundle; the status item's menu bar mark lives here too.
+  static let resources: Bundle? = {
     // A packaged app must not silently fall back to the developer's build tree.
     if Bundle.main.bundleURL.pathExtension == "app" {
       return Bundle.main.url(forResource: "PaddockMac_PaddockUI", withExtension: "bundle")

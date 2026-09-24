@@ -70,7 +70,7 @@ function active(name: string): boolean {
 
 <template>
   <nav class="activity-bar">
-    <!-- Brand mark (Truespar) - the area's home -->
+    <!-- Brand mark (Paddock) - the area's home -->
     <Tooltip label="Paddock" side="right">
       <button
         class="activity-bar__logo"
@@ -79,7 +79,7 @@ function active(name: string): boolean {
         @click="go(area === 'studio' ? 'home' : 'servers')"
       >
         <div class="activity-bar__logo-icon">
-          <img src="/img/truespar-mark-3d.svg" alt="" aria-hidden="true" />
+          <img src="/img/paddock-mark.svg" alt="" aria-hidden="true" />
         </div>
       </button>
     </Tooltip>
