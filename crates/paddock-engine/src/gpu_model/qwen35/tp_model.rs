@@ -13,6 +13,7 @@ use super::{
     delta_tp::{DeltaTpError, DeltaTpRank},
     ffn_tp::{FfnTpError, FfnTpRank},
     gqa_tp::{GqaTpError, GqaTpRank},
+    tp_graph::{TpGraphs, TpRunKey},
 };
 use crate::{
     gpu::distributed::{CollectiveError, Communicator},
@@ -85,6 +86,9 @@ pub struct Qwen35TpRank {
     /// `pd_sr_*` pack scratch - see PreFillLane). None until the first device
     /// sample.
     sample_chain: Option<CudaEvent>,
+    /// Phase 11 Stage A: the decode lane's rank-local graph cache. Empty
+    /// until `enable_tp_graphs`; the prefill lane never captures.
+    graphs: TpGraphs,
     /// Second execution lane for overlapped prefill spans: a forked executor
     /// (own stream) plus per-lane backbone scratch re-allocated beside the
     /// decode lane's. Immutable weights (`tok_embd`, `layers`, `out_norm`,
@@ -261,6 +265,7 @@ impl Qwen35TpRank {
             feedback_ids,
             sample_chain: None,
             prefill: None,
+            graphs: TpGraphs::default(),
             exec,
             rank: group.rank(),
             hidden,
@@ -273,6 +278,120 @@ impl Qwen35TpRank {
             out_norm,
             output,
         })
+    }
+
+    /// Phase 11 Stage A opt-in (`PADDOCK_TP_GRAPH=1`): capture the rank-local
+    /// collective-free per-layer runs of the decode-lane model. Paged GQA
+    /// mode only - the non-paged KV append follows a host-side counter and
+    /// is not captured (isolated parity paths without the mirrored KV pool
+    /// never enable graphs anyway). The DeltaNet layers key their captures
+    /// per slot; both slots' first DeltaNet run is captured lazily. The
+    /// prefill lane is never captured.
+    pub fn enable_tp_graphs<C: Communicator>(&mut self, group: &C) -> Result<(), Qwen35TpError> {
+        if self.rank != group.rank() || group.world_size() != 2 {
+            return Err(Qwen35TpError::Shape(
+                "rank changed under graph enable".into(),
+            ));
+        }
+        for i in 0..self.layers.len() {
+            match &mut self.layers[i].mixer {
+                TpMixer::Full(gqa) => {
+                    if !gqa.is_paged() {
+                        return Err(Qwen35TpError::Shape(
+                            "TP graphs require paged GQA (the non-paged KV append \
+                             advances a host-side counter a graph cannot replay)"
+                                .into(),
+                        ));
+                    }
+                }
+                TpMixer::Linear(_) => {}
+            }
+        }
+        // Capture pass: DeltaNet slot 0's state pair is live in place, so its
+        // runs bake the home buffers; other slots' captures happen lazily on
+        // their first decode row (the swap must be live then too).
+        for i in 0..self.layers.len() {
+            self.capture_mixer_run(group, i, 0)?;
+        }
+        Ok(())
+    }
+
+    /// How many per-layer graphs are cached (both lanes' probe surface).
+    pub fn tp_graph_count(&self) -> usize {
+        self.graphs.len()
+    }
+
+    /// Capture one layer's collective-free mixer run (the pre-attention or
+    /// pre-FFN run) at position 0/slot `slot`, following the serial model's
+    /// capture discipline: quiesce the stream, begin thread-local capture,
+    /// record the run, end and instantiate. The graph bakes the CURRENT
+    /// DeltaNet state-pair addresses - DeltaNet callers must have swapped
+    /// slot `slot`'s state in. The recorded run EXECUTES nothing, so the
+    /// caller still runs the run eagerly (or replays the graph) to produce
+    /// its outputs.
+    fn capture_mixer_run<C: Communicator>(
+        &mut self,
+        group: &C,
+        layer: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
+        let exec = self.exec.clone();
+        // Quiesce the stream so no in-flight work (the previous layer's
+        // collectives included) is folded into the capture.
+        exec.stream
+            .synchronize()
+            .map_err(|e| GpuError::Driver(format!("tp pre-capture sync: {e}")))?;
+        exec.stream
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| GpuError::Driver(format!("tp begin_capture: {e}")))?;
+        let rec = self.record_mixer_run(group, layer, slot);
+        let graph = crate::gpu::end_capture_no_flags(&exec.stream)
+            .map_err(|e| GpuError::Driver(format!("tp end_capture: {e}")));
+        // Surface a record failure only after capture is cleanly ended.
+        rec?;
+        let graph =
+            graph?.ok_or_else(|| GpuError::Driver("tp capture produced no graph".into()))?;
+        let key = match &self.layers[layer].mixer {
+            TpMixer::Full(_) => TpRunKey::PreAttn(layer),
+            TpMixer::Linear(_) => TpRunKey::PreAttnDelta(layer, slot),
+        };
+        self.graphs.insert(key, super::SendGraph(graph));
+        Ok(())
+    }
+
+    /// Record (or replay) one layer's collective-free mixer run: the pre-
+    /// attention norm plus the mixer's run up to its `partial`. The graph
+    /// path stages nothing here - the caller stages token/position/slot and
+    /// re-stages per replay outside capture.
+    fn record_mixer_run<C: Communicator>(
+        &mut self,
+        _group: &C,
+        layer: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
+        self.exec.rmsnorm_batch(
+            &self.x,
+            &self.layers[layer].attn_norm.buf,
+            &mut self.xn,
+            self.hidden,
+            self.eps,
+            1,
+        )?;
+        match &mut self.layers[layer].mixer {
+            TpMixer::Full(gqa) => {
+                gqa.attention_run(&self.exec, &self.xn)?;
+            }
+            TpMixer::Linear(delta) => {
+                delta.decode_run(&self.exec, &self.xn, 1)?;
+                // Stage the out-projection partial now: eager `forward`
+                // does it after the run, inside `finish`'s contract; the
+                // graph bakes the memset + GEMV too so a replay leaves
+                // `partial` ready for the host-side collective.
+                delta.finish_partial(&self.exec, 1)?;
+            }
+        }
+        let _ = slot;
+        Ok(())
     }
 
     pub fn rank(&self) -> usize {
@@ -378,7 +497,13 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(group, logical_kv, position, slot)
+        self.forward_token_body(
+            group,
+            logical_kv,
+            position,
+            slot,
+            Self::tp_graph_enabled(),
+        )
     }
 
     /// Sample the resident `self.logits` row on device after a
@@ -587,7 +712,7 @@ impl Qwen35TpRank {
             .stream
             .memcpy_dtod(&self.feedback_ids[slot][plane], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(group, logical_kv, position, slot)
+        self.forward_token_body(group, logical_kv, position, slot, Self::tp_graph_enabled())
     }
 
     fn forward_token_gpu<C: Communicator>(
@@ -609,7 +734,30 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(group, logical_kv, position, slot)
+        self.forward_token_body(
+            group,
+            logical_kv,
+            position,
+            slot,
+            Self::tp_graph_enabled(),
+        )
+    }
+
+    /// Phase 11 Stage A opt-in (`PADDOCK_TP_GRAPH=1`): route decode-lane
+    /// token rows through the rank-local graph cache. Read once per process;
+    /// BOTH ranks must run with the identical value or the NCCL collectives
+    /// mispair (an eager all_reduce meets a graphed one and the row hangs).
+    /// The runner exports its environment to the worker rank, so setting it
+    /// on the coordinator covers the pair.
+    fn tp_graph_enabled() -> bool {
+        static TP_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TP_GRAPH.get_or_init(|| std::env::var("PADDOCK_TP_GRAPH").as_deref() == Ok("1"))
+    }
+
+    /// Serving-side probe (public for tp_serve): identical semantics, one
+    /// shared OnceLock so coordinator and worker cannot diverge mid-process.
+    pub fn tp_graph_enabled_for_serve() -> bool {
+        Self::tp_graph_enabled()
     }
 
     fn forward_token_body<C: Communicator>(
@@ -618,7 +766,11 @@ impl Qwen35TpRank {
         logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
         position: usize,
         slot: usize,
+        graphed: bool,
     ) -> Result<(), Qwen35TpError> {
+        if graphed {
+            return self.forward_token_body_graphed(group, logical_kv, position, slot);
+        }
         embed_any(
             &self.exec,
             &self.tok_embd,
@@ -664,6 +816,138 @@ impl Qwen35TpRank {
             1,
         )?;
         gemv_any(&self.exec, &self.output, &self.xn, &mut self.logits)?;
+        Ok(())
+    }
+
+    /// The graphed twin of `forward_token_body` (Phase 11 Stage A,
+    /// `PADDOCK_TP_GRAPH=1`): identical math and identical NCCL sequencing,
+    /// with each per-layer collective-free run replayed from the rank-local
+    /// graph cache instead of enqueued kernel-by-kernel. The collectives,
+    /// event fences and residual adds stay eager host-side (NCCL outside
+    /// graph capture); the varying inputs (token embedding source, position,
+    /// slot, block table) are buffer contents re-staged by plain memcpys
+    /// between replays.
+    ///
+    /// DeltaNet layers key their captures per slot: the graph bakes the
+    /// slot-swapped recurrent/conv buffer addresses, so `decode_slot` must
+    /// have swapped the row's slot in BEFORE the replay and swapped it back
+    /// after the collective - the same pointer swap the eager path does.
+    /// A slot's DeltaNet capture is taken on its first graphed row.
+    fn forward_token_body_graphed<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        position: usize,
+        slot: usize,
+    ) -> Result<(), Qwen35TpError> {
+        // Embedding stays eager: one kernel, nothing to amortize.
+        embed_any(
+            &self.exec,
+            &self.tok_embd,
+            &self.token,
+            &mut self.x,
+            self.hidden,
+            1,
+            None,
+        )?;
+        for i in 0..self.layers.len() {
+            // ── attention half: stage the varying inputs (position, slot,
+            // block table - the graphed kernels read the buffers' CONTENT),
+            // swap the DeltaNet state pair in for this slot, then replay the
+            // captured run.
+            match &mut self.layers[i].mixer {
+                TpMixer::Full(gqa) => {
+                    gqa.stage_decode_inputs(&self.exec, slot, position, logical_kv)?;
+                }
+                TpMixer::Linear(delta) => {
+                    delta.swap_state_in(slot)?;
+                }
+            }
+            let key = match &self.layers[i].mixer {
+                TpMixer::Full(_) => TpRunKey::PreAttn(i),
+                TpMixer::Linear(_) => TpRunKey::PreAttnDelta(i, slot),
+            };
+            if self.graphs.get(key).is_none() {
+                // First graphed row for this (layer, slot): capture the run
+                // live (DeltaNet's swapped state pair is in place right now).
+                self.capture_mixer_run(group, i, slot)?;
+            }
+            self.graphs
+                .get(key)
+                .expect("captured above")
+                .0
+                .launch()
+                .map_err(|e| GpuError::Driver(format!("tp graph launch: {e}")))?;
+            // ── the collective + residual, eager and outside capture.
+            let mixed_ref = match &mut self.layers[i].mixer {
+                TpMixer::Full(gqa) => gqa.finish(&self.exec, group)?,
+                TpMixer::Linear(delta) => {
+                    // The captured graph already staged `partial`. Swap the
+                    // (advanced) state pair back first - the swap is host-side
+                    // pointer surgery touching no stream work - then reduce.
+                    delta.swap_state_out(slot)?;
+                    delta.finish(&self.exec, group)?
+                }
+            };
+            self.exec.add(&mut self.x, mixed_ref, self.hidden)?;
+            // ── FFN half: the captured PreFfn graph IS the norm + run (no
+            // eager norm here - RMSNorm is not idempotent and the graph
+            // bakes it).
+            if self.graphs.get(TpRunKey::PreFfn(i)).is_none() {
+                self.capture_ffn_run(group, i)?;
+            }
+            self.graphs
+                .get(TpRunKey::PreFfn(i))
+                .expect("captured above")
+                .0
+                .launch()
+                .map_err(|e| GpuError::Driver(format!("tp ffn graph launch: {e}")))?;
+            let ffn_ref = self.layers[i].ffn.finish(&self.exec, group)?;
+            self.exec.add(&mut self.x, ffn_ref, self.hidden)?;
+        }
+        self.exec.rmsnorm_batch(
+            &self.x,
+            &self.out_norm.buf,
+            &mut self.xn,
+            self.hidden,
+            self.eps,
+            1,
+        )?;
+        gemv_any(&self.exec, &self.output, &self.xn, &mut self.logits)?;
+        Ok(())
+    }
+
+    /// Capture the FFN half's collective-free run for `layer` (rmsnorm +
+    /// gate/up/swiglu/down), mirroring `capture_mixer_run`'s discipline.
+    fn capture_ffn_run<C: Communicator>(&mut self, _group: &C, layer: usize) -> Result<(), Qwen35TpError> {
+        let exec = self.exec.clone();
+        exec.stream
+            .synchronize()
+            .map_err(|e| GpuError::Driver(format!("tp ffn pre-capture sync: {e}")))?;
+        exec.stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .map_err(|e| GpuError::Driver(format!("tp ffn begin_capture: {e}")))?;
+        let rec = (|| {
+            self.exec.rmsnorm_batch(
+                &self.x,
+                &self.layers[layer].post_norm.buf,
+                &mut self.xn,
+                self.hidden,
+                self.eps,
+                1,
+            )?;
+            self.layers[layer].ffn.run(&self.exec, &self.xn)?;
+            Ok::<(), Qwen35TpError>(())
+        })();
+        let graph = crate::gpu::end_capture_no_flags(&exec.stream)
+            .map_err(|e| GpuError::Driver(format!("tp ffn end_capture: {e}")));
+        rec?;
+        let graph =
+            graph?.ok_or_else(|| GpuError::Driver("tp ffn capture produced no graph".into()))?;
+        self.graphs
+            .insert(TpRunKey::PreFfn(layer), super::SendGraph(graph));
         Ok(())
     }
 
@@ -755,6 +1039,7 @@ impl Qwen35TpRank {
                 .collect::<Result<Vec<_>, GpuError>>()?,
             sample_chain: None,
             prefill: None,
+            graphs: TpGraphs::default(),
         };
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("blk.{i}.");
@@ -853,7 +1138,7 @@ impl Qwen35TpRank {
             .memcpy_htod(&[token], &mut lane.model.token)
             .map_err(GpuError::from)?;
         lane.model
-            .forward_token_body(group, logical_kv, position, slot)
+            .forward_token_body(group, logical_kv, position, slot, false)
     }
 
     /// Enqueue the span finisher for `slot`'s final prefill row on the lane:

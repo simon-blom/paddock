@@ -464,6 +464,13 @@ impl TpCoordinator {
             .enable_prefill_lane(&group, &map)
             .map_err(|e| e.to_string())?;
         drop(map);
+        // Phase 11 Stage A opt-in: BOTH ranks must read the identical env
+        // value or the graphed/eager sequencing mispairs the collectives.
+        if Qwen35TpRank::tp_graph_enabled_for_serve() {
+            model
+                .enable_tp_graphs(&group)
+                .map_err(|e| e.to_string())?;
+        }
         ready(&mut stream, 1)?;
         stream
             .set_read_timeout(Some(STEP_TIMEOUT))
@@ -2027,6 +2034,13 @@ pub fn run_worker(
             .enable_prefill_lane(&group, &map)
             .map_err(|e| e.to_string())?;
         drop(map);
+        // Phase 11 Stage A opt-in, worker side: the SAME env read gates both
+        // ranks (per-process OnceLock), so graphed/eager sequencing pairs.
+        if Qwen35TpRank::tp_graph_enabled_for_serve() {
+            model
+                .enable_tp_graphs(&group)
+                .map_err(|e| e.to_string())?;
+        }
         let mut logical = logical(max_ctx, slots)?;
         let mut positions = vec![0; slots];
         let mut probe = TpAcceptanceProbe::enabled();

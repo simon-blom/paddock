@@ -327,7 +327,7 @@ impl GqaTpRank {
         self.forward_at(e, group, input, 0, self.pos, None)
     }
 
-    /// Run one rank-0-authorized logical slot/position through paged GPU KV.
+    /// Run one rank-authorized logical slot/position through paged GPU KV.
     /// Validate the entire read prefix against the mirrored live block pool.
     pub fn forward_paged<'a, C: Communicator>(
         &'a mut self,
@@ -369,7 +369,6 @@ impl GqaTpRank {
                 "rank, input or context limit changed".into(),
             ));
         }
-        let g = self.geometry;
         let pos =
             u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
         e.stream
@@ -386,6 +385,33 @@ impl GqaTpRank {
                 .memcpy_htod(host, self.block_tables.as_mut().expect("paged checked"))
                 .map_err(GpuError::from)?;
         }
+        self.attention_run(e, input)?;
+        group.after_compute(&e.stream)?;
+        group.all_reduce(&self.partial, &mut self.reduced)?;
+        group.before_compute(&e.stream)?;
+        if table.is_none() {
+            self.pos += 1;
+        }
+        Ok(&self.reduced)
+    }
+
+    /// The pre-collective attention run: position/slot inputs are already
+    /// staged (the caller's memcpys; also re-staged per replay), then the
+    /// QKV GEMVs, head split, per-head norms, M-RoPE, paged KV append,
+    /// decode attention, sigmoid gate and the row-parallel down GEMV into
+    /// `partial`. `forward_at` runs this between its NCCL fences; Phase 11
+    /// graph capture records exactly this run so a replay enqueues the
+    /// identical kernels over the identical buffers. The kernels' varying
+    /// inputs (position, slot, block table) are buffer CONTENT read on
+    /// device, so one capture serves every position and slot. The
+    /// non-paged KV append's write offset follows a HOST-side counter, so
+    /// this run is captured only in paged mode.
+    pub(crate) fn attention_run(
+        &mut self,
+        e: &GpuExecutor,
+        input: &CudaSlice<f32>,
+    ) -> Result<(), GqaTpError> {
+        let g = self.geometry;
         gemv_any(e, &self.weights[0], input, &mut self.qg)?;
         gemv_any(e, &self.weights[1], input, &mut self.k)?;
         gemv_any(e, &self.weights[2], input, &mut self.v)?;
@@ -517,16 +543,67 @@ impl GqaTpRank {
         }
         e.mul_sigmoid(&mut self.attn, &self.gate, g.q_dim())?;
         gemv_any(e, &self.weights[3], &self.attn, &mut self.partial)?;
+        Ok(())
+    }
+
+    /// The post-run NCCL fences + all-reduce; returns the reduced output.
+    pub(crate) fn finish<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+    ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         group.after_compute(&e.stream)?;
         group.all_reduce(&self.partial, &mut self.reduced)?;
         group.before_compute(&e.stream)?;
-        if table.is_none() {
-            self.pos += 1;
-        }
         Ok(&self.reduced)
     }
-}
 
+    /// Re-stage ALL varying attention inputs into their fixed device buffers
+    /// without running any kernel: position, axes, slot id and the slot's
+    /// validated block table. The graphed caller uses this between replays:
+    /// the captured kernels read these buffers' CONTENT (unpinned host
+    /// sources are illegal inside a capture, so staging happens outside).
+    /// Validation mirrors `forward_paged` exactly.
+    pub(crate) fn stage_decode_inputs(
+        &mut self,
+        e: &GpuExecutor,
+        slot: usize,
+        position: usize,
+        logical: &MirroredKv,
+    ) -> Result<(), GqaTpError> {
+        if self.block_tables.is_none() {
+            return Err(GqaTpError::Shape("not a paged GQA rank".into()));
+        }
+        let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
+        let blocks = u32::try_from(self.kc.len() / stride)
+            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
+        let table = logical
+            .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
+            .map_err(|err| GqaTpError::Shape(err.into()))?;
+        let pos =
+            u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
+        e.stream
+            .memcpy_htod(&[pos], &mut self.positions)
+            .map_err(GpuError::from)?;
+        e.stream
+            .memcpy_htod(&[pos; 4], &mut self.axes)
+            .map_err(GpuError::from)?;
+        e.stream
+            .memcpy_htod(&[slot as u32], &mut self.slots)
+            .map_err(GpuError::from)?;
+        e.stream
+            .memcpy_htod(&table, self.block_tables.as_mut().expect("paged checked"))
+            .map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    /// Paged mode probe: true when this rank owns device block tables (the
+    /// mirrored-KV serving geometry). Phase 11 graph capture is offered in
+    /// this mode only.
+    pub(crate) fn is_paged(&self) -> bool {
+        self.block_tables.is_some()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
