@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn residency_is_strict_and_unsupported_models_cannot_claim_lazy_start() {
+    assert!(!on_demand_config(RAW));
+    for policy in [
+        "load='on_demand'",
+        "load='invalid'",
+        "load_timeout_seconds=0",
+        "unload_after_idel_seconds=60",
+        "unload_after_idle_seconds=-1",
+    ] {
+        let raw = format!("{RAW}\n[residency]\n{policy}\n");
+        assert!(validate_residency(&toml::from_str(&raw).unwrap()).is_err());
+        assert!(!on_demand_config(&raw));
+    }
+    let raw = format!("{RAW}\n[residency]\nload='at_startup'\nload_timeout_seconds=120\n");
+    assert!(
+        !validate_residency(&toml::from_str(&raw).unwrap())
+            .unwrap()
+            .enabled()
+    );
+    let edited = patch(
+        &raw,
+        13493,
+        &[Change::Residency(
+            paddock_admin::residency::Config::default(),
+        )],
+        false,
+    )
+    .unwrap();
+    assert!(edited.contains("retained comment"));
+    assert!(edited.contains("synthetic-runner-secret"));
+    assert!(
+        patch(
+            RAW,
+            13493,
+            &[Change::Residency(paddock_admin::residency::Config {
+                load: paddock_admin::residency::LoadPolicy::OnDemand,
+                ..Default::default()
+            })],
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn log_output_withholds_saved_live_and_labeled_credentials() {
     let (_dir, state) = isolated_state();
     let path = fixture(&state);

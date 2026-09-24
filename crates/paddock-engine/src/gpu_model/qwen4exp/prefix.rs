@@ -20,6 +20,17 @@
 //! token stream the PLE n-gram gather hashes is host state and is re-derived
 //! from the prompt.
 //!
+//! SAME-SLOT resume. The side store is bounded (a 2 GB budget is ~87K tokens
+//! at 262K x 1), but a continued conversation usually comes back to the slot
+//! that served its last turn, whose strips still hold every row it had - the
+//! KV, the QSA index rows, the drafter's rows. So each slot also keeps a few
+//! state checkpoints of its OWN current stream (`Resident`: the prompt's two
+//! cuts, the reply's pinned and rolling checkpoints) in a pool the radix
+//! cannot steal from, and `res_resume` restores the deepest one under the
+//! new prompt's common prefix with the slot's stream - a state copy, no page
+//! copy, at any depth. llama.cpp's per-slot context checkpoints are the
+//! same idea; the side store remains what OTHER slots share.
+//!
 //! The walk continues a sequence mid-way (`walk_span` with `from > 0`):
 //! attention already takes per-row positions against the slot's cache, the
 //! recurrence starts from the slot's state, and the two causal convs - which
@@ -79,6 +90,42 @@ enum Dir {
     Store,
 }
 
+/// Same-slot checkpoints per slot (see the module doc).
+pub(super) const RES: usize = 4;
+
+/// What a same-slot checkpoint is: the prompt's lower and upper cut, the
+/// reply's checkpoint held at its first tool call, and its rolling one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResRole {
+    CutLo = 0,
+    CutHi = 1,
+    Pinned = 2,
+    Rolling = 3,
+}
+
+/// One same-slot checkpoint: the state after `pos` tokens of the slot's
+/// stream; `src` as the radix records it (an in-walk cut's prompt).
+#[derive(Clone, Copy)]
+struct ResCkpt {
+    pos: usize,
+    src: Option<(usize, u64)>,
+}
+
+/// The same-slot checkpoints' own pool: `[slots * RES][ckpt_f32]`.
+struct Resident {
+    pool: CudaSlice<f32>,
+    /// per slot, role -> blob (a pin swaps the pinned and rolling blobs)
+    ix: Vec<[usize; RES]>,
+    at: Vec<[Option<ResCkpt>; RES]>,
+}
+
+/// Which state pool a copy addresses.
+#[derive(Clone, Copy)]
+enum StatePool {
+    Radix,
+    Resident,
+}
+
 pub(super) struct PrefixCache {
     radix: PagedRadix,
     /// side-store page bookkeeping: the radix's refcounts are the only
@@ -113,6 +160,8 @@ pub(super) struct PrefixCache {
     /// prefills cold (see `resume`). None for a checkpoint a walk boundary
     /// took (cut walks, the reply checkpoint).
     src: Vec<Option<(usize, u64)>>,
+    /// same-slot checkpoints (None: off, or over their byte budget)
+    res: Option<Resident>,
 }
 
 /// A checkpoint blob in the pool as a prefill walk writes it from inside
@@ -220,6 +269,27 @@ impl PrefixCache {
             }
         }
         let state_pool = exec.alloc(n_ckpt * ckpt_f32)?;
+        let res_bytes = slots * RES * ckpt_bytes;
+        let res_budget = env_usize!("PADDOCK_Q38FN_RESIDENT_STATE_MB", 4096) << 20;
+        let res = if paddock_models::dev_var_os!("PADDOCK_Q38FN_NO_RESIDENT").is_some() {
+            None
+        } else if res_bytes > res_budget {
+            tracing::info!(
+                "qwen4exp prefix cache: same-slot checkpoints off - {slots} slots x {RES} x {} MB \
+                 is over their {} MB budget",
+                ckpt_bytes >> 20,
+                res_budget >> 20
+            );
+            None
+        } else {
+            Some(Resident {
+                pool: exec.alloc(slots * RES * ckpt_f32)?,
+                ix: (0..slots)
+                    .map(|s| std::array::from_fn(|k| s * RES + k))
+                    .collect(),
+                at: vec![[None; RES]; slots],
+            })
+        };
         let per_page = if x_page_bytes > 0 { 3 } else { 2 };
         let max_descs = (per_page * n_attn * pages).max(2 * n_gdn + 2);
         let descs = exec.alloc_u64(3 * max_descs)?;
@@ -227,9 +297,11 @@ impl PrefixCache {
         radix.set_state_capacity(n_ckpt as u32);
         tracing::info!(
             "qwen4exp prefix cache: {pages} side pages ({} MB over {n_attn} attention layers, \
-             QSA index keys included), {n_ckpt} state checkpoints ({} MB each)",
+             QSA index keys included), {n_ckpt} state checkpoints ({} MB each), {} same-slot \
+             checkpoints",
             (n_attn * pages * (2 * page_bytes + x_page_bytes)) >> 20,
-            ckpt_bytes >> 20
+            ckpt_bytes >> 20,
+            if res.is_some() { slots * RES } else { 0 }
         );
         Ok(Some(Self {
             radix,
@@ -251,6 +323,7 @@ impl PrefixCache {
             last_reused: vec![0; slots],
             stats: paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some(),
             src: vec![None; n_ckpt],
+            res,
         }))
     }
 
@@ -262,13 +335,15 @@ impl PrefixCache {
 
     /// The resume point for `tokens` in `slot`: the deepest checkpoint under
     /// the radix match, with its KV pages copied into the slot's strips and
-    /// its state restored. 0 = cold (nothing touched).
+    /// its state restored - only when it is deeper than `floor` (what the
+    /// slot's own checkpoints already offer). 0 = nothing touched.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resume(
         &mut self,
         exec: &GpuExecutor,
         slot: usize,
         tokens: &[u32],
+        floor: usize,
         max_tokens: usize,
         kv_k: &mut [Option<CudaSlice<u8>>],
         kv_v: &mut [Option<CudaSlice<u8>>],
@@ -293,6 +368,9 @@ impl PrefixCache {
             }
             return Ok(0);
         }
+        if pos <= floor {
+            return Ok(0);
+        }
         if pos < MIN_RESUME || pos >= t_len || m.blocks.len() * BLOCK_TOKENS < pos {
             if self.stats {
                 tracing::info!(
@@ -314,7 +392,16 @@ impl PrefixCache {
             idx_cache,
             Dir::Load,
         )?;
-        self.copy_state(exec, slot, idx, recur, gdn_win, ple_win, Dir::Load)?;
+        self.copy_state(
+            exec,
+            slot,
+            StatePool::Radix,
+            idx as usize,
+            recur,
+            gdn_win,
+            ple_win,
+            Dir::Load,
+        )?;
         self.last_reused[slot] = pos;
         if self.stats {
             tracing::info!(
@@ -355,14 +442,28 @@ impl PrefixCache {
         let m = self.radix.match_full(prefix);
         let have = m.blocks.len();
         if have < full {
-            let need = full - have;
-            while self.pool.free_blocks() < need {
-                if self.radix.evict_lru(&mut self.pool).is_none() {
+            // Make room WITHOUT touching the path being extended. The tree is
+            // the only holder of a side-store page, so evicting this path's
+            // own tail would free pages `m` still names; the allocs below
+            // would hand them straight back, and the insert would map two
+            // nodes onto one page - a resume would then copy another
+            // position's KV over the slot's correct rows (found on a 204K
+            // agent session, a 2 GB store). Sparing the tail spares the path.
+            let want = full - have;
+            while self.pool.free_blocks() < want {
+                if self
+                    .radix
+                    .evict_lru_sparing(m.tail, &mut self.pool)
+                    .is_none()
+                {
                     break;
                 }
             }
-            if self.pool.free_blocks() < need {
-                return Ok(None); // nothing evictable: this prompt is not cached
+            // file what fits: a prefix-closed extension (a checkpoint past it
+            // has no node to attach to, and the same-slot pool covers it)
+            let need = want.min(self.pool.free_blocks());
+            if need == 0 {
+                return Ok(None);
             }
             let mut new: Vec<BlockId> = Vec::with_capacity(need);
             for _ in 0..need {
@@ -396,7 +497,16 @@ impl PrefixCache {
             && upto.is_multiple_of(BLOCK_TOKENS)
             && let Some(idx) = self.radix.attach_state(tokens, upto)
         {
-            self.copy_state(exec, slot, idx, recur, gdn_win, ple_win, Dir::Store)?;
+            self.copy_state(
+                exec,
+                slot,
+                StatePool::Radix,
+                idx as usize,
+                recur,
+                gdn_win,
+                ple_win,
+                Dir::Store,
+            )?;
             if let Some(s) = self.src.get_mut(idx as usize) {
                 *s = None;
             }
@@ -406,6 +516,168 @@ impl PrefixCache {
             return Ok(Some(idx));
         }
         Ok(None)
+    }
+
+    /// Snapshot `slot`'s carried state - the state after `pos` tokens of its
+    /// stream - as its same-slot checkpoint `role`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn res_store(
+        &mut self,
+        exec: &GpuExecutor,
+        slot: usize,
+        role: ResRole,
+        pos: usize,
+        recur: &mut [Option<CudaSlice<f32>>],
+        gdn_win: &mut [Option<CudaSlice<f32>>],
+        ple_win: Option<&mut CudaSlice<f32>>,
+    ) -> Result<(), GpuModelError> {
+        let Some(blob) = self.res.as_ref().map(|r| r.ix[slot][role as usize]) else {
+            return Ok(());
+        };
+        self.copy_state(
+            exec,
+            slot,
+            StatePool::Resident,
+            blob,
+            recur,
+            gdn_win,
+            ple_win,
+            Dir::Store,
+        )?;
+        if let Some(r) = self.res.as_mut() {
+            r.at[slot][role as usize] = Some(ResCkpt { pos, src: None });
+        }
+        Ok(())
+    }
+
+    /// Copy the in-walk checkpoint `idx` (radix pool) that a walk of
+    /// `tokens` wrote at cut `pos` into `slot`'s same-slot checkpoint `role` -
+    /// before the attach, which may give the index back.
+    pub(super) fn res_from_ckpt(
+        &mut self,
+        exec: &GpuExecutor,
+        slot: usize,
+        role: ResRole,
+        pos: usize,
+        tokens: &[u32],
+        idx: u32,
+    ) -> Result<(), GpuModelError> {
+        let Some(blob) = self.res.as_ref().map(|r| r.ix[slot][role as usize]) else {
+            return Ok(());
+        };
+        let bytes = (self.ckpt_f32 * 4) as u64;
+        let descs = {
+            let (sp, _g1) = self.state_pool.device_ptr(&exec.stream);
+            let res = self.res.as_ref().expect("same-slot pool");
+            let (rp, _g2) = res.pool.device_ptr(&exec.stream);
+            [sp + idx as u64 * bytes, rp + blob as u64 * bytes, bytes]
+        };
+        self.run_descs(exec, &descs)?;
+        if let Some(r) = self.res.as_mut() {
+            r.at[slot][role as usize] = Some(ResCkpt {
+                pos,
+                src: Some((tokens.len(), prompt_hash(tokens))),
+            });
+        }
+        Ok(())
+    }
+
+    /// The reply's first tool call: its rolling checkpoint becomes the held
+    /// one, and the next rolling snapshot takes the other blob.
+    pub(super) fn res_pin(&mut self, slot: usize) {
+        if let Some(r) = self.res.as_mut() {
+            let (p, q) = (ResRole::Pinned as usize, ResRole::Rolling as usize);
+            r.at[slot][p] = r.at[slot][q].take();
+            r.ix[slot].swap(p, q);
+        }
+    }
+
+    /// A new reply starts: the last one's checkpoints are superseded.
+    pub(super) fn res_drop_reply(&mut self, slot: usize) {
+        if let Some(r) = self.res.as_mut() {
+            r.at[slot][ResRole::Pinned as usize] = None;
+            r.at[slot][ResRole::Rolling as usize] = None;
+        }
+    }
+
+    /// The slot's rows from `upto` on are about to be rewritten: forget the
+    /// checkpoints past it (0: all of them).
+    pub(super) fn res_keep_upto(&mut self, slot: usize, upto: usize) {
+        if let Some(r) = self.res.as_mut() {
+            for c in r.at[slot].iter_mut() {
+                if c.is_some_and(|c| c.pos > upto) {
+                    *c = None;
+                }
+            }
+        }
+    }
+
+    /// The same-slot resume point for `tokens`: the deepest of `slot`'s own
+    /// checkpoints under the common prefix with `held` (the stream whose rows
+    /// the slot's strips hold), as (role, position); nothing is touched. The
+    /// in-walk trade holds here as in `resume`: an exact re-send of the
+    /// prompt that took an in-walk cut does not resume from that cut.
+    pub(super) fn res_best(
+        &self,
+        slot: usize,
+        tokens: &[u32],
+        held: &[i64],
+    ) -> Option<(usize, usize)> {
+        let r = self.res.as_ref()?;
+        let t_len = tokens.len();
+        let lcp = tokens
+            .iter()
+            .zip(held)
+            .take_while(|(a, b)| i64::from(**a) == **b)
+            .count();
+        let mut hash = None;
+        let mut best: Option<(usize, usize)> = None;
+        for (k, c) in r.at[slot].iter().enumerate() {
+            let Some(c) = c else { continue };
+            if c.pos < MIN_RESUME || c.pos > lcp || c.pos >= t_len {
+                continue;
+            }
+            if let Some(src) = c.src
+                && src == (t_len, *hash.get_or_insert_with(|| prompt_hash(tokens)))
+            {
+                continue;
+            }
+            if best.is_none_or(|(_, p)| c.pos > p) {
+                best = Some((k, c.pos));
+            }
+        }
+        best
+    }
+
+    /// Restore `slot`'s same-slot checkpoint `role` (from [`Self::res_best`])
+    /// at `pos`: a state copy - the slot's strips already hold the rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn res_restore(
+        &mut self,
+        exec: &GpuExecutor,
+        slot: usize,
+        role: usize,
+        pos: usize,
+        recur: &mut [Option<CudaSlice<f32>>],
+        gdn_win: &mut [Option<CudaSlice<f32>>],
+        ple_win: Option<&mut CudaSlice<f32>>,
+    ) -> Result<(), GpuModelError> {
+        let blob = self.res.as_ref().expect("same-slot pool").ix[slot][role];
+        self.copy_state(
+            exec,
+            slot,
+            StatePool::Resident,
+            blob,
+            recur,
+            gdn_win,
+            ple_win,
+            Dir::Load,
+        )?;
+        self.last_reused[slot] = pos;
+        if self.stats {
+            tracing::info!("qwen4exp-resume: slot {slot} same-slot at {pos} (blob {blob})");
+        }
+        Ok(())
     }
 
     /// The pool as a prefill walk writes in-walk checkpoints into it.
@@ -533,13 +805,14 @@ impl PrefixCache {
         self.run_descs(exec, &descs)
     }
 
-    /// The slot's carried state <-> checkpoint `idx` of the pool.
+    /// The slot's carried state <-> blob `blob` of `pool`.
     #[allow(clippy::too_many_arguments)]
     fn copy_state(
         &mut self,
         exec: &GpuExecutor,
         slot: usize,
-        idx: u32,
+        pool: StatePool,
+        blob: usize,
         recur: &mut [Option<CudaSlice<f32>>],
         gdn_win: &mut [Option<CudaSlice<f32>>],
         ple_win: Option<&mut CudaSlice<f32>>,
@@ -547,9 +820,13 @@ impl PrefixCache {
     ) -> Result<(), GpuModelError> {
         let mut descs: Vec<u64> = Vec::with_capacity(3 * (2 * recur.len() + 1));
         {
-            let (pp, _g) = self.state_pool.device_ptr(&exec.stream);
+            let buf = match pool {
+                StatePool::Radix => &self.state_pool,
+                StatePool::Resident => &self.res.as_ref().expect("same-slot pool").pool,
+            };
+            let (pp, _g) = buf.device_ptr(&exec.stream);
             let (st_elems, win_elems, ple_elems) = (self.st_elems, self.win_elems, self.ple_elems);
-            let mut boff = (idx as usize * self.ckpt_f32 * 4) as u64;
+            let mut boff = (blob * self.ckpt_f32 * 4) as u64;
             let mut push = |descs: &mut Vec<u64>, slot_ptr: u64, len_elems: usize| {
                 let len = (len_elems * 4) as u64;
                 match dir {

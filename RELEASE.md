@@ -1,62 +1,95 @@
-# Paddock 0.1.8
+# Paddock 0.1.9
 
-A feature release: a new model that puts 27B on a 16 GB card, a fix for image
-requests under load, and a smoother Studio. Windows x64, Linux x64 and the
-NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer.
+A feature release: a diffusion language model with a structured-read API,
+image generation and editing, a small MiniCPM5 model, Claude Code working
+again with its current versions, and long-context fixes for Qwen 3.8
+Flash-Next. Windows x64, Linux x64 and the NVIDIA DGX Spark. NVIDIA GPUs,
+driver 580 or newer. The macOS pre-release for Apple Silicon is built from
+the same commit.
 
 ## New
 
-- **Bonsai 2 27B: a 27B model on a 16 GB card.** Prism ML's ternary build of
-  Qwen 3.8 27B is 5.9 GB of weights and is served exactly as shipped. Image
-  input is a separate 0.9 GB download, on by default. A 16 GB card holds about
-  43,000 tokens of context with text only and about 27,000 with images; a
-  24 GB card reaches the full 256K with the 8-bit KV cache. Ternary weights
-  are close to the original model, not identical to it.
+- **DiffusionGemma 26B A4B.** Google's diffusion version of Gemma 4 26B
+  writes a whole block of text per step instead of one token at a time.
+  27 GB of weights at full quality, text only for now.
 
-- **Qwen 3.8 Flash-Next speculates for sampled requests.** The drafter used to
-  help only requests that did not sample. Requests with a temperature, which
-  is the default, now speculate too.
+- **Structured reads.** `POST /v1/systemone` asks DiffusionGemma a fixed set
+  of yes/no, multiple-choice and scored questions about a text and returns
+  every answer with its confidence, in the shape of the Jev API. The
+  Studio's new Reads page builds the questions, runs them over a pasted or
+  attached text and saves question sets for reuse.
 
-- **Qwen 3.8 Flash-Next has an NVFP4 build for Blackwell cards.** The catalog
-  offers the distilled NVFP4 checkpoint for RTX 50-series class GPUs, and the
-  engine reads MX-quantized checkpoints as they ship.
+- **Qwen-Image 2.1: pictures from a prompt, and edits of your own
+  pictures.** `POST /v1/images/generations` and `POST /v1/images/edits`, with
+  previews streamed while the picture renders. In the Studio a picture is a
+  conversation of its own: ask for one, then ask for changes. Full quality
+  needs about 17 GB of VRAM and the compact build about 10 GB, plus room
+  that grows with the picture. The Qwen Research License allows research and
+  evaluation only, not commercial use.
 
-- **An image segmentation endpoint.** `POST /v1/segmentations` takes image
-  chips and returns rasters from a DINOv3-based segmentation checkpoint served
-  by path. No catalog model uses it yet.
+- **MiniCPM5 2B**, a small model with tool calling.
+
+- **Whisper endpoints can load their model on demand.** An endpoint set to
+  load on first request stays up without holding GPU memory, loads the model
+  when a transcription arrives and unloads it after the idle time you
+  choose. Set it under Model loading in the endpoint's settings; the change
+  applies without a restart. Other models stay loaded as before.
 
 ## Improved
 
-- **Long chats stay smooth in the Studio.** Formatting a long conversation now
-  runs in the background and is spread across frames, so scrolling and
-  streaming no longer stall on large replies, tables and diagrams.
+- **Qwen 3.8 Flash-Next at long context.** Past about 2,000 tokens the model
+  attends sparsely, and Paddock now serves it that way. Before, longer
+  prompts got full attention, which is not the model's own behaviour. The
+  full 262K context now loads, a long prompt no longer freezes the other
+  conversations while it is read, and a continued conversation resumes from
+  its cache at any depth.
 
-- **Cloud models get reply lengths sized from the provider's own token
-  counts**, not from an estimate.
+- **Long prompts no longer stall other conversations** on any model: while
+  one conversation reads a long prompt, the others keep getting tokens at a
+  steady pace.
 
-- **Conversation summaries hold up under pressure.** Four fixes contributed by
-  @DivyamTalwar: a window with no room left is no longer sent the whole
-  transcript, a model switch mid-summary no longer saves the old model's
-  summary under the new one, a stalled summary request times out, and an
-  injected summary counts against the reply budget.
+- **Agent loops reuse more of their cache.** The next turn of an agent
+  resumes at the tool call instead of reading the whole previous reply
+  again, and the model's earlier reasoning now reaches its template on every
+  model, as the model expects.
+
+- **Replies run to the context window when no limit is set.** A request
+  without `max_tokens` used to stop at 1,024 tokens, which cut reasoning
+  models off before they answered.
+
+- **Streams stay alive during long work.** A long prompt or a long tool call
+  no longer leaves a stream silent long enough for a client to hang up.
+
+- **Gemma 4 serves 4-bit k-quant GGUF files** such as Q4_K_M at 4 bits.
 
 ## Fixed
 
-- **Several image requests at once could all answer with garbage.** On the
-  Qwen 3.5, 3.6 and 3.8 vision models, two or more image requests arriving
-  together, each with a prompt of 128 tokens or more, could all return a run
-  of "!" in place of an answer. A single request at a time was never affected.
+- **Claude Code works again.** Current Claude Code versions send system
+  messages in the middle of a conversation, and every request failed with
+  "invalid message role". They are accepted now.
 
-- **Qwen 3.8 Flash-Next tool calls with the IQ3 build.** Tool calls came back
-  as plain text, `tool_choice: "required"` was refused and thinking budgets
-  were rejected. The engine now reads the tool-call format from the model's
-  own template when it has no entry of its own.
+- **Claude Code at long context.** Token usage counts the cached prefix
+  once, so Claude Code no longer compacts at half the window. A prompt past
+  the window returns Anthropic's own "prompt is too long" error, so Claude
+  Code compacts and carries on. Requests with tools keep speculating after
+  the first turn.
+
+## macOS (pre-release)
+
+- Image generation and editing with Qwen-Image on Metal.
+- DiffusionGemma on Metal, with the Reads page in the native app.
+- MiniCPM5 on Metal, and faster Bonsai.
+- Usage, activity and cache views, storage per model, saved settings
+  profiles and on-demand Whisper loading in Settings.
+- Fixes to documents, transcripts, viewers and scrolling.
 
 ## Known
 
 - **Switching Vision off does not unload the image tower** when its file sits
   beside the model: the model still answers images, and the memory estimate
   does not count the tower (about 0.9 GB).
+
+- On-demand loading covers Whisper only.
 
 - The fp8 KV cache's paged attention on RTX 50-series cards shows a small
   numeric deviation in one split configuration (#5).

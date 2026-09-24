@@ -25,6 +25,9 @@ final class EndpointEditor {
   var kvOffloadEnabled = false
   var kvOffloadRAM = ""
   var kvOffloadDisk = ""
+  var loadOnDemand = false
+  var unloadIdleSeconds = ""
+  var loadWaitSeconds = "120"
   let memoryHardware: MetalMemoryHardware
   var customWorkload = false
   var customContext = false
@@ -52,6 +55,10 @@ final class EndpointEditor {
     guard !saving, !refreshing, !dirty, profile.model == modelID, profile.artifact == artifactID
     else { return }
     let values = profile.settings
+    let residency = values.residency ?? EndpointResidency()
+    loadOnDemand = residency.load == "on_demand"
+    unloadIdleSeconds = residency.unloadAfterIdleSeconds.map(String.init) ?? ""
+    loadWaitSeconds = String(residency.loadTimeoutSeconds)
     context = values.maxCtx.map(String.init) ?? ""
     concurrency = values.maxBatch.map(String.init) ?? ""
     speculation = values.noSpec == true ? "off" : values.spec ?? ""
@@ -94,8 +101,14 @@ final class EndpointEditor {
     !changes.isEmpty || customMemoryBudget != (endpoint.settings?.vramBudget != nil)
       || kvOffloadDirty
   }
+  var onlyResidencyChanges: Bool {
+    !changes.isEmpty && changes.allSatisfy { if case .residency = $0 { true } else { false } }
+  }
   var localOnly: Bool { host == "127.0.0.1" || host == "::1" }
   var validation: String? {
+    if residencySupported && residencyValue == nil {
+      return "Use an idle timeout of 0–604800 seconds and a load wait limit of 1–3600 seconds."
+    }
     guard endpoint.settings != nil, isCreating || endpoint.revision != nil else {
       return "Reload this endpoint's saved settings before editing."
     }
@@ -201,10 +214,17 @@ final class EndpointEditor {
     }
     if !options.isEmpty { result.append(.runtime(options)) }
     if kvOffloadDirty, let offload = kvOffloadValue { result.append(.kvOffload(offload)) }
+    if let value = residencyValue, value != old.residency ?? EndpointResidency() {
+      result.append(.residency(value))
+    }
     return result
   }
 
   func reset() {
+    let residency = endpoint.settings?.residency ?? EndpointResidency()
+    loadOnDemand = residency.load == "on_demand"
+    unloadIdleSeconds = residency.unloadAfterIdleSeconds.map(String.init) ?? ""
+    loadWaitSeconds = String(residency.loadTimeoutSeconds)
     guard !saving else { return }
     context = endpoint.settings?.maxCtx.map(String.init) ?? ""
     concurrency = endpoint.settings?.maxBatch.map(String.init) ?? ""
@@ -279,6 +299,7 @@ final class EndpointEditor {
     ]
     if !replacementKey.isEmpty { fields.append(.apiKey(replacementKey)) }
     if let value = kvOffloadValue { fields.append(.kvOffload(value)) }
+    if residencySupported, let value = residencyValue { fields.append(.residency(value)) }
     return CreateEndpointRequest(
       model: modelID, artifact: artifactID,
       port: automaticPort ? nil : UInt16(newPort), changes: fields,
@@ -404,4 +425,18 @@ final class EndpointEditor {
   }
 
   func settle() async { await task?.value }
+}
+
+extension EndpointEditor {
+  var residencySupported: Bool { endpoint.settings?.residencySupported == true }
+  var residencyValue: EndpointResidency? {
+    guard let wait = Int(loadWaitSeconds), (1...3600).contains(wait) else { return nil }
+    let idle = unloadIdleSeconds.isEmpty ? nil : Int(unloadIdleSeconds)
+    guard unloadIdleSeconds.isEmpty || idle.map({ (0...604800).contains($0) }) == true else {
+      return nil
+    }
+    return EndpointResidency(
+      load: loadOnDemand ? "on_demand" : "at_startup", unloadAfterIdleSeconds: idle,
+      loadTimeoutSeconds: wait)
+  }
 }

@@ -10,6 +10,11 @@ use std::path::Path;
 
 mod dflash;
 mod dflash_budget;
+mod diffusion;
+mod diffusion_mlx;
+#[cfg(test)]
+mod diffusion_packed_tests;
+mod diffusion_residency;
 mod forward;
 mod load;
 mod mlx;
@@ -122,6 +127,7 @@ struct Pending {
 }
 
 pub struct Gemma4 {
+    diffusion: Option<diffusion::Lane>,
     // Only explicitly validated graphs share the scheduler. Muse is not a
     // Gemma alias: the factory and every arithmetic fork inspect this tag.
     muse: bool,

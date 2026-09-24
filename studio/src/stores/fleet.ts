@@ -87,6 +87,26 @@ export interface FleetRow {
     drift: number | null
     anomaly: boolean
   } | null
+  /** The runner-local model lifecycle when the runner manages one (Whisper
+   *  on demand): whether the model is resident right now, the policy in
+   *  force, and the load/unload counters. Absent for runners that keep
+   *  their model loaded for life. */
+  residency?: ResidencySnapshot | null
+}
+
+/** The runner's own report of its residency (`/v1/residency` on its admin
+ *  pipe, relayed on the fleet row). `phase` is what the model is doing now;
+ *  `policy` is what the config file asks for. */
+export interface ResidencySnapshot {
+  phase: 'unloaded' | 'loading' | 'loaded' | 'unloading' | 'failed'
+  active_leases: number
+  waiting_requests: number
+  loads: number
+  unloads: number
+  load_failures: number
+  last_load_ms: number | null
+  last_error: string | null
+  policy: ResidencyConfig
 }
 
 /** One configured endpoint (servers/<port>.toml) as /api/servers reports it.
@@ -162,6 +182,7 @@ export interface ForensicsSpec {
  *  sets `pull`: missing pieces are pulled explicitly first (deployWithPull),
  *  so the manager API keeps its no-silent-download contract. */
 export interface DeploySpec {
+  residency?: ResidencyConfig
   model: string
   /** weights-artifact choice (schema 3), e.g. "q4". Absent = default. */
   artifact?: string
@@ -208,6 +229,12 @@ export interface DeploySpec {
   forensics?: ForensicsSpec
   /** Prefix-cache offload (`[kv_offload]`). Absent = leave the block out. */
   kv_offload?: KvOffloadSpec
+}
+
+export interface ResidencyConfig {
+  load: 'at_startup' | 'on_demand'
+  unload_after_idle_seconds?: number | null
+  load_timeout_seconds: number
 }
 
 /** One endpoint the manager's refusal says would free enough if stopped. */

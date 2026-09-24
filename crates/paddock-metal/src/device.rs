@@ -78,6 +78,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     "\n",
     include_str!("../../../packs/metal/qwen_moe.metal"),
     include_str!("../../../packs/metal/gemma_moe.metal"),
+    include_str!("../../../packs/metal/diffusion_gemma.metal"),
     include_str!("../../../packs/metal/laguna.metal"),
     include_str!("../../../packs/metal/nemotron.metal"),
     include_str!("../../../packs/metal/paddleocr.metal"),
@@ -823,6 +824,42 @@ impl MetalDevice {
             "splash_affine_vector",
             "splash_reduce",
             "gmlx_centered_weights",
+            "dg_project",
+            "dg_project_f32",
+            "dg_project_q4",
+            "dg_project_q5",
+            "dg_project_q6",
+            "dg_project_q8",
+            "dg_project_a4",
+            "dg_project_a8",
+            "dg_attention256",
+            "dg_attention512",
+            "dg_gguf_attention256",
+            "dg_gguf_attention512",
+            "dg_affine_vector",
+            "dg_expert_vector",
+            "dg_embed",
+            "dg_soft_embed",
+            "dg_soft_embed_q6",
+            "dg_soft_embed_q8",
+            "dg_soft_embed_a8",
+            "dg_soft_fold",
+            "dg_add_norm",
+            "dg_zero",
+            "dg_experts",
+            "dg_experts_q4",
+            "dg_experts_q5",
+            "dg_experts_q8",
+            "dg_experts_a4",
+            "dg_experts_a8",
+            "dg_sample",
+            "dg_accept",
+            "dg_labels",
+            "dg_moe_head",
+            "dg_moe_route",
+            "dg_moe_geglu",
+            "dg_moe_fold",
+            "dg_moe_branches",
             "gmlx_round",
             "gmlx_embed",
             "llama_mlx_rope",
@@ -1537,7 +1574,9 @@ impl Commands<'_> {
             }
             // Shape attribution is control metadata only. Keep the generic
             // kernel name for every unrelated backend/profiler consumer.
-            let label = if name.starts_with("q4a_mv")
+            let label = if name.starts_with("dg_project")
+                || name.starts_with("dg_experts")
+                || name.starts_with("q4a_mv")
                 || name.starts_with("q4a_mm")
                 || name.starts_with("splash_affine")
                 || name.starts_with("bonsai_vectors")

@@ -12,6 +12,7 @@ public struct ModelProfile: Decodable, Sendable, Identifiable {
     public let noSpec: Bool?
     public let vramBudget: Int?
     public let kvOffload: EndpointKVOffload?
+    public let residency: EndpointResidency?
     public let runtimeOptions: [EndpointRuntimeOption]?
   }
 }

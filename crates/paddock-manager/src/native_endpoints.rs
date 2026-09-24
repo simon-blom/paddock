@@ -119,6 +119,7 @@ pub enum Change {
     Composition(Composition),
     Runtime(serde_json::Map<String, Value>),
     KvOffload(offload::Settings),
+    Residency(paddock_admin::residency::Config),
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +144,7 @@ impl Change {
             Self::Composition(_) => "composition",
             Self::Runtime(_) => "runtime",
             Self::KvOffload(_) => "kv_offload",
+            Self::Residency(_) => "residency",
         }
     }
 }
@@ -190,6 +192,8 @@ fn settings_projection(
             "runtime_options": options::projection(doc),
             "kv_offload": offload::projection(doc),
             "kv_offload_supported": offload_supported,
+            "residency": doc.get("residency").cloned().and_then(|v| v.try_into::<paddock_admin::residency::Config>().ok()),
+            "residency_supported": residency_supported(doc),
             "kv_cache_dtype":doc.get("kv_cache_dtype").and_then(toml::Value::as_str),
             "has_api_key":doc.get("api_key").and_then(toml::Value::as_str).is_some_and(|v|!v.is_empty()),
             "vision":doc.get("mmproj").is_some(),
@@ -329,7 +333,7 @@ fn parse(raw: &str, port: u16) -> Result<toml::Value, String> {
 /// so TOML array-of-table ordering cannot silently move a new scalar into MCP.
 fn patch(raw: &str, port: u16, changes: &[Change], allow_network: bool) -> Result<String, String> {
     let mut want = parse(raw, port)?;
-    if changes.is_empty() || changes.len() > 11 {
+    if changes.is_empty() || changes.len() > 12 {
         return Err("Select the settings to change.".into());
     }
     let mut seen = HashSet::new();
@@ -421,6 +425,15 @@ fn patch(raw: &str, port: u16, changes: &[Change], allow_network: bool) -> Resul
                 v.map(|v| toml::Value::Integer(v as i64))
             }
             Change::KvOffload(v) => Some(offload::value(&want, v)?),
+            Change::Residency(v) => {
+                v.validate()?;
+                if v.enabled() && !residency_supported(&want) {
+                    return Err(
+                        "On-demand loading supports Whisper on CUDA/Metal and DiffusionGemma on Metal.".into(),
+                    );
+                }
+                Some(toml::Value::try_from(v).map_err(|_| "Invalid model residency policy.")?)
+            }
             Change::Composition(_) | Change::Runtime(_) => unreachable!(),
         };
         if let Some(value) = value {
@@ -462,6 +475,52 @@ fn patch(raw: &str, port: u16, changes: &[Change], allow_network: bool) -> Resul
     } else {
         toml::to_string(&want).map_err(|_| "Cannot serialize endpoint settings.".into())
     }
+}
+
+pub(crate) fn residency_supported(doc: &toml::Value) -> bool {
+    let Some(path) = doc
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(std::path::Path::new)
+    else {
+        return false;
+    };
+    let metal = doc.get("device").and_then(toml::Value::as_str) == Some("metal");
+    if metal && path.is_dir() {
+        return paddock_models::mlx::DiffusionConfig::read(path).is_ok();
+    }
+    paddock_models::mapped::MappedGguf::open(path)
+        .ok()
+        .is_some_and(|map| {
+            map.gguf().architecture() == Some("whisper")
+                || (metal && map.gguf().architecture() == Some("diffusion-gemma"))
+        })
+}
+
+pub(crate) fn validate_residency(
+    doc: &toml::Value,
+) -> Result<paddock_admin::residency::Config, String> {
+    let policy = doc
+        .get("residency")
+        .cloned()
+        .map(|v| v.try_into::<paddock_admin::residency::Config>())
+        .transpose()
+        .map_err(|_| "Invalid model residency policy.")?
+        .unwrap_or_default();
+    policy.validate()?;
+    if policy.enabled() && !residency_supported(doc) {
+        return Err(
+            "On-demand loading supports Whisper on CUDA/Metal and DiffusionGemma on Metal.".into(),
+        );
+    }
+    Ok(policy)
+}
+
+pub(crate) fn on_demand_config(raw: &str) -> bool {
+    toml::from_str::<toml::Value>(raw)
+        .ok()
+        .and_then(|doc| validate_residency(&doc).ok())
+        .is_some_and(|policy| policy.load == paddock_admin::residency::LoadPolicy::OnDemand)
 }
 
 pub async fn edit(
@@ -650,7 +709,7 @@ async fn finish_edit(
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .is_some_and(|value| value["applied"] == "live");
         return Ok(if deferred {
-            "Settings saved for the next start. No model was started or restarted."
+            "Settings saved without restarting. Live settings apply automatically; other changes apply on the next start."
         } else if live {
             "Settings saved and applied live. The model did not need to restart."
         } else {

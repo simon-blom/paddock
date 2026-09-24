@@ -17,6 +17,23 @@ pub fn render(
     render_with_specials(template, messages, tools, kwargs, &[])
 }
 
+/// Preserve DiffusionGemma's published default: do not inject Gemma 4's
+/// house-default `<|think|>` instruction into its encoder prompt. Explicit
+/// caller choices still win. Non-object kwargs remain errors at render time.
+pub(crate) fn family_defaults(
+    arch: &str,
+    kwargs: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if arch != "diffusion-gemma" {
+        return kwargs;
+    }
+    let mut kwargs = kwargs.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = kwargs.as_object_mut() {
+        object.entry("enable_thinking").or_insert(false.into());
+    }
+    Some(kwargs)
+}
+
 /// [`render`] with the tokenizer's special-token strings bound as template
 /// globals - `bos_token`, `eos_token` - the way transformers and llama.cpp's
 /// minja both do it. A template that writes `{{ bos_token }}` (MiniCPM5 opens
@@ -1162,6 +1179,26 @@ fn scan_tag_literals(template: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::{normalize_messages, parenthesize_call_ternaries, render, task_tags};
     use serde_json::json;
+
+    #[test]
+    fn diffusion_default_keeps_the_published_prompt_and_explicit_controls() {
+        let tpl =
+            "{% if enable_thinking %}<|turn>system\n<|think|>\n<turn|>\n{% endif %}<|turn>model\n";
+        let kwargs = super::family_defaults("diffusion-gemma", None);
+        assert_eq!(
+            render(tpl, &[], None, kwargs.as_ref()).unwrap(),
+            "<|turn>model"
+        );
+        let requested = json!({"enable_thinking":true,"other":42});
+        assert_eq!(
+            super::family_defaults("diffusion-gemma", Some(requested.clone())),
+            Some(requested)
+        );
+        assert!(super::family_defaults("gemma4", None).is_none());
+        assert!(render(tpl, &[], None, None).unwrap().contains("<|think|>"));
+        let malformed = super::family_defaults("diffusion-gemma", Some(json!([])));
+        assert!(render(tpl, &[], None, malformed.as_ref()).is_err());
+    }
 
     /// Chat templates are authored against transformers' jinja2 environment,
     /// which sets `trim_blocks=True, lstrip_blocks=True`. minijinja defaults

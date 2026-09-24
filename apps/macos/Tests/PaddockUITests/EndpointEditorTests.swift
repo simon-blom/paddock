@@ -8,6 +8,31 @@ import Testing
 
 @Suite("Acknowledged native endpoint editing", .timeLimit(.minutes(1))) @MainActor
 struct EndpointEditorTests {
+  @Test func residencyEditsAreValidatedAndDoNotChangeServingGeometry() throws {
+    let data = try JSONSerialization.data(withJSONObject: [
+      "port": 12345, "model": "kb-whisper-large", "running": true, "revision": "before",
+      "runtime_state": [
+        "pid": 42, "restart_required": false, "residency_live": true,
+        "changed": [], "max_ctx": 448, "max_batch": 1,
+      ],
+      "settings": [
+        "host": "127.0.0.1", "max_ctx": 448, "max_batch": 1,
+        "has_api_key": true, "vision": false, "forensics": false, "device": "metal",
+        "residency_supported": true,
+      ],
+    ])
+    let endpoint = try ManagerWire.decode(ConfiguredEndpoint.self, from: data)
+    let editor = EndpointEditor(client: EndpointEditFixture(), endpoint: endpoint, pid: 42)
+    #expect(!editor.dirty && editor.residencySupported)
+    editor.loadOnDemand = true
+    editor.unloadIdleSeconds = "0"
+    #expect(editor.onlyResidencyChanges && editor.validation == nil)
+    #expect(editor.runtimeState?.residencyLive == true)
+    editor.unloadIdleSeconds = "-1"
+    #expect(editor.validation != nil)
+    editor.reset()
+    #expect(!editor.dirty && editor.unloadIdleSeconds.isEmpty)
+  }
   @Test func pendingSavedSettingsCanRestartWithoutInventingAnEdit() async throws {
     let client = EndpointEditFixture()
     let data = try JSONSerialization.data(withJSONObject: [

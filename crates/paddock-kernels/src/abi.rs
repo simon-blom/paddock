@@ -7396,6 +7396,15 @@ pub struct KernelTableV1 {
     /// blocks, 5.5 stages). Rides the existing entry point, which on an
     /// older pack refuses that width with cudaErrorInvalidValue.
     pub kquant_moe_down_mma_e_tail: Option<unsafe extern "C" fn() -> i32>,
+    /// Slot 669: `pd_q4x_qsa_attn_mma` - slot 666's contract on f16 tensor
+    /// cores (a kv group's heads as one 16-row MMA tile, gathered K/V tiles
+    /// double-buffered). Returns -1 for shapes it does not take (block size
+    /// 4, group <= 16, head dim 128/256), which keep slot 666.
+    pub q4x_qsa_attn_mma: Option<Q4xQsaAttnFn>,
+    /// Slot 670: `pd_q4x_qsa_logits_mma` - slot 664's contract on bf16 tensor
+    /// cores (16 query rows x 4 heads against 64-block key tiles, relu-sum
+    /// across lanes). Returns -1 unless 4 heads x 128 and 4-token blocks.
+    pub q4x_qsa_logits_mma: Option<Q4xQsaLogitsFn>,
 }
 
 /// QSA attention over the selection (see `KernelTableV1::q4x_qsa_attn`).
@@ -8131,7 +8140,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 654;
+pub const KERNEL_TABLE_SLOTS: usize = 656;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

@@ -202,6 +202,18 @@ impl Dialect {
         }
     }
 
+    /// DiffusionGemma generates its channel framing inside the canvas. A bare
+    /// model turn is not an already-open thought region, even when thinking
+    /// was requested in the system turn. Never force Gemma 4's AR pre-opener
+    /// into this family's encoder context.
+    pub fn thinking_open_for_arch(self, arch: &str, prompt: &str) -> bool {
+        if arch == "diffusion-gemma" {
+            prompt.ends_with(G_THOUGHT)
+        } else {
+            self.thinking_open(prompt)
+        }
+    }
+
     /// Markers that can open a non-content region mid-stream. Content deltas
     /// hold back a partial-tag tail so these never leak to the client.
     /// Harmony's channel markers are single special tokens (decode atomically),
@@ -1070,6 +1082,25 @@ pub(crate) fn coerce(val: &str, declared_string: Option<bool>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diffusion_canvas_owns_its_channel_framing() {
+        let dialect = Dialect::for_arch("diffusion-gemma");
+        let prompt = "<|turn>system\n<|think|>\n<turn|>\n<|turn>model\n";
+        assert!(!dialect.thinking_open_for_arch("diffusion-gemma", prompt));
+        assert!(dialect.thinking_open_for_arch("gemma4", prompt));
+        let parsed = parse(dialect, "<|channel>thought\n<channel|>Hello", false, None);
+        assert_eq!(parsed.content.as_deref(), Some("Hello"));
+        assert!(parsed.reasoning.is_none());
+        let parsed = parse(
+            dialect,
+            "<|channel>thought\nChecking\n<channel|>Hello",
+            false,
+            None,
+        );
+        assert_eq!(parsed.content.as_deref(), Some("Hello"));
+        assert_eq!(parsed.reasoning.as_deref(), Some("Checking\n"));
+    }
 
     #[test]
     fn flash_next_uses_its_checkpoint_xml_and_thinking_dialect() {

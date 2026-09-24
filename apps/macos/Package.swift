@@ -50,7 +50,8 @@ let package = Package(
     .target(
       name: "PaddockUI",
       dependencies: [
-        "PaddockClient", "PaddockStudio", "PaddockNativeMarkdown", "PaddockDesign",
+        "PaddockClient", "PaddockConversationCore", "PaddockStudio", "PaddockNativeMarkdown",
+        "PaddockDesign",
         .product(name: "Sparkle", package: "Sparkle"),
       ],
       resources: [.process("Resources")]),

@@ -51,6 +51,7 @@ struct EndpointSettingsView: View {
         if editor.advanced {
           EndpointAdvancedSettings(editor: editor).disabled(disabled)
           EndpointMemorySettings(editor: editor).disabled(disabled)
+          EndpointResidencySettings(editor: editor).disabled(disabled)
           EndpointKVOffloadSettings(editor: editor).disabled(disabled)
           access(advanced: true).disabled(disabled)
         } else {
@@ -61,6 +62,10 @@ struct EndpointSettingsView: View {
           Button(editor.isCreating ? "Start Model" : (editor.saving ? "Saving…" : "Save")) {
             if editor.isCreating {
               if editor.localOnly { onCreate?(false) } else { confirmation = .networkSave }
+            } else if editor.pid != nil && editor.onlyResidencyChanges
+              && editor.runtimeState?.residencyLive == true && !editor.restartRequired
+            {
+              editor.save(.restart, networkConfirmed: !editor.localOnly)
             } else if editor.pid != nil {
               confirmation = .restart
             } else if editor.localOnly {
@@ -132,6 +137,7 @@ struct EndpointSettingsView: View {
         EndpointModelWorkload(editor: editor, onChangeModel: onChangeModel, onDownload: onDownload)
       }.disabled(disabled)
       EndpointMemorySettings(editor: editor).disabled(disabled)
+      EndpointResidencySettings(editor: editor).disabled(disabled)
       EndpointKVOffloadSettings(editor: editor).disabled(disabled)
       if editor.capabilities.contains("chat") || editor.visionServed {
         EndpointFormCard("Document & image intelligence") {

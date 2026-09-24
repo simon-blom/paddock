@@ -81,6 +81,12 @@ pub(super) fn prefill96_projection(
 pub(super) use crate::weights::paired_projections as pair_projection;
 impl Gemma4 {
     fn project(&self, cmd: &Commands<'_>, planes: &[(&Weight, &Buffer)], input: &Buffer, m: usize) {
+        if self.diffusion.is_some() {
+            for &(w, out) in planes {
+                diffusion::project(cmd, w, input, out, m, self.mlx);
+            }
+            return;
+        }
         if self.mlx {
             crate::affine::project(cmd, planes, input, m, &self.scratch.gemm);
             return;
@@ -235,11 +241,14 @@ impl Gemma4 {
         carry: Option<&sliced_prefill::Carry>,
     ) -> Result<Vec<f32>> {
         let final_slice = layers.end == self.layers.len();
+        let canvas = self.diffusion.as_ref().is_some_and(|d| !d.pass.is_empty());
         let m = rows.len();
         if m == 0
             || m > self.scratch.rows
             || outputs.len()
-                > if self.verifying {
+                > if canvas {
+                    CHUNK
+                } else if self.verifying {
                     self.spec.as_ref().expect("verification allocated").rows
                 } else {
                     self.slots.len()
@@ -267,6 +276,17 @@ impl Gemma4 {
         let limits = rows
             .iter()
             .map(|r| {
+                if canvas {
+                    let pass = self
+                        .diffusion
+                        .as_ref()
+                        .expect("canvas lane")
+                        .pass
+                        .iter()
+                        .find(|p| p.slot == r.0)
+                        .expect("validated canvas slot");
+                    return (pass.base + pass.width - 1) as u32;
+                }
                 self.slots[r.0].mm.as_ref().map_or(r.2 as usize, |m| {
                     if self.muse {
                         r.2 as usize
@@ -331,6 +351,10 @@ impl Gemma4 {
         }
         let mut tiles = Vec::new();
         let mut decode = Vec::new();
+        // A diffusion canvas has one shared retained prefix window, not a
+        // different sliding floor for each query. This is independent of the
+        // checkpoint's weight format; only MLX's arithmetic rounds QK/P to BF16.
+        let diffusion_attention = self.diffusion.is_some() && (self.mlx || canvas);
         let mut first = 0;
         while first < m {
             let mut end = first + 1;
@@ -340,9 +364,10 @@ impl Gemma4 {
             // A multi-token span reuses one K/V tile for every causal query,
             // including narrow MTP verification. One 32-query launch per
             // individual draft row wastes nearly the entire matrix tile.
-            if end - first > 1 {
-                for at in (first..end).step_by(32) {
-                    tiles.extend([at as u32, (end - at).min(32) as u32]);
+            if end - first > 1 || diffusion_attention {
+                let tile = if diffusion_attention { 16 } else { 32 };
+                for at in (first..end).step_by(tile) {
+                    tiles.extend([at as u32, (end - at).min(tile) as u32]);
                 }
             } else {
                 decode.extend((first..end).map(|r| r as u32));
@@ -371,7 +396,9 @@ impl Gemma4 {
         } else {
             256
         };
-        let logits = if self.verifying {
+        let logits = if canvas {
+            &self.diffusion.as_ref().expect("canvas lane").logits
+        } else if self.verifying {
             &self.spec.as_ref().expect("verification allocated").logits
         } else {
             &s.logits
@@ -402,6 +429,19 @@ impl Gemma4 {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        let mut diagnostic = Vec::<(String, Buffer, usize)>::new();
+        macro_rules! capture {
+            ($name:expr, $buffer:expr, $count:expr) => {{
+                #[cfg(test)]
+                if self.diffusion.is_some() && std::env::var_os("PADDOCK_DG_TRACE").is_some() {
+                    let count = $count;
+                    let buffer = self.device.alloc(count * 4)?;
+                    copy_words(&cmd, $buffer, &buffer, 0, 0, count);
+                    diagnostic.push(($name.to_string(), buffer, count));
+                }
+            }};
+        }
         for layer in self.layers.iter().filter(|l| !l.sliding) {
             let words = BLOCK_TOKENS * layer.kv_width() / 2;
             for &(from, to) in &copies {
@@ -426,26 +466,43 @@ impl Gemma4 {
             }
         } else {
             cmd.dispatch(
-                if self.mlx { "gmlx_embed" } else { "embed" },
+                if self.diffusion.is_some() {
+                    "dg_embed"
+                } else if self.mlx {
+                    "gmlx_embed"
+                } else {
+                    "embed"
+                },
                 &[&self.embedding.buffer, &s.ids, &s.x],
                 &[
                     self.width as u32,
                     m as u32,
-                    if self.mlx {
+                    if self.diffusion.is_some() || self.mlx {
                         self.vocab as u32
                     } else {
                         self.embedding.ty
                     },
-                    (if self.muse {
-                        1.
+                    if self.diffusion.is_some() {
+                        self.embedding.ty
                     } else {
-                        (self.width as f32).sqrt()
-                    })
-                    .to_bits(),
+                        (if self.muse {
+                            1.
+                        } else {
+                            (self.width as f32).sqrt()
+                        })
+                        .to_bits()
+                    },
+                    u32::from(self.mlx),
                 ],
                 [(m * self.width).div_ceil(256), 1, 1],
                 256,
             );
+            if let Some(lane) = &self.diffusion
+                && canvas
+            {
+                lane.preamble(&cmd, &self.embedding, &s.x, self.eps, self.mlx);
+            }
+            capture!("embedding", &s.x, m * self.width);
             self.inject_images(&cmd, rows);
             if self.muse {
                 if self.mlx {
@@ -537,7 +594,14 @@ impl Gemma4 {
             } else {
                 vec![(&l.q, &s.q), (&l.k, &s.k)]
             };
+            if i == 0 {
+                capture!("stage.norm", &s.norm, m * self.width);
+            }
             self.project(&cmd, &planes, &s.norm, m);
+            if i == 0 {
+                capture!("stage.qraw", &s.q, m * heads * hd);
+                capture!("stage.kraw", &s.k, m * kh * hd);
+            }
             let rope = self.rope[usize::from(!l.sliding)];
             cmd.dispatch(
                 if self.mlx {
@@ -598,7 +662,28 @@ impl Gemma4 {
                 32,
             );
             p.truncate(5);
-            if !tiles.is_empty() {
+            if i == 0 {
+                capture!("stage.qrot", &s.q, m * heads * hd);
+            }
+            if diffusion_attention {
+                let mut params = p.clone();
+                params.extend([u32::from(canvas), u32::from(self.mlx)]);
+                params.extend(self.slots.iter().map(|s| s.history.len() as u32));
+                cmd.dispatch(
+                    match (self.mlx, hd) {
+                        (true, 256) => "dg_attention256",
+                        (true, _) => "dg_attention512",
+                        (false, 256) => "dg_gguf_attention256",
+                        (false, _) => "dg_gguf_attention512",
+                    },
+                    &[
+                        &s.q, &l.keys, &l.values, &s.meta, &s.pages, &s.attn, &s.tiles, &s.limits,
+                    ],
+                    &params,
+                    [heads, tiles.len() / 2, 1],
+                    128,
+                );
+            } else if !tiles.is_empty() {
                 let strict = self.mlx || self.moe_scratch.is_some();
                 if !strict {
                     cmd.dispatch(
@@ -738,8 +823,21 @@ impl Gemma4 {
                 );
             }
             self.project(&cmd, &[(&l.o, &s.delta)], &s.attn, m);
+            if i == 0 {
+                capture!("stage.attn", &s.attn, m * heads * hd);
+            }
+            if i == 0 {
+                capture!("stage.attn_delta", &s.delta, m * self.width);
+            }
             sandwich(&l.post_attn, &l.ffn_norm, 1.);
+            if i == 0 {
+                capture!("stage.ffn_norm", &s.norm, m * self.width);
+            }
             self.project(&cmd, &[(&l.gate, &s.gate), (&l.up, &s.up)], &s.norm, m);
+            if i == 0 {
+                capture!("stage.gate", &s.gate, m * self.ff);
+                capture!("stage.up", &s.up, m * self.ff);
+            }
             cmd.dispatch(
                 if self.mlx {
                     if self.muse {
@@ -758,11 +856,20 @@ impl Gemma4 {
                 256,
             );
             self.project(&cmd, &[(&l.down, &s.delta)], &s.gate, m);
+            if i == 0 {
+                capture!("stage.shared", &s.delta, m * self.width);
+            }
             if let Some(experts) = &l.moe {
                 self.moe_scratch
                     .as_ref()
                     .expect("MoE workspace")
                     .execute(&cmd, experts, &s.x, &s.delta, m, self.eps);
+                #[cfg(test)]
+                if i == 0 {
+                    for (name, buffer, count) in self.moe_scratch.as_ref().unwrap().diagnostic(m) {
+                        capture!(name, buffer, count);
+                    }
+                }
             }
             sandwich(
                 &l.post_ffn,
@@ -771,6 +878,7 @@ impl Gemma4 {
                     .map_or(&self.output_norm, |l| &l.norm),
                 l.scale,
             );
+            capture!(i, &s.x, m * self.width);
         }
         if !final_slice {
             // Preserve both values: recomputing the next RMS after a yield
@@ -825,7 +933,9 @@ impl Gemma4 {
                 outputs.len(),
             );
             cmd.dispatch(
-                if self.mlx {
+                if self.diffusion.is_some() {
+                    "gemma_softcap"
+                } else if self.mlx {
                     "gmlx_softcap"
                 } else if self.muse {
                     "muse_softcap"
@@ -859,12 +969,31 @@ impl Gemma4 {
             self.pool.release(source);
         }
         self.last_gpu_seconds = completed?;
+        #[cfg(test)]
+        if let Some(root) = std::env::var_os("PADDOCK_DG_TRACE") {
+            let root = std::path::Path::new(&root);
+            std::fs::create_dir_all(root).map_err(|e| MetalError::Model(e.to_string()))?;
+            for (name, buffer, count) in diagnostic {
+                let bytes = unsafe { buffer.read_f32(0, count) }
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                std::fs::write(
+                    root.join(format!(
+                        "{}.{name}.f32",
+                        if canvas { "canvas" } else { "encoder" }
+                    )),
+                    bytes,
+                )
+                .map_err(|e| MetalError::Model(e.to_string()))?;
+            }
+        }
         if !final_slice {
             // Uncommitted KV is private to the pending slot. Neither its
             // history nor MTP cursor/prefix snapshot becomes visible yet.
             return Ok(Vec::new());
         }
-        if !self.verifying {
+        if !self.verifying && !canvas {
             for &(slot, tok, _) in rows {
                 self.slots[slot].history.push(tok);
                 if let Some(d) = &mut self.mtp {
@@ -878,7 +1007,7 @@ impl Gemma4 {
                 }
             }
         }
-        Ok(if self.greedy_verify {
+        Ok(if self.greedy_verify || canvas {
             Vec::new()
         } else {
             unsafe { logits.read_f32(0, outputs.len() * self.vocab) }

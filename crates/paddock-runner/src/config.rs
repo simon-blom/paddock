@@ -120,6 +120,8 @@ pub struct Config {
     pub vram_budget: Option<u64>,
     /// See [`KvOffload`].
     pub kv_offload: KvOffload,
+    /// Runner-local model lifecycle; listener and identity stay available.
+    pub residency: crate::residency::Config,
     /// See [`MoeOffload`].
     pub moe_offload: MoeOffload,
     /// Override the KV plan's graph/scratch reserve, in MiB. gpt-oss charges
@@ -366,6 +368,7 @@ impl Default for Config {
             fp8_native: None,
             vram_budget: None,
             kv_offload: KvOffload::default(),
+            residency: crate::residency::Config::default(),
             moe_offload: MoeOffload::default(),
             graph_scratch_mib: None,
             max_tokens: None,

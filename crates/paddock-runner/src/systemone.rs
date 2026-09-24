@@ -29,6 +29,14 @@
 //! share of reads that picked the reported label, and the diagnostics list
 //! every read's pick and confidence per question, so a caller can see WHICH
 //! reads disagreed and not only that some did.
+//!
+//! `confidence` is Jev's documented measure, not the winning probability:
+//! `(n * max - 1) / (n - 1)` over the label distribution, 0 at uniform and 1
+//! at certainty ((3 * max - 1) / 2 for three options). A client written
+//! against Jev's act / review / human bands then reads the field the same
+//! way here; the probabilities beside it are untouched. Jev carries no
+//! confidence on a noul answer; ours does, by the same rule with n = 2, so
+//! the field means one thing on every type.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -381,6 +389,17 @@ fn scaffold(model: &ServingModel) -> Result<Vec<u32>, String> {
     Ok(s)
 }
 
+/// Jev's confidence: how far the winning probability sits above uniform,
+/// scaled so that 1/n reads 0 and 1 reads 1. Averaged probabilities sum to
+/// one, so the clamp only guards float noise.
+fn margin(p_top: f32, n: usize) -> f32 {
+    if n < 2 {
+        return 1.0;
+    }
+    let n = n as f32;
+    ((n * p_top - 1.0) / (n - 1.0)).clamp(0.0, 1.0)
+}
+
 /// One read's per-question outcome.
 struct Read {
     /// normalized over the question's labels
@@ -649,7 +668,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
             entropy += rq.entropy;
             per_read.push(json!({
                 "pick": q.names[top],
-                "confidence": rq.probs[top],
+                "confidence": margin(rq.probs[top], n),
                 "entropy": rq.entropy,
             }));
         }
@@ -664,7 +683,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map_or(0, |(i, _)| i);
-        let confidence = mean[top];
+        let confidence = margin(mean[top], n);
         let agreement = picks[top] as f32 / k;
         let probabilities: Map<String, Value> = q
             .names

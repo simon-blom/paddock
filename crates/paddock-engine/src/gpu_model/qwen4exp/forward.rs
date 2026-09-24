@@ -81,7 +81,74 @@ const QSA_DENSE_EXACT: usize = 512 * 4 + 3;
 /// QSA_BLOCK + the deepest verify chunk, rounded up to whole blocks (the
 /// shape vLLM sizes its ring by). 16 covers chunks up to 12 rows.
 const QSA_RING: usize = 16;
-use crate::gpu::qsa::QSA_BLOCK;
+use super::prefix::ResRole;
+use crate::gpu::qsa::{QSA_BLOCK, QsaRoute};
+
+/// Which attention a walk takes. `Auto` is the serving rule: QSA sparse
+/// attention once any row of the walk sees more than `QSA_DENSE_EXACT` tokens.
+/// Below that the selection is every block, dense is the same answer, and the
+/// dense kernels are the faster way to it (DeepSeek's production rule for its
+/// own indexer). `Dense` and `Sparse` pin one path: gate instruments (the
+/// sparse path against the dense one where both must agree) and the A/B.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QsaMode {
+    Auto,
+    Dense,
+    Sparse,
+}
+
+/// The serving mode, or a pinned one for A/B legs: `PADDOCK_Q38FN_QSA=dense`
+/// or `=sparse` (a development switch; `QsaMode::Auto` otherwise).
+fn qsa_mode_env() -> QsaMode {
+    match paddock_models::dev_var!("PADDOCK_Q38FN_QSA")
+        .ok()
+        .as_deref()
+    {
+        Some("dense") => QsaMode::Dense,
+        Some("sparse") => QsaMode::Sparse,
+        _ => QsaMode::Auto,
+    }
+}
+
+/// The sparse path's kernels: tensor cores wherever the pack has them and
+/// the shape fits, the f32 SIMT kernels otherwise - (scores, attention).
+/// Dev switch `PADDOCK_Q38FN_QSA_SIMT=1` pins both to SIMT (the parity
+/// anchors) for A/B legs.
+fn qsa_routes(e: &GpuExecutor, c: &Qwen4ExpConfig) -> (QsaRoute, QsaRoute) {
+    static SIMT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pinned = *SIMT.get_or_init(|| paddock_models::dev_var!("PADDOCK_Q38FN_QSA_SIMT").is_ok());
+    let pick = |ok: bool| {
+        if ok && !pinned {
+            QsaRoute::Mma
+        } else {
+            QsaRoute::Simt
+        }
+    };
+    (
+        pick(
+            e.has_qsa_logits_mma() && QsaRoute::logits_fits(c.idx_heads, c.idx_head_dim, QSA_BLOCK),
+        ),
+        pick(
+            e.has_qsa_attn_mma()
+                && QsaRoute::attn_fits(c.n_heads, c.n_kv_heads, c.head_dim, QSA_BLOCK),
+        ),
+    )
+}
+
+/// A prompt checkpoint cut's same-slot role: the prompt's upper cut or its
+/// lower one (`prefix::ckpt_cuts`).
+fn cut_role(n: usize, c: usize) -> ResRole {
+    if super::prefix::ckpt_cuts(n)[1] == c {
+        ResRole::CutHi
+    } else {
+        ResRole::CutLo
+    }
+}
+
+/// Bytes of the per-walk QSA score scratch: rows are scored and selected in
+/// batches of as many as fit, so the plane stays this size at any context
+/// (65536 blocks x 256 rows at 262K).
+const QSA_SCORE_BYTES: usize = 64 << 20;
 
 /// PLE conv dilation - a k=4 kernel over a 9-token receptive ring.
 pub(super) const PLE_DILATION: usize = 3;
@@ -183,8 +250,13 @@ impl PhaseMs {
 /// (every later walk and decode tick writes the same file names, so a
 /// prefill's own tree is gone by the end of a run otherwise), and
 /// `PADDOCK_Q38FN_DUMP_TAGS=a,b,..` keeps just those tags - a whole 992-row
-/// Flash-Next walk is ~12 GB.
-struct Dump(Option<std::path::PathBuf>, Option<Vec<String>>);
+/// Flash-Next walk is ~12 GB - and `PADDOCK_Q38FN_DUMP_LAYERS=3,7,..` just
+/// those layers (the QSA gate reads one attention layer's output, not 48).
+struct Dump(
+    Option<std::path::PathBuf>,
+    Option<Vec<String>>,
+    Option<Vec<usize>>,
+);
 
 impl Dump {
     fn arm(n: usize) -> Self {
@@ -195,6 +267,9 @@ impl Dump {
         let tags = std::env::var("PADDOCK_Q38FN_DUMP_TAGS")
             .ok()
             .map(|s| s.split(',').map(str::to_owned).collect());
+        let layers = std::env::var("PADDOCK_Q38FN_DUMP_LAYERS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|l| l.trim().parse().ok()).collect());
         Self(
             std::env::var_os("PADDOCK_Q38FN_DUMP")
                 .filter(|_| width_ok)
@@ -204,22 +279,22 @@ impl Dump {
                     p
                 }),
             tags,
+            layers,
         )
     }
     fn on(&self) -> bool {
         self.0.is_some()
     }
-    /// The dump dir, when `tag` is one the sink keeps.
-    fn dir_for(&self, tag: &str) -> Option<&std::path::Path> {
+    /// The dump dir, when `tag` of layer `li` is one the sink keeps
+    /// (`li == usize::MAX`: not a layer's tag, kept by the tag filter alone).
+    fn dir_for(&self, li: usize, tag: &str) -> Option<&std::path::Path> {
         let dir = self.0.as_deref()?;
-        self.1
-            .as_ref()
-            .is_none_or(|t| t.iter().any(|x| x == tag))
-            .then_some(dir)
+        let layer_ok = li == usize::MAX || self.2.as_ref().is_none_or(|l| l.contains(&li));
+        (layer_ok && self.1.as_ref().is_none_or(|t| t.iter().any(|x| x == tag))).then_some(dir)
     }
     /// Write host-side values already read back.
     fn put_host(&self, li: usize, tag: &str, v: &[f32]) -> Result<(), GpuModelError> {
-        let Some(dir) = self.dir_for(tag) else {
+        let Some(dir) = self.dir_for(li, tag) else {
             return Ok(());
         };
         let mut b = Vec::with_capacity(v.len() * 4);
@@ -240,7 +315,7 @@ impl Dump {
         buf: &CudaSlice<f32>,
         len: usize,
     ) -> Result<(), GpuModelError> {
-        let Some(dir) = self.dir_for(tag) else {
+        let Some(dir) = self.dir_for(li, tag) else {
             return Ok(());
         };
         let v = e.to_host_len(buf, len)?;
@@ -393,7 +468,11 @@ pub struct Qwen4ExpGpu {
     embed: Embed,
     lm_head: DensePlane,
     final_mix: HcW,
+    /// the context: KV, state and index caches hold this many positions a slot
     max_tokens: usize,
+    /// the most rows one device walk carries - every per-row scratch plane's
+    /// size (`super::walk_rows()`, capped at the context); longer walks split
+    walk_rows: usize,
     sc: Scratch,
     /// per-layer GDN recurrent state `[v_heads][k_dim][v_dim]`, None on attn layers
     recur: Vec<Option<CudaSlice<f32>>>,
@@ -429,6 +508,14 @@ pub struct Qwen4ExpGpu {
     /// the per-run arms; everything row-parallel runs once over all rows.
     /// 0 outside a mixed tick.
     walk_lead: usize,
+    /// QSA sparse attention serves the next walk - set by each walk's caller
+    /// from its rows' positions (`qsa_for`), read by `device_walk`
+    walk_qsa: bool,
+    /// the pack carries the QSA selection and attention, and the lane keeps
+    /// the index caches they read
+    qsa_ready: bool,
+    /// which attention the walks take (`QsaMode::Auto` serves)
+    qsa_mode: QsaMode,
     /// how many independent sequences this instance carries. 1 is the
     /// single-sequence lane every gate is stamped against; > 1 sizes every
     /// carried-state buffer per slot and unlocks `decode_step_batch`.
@@ -445,11 +532,14 @@ pub struct Qwen4ExpGpu {
     /// - so one capture is valid at every position, exactly as in the qwen3.5
     ///   lane. `None` until the first decode step builds it, or forever under
     ///   `PADDOCK_Q38FN_NO_GRAPH`.
-    decode_graph: Option<Q4xSendGraph>,
+    ///
+    /// Indexed by attention mode (0 dense, 1 QSA): a walk's kernels differ by
+    /// mode, so each captures its own graph.
+    decode_graph: [Option<Q4xSendGraph>; 2],
     /// one captured batched tick per WIDTH. Valid only for the dense slot set
     /// `0..n`: the PLE window advance bakes per-slot copy offsets into the
     /// graph, so a different slot set must not replay it.
-    batch_graphs: Vec<Option<Q4xSendGraph>>,
+    batch_graphs: Vec<[Option<Q4xSendGraph>; 2]>,
     /// staging the 8-bit classes need on their batch > 1 arm
     stage: DenseStage,
     /// Whether decode ticks may be captured at all. Defaults to the env gate;
@@ -534,6 +624,16 @@ struct Scratch {
     d_idx_q: CudaSlice<f32>,
     d_idx_stage: CudaSlice<f32>,
     d_idx_spos: CudaSlice<u32>,
+    /// QSA selection + attention planes (`qsa_attend`): block scores for a
+    /// batch of `qsa_rb` rows `[qsa_rb, cap]`, each row's selected blocks
+    /// `[t, k]` and count `[t]`, and the split partials `[t, heads, hd]` /
+    /// `[t, heads, 2]` (rows x splits never exceed t)
+    d_qsa_scores: CudaSlice<f32>,
+    d_qsa_sel: CudaSlice<u32>,
+    d_qsa_cnt: CudaSlice<u32>,
+    d_qsa_po: CudaSlice<f32>,
+    d_qsa_pml: CudaSlice<f32>,
+    qsa_rb: usize,
     d_x: CudaSlice<f32>,
     d_h: CudaSlice<f32>,
     d_xn: CudaSlice<f32>,
@@ -955,7 +1055,7 @@ impl Qwen4ExpGpu {
         }
         let n_expert = self.cfg.n_expert;
         let slots = slots.min(n_expert);
-        let max_rows = self.max_tokens * self.cfg.n_active;
+        let max_rows = self.walk_rows * self.cfg.n_active;
         let mut seated = 0usize;
         let mut vram = 0u64;
         for l in self.layers.iter_mut() {
@@ -1027,20 +1127,21 @@ impl Qwen4ExpGpu {
         max_tokens: usize,
         slots: usize,
     ) -> Result<Self, GpuModelError> {
-        if max_tokens > QSA_DENSE_EXACT {
-            tracing::warn!(
-                max_ctx = max_tokens,
-                "qwen4exp: attention is served DENSE and the QSA sparse path is not built - rows past \
-                 {QSA_DENSE_EXACT} visible tokens will not be the reference model's (they attend to \
-                 every token, the model to its indexer's selection)"
-            );
-        }
         let (recur, kv_k, kv_v) = alloc_state(exec, &cfg, max_tokens, slots)?;
         // QSA indexer state beside every attention layer's KV (tiny: 64 B a
         // token a layer, plus a 16-deep raw ring per slot). Written on every
         // walk, dense or not, so a sequence crossing the dense-exact window
         // already has every block key the sparse path will score.
         let qsa = exec.has_qsa_indexer();
+        let qsa_ready = qsa && exec.has_qsa_select() && exec.has_qsa_attn();
+        if max_tokens > QSA_DENSE_EXACT && !qsa_ready {
+            tracing::warn!(
+                max_ctx = max_tokens,
+                "qwen4exp: this pack has no QSA sparse attention, so attention is served DENSE - \
+                 rows past {QSA_DENSE_EXACT} visible tokens will not be the reference model's (they \
+                 attend to every token, the model to its indexer's selection)"
+            );
+        }
         let (mut idx_cache, mut idx_ring) = (Vec::new(), Vec::new());
         for b in &cfg.blocks {
             let attn = qsa && matches!(b, Qwen4ExpBlock::Attention);
@@ -1081,7 +1182,8 @@ impl Qwen4ExpGpu {
         // sized from leftover headroom, not weights, and is correctly outside
         // this number.
         let weights_bytes = exec.settled_mem_used();
-        let mut sc = Scratch::new(exec, &cfg, max_tokens, slots, kq_lanes)?;
+        let walk_rows = max_tokens.min(super::walk_rows());
+        let mut sc = Scratch::new(exec, &cfg, walk_rows, max_tokens, slots, kq_lanes)?;
         // the rebuild planes' norm prefixes: each mix's (1+w) weight, once
         if !sc.d_hcaux.is_empty() {
             let hw = cfg.hc_width();
@@ -1104,18 +1206,18 @@ impl Qwen4ExpGpu {
             } else {
                 None
             },
-            q: exec.alloc_i8(max_tokens * cfg.hc_width())?,
+            q: exec.alloc_i8(walk_rows * cfg.hc_width())?,
             // widest activation row any dense plane takes is hc_width
-            xq8: exec.alloc_i8(max_tokens * cfg.hc_width())?,
-            xs8: exec.alloc_u8(max_tokens * cfg.hc_width() / 32)?,
-            rs: exec.alloc(max_tokens)?,
+            xq8: exec.alloc_i8(walk_rows * cfg.hc_width())?,
+            xs8: exec.alloc_u8(walk_rows * cfg.hc_width() / 32)?,
+            rs: exec.alloc(walk_rows)?,
             xs: exec.alloc(if kq_lanes {
-                max_tokens * cfg.hc_width() / 32
+                walk_rows * cfg.hc_width() / 32
             } else {
                 1
             })?,
             ssums: exec.alloc(if kq_lanes {
-                max_tokens * cfg.hc_width() / 16
+                walk_rows * cfg.hc_width() / 16
             } else {
                 1
             })?,
@@ -1148,8 +1250,8 @@ impl Qwen4ExpGpu {
                 1
             })?,
             // the widest activation any dense plane reads is the 4-stream state
-            x16: exec.alloc_f16(max_tokens * cfg.hc_width())?,
-            xb16: exec.stream_alloc_bf16(max_tokens * cfg.hc_width())?,
+            x16: exec.alloc_f16(walk_rows * cfg.hc_width())?,
+            xb16: exec.stream_alloc_bf16(walk_rows * cfg.hc_width())?,
             // the low-M arm runs at batch <= 8 only, so this is sized by the
             // widest plane (q at 12288) and not by the prefill width
             f16_ok: false,
@@ -1166,6 +1268,7 @@ impl Qwen4ExpGpu {
             lm_head,
             final_mix,
             max_tokens,
+            walk_rows,
             sc,
             recur,
             kv_k,
@@ -1178,11 +1281,14 @@ impl Qwen4ExpGpu {
             cur_slots: vec![0usize],
             cur_runs: Vec::new(),
             walk_lead: 0,
+            walk_qsa: false,
+            qsa_ready,
+            qsa_mode: qsa_mode_env(),
             pos: vec![0usize; slots],
             stream: vec![Vec::new(); slots],
-            batch_graphs: (0..=slots).map(|_| None).collect(),
+            batch_graphs: (0..=slots).map(|_| [None, None]).collect(),
             stage,
-            decode_graph: None,
+            decode_graph: [None, None],
             graph_capture: capture_wanted(),
             prefix: None,
             walk_row0: 0,
@@ -1253,11 +1359,13 @@ impl Qwen4ExpGpu {
         self.stream[0].push(id as i64);
         self.stage_inputs(&[id])?;
         let d_stage = t_stage.elapsed();
-        if self.decode_graph.is_none() && self.graph_capture {
+        self.walk_qsa = self.qsa_for(self.pos[0]);
+        let mode = self.walk_qsa as usize;
+        if self.decode_graph[mode].is_none() && self.graph_capture {
             self.capture_decode_tick()?;
         }
         let t_launch = std::time::Instant::now();
-        match self.decode_graph.as_ref() {
+        match self.decode_graph[mode].as_ref() {
             Some(g) => g
                 .launch()
                 .map_err(|e| crate::gpu::GpuError::Driver(format!("decode graph replay: {e}")))?,
@@ -1360,21 +1468,34 @@ impl Qwen4ExpGpu {
         }
         self.cur_slots = vec![slot; n];
         self.walk_row0 = from;
+        self.walk_qsa = self.qsa_for(to - 1);
         let walked = self.device_walk(n, Phase::Prefill);
         self.walk_row0 = 0;
         walked
     }
 
     /// The prefix-cache consult for `slot`: the resume point with the slot's
-    /// carried state restored to it, or 0 (nothing touched).
+    /// carried state restored to it, or 0 (nothing touched). The deeper of
+    /// the slot's own checkpoints - its strips still hold the rows under
+    /// them, so that resume is a state copy at any depth - and the side
+    /// store, which copies pages in and only holds what its budget does.
+    /// Either way the slot's checkpoints past the resume point are
+    /// forgotten: the walk from there rewrites their rows.
     fn prefix_resume(&mut self, slot: usize, ids: &[u32]) -> Result<usize, GpuModelError> {
         let Some(pc) = self.prefix.as_mut() else {
             return Ok(0);
         };
-        pc.resume(
+        // must run before the prompt replaces the slot's stream
+        let held = self.pos[slot].min(self.stream[slot].len().saturating_sub(2));
+        // a slot that never held a sequence has no stream at all
+        let own = pc.res_best(slot, ids, self.stream[slot].get(2..2 + held).unwrap_or(&[]));
+        // the side store only where it goes deeper (another slot published a
+        // longer shared prefix); at equal depth the state copy alone wins
+        let mut at = pc.resume(
             &self.exec,
             slot,
             ids,
+            own.map_or(0, |(_, p)| p),
             self.max_tokens,
             &mut self.kv_k,
             &mut self.kv_v,
@@ -1382,7 +1503,61 @@ impl Qwen4ExpGpu {
             &mut self.recur,
             &mut self.gdn_win,
             self.ple_win.as_mut(),
-        )
+        )?;
+        if at == 0
+            && let Some((role, pos)) = own
+        {
+            pc.res_restore(
+                &self.exec,
+                slot,
+                role,
+                pos,
+                &mut self.recur,
+                &mut self.gdn_win,
+                self.ple_win.as_mut(),
+            )?;
+            at = pos;
+        }
+        pc.res_keep_upto(slot, at);
+        Ok(at)
+    }
+
+    /// File checkpoint cut `c` of `ids` in `slot`, whose carried state is the
+    /// state after `c` right now: under the radix, and as the slot's own
+    /// same-slot checkpoint for that cut.
+    fn prefix_cut(&mut self, slot: usize, ids: &[u32], c: usize) -> Result<(), GpuModelError> {
+        self.prefix_publish(slot, ids, c, true)?;
+        if let Some(pc) = self.prefix.as_mut() {
+            pc.res_store(
+                &self.exec,
+                slot,
+                cut_role(ids.len(), c),
+                c,
+                &mut self.recur,
+                &mut self.gdn_win,
+                self.ple_win.as_mut(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Attach the in-walk checkpoints a walk of `ids` wrote (`reserved`: cut,
+    /// radix index), each first copied into `slot`'s same-slot checkpoint for
+    /// its cut - the attach may give the index back to the pool.
+    fn attach_cuts(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        reserved: &[(usize, u32)],
+    ) -> Result<(), GpuModelError> {
+        let Some(pc) = self.prefix.as_mut() else {
+            return Ok(());
+        };
+        for &(c, idx) in reserved {
+            pc.res_from_ckpt(&self.exec, slot, cut_role(ids.len(), c), c, ids, idx)?;
+            pc.attach_reserved(ids, c, idx);
+        }
+        Ok(())
     }
 
     fn prefix_publish(
@@ -1426,13 +1601,16 @@ impl Qwen4ExpGpu {
     /// The dense attention walk is the model only while a row sees at most
     /// `QSA_DENSE_EXACT` tokens: past that, QSA attends to its indexer's 512
     /// selected blocks of 4 plus the tail, and dense attends to everything - a
-    /// different model (the Flash-Next QSA design note). Until
-    /// the sparse path lands, say so the first time a sequence crosses it,
-    /// rather than serve the difference silently. Once per process: the
-    /// condition is the lane's, not the request's.
+    /// different model (the Flash-Next QSA design note). When dense serves
+    /// past it anyway - a pack without the QSA kernels, or `QsaMode::Dense`
+    /// pinned - say so the first time a sequence crosses it, rather than
+    /// serve the difference silently. Once per process: the condition is the
+    /// lane's, not the request's.
     fn qsa_dense_guard(&self, slot: usize) {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if self.pos[slot] > QSA_DENSE_EXACT
+        let dense = !self.qsa_ready || self.qsa_mode == QsaMode::Dense;
+        if dense
+            && self.pos[slot] > QSA_DENSE_EXACT
             && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             tracing::warn!(
@@ -1446,12 +1624,39 @@ impl Qwen4ExpGpu {
         }
     }
 
+    /// Whether a walk whose deepest row sits at position `max_pos` takes QSA
+    /// (see `QsaMode`): a row there sees `max_pos + 1` tokens.
+    fn qsa_for(&self, max_pos: usize) -> bool {
+        self.qsa_ready
+            && match self.qsa_mode {
+                QsaMode::Auto => max_pos + 1 > QSA_DENSE_EXACT,
+                QsaMode::Sparse => true,
+                QsaMode::Dense => false,
+            }
+    }
+
+    /// `qsa_for` over a runs walk: its deepest row ends one of the runs.
+    fn qsa_for_runs(&self, runs: &[Run]) -> bool {
+        let deepest = runs.iter().map(|r| r.row0 + r.len.max(1) - 1).max();
+        deepest.is_some_and(|p| self.qsa_for(p))
+    }
+
+    /// Pin the attention mode (a gate instrument; `QsaMode::Auto` serves).
+    /// Returns false when the lane cannot run QSA at all (an older pack).
+    pub fn set_qsa_mode(&mut self, mode: QsaMode) -> bool {
+        self.qsa_mode = mode;
+        self.qsa_ready
+    }
+
     /// Admission: the prompt just landed in `slot`. Track its reply when the
     /// cache is on and the sequence is long enough to be worth a checkpoint.
     fn reply_track_admit(&mut self, slot: usize) {
         self.qsa_dense_guard(slot);
         self.reply_ckpt[slot] = None;
         self.reply_pinned[slot] = None;
+        if let Some(pc) = self.prefix.as_mut() {
+            pc.res_drop_reply(slot);
+        }
         self.reply_track[slot] = self.prefix.is_some()
             && !crate::gpu_model::prefix_cache::reply_ckpt_disabled()
             && self.pos[slot] >= super::prefix::MIN_SNAPSHOT_LEN;
@@ -1482,6 +1687,19 @@ impl Qwen4ExpGpu {
             self.reply_track[slot] = false;
             return Ok(());
         }
+        // the slot's own rolling checkpoint first: it holds wherever the
+        // side store has no room for the reply's pages
+        if let Some(pc) = self.prefix.as_mut() {
+            pc.res_store(
+                &self.exec,
+                slot,
+                ResRole::Rolling,
+                cut,
+                &mut self.recur,
+                &mut self.gdn_win,
+                self.ple_win.as_mut(),
+            )?;
+        }
         let tokens: Vec<u32> = self.stream[slot][2..].iter().map(|&t| t as u32).collect();
         let Some(idx) = self.prefix_publish(slot, &tokens, cut, true)? else {
             return Ok(());
@@ -1506,6 +1724,58 @@ impl Qwen4ExpGpu {
             return;
         }
         self.reply_pinned[slot] = self.reply_ckpt[slot].take();
+        if let Some(pc) = self.prefix.as_mut() {
+            pc.res_pin(slot);
+        }
+    }
+
+    /// Walk `ids[from..to]` of `slot` - its state already the state after
+    /// `from` - in walks of at most `walk_rows`, split at ABSOLUTE multiples
+    /// of it, so a resumed walk meets exactly the boundaries the cold walk
+    /// did. Each walk seeds the MTP head with its own rows. `cuts` are the
+    /// in-walk checkpoints (absolute position, reserved pool index): each
+    /// rides the walk it falls strictly inside; one landing ON a boundary is
+    /// the state that walk ends in - filed by a snapshot publish there, and
+    /// its reservation given back (removed from `cuts`). The last walk's
+    /// final-row logits are returned.
+    fn walk_bounded(
+        &mut self,
+        slot: usize,
+        ids: &[u32],
+        from: usize,
+        to: usize,
+        cuts: &mut Vec<(usize, u32)>,
+    ) -> Result<Vec<f32>, GpuModelError> {
+        let w = self.walk_rows;
+        let mut a = from;
+        loop {
+            let b = to.min((a / w + 1) * w);
+            self.walk_cuts = cuts
+                .iter()
+                .filter(|&&(c, _)| c > a && c < b)
+                .map(|&(c, idx)| (c - a, idx))
+                .collect();
+            let walked = if b == to {
+                self.walk_span(slot, ids, a, b).map(Some)
+            } else {
+                self.walk_span_dev(slot, ids, a, b).map(|()| None)
+            };
+            self.walk_cuts.clear();
+            let logits = walked?;
+            self.mtp_seed(slot, 0, a, b, ids)?;
+            self.pos[slot] = b;
+            if b == to {
+                return Ok(logits.expect("the last walk reads its logits back"));
+            }
+            if let Some(i) = cuts.iter().position(|&(c, _)| c == b) {
+                let (_, idx) = cuts.remove(i);
+                if let Some(pc) = self.prefix.as_mut() {
+                    pc.recycle_ckpt(idx);
+                }
+                self.prefix_cut(slot, ids, b)?;
+            }
+            a = b;
+        }
     }
 
     /// Prefill `ids[start..]` into `slot` whose state is already the state
@@ -1552,9 +1822,7 @@ impl Qwen4ExpGpu {
                     }
                 }
             }
-            self.walk_cuts = reserved.iter().map(|&(c, idx)| (c - pos, idx)).collect();
-            let walked = self.walk_span(slot, ids, pos, n);
-            self.walk_cuts.clear();
+            let walked = self.walk_bounded(slot, ids, pos, n, &mut reserved);
             let logits = match walked {
                 Ok(l) => l,
                 Err(err) => {
@@ -1568,12 +1836,7 @@ impl Qwen4ExpGpu {
             };
             self.pos[slot] = n;
             self.prefix_publish(slot, ids, n, false)?;
-            if let Some(pc) = self.prefix.as_mut() {
-                for (c, idx) in reserved {
-                    pc.attach_reserved(ids, c, idx);
-                }
-            }
-            self.mtp_seed(slot, 0, pos, n, ids)?;
+            self.attach_cuts(slot, ids, &reserved)?;
             self.reply_track_admit(slot);
             return Ok(logits);
         }
@@ -1581,14 +1844,12 @@ impl Qwen4ExpGpu {
             if c <= pos || c >= n {
                 continue;
             }
-            self.walk_span(slot, ids, pos, c)?;
-            self.mtp_seed(slot, 0, pos, c, ids)?;
+            self.walk_bounded(slot, ids, pos, c, &mut Vec::new())?;
             self.pos[slot] = c;
-            self.prefix_publish(slot, ids, c, true)?;
+            self.prefix_cut(slot, ids, c)?;
             pos = c;
         }
-        let logits = self.walk_span(slot, ids, pos, n)?;
-        self.mtp_seed(slot, 0, pos, n, ids)?;
+        let logits = self.walk_bounded(slot, ids, pos, n, &mut Vec::new())?;
         self.pos[slot] = n;
         self.prefix_publish(slot, ids, n, false)?;
         self.reply_track_admit(slot);
@@ -1612,11 +1873,11 @@ impl Qwen4ExpGpu {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        if rows.len() > self.max_tokens {
+        if rows.len() > self.walk_rows {
             return Err(GpuModelError::Unsupported(format!(
                 "{} rows; scratch is sized for {}",
                 rows.len(),
-                self.max_tokens
+                self.walk_rows
             )));
         }
         let mut seen = vec![false; self.slots];
@@ -1659,11 +1920,13 @@ impl Qwen4ExpGpu {
         // `d_slots`/`d_pos`, which the graph names rather than bakes. Before
         // that the capture was pinned to a dense slot set, so any hole in the
         // scheduler's occupied prefix dropped the tick to an eager walk.
-        if self.graph_capture && self.batch_graphs[n].is_none() {
+        self.walk_qsa = self.qsa_for(rows.iter().map(|&(sl, _)| self.pos[sl]).max().unwrap_or(0));
+        let mode = self.walk_qsa as usize;
+        if self.graph_capture && self.batch_graphs[n][mode].is_none() {
             self.capture_batch_tick(n)?;
         }
         let t_launch = std::time::Instant::now();
-        match self.batch_graphs[n].as_ref() {
+        match self.batch_graphs[n][mode].as_ref() {
             Some(g) => g
                 .launch()
                 .map_err(|e| crate::gpu::GpuError::Driver(format!("batched graph replay: {e}")))?,
@@ -1699,11 +1962,11 @@ impl Qwen4ExpGpu {
     /// first serving measurement (27.6 ms/tok through the server against 7.9
     /// in a bare loop).
     fn decode_batch_walk(&mut self, rows: &[(usize, u32)]) -> Result<(), GpuModelError> {
-        if rows.len() > self.max_tokens {
+        if rows.len() > self.walk_rows {
             return Err(GpuModelError::Unsupported(format!(
                 "{} rows; scratch is sized for {}",
                 rows.len(),
-                self.max_tokens
+                self.walk_rows
             )));
         }
         let mut seen = vec![false; self.slots];
@@ -1743,10 +2006,12 @@ impl Qwen4ExpGpu {
         // `d_slots`/`d_pos`, which the graph names rather than bakes. Before
         // that the capture was pinned to a dense slot set, so any hole in the
         // scheduler's occupied prefix dropped the tick to an eager walk.
-        if self.graph_capture && self.batch_graphs[n].is_none() {
+        self.walk_qsa = self.qsa_for(rows.iter().map(|&(sl, _)| self.pos[sl]).max().unwrap_or(0));
+        let mode = self.walk_qsa as usize;
+        if self.graph_capture && self.batch_graphs[n][mode].is_none() {
             self.capture_batch_tick(n)?;
         }
-        match self.batch_graphs[n].as_ref() {
+        match self.batch_graphs[n][mode].as_ref() {
             Some(g) => g
                 .launch()
                 .map_err(|e| crate::gpu::GpuError::Driver(format!("batched graph replay: {e}")))?,
@@ -2018,10 +2283,10 @@ impl Qwen4ExpGpu {
             return Ok(vec![self.prefill_slot(items[0].0, &items[0].1)?]);
         }
         let n: usize = items.iter().map(|(_, t)| t.len()).sum();
-        if n > self.max_tokens {
+        if n > self.walk_rows {
             return Err(GpuModelError::Unsupported(format!(
                 "prefill wave of {n} rows; the walk is sized for {}",
-                self.max_tokens
+                self.walk_rows
             )));
         }
         let mut seen = vec![false; self.slots];
@@ -2116,6 +2381,7 @@ impl Qwen4ExpGpu {
                 .collect();
             let prompts: Vec<(usize, Vec<u32>)> = which.iter().map(|&i| items[i].clone()).collect();
             self.stage_inputs_runs(&prompts, &runs)?;
+            self.walk_qsa = self.qsa_for_runs(&runs);
             let walked = self.device_walk(rows, Phase::PrefillRuns);
             self.cur_runs.clear();
             walked?;
@@ -2137,7 +2403,7 @@ impl Qwen4ExpGpu {
                     out[i] = Some(all[k * self.cfg.vocab..(k + 1) * self.cfg.vocab].to_vec());
                     done[i] = true;
                 } else {
-                    self.prefix_publish(*slot, toks, to, true)?;
+                    self.prefix_cut(*slot, toks, to)?;
                 }
             }
             stage += 1;
@@ -2283,7 +2549,7 @@ impl Qwen4ExpGpu {
         let graph = crate::gpu::end_capture_no_flags(&self.exec.stream)
             .map_err(|e| crate::gpu::GpuError::Driver(format!("end_capture: {e}")));
         walked?;
-        self.decode_graph = graph?.map(Q4xSendGraph);
+        self.decode_graph[self.walk_qsa as usize] = graph?.map(Q4xSendGraph);
         Ok(())
     }
 
@@ -2298,7 +2564,7 @@ impl Qwen4ExpGpu {
         let graph = crate::gpu::end_capture_no_flags(&self.exec.stream)
             .map_err(|e| crate::gpu::GpuError::Driver(format!("end_capture: {e}")));
         walked?;
-        self.batch_graphs[n] = graph?.map(Q4xSendGraph);
+        self.batch_graphs[n][self.walk_qsa as usize] = graph?.map(Q4xSendGraph);
         Ok(())
     }
 
@@ -2329,18 +2595,18 @@ impl Qwen4ExpGpu {
     pub fn set_graph_capture(&mut self, on: bool) {
         self.graph_capture = on;
         if !on {
-            self.decode_graph = None;
+            self.decode_graph = [None, None];
             // the batched ticks too: a width already captured would otherwise
             // keep replaying, and an "eager" A/B would silently time the graph
             for g in self.batch_graphs.iter_mut() {
-                *g = None;
+                *g = [None, None];
             }
         }
     }
 
     /// Whether the decode tick is currently running as a captured graph.
     pub fn graph_active(&self) -> bool {
-        self.decode_graph.is_some()
+        self.decode_graph.iter().any(|g| g.is_some())
     }
 
     /// Resident weight bytes measured at load - see the `weights_bytes` field.
@@ -2369,6 +2635,20 @@ impl Qwen4ExpGpu {
     /// Position cursor of one slot.
     pub fn slot_position(&self, slot: usize) -> usize {
         self.pos[slot]
+    }
+
+    /// Lower the walk budget - a GATE instrument, so one loaded model can
+    /// hold the whole walk against the bounded walks a long context takes.
+    /// Only down (the scratch was sized at load) and in whole KV pages.
+    pub fn cap_walk_rows(&mut self, w: usize) -> Result<(), GpuModelError> {
+        if w == 0 || !w.is_multiple_of(16) || w > self.walk_rows {
+            return Err(GpuModelError::Unsupported(format!(
+                "walk budget {w}: a multiple of 16 no larger than {}",
+                self.walk_rows
+            )));
+        }
+        self.walk_rows = w;
+        Ok(())
     }
 
     /// Diagnostic read of the QSA compressed key cache: attention layer
@@ -2444,6 +2724,7 @@ impl Qwen4ExpGpu {
     /// `tests/gpu_qwen4exp_forward.rs`).
     fn walk(&mut self, ids: &[u32], phase: Phase) -> Result<Vec<f32>, GpuModelError> {
         self.stage_inputs(ids)?;
+        self.walk_qsa = self.qsa_for(self.pos[0] + ids.len().max(1) - 1);
         self.device_walk(ids.len(), phase)?;
         Ok(self.exec.to_host_len(&self.sc.d_out, self.cfg.vocab)?)
     }
@@ -2513,6 +2794,7 @@ impl Qwen4ExpGpu {
             cur_slots,
             cur_runs,
             walk_lead,
+            walk_qsa,
             walk_row0,
             walk_cuts,
             prefix,
@@ -2777,6 +3059,7 @@ impl Qwen4ExpGpu {
                         kv_k[li].as_mut().expect("kv k"),
                         kv_v[li].as_mut().expect("kv v"),
                         idx_cache[li].as_mut().zip(idx_ring[li].as_mut()),
+                        *walk_qsa,
                         *max_tokens,
                         n,
                         attn_phase,
@@ -4709,6 +4992,108 @@ fn verify_gdn_rows(
     Ok(())
 }
 
+/// QSA attention for this walk's `n` rows, into `d_attn` (where the dense
+/// kernels write): every row's blocks scored against the layer's compressed
+/// keys and the top k selected, in batches of `qsa_rb` rows (the score plane
+/// stays bounded at any context), then each row attends to its selected
+/// blocks' tokens plus its tail. Rows that see no more than the window select
+/// every block, so a walk mixing short and long rows is exact for both.
+/// Decode-width walks split each row's tokens across CTAs to fill the die;
+/// a partial's merge is the combine, which for one split just normalizes.
+#[allow(clippy::too_many_arguments)]
+fn qsa_attend(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    sc: &mut Scratch,
+    cache: &CudaSlice<half::bf16>,
+    kc: &CudaSlice<u8>,
+    vc: &CudaSlice<u8>,
+    max_ctx: usize,
+    n: usize,
+    scale: f32,
+) -> Result<(), GpuModelError> {
+    let (ih, ihd) = (c.idx_heads, c.idx_head_dim);
+    let (nh, nkv, hd) = (c.n_heads, c.n_kv_heads, c.head_dim);
+    let cap = max_ctx.div_ceil(QSA_BLOCK);
+    let k = c.idx_budget / c.idx_compress;
+    let (score_route, attn_route) = qsa_routes(e, c);
+    let mut row0 = 0;
+    while row0 < n {
+        let rows = sc.qsa_rb.min(n - row0);
+        e.q4x_qsa_logits(
+            score_route,
+            &sc.d_idx_q,
+            cache,
+            &sc.d_pos,
+            &sc.d_slots,
+            &mut sc.d_qsa_scores,
+            row0,
+            rows,
+            ih,
+            ihd,
+            cap,
+            QSA_BLOCK,
+            k,
+        )?;
+        e.q4x_qsa_topk(
+            &sc.d_qsa_scores,
+            &sc.d_pos,
+            &mut sc.d_qsa_sel,
+            &mut sc.d_qsa_cnt,
+            row0,
+            rows,
+            cap,
+            QSA_BLOCK,
+            k,
+        )?;
+        row0 += rows;
+    }
+    // enough CTAs to fill the die at decode width; one split once the rows
+    // themselves do (the partials plane holds rows x splits <= its rows)
+    let ctas = n * nkv;
+    let fill = 2 * e.sm_count().max(1);
+    let splits = if ctas >= fill {
+        1
+    } else {
+        fill.div_ceil(ctas)
+            .clamp(1, 16)
+            .min(sc.d_qsa_cnt.len() / n.max(1))
+    };
+    e.q4x_qsa_attn(
+        attn_route,
+        &sc.d_qn,
+        kc,
+        vc,
+        &sc.d_pos,
+        &sc.d_slots,
+        &sc.d_qsa_sel,
+        &sc.d_qsa_cnt,
+        &mut sc.d_qsa_po,
+        &mut sc.d_qsa_pml,
+        n,
+        nh,
+        nkv,
+        hd,
+        max_ctx,
+        k,
+        QSA_BLOCK,
+        splits,
+        scale,
+        KV(),
+    )?;
+    e.q4x_qsa_combine(
+        &sc.d_qsa_po,
+        &sc.d_qsa_pml,
+        &mut sc.d_attn,
+        n,
+        nh,
+        nkv,
+        hd,
+        splits,
+    )?;
+    Ok(())
+}
+
 /// The QSA indexer for this walk's `n` rows (the Flash-Next QSA design
 /// note, attn/qsa.cuh): project q|k off the layer input the main
 /// projections read, normalize and rotate the 4 query heads (the scores'
@@ -4810,6 +5195,8 @@ fn attn_pass(
     // the layer's QSA indexer state (compressed keys, raw ring); None where
     // the lane keeps none (an old pack, the MTP head's own layer)
     idx: Option<(&mut CudaSlice<half::bf16>, &mut CudaSlice<f32>)>,
+    // this walk attends through QSA (needs `idx`); else the dense kernels
+    qsa: bool,
     max_ctx: usize,
     n: usize,
     phase: Phase,
@@ -4977,12 +5364,22 @@ fn attn_pass(
         )?;
     }
     pm_lap(e, "attn-qkv");
-    if let Some((cache, ring)) = idx {
-        qsa_index(e, c, w, sc, stage, cache, ring, max_ctx, n)?;
-        pm_lap(e, "attn-qsa-index");
-    }
     let scale = 1.0 / (hd as f32).sqrt();
-    if matches!(phase, Phase::PrefillRuns) && lead > 0 {
+    let sparse = match idx {
+        Some((cache, ring)) => {
+            qsa_index(e, c, w, sc, stage, cache, ring, max_ctx, n)?;
+            pm_lap(e, "attn-qsa-index");
+            if qsa {
+                qsa_attend(e, c, sc, cache, kc, vc, max_ctx, n, scale)?;
+                pm_lap(e, "attn-qsa");
+            }
+            qsa
+        }
+        None => false,
+    };
+    if sparse {
+        // the QSA output is in d_attn, where the dense kernels would put it
+    } else if matches!(phase, Phase::PrefillRuns) && lead > 0 {
         // A mixed walk: the decode rows lead, one per slot at its own
         // position, so the decode attention's dispatch (the class a decode
         // tick runs, split-KV where elected) covers rows [0, lead) exactly -
@@ -5363,6 +5760,17 @@ fn grp_align_blocks(rows: usize, n_expert: usize, bm: usize) -> usize {
     (rows + n_expert * (bm - 1)).div_ceil(bm).min(rows)
 }
 
+/// Entries the moe_align_bm sorted arrays need for `pairs` routed pairs at
+/// any group size the election can pick (`kq_moe_group_for`: 8 or 16) - the
+/// largest of blocks x bm, which is the LARGEST bm's, not the smallest's.
+fn moe_sorted_capacity(pairs: usize, n_expert: usize) -> usize {
+    [8usize, 16]
+        .iter()
+        .map(|&bm| grp_align_blocks(pairs, n_expert, bm) * bm)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Whether the mix `w` reads its normalized state through the rebuild
 /// consumers at `n` rows (slots 607 / 608): its inject is a separate f32
 /// matvec and its up + mix takes the single-launch rebuild rung. `combine`
@@ -5664,6 +6072,15 @@ fn kq_moe_routed(
     match grp {
         Some(bm) => {
             let blocks = grp_align_blocks(rows, c.n_expert, bm);
+            if blocks * bm > sc.d_msrow.len() || blocks > sc.d_mbexp.len() {
+                return Err(GpuModelError::Unsupported(format!(
+                    "moe_align_bm: {rows} pairs at group {bm} need {} sorted entries and {blocks} \
+                     blocks; the scratch holds {} and {}",
+                    blocks * bm,
+                    sc.d_msrow.len(),
+                    sc.d_mbexp.len()
+                )));
+            }
             if !down_e {
                 e.moe_align_bm(
                     idx,
@@ -6494,7 +6911,10 @@ impl Scratch {
     fn new(
         e: &Arc<GpuExecutor>,
         c: &Qwen4ExpConfig,
+        // rows per walk: every per-row plane
         t: usize,
+        // the context: only the identity block table over the KV spans it
+        ctx: usize,
         slots: usize,
         // the GGUF lane's k-quant dense planes / expert seats read int8
         // activations; the safetensors lane never does, and the pair below
@@ -6504,6 +6924,11 @@ impl Scratch {
         // the safetensors lane is the one that seats NVFP4 routed experts,
         // which is the only seat the W4A4 pair (slot 631) can read
         let nvf4_lane = !kq_lanes;
+        // QSA planes: scores for as many rows as fit QSA_SCORE_BYTES at this
+        // context's block count
+        let qsa_cap = ctx.div_ceil(QSA_BLOCK).max(1);
+        let qsa_k = (c.idx_budget / c.idx_compress.max(1)).max(1);
+        let qsa_rb = (QSA_SCORE_BYTES / (qsa_cap * 4)).clamp(1, t.max(1));
         let (h, hw, hc) = (c.hidden, c.hc_width(), c.hc_count);
         let kv_dim = c.n_kv_heads * c.head_dim;
         let q_dim = c.n_heads * c.head_dim;
@@ -6552,7 +6977,7 @@ impl Scratch {
         };
         Ok(Self {
             d_blk_tab: e
-                .to_device_u32(&(0..(slots * (t / 16)).max(1) as u32).collect::<Vec<u32>>())?,
+                .to_device_u32(&(0..(slots * (ctx / 16)).max(1) as u32).collect::<Vec<u32>>())?,
             d_tok: e.alloc_u32(t)?,
             d_pos: e.alloc_u32(t)?,
             d_mrope: e.alloc_u32(4 * t)?,
@@ -6561,6 +6986,12 @@ impl Scratch {
             d_idx_q: e.alloc(t * c.idx_heads * c.idx_head_dim)?,
             d_idx_stage: e.alloc(t * c.idx_head_dim)?,
             d_idx_spos: e.alloc_u32(4 * t)?,
+            d_qsa_scores: e.alloc(qsa_rb * qsa_cap)?,
+            d_qsa_sel: e.alloc_u32(t * qsa_k)?,
+            d_qsa_cnt: e.alloc_u32(t)?,
+            d_qsa_po: e.alloc(t * q_dim)?,
+            d_qsa_pml: e.alloc(t * c.n_heads * 2)?,
+            qsa_rb,
             d_x: e.alloc(t * h)?,
             d_h: e.alloc(t * hw)?,
             d_xn: e.alloc(t * hw)?,
@@ -6628,16 +7059,21 @@ impl Scratch {
             } else {
                 1
             })?,
-            // moe_align CSR: max_blocks = ceil((rows + n_expert*(bm-1))/bm)
-            // at bm = 8 (the widest block count of the three group sizes),
-            // and the sorted arrays carry bm entries per block.
+            // moe_align CSR: max_blocks = ceil((rows + n_expert*(bm-1))/bm).
+            // The block COUNT peaks at the smallest group (bm = 8), but the
+            // sorted arrays carry bm entries per block and every expert's
+            // padding grows with bm - so their LENGTH peaks at the largest
+            // group the election picks (16, `kq_moe_group_for`). Sized at 8 x
+            // 8 they were n_expert*8 entries short of a full-height 16-row
+            // walk: a 4096-row walk overran them by 4096 entries, silently at
+            // 128K context and as an illegal address at 262K (2026-09-24).
             d_msrow: e.alloc_u32(if kq_lanes {
-                grp_align_blocks(t * c.n_active, c.n_expert, 8) * 8
+                moe_sorted_capacity(t * c.n_active, c.n_expert)
             } else {
                 1
             })?,
             d_msslot: e.alloc_u32(if kq_lanes {
-                grp_align_blocks(t * c.n_active, c.n_expert, 8) * 8
+                moe_sorted_capacity(t * c.n_active, c.n_expert)
             } else {
                 1
             })?,
@@ -6849,11 +7285,11 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         while lo < items.len() {
             let mut hi = lo;
             let mut rows = 0usize;
-            while hi < items.len() && (hi == lo || rows + items[hi].1.len() <= self.max_tokens) {
+            while hi < items.len() && (hi == lo || rows + items[hi].1.len() <= self.walk_rows) {
                 rows += items[hi].1.len();
                 hi += 1;
             }
-            if rows > self.max_tokens {
+            if rows > self.walk_rows {
                 // a single prompt longer than the walk: the serial entry owns
                 // that case (it is the one the chunked lane would take)
                 let (s, t) = &items[lo];
@@ -7194,5 +7630,30 @@ impl crate::generator::Generator for Qwen4ExpGpu {
 
     fn spec_rs_stash(&mut self, draws: Vec<crate::generator::SpecRsDraw>) {
         self.spec_rs_draws = Some(draws);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grp_align_blocks, moe_sorted_capacity};
+
+    /// The sorted arrays hold every group size the election can pick, at
+    /// every walk height - and the old 8 x 8 sizing did not (the 4096-row
+    /// walk that overran it on the Flash-Next lane, 10 routed of 512).
+    #[test]
+    fn moe_sorted_capacity_covers_every_group() {
+        let (k, e) = (10usize, 512usize);
+        for rows in [1usize, 7, 64, 511, 1024, 2048, 4095, 4096, 8192] {
+            let pairs = rows * k;
+            for bm in [8usize, 16] {
+                let need = grp_align_blocks(pairs, e, bm) * bm;
+                assert!(
+                    moe_sorted_capacity(pairs, e) >= need,
+                    "{rows} rows at bm {bm}"
+                );
+            }
+        }
+        let pairs = 4096 * k;
+        assert!(grp_align_blocks(pairs, e, 8) * 8 < grp_align_blocks(pairs, e, 16) * 16);
     }
 }

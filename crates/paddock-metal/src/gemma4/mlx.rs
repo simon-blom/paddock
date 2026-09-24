@@ -12,6 +12,87 @@ pub(super) struct Source {
     used: RefCell<HashSet<String>>,
 }
 impl Source {
+    pub(super) fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            map: ShardedSafetensors::open_dir(path)
+                .map_err(|e| MetalError::Model(e.to_string()))?,
+            used: RefCell::new(HashSet::new()),
+        })
+    }
+    pub(super) fn bytes(&self) -> u64 {
+        self.map.total_len()
+    }
+    pub(super) fn packed(
+        &self,
+        d: &MetalDevice,
+        base: &str,
+        k: usize,
+        shape: &[usize],
+        bits: usize,
+    ) -> Result<Weight> {
+        if !matches!(bits, 4 | 8)
+            || k == 0
+            || !k.is_multiple_of(64)
+            || shape.is_empty()
+            || shape.contains(&0)
+        {
+            return Err(MetalError::Model(format!(
+                "{base}: invalid packed shape/bits"
+            )));
+        }
+        let n = shape
+            .iter()
+            .try_fold(1usize, |n, &v| n.checked_mul(v))
+            .ok_or_else(|| MetalError::Model("affine shape overflow".into()))?;
+        let mut parts = Vec::new();
+        for (suffix, dtype, last) in [
+            ("weight", StDtype::U32, k / (32 / bits)),
+            ("scales", StDtype::Bf16, k / 64),
+            ("biases", StDtype::Bf16, k / 64),
+        ] {
+            let name = format!("{base}.{suffix}");
+            let (info, bytes) = self
+                .map
+                .bytes(&name)
+                .ok_or_else(|| MetalError::Model(format!("missing {name}")))?;
+            let mut expected = shape.to_vec();
+            expected.push(last);
+            if info.dtype != dtype || info.shape != expected {
+                return Err(MetalError::Model(format!(
+                    "{name}: expected {dtype:?} {expected:?}"
+                )));
+            }
+            if suffix != "weight"
+                && bytes
+                    .chunks_exact(2)
+                    .any(|b| (u16::from_le_bytes([b[0], b[1]]) & 0x7f80) == 0x7f80)
+            {
+                return Err(MetalError::Model(format!(
+                    "{name}: nonfinite quantization parameters"
+                )));
+            }
+            parts.push(bytes);
+            self.used.borrow_mut().insert(name);
+        }
+        Ok(Weight {
+            buffer: d.upload_parts(&parts)?,
+            ty: if bits == 4 { 0x100 } else { 0x108 },
+            k,
+            n,
+        })
+    }
+    pub(super) fn finish_diffusion_text(&self) -> Result<()> {
+        // The bundled image tower is not loaded or advertised by the text
+        // adapter. Only its named namespaces may remain unused.
+        for name in self.map.names() {
+            if name.starts_with("model.encoder.vision_tower.")
+                || name.starts_with("model.encoder.embed_vision.")
+            {
+                self.used.borrow_mut().insert(name.to_owned());
+            }
+        }
+        self.finish()
+    }
     pub(super) fn affine(&self, d: &MetalDevice, base: &str, k: usize, n: usize) -> Result<Weight> {
         let w = crate::affine::load(d, &self.map, &format!("{base}.weight"), k, n)?;
         for suffix in ["weight", "scales", "biases"] {
@@ -347,6 +428,7 @@ impl Gemma4 {
             ));
         }
         Ok(Self {
+            diffusion: None,
             muse,
             mlx: true,
             device,

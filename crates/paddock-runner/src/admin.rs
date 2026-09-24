@@ -36,6 +36,7 @@ pub fn router(state: Arc<AdminState>) -> axum::Router {
         .route("/v1/drain", post(drain))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/stats", get(stats))
+        .route("/v1/residency", get(residency))
         .route("/v1/events", get(events))
         .route("/v1/metrics", get(metrics))
         .route("/v1/metrics_snapshots", get(metrics_snapshots))
@@ -65,6 +66,9 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
         }),
         capabilities: {
             let mut caps = vec!["stats".to_owned()];
+            if s.app.residency().is_some() {
+                caps.push("residency".to_owned());
+            }
             if s.app.events.enabled() {
                 caps.push("events".to_owned());
             }
@@ -78,6 +82,10 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
         },
     })
     .into_response()
+}
+
+async fn residency(State(s): State<Arc<AdminState>>) -> Response {
+    Json(s.app.residency()).into_response()
 }
 
 async fn health(State(s): State<Arc<AdminState>>) -> Response {
@@ -103,7 +111,13 @@ fn changed_restart_fields(before: &toml::Value, after: &toml::Value) -> Vec<Stri
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .filter(|k| {
-            !["mcp_servers", "web_search_provider", "web_search_api_key"].contains(&k.as_str())
+            ![
+                "mcp_servers",
+                "web_search_provider",
+                "web_search_api_key",
+                "residency",
+            ]
+            .contains(&k.as_str())
                 && a.get(*k) != b.get(*k)
         })
         .map(|k| {
@@ -146,6 +160,22 @@ async fn config_status(State(s): State<Arc<AdminState>>) -> Response {
         changed: changes.unwrap_or_default(),
         max_ctx: s.app.max_ctx,
         max_batch: s.app.max_batch,
+        residency_budget: s
+            .app
+            .asr
+            .as_ref()
+            .and_then(|m| m.residency_budget)
+            .or_else(|| {
+                s.app
+                    .serving
+                    .as_ref()
+                    .and_then(|m| m.engine.residency_budget())
+            }),
+        residency_unloaded: s
+            .app
+            .residency()
+            .map(|s| s.phase == crate::residency::Phase::Unloaded),
+        residency_live: Some(s.app.residency().is_some()),
     })
     .into_response()
 }

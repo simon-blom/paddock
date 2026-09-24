@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn diffusion_metal_catalog_exposes_three_text_formats_without_cuda_drift() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("diffusiongemma-26b-a4b").unwrap();
+    assert_eq!(
+        model.default_weights_for_backend("metal", None).unwrap().id,
+        "mlx-4bit"
+    );
+    for id in ["q8", "q4", "mlx-4bit"] {
+        let a = model.artifact(id).unwrap();
+        assert!(a.runtime.supports_backend("metal"));
+        assert_eq!(a.capabilities(model), ["chat", "reasoning"]);
+        assert_eq!(a.runtime.default_spec.as_deref(), Some("off"));
+        assert_eq!(metal.default_envelope(&model.id, Some(id)), (32768, 1));
+        assert_eq!(a.runtime.memory.as_ref().unwrap().max_batch, 8);
+        assert!(!a.runtime.embedded_vision);
+        assert!(!crate::backend_contract::metal_kv_offload(model, a));
+        let (_, tower, drafter) = metal.planned_paths(&model.id, Some(id)).unwrap();
+        assert!(tower.is_none() && drafter.is_none());
+        assert_eq!(a.runtime.checkpoint_dir, id == "mlx-4bit");
+        assert!(a.files.iter().all(|f| f.size > 0 && f.sha256.len() == 64));
+        assert!(
+            a.files
+                .iter()
+                .all(|f| { f.url == format!("https://models.truespar.io/models/{}", f.dest) })
+        );
+    }
+    assert_eq!(
+        model
+            .artifact("q4")
+            .unwrap()
+            .source
+            .as_ref()
+            .unwrap()
+            .revision,
+        "f4183a2c7a354128d02545752303c4354d165bf0"
+    );
+    let a = model.artifact("mlx-4bit").unwrap();
+    assert_eq!(a.files.len(), 12);
+    assert_eq!(
+        a.source.as_ref().unwrap().revision,
+        "a7a81407613811e8ba63af92ac0d852b809e191f"
+    );
+    for name in ["processor_config.json", "README.md"] {
+        assert!(a.files.iter().any(|f| f.dest.ends_with(name)));
+    }
+    assert!(
+        a.entry_path(metal.models_dir())
+            .unwrap()
+            .ends_with("diffusiongemma-26B-A4B-it-MLX-4bit")
+    );
+    let cuda = metal.with_backend("cuda");
+    let model = cuda.catalog_of("diffusiongemma-26b-a4b").unwrap();
+    assert_eq!(model.default_weights().unwrap().id, "q8");
+    assert_eq!(cuda.default_envelope(&model.id, Some("q8")), (4096, 32));
+    for id in ["q4", "mlx-4bit"] {
+        assert!(cuda.planned_paths(&model.id, Some(id)).is_none());
+    }
+}
+
+#[test]
 fn qwen_image_metal_resolves_embedded_mlx_and_gguf_editing_tower() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("qwen-image-2.1").unwrap();
@@ -1004,7 +1064,7 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 !matches!(
                     artifact.id.as_str(),
                     "mlx-4bit" | "mlx-2bit" | "splash-4bit"
-                ),
+                ) && !(model.id == "diffusiongemma-26b-a4b" && artifact.id == "q4"),
                 "{}/{}",
                 model.id,
                 artifact.id

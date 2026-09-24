@@ -104,6 +104,31 @@ async fn assert_native_client_read_routes() {
                         .is_empty()
                 );
                 let models = json["models"].as_array().expect("catalog models");
+                let diffusion = models
+                    .iter()
+                    .find(|m| m["id"] == "diffusiongemma-26b-a4b")
+                    .expect("DiffusionGemma reaches the native and web catalogs");
+                for id in ["q8", "q4", "mlx-4bit"] {
+                    let artifact = diffusion["artifacts"]
+                        .as_array()
+                        .expect("DiffusionGemma artifacts")
+                        .iter()
+                        .find(|a| a["id"] == id)
+                        .expect("Metal DiffusionGemma artifact");
+                    assert_eq!(artifact["backend_supported"], true);
+                    assert_eq!(artifact["runtime"]["default_max_batch"], 1);
+                    assert_eq!(artifact["runtime"]["default_spec"], "off");
+                    assert_eq!(artifact["runtime"]["embedded_vision"], false);
+                    let files = artifact["files"]
+                        .as_array()
+                        .expect("DiffusionGemma download manifest");
+                    assert_eq!(files.len(), if id == "mlx-4bit" { 12 } else { 1 });
+                    assert!(files.iter().all(|f| {
+                        f["url"].as_str().is_some_and(|url| {
+                            url.starts_with("https://models.truespar.io/models/")
+                        })
+                    }));
+                }
                 let qwen = models
                     .iter()
                     .find(|m| m["id"] == "qwen3.8-27b")
@@ -187,4 +212,61 @@ async fn assert_native_client_read_routes() {
             std::fs::write(dir.join(file), &bytes).expect("write derived contract fixture");
         }
     }
+}
+
+#[tokio::test]
+async fn native_reads_use_the_same_revision_checked_store_as_web() {
+    let mut state = AppState::for_tests();
+    state.auth_key = Some("read-contract".into());
+    let router = paddock_manager::routes::router(Arc::new(state));
+    let call = |method: &'static str, path: String, body: serde_json::Value| {
+        let router = router.clone();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", "Bearer read-contract")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        }
+    };
+    let body = serde_json::json!({"id":"native-reads-contract","name":"Triage","revision":"",
+        "body":r#"{"questions":{"q1":{"type":"noul","instructions":"Is it urgent?"}},"samples":"auto"}"#});
+    let (status, saved) = call("POST", "/api/reads".into(), body.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(saved["set"]["name"], "Triage");
+    let (status, conflict) = call("POST", "/api/reads".into(), body).await;
+    assert_eq!(status, 409);
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("draft is kept")
+    );
+    let (_, listed) = call("GET", "/api/reads".into(), serde_json::Value::Null).await;
+    assert_eq!(listed.as_array().unwrap(), &[saved["set"].clone()]);
+    let (status, _) = call(
+        "DELETE",
+        format!(
+            "/api/reads/native-reads-contract?revision={}",
+            saved["set"]["revision"].as_str().unwrap()
+        ),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, 204);
 }

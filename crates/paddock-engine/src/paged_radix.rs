@@ -83,6 +83,10 @@ struct Node {
 pub struct PagedMatch {
     pub blocks: Vec<BlockId>,
     pub ckpt: Option<(usize, u32)>,
+    /// The deepest matched node (0 = nothing matched): the one childless node
+    /// on the matched path, so sparing it spares the path (see
+    /// [`PagedRadix::evict_lru_sparing`]).
+    pub tail: u32,
 }
 
 /// One block on the LRU leaf's root-to-leaf path (see
@@ -253,7 +257,11 @@ impl PagedRadix {
             self.nodes[child as usize].last_used = t;
             node = child;
         }
-        PagedMatch { blocks, ckpt }
+        PagedMatch {
+            blocks,
+            ckpt,
+            tail: node,
+        }
     }
 
     /// Claim a free state-pool index without attaching it - the tier's aux
@@ -642,6 +650,25 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.children.is_empty())
+            .min_by_key(|(_, n)| n.last_used)
+            .map(|(i, _)| i as u32)?;
+        Some(self.evict_node(victim, pool))
+    }
+
+    /// `evict_lru`, never taking node `spare` - for a caller about to EXTEND
+    /// the path a match just returned (`PagedMatch::tail`). Sparing the tail
+    /// spares the whole path: every other node on it has the next one as a
+    /// child, so none of them is ever a leaf while the tail stands. Where the
+    /// tree holds the only reference to a page (a side store copied in and
+    /// out, not pages a live sequence also holds), evicting the caller's own
+    /// tail would free pages its match still names - the next alloc hands
+    /// them back out, and re-inserting the match maps two nodes onto one page.
+    pub fn evict_lru_sparing(&mut self, spare: u32, pool: &mut KvPool) -> Option<BlockId> {
+        let victim = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.children.is_empty())
             .min_by_key(|(_, n)| n.last_used)
             .map(|(i, _)| i as u32)?;
         Some(self.evict_node(victim, pool))
@@ -1050,5 +1077,72 @@ mod tests {
         r.insert(&toks, table.blocks(), &mut pool);
         assert_eq!(pool.refcount(table.blocks()[0]), rc, "no double-retain");
         assert_eq!(r.cached_blocks(), 1);
+    }
+
+    /// A side store (the tree holds each page's only reference) extended past
+    /// its capacity must never map two nodes onto one page. The publish
+    /// pattern: match, make room, alloc the missing pages, insert match + new.
+    #[test]
+    fn extending_a_path_past_capacity_never_aliases_a_page() {
+        let publish = |r: &mut PagedRadix, pool: &mut KvPool, toks: &[u32], sparing: bool| {
+            let full = toks.len() / BLOCK_TOKENS;
+            let m = r.match_full(toks);
+            let want = full - m.blocks.len();
+            while pool.free_blocks() < want {
+                let freed = if sparing {
+                    r.evict_lru_sparing(m.tail, pool)
+                } else {
+                    r.evict_lru(pool)
+                };
+                if freed.is_none() {
+                    break;
+                }
+            }
+            let need = want.min(pool.free_blocks());
+            let new: Vec<BlockId> = (0..need).map(|_| pool.alloc().expect("free")).collect();
+            let mut all = m.blocks.clone();
+            all.extend_from_slice(&new);
+            r.insert(toks, &all, pool);
+            for b in new {
+                pool.release(b);
+            }
+        };
+        let alive_blocks = |r: &PagedRadix| -> Vec<BlockId> {
+            r.nodes
+                .iter()
+                .skip(1)
+                .filter(|n| n.alive)
+                .map(|n| n.block)
+                .collect()
+        };
+        // one conversation growing 3 blocks a turn through a 4-page store
+        let conv: Vec<u32> = (0..9).flat_map(block_toks).collect();
+        for sparing in [false, true] {
+            let mut pool = KvPool::with_blocks(4);
+            let mut r = PagedRadix::new();
+            for turn in 1..=3 {
+                publish(&mut r, &mut pool, &conv[..turn * 3 * BLOCK_TOKENS], sparing);
+            }
+            let blocks = alive_blocks(&r);
+            let mut distinct = blocks.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if sparing {
+                assert_eq!(
+                    distinct.len(),
+                    blocks.len(),
+                    "a page mapped twice: {blocks:?}"
+                );
+                assert!(blocks.len() <= 4, "more nodes than pages: {blocks:?}");
+                // what it kept is the conversation's head, prefix-closed
+                assert_eq!(r.match_full(&conv).blocks.len(), blocks.len());
+            } else {
+                // the unspared form evicts its own tail and re-adopts the ids
+                assert!(
+                    distinct.len() < blocks.len(),
+                    "expected the aliasing: {blocks:?}"
+                );
+            }
+        }
     }
 }

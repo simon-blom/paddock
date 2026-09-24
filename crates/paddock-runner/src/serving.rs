@@ -48,7 +48,7 @@ pub struct ServingModel {
     /// 4.2 publishes (temperature 1.0, top_p 0.95). Consulted only where the
     /// arch-keyed table has no row - see `paddock_models::sampling`.
     pub published_sampling: Option<paddock_models::sampling::Elected>,
-    pub engine: Engine,
+    pub engine: crate::generation_residency::Handle,
     pub tokenizer: Arc<GgufTokenizer>,
     /// BOS to prepend, or None when the model's tokenizer says not to.
     pub bos: Option<u32>,
@@ -273,10 +273,11 @@ pub struct EmbedModel {
 /// own thread seam rather than the generative `Engine`, the same way the
 /// embeddings encoder does.
 pub struct AsrModel {
+    pub residency_budget: Option<u64>,
     /// Only advertise the teacher-forced alignment pass when this backend implements it.
     pub word_times: bool,
     pub id: String,
-    pub transcriber: Transcriber,
+    pub transcriber: crate::asr_residency::Handle,
     pub tokenizer: Arc<GgufTokenizer>,
     /// decoder position budget - the served cap on one window's tokens
     pub max_tokens: usize,
@@ -1234,6 +1235,41 @@ pub fn load_asr(
     max_batch: usize,
     vram_budget: Option<u64>,
 ) -> Result<AsrModel, ServeError> {
+    let map = MappedGguf::open(path).map_err(|e| ServeError::Open(path.into(), e.to_string()))?;
+    let tokenizer = Arc::new(
+        GgufTokenizer::from_gguf(map.gguf()).map_err(|e| ServeError::Tokenizer(e.to_string()))?,
+    );
+    load_asr_reusing(
+        id,
+        path,
+        device,
+        gpu,
+        pack,
+        max_ctx,
+        max_batch,
+        vram_budget,
+        tokenizer,
+    )
+}
+
+/// GPU residency changes do not change tokenization. Keep the already validated
+/// immutable CPU tokenizer instead of rebuilding its tables on every cold load.
+pub(crate) fn load_asr_reusing(
+    id: String,
+    path: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    max_ctx: usize,
+    max_batch: usize,
+    vram_budget: Option<u64>,
+    tokenizer: Arc<GgufTokenizer>,
+) -> Result<AsrModel, ServeError> {
+    let _load_gate = crate::device_admission::load_lock(device, gpu).map_err(ServeError::Engine)?;
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if device == "metal" {
+        return load_asr_metal(id, path, max_ctx, max_batch, vram_budget, tokenizer);
+    }
     let map =
         MappedGguf::open(path).map_err(|e| ServeError::Open(path.to_path_buf(), e.to_string()))?;
     let arch = map
@@ -1241,19 +1277,11 @@ pub fn load_asr(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    if device == "metal" {
-        return load_asr_metal(id, path, max_ctx, max_batch, vram_budget);
-    }
     if device != "cuda" {
         return Err(ServeError::Engine(format!(
             "{arch} requires native CUDA or Metal (got {device:?})"
         )));
     }
-    let tokenizer =
-        GgufTokenizer::from_gguf(map.gguf()).map_err(|e| ServeError::Tokenizer(e.to_string()))?;
-    let tokenizer = Arc::new(tokenizer);
-
     let pack = pack.map(Path::to_path_buf);
     let path = path.to_path_buf();
     // `max_batch` is the decode-slot count, and for whisper that is a real
@@ -1271,6 +1299,21 @@ pub fn load_asr(
             }
             let exec = Arc::new(exec);
             let map = MappedGguf::open(&path).map_err(|e| e.to_string())?;
+            let required = paddock_engine::gpu_model::whisper::GpuWhisper::residency_bytes(
+                &map,
+                max_ctx,
+                max_batch.max(1),
+            )?;
+            exec.vram_load_gate(required, "Whisper serving envelope")?;
+            // Source/staging RAM is needed even on a discrete GPU. On unified
+            // CUDA devices the executor additionally gates against host memory.
+            let host = paddock_engine::host_memory::sample()
+                .ok_or("cannot read physical memory availability")?;
+            paddock_engine::host_memory::check(
+                map.total_len(),
+                host.available.saturating_sub(1 << 30),
+                None,
+            )?;
             let mut m = paddock_engine::gpu_model::whisper::GpuWhisper::load(exec, &map, max_ctx)
                 .map_err(|e| e.to_string())?;
             // Whisper's KV is unlike any other family's: the CROSS planes are a
@@ -1292,9 +1335,10 @@ pub fn load_asr(
     // the prompt takes four of those rows
     let max_tokens = max_ctx.min(448).saturating_sub(8).max(16);
     Ok(AsrModel {
+        residency_budget: None,
         word_times: card.word_times,
         id,
-        transcriber,
+        transcriber: crate::asr_residency::Handle::Loaded(transcriber),
         metrics,
         tokenizer,
         max_tokens,
@@ -1310,23 +1354,23 @@ fn load_asr_metal(
     max_ctx: usize,
     max_batch: usize,
     budget: Option<u64>,
+    tokenizer: Arc<GgufTokenizer>,
 ) -> Result<AsrModel, ServeError> {
-    let map =
-        MappedGguf::open(path).map_err(|e| ServeError::Open(path.to_path_buf(), e.to_string()))?;
-    let tokenizer = Arc::new(
-        GgufTokenizer::from_gguf(map.gguf()).map_err(|e| ServeError::Tokenizer(e.to_string()))?,
-    );
     let metrics = Arc::new(paddock_engine::metrics::EngineMetrics::default());
     let path = path.to_owned();
     let (transcriber, card) = Transcriber::spawn(
-        move || paddock_metal::Whisper::load(&path, max_ctx, budget).map_err(|e| e.to_string()),
+        move || {
+            paddock_metal::Whisper::load_for_batch(&path, max_ctx, budget, max_batch)
+                .map_err(|e| e.to_string())
+        },
         max_batch,
         Some(Arc::clone(&metrics)),
     )
     .map_err(ServeError::Engine)?;
     Ok(AsrModel {
+        residency_budget: None,
         id,
-        transcriber,
+        transcriber: crate::asr_residency::Handle::Loaded(transcriber),
         tokenizer,
         metrics,
         word_times: card.word_times,
@@ -1408,6 +1452,41 @@ pub fn load_with(
     max_image_tokens: Option<u32>,
     tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
+    load_with_residency(
+        id,
+        path,
+        device,
+        gpu,
+        pack,
+        max_ctx,
+        max_batch,
+        mmproj,
+        mtp,
+        fp8_native,
+        vram_budget,
+        max_image_tokens,
+        tp,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_with_residency(
+    id: String,
+    path: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    max_ctx: usize,
+    max_batch: usize,
+    mmproj: Option<&Path>,
+    mtp: Option<&Path>,
+    fp8_native: Option<&Path>,
+    vram_budget: Option<u64>,
+    max_image_tokens: Option<u32>,
+    tp: Option<paddock_dist::config::Resolved>,
+    residency: Option<crate::generation_residency::Options>,
+) -> Result<ServingModel, ServeError> {
     if tp.is_some()
         && (!(1..=2).contains(&max_batch)
             || device != "cuda"
@@ -1446,6 +1525,7 @@ pub fn load_with(
             max_batch,
             vram_budget,
             if device == "metal" { mtp } else { None },
+            residency,
         );
     }
     // open once here for tokenizer + metadata; the engine reopens on its thread
@@ -1638,6 +1718,7 @@ pub fn load_with(
         vram_budget,
         max_image_tokens,
         tp,
+        residency,
     )?;
 
     Ok(ServingModel {
@@ -1717,6 +1798,7 @@ fn load_hf_dir(
     max_batch: usize,
     vram_budget: Option<u64>,
     mtp: Option<&Path>,
+    residency: Option<crate::generation_residency::Options>,
 ) -> Result<ServingModel, ServeError> {
     let splash = dir.join("manifest.json").is_file() && dir.join("target").is_dir();
     if splash && mtp.is_some_and(|p| p != dir) {
@@ -1754,6 +1836,11 @@ fn load_hf_dir(
             ServeError::Open(dir.to_path_buf(), "config.json has no model_type".into())
         })?;
     let arch = match model_type.as_str() {
+        "diffusion_gemma" if device == "metal" => {
+            paddock_models::mlx::DiffusionConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
+            "diffusion-gemma".to_owned()
+        }
         "llama" if device == "metal" => {
             paddock_models::mlx::MiniCpmConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
@@ -1880,6 +1967,7 @@ fn load_hf_dir(
         // Embedded MLX towers use their validated checkpoint processor budget.
         None,
         None,
+        residency,
     )?;
 
     Ok(ServingModel {
@@ -1934,7 +2022,35 @@ fn build_engine(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     tp: Option<paddock_dist::config::Resolved>,
-) -> Result<Engine, ServeError> {
+    residency: Option<crate::generation_residency::Options>,
+) -> Result<crate::generation_residency::Handle, ServeError> {
+    let reservation = if residency.is_some() {
+        if arch != "diffusion-gemma"
+            || device != "metal"
+            || mmproj.is_some()
+            || mtp.is_some()
+            || pack.is_some()
+            || fp8_native.is_some()
+            || max_image_tokens.is_some()
+        {
+            return Err(ServeError::Engine("text-engine residency currently supports native Metal DiffusionGemma without companions".into()));
+        }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            paddock_metal::Gemma4::diffusion_residency_bytes(&path, max_ctx, max_batch)
+                .map_err(|e| ServeError::Engine(e.to_string()))?
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        {
+            return Err(ServeError::Engine(
+                "DiffusionGemma residency requires a Metal build".into(),
+            ));
+        }
+    } else {
+        0
+    };
+    let resident_path = path.clone();
+    let resident_device = device.to_owned();
     let arch = arch.to_owned();
     let device = device.to_owned();
 
@@ -1944,35 +2060,64 @@ fn build_engine(
     let max_batch = max_batch.max(1);
 
     // the factory runs on the engine thread (required for CUDA context binding)
-    Engine::spawn(max_batch, move || {
-        if let Some(resolved) = tp {
-            if arch != "qwen35" || device != "cuda" || !(1..=2).contains(&max_batch) || mmproj.is_some()
-                || mtp.is_some() || fp8_native.is_some() || vram_budget.is_some() {
-                return Err("TP=2 requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
+    let metrics = Arc::new(paddock_engine::metrics::EngineMetrics::default());
+    let loaded_metrics = metrics.clone();
+    let build = move || {
+        let (arch, path, device, pack, mmproj, mtp, fp8_native) = (
+            arch.clone(),
+            path.clone(),
+            device.clone(),
+            pack.clone(),
+            mmproj.clone(),
+            mtp.clone(),
+            fp8_native.clone(),
+        );
+        // Re-clone per build call: the inner move closure consumes this copy,
+        // keeping the outer closure Fn (residency reloads may call it again).
+        let tp = tp.clone();
+        Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
+            if let Some(resolved) = tp {
+                if arch != "qwen35" || device != "cuda" || !(1..=2).contains(&max_batch) || mmproj.is_some()
+                    || mtp.is_some() || fp8_native.is_some() || vram_budget.is_some() {
+                    return Err("TP=2 requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
+                }
+                let pack = pack.as_deref().ok_or("Phase 9 TP=2 requires an explicit CUDA pack")?;
+                let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
+                let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
+                    stream, resolved, &path, pack, gpu, max_ctx, max_batch,
+                )?;
+                return Ok(Box::new(generator) as Box<dyn Generator>);
             }
-            let pack = pack.as_deref().ok_or("Phase 9 TP=2 requires an explicit CUDA pack")?;
-            let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
-            let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
-                stream, resolved, &path, pack, gpu, max_ctx, max_batch,
-            )?;
-            return Ok(Box::new(generator) as Box<dyn Generator>);
-        }
-        build_generator(
-            &arch,
-            &path,
-            &device,
+            build_generator(
+                &arch,
+                &path,
+                &device,
+                gpu,
+                pack.as_deref(),
+                max_ctx,
+                max_batch,
+                mmproj.as_deref(),
+                mtp.as_deref(),
+                fp8_native.as_deref(),
+                vram_budget,
+                max_image_tokens,
+            )
+        })
+    };
+    if let Some(options) = residency {
+        crate::generation_residency::configure(
+            options,
+            resident_path,
+            resident_device,
             gpu,
-            pack.as_deref(),
-            max_ctx,
-            max_batch,
-            mmproj.as_deref(),
-            mtp.as_deref(),
-            fp8_native.as_deref(),
-            vram_budget,
-            max_image_tokens,
+            reservation,
+            metrics,
+            build,
         )
-    })
-    .map_err(ServeError::Engine)
+        .map_err(ServeError::Engine)
+    } else {
+        build().map(Into::into).map_err(ServeError::Engine)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2030,6 +2175,14 @@ fn build_generator(
                 tracing::warn!(
                     "native Gemma/Muse MLX: affine4 text, BF16 tower/KV; parity and performance qualification pending"
                 );
+                return paddock_metal::Gemma4::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .map_err(|e| e.to_string());
+            }
+            if arch == "diffusion-gemma" {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err("DiffusionGemma Metal currently implements text diffusion; vision companions, speculative drafters and CUDA packs are not supported".into());
+                }
                 return paddock_metal::Gemma4::load(path, max_ctx, max_batch, vram_budget)
                     .map(|m| Box::new(m) as Box<dyn Generator>)
                     .map_err(|e| e.to_string());

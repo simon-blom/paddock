@@ -355,6 +355,7 @@ impl Qwen4ExpGpu {
             .collect();
         self.stage_inputs_runs_ids(&ids, &runs, 0)?;
         self.cur_runs = runs.clone();
+        self.walk_qsa = self.qsa_for_runs(&runs);
         self.verify.as_mut().expect("built").active = true;
         let walked = self.device_walk(total, Phase::PrefillRuns);
         self.verify.as_mut().expect("built").active = false;

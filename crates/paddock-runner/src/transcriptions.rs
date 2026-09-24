@@ -1817,6 +1817,7 @@ fn ev_done(
 /// may borrow `AppState`.
 fn stream_whisper(
     asr: &crate::serving::AsrModel,
+    residency: Option<crate::residency::Lease<paddock_engine::transcriber::Transcriber>>,
     mel_windows: Vec<paddock_engine::audio::MelFeatures>,
     // per-window VAD gate; empty = ungated
     speech: Vec<bool>,
@@ -1843,6 +1844,7 @@ fn stream_whisper(
     let rows_per_window = (scale.window_s / scale.precision).round().max(0.0) as usize;
 
     let sse = stream! {
+        let _residency = residency;
         let (ptx, mut prx) = unbounded_channel();
         let fut = transcriber
             .transcribe(mel_windows, speech, language, prompt, grans.segment, grans.word, max_tokens, Some(ptx));
@@ -2781,8 +2783,15 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             strength: paddock_engine::transcriber::DEFAULT_LANGUAGE_PRIOR,
         };
         if stream {
+            // Refuse a failed cold load before committing HTTP 200/SSE.
+            // The stream owns the lease, including while the client is slow.
+            let residency = match asr.transcriber.session_lease().await {
+                Ok(lease) => lease,
+                Err(error) => return crate::asr_residency::error_response(error),
+            };
             return stream_whisper(
                 asr,
+                residency,
                 mel_windows,
                 speech,
                 ask,
@@ -2807,6 +2816,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             .await;
         let mut out = match out {
             Ok(t) => t,
+            Err(e) if asr.transcriber.residency().is_some() => {
+                return crate::asr_residency::error_response(e);
+            }
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
         };
         // before anything reads the tokens

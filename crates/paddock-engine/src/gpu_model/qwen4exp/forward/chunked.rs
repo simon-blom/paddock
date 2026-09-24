@@ -168,7 +168,9 @@ impl Qwen4ExpGpu {
     /// idle tick has no one to stall, and a burst or a lone prompt walks as
     /// the wave and the single-slot walk always did.
     pub(super) fn prefill_tick_cap_impl(&self, decode_rows: usize) -> usize {
-        let room = self.max_tokens.saturating_sub(decode_rows);
+        // a walk carries at most walk_rows rows (the scratch's size); with
+        // a context longer than that, the riderless tick walks it in pieces
+        let room = self.walk_rows.saturating_sub(decode_rows);
         if decode_rows == 0 {
             room
         } else {
@@ -182,7 +184,10 @@ impl Qwen4ExpGpu {
     fn span_end(&self, qi: usize, room: usize, inwalk: bool) -> (usize, bool) {
         let c = &self.chunked[qi];
         let len = c.tokens.len();
-        let to = (c.cursor + room).min(len);
+        // and never across an absolute multiple of walk_rows: the single-slot
+        // walk splits there, so both walk a long prompt in the same pieces
+        let bound = (c.cursor / self.walk_rows + 1) * self.walk_rows;
+        let to = (c.cursor + room).min(len).min(bound);
         if inwalk && to == len {
             return (to, false);
         }
@@ -326,6 +331,7 @@ impl Qwen4ExpGpu {
                 .iter()
                 .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
                 .collect();
+            self.walk_qsa = self.qsa_for_runs(&runs);
             self.cur_runs = runs;
             self.walk_lead = nd;
             let w = self.device_walk(rows, Phase::PrefillRuns);
@@ -420,14 +426,10 @@ impl Qwen4ExpGpu {
                 self.pos[s.slot] = s.to;
                 if s.finishes {
                     self.prefix_publish(s.slot, &ids, s.to, false)?;
-                    if let Some(pc) = self.prefix.as_mut() {
-                        for &(c, idx) in &w.reserved {
-                            pc.attach_reserved(&ids, c, idx);
-                        }
-                    }
+                    self.attach_cuts(s.slot, &ids, &w.reserved)?;
                     self.reply_track_admit(s.slot);
                 } else if s.at_cut {
-                    self.prefix_publish(s.slot, &ids, s.to, true)?;
+                    self.prefix_cut(s.slot, &ids, s.to)?;
                 }
                 Ok::<(), GpuModelError>(())
             })();

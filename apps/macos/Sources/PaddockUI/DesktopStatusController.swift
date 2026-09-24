@@ -35,8 +35,7 @@ import SwiftUI
     guard item == nil else { return }
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     item.autosaveName = "PaddockModels"
-    item.button?.image = NSImage(
-      systemSymbolName: "square.stack.3d.up", accessibilityDescription: "Paddock models")
+    item.button?.image = Self.menuBarImage
     item.button?.image?.isTemplate = true
     item.button?.setAccessibilityLabel("Paddock models")
     item.button?.setAccessibilityIdentifier("paddock-status-item")
@@ -53,5 +52,17 @@ import SwiftUI
     self.item = item
     self.menu = menu
   }
+  /// The Paddock mark drawn for the menu bar (PaddockMenuBar.svg, 18 pt, black
+  /// only), used as a template so macOS tints it. The system symbol stands in
+  /// only if the resource bundle is missing.
+  static let menuBarImage: NSImage? = {
+    let image =
+      ProviderArtwork.resources?.url(forResource: "PaddockMenuBar", withExtension: "svg")
+      .flatMap(NSImage.init(contentsOf:))
+      ?? NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: nil)
+    image?.accessibilityDescription = "Paddock models"
+    return image
+  }()
+
   isolated deinit { if let item { NSStatusBar.system.removeStatusItem(item) } }
 }

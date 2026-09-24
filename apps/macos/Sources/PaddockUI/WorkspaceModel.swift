@@ -48,6 +48,7 @@ public final class WorkspaceModel {
   var endpointEditor: EndpointEditor?
   let endpointLogs: EndpointLogsModel
   let studioLibrary = StudioLibraryModel()
+  let reads: NativeReadsModel
   let studioPreferences = StudioPreferencesModel()
   public var desktopRequest: DesktopRequest?
   public var desktopError: String?
@@ -56,7 +57,7 @@ public final class WorkspaceModel {
   @ObservationIgnored public var onSnapshot: ((ManagerSnapshot) -> Void)?
   @ObservationIgnored public var onStudioState: ((StudioState) -> Void)?
   public var studioNeedsQuitConfirmation: Bool {
-    connections.hasDraft || integrations.hasDraft || endpointEditor?.dirty == true
+    reads.hasWork || connections.hasDraft || integrations.hasDraft || endpointEditor?.dirty == true
       || studioLibrary.hasWork || studioLibrary.instructions.hasWork || studioPreferences.hasWork
       || draft.hasContent || chatStorage?.busy == true
       || chatStorage?.uploading == true
@@ -79,6 +80,7 @@ public final class WorkspaceModel {
     cloudClient: any OpenRouterLoading = NativeOpenRouter()
   ) {
     self.client = client
+    reads = NativeReadsModel(client: client)
     insights = InsightsModel(client: client)
     benchmarks = BenchmarksModel(client: client)
     dataStorage = DataStorageModel(client: client)

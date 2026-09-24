@@ -22,6 +22,7 @@ public struct ConfiguredEndpoint: Decodable, Identifiable, Sendable {
 public struct EndpointRuntimeState: Decodable, Sendable {
   public let pid: UInt32
   public let restartRequired: Bool?
+  public let residencyLive: Bool?
   public let changed: [String]
   public let maxCtx: Int
   public let maxBatch: Int
@@ -158,6 +159,21 @@ public struct EndpointSettings: Decodable, Sendable, Equatable {
   public let vramBudget: Int?
   public let kvOffload: EndpointKVOffload?
   public let kvOffloadSupported: Bool?
+  public let residency: EndpointResidency?
+  public let residencySupported: Bool?
+}
+
+public struct EndpointResidency: Codable, Sendable, Equatable {
+  public var load: String
+  public var unloadAfterIdleSeconds: Int?
+  public var loadTimeoutSeconds: Int
+  public init(
+    load: String = "at_startup", unloadAfterIdleSeconds: Int? = nil, loadTimeoutSeconds: Int = 120
+  ) {
+    self.load = load
+    self.unloadAfterIdleSeconds = unloadAfterIdleSeconds
+    self.loadTimeoutSeconds = loadTimeoutSeconds
+  }
 }
 
 public struct EndpointKVOffload: Codable, Sendable, Equatable {
@@ -202,6 +218,7 @@ public enum EndpointChange: Encodable, Sendable {
   case composition(EndpointComposition)
   case runtime([String: EndpointRuntimeValue?])
   case kvOffload(EndpointKVOffload)
+  case residency(EndpointResidency)
   private enum CodingKeys: String, CodingKey { case field, value }
   public func encode(to encoder: any Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
@@ -238,6 +255,9 @@ public enum EndpointChange: Encodable, Sendable {
       try c.encode(v, forKey: .value)
     case .kvOffload(let v):
       try c.encode("kv_offload", forKey: .field)
+      try c.encode(v, forKey: .value)
+    case .residency(let v):
+      try c.encode("residency", forKey: .field)
       try c.encode(v, forKey: .value)
     }
   }

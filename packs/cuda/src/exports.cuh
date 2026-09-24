@@ -643,6 +643,8 @@ extern "C" int pd_q4x_qsa_logits(const void*, const void*, const void*, const vo
 extern "C" int pd_q4x_qsa_topk(const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_qsa_attn(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 extern "C" int pd_q4x_qsa_combine(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_logits_mma(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_attn_mma(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 extern "C" int pd_kquant_moe_down_mma_e_tail(void);
 
 static const KernelTableV1 PD_KERNELS = {
@@ -1687,6 +1689,10 @@ static const KernelTableV1 PD_KERNELS = {
     pd_q4x_qsa_combine,
     // 668: slot 603 takes a flat down at any 32-multiple width (partial tail stage)
     pd_kquant_moe_down_mma_e_tail,
+    // 669: QSA attention over the selection on tensor cores (attn/qsa.cuh)
+    pd_q4x_qsa_attn_mma,
+    // 670: QSA block scores on tensor cores (attn/qsa.cuh)
+    pd_q4x_qsa_logits_mma,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

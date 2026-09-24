@@ -186,6 +186,8 @@ public struct WorkspaceView: View {
       StudioConversationView(
         chat: model.chat, draft: $model.draft, notices: hasNotices ? AnyView(notices) : nil)
     case .prompts: StudioLibraryView(model: model.studioLibrary)
+    case .reads:
+      NativeReadsView(model: model.reads) { navigation.showManager(.runners) }
     case .settings:
       StudioPreferencesView(model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
     }

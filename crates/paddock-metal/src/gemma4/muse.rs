@@ -231,6 +231,7 @@ impl Gemma4 {
             _ => None,
         };
         Ok(Self {
+            diffusion: None,
             muse: true,
             mlx: false,
             device,

@@ -131,6 +131,14 @@ const apiKey = ref('')
 const pinned = ref(false)
 const persist = ref(true)
 const busy = ref(false)
+const residencyOnDemand = ref(false)
+const residencyUnload = ref(false)
+const residencyIdle = ref(60)
+const residencyWait = ref(120)
+const projectedResidency = ref(false)
+const residencyLive = ref(false)
+const canResidency = computed(() => catModel.value?.family === 'whisper'
+  || (model.value === '__custom' && projectedResidency.value))
 // Intelligence / context enrichment: forensics ([forensics].enabled).
 // The toggle owns `enabled`; a hand-set scope (auto/tool/device from the file or
 // the Advanced tab) rides through `forensicsExtra` so flipping the switch never
@@ -245,7 +253,9 @@ async function loadFile(): Promise<void> {
   try {
     const res = await fetch(`/api/servers/${port.value}/file`)
     if (!res.ok) throw new Error(`the manager answered ${res.status}`)
-    const f = (await res.json()) as { path: string; content: string; hash: string }
+    const f = (await res.json()) as { path: string; content: string; hash: string;
+      runtime_state?: { residency_live?: boolean } | null }
+    residencyLive.value = f.runtime_state?.residency_live === true
     // Drop a leading BYTE ORDER MARK. A config file is user-editable on a
     // platform whose editors add one freely - and PowerShell 5.1's
     // `Set-Content -Encoding utf8` writes one every time, which is how a
@@ -438,6 +448,7 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       // vad_filter, whisper.cpp's --vad) because it changes what a transcript
       // CONTAINS, not just how fast it arrives.
       { key: 'vad_gate', kind: 'switch', hint: 'speech models · skip silent windows before the encoder runs - faster, and changes what the transcript contains' },
+      { key: 'residency', kind: 'json', hint: 'Whisper on CUDA/Metal · {"load": "on_demand", "unload_after_idle_seconds": 60, "load_timeout_seconds": 120}' },
     ],
   },
   {
@@ -1573,6 +1584,11 @@ async function simpleFromToml(text: string): Promise<boolean> {
     return false
   }
   const p = r.projection
+  projectedResidency.value = p.residency_supported === true
+  residencyOnDemand.value = p.residency?.load === 'on_demand'
+  residencyUnload.value = p.residency?.unload_after_idle_seconds != null
+  residencyIdle.value = p.residency?.unload_after_idle_seconds ?? 60
+  residencyWait.value = p.residency?.load_timeout_seconds ?? 120
   // `fp8_native` and `mmproj` are PATHS in the file and switches on the form:
   // present means on. The live fleet row carries neither, which is why this
   // reads the config even for a running endpoint.
@@ -1930,6 +1946,13 @@ function buildSpec(): DeploySpec {
     }
     spec.kv_offload = kv
   }
+  if (canResidency.value) {
+    spec.residency = {
+      load: residencyOnDemand.value ? 'on_demand' : 'at_startup',
+      load_timeout_seconds: residencyWait.value,
+      ...(residencyUnload.value ? { unload_after_idle_seconds: residencyIdle.value } : {}),
+    }
+  }
   // the concurrency token: Save refuses if the file moved since this page
   // loaded it
   if (isEdit.value && fileHash.value) spec.expect_config_hash = fileHash.value
@@ -1966,6 +1989,7 @@ function onlyLiveKeysChanged(before: string, after: string): boolean {
     const b = tomlParse(after) as Record<string, unknown>
     for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
       if (LIVE_TOML_KEYS.includes(k)) continue
+      if (k === 'residency' && residencyLive.value) continue
       if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) return false
     }
     return true
@@ -2446,6 +2470,24 @@ function start(): void {
           </p>
         </template>
         </template>
+        </div>
+
+        <div v-if="canResidency" class="sf__card">
+          <p class="sf__card-hd">Model loading</p>
+          <FieldLabel label="Load model" />
+          <Select :model-value="residencyOnDemand ? 'on_demand' : 'at_startup'"
+            :options="[{ value: 'at_startup', label: 'At runner startup' }, { value: 'on_demand', label: 'On first request' }]"
+            @update:model-value="residencyOnDemand = $event === 'on_demand'" />
+          <label class="sf__check">
+            <Switch v-model="residencyUnload" label="Unload after inactivity" />
+            Unload after inactivity
+          </label>
+          <template v-if="residencyUnload">
+            <FieldLabel label="Idle timeout (seconds)">
+              <p>Zero unloads after all requests and realtime sessions finish. The API stays available.</p>
+            </FieldLabel>
+            <NumberField v-model="residencyIdle" :min="0" :max="604800" :step="1" />
+          </template>
         </div>
 
         <div v-if="!singlePass" class="sf__card">

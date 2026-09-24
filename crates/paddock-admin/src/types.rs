@@ -230,4 +230,57 @@ pub struct ConfigStatus {
     pub changed: Vec<String>,
     pub max_ctx: usize,
     pub max_batch: usize,
+    #[serde(default)]
+    pub residency_live: Option<bool>,
+    /// True only AFTER device resources have been destroyed. Loading,
+    /// unloading, failed/unknown disposal, and older runners never imply free.
+    #[serde(default)]
+    pub residency_unloaded: Option<bool>,
+    /// Immutable serving envelope of a residency-managed model (device bytes).
+    #[serde(default)]
+    pub residency_budget: Option<u64>,
+}
+
+impl ConfigStatus {
+    pub fn residency_reservation(&self, expected_pid: u32) -> Option<u64> {
+        if self.pid != expected_pid || self.residency_live != Some(true) {
+            return None;
+        }
+        if self.residency_released(expected_pid) {
+            Some(0)
+        } else {
+            self.residency_budget
+        }
+    }
+    pub fn residency_released(&self, expected_pid: u32) -> bool {
+        self.pid == expected_pid
+            && self.residency_live == Some(true)
+            && self.residency_unloaded == Some(true)
+    }
+}
+
+#[cfg(test)]
+mod residency_status_tests {
+    use super::ConfigStatus;
+    #[test]
+    fn releasing_a_reservation_needs_new_runner_confirmation_and_matching_pid() {
+        let old: ConfigStatus = serde_json::from_str(
+            r#"{"pid":42,"restart_required":false,"changed":[],"max_ctx":448,"max_batch":1}"#,
+        )
+        .unwrap();
+        assert!(!old.residency_released(42));
+        assert_eq!(old.residency_reservation(42), None);
+        let mut status = old;
+        status.residency_live = Some(true);
+        status.residency_budget = Some(4096);
+        assert_eq!(status.residency_reservation(42), Some(4096));
+        assert!(!status.residency_released(42));
+        status.residency_unloaded = Some(true);
+        assert!(status.residency_released(42));
+        assert_eq!(status.residency_reservation(42), Some(0));
+        assert_eq!(status.residency_reservation(43), None);
+        assert!(!status.residency_released(43));
+        status.residency_unloaded = Some(false);
+        assert!(!status.residency_released(42));
+    }
 }
