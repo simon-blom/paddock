@@ -29,7 +29,7 @@ components it covers.
 
 ===============================================================================
 
-RUST CRATES (558)
+RUST CRATES (560)
 -------------------------------------------------------------------------------
 
 Name                              Version                        Licence
@@ -509,7 +509,9 @@ typenum                           1.20.1                         MIT OR Apache-2
 ucd-trie                          0.1.7                          MIT OR Apache-2.0
 unicase                           2.9.0                          MIT OR Apache-2.0
 unicode-ident                     1.0.24                         (MIT OR Apache-2.0) AND Unicode-3.0
+unicode-normalization             0.1.25                         MIT OR Apache-2.0
 unicode-normalization-alignments  0.1.12                         MIT/Apache-2.0
+unicode-properties                0.1.4                          MIT/Apache-2.0
 unicode-segmentation              1.13.3                         MIT OR Apache-2.0
 unicode_categories                0.1.1                          MIT OR Apache-2.0
 untrusted                         0.7.1                          ISC
@@ -4299,7 +4301,7 @@ LICENCE TEXTS (484 distinct)
 ===============================================================================
 
 -------------------------------------------------------------------------------
-Applies to: @chevrotain/types 11.1.2, aes 0.9.3, ahash 0.8.12, arbitrary 1.4.2, arrayvec 0.7.8, asn1-rs 0.7.2, asn1-rs-derive 0.6.0, assert_matches 1.5.0, atomic-polyfill 1.0.3, atomic-waker 1.1.2, atomig 0.4.3, base64 0.13.1, base64 0.22.1, base64 0.23.1, bit-set 0.8.0, bit-vec 0.8.0, bit-vec 0.9.1, bitflags 2.13.1, bitreader 0.3.11, block-buffer 0.10.4, block-buffer 0.12.1, block-padding 0.4.2, bumpalo 3.20.3, bytemuck 1.25.2, cbc 0.2.1, cfg-if 1.0.4, chacha20 0.10.1, chardetng 1.0.0, ciborium 0.2.2, ciborium-io 0.2.2, ciborium-ll 0.2.2, cipher 0.5.2, codepage 0.1.2, const-oid 0.10.2, core-foundation 0.10.1, core-foundation-sys 0.8.7, cpubits 0.1.1, cpufeatures 0.2.17, cpufeatures 0.3.0, critical-section 1.2.0, crossbeam-deque 0.8.7, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.22, crypto-common 0.1.7, crypto-common 0.2.2, der-parser 10.0.0, derive_arbitrary 1.4.2, digest 0.10.7, digest 0.11.3, displaydoc 0.2.7, dompurify 3.4.14, either 1.18.0, embedded-io 0.4.0, embedded-io 0.6.1, encoding_rs 0.8.35, equivalent 1.0.2, errno 0.3.14, esaxx-rs 0.1.10, fallible_collections 0.5.2, fastrand 2.5.0, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, fs4 1.1.0, gif 0.14.2, hash32 0.2.1, hash32 0.3.1, hashbrown 0.15.5, hashbrown 0.16.1, hashbrown 0.17.1, hashlink 0.12.1, heapless 0.7.17, heapless 0.8.0, heapless 0.9.3, heck 0.4.1, heck 0.5.0, httparse 1.10.1, httpdate 1.0.3, hybrid-array 0.4.14, hyper-rustls 0.27.9, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, inout 0.2.2, itertools 0.11.0, itertools 0.12.1, itertools 0.14.0, js-sys 0.3.104, lazy_static 1.5.0, leb128 0.2.7, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, lru-slab 0.1.2, matrixmultiply 0.3.11, md-5 0.11.0, memo-map 0.3.3, mime 0.3.17, minijinja 2.24.0, minijinja-contrib 2.24.0, minimal-lexical 0.2.1, ndarray 0.17.2, num 0.4.3, num-bigint 0.4.8, num-complex 0.4.6, num-derive 0.4.2, num-integer 0.1.47, num-iter 0.1.46, num-rational 0.4.2, num-traits 0.2.19, oauth2 5.0.0, oid-registry 0.8.1, once_cell 1.21.4, openssl-probe 0.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, png 0.18.1, postcard 1.1.3, primal-check 0.3.4, quinn 0.11.11, quinn-proto 0.11.17, quinn-udp 0.5.15, rand_xoshiro 0.6.0, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rusticata-macros 4.1.0, rustix 1.1.4, rustls 0.23.43, rustls-native-certs 0.8.4, rustls-platform-verifier 0.7.0, scoped-tls 1.0.1, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, sha1 0.10.7, sha1 0.11.0, sha2 0.10.9, sha2 0.11.0, signal-hook-registry 1.4.8, simd_cesu8 1.2.0, smallvec 1.15.2, socket2 0.6.5, spm_precompiled 0.1.4, sse-stream 0.2.5, stable_deref_trait 1.2.1, static_assertions 1.1.0, symphonia-adapter-libopus 0.3.0, syn 1.0.109, tempfile 3.27.0, thread_local 1.1.10, tinyvec 1.12.0, tokenizers 0.23.1, tungstenite 0.29.0, tungstenite 0.30.0, ucd-trie 0.1.7, unicase 2.9.0, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, ureq 3.4.0, ureq-proto 0.6.1, url 2.5.8, utf8_iter 1.0.4, uuid 1.25.0, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.127, wasm-bindgen-futures 0.4.77, wasm-bindgen-macro 0.2.127, wasm-bindgen-macro-support 0.2.127, wasm-bindgen-shared 0.2.127, web-sys 0.3.104, weezl 0.1.12, wit-bindgen 0.57.1, x509-parser 0.18.1, yasna 0.6.0, zeroize 1.9.0, zune-core 0.5.3, zune-jpeg 0.5.15
+Applies to: @chevrotain/types 11.1.2, aes 0.9.3, ahash 0.8.12, arbitrary 1.4.2, arrayvec 0.7.8, asn1-rs 0.7.2, asn1-rs-derive 0.6.0, assert_matches 1.5.0, atomic-polyfill 1.0.3, atomic-waker 1.1.2, atomig 0.4.3, base64 0.13.1, base64 0.22.1, base64 0.23.1, bit-set 0.8.0, bit-vec 0.8.0, bit-vec 0.9.1, bitflags 2.13.1, bitreader 0.3.11, block-buffer 0.10.4, block-buffer 0.12.1, block-padding 0.4.2, bumpalo 3.20.3, bytemuck 1.25.2, cbc 0.2.1, cfg-if 1.0.4, chacha20 0.10.1, chardetng 1.0.0, ciborium 0.2.2, ciborium-io 0.2.2, ciborium-ll 0.2.2, cipher 0.5.2, codepage 0.1.2, const-oid 0.10.2, core-foundation 0.10.1, core-foundation-sys 0.8.7, cpubits 0.1.1, cpufeatures 0.2.17, cpufeatures 0.3.0, critical-section 1.2.0, crossbeam-deque 0.8.7, crossbeam-epoch 0.9.20, crossbeam-utils 0.8.22, crypto-common 0.1.7, crypto-common 0.2.2, der-parser 10.0.0, derive_arbitrary 1.4.2, digest 0.10.7, digest 0.11.3, displaydoc 0.2.7, dompurify 3.4.14, either 1.18.0, embedded-io 0.4.0, embedded-io 0.6.1, encoding_rs 0.8.35, equivalent 1.0.2, errno 0.3.14, esaxx-rs 0.1.10, fallible_collections 0.5.2, fastrand 2.5.0, flate2 1.1.9, fnv 1.0.7, form_urlencoded 1.2.2, fs4 1.1.0, gif 0.14.2, hash32 0.2.1, hash32 0.3.1, hashbrown 0.15.5, hashbrown 0.16.1, hashbrown 0.17.1, hashlink 0.12.1, heapless 0.7.17, heapless 0.8.0, heapless 0.9.3, heck 0.4.1, heck 0.5.0, httparse 1.10.1, httpdate 1.0.3, hybrid-array 0.4.14, hyper-rustls 0.27.9, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.0, inout 0.2.2, itertools 0.11.0, itertools 0.12.1, itertools 0.14.0, js-sys 0.3.104, lazy_static 1.5.0, leb128 0.2.7, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, lru-slab 0.1.2, matrixmultiply 0.3.11, md-5 0.11.0, memo-map 0.3.3, mime 0.3.17, minijinja 2.24.0, minijinja-contrib 2.24.0, minimal-lexical 0.2.1, ndarray 0.17.2, num 0.4.3, num-bigint 0.4.8, num-complex 0.4.6, num-derive 0.4.2, num-integer 0.1.47, num-iter 0.1.46, num-rational 0.4.2, num-traits 0.2.19, oauth2 5.0.0, oid-registry 0.8.1, once_cell 1.21.4, openssl-probe 0.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pest 2.9.0, pest_derive 2.9.0, pest_generator 2.9.0, pest_meta 2.9.0, png 0.18.1, postcard 1.1.3, primal-check 0.3.4, quinn 0.11.11, quinn-proto 0.11.17, quinn-udp 0.5.15, rand_xoshiro 0.6.0, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-lite 0.1.9, regex-syntax 0.8.11, rusticata-macros 4.1.0, rustix 1.1.4, rustls 0.23.43, rustls-native-certs 0.8.4, rustls-platform-verifier 0.7.0, scoped-tls 1.0.1, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, sha1 0.10.7, sha1 0.11.0, sha2 0.10.9, sha2 0.11.0, signal-hook-registry 1.4.8, simd_cesu8 1.2.0, smallvec 1.15.2, socket2 0.6.5, spm_precompiled 0.1.4, sse-stream 0.2.5, stable_deref_trait 1.2.1, static_assertions 1.1.0, symphonia-adapter-libopus 0.3.0, syn 1.0.109, tempfile 3.27.0, thread_local 1.1.10, tinyvec 1.12.0, tokenizers 0.23.1, tungstenite 0.29.0, tungstenite 0.30.0, ucd-trie 0.1.7, unicase 2.9.0, unicode-normalization 0.1.25, unicode-normalization-alignments 0.1.12, unicode-properties 0.1.4, unicode-segmentation 1.13.3, ureq 3.4.0, ureq-proto 0.6.1, url 2.5.8, utf8_iter 1.0.4, uuid 1.25.0, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wasm-bindgen 0.2.127, wasm-bindgen-futures 0.4.77, wasm-bindgen-macro 0.2.127, wasm-bindgen-macro-support 0.2.127, wasm-bindgen-shared 0.2.127, web-sys 0.3.104, weezl 0.1.12, wit-bindgen 0.57.1, x509-parser 0.18.1, yasna 0.6.0, zeroize 1.9.0, zune-core 0.5.3, zune-jpeg 0.5.15
 -------------------------------------------------------------------------------
 
 Apache License
@@ -6068,6 +6070,36 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
+Applies to: fs4 1.1.0, heck 0.4.1, heck 0.5.0, leb128 0.2.7, unicode-normalization 0.1.25, unicode-normalization-alignments 0.1.12, unicode-properties 0.1.4, unicode-segmentation 1.13.3
+-------------------------------------------------------------------------------
+
+Copyright (c) 2015 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
 Applies to: rand 0.10.2, rand 0.8.7, rand 0.9.5, rand_chacha 0.10.0, rand_chacha 0.3.1, rand_chacha 0.9.0, rand_core 0.6.4, rand_core 0.9.5
 -------------------------------------------------------------------------------
 
@@ -6326,36 +6358,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
--------------------------------------------------------------------------------
-Applies to: fs4 1.1.0, heck 0.4.1, heck 0.5.0, leb128 0.2.7, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3
--------------------------------------------------------------------------------
-
-Copyright (c) 2015 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 
 -------------------------------------------------------------------------------
 Applies to: ccount 2.0.1, character-entities-html4 2.1.0, character-entities-legacy 3.0.0, unist-util-position 5.0.0, unist-util-visit 5.1.0
@@ -7442,6 +7444,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+Applies to: unicode-normalization 0.1.25, unicode-normalization-alignments 0.1.12, unicode-properties 0.1.4, unicode-segmentation 1.13.3
+-------------------------------------------------------------------------------
+
+Licensed under the Apache License, Version 2.0
+<LICENSE-APACHE or
+http://www.apache.org/licenses/LICENSE-2.0> or the MIT
+license <LICENSE-MIT or http://opensource.org/licenses/MIT>,
+at your option. All files in the project carrying such
+notice may not be copied, modified, or distributed except
+according to those terms.
 
 -------------------------------------------------------------------------------
 Applies to: zerocopy 0.7.35, zerocopy 0.8.56, zerocopy-derive 0.7.35, zerocopy-derive 0.8.56
@@ -11321,18 +11335,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
--------------------------------------------------------------------------------
-Applies to: unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3
--------------------------------------------------------------------------------
-
-Licensed under the Apache License, Version 2.0
-<LICENSE-APACHE or
-http://www.apache.org/licenses/LICENSE-2.0> or the MIT
-license <LICENSE-MIT or http://opensource.org/licenses/MIT>,
-at your option. All files in the project carrying such
-notice may not be copied, modified, or distributed except
-according to those terms.
 
 -------------------------------------------------------------------------------
 Applies to: untrusted 0.7.1, untrusted 0.9.0
