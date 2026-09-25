@@ -1,12 +1,8 @@
 # Phase 13 — Broaden qwen35-family coverage
 
-Status: IMPLEMENTATION COMPLETE (host-side scope), HOST VERIFICATION
-COMPLETE, two-Spark validation DEFERRED. Most of this phase's checklist is
-intrinsically target/model-bound: the only qwen35-family checkpoints that
-exist locally are the pinned Qwen3.8-27B UD-Q4_K_M GGUF (already accepted)
-and a Qwen3.8-Flash-Next NVFP4 safetensors tree that is a DIFFERENT
-architecture (qwen4_exp, Phase 14 scope). No Sparks were available this
-session.
+Status: ACCEPTED for the currently available checkpoint (host scope plus
+pinned Qwen3.8-27B target-device validation). No broader qwen35-family
+checkpoint was available, so no unsupported model-variant coverage is claimed.
 
 Baseline: Phase 12 checkpoint `17efad0` (dtype plumbing + rank-local
 accounting, host-verified).
@@ -104,3 +100,25 @@ checkpoint/quantization ever lands:
   claimed and should not be assumed - the kernel pack instantiates
   256-wide-head qwen3.8 shapes only.
 - `PINNED_SHA256` remains a single-checkpoint gate by design.
+
+## Target-device validation boundary
+
+The Phase 12 two-Spark F16 and FP8 runs, including decode pipe, unified
+prefill/decode overlap, page crossing, reset/reuse, and rank exits, exercised
+the only available qwen35 TP checkpoint: Qwen3.8-27B UD-Q4_K_M. This validates
+the Phase 13 geometry and quant-dispatch boundaries on that checkpoint only;
+it does not turn the three hard-coded Qwen3.8 geometry pins into evidence for
+other model sizes, Safetensors, or other quantized artifacts.
+
+The following remain explicitly open and require real artifacts before any
+additional Phase 13 claim:
+
+- another qwen35 checkpoint (model size or quantization) with its exact hash and
+  tensor inventory;
+- a Safetensors qwen35 checkpoint, if that variant is to be supported, plus a
+  mapper and target run;
+- a two-Spark parity run for each newly admitted checkpoint/quantization,
+  including FP16/FP8 and rank-local accounting checks.
+
+The local Qwen3.8-Flash-Next NVFP4 tree remains `qwen4_exp` and is not used as
+qwen35-family evidence.
