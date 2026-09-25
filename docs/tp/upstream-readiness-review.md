@@ -245,11 +245,11 @@ batching with max_batch 1-2; device-side sampling (greedy/temperature-only
 categorical; rank 0 only); decode pipeline with fixed-context drain bound;
 unified prefill/decode overlap via the prefill lane; CUDA graphs behind
 opt-in `PADDOCK_TP_GRAPH=1` with NCCL outside capture; F16 KV, and FP8
-(fp8_e4m3) KV for the validated non-spec path; n-gram speculative decoding on
-F16 KV; cancellation, reset, release and slot reuse; normal OpenAI/Anthropic
--compatible serving on rank 0. Everything else (MoE, other TP sizes, other
-model families or checkpoints, NCCL graph capture, spec with FP8 KV, separate
-draft models) is refused by name at startup, not silently unsupported.
+(fp8_e4m3) KV for the validated non-spec and speculative paths; n-gram
+speculative decoding on F16 and FP8 KV; cancellation, reset, release and slot
+reuse; normal OpenAI/Anthropic-compatible serving on rank 0. Everything else
+(MoE, other TP sizes, other model families or checkpoints, NCCL graph capture,
+separate draft models) is refused by name at startup, not silently unsupported.
 
 ## 14. Known limitations (for the PR description)
 
@@ -264,8 +264,10 @@ draft models) is refused by name at startup, not silently unsupported.
   0 on its own node.
 - CUDA-graph capture is opt-in Stage A (decode runs only), with the first
   token per slot paying the capture pre-sync.
-- FP8 KV + speculation is refused pending validation; FP8 KV without
-  speculation is the validated lossy lane.
+- FP8 KV + speculation is accepted for the target-validated TP=2 lane; its
+  numerical outputs are not required to match F16 exactly, and correctness is
+  established by within-FP8 oracle replay, rank agreement and state/position
+  accounting.
 - The manager/Studio has no TP start surface; `[parallel]` is config/CLI only.
 
 ## 15. Pre-PR checklist
@@ -312,8 +314,8 @@ Updated after the bounded pre-PR cleanup pass. See section 17 for evidence.
   cleanup-pass instruction: the combined TP speculation + FP8 KV path was
   audited (no F16-specific assumptions found in the spec path — it runs the
   same resolved-dtype KV ops as the non-spec path) and is now an accepted,
-  documented configuration. Host gates updated; target-device validation of
-  the combined path is explicitly outstanding (see section 17).
+  documented configuration. Host and target-device validation both pass; see
+  section 17.
 - I2 — removed: `TpAcceptanceProbe` and `PADDOCK_TP_STATE_PROBE` deleted from
   product code; the production drain-before-release invariant (already
   enforced independently of the probe via `prefill_lane_done()` checks) is
@@ -334,59 +336,163 @@ Updated after the bounded pre-PR cleanup pass. See section 17 for evidence.
 
 ## 17. Validation evidence
 
-Host (this session, GLM vLLM stack occupies both Sparks, so no CUDA binary was
-built and no GPU test ran):
+The bounded target-validation pass was run after `05bf158` on the actual two-Spark
+pair. No source code changes were required during target validation.
 
-- `cargo check --workspace --all-targets` — exit 0.
-- `cargo test -p paddock-dist` — 18 passed (16 bootstrap incl. the
-  strengthened previous-version rejection; 2 moved `work()` loop tests).
-- `cargo test -p paddock-runner --lib` — 572 passed, incl. the new
-  `tp2_gate` host tests (6): baseline accepted, spec+F16, spec+fp8_e4m3
-  accepted (I1), fp8 non-spec accepted, offload refused, missing-model
-  refused.
-- `cargo test -p paddock-engine --lib` — 463 passed, incl. the new
-  `authorize_all`/`mirror_tick` round-trip and fail-closed tests (divergent
-  end state, empty tick, bad op leaving no partial advance).
-- `cargo test -p paddock-engine --test tp_wire_frame` — 4 passed: old
-  per-row-snapshot design measured crossing MAX_FRAME at 256 prompt rows
-  (16k ctx, 2 slots; 512 rows = 2.18 MB), new end-of-tick design bounded
-  (decode tick 4.2 KB, 512-row span 10.2 KB, 4096-row span 60 KB = 17x
-  headroom), and a real-TCP round-trip mirror test incl. tampered-state
-  rejection.
-- `cargo clippy -p paddock-dist -p paddock-runner -p paddock-engine
-  --all-targets` — 0 errors; B3's `unwrap_used` findings gone, plus the 7
-  same-diff example `unwrap()`s clippy surfaced once the lib was fixed
-  (also converted to `expect`). Remaining lib warnings verified identical
-  to the pre-cleanup baseline (same 6, none introduced).
-- `cargo fmt --all -- --check` — pre-existing drift across 25+ files at
-  HEAD (incl. files this pass never touched, e.g. `kquant.rs`,
-  `service.rs`, `delta_tp.rs`); left untouched per session scope. The four
-  files this pass made fmt-dirty (`tp_kv.rs`, `tp_wire_frame.rs`,
-  `bootstrap.rs`, `startup.rs`) were rustfmt-ed individually and are
-  clean; the full-repo reformat belongs to the PR-preparation pass.
-- `git diff --check` — clean.
+### Exact target environment and artifacts
 
-Target-device validation — EXPLICITLY OUTSTANDING, not run:
+- rank 0/head: `192.168.100.10`; rank 1/worker: `192.168.100.11`;
+- GPU/driver: NVIDIA GB10, driver `580.173.02`, one GPU per process;
+- CUDA toolkit: `13.0.88`;
+- NCCL/RoCE: `NCCL_SOCKET_IFNAME=enp1s0f0np0`,
+  `NCCL_IB_HCA=rocep1s0f0`, `NCCL_IB_DISABLE=0`, `NCCL_NET=IB`;
+- checkpoint: `Qwen3.8-27B-UD-Q4_K_M.gguf`, SHA-256
+  `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`;
+- freshly rebuilt CUDA pack: `pd-cuda-sm120.so`, SHA-256
+  `5908806748f0cfa62926ff1455e8d4d54fb7b7554360a0456d1eeb54280f77b0`;
+- current release runner on both ranks, SHA-256
+  `68f70d3c1590def934fbf96eee8145906bb7d7157691b7df3658d0cc6171685c`;
+- current direct-oracle binaries were rebuilt from the same checkout and copied
+  to `/home/sime/ffn-tp/paddock-tp-acceptance/`; their hashes matched the head
+  copies before launch.
 
-The two Sparks are occupied by the GLM vLLM serving stack that hosts this
-session itself (`VLLM::Worker_TP0`, `--nnodes 2 --node-rank 0` on
-192.168.100.10 with the worker on .11), so stopping serving or running CUDA
-tests would kill the session's own inference and requires user approval. The
-following must run before any upstream submission:
+The worker used the accepted RoCE interface/HCA and the explicit `--tp-worker`
+CLI path. No target launch used `PADDOCK_TP_WORKER_CHILD`.
 
-1. Real two-node start via `--tp-worker` (no internal marker), handshake,
-   serving, clean shutdown.
-2. Long-context frame regression for B2: several-hundred-token prompt at
-   multi-k context; the old design's largest frame would have exceeded 1 MiB;
-   record the new design's actual largest encoded control frame.
-3. Normal TP=2 non-spec serving smoke: unified overlap, graphs in the accepted
-   mode, concurrent requests, clean rank exit.
-4. Speculative F16 serving smoke (Phase 15 still works after the protocol
-   change).
-5. TP FP8 non-spec smoke.
-6. The new combined spec + FP8 configuration validated per the cleanup-pass
-   instruction (direct FP8 spec oracle, page/lifecycle coverage, optimized
-   execution, normal serving, FP8-non-spec and F16-spec regressions).
+### Host regression
+
+The host gates were rerun against the same checkout before documenting target
+acceptance: `cargo test -q -p paddock-dist` passed 18 tests total (2 + 16
+across its test targets), `cargo test -q -p paddock-runner --lib` passed 572,
+`cargo test -q -p paddock-engine --lib` passed 463, and
+`cargo test -q -p paddock-engine --test tp_wire_frame` passed 4. Targeted
+clippy with `-D clippy::unwrap_used` exited 0; only the existing non-error
+example/style warnings remain. `git diff --check` is clean.
+
+### B1 — explicit two-node worker startup: PASS
+
+`/home/sime/.hermes/cache/scratch/accept-b1-{head,worker}.log` records the
+first target startup using the supported operator path. Rank 0 listened,
+rank 1 joined as `worker`, `tensor-parallel bootstrap complete` was logged,
+rank 0 alone bound the HTTP API, and a normal completion returned HTTP 200
+with text `", I"`. The worker-side socket check found no API listener.
+The coordinator and worker both exited `0` after SIGINT; the coordinator log
+ends with `shutdown: device memory freed - exiting`.
+
+The bounded fail-early checks also passed: an explicit worker with a missing
+model and one with a missing CUDA pack each exited `2` immediately with an
+actionable `--tp-worker model not found` / `--tp-worker kernel pack not found`
+message, without dialing a coordinator.
+
+### B2 — long-context mirror-frame regression: PASS
+
+`/home/sime/.hermes/cache/scratch/accept-b2-{head,worker}.log` records the
+strong run with `max_ctx=8192`, F16 KV, and a 4,000-token prompt (17,999
+characters; 400 repeated prompt sentences). The request returned HTTP 200,
+one completion token, and `prompt_tokens=4000`; both ranks exited `0`.
+The logs contain no `FrameTooLarge`, mirror mismatch, pair-poisoning, NCCL
+mismatch, panic, or signal-139 symptom. The old design's crossing case remains
+mechanically recorded by the host wire test (512 rows at 16k context: 2.18 MB);
+the new design's host measurement was 60 KB for a 4,096-row span. The runtime
+serving path does not expose encoded control-frame sizes, so no target frame
+size is claimed beyond the passing request and the host wire measurements.
+
+### F16 TP=2 non-spec regression: PASS
+
+The live graph/unified HTTP regression (`accept-f16-live-*`) used max batch 2,
+two concurrent requests, categorical arrival during decode, cancellation,
+survivor continuation, release/reuse, and a 55-token page-boundary request;
+both ranks exited `0`. The focused direct probes also passed:
+
+- `accept-f16-pipe-head.log`: production greedy IDs through position 20/page
+  crossing, drain, release/reuse and reset/replay;
+- `accept-f16-overlap-head.log`: categorical decode/finisher IDs, full
+  finisher/next-row logits, page crossing, drain and release/reuse.
+
+### F16 speculative regression: PASS
+
+`accept-f16-spec-head.log` records the direct TP oracle passing zero, partial and
+full greedy acceptance, fixed-plan sampled replay, padded picks, committed
+position advancement and both-rank replay; it exited `0 0` with graph mode
+enabled. The live `accept-f16-spec-live-*` run then passed normal HTTP serving
+with two concurrent requests, cancellation, survivor continuation,
+release/reuse, page-boundary continuation, `PADDOCK_UNIFIED=1`, and
+`PADDOCK_TP_GRAPH=1`; it exited `0 0` and logged prefill-span, slot-mapped-pipe
+and decode-pipe activity.
+
+### FP8 non-spec regression: PASS
+
+The rank-0 log for the live run (`accept-fp8-live-head.log`) explicitly records
+`kv cache: fp8-e4m3`; the same graph/unified HTTP workload as F16 completed,
+including cancellation and reuse, with both ranks exiting `0`. The focused
+`accept-fp8-{pipe,overlap,sampled}-head.log` probes passed page crossing,
+rank-local device sampling, categorical replay, drain, release/reuse and reset
+replay. FP8 output differences from F16 were treated as expected lossy-dtype
+numerics, not as failures.
+
+### FP8 + speculation: PASS — accepted configuration
+
+The direct `accept-fp8-spec-head.log` oracle passed greedy zero/partial/full
+acceptance, sampled deterministic `DevicePlan` replay, rank-0-only sampling,
+rank-symmetric target execution, rejected-prefix position advancement and
+within-FP8 deterministic replay; both ranks exited `0`. The companion
+`accept-fp8-sampled-head.log` probe passed FP8 categorical replay, sparse-hole
+handling, page crossing and release/reuse.
+
+The live `accept-fp8-spec-live-*` run used TP=2, FP8 KV, `--spec on`,
+`PADDOCK_UNIFIED=1`, and coordinator `PADDOCK_TP_GRAPH=1`; the remote worker's
+local graph variable was explicitly unset/different. Two concurrent HTTP
+requests, cancellation, survivor continuation, categorical reuse and the
+55-token page-boundary request completed successfully. The rank-0 log records
+FP8 resolution plus prefill-span, slot-mapped-pipe and decode-pipe activity;
+both ranks exited `0`. No FP8 output was required to match F16 exactly.
+
+### I4 graph-mode handshake: PASS
+
+The coordinator runs set `PADDOCK_TP_GRAPH=1`; the explicit remote worker ran
+with `PADDOCK_TP_GRAPH` unset in B1/B2 and unset or `0` in the live/direct
+regressions. All graph-enabled pairs completed the same collectives and exited
+cleanly. This validates the rank-0-resolved `TpInit.use_graphs` propagation in
+practice; rank 1 did not independently elect eager/graph mode.
+
+### Clean exit and performance observations
+
+All required successful target runs ended with rank-0 and rank-1 exit `0`; no
+exit 139, stale-pack warning, collective mismatch, mirror mismatch or poisoned
+pair appeared. The rebuilt pack was used for every target run. The one
+auxiliary two-slot example was not used as an acceptance gate: its first
+attempt correctly refused without `PADDOCK_NO_SPEC=1`, and its legacy direct
+control sequence did not complete after the precondition was supplied; the
+required cancellation/reuse evidence is provided by the production HTTP
+regressions and the passing pipe/overlap oracles.
+
+The live logs do not emit drafted/accepted token counters, so no fabricated
+acceptance rate is reported. Rough observed request latencies from the accepted
+F16-spec live run were 55-token completion ~4.41 s, 28-token survivor ~2.81 s,
+and 5-token concurrent request ~0.63 s; FP8-spec was ~4.37 s, ~2.78 s and
+~0.62 s respectively. These are sanity observations, not benchmark claims.
+
+### Outstanding target checklist
+
+- B1 explicit `--tp-worker` startup: PASS — `accept-b1-*`, HTTP 200, no worker API,
+  fail-early negatives, exits `0 0`.
+- B2 long-context one-snapshot mirror protocol: PASS — `accept-b2-*`, 4,000
+  prompt tokens at `max_ctx=8192`, HTTP 200, exits `0 0`, no frame/mirror errors.
+- B3 host fail-closed/clippy gate: PASS — host evidence above, no target source
+  changes needed.
+- Non-spec F16 TP=2: PASS — live HTTP plus pipe/overlap oracles.
+- F16 speculation: PASS — direct oracle plus graph/unified live HTTP.
+- FP8 non-spec: PASS — direct pipe/overlap/sampling plus live HTTP.
+- FP8 + speculation direct oracle: PASS — greedy and sampled fixed-plan oracle.
+- FP8 + speculation lifecycle/optimized serving: PASS — cancellation,
+  concurrent requests, reuse, page crossing, unified/graphs, clean HTTP exit.
+- I4 graph handshake: PASS — coordinator-authoritative graph mode with worker
+  environment unset/different.
+- Clean two-rank shutdown: PASS — all required target runs exited `0 0`.
+
+B1/B2/B3/I4 are fully accepted. FP8+spec is now an accepted TP=2
+configuration. The branch is ready for PR-preparation/history-cleanup review;
+that history work is intentionally not performed in this session.
 
 ## 18. Deferred-to-PR-preparation notes
 
