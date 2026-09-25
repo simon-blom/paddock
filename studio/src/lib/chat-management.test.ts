@@ -4,6 +4,7 @@ import { DEFAULT_PARAMS, type Conversation } from '@/types/chat'
 import { useChatStore } from '@/stores/chat'
 import { titleGenerator } from './chat-title'
 import { activeChatControllers } from './chat-activity'
+import { uiPreferences } from './ui-preferences'
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(), get: vi.fn(), put: vi.fn(), remove: vi.fn(),
@@ -24,7 +25,9 @@ beforeEach(() => {
   vi.clearAllMocks()
   setActivePinia(createPinia())
   const data = new Map<string, string>()
-  vi.stubGlobal('localStorage', { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => data.set(k, v), removeItem: (k: string) => data.delete(k) })
+  vi.spyOn(uiPreferences, 'getItem').mockImplementation(k => data.get(k) ?? null)
+  vi.spyOn(uiPreferences, 'setItem').mockImplementation((k, v) => { if (v !== null) data.set(k, v) })
+  vi.spyOn(uiPreferences, 'removeItem').mockImplementation(k => { data.delete(k) })
   vi.stubGlobal('window', { setTimeout, clearTimeout })
   mocks.list.mockResolvedValue([fixture('a'), fixture('b')])
   mocks.get.mockImplementation(async id => fixture(id))

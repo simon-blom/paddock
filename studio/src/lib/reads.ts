@@ -491,19 +491,92 @@ export function routeError(msg: string): ErrorTarget {
   return { where: 'page' }
 }
 
-// ── run history (local) ─────────────────────────────────────────────────────
+// ── shared SQLite history ───────────────────────────────────────────────────
 
+/** One run of a read: what was sent and what came back. The text rides
+ *  along whole, so stepping back to an earlier run shows what it read. */
 export interface ReadRun {
+  id?: string
   at: number
   model: string
   port: number
-  /** the first line or so of the state - the run keeps no full text */
+  /** the first line or so of the state, for labels */
   excerpt: string
   chars: number
+  /** the whole text the run read */
+  state: string
+  /** Imported legacy results had no full input. Never substitute the excerpt. */
+  stateMissing?: boolean
+  questionOrder?: string[][]
+  /** the file the text came from; '' when it was typed or pasted */
+  fileName: string
   questions: Record<string, WireQuestion>
   samples: Samples
   response: ReadResponse
   ms: number
+}
+
+/** A read: a text, its questions and every run made of them. It is the
+ *  Reads page's unit of history, listed in the side panel the way a chat
+ *  lists conversations and kept by the manager (/api/read-history), so a
+ *  read made in one browser is there in the next. */
+export interface ReadDoc {
+  revision?: string
+  id: string
+  title: string
+  /** the reader of the latest run */
+  model: string
+  createdAt: number
+  updatedAt: number
+  /** oldest first; the page shows the last one */
+  runs: ReadRun[]
+}
+
+/** A side-panel row. `runs` is a count here, never the runs themselves. */
+export interface ReadSummary {
+  revision?: string
+  id: string
+  title: string
+  model: string
+  runs: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** Swift dictionaries do not preserve JSON key order. Both clients honor the
+ * explicit order; refuse malformed metadata instead of silently dropping rows. */
+export function orderedRunQuestions(run: ReadRun): Record<string, WireQuestion> {
+  if (!run.questionOrder) return run.questions
+  const keys = Object.keys(run.questions)
+  const ids = run.questionOrder.map((row) => row[0])
+  if (ids.length !== keys.length || new Set(ids).size !== keys.length ||
+    ids.some((id) => !id || !keys.includes(id))) throw new Error('Invalid saved question order')
+  return Object.fromEntries(run.questionOrder.map(([id, ...options]) => {
+    const q = run.questions[id!]!
+    if (q.type !== 'choice') return [id!, q]
+    const criteria = q.criteria as Record<string, string>
+    const names = Object.keys(criteria ?? {})
+    if (options.length !== names.length || new Set(options).size !== names.length ||
+      options.some((name) => !names.includes(name))) throw new Error('Invalid saved choice order')
+    return [id!, { ...q, criteria: Object.fromEntries(options.map((name) => [name, criteria[name]])) }]
+  }))
+}
+
+/** Runs kept per read; the oldest go first. Each run holds its text, so this
+ *  is what bounds a read's size. */
+export const READ_RUNS_KEEP = 20
+
+/** A new read is named after where its text came from: the file, else the
+ *  text's first line. */
+export function readTitle(state: string, fileName: string): string {
+  if (fileName.trim()) return fileName.trim()
+  const first = state.split(/\r?\n/).find((l) => l.trim()) ?? ''
+  return excerptOf(first, 60) || 'Untitled read'
+}
+
+/** Append a run, dropping the oldest past READ_RUNS_KEEP. */
+export function withRun(runs: ReadRun[], run: ReadRun): ReadRun[] {
+  return [...runs, run].slice(-READ_RUNS_KEEP)
 }
 
 export function excerptOf(state: string, max = 120): string {

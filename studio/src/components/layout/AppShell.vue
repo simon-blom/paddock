@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { uiPreferences } from '@/lib/ui-preferences'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme } from '@/composables/useTheme'
@@ -23,8 +24,8 @@ const tele = useTelemetryStore()
 const registry = useRegistryStore()
 
 // Resizable GPU dock (persisted).
-const dockWidth = ref(Number(localStorage.getItem('pk_gpu_dock_width')) || 320)
-watch(dockWidth, (w) => localStorage.setItem('pk_gpu_dock_width', String(w)))
+const dockWidth = ref(Number(uiPreferences.getItem('pk_gpu_dock_width')) || 320)
+watch(dockWidth, (w) => uiPreferences.setItem('pk_gpu_dock_width', String(w)))
 
 onMounted(() => {
   initTheme()
@@ -148,7 +149,9 @@ router.beforeEach((to) => {
 // The chat surface runs edge-to-edge on all three of its routes (a chat, the
 // start page, and New chat's /chat/new); other panels get the padded,
 // scrollable content area.
-const isChat = computed(() => ['chat', 'chat-new', 'home'].includes(String(route.name)))
+// full-bleed pages: the chat, and Reads - both a history list beside a
+// workspace that scrolls on its own
+const isChat = computed(() => ['chat', 'chat-new', 'home', 'reads'].includes(String(route.name)))
 </script>
 
 <template>

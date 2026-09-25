@@ -1,17 +1,19 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { uuid } from '@/lib/uuid'
-import { readsApi, type SavedReadSet } from '@/lib/api'
-import type { ReadRun } from '@/lib/reads'
+import { readHistoryApi, readsApi, type SavedReadSet } from '@/lib/api'
+import type { ReadDoc, ReadSummary } from '@/lib/reads'
 
-/** Saved read sets - named question sets for the Reads page, backed by the
- *  server store (/api/reads) on the Prompts pattern: the same optimistic
- *  revision on save and delete, the acknowledged row published rather than
- *  a refresh that might fail after commit.
+/** The Reads page's two kinds of record, both kept by the manager.
  *
- *  Run history is LOCAL and per set: the last few reads (excerpt, answers,
- *  model, time) so a tweak can be read against the previous result. It is a
- *  convenience, so it lives in localStorage and the page renders without it. */
+ *  Saved read SETS are named question sets (/api/reads) on the Prompts
+ *  pattern: the same optimistic revision on save and delete, the acknowledged
+ *  row published rather than a refresh that might fail after commit.
+ *
+ *  READS are the page's history (/api/read-history): a text, its questions
+ *  and every run, listed in the side panel the way a chat lists
+ *  conversations. The list holds summaries; a read is fetched whole to open
+ *  it and saved whole after each run, never from a summary. */
 export const useReadsStore = defineStore('reads', () => {
   const sets = ref<SavedReadSet[]>([])
   const loading = ref(false)
@@ -56,43 +58,87 @@ export const useReadsStore = defineStore('reads', () => {
     loading.value = false
     error.value = null
     sets.value = sets.value.filter((s) => s.id !== id)
-    forgetRuns(id)
   }
 
-  // ── local run history ───────────────────────────────────────────────────
+  // ── reads: the side panel's history ─────────────────────────────────────
 
-  const RUNS_KEEP = 10
-  function runsKey(setId: string | undefined): string {
-    return `pk_reads_runs:${setId ?? 'draft'}`
-  }
-  function runsOf(setId: string | undefined): ReadRun[] {
+  const reads = ref<ReadSummary[]>([])
+  const readsLoaded = ref(false)
+  const readsError = ref<string | null>(null)
+  let readsGeneration = 0
+
+  async function refreshReads(): Promise<void> {
+    const generation = ++readsGeneration
     try {
-      const raw = localStorage.getItem(runsKey(setId))
-      if (!raw) return []
-      const v = JSON.parse(raw) as unknown
-      return Array.isArray(v) ? (v as ReadRun[]) : []
-    } catch {
-      return []
+      const rows = await readHistoryApi.list()
+      if (generation === readsGeneration) {
+        reads.value = rows
+        readsError.value = null
+      }
+    } catch (e) {
+      if (generation === readsGeneration) readsError.value = e instanceof Error ? e.message : String(e)
+    } finally {
+      if (generation === readsGeneration) readsLoaded.value = true
     }
   }
-  /** Keep a run; the newest first, the oldest dropped past RUNS_KEEP. A full
-   *  storage never fails the read - the run is simply not remembered. */
-  function recordRun(setId: string | undefined, run: ReadRun): ReadRun[] {
-    const next = [run, ...runsOf(setId)].slice(0, RUNS_KEEP)
-    try {
-      localStorage.setItem(runsKey(setId), JSON.stringify(next))
-    } catch {
-      /* quota or private mode: history is a convenience */
+
+  function loadRead(id: string): Promise<ReadDoc> {
+    return readHistoryApi.get(id)
+  }
+
+  /** Save a whole read and move its row to the top: the list follows what
+   *  the manager acknowledged, not a refetch that could race the next run. */
+  async function saveRead(doc: ReadDoc): Promise<ReadSummary> {
+    const reply = await readHistoryApi.save(doc)
+    doc.revision = reply.read?.revision
+    ++readsGeneration
+    const row: ReadSummary = reply.read ?? {
+      id: doc.id,
+      title: doc.title,
+      model: doc.model,
+      runs: doc.runs.length,
+      createdAt: doc.createdAt,
+      updatedAt: doc.updatedAt,
     }
+    reads.value = [row, ...reads.value.filter((r) => r.id !== row.id)]
+    readsError.value = null
+    return row
+  }
+
+  async function removeRead(id: string): Promise<void> {
+    const doc = await readHistoryApi.get(id)
+    await readHistoryApi.remove(id, doc.revision!)
+    ++readsGeneration
+    reads.value = reads.value.filter((r) => r.id !== id)
+  }
+
+  /** Rename from the side panel: the read is fetched whole and saved whole,
+   *  so a title change never travels on a summary. */
+  async function renameRead(id: string, title: string): Promise<ReadDoc> {
+    const doc = await readHistoryApi.get(id)
+    const next = { ...doc, title: title.trim() || doc.title }
+    const reply = await readHistoryApi.save(next)
+    next.revision = reply.read?.revision
+    ++readsGeneration
+    // a rename keeps the row where it is: position follows the last run
+    reads.value = reads.value.map((r) => (r.id === id ? (reply.read ?? { ...r, title: next.title }) : r))
     return next
   }
-  function forgetRuns(setId: string | undefined): void {
-    try {
-      localStorage.removeItem(runsKey(setId))
-    } catch {
-      /* nothing to forget */
-    }
-  }
 
-  return { sets, loading, error, refresh, save, remove, runsOf, recordRun, forgetRuns }
+  return {
+    sets,
+    loading,
+    error,
+    refresh,
+    save,
+    remove,
+    reads,
+    readsLoaded,
+    readsError,
+    refreshReads,
+    loadRead,
+    saveRead,
+    removeRead,
+    renameRead,
+  }
 })

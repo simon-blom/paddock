@@ -1,3 +1,4 @@
+import { uiPreferences } from '@/lib/ui-preferences'
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import type { VisionBudget } from '@/lib/vision'
@@ -491,14 +492,14 @@ export const useModelsStore = defineStore('models', () => {
   // every restart (Laguna, every time -). Explicit picks
   // persist; the fallback's choice is provisional (autoValue) and the
   // remembered model reclaims the seat the moment it is available.
-  const remembered = ref<string>(localStorage.getItem('pk_model') ?? '')
+  const remembered = ref<string>(uiPreferences.getItem('pk_model') ?? '')
   let autoValue = ''
   let retriedForRemembered = false
   watch(currentId, (v) => {
     if (!v || v === autoValue) return
     autoValue = ''
     remembered.value = v
-    localStorage.setItem('pk_model', v)
+    uiPreferences.setItem('pk_model', v)
   })
   const loading = ref(false)
   const error = ref<string | null>(null)

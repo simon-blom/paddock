@@ -38,8 +38,8 @@ export interface RecentFileEntry {
 /**
  * Pluggable storage backend for the recent-files list.
  *
- * The default implementation uses `window.localStorage`. Apps can supply
- * their own (IndexedDB, server-side, custom encryption, etc.) by setting
+ * The default implementation uses the host preferenceStore (memory-only if absent). Apps can supply
+ * their own server-side store by setting
  * `LectorEngineOptions.recentFilesStore`.
  */
 export interface RecentFilesStore {

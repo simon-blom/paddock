@@ -4,6 +4,7 @@
 // pdfium build, so no COOP/COEP cross-origin-isolation headers are needed; the
 // loader + .wasm are served from /pdfium/ (studio/public/pdfium).
 import { LectorEngine } from '@truespar/lector-core'
+import { uiPreferences } from './ui-preferences'
 import { CORE_PLUGINS, READER_PLUGINS } from '@truespar/lector-vue'
 // `?worker&url` points straight at the package's module-worker export - a .ts
 // re-export or a side-effect import both fail under Vite 8/rolldown (the worker
@@ -18,6 +19,7 @@ export function pdfEngine(): Promise<LectorEngine> {
   if (!enginePromise) {
     enginePromise = (async () => {
       const engine = new LectorEngine({
+        preferenceStore: uiPreferences,
         // Both primary + fallback point at the single-threaded build, so it
         // loads regardless of crossOriginIsolated (we never set the headers).
         wasmUrl: '/pdfium/pdfium-st.wasm',
@@ -58,6 +60,7 @@ export function pdfViewerEngine(): Promise<LectorEngine> {
   if (!viewerEnginePromise) {
     viewerEnginePromise = (async () => {
       const engine = new LectorEngine({
+        preferenceStore: uiPreferences,
         wasmUrl: '/pdfium/pdfium-st.wasm',
         wasmJsUrl: '/pdfium/pdfium-st.js',
         wasmUrlFallback: '/pdfium/pdfium-st.wasm',

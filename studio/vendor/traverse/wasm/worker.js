@@ -164,43 +164,15 @@ async function handle(kind, payload) {
       }
     }
 
-    // ── OPFS persistence ────────────────────────────────────────
-
-    case 'commit': {
-      await ensureReady()
-      const bytes = db.exportTvdb()
-      await opfsWrite(payload.name, bytes)
-      return { ok: true, bytes: bytes.byteLength }
-    }
-
-    case 'writeBytes': {
-      // Persist a caller-provided `.tvdb` byte buffer to OPFS WITHOUT
-      // touching the engine. Used by the upload flow: lets the file
-      // manager show "uploading" then "loading into memory" as two
-      // separate phases, instead of one long opaque pause while the
-      // engine parses a 500 MB tvdb.
-      await ensureReady()
-      const bytes = payload.bytes
-      await opfsWrite(payload.name, bytes)
-      return { ok: true, bytes: bytes.byteLength }
-    }
-
-    case 'open': {
-      await ensureReady()
-      const bytes = await opfsRead(payload.name)
-      if (!bytes) {
-        return { ok: false, missing: true }
-      }
-      db.loadTvdb(bytes)
-      return { ok: true, nodes: db.nodeCount(), edges: db.edgeCount() }
-    }
-
+    // Persistence is owned by Paddock's Rust graph API, not the renderer.
+    // Keep an explicit failure for obsolete clients rather than silently
+    // saving a second graph in the browser or pretending memory is durable.
+    case 'commit':
+    case 'writeBytes':
+    case 'open':
     case 'listDatabases':
-      return await opfsList()
-
     case 'deleteDatabase':
-      await opfsDelete(payload.name)
-      return { ok: true }
+      throw new Error('Use the Paddock graph API for persistence')
 
     // ── Manual byte-level I/O for File-API import / Download export ──
     // The bytes are the same `.tvdb` binary format the native server
@@ -230,10 +202,6 @@ async function handle(kind, payload) {
  *  live here as `<name>.tvdb` (binary) files; per-database studio
  *  metadata (styles, saved queries) lives as `<name>.studio.json`
  *  sidecar files. */
-async function opfsDir() {
-  const root = await navigator.storage.getDirectory()
-  return root.getDirectoryHandle('traverse', { create: true })
-}
 
 /** Empty QueryStats — Cypher executor doesn't emit one yet on WASM,
  *  so import stats are derived from before/after counts. */
@@ -262,76 +230,4 @@ function stats0FromResponse(_response, before, db) {
   if (de > 0) stats.relationships_created = de
   else if (de < 0) stats.relationships_deleted = -de
   return stats
-}
-
-/** Write bytes to OPFS via a sync access handle (worker-only API). */
-async function opfsWrite(name, bytes) {
-  const dir = await opfsDir()
-  const file = await dir.getFileHandle(filename(name), { create: true })
-  const handle = await file.createSyncAccessHandle()
-  try {
-    handle.truncate(0)
-    handle.write(bytes, { at: 0 })
-    handle.flush()
-  } finally {
-    handle.close()
-  }
-}
-
-/** Read bytes from OPFS. Returns null if the file doesn't exist. */
-async function opfsRead(name) {
-  const dir = await opfsDir()
-  let file
-  try {
-    file = await dir.getFileHandle(filename(name))
-  } catch {
-    return null
-  }
-  const handle = await file.createSyncAccessHandle()
-  try {
-    const size = handle.getSize()
-    const buf = new Uint8Array(size)
-    handle.read(buf, { at: 0 })
-    return buf
-  } finally {
-    handle.close()
-  }
-}
-
-/** List databases in OPFS root. Sidecar `.studio.json` files are
- *  hidden from this listing (Studio reaches for them separately). */
-async function opfsList() {
-  const dir = await opfsDir()
-  const items = []
-  // @ts-ignore — OPFS async iterator is well-supported in modern browsers.
-  for await (const [filenameStr, entry] of dir.entries()) {
-    if (entry.kind !== 'file') continue
-    if (!filenameStr.endsWith('.tvdb')) continue
-    const f = await entry.getFile()
-    items.push({
-      name: filenameStr.slice(0, -'.tvdb'.length),
-      size: f.size,
-      lastModified: f.lastModified,
-    })
-  }
-  return items.sort((a, b) => b.lastModified - a.lastModified)
-}
-
-/** Delete a database from OPFS. No-op if it doesn't exist. */
-async function opfsDelete(name) {
-  const dir = await opfsDir()
-  try {
-    await dir.removeEntry(filename(name))
-  } catch {
-    // Already gone — fine.
-  }
-}
-
-/** Filename for an OPFS-stored database. Slashes / dots in the user
- *  name are stripped to keep the OPFS layout flat. The binary tvdb
- *  buffer (paged layout, lz4-per-record, same on-disk format as the
- *  native server) lives under `<name>.tvdb`. */
-function filename(name) {
-  const safe = String(name).replace(/[\/\\.]/g, '_')
-  return `${safe}.tvdb`
 }

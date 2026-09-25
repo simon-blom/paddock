@@ -5,9 +5,8 @@ type Theme = 'light' | 'dark'
 
 /**
  * Light/dark theme: the setting is stored in the `settings` Pinia store
- * (persisted to localStorage as `pk_theme`); applying it writes `data-theme`
- * on <html>. An anti-FOUC script in index.html applies the stored value
- * before this bundle loads, so `initTheme` just re-syncs the DOM to the store.
+ * (persisted in SQLite); applying it writes `data-theme` on <html>.
+ * Preferences hydrate before the app mounts.
  */
 export function useTheme() {
   const settings = useSettingsStore()

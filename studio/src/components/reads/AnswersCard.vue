@@ -9,7 +9,7 @@
 import { computed } from 'vue'
 import Collapsible from '@/components/ui/Collapsible.vue'
 import Icon from '@/components/Icon.vue'
-import Select, { type SelectOption } from '@/components/ui/Select.vue'
+import Tooltip from '@/components/ui/Tooltip.vue'
 import ProbBars from './ProbBars.vue'
 import ReadHeatmap from './ReadHeatmap.vue'
 import { fmtClock } from '@/lib/format'
@@ -31,9 +31,11 @@ import {
 
 const props = defineProps<{
   run: ReadRun | null
-  history: ReadRun[]
-  /** index into `history` of the run shown, when it is one of them */
-  selected: number
+  /** which run of the open read is shown, and how many it has: the answers
+   *  step through one read's runs, never through other reads - those are
+   *  the side panel's */
+  runIndex: number
+  runCount: number
   busy: boolean
   /** the editor has moved on since this read: the answers on show are of
    *  a request that is no longer the one Run would send */
@@ -41,15 +43,9 @@ const props = defineProps<{
   /** a reader is up and the page can fill and run its worked example */
   canExample: boolean
 }>()
-const emit = defineEmits<{ (e: 'select', index: number): void; (e: 'example'): void }>()
+const emit = defineEmits<{ (e: 'step', delta: number): void; (e: 'example'): void }>()
 
-const historyOptions = computed<SelectOption[]>(() =>
-  props.history.map((r, i) => ({
-    value: i,
-    label: `${fmtClock(new Date(r.at))} ${r.excerpt}`.slice(0, 72),
-    hint: `${r.response.diagnostics.reads} read${r.response.diagnostics.reads === 1 ? '' : 's'}`,
-  })),
-)
+const runWhen = computed(() => (props.run ? fmtClock(new Date(props.run.at)) : ''))
 
 interface Block {
   id: string
@@ -132,14 +128,36 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
         {{ run.ms }} ms · {{ run.response.diagnostics.reads }}
         read{{ run.response.diagnostics.reads === 1 ? '' : 's' }}
       </span>
-      <span v-if="run && stale && !busy" class="ac__stale">edited since this read</span>
-      <Select
-        v-if="history.length > 1"
-        class="ac__hist"
-        :model-value="selected"
-        :options="historyOptions"
-        @update:model-value="(v) => emit('select', Number(v))"
-      />
+      <span v-if="run && stale && !busy" class="ac__stale">edited since this run</span>
+      <!-- the same < 2/3 > a chat turn shows for its versions: here, the runs
+           of this read, oldest first, the latest on show until stepped back -->
+      <nav v-if="runCount > 1" class="ac__runs" aria-label="Runs of this read">
+        <Tooltip label="Earlier run">
+          <button
+            class="ac__runbtn"
+            type="button"
+            :disabled="busy || runIndex <= 0"
+            aria-label="Earlier run"
+            @click="emit('step', -1)"
+          >
+            <Icon name="chevron-left" :size="13" />
+          </button>
+        </Tooltip>
+        <Tooltip :label="`Run ${runIndex + 1} of ${runCount}, at ${runWhen}`">
+          <span class="ac__runcount" aria-live="polite">{{ runIndex + 1 }}/{{ runCount }}</span>
+        </Tooltip>
+        <Tooltip label="Later run">
+          <button
+            class="ac__runbtn"
+            type="button"
+            :disabled="busy || runIndex >= runCount - 1"
+            aria-label="Later run"
+            @click="emit('step', 1)"
+          >
+            <Icon name="chevron-right" :size="13" />
+          </button>
+        </Tooltip>
+      </nav>
     </div>
 
     <div v-if="busy && !run" class="ac__empty">
@@ -303,8 +321,39 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
   color: var(--pk-status-warning);
   font-size: var(--pk-font-size-xs);
 }
-.ac__hist {
+.ac__runs {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
   margin-left: auto;
+}
+.ac__runbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: var(--pk-radius-sm);
+  background: none;
+  color: var(--pk-text-muted);
+  cursor: pointer;
+}
+.ac__runbtn:hover:not(:disabled) {
+  background: var(--pk-bg-elevated);
+  color: var(--pk-text-primary);
+}
+.ac__runbtn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.ac__runcount {
+  min-width: 30px;
+  text-align: center;
+  font-family: var(--pk-font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--pk-text-secondary);
 }
 .ac__empty {
   display: flex;

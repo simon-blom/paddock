@@ -30,6 +30,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runnerConfigKeys } from './config-fields.mjs'
+import './check-browser-storage.mjs'
 
 const SRC = fileURLToPath(new URL('../src', import.meta.url))
 const INDEX_HTML = fileURLToPath(new URL('../index.html', import.meta.url))

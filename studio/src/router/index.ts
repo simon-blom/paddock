@@ -112,7 +112,8 @@ const router = createRouter({
         // read yields a table, not a reply, so it is a page beside
         // embeddings and never a chat lane. The nav shows it only while a
         // running model advertises the capability.
-        { path: 'reads', name: 'reads', component: ReadsPanel },
+        // /studio/reads/<id> names the read on screen; no id is a new read
+        { path: 'reads/:id?', name: 'reads', component: ReadsPanel },
         // Pictures are made in a CONVERSATION: an image model holds a lane in
         // the chat like a speech model does, the prompt is the turn and the
         // picture the reply, with its seed and settings on the record. The

@@ -1,55 +1,35 @@
 import "./chunk-UAWBPTDW.js";
 
-// src/worker/wasm-cache.ts
-var CACHE_NAME = "lector-wasm-v1";
-async function getCachedResponse(url) {
-  try {
-    if (typeof caches === "undefined") return null;
-    const cache = await caches.open(CACHE_NAME);
-    const response = await cache.match(url);
-    return response ?? null;
-  } catch {
-    return null;
-  }
-}
-async function cacheResponse(url, response) {
-  try {
-    if (typeof caches === "undefined") return;
-    const cache = await caches.open(CACHE_NAME);
-    await cache.put(url, response);
-  } catch {
-  }
-}
+// Paddock uses shipped assets and a bounded worker-lifetime compiled-module
+// cache. No browser CacheStorage; terminating the worker releases this cache.
+const modules = new Map();
 async function loadWasmCached(wasmUrl, imports) {
-  const cached = await getCachedResponse(wasmUrl);
-  if (cached && typeof WebAssembly.instantiateStreaming === "function") {
-    const result2 = await WebAssembly.instantiateStreaming(cached, imports);
-    return { instance: result2.instance, module: result2.module };
+  let pending = modules.get(wasmUrl);
+  if (!pending) {
+    pending = (async () => {
+      const response = await fetch(wasmUrl);
+      if (!response.ok) throw new Error("PDF engine download failed: " + response.status);
+      if (typeof WebAssembly.compileStreaming === "function") {
+        try { return await WebAssembly.compileStreaming(response.clone()); } catch { /* MIME fallback */ }
+      }
+      return await WebAssembly.compile(await response.arrayBuffer());
+    })();
+    if (modules.size >= 4) modules.delete(modules.keys().next().value);
+    modules.set(wasmUrl, pending);
   }
-  if (typeof WebAssembly.instantiateStreaming === "function") {
-    const response2 = await fetch(wasmUrl);
-    const responseForCache = response2.clone();
-    const result2 = await WebAssembly.instantiateStreaming(response2, imports);
-    void cacheResponse(wasmUrl, responseForCache);
-    return { instance: result2.instance, module: result2.module };
+  let module;
+  try { module = await pending; } catch (error) {
+    if (modules.get(wasmUrl) === pending) modules.delete(wasmUrl);
+    throw error;
   }
-  const response = await fetch(wasmUrl);
-  const bytes = await response.arrayBuffer();
-  const result = await WebAssembly.instantiate(bytes, imports);
-  return { instance: result.instance, module: result.module };
+  return { module, instance: await WebAssembly.instantiate(module, imports) };
 }
 function createInstantiateWasmHook(wasmUrl) {
   return (imports, receiveInstance) => {
     loadWasmCached(wasmUrl, imports).then(({ instance, module }) => {
       receiveInstance(instance, module);
-    }).catch((err) => {
-      throw err;
-    });
+    }).catch((err) => { throw err; });
     return {};
   };
 }
-export {
-  createInstantiateWasmHook,
-  loadWasmCached
-};
-//# sourceMappingURL=wasm-cache-IXSAKVDT.js.map
+export { createInstantiateWasmHook, loadWasmCached };

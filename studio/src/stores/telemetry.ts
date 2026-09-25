@@ -1,3 +1,4 @@
+import { uiPreferences } from '@/lib/ui-preferences'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import type { GpuSnapshot } from '@/lib/api'
@@ -27,7 +28,7 @@ function push<T>(arr: T[], v: T): void {
  *  snapshots in real time - including mid-generation, since the server samples
  *  off the inference thread. No HTTP polling. */
 export const useTelemetryStore = defineStore('telemetry', () => {
-  const open = ref(localStorage.getItem('pk_gpu_dock') === '1')
+  const open = ref(uiPreferences.getItem('pk_gpu_dock') === '1')
   const snapshot = ref<GpuSnapshot | null>(null)
   const history = ref<Record<number, Series>>({})
   const connected = ref(false)
@@ -191,7 +192,7 @@ export const useTelemetryStore = defineStore('telemetry', () => {
 
   function setOpen(v: boolean): void {
     open.value = v
-    localStorage.setItem('pk_gpu_dock', v ? '1' : '0')
+    uiPreferences.setItem('pk_gpu_dock', v ? '1' : '0')
     sync()
   }
   function toggle(): void {

@@ -47,6 +47,8 @@ export interface StampTemplate {
 }
 /** Configuration for creating a LectorEngine instance. */
 export interface LectorEngineOptions {
+    /** Host-managed persistence; omitted means memory-only. */
+    readonly preferenceStore?: { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
     /** URL of the pdfium.wasm binary (multi-threaded, requires COOP+COEP headers). */
     readonly wasmUrl: string;
     /** URL of the Emscripten JS loader (pdfium.js). */
@@ -98,7 +100,7 @@ export interface LectorEngineOptions {
     readonly hourCycle?: 'h11' | 'h12' | 'h23' | 'h24';
     /**
      * Custom storage backend for the document manager's recent-files list.
-     * Defaults to a `localStorage`-backed implementation. Apps that need
+     * Defaults to the host preferenceStore (memory-only if absent). Apps that need
      * IndexedDB, server-side persistence, or custom encryption can supply
      * their own. Type is loose to avoid a circular import; the actual shape
      * is `RecentFilesStore` from `plugins/document-manager-plugin`.
@@ -106,7 +108,7 @@ export interface LectorEngineOptions {
     readonly recentFilesStore?: unknown;
     /** Maximum entries kept in the recent-files list. Default 20. */
     readonly recentFilesMax?: number;
-    /** localStorage key under which the recent-files list is persisted. */
+    /** Host preference key under which the recent-files list is persisted. */
     readonly recentFilesStorageKey?: string;
     /**
      * Whether the document manager should automatically register the viewer
@@ -243,9 +245,10 @@ export declare class LectorEngine implements Disposable {
     readonly hourCycle: 'h11' | 'h12' | 'h23' | 'h24' | undefined;
     /** Custom recent-files store, if provided. */
     readonly recentFilesStore: unknown;
+    readonly preferenceStore: LectorEngineOptions['preferenceStore'];
     /** Max number of recent-files entries. */
     readonly recentFilesMax: number | undefined;
-    /** localStorage key for recent files. */
+    /** Host preference key for recent files. */
     readonly recentFilesStorageKey: string | undefined;
     /** Auto-register the viewer container as a drop zone. */
     readonly enableViewerDropZone: boolean;

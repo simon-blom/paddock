@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { uiPreferences } from '@/lib/ui-preferences'
 import { computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NATIVE_CONTENT } from '@/lib/native-content'
 import { useRoute, useRouter } from 'vue-router'
@@ -62,13 +63,13 @@ const { isStreaming, send, regenerate, editAndResend, continueLast, stop } = use
 initMarkstream()
 
 /** A persisted panel width, parsed so that zero SURVIVES. The obvious
- *  `Number(localStorage.getItem(k)) || fallback` reads a stored "0" as falsy
+ *  `Number(uiPreferences.getItem(k)) || fallback` reads a stored "0" as falsy
  *  and hands back the default, so a collapsed history sidebar was always open
  *  again after a reload - the state could be set but not saved.
  *  Number(null) is 0, so the missing key has to be caught first
  *  or every fresh browser would start collapsed. */
 function storedWidth(key: string, fallback: number): number {
-  const raw = localStorage.getItem(key)
+  const raw = uiPreferences.getItem(key)
   if (raw === null || raw === '') return fallback
   const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? n : fallback
@@ -92,10 +93,10 @@ const sidebarOpenWidth = ref(
   storedWidth('pk_sidebar_open_width', sidebarWidth.value || SIDEBAR_DEFAULT),
 )
 watch(sidebarWidth, (w) => {
-  localStorage.setItem('pk_sidebar_width', String(w))
+  uiPreferences.setItem('pk_sidebar_width', String(w))
   if (w > 0) {
     sidebarOpenWidth.value = w
-    localStorage.setItem('pk_sidebar_open_width', String(w))
+    uiPreferences.setItem('pk_sidebar_open_width', String(w))
   }
 })
 const sidebarOpen = computed(() => sidebarWidth.value > 0)
@@ -136,7 +137,7 @@ function defaultArtifactWidth(): number {
 // default, so the better default would never reach them. The new key hands it
 // out once; every drag after that is theirs.
 const artifactWidth = ref(storedWidth('pk_artifact_width_v2', defaultArtifactWidth()))
-watch(artifactWidth, (w) => localStorage.setItem('pk_artifact_width_v2', String(w)))
+watch(artifactWidth, (w) => uiPreferences.setItem('pk_artifact_width_v2', String(w)))
 
 // The graph is its own side panel, never a lodger in the artifact column
 // ("that is its own sidepanel"). First-open width is a
@@ -148,7 +149,7 @@ function defaultGraphWidth(): number {
   return Math.max(480, Math.min(1000, Math.round(free * 0.45)))
 }
 const graphPaneWidth = ref(storedWidth('pk_graphpane_width_v1', defaultGraphWidth()))
-watch(graphPaneWidth, (w) => localStorage.setItem('pk_graphpane_width_v1', String(w)))
+watch(graphPaneWidth, (w) => uiPreferences.setItem('pk_graphpane_width_v1', String(w)))
 
 // Document mode divides the MAIN AREA into columns and the first one is the
 // document: the pane shows the conversation's sticky
@@ -184,7 +185,7 @@ function defaultDocPaneWidth(): number {
 // reach them. A new key hands out the new default once; every drag after that
 // is theirs and sticks.
 const docPaneWidth = ref(storedWidth('pk_docpane_width_v2', defaultDocPaneWidth()))
-watch(docPaneWidth, (w) => localStorage.setItem('pk_docpane_width_v2', String(w)))
+watch(docPaneWidth, (w) => uiPreferences.setItem('pk_docpane_width_v2', String(w)))
 
 // ── the document pane: one viewer per format, reached the same way ─────────
 // It used to appear only for document-parser models, and a PDF in an ordinary

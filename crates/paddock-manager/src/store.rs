@@ -19,6 +19,8 @@ mod integrations;
 mod model_profiles;
 mod native_benchmarks;
 mod prompts;
+mod read_history;
+mod read_history_migration;
 mod read_runs;
 mod reads;
 
@@ -391,6 +393,21 @@ CREATE TABLE IF NOT EXISTS read_sets (
     updated_at INTEGER NOT NULL
 );
 
+-- the Reads page's earlier reads (store/read_history.rs): a text, its
+-- questions and every run, like a conversation - title/model/runs are columns
+-- so the side panel lists without reading `doc`
+CREATE TABLE IF NOT EXISTS read_history (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    model      TEXT NOT NULL DEFAULT '',
+    runs       INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    doc        TEXT NOT NULL
+);
+
+-- the native app's bounded result history (store/read_runs.rs): the last
+-- results per question set, a short excerpt and never the document
 CREATE TABLE IF NOT EXISTS read_runs (
     scope TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -1660,6 +1677,42 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value=?2",
             params![key, v],
         )?;
+        Ok(())
+    }
+
+    /// Commit a settings patch as one unit. Imports never overwrite an existing
+    /// key (including a null tombstone), even with simultaneous Studio clients.
+    pub fn patch_settings(&self, patch: &Value, import: bool) -> Result<(), StoreError> {
+        let map = patch
+            .as_object()
+            .ok_or_else(|| StoreError::Bad("settings must be an object".into()))?;
+        if map.len() > 128 || patch.to_string().len() > 1024 * 1024 {
+            return Err(StoreError::Bad("settings patch is too large".into()));
+        }
+        for key in map.keys() {
+            if key.is_empty() || key.len() > 160 {
+                return Err(StoreError::Bad("invalid setting key".into()));
+            }
+            if import && !key.starts_with("studio.") && key != "readsPanelOpen" {
+                return Err(StoreError::Bad(
+                    "only Studio preferences can be imported".into(),
+                ));
+            }
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for (key, value) in map {
+            tx.execute(
+                if import {
+                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)"
+                } else {
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                },
+                params![key, value.to_string()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3195,6 +3248,55 @@ mod tests {
 
     fn mem_store() -> Store {
         Store::open(&PathBuf::from(":memory:")).expect("mem db")
+    }
+
+    #[test]
+    fn settings_import_preserves_existing_keys_and_tombstones() {
+        let s = mem_store();
+        s.patch_settings(
+            &json!({"studio.pk_theme": "dark", "studio.pk_model": null}),
+            false,
+        )
+        .unwrap();
+        s.patch_settings(&json!({"studio.pk_theme": "light", "studio.pk_model": "old", "studio.pk_sidebar_width": "0"}), true).unwrap();
+        let saved = s.all_settings().unwrap();
+        assert_eq!(saved["studio.pk_theme"], "dark");
+        assert!(saved["studio.pk_model"].is_null());
+        assert_eq!(saved["studio.pk_sidebar_width"], "0");
+    }
+
+    #[test]
+    fn settings_patch_validation_prevents_partial_writes() {
+        let s = mem_store();
+        assert!(
+            s.patch_settings(
+                &json!({"studio.pk_theme": "light", "not-a-preference": "x"}),
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(s.all_settings().unwrap(), json!({}));
+        assert!(s.patch_settings(&json!(["bad"]), false).is_err());
+        assert!(
+            s.patch_settings(&json!({"x": "x".repeat(1024 * 1024)}), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn settings_sql_failure_rolls_back_the_entire_patch() {
+        let s = mem_store();
+        s.lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_setting BEFORE INSERT ON settings
+            WHEN NEW.key = 'studio.z' BEGIN SELECT RAISE(ABORT, 'test disk error'); END;",
+            )
+            .unwrap();
+        assert!(
+            s.patch_settings(&json!({"studio.a": "first", "studio.z": "last"}), false)
+                .is_err()
+        );
+        assert_eq!(s.all_settings().unwrap(), json!({}));
     }
 
     fn conv(id: &str, messages: Value) -> Value {

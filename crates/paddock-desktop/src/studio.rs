@@ -151,6 +151,8 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "models", "catalog" | "estimate" | "pulls"] => *method == Method::GET,
         ["api", "usage", "history"] => *method == Method::GET,
         ["api", "reads"] => matches!(*method, Method::GET | Method::POST),
+        ["api", "read-history"] => *method == Method::GET,
+        ["api", "read-history", _] => matches!(*method, Method::GET | Method::PUT | Method::DELETE),
         ["api", "read-runs", _] => matches!(*method, Method::GET | Method::POST | Method::DELETE),
         ["api", "reads", _] => matches!(*method, Method::GET | Method::PUT | Method::DELETE),
         ["api", "runners", port, "v1", "systemone"] if port.parse::<u16>().is_ok() => {
@@ -576,6 +578,10 @@ mod tests {
         for (method, path) in [
             (Method::GET, "/api/reads"),
             (Method::POST, "/api/reads"),
+            (Method::GET, "/api/read-history"),
+            (Method::GET, "/api/read-history/a"),
+            (Method::PUT, "/api/read-history/a"),
+            (Method::DELETE, "/api/read-history/a"),
             (Method::GET, "/api/reads/set-1"),
             (Method::PUT, "/api/reads/set-1"),
             (Method::DELETE, "/api/reads/set-1"),
@@ -598,6 +604,9 @@ mod tests {
         }
         for (method, path) in [
             (Method::DELETE, "/api/reads"),
+            (Method::POST, "/api/read-history"),
+            (Method::DELETE, "/api/read-history"),
+            (Method::GET, "/api/read-history/a/secret"),
             (Method::POST, "/api/reads/set-1"),
             (Method::GET, "/api/reads/set-1/secret"),
             (Method::GET, "/api/runners/12587/v1/systemone"),
@@ -606,6 +615,128 @@ mod tests {
         ] {
             assert!(!api_allowed(&method, path));
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_preferences_import_and_patch_cross_the_native_guard() {
+        let state = Arc::new(paddock_manager::routes::AppState::for_tests());
+        let app = paddock_manager::routes::router(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(policy()),
+                guard,
+            ))
+            .layer(axum::Extension(state));
+        for (path, body, status) in [
+            (
+                "/api/settings/import",
+                r#"{"studio.pk_theme":"light"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "/api/settings",
+                r#"{"studio.pk_theme":"dark"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "/api/settings/import",
+                r#"{"studio.pk_theme":"light","studio.pk_sidebar_width":"0"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "/api/settings/import",
+                r#"{"credentials":"must not import"}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    request(path)
+                        .method(Method::PUT)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        let response = app
+            .oneshot(request("/api/settings").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(settings["studio.pk_theme"], "dark");
+        assert_eq!(settings["studio.pk_sidebar_width"], "0");
+        assert!(settings.get("credentials").is_none());
+    }
+
+    #[tokio::test]
+    async fn web_and_native_reads_share_one_sqlite_document_and_conflict_contract() {
+        let state = Arc::new(paddock_manager::routes::AppState::for_tests());
+        let app = paddock_manager::routes::router(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(policy()),
+                guard,
+            ))
+            .layer(axum::Extension(state));
+        let call = |method: Method, path: &str, body: String| {
+            app.clone().oneshot(
+                request(path)
+                    .method(method)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let web = r#"{"id":"shared","title":"Web read","createdAt":1,"updatedAt":1,"runs":[{"state":"Full input","questions":{"z":{},"a":{}}}]}"#;
+        let reply = call(
+            Method::PUT,
+            "/api/read-history/shared?revision=",
+            web.into(),
+        )
+        .await
+        .unwrap();
+        let status = reply.status();
+        let body = axum::body::to_bytes(reply.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reply = call(
+            Method::GET,
+            "/api/read-history/shared?envelope=true",
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(reply.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot["doc"], web);
+        let revision = snapshot["revision"].as_str().unwrap();
+        let native = web.replace("Web read", "Native read");
+        let envelope = serde_json::json!({"doc":native}).to_string();
+        let path = format!("/api/read-history/shared?envelope=true&revision={revision}");
+        let reply = call(Method::PUT, &path, envelope.clone()).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let reply = call(Method::PUT, &path, envelope).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK, "a lost reply is retryable");
+        let reply = call(Method::GET, "/api/read-history/shared", String::new())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(reply.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), native);
+        let stale = format!("/api/read-history/shared?revision={revision}");
+        let reply = call(Method::PUT, &stale, web.into()).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::CONFLICT);
+        let reply = call(Method::DELETE, &stale, String::new()).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

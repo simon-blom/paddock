@@ -1,3 +1,4 @@
+import { uiPreferences } from '@/lib/ui-preferences'
 import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 import { parseReplyLimit } from '@/lib/reply-limit'
@@ -5,7 +6,7 @@ import { parseReplyLimit } from '@/lib/reply-limit'
 type Theme = 'light' | 'dark'
 
 function initialTheme(): Theme {
-  const stored = localStorage.getItem('pk_theme')
+  const stored = uiPreferences.getItem('pk_theme')
   if (stored === 'light' || stored === 'dark') return stored
   // First-visit fallback: follow the system preference.
   return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
@@ -20,13 +21,13 @@ function initialTheme(): Theme {
  *  leaving it would mean the fix reached only fresh installs. An explicit
  *  choice (any other value) is the user's and survives. */
 function initialMaxTokens(): number | null {
-  if (!localStorage.getItem('pk_max_tokens_v2')) {
-    localStorage.setItem('pk_max_tokens_v2', '1')
-    if (localStorage.getItem('pk_max_tokens') === '8192') {
-      localStorage.removeItem('pk_max_tokens')
+  if (!uiPreferences.getItem('pk_max_tokens_v2')) {
+    uiPreferences.setItem('pk_max_tokens_v2', '1')
+    if (uiPreferences.getItem('pk_max_tokens') === '8192') {
+      uiPreferences.removeItem('pk_max_tokens')
     }
   }
-  const raw = localStorage.getItem('pk_max_tokens')
+  const raw = uiPreferences.getItem('pk_max_tokens')
   if (raw == null || raw === 'max') return null
   return parseReplyLimit(raw)
 }
@@ -34,13 +35,13 @@ function initialMaxTokens(): number | null {
 /** null = send no `max_tool_calls` at all, so the server's own budget applies.
  *  Anything else is a number the user chose deliberately. */
 function initialMaxToolCalls(): number | null {
-  const raw = localStorage.getItem('pk_max_tool_calls')
+  const raw = uiPreferences.getItem('pk_max_tool_calls')
   if (raw == null || raw === 'server') return null
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null
 }
 
-/** UI/user preferences. Each persists to localStorage on change. */
+/** UI preferences backed by the shared Rust/SQLite store. */
 export const useSettingsStore = defineStore('settings', () => {
   const theme = ref<Theme>(initialTheme())
   // Cap on one reply (thinking + answer share it), or null for "model maximum"
@@ -60,20 +61,20 @@ export const useSettingsStore = defineStore('settings', () => {
   const maxToolCalls = ref<number | null>(initialMaxToolCalls())
   // Context compaction: summarize older messages when a chat outgrows the
   // window (on by default); off = drop the oldest messages, the old behavior.
-  const summarize = ref<boolean>(localStorage.getItem('pk_summarize') !== 'off')
-  const autoTitle = ref<boolean>(localStorage.getItem('pk_auto_title') !== 'off')
-  watch(autoTitle, v => localStorage.setItem('pk_auto_title', v ? 'on' : 'off'), { flush: 'sync' })
+  const summarize = ref<boolean>(uiPreferences.getItem('pk_summarize') !== 'off')
+  const autoTitle = ref<boolean>(uiPreferences.getItem('pk_auto_title') !== 'off')
+  watch(autoTitle, v => uiPreferences.setItem('pk_auto_title', v ? 'on' : 'off'), { flush: 'sync' })
   // Mark the words a speech model was least sure of. A VIEWER preference, the
   // way Rev's "show low confidence words" is: the marks help you find what to
   // check, and they are noise once you have. On by default because the Studio
   // is for judging models, not for producing a clean read.
-  const markUnsure = ref<boolean>(localStorage.getItem('pk_mark_unsure') !== 'off')
+  const markUnsure = ref<boolean>(uiPreferences.getItem('pk_mark_unsure') !== 'off')
   /** Which transcriber the composer's mic dictates with, by model id.
    *  A user who picks their good multilingual model once should not
    *  re-pick it every turn - and it is a PREFERENCE, not conversation state:
    *  the same ears follow you into a new chat. Empty = "whichever is running",
    *  which is also what a stale id falls back to. */
-  const dictateWith = ref<string>(localStorage.getItem('pk_dictate_with') ?? '')
+  const dictateWith = ref<string>(uiPreferences.getItem('pk_dictate_with') ?? '')
   /** Which microphone every mic path opens. Empty = the system default, which
    *  is also what a box with one input never has to think about.
    *
@@ -82,14 +83,14 @@ export const useSettingsStore = defineStore('settings', () => {
    *  every chat and outlives all of them. The id is opaque and origin-scoped -
    *  it means nothing on another browser or machine, which is fine, since
    *  neither does the hardware it names. */
-  const micDeviceId = ref<string>(localStorage.getItem('pk_mic_device') ?? '')
+  const micDeviceId = ref<string>(uiPreferences.getItem('pk_mic_device') ?? '')
   /** ...and what it was CALLED when it was chosen. Stored beside the id purely
    *  so a device that is unplugged can still be named: `enumerateDevices` only
    *  lists what is connected, so without this the honest report degrades from
    *  "your Jabra headset isn't here" to "the microphone you chose isn't
    *  here" - which is the difference between knowing what to plug in and
    *  guessing. */
-  const micDeviceLabel = ref<string>(localStorage.getItem('pk_mic_device_label') ?? '')
+  const micDeviceLabel = ref<string>(uiPreferences.getItem('pk_mic_device_label') ?? '')
   /** Raster tile template for the interactive map a geotagged photo can open
    *  (layer 3). Empty = OSM's own tile server, named in the UI.
    *
@@ -101,44 +102,43 @@ export const useSettingsStore = defineStore('settings', () => {
    *  pull from it systematically. The map itself stays behind a click; this
    *  decides where that click goes.
    *
-   *  A preference of this BROWSER, like the theme: nothing about it belongs
-   *  in a server's config or the manager's DB. */
-  const mapTiles = ref<string>(localStorage.getItem('pk_map_tiles') ?? '')
+   *  A UI preference stored in the manager's SQLite, shared by Studio clients. */
+  const mapTiles = ref<string>(uiPreferences.getItem('pk_map_tiles') ?? '')
 
   watch(theme, (v) => {
-    localStorage.setItem('pk_theme', v)
+    uiPreferences.setItem('pk_theme', v)
     document.documentElement.setAttribute('data-theme', v)
   })
   watch(maxTokens, (v) => {
-    if (v == null) localStorage.setItem('pk_max_tokens', 'max')
-    else localStorage.setItem('pk_max_tokens', String(v))
+    if (v == null) uiPreferences.setItem('pk_max_tokens', 'max')
+    else uiPreferences.setItem('pk_max_tokens', String(v))
   })
   watch(maxToolCalls, (v) => {
-    localStorage.setItem('pk_max_tool_calls', v == null ? 'server' : String(v))
+    uiPreferences.setItem('pk_max_tool_calls', v == null ? 'server' : String(v))
   })
   watch(summarize, (v) => {
-    localStorage.setItem('pk_summarize', v ? 'on' : 'off')
+    uiPreferences.setItem('pk_summarize', v ? 'on' : 'off')
   })
   watch(markUnsure, (v) => {
-    localStorage.setItem('pk_mark_unsure', v ? 'on' : 'off')
+    uiPreferences.setItem('pk_mark_unsure', v ? 'on' : 'off')
   })
 
   watch(dictateWith, (v) => {
-    if (v) localStorage.setItem('pk_dictate_with', v)
-    else localStorage.removeItem('pk_dictate_with')
+    if (v) uiPreferences.setItem('pk_dictate_with', v)
+    else uiPreferences.removeItem('pk_dictate_with')
   })
   watch(micDeviceId, (v) => {
-    if (v) localStorage.setItem('pk_mic_device', v)
-    else localStorage.removeItem('pk_mic_device')
+    if (v) uiPreferences.setItem('pk_mic_device', v)
+    else uiPreferences.removeItem('pk_mic_device')
   })
   watch(micDeviceLabel, (v) => {
-    if (v) localStorage.setItem('pk_mic_device_label', v)
-    else localStorage.removeItem('pk_mic_device_label')
+    if (v) uiPreferences.setItem('pk_mic_device_label', v)
+    else uiPreferences.removeItem('pk_mic_device_label')
   })
   watch(mapTiles, (v) => {
     const t = v.trim()
-    if (t) localStorage.setItem('pk_map_tiles', t)
-    else localStorage.removeItem('pk_map_tiles')
+    if (t) uiPreferences.setItem('pk_map_tiles', t)
+    else uiPreferences.removeItem('pk_map_tiles')
   })
 
   return {

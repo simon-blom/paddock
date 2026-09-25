@@ -109,7 +109,7 @@ extension Checks {
       "preferencesSave", ["changes": .object(changed), "expected": .object(expected)])
     try await check(
       "native preferences share runtime settings and durable SQLite",
-      "const p=(await(await fetch('/api/settings')).json()).macos_studio_preferences;return p.pk_max_tokens==='8192'&&p.pk_max_tokens_v2==='1'&&p.pk_max_tool_calls==='25'&&window.promptSettings.maxToolCalls===25"
+      "const p=await(await fetch('/api/settings')).json();return p['studio.pk_max_tokens']==='8192'&&p['studio.pk_max_tokens_v2']==='1'&&p['studio.pk_max_tool_calls']==='25'&&window.promptSettings.maxToolCalls===25"
     )
     _ = try await session.webView.evaluateJavaScript("window.promptFailSettings=true")
     do {
@@ -123,7 +123,7 @@ extension Checks {
     } catch is Failure { throw Failure(message: "Failed preference save succeeded") } catch {}
     try await check(
       "failed preference save rolls runtime back",
-      "return window.promptSettings.maxToolCalls===25&&localStorage.getItem('pk_max_tool_calls')==='25'"
+      "return window.promptSettings.maxToolCalls===25"
     )
     try await session.command("preferencesGet")
     // Clear the displayed command failure before recovery's ready check.

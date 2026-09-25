@@ -997,9 +997,10 @@ var LectorEngine = class {
   hourCycle;
   /** Custom recent-files store, if provided. */
   recentFilesStore;
+  preferenceStore;
   /** Max number of recent-files entries. */
   recentFilesMax;
-  /** localStorage key for recent files. */
+  /** Host preference key for recent files. */
   recentFilesStorageKey;
   /** Auto-register the viewer container as a drop zone. */
   enableViewerDropZone;
@@ -1033,6 +1034,7 @@ var LectorEngine = class {
     this.measurementSystem = options.measurementSystem;
     this.hourCycle = options.hourCycle;
     this.recentFilesStore = options.recentFilesStore;
+    this.preferenceStore = options.preferenceStore;
     this.recentFilesMax = options.recentFilesMax;
     this.recentFilesStorageKey = options.recentFilesStorageKey;
     this.enableViewerDropZone = options.enableViewerDropZone ?? true;
@@ -4026,10 +4028,10 @@ var annotationPlugin = definePlugin({
 // src/plugins/annotation-presets-plugin.ts
 import { signal as signal10, computed as computed10 } from "@truespar/lector-utils";
 var STORAGE_KEY = "lector.annotationPresets.user";
-function loadFromStorage() {
-  if (typeof localStorage === "undefined") return [];
+function loadFromStorage(store) {
+  if (!store) return [];
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = store.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -4040,11 +4042,11 @@ function loadFromStorage() {
     return [];
   }
 }
-function saveToStorage(presets) {
-  if (typeof localStorage === "undefined") return;
+function saveToStorage(presets, store) {
+  if (!store) return;
   try {
     const userPresets = presets.filter((p) => !p.builtin);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(userPresets));
+    store.setItem(STORAGE_KEY, JSON.stringify(userPresets));
   } catch {
   }
 }
@@ -4095,7 +4097,8 @@ var annotationPresetsPlugin = definePlugin({
   setup(ctx) {
     const annotation = ctx.require("annotation");
     const builtin = coerceConfigPresets(ctx.engine.annotationPresets);
-    const user = loadFromStorage();
+    const preferenceStore = ctx.engine.preferenceStore;
+    const user = loadFromStorage(preferenceStore);
     const seeded = [...builtin];
     for (const p of user) {
       const idx = seeded.findIndex((b) => b.name === p.name);
@@ -4146,7 +4149,7 @@ var annotationPresetsPlugin = definePlugin({
         if (idx >= 0) list[idx] = normalized;
         else list.push(normalized);
         presets$.value = list;
-        saveToStorage(list);
+        saveToStorage(list, preferenceStore);
         ctx.emit("annotation-presets:changed");
       },
       deletePreset(name) {
@@ -4155,7 +4158,7 @@ var annotationPresetsPlugin = definePlugin({
         if (!target || target.builtin) return false;
         const next = list.filter((p) => p.name !== name);
         presets$.value = next;
-        saveToStorage(next);
+        saveToStorage(next, preferenceStore);
         if (activePreset$.peek() === name) {
           activePreset$.value = null;
           ctx.emit("annotation-presets:active-changed", null);
@@ -8870,11 +8873,16 @@ function serialize(entry) {
     lastOpenedAt: entry.lastOpenedAt.toISOString()
   };
 }
-function createLocalStorageStore(storageKey, maxEntries) {
+function createPreferenceStore(storageKey, maxEntries, preferenceStore) {
+  const memory = new Map();
+  const store = preferenceStore ?? {
+    getItem: (key) => memory.get(key) ?? null,
+    setItem: (key, value) => memory.set(key, value),
+    removeItem: (key) => memory.delete(key)
+  };
   function read() {
     try {
-      if (typeof localStorage === "undefined") return [];
-      const raw = localStorage.getItem(storageKey);
+      const raw = store.getItem(storageKey);
       if (!raw) return [];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
@@ -8885,8 +8893,7 @@ function createLocalStorageStore(storageKey, maxEntries) {
   }
   function write(entries) {
     try {
-      if (typeof localStorage === "undefined") return;
-      localStorage.setItem(storageKey, JSON.stringify(entries.map(serialize)));
+      store.setItem(storageKey, JSON.stringify(entries.map(serialize)));
     } catch {
     }
   }
@@ -8908,8 +8915,7 @@ function createLocalStorageStore(storageKey, maxEntries) {
     },
     clear() {
       try {
-        if (typeof localStorage === "undefined") return;
-        localStorage.removeItem(storageKey);
+        store.removeItem(storageKey);
       } catch {
       }
     }
@@ -8939,7 +8945,7 @@ var documentManagerPlugin = definePlugin({
     const customStore = engineAny["recentFilesStore"];
     const maxRecent = engineAny["recentFilesMax"] ?? DEFAULT_MAX_RECENT;
     const storageKey = engineAny["recentFilesStorageKey"] ?? DEFAULT_STORAGE_KEY;
-    const store = customStore ?? createLocalStorageStore(storageKey, maxRecent);
+    const store = customStore ?? createPreferenceStore(storageKey, maxRecent, engineAny.preferenceStore);
     const openDocs$ = signal17(/* @__PURE__ */ new Map());
     const recentFiles$ = signal17([]);
     void Promise.resolve(store.list()).then((entries) => {

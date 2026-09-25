@@ -13,6 +13,8 @@ struct NativeReadsView: View {
   @State private var confirmDelete = false
   @State private var confirmExample = false
   @State private var pendingSet: NativeReadsModel.SavedSet?
+  @State private var pendingSession: NativeReadsModel.Session?
+  @State private var confirmDeleteRead = false
   var body: some View {
     GeometryReader { geometry in
       PaddockScrollView {
@@ -33,7 +35,8 @@ struct NativeReadsView: View {
                 Button("Start a model", action: onStart).buttonStyle(FlatButtonStyle(primary: true))
               }
             }.frame(maxWidth: .infinity).padding(.vertical, 60)
-          } else if geometry.size.width >= 1100 {
+          }
+          if geometry.size.width >= 1100 {
             HStack(alignment: .top, spacing: 20) {
               editor.frame(maxWidth: .infinity)
               answers.frame(maxWidth: .infinity)
@@ -84,6 +87,26 @@ struct NativeReadsView: View {
       }
       .accessibilityIdentifier("native-reads")
       .confirmationDialog(
+        "Open this read?",
+        isPresented: Binding(
+          get: { pendingSession != nil }, set: { if !$0 { pendingSession = nil } }),
+        titleVisibility: .visible
+      ) {
+        if let session = pendingSession {
+          Button("Open \(session.title)") {
+            pendingSession = nil
+            Task { await model.openSession(session.id) }
+          }
+        }
+        Button("Cancel", role: .cancel) { pendingSession = nil }
+      }
+      .confirmationDialog(
+        "Delete this read and its runs?", isPresented: $confirmDeleteRead, titleVisibility: .visible
+      ) {
+        Button("Delete read", role: .destructive) { Task { await model.clearHistory() } }
+        Button("Cancel", role: .cancel) {}
+      }
+      .confirmationDialog(
         "Replace the draft with the example?", isPresented: $confirmExample,
         titleVisibility: .visible
       ) {
@@ -106,6 +129,28 @@ struct NativeReadsView: View {
         if !stacked, !model.readers.isEmpty { modelPicker.frame(width: 270) }
       }
       if stacked, !model.readers.isEmpty { modelPicker }
+      HStack {
+        Dropdown(
+          title: "Earlier reads", value: model.activeSession?.value["title"]?.string ?? "History"
+        ) {
+          ForEach(model.sessions) { session in
+            Button(session.title) {
+              if model.hasWork {
+                pendingSession = session
+              } else {
+                Task { await model.openSession(session.id) }
+              }
+            }
+          }
+        }.disabled(model.busy || model.saving || model.sessions.isEmpty)
+          .accessibilityIdentifier("reads-sessions")
+        if model.openingSession { ProgressView().controlSize(.small) }
+        Spacer()
+        if model.historyUnsaved {
+          Button("Retry saving") { Task { await model.saveHistory() } }
+            .buttonStyle(FlatButtonStyle()).disabled(model.busy || model.saving)
+        }
+      }
     }.accessibilityIdentifier("reads-header")
   }
 
@@ -314,11 +359,14 @@ struct NativeReadsView: View {
               }
             }
             Divider()
-            Button("Clear history", role: .destructive) { Task { await model.clearHistory() } }
+            Button("Delete read", role: .destructive) { confirmDeleteRead = true }
               .disabled(model.busy)
           }.fixedSize()
         }
-        if model.stale {
+        if result.state == nil {
+          Text("The original input was not retained with this older result.")
+            .font(.caption).foregroundStyle(.secondary)
+        } else if model.stale {
           Text("Edited since this read").font(.caption).foregroundStyle(PaddockStyle.caution)
         } else if model.previousRead {
           Text("Previous read · " + result.excerpt).font(.caption).foregroundStyle(.secondary)

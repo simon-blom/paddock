@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { uiPreferences } from '@/lib/ui-preferences'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
@@ -117,14 +118,14 @@ const SORT_LABEL: Record<SortMode, string> = {
   oldest: 'Oldest first',
 }
 const sortMode = ref<SortMode>(
-  (localStorage.getItem('pk_chat_sort') as SortMode) || 'recent',
+  (uiPreferences.getItem('pk_chat_sort') as SortMode) || 'recent',
 )
 // Controlled open state - reka's uncontrolled dropdown path doesn't reliably
 // toggle in our wrappers (same reason the ⋯ menu is controlled).
 const sortOpen = ref(false)
 function setSort(m: SortMode): void {
   sortMode.value = m
-  localStorage.setItem('pk_chat_sort', m)
+  uiPreferences.setItem('pk_chat_sort', m)
   sortOpen.value = false
 }
 

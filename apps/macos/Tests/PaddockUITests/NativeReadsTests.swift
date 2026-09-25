@@ -24,7 +24,7 @@ struct NativeReadsTests {
         )
       }
       if path == "api/reads" { return .array([]) }
-      if path.hasPrefix("api/read-runs/") { return .array([]) }
+      if path == "api/read-history" { return .array([]) }
       return .object([:])
     }
     return m
@@ -104,7 +104,10 @@ struct NativeReadsTests {
     await m.refresh()
     m.draft.state = "Sky is blue."
     m.api = { path, _, body, _ in
-      if path.hasPrefix("api/read-runs/") { return .null }
+      if path == "api/read-history" { return .array([]) }
+      if path.hasPrefix("api/read-history/") {
+        return .object(["read": .object(["revision": .string("saved")])])
+      }
       #expect(body?["model"] == .string("diffusion") && body?["samples"] == .string("auto"))
       return try value(
         #"{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.9,"confidence":0.8,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":16,"questions":[{"id":"q1","label":"yes","entropy":0.1,"label_mass":0.99}],"timing":{"total_ms":12}}}"#
@@ -193,7 +196,10 @@ struct NativeReadsTests {
     m.beginJSON()
     var requests = 0
     m.api = { path, _, body, _ in
-      if path.hasPrefix("api/read-runs/") { return .null }
+      if path == "api/read-history" { return .array([]) }
+      if path.hasPrefix("api/read-history/") {
+        return .object(["read": .object(["revision": .string("saved")])])
+      }
       requests += 1
       #expect(body?["questions"]?["urgent"]?["type"] == .string("noul"))
       return try value(
@@ -225,15 +231,22 @@ struct NativeReadsTests {
     #expect(m.rowErrors.isEmpty && m.stateError == nil && m.questionsError == nil)
   }
 
-  @Test func historyRestoresAcrossModelsWithoutRetainingTheFullSourceDocument() async throws {
+  @Test func historyUsesTheSharedWebDocumentAndReopensTheFullInput() async throws {
     let m = model()
     await m.refresh()
-    m.draft.state = String(repeating: "private document ", count: 200) + "SENSITIVE_END"
-    var saved: ConversationValue?
-    m.api = { path, method, body, _ in
-      if path.hasPrefix("api/read-runs/") {
-        if method == "POST" { saved = body }
-        return .null
+    m.draft.state = "The complete input that can be rerun"
+    m.fileName = "source.txt"
+    var saved: String?
+    let summary: ConversationValue = .object([
+      "id": .string("session"), "title": .string("Source"),
+      "model": .string("diffusion"), "runs": .number(1), "updatedAt": .number(1000),
+    ])
+    m.api = { path, method, body, query in
+      if path == "api/read-history" { return .array([summary]) }
+      if path.hasPrefix("api/read-history/") {
+        #expect(method == "PUT" && query["revision"] == "")
+        saved = body?["doc"]?.string
+        return .object(["read": .object(["revision": .string("revision-1")])])
       }
       return try value(
         #"{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.9,"confidence":0.8,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":16,"questions":[],"timing":{"total_ms":1}}}"#
@@ -241,21 +254,60 @@ struct NativeReadsTests {
     }
     m.run()
     await m.settle()
-    let record = try #require(saved)
-    #expect(record["state"] == nil && record["request"] == nil)
-    #expect(
-      !String(decoding: try JSONEncoder().encode(record), as: UTF8.self).contains("SENSITIVE_END"))
-    #expect((record["excerpt"]?.string?.count ?? 1000) <= 120)
+    let text = try #require(saved)
+    let doc = try ReadHistoryDocument(json: text)
+    #expect(doc.runs.first?["state"] == .string(m.draft.state))
+    #expect(doc.runs.first?["fileName"] == .string("source.txt"))
+    #expect(!m.historyUnsaved && m.historyError == nil)
     let restored = model()
     let api = restored.api
     restored.api = { path, method, body, query in
-      if path == "api/read-runs/draft" { return method == "GET" ? .array([record]) : .null }
+      if path == "api/read-history" { return .array([summary]) }
+      if path.hasPrefix("api/read-history/") {
+        if method == "DELETE" {
+          #expect(query["revision"] == "revision-1")
+          return .null
+        }
+        return .object(["doc": .string(text), "revision": .string("revision-1")])
+      }
       return try await api(path, method, body, query)
     }
     await restored.refresh()
+    await restored.openSession(doc.id)
     #expect(restored.runs.count == 1 && restored.result?.id == m.result?.id)
-    #expect(restored.previousRead && restored.draft.state.isEmpty && restored.historyError == nil)
+    #expect(restored.draft.state == m.draft.state && restored.fileName == "source.txt")
+    #expect(
+      restored.historyError == nil && restored.result!.at.timeIntervalSince1970 > 1_700_000_000)
     await restored.clearHistory()
     #expect(restored.runs.isEmpty)
+  }
+
+  @Test func failedHistorySaveKeepsAnswersAndDraftForRetry() async throws {
+    let m = model()
+    await m.refresh()
+    m.draft.state = "Preserve me"
+    m.api = { path, _, _, _ in
+      if path.hasPrefix("api/read-history/") { throw ConversationFailure.http(409) }
+      return try value(
+        #"{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.9,"confidence":0.8,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":16,"questions":[],"timing":{"total_ms":1}}}"#
+      )
+    }
+    m.run()
+    await m.settle()
+    #expect(m.historyUnsaved && m.historyError != nil && m.result != nil)
+    #expect(m.draft.state == "Preserve me" && m.activeSession != nil)
+  }
+
+  @Test func lateHistoryOpenCannotOverwriteANewerDraft() async throws {
+    let m = model()
+    m.api = { _, _, _, _ in
+      m.draft.state = "Newer input"
+      return .object([
+        "doc": .string(#"{"id":"session","title":"Old","runs":[]}"#),
+        "revision": .string("r"),
+      ])
+    }
+    await m.openSession("session")
+    #expect(m.draft.state == "Newer input" && m.activeSession == nil && !m.openingSession)
   }
 }

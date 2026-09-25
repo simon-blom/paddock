@@ -5,6 +5,8 @@
 // EvictConfirm is the one "Stop X and start Y?" dialog - any start path can
 // raise it via the fleet store, so it mounts once here like the toasts.
 import { TooltipProvider } from 'reka-ui'
+import PersistenceStatus from '@/components/ui/PersistenceStatus.vue'
+import { migrationError, retryReadMigration } from '@/lib/browser-storage-migration'
 import Toaster from '@/components/ui/Toaster.vue'
 import EvictConfirm from '@/components/manage/EvictConfirm.vue'
 import KeyGate from '@/components/KeyGate.vue'
@@ -18,6 +20,7 @@ const models = useModelsStore()
     <router-view />
     <KeyGate v-if="models.needsKey" />
     <Toaster />
+    <PersistenceStatus :migration-error="migrationError" :retry-migration="retryReadMigration" />
     <EvictConfirm />
   </TooltipProvider>
 </template>

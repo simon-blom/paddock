@@ -3,6 +3,8 @@
 // attached here in one place.
 
 import type { Conversation } from '@/types/chat'
+import type { ReadDoc, ReadSummary } from '@/lib/reads'
+import { orderedRunQuestions } from '@/lib/reads'
 import { DEFAULT_PARAMS } from '@/types/chat'
 import { useModelsStore } from '@/stores/models'
 
@@ -739,6 +741,31 @@ export const readsApi = {
       `/api/reads/${encodeURIComponent(id)}${revision === undefined ? '' : `?revision=${encodeURIComponent(revision)}`}`,
       'DELETE',
     ),
+}
+
+// Earlier reads - the Reads page's side panel. The list is summaries; a read
+// is fetched whole when opened and always saved whole (the manager refuses a
+// summary, so a list row can never overwrite the runs it stands for).
+export const readHistoryApi = {
+  list: () => jget<ReadSummary[]>('/api/read-history'),
+  get: async (id: string): Promise<ReadDoc> => {
+    const snapshot = await jget<{ doc: string; revision: string }>(`/api/read-history/${encodeURIComponent(id)}?envelope=true`)
+    const doc = JSON.parse(snapshot.doc) as ReadDoc
+    doc.runs = doc.runs.map((run) => ({ ...run, questions: orderedRunQuestions(run) }))
+    return { ...doc, revision: snapshot.revision }
+  },
+  save: ({ revision, ...doc }: ReadDoc) =>
+    jbody<{ ok: boolean; read?: ReadSummary }>(
+      `/api/read-history/${encodeURIComponent(doc.id)}?revision=${encodeURIComponent(revision ?? '')}`,
+      'PUT',
+      doc,
+    ),
+  remove: (id: string, revision: string) => jbody(`/api/read-history/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`, 'DELETE'),
+}
+
+export const readsPreferencesApi = {
+  get: () => jget<{ readsPanelOpen?: boolean }>('/api/settings'),
+  save: (open: boolean) => jbody('/api/settings', 'PUT', { readsPanelOpen: open }),
 }
 
 // ── MCP tool approvals ──────────────────────────────────────────────────────

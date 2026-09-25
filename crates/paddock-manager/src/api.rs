@@ -8,7 +8,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, put};
 use paddock_api::ErrorBody;
 use serde_json::{Value, json};
 
@@ -54,7 +54,14 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .put(update_read_set)
                 .delete(delete_read_set),
         )
+        // the Reads page's earlier reads - the conversation list's shape
+        .route("/api/read-history", get(list_read_history))
+        .route(
+            "/api/read-history/{id}",
+            get(get_read).put(put_read).delete(delete_read),
+        )
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/settings/import", put(import_settings))
         .route("/api/export", get(export_db))
         .route(
             "/api/attachments/{id}",
@@ -266,6 +273,92 @@ async fn delete_read_set(
     }
 }
 
+async fn list_read_history(State(s): State<Arc<AppState>>) -> Response {
+    match s.db.list_read_history() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ReadHistoryQuery {
+    #[serde(default)]
+    envelope: bool,
+    revision: Option<String>,
+}
+
+async fn get_read(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ReadHistoryQuery>,
+) -> Response {
+    if q.envelope {
+        return match s.db.read_snapshot(&id) {
+            Ok(Some(doc)) => Json(doc).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody::not_found(format!("read {id}"))),
+            )
+                .into_response(),
+            Err(e) => err500(e),
+        };
+    }
+    match s.db.get_read(&id) {
+        // the saved text as it was sent - see store/read_history.rs on why a
+        // read never passes through Value on the way out
+        Ok(Some(text)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            text,
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody::not_found(format!("read {id}"))),
+        )
+            .into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn put_read(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ReadHistoryQuery>,
+    text: String,
+) -> Response {
+    let text = if q.envelope {
+        match serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["doc"].as_str().map(str::to_owned))
+        {
+            Some(text) => text,
+            None => {
+                return prompt_error(crate::store::StoreError::Bad(
+                    "Expected a read document".into(),
+                ));
+            }
+        }
+    } else {
+        text
+    };
+    // kept as the text it arrived as, so the questions keep their order
+    match s.db.put_read_checked(&id, &text, q.revision.as_deref()) {
+        Ok(read) => Json(json!({ "ok": true, "read": read })).into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+
+async fn delete_read(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ReadHistoryQuery>,
+) -> Response {
+    match s.db.delete_read_checked(&id, q.revision.as_deref()) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+
 // ── settings ─────────────────────────────────────────────────────────────────
 
 async fn get_settings(State(s): State<Arc<AppState>>) -> Response {
@@ -277,17 +370,20 @@ async fn get_settings(State(s): State<Arc<AppState>>) -> Response {
 
 /// Merge the posted object into settings (each key upserts).
 async fn put_settings(State(s): State<Arc<AppState>>, Json(obj): Json<Value>) -> Response {
-    if let Some(map) = obj.as_object() {
-        for (k, v) in map {
-            if let Err(e) = s.db.set_setting(k, v) {
-                return err500(e);
-            }
-        }
+    if let Err(e) = s.db.patch_settings(&obj, false) {
+        return prompt_error(e);
     }
     match s.db.all_settings() {
         Ok(v) => Json(v).into_response(),
         Err(e) => err500(e),
     }
+}
+
+async fn import_settings(State(s): State<Arc<AppState>>, Json(obj): Json<Value>) -> Response {
+    if let Err(e) = s.db.patch_settings(&obj, true) {
+        return prompt_error(e);
+    }
+    get_settings(State(s)).await
 }
 
 // NOTE: there is deliberately no web-search or MCP section here.

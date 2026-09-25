@@ -2,6 +2,7 @@ import { fileURLToPath, URL } from 'node:url'
 import { readFileSync } from 'node:fs'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { browserStorageBundleGuard } from './scripts/check-browser-storage.mjs'
 import { compression } from 'vite-plugin-compression2'
 
 // The lector pdfium worker loads its emscripten glue at runtime via a URL under
@@ -127,6 +128,7 @@ function serveIcons() {
 // split.
 export default defineConfig({
   plugins: [
+    browserStorageBundleGuard(),
     vue(),
     compression({
       algorithms: ['gzip'],

@@ -1,3 +1,4 @@
+import { uiPreferences } from '@/lib/ui-preferences'
 import { defineStore } from 'pinia'
 import { uuid } from '@/lib/uuid'
 import { computed, ref, toRaw } from 'vue'
@@ -93,11 +94,11 @@ export const useChatStore = defineStore('chat', () => {
   /** The chat to resume when no id is given: the last one opened, else the
    *  newest, else null when there are none.
    *
-   *  Reads localStorage rather than `activeId` deliberately - the start page
+   *  Reads uiPreferences rather than `activeId` deliberately - the start page
    *  clears activeId (nothing is selected there), so activeId is null exactly
    *  when someone arrives from `/`. */
   function lastOpenId(): string | null {
-    const last = localStorage.getItem('pk_last_conversation')
+    const last = uiPreferences.getItem('pk_last_conversation')
     if (last && conversations.value.some((c) => c.id === last)) return last
     return conversations.value[0]?.id ?? null
   }
@@ -202,7 +203,7 @@ export const useChatStore = defineStore('chat', () => {
     conversations.value.unshift(c)
     activeId.value = c.id
     loadedIds.value.add(c.id)
-    localStorage.setItem('pk_last_conversation', c.id)
+    uiPreferences.setItem('pk_last_conversation', c.id)
     void save(c)
     return c
   }
@@ -228,7 +229,7 @@ export const useChatStore = defineStore('chat', () => {
   function select(id: string): void {
     draft.value = null // leaving the start page discards its unsent draft
     activeId.value = id
-    localStorage.setItem('pk_last_conversation', id)
+    uiPreferences.setItem('pk_last_conversation', id)
     void ensureLoaded(id)
   }
 
@@ -323,15 +324,15 @@ export const useChatStore = defineStore('chat', () => {
     })
   }
 
-  /** Re-point activeId after the current chat is gone; keeps URL/localStorage in
+  /** Re-point activeId after the current chat is gone; keeps URL/uiPreferences in
    *  sync. Returns the new active id (or null when the list is now empty). */
   function repointActive(): string | null {
     activeId.value = conversations.value[0]?.id ?? null
     if (activeId.value) {
-      localStorage.setItem('pk_last_conversation', activeId.value)
+      uiPreferences.setItem('pk_last_conversation', activeId.value)
       void ensureLoaded(activeId.value)
     } else {
-      localStorage.removeItem('pk_last_conversation')
+      uiPreferences.removeItem('pk_last_conversation')
     }
     return activeId.value
   }

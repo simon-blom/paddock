@@ -16,6 +16,12 @@ private actor ReadsConnection {
       let host = try await client.nativeConversationHost()
       transport = try NativeConversationTransport(host: host)
     }
+    if path.hasPrefix("api/read-history/") && method == "GET" {
+      // A 16 MiB document expands when carried as a JSON string envelope.
+      let data = try await transport!.bytes(
+        path, method: method, query: query, maximum: 40 * 1024 * 1024)
+      return try JSONDecoder().decode(ConversationValue.self, from: data)
+    }
     return try await transport!.api(path, method: method, body: body, query: query)
   }
 }
@@ -51,8 +57,12 @@ private actor ReadsConnection {
     let port: UInt16
     let elapsedMilliseconds: Double
     let response: ReadResponse
+    var state: String?
+    var fileName = ""
+    var samples = 0
     enum CodingKeys: String, CodingKey {
-      case id, at, fingerprint, excerpt, characters, questions, raw, port, elapsedMilliseconds
+      case id, at, fingerprint, excerpt, characters, questions, raw, port, elapsedMilliseconds,
+        state, fileName, samples
     }
     var retainedBytes: Int { (try? JSONEncoder().encode(self).count) ?? 0 }
     nonisolated static func fingerprint(_ value: ConversationValue) -> String {
@@ -79,13 +89,22 @@ private actor ReadsConnection {
   var questionsError: String?
   var rowErrors: [String: String] = [:]
   var historyError: String?
+  struct Session: Decodable, Identifiable {
+    let id: String
+    let title: String
+    let model: String
+    let runs: Int
+    let updatedAt: Double
+  }
+  private(set) var sessions: [Session] = []
+  private(set) var activeSession: ReadHistoryDocument?
+  private var sessionRevision = ""
+  private var sessionEpoch = 0
+  private(set) var openingSession = false
+  private(set) var historyUnsaved = false
   @ObservationIgnored var api: API
   @ObservationIgnored private var task: Task<Void, Never>?
   @ObservationIgnored private var refreshError: String?
-  @ObservationIgnored private var history: [String: [Run]] = [:]
-  @ObservationIgnored private var loadedHistory: Set<String> = []
-  @ObservationIgnored private var loadingHistory: Set<String> = []
-  @ObservationIgnored private var historyEpoch: [String: Int] = [:]
   @ObservationIgnored private var latestRequest: ConversationValue?
   @ObservationIgnored private var latestRunID: UUID?
   @ObservationIgnored private var setsEpoch = 0
@@ -99,7 +118,9 @@ private actor ReadsConnection {
     draft.setBody != originalBody || draft.ordering != originalOrdering
       || setName != (selectedSet?.name ?? "") || hasUnappliedJSON
   }
-  var hasWork: Bool { dirty || busy || saving || importing || !draft.state.isEmpty }
+  var hasWork: Bool {
+    dirty || busy || saving || importing || historyUnsaved || !draft.state.isEmpty
+  }
   var validation: String? {
     draft.validation(
       maxQuestions: current?.maxQuestions ?? 64, maxSamples: current?.maxSamples ?? 32)
@@ -109,7 +130,7 @@ private actor ReadsConnection {
         ? "This runner does not support one of these question types." : nil)
   }
   var canRun: Bool {
-    current != nil && !busy && !importing && validation == nil
+    current != nil && !busy && !saving && !importing && !openingSession && validation == nil
       && !draft.state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
   var stale: Bool {
@@ -161,7 +182,7 @@ private actor ReadsConnection {
       let epoch = setsEpoch
       let saved = try await api("api/reads", "GET", nil, [:])
       if epoch == setsEpoch { sets = try decode([SavedSet].self, saved) }
-      await restoreHistory(selectedSet?.id ?? "draft")
+      await refreshHistory()
       if error == refreshError { error = nil }
       refreshError = nil
     } catch is CancellationError {} catch {
@@ -250,11 +271,17 @@ private actor ReadsConnection {
     selectedSet = nil
     setName = ""
     fileName = ""
-    runs = history["draft"] ?? []
+    sessionEpoch += 1
+    activeSession = nil
+    sessionRevision = ""
+    openingSession = false
+    historyUnsaved = false
+    runs = []
+    latestRequest = nil
+    latestRunID = nil
     selectedRun = nil
     error = nil
     clearRunErrors()
-    Task { await restoreHistory("draft") }
   }
   func open(_ set: SavedSet) {
     guard !busy && !saving && !importing else { return }
@@ -269,11 +296,8 @@ private actor ReadsConnection {
       beginJSON()
       selectedSet = set
       setName = set.name
-      runs = history[set.id] ?? []
-      selectedRun = nil
       error = nil
       clearRunErrors()
-      Task { await restoreHistory(set.id) }
     } catch { self.error = error.localizedDescription }
   }
   func save(asNew: Bool = false) async {
@@ -284,7 +308,6 @@ private actor ReadsConnection {
     }
     let name = setName.trimmingCharacters(in: .whitespacesAndNewlines)
     let submittedName = setName
-    let previousID = selectedSet?.id ?? "draft"
     guard !name.isEmpty && name.utf8.count <= 512 else {
       error = "Enter a set name up to 512 bytes."
       return
@@ -312,14 +335,6 @@ private actor ReadsConnection {
       originalBody = body
       originalOrdering = ordering
       if setName == submittedName { setName = saved.name }
-      // Save As gives the current runs a new identity without losing them.
-      if saved.id != previousID {
-        history[saved.id] = history[previousID] ?? runs
-        if previousID == "draft" { history[previousID] = nil }
-        trimHistory()
-        for run in history[saved.id] ?? [] { await persist(run, scope: saved.id) }
-        loadedHistory.insert(saved.id)
-      }
       error = nil
     } catch { self.error = error.localizedDescription }
   }
@@ -333,14 +348,9 @@ private actor ReadsConnection {
       }
       _ = try await api("api/reads/\(set.id)", "DELETE", nil, ["revision": set.revision])
       setsEpoch += 1
-      historyEpoch[set.id, default: 0] += 1
-      loadedHistory.insert(set.id)
       sets.removeAll { $0.id == set.id }
-      history[set.id] = nil
       selectedSet = nil
       setName = ""
-      runs = []
-      selectedRun = nil
       error = nil
     } catch { self.error = error.localizedDescription }
   }
@@ -356,7 +366,8 @@ private actor ReadsConnection {
       return
     }
     let questions = draft.questions
-    let setID = selectedSet?.id ?? "draft"
+    let submittedFileName = fileName
+    let submittedSamples = draft.samples
     busy = true
     error = nil
     clearRunErrors()
@@ -381,14 +392,13 @@ private actor ReadsConnection {
               .joined(separator: " ").prefix(120)),
           characters: request["state"]?.string?.count ?? 0,
           questions: questions, raw: raw, port: reader.port, elapsedMilliseconds: milliseconds,
-          response: response)
-        history[setID] = Array(([result] + (history[setID] ?? [])).prefix(10))
+          response: response, state: request["state"]?.string,
+          fileName: submittedFileName, samples: submittedSamples)
         latestRequest = request
         latestRunID = result.id
-        trimHistory()
-        runs = history[setID] ?? []
+        runs = Array(([result] + runs).prefix(20))
         selectedRun = result.id
-        await persist(result, scope: setID)
+        await keepRun(result)
       } catch is CancellationError {} catch { routeError(error.localizedDescription) }
     }
   }
@@ -400,19 +410,14 @@ private actor ReadsConnection {
     beginJSON()
     run()
   }
-  // Bounded results plus one volatile request for edit detection. Durable
-  // history contains only a fingerprint and excerpt, never the full state.
+  // Bound in-memory results. Durable history is the shared SQLite document.
   func trimHistory(maxBytes: Int = 16 * 1024 * 1024) {
     var used = 0
     let keep = Set(
-      history.values.flatMap { $0 }.sorted { $0.at > $1.at }.prefix { run in
+      runs.sorted { $0.at > $1.at }.prefix { run in
         used += run.retainedBytes
         return used <= maxBytes
       }.map(\.id))
-    for key in Array(history.keys) {
-      let retained = history[key, default: []].filter { keep.contains($0.id) }
-      history[key] = retained.isEmpty ? nil : retained
-    }
     runs = runs.filter { keep.contains($0.id) }
     if let latestRunID, !keep.contains(latestRunID) {
       latestRequest = nil
@@ -449,49 +454,159 @@ private actor ReadsConnection {
       error = message
     }
   }
-  private func persist(_ run: Run, scope: String) async {
+  func refreshHistory() async {
+    let epoch = sessionEpoch
     do {
-      let value = try JSONDecoder().decode(ConversationValue.self, from: JSONEncoder().encode(run))
-      _ = try await api("api/read-runs/\(scope)", "POST", value, [:])
-      historyError = nil
-    } catch {
-      historyError =
-        "The result is available, but history could not be saved: \(error.localizedDescription)"
-    }
-  }
-  func restoreHistory(_ scope: String) async {
-    guard !loadedHistory.contains(scope), !loadingHistory.contains(scope) else { return }
-    loadingHistory.insert(scope)
-    let epoch = historyEpoch[scope, default: 0]
-    defer { loadingHistory.remove(scope) }
-    do {
-      let value = try await api("api/read-runs/\(scope)", "GET", nil, [:])
-      let saved = try decode([Run].self, value)
-      guard epoch == historyEpoch[scope, default: 0] else { return }
-      for run in saved {
-        try run.response.validate(for: run.questions)
-      }
-      let local = history[scope] ?? []
-      let ids = Set(local.map(\.id))
-      history[scope] = Array(
-        (local + saved.filter { !ids.contains($0.id) })
-          .sorted { $0.at > $1.at }.prefix(10))
-      loadedHistory.insert(scope)
-      trimHistory()
-      if (selectedSet?.id ?? "draft") == scope { runs = history[scope] ?? [] }
-      historyError = nil
+      let rows = try await api("api/read-history", "GET", nil, [:])
+      if epoch == sessionEpoch { sessions = try decode([Session].self, rows) }
     } catch is CancellationError {} catch {
       historyError = "Read history could not be loaded: \(error.localizedDescription)"
     }
   }
-  func clearHistory() async {
-    guard !busy, !saving else { return }
-    let scope = selectedSet?.id ?? "draft"
+
+  private func keepRun(_ run: Run) async {
+    let at = (run.at.timeIntervalSince1970 * 1000).rounded()
+    let value: ConversationValue = .object([
+      "id": .string(run.id.uuidString), "at": .number(Decimal(at)),
+      "model": .string(run.response.model),
+      "port": .number(Decimal(run.port)), "excerpt": .string(run.excerpt),
+      "chars": .number(Decimal(run.characters)), "state": .string(run.state ?? ""),
+      "fileName": .string(run.fileName),
+      "questions": .object(
+        Dictionary(
+          run.questions.map { ($0.questionID, $0.wire) }, uniquingKeysWith: { _, b in b })),
+      "questionOrder": .array(
+        run.questions.map { q in
+          .array(
+            ([q.questionID]
+              + (q.kind == .choice
+                ? q.options.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) } : []))
+              .map(ConversationValue.string))
+        }),
+      "samples": run.samples == 0 ? .string("auto") : .number(Decimal(run.samples)),
+      "response": run.raw, "ms": .number(Decimal(run.elapsedMilliseconds)),
+    ])
+    let title =
+      run.fileName.isEmpty
+      ? String(
+        (run.state ?? "").split(separator: "\n").first.map(String.init)?.prefix(60)
+          ?? "Untitled read")
+      : run.fileName
+    var doc =
+      activeSession?.value.object ?? [
+        "id": .string(UUID().uuidString), "title": .string(title),
+        "createdAt": .number(Decimal(at)),
+      ]
+    doc["updatedAt"] = .number(Decimal(at))
+    doc["model"] = value["model"]
+    doc["runs"] = .array(Array(((doc["runs"]?.array ?? []) + [value]).suffix(20)))
+    activeSession = ReadHistoryDocument(value: .object(doc))
+    historyUnsaved = true
+    await saveHistory()
+  }
+
+  func saveHistory() async {
+    guard !saving, let doc = activeSession else { return }
+    saving = true
+    defer { saving = false }
+    let epoch = sessionEpoch
     do {
-      _ = try await api("api/read-runs/\(scope)", "DELETE", nil, [:])
-      historyEpoch[scope, default: 0] += 1
-      loadedHistory.insert(scope)
-      history[scope] = nil
+      let json = try await Task.detached(priority: .utility) { try doc.json }.value
+      guard json.utf8.count <= 16 * 1024 * 1024 else { throw ConversationFailure.tooLarge }
+      let reply = try await api(
+        "api/read-history/\(doc.id)", "PUT",
+        .object(["doc": .string(json)]), ["envelope": "true", "revision": sessionRevision])
+      guard epoch == sessionEpoch else { return }
+      guard let revision = reply["read"]?["revision"]?.string else {
+        throw ConversationFailure.invalid("Read history was not acknowledged.")
+      }
+      sessionRevision = revision
+      historyUnsaved = false
+      historyError = nil
+      await refreshHistory()
+    } catch is CancellationError {} catch {
+      historyError =
+        "The result is available, but history could not be saved: \(error.localizedDescription)"
+    }
+  }
+
+  func openSession(_ id: String) async {
+    guard !busy, !saving, !importing, ConversationDocument.validID(id) else { return }
+    sessionEpoch += 1
+    let epoch = sessionEpoch
+    let before = draft
+    openingSession = true
+    defer { if epoch == sessionEpoch { openingSession = false } }
+    do {
+      let snapshot = try await api("api/read-history/\(id)", "GET", nil, ["envelope": "true"])
+      guard let text = snapshot["doc"]?.string, let revision = snapshot["revision"]?.string else {
+        throw ConversationFailure.invalid("Invalid read history response.")
+      }
+      let doc = try await Task.detached(priority: .userInitiated) {
+        try ReadHistoryDocument(json: text)
+      }.value
+      guard doc.id == id else {
+        throw ConversationFailure.invalid("The read identity does not match its address.")
+      }
+      guard epoch == sessionEpoch, draft == before else { return }
+      var restored: [Run] = []
+      for (index, value) in doc.runs.enumerated() {
+        let input = try ReadHistoryDocument.draft(value)
+        let raw = value["response"] ?? .null
+        let response = try decode(ReadResponse.self, raw)
+        try response.validate(for: input.questions)
+        guard let p = value["port"]?.integer, let runPort = UInt16(exactly: p), runPort > 0 else {
+          throw ConversationFailure.invalid("Invalid saved reader port.")
+        }
+        var run = Run(
+          fingerprint: "", excerpt: value["excerpt"]?.string ?? "",
+          characters: value["chars"]?.integer ?? 0, questions: input.questions, raw: raw,
+          port: runPort, elapsedMilliseconds: try decode(Double.self, value["ms"] ?? .number(0)),
+          response: response,
+          state: value["stateMissing"] == .bool(true) ? nil : input.state,
+          fileName: value["fileName"]?.string ?? "", samples: input.samples)
+        // Legacy web runs have no UUID. Stable within this loaded document.
+        run.id = value["id"]?.string.flatMap(UUID.init(uuidString:)) ?? UUID()
+        run.at = Date(
+          timeIntervalSince1970: try decode(Double.self, value["at"] ?? .number(0)) / 1000)
+        restored.append(run)
+        if index == doc.runs.count - 1 {
+          draft = input
+          fileName = run.fileName
+          if readers.contains(where: { $0.port == runPort }) { port = runPort }
+        }
+      }
+      activeSession = doc
+      sessionRevision = revision
+      runs = restored.reversed()
+      selectedRun = runs.first?.id
+      latestRunID = runs.first?.id
+      latestRequest = draft.request(model: runs.first?.response.model ?? "")
+      selectedSet = nil
+      setName = ""
+      jsonText = ""
+      originalJSON = ""
+      beginJSON()
+      originalBody = draft.setBody
+      originalOrdering = draft.ordering
+      historyUnsaved = false
+      historyError = nil
+      clearRunErrors()
+    } catch is CancellationError {} catch { historyError = error.localizedDescription }
+  }
+
+  func clearHistory() async {
+    guard !busy, !saving, let doc = activeSession else { return }
+    saving = true
+    defer { saving = false }
+    do {
+      _ = try await api("api/read-history/\(doc.id)", "DELETE", nil, ["revision": sessionRevision])
+      sessionEpoch += 1
+      sessions.removeAll { $0.id == doc.id }
+      activeSession = nil
+      sessionRevision = ""
+      openingSession = false
+      historyUnsaved = false
       runs = []
       selectedRun = nil
       latestRequest = nil
@@ -581,6 +696,9 @@ extension NativeReadsModel.Run {
     raw = try c.decode(ConversationValue.self, forKey: .raw)
     port = try c.decode(UInt16.self, forKey: .port)
     elapsedMilliseconds = try c.decode(Double.self, forKey: .elapsedMilliseconds)
+    state = try c.decodeIfPresent(String.self, forKey: .state)
+    fileName = try c.decodeIfPresent(String.self, forKey: .fileName) ?? ""
+    samples = try c.decodeIfPresent(Int.self, forKey: .samples) ?? 0
     response = try JSONDecoder().decode(ReadResponse.self, from: JSONEncoder().encode(raw))
   }
 }

@@ -9,7 +9,11 @@
 // answers stay in view beside the editor. Everything runs through the same
 // endpoint code calls, relayed by the manager (which holds the runner key),
 // and the API pane shows the equivalent curl built from the live request.
+// Earlier reads sit in a side panel the way a chat lists conversations: a
+// read is the text, its questions and every run of them, kept by the manager
+// and named in the URL, so a read opens again from any browser.
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useModelsStore } from '@/stores/models'
 import { useReadsStore } from '@/stores/reads'
 import { useToastsStore } from '@/stores/toasts'
@@ -25,8 +29,12 @@ import MenuSeparator from '@/components/ui/MenuSeparator.vue'
 import MenuTrigger from '@/components/ui/MenuTrigger.vue'
 import Select, { type SelectOption } from '@/components/ui/Select.vue'
 import Tabs, { type TabOption } from '@/components/ui/Tabs.vue'
+import Tooltip from '@/components/ui/Tooltip.vue'
+import { uuid } from '@/lib/uuid'
+import { readsPreferencesApi } from '@/lib/api'
 import QuestionRow from './QuestionRow.vue'
 import AnswersCard from './AnswersCard.vue'
+import ReadsSidebar from './ReadsSidebar.vue'
 import {
   DEFAULT_MAX_QUESTIONS,
   DEFAULT_MAX_SAMPLES,
@@ -40,8 +48,11 @@ import {
   parseQuestionsJson,
   requestBody,
   routeError,
+  readTitle,
   toWire,
   validate,
+  withRun,
+  type ReadDoc,
   type ReadQuestion,
   type ReadResponse,
   type ReadRun,
@@ -52,6 +63,8 @@ import {
 const models = useModelsStore()
 const sets = useReadsStore()
 const toasts = useToastsStore()
+const route = useRoute()
+const router = useRouter()
 
 // keep the reader list fresh while the page is open: a model started or
 // stopped in the Manager appears or goes without a reload
@@ -63,6 +76,7 @@ async function poll(): Promise<void> {
 onMounted(() => {
   void poll()
   void sets.refresh()
+  void sets.refreshReads()
   timer = window.setInterval(() => void poll(), 5000)
 })
 onUnmounted(() => clearInterval(timer))
@@ -320,11 +334,14 @@ async function copyJson(): Promise<void> {
   toasts.push({ tone: 'info', title: 'Copied the questions' })
 }
 
-// ── the run ────────────────────────────────────────────────────────────────
+// ── the run, and the read it belongs to ────────────────────────────────────
 const busy = ref(false)
-const run = ref<ReadRun | null>(null)
-const history = ref<ReadRun[]>([])
-const historyIdx = ref(0)
+/** The read on screen, whole; null for a new read that has not run yet. */
+const activeRead = ref<ReadDoc | null>(null)
+const readSaveFailed = ref(false)
+/** Which of its runs the answers show - the latest unless stepped back. */
+const runIdx = ref(0)
+const run = computed<ReadRun | null>(() => activeRead.value?.runs[runIdx.value] ?? null)
 const lastMs = ref<number | null>(null)
 const canRun = computed(
   () => !!current.value && !busy.value && state.value.trim().length > 0 && validation.value.ok,
@@ -340,6 +357,7 @@ async function doRun(): Promise<void> {
   stateError.value = null
   serverRowErrors.value = {}
   const req = body.value
+  const sourceFile = fileName.value
   const p = port.value
   const model = current.value
   const t0 = performance.now()
@@ -367,29 +385,63 @@ async function doRun(): Promise<void> {
       return
     }
     const r: ReadRun = {
+      id: uuid(),
       at: Date.now(),
       model: model.display ?? modelLabel(model.id),
       port: p,
       excerpt: excerptOf(req.state),
       chars: req.state.length,
+      state: req.state,
+      fileName: sourceFile,
       questions: req.questions,
-      samples: samples.value,
+      samples: req.samples ?? 'auto',
       response: json as ReadResponse,
       ms,
     }
-    run.value = r
     lastMs.value = ms
-    history.value = sets.recordRun(activeSetId.value, r)
-    historyIdx.value = 0
+    await keepRun(r)
   } catch (e) {
     pageError.value = e instanceof Error ? e.message : String(e)
   } finally {
     busy.value = false
   }
 }
-function selectHistory(i: number): void {
-  historyIdx.value = i
-  run.value = history.value[i] ?? null
+/** A run lands on the read on screen - a new read is created by its first
+ *  run, the way a chat is created by its first message - and the read is
+ *  saved whole. A failed save keeps the answers on screen and says so. */
+async function keepRun(r: ReadRun): Promise<void> {
+  const prev = activeRead.value
+  const doc: ReadDoc = prev
+    ? { ...prev, model: r.model, updatedAt: r.at, runs: withRun(prev.runs, r) }
+    : {
+        id: uuid(),
+        title: readTitle(r.state, r.fileName),
+        model: r.model,
+        createdAt: r.at,
+        updatedAt: r.at,
+        runs: [r],
+      }
+  activeRead.value = doc
+  runIdx.value = doc.runs.length - 1
+  if (!prev) void router.replace({ name: 'reads', params: { id: doc.id } })
+  await persistRead(doc)
+}
+async function persistRead(doc: ReadDoc): Promise<void> {
+  readSaveFailed.value = true
+  try {
+    await sets.saveRead(doc)
+    readSaveFailed.value = false
+  } catch (e) {
+    toasts.push({
+      tone: 'bad',
+      title: 'This read was not saved',
+      description: e instanceof Error ? e.message : String(e),
+    })
+  }
+}
+function stepRun(delta: number): void {
+  const n = activeRead.value?.runs.length ?? 0
+  runIdx.value = Math.min(Math.max(runIdx.value + delta, 0), Math.max(n - 1, 0))
 }
 /** The answers on show belong to a request the editor has since changed. */
 const stale = computed(() => {
@@ -398,8 +450,7 @@ const stale = computed(() => {
   const b = body.value
   return (
     b.state !== undefined &&
-    (r.chars !== b.state.length ||
-      r.excerpt !== excerptOf(b.state) ||
+    ((r.state ?? '') !== b.state ||
       JSON.stringify(r.questions) !== JSON.stringify(b.questions) ||
       r.samples !== samples.value)
   )
@@ -487,9 +538,6 @@ function selectSet(v: string | number): void {
     }
   }
   if (tab.value === 'json') jsonText.value = JSON.stringify(toWire(questions.value), null, 2)
-  history.value = sets.runsOf(activeSetId.value)
-  historyIdx.value = 0
-  run.value = history.value[0] ?? null
   serverRowErrors.value = {}
   questionsError.value = null
 }
@@ -525,11 +573,7 @@ async function confirmSave(): Promise<void> {
   saveError.value = ''
   try {
     const saved = await sets.save(saveName.value, setBody.value)
-    const draftRuns = activeSetId.value === undefined ? history.value : []
     activeSetId.value = saved.id
-    // a draft's runs belong to the set it just became
-    for (const r of [...draftRuns].reverse()) sets.recordRun(saved.id, r)
-    if (draftRuns.length) sets.forgetRuns(undefined)
     saveOpen.value = false
     toasts.push({ tone: 'good', title: 'Saved', description: saved.name })
   } catch (e) {
@@ -545,9 +589,6 @@ async function confirmDelete(): Promise<void> {
   try {
     await sets.remove(s.id, s.revision)
     activeSetId.value = undefined
-    history.value = sets.runsOf(undefined)
-    historyIdx.value = 0
-    run.value = history.value[0] ?? null
     deleteOpen.value = false
     toasts.push({ tone: 'info', title: 'Deleted', description: s.name })
   } catch (e) {
@@ -556,24 +597,49 @@ async function confirmDelete(): Promise<void> {
     saving.value = false
   }
 }
-// the draft's history is there from the start
-history.value = sets.runsOf(undefined)
-run.value = history.value[0] ?? null
-
-// ── a new read: everything back to the start ───────────────────────────────
-// Confirmed only when it would discard something not saved: text or
-// questions on an unsaved or edited set. A clean saved set just steps aside.
+// ── moving between reads ───────────────────────────────────────────────────
+// The URL names the read on screen (/studio/reads/<id>); no id is a new read.
+// Leaving asks first only when something would be lost: text or questions
+// that were never run, or edits made since the read's last run.
 const hasWork = computed(
   () =>
     state.value.trim().length > 0 ||
     questions.value.some((q) => q.instructions.trim().length > 0 || q.idTouched),
 )
-const newOpen = ref(false)
+const unsaved = computed(() => {
+  if (readSaveFailed.value) return true
+  if (!hasWork.value) return false
+  const runs = activeRead.value?.runs ?? []
+  const latest = runs[runs.length - 1]
+  if (!latest) return true
+  const b = body.value
+  return (
+    latest.state !== b.state ||
+    JSON.stringify(latest.questions) !== JSON.stringify(b.questions) ||
+    latest.samples !== samples.value
+  )
+})
+/** Where a confirmed leave goes: a new read, or an earlier one. */
+const leaving = ref<{ to: 'new' } | { to: 'read'; id: string } | null>(null)
 function newRead(): void {
-  if (hasWork.value && (dirty.value || !activeSet.value)) {
-    newOpen.value = true
-    return
-  }
+  if (unsaved.value) leaving.value = { to: 'new' }
+  else goNew()
+}
+function openRead(id: string): void {
+  if (id === activeRead.value?.id) return
+  if (unsaved.value) leaving.value = { to: 'read', id }
+  else void router.push({ name: 'reads', params: { id } })
+}
+function confirmLeave(): void {
+  const l = leaving.value
+  leaving.value = null
+  if (!l) return
+  if (l.to === 'new') goNew()
+  // the route watcher opens it; the edits being left are dropped there
+  else void router.push({ name: 'reads', params: { id: l.id } })
+}
+function goNew(): void {
+  if (route.params.id) void router.push({ name: 'reads' })
   resetRead()
 }
 function resetRead(): void {
@@ -581,9 +647,10 @@ function resetRead(): void {
   questions.value = [newQuestion()]
   samples.value = 'auto'
   activeSetId.value = undefined
-  run.value = null
-  history.value = sets.runsOf(undefined)
-  historyIdx.value = 0
+  activeRead.value = null
+  readSaveFailed.value = false
+  runIdx.value = 0
+  lastMs.value = null
   serverRowErrors.value = {}
   questionsError.value = null
   pageError.value = null
@@ -591,8 +658,88 @@ function resetRead(): void {
   jsonError.value = null
   jsonNotes.value = []
   tab.value = 'form'
-  newOpen.value = false
 }
+/** Put a read on screen: the editor takes its latest run's text and
+ *  questions, the answers show that run. */
+const opening = ref(false)
+async function loadRead(id: string): Promise<void> {
+  opening.value = true
+  pageError.value = null
+  try {
+    const doc = await sets.loadRead(id)
+    if (route.params.id !== id) return
+    resetRead()
+    activeRead.value = doc
+    runIdx.value = Math.max(doc.runs.length - 1, 0)
+    const latest = doc.runs[doc.runs.length - 1]
+    if (latest) {
+      if (latest.fileName) setFromFile(latest.state ?? '', latest.fileName)
+      else state.value = latest.state ?? ''
+      const p = fromWire({ questions: latest.questions, samples: latest.samples })
+      questions.value = p.questions.length ? p.questions : [newQuestion()]
+      samples.value = p.samples ?? latest.samples
+      lastMs.value = latest.ms
+    }
+  } catch (e) {
+    if (route.params.id !== id) return
+    resetRead()
+    pageError.value = `This read could not be opened: ${e instanceof Error ? e.message : String(e)}`
+  } finally {
+    opening.value = false
+  }
+}
+watch(
+  () => route.params.id,
+  (raw) => {
+    const id = typeof raw === 'string' && raw ? raw : undefined
+    if (!id) {
+      if (activeRead.value) resetRead()
+      return
+    }
+    if (id !== activeRead.value?.id) void loadRead(id)
+  },
+  { immediate: true },
+)
+async function renameRead(id: string, title: string): Promise<void> {
+  try {
+    const doc = await sets.renameRead(id, title)
+    if (activeRead.value?.id === id) activeRead.value = { ...activeRead.value, title: doc.title, revision: doc.revision }
+  } catch (e) {
+    toasts.push({ tone: 'bad', title: 'Not renamed', description: e instanceof Error ? e.message : String(e) })
+  }
+}
+async function removeRead(id: string): Promise<void> {
+  try {
+    await sets.removeRead(id)
+    if (activeRead.value?.id === id) goNew()
+  } catch (e) {
+    toasts.push({ tone: 'bad', title: 'Not deleted', description: e instanceof Error ? e.message : String(e) })
+  }
+}
+
+// the side panel folds like the chat list; a narrow window starts folded
+const panelOpen = ref(window.innerWidth >= 1100)
+let panelEdited = false
+let restoringPanel = false
+onMounted(async () => {
+  try {
+    const saved = await readsPreferencesApi.get()
+    if (!panelEdited && typeof saved.readsPanelOpen === 'boolean') {
+      restoringPanel = true
+      panelOpen.value = saved.readsPanelOpen
+    }
+  } catch (e) {
+    toasts.push({ tone: 'bad', title: 'Layout could not be loaded', description: String(e) })
+  } finally { restoringPanel = false }
+})
+let panelSave: Promise<unknown> = Promise.resolve()
+watch(panelOpen, (v) => {
+  if (restoringPanel) return
+  panelEdited = true
+  panelSave = panelSave.catch(() => {}).then(() => readsPreferencesApi.save(v)).catch((e) => {
+    toasts.push({ tone: 'bad', title: 'Layout was not saved', description: String(e) })
+  })
+}, { flush: 'sync' })
 
 // ── API pane ───────────────────────────────────────────────────────────────
 const copied = ref(false)
@@ -605,6 +752,34 @@ async function copyCurl(): Promise<void> {
 
 <template>
   <div class="rd" @keydown="onKey">
+    <ReadsSidebar
+      v-if="panelOpen"
+      :reads="sets.reads"
+      :active-id="activeRead?.id ?? null"
+      :loaded="sets.readsLoaded"
+      :error="sets.readsError"
+      :busy="busy"
+      @new="newRead"
+      @open="openRead"
+      @rename="renameRead"
+      @remove="removeRead"
+      @fold="panelOpen = false"
+    />
+    <aside v-else class="rd__rail">
+      <Tooltip label="Show reads" side="right">
+        <button class="pk-icon-btn rd__railbtn" type="button" aria-label="Show reads" @click="panelOpen = true">
+          <Icon name="panel-left" :size="18" />
+        </button>
+      </Tooltip>
+      <Tooltip label="New read" side="right">
+        <button class="pk-icon-btn rd__railbtn" type="button" aria-label="New read" :disabled="busy" @click="newRead">
+          <Icon name="plus" :size="18" />
+        </button>
+      </Tooltip>
+    </aside>
+
+    <div class="rd__main">
+    <div class="rd__inner">
     <div class="rd__head">
       <div>
         <h1 class="rd__title">Reads</h1>
@@ -614,18 +789,19 @@ async function copyCurl(): Promise<void> {
         </p>
       </div>
       <div v-if="readers.length" class="rd__headr">
-        <button class="pk-btn" type="button" :disabled="busy" @click="newRead">
-          <Icon name="plus" :size="14" /> New read
-        </button>
         <Select v-model="port" :options="modelOptions" />
       </div>
     </div>
 
-    <div v-if="!readers.length && !models.readersProbed" class="rd__none">
+    <div v-if="opening && !activeRead" class="rd__none">
+      <Icon name="spinner" :size="24" class="rd__none-icon spin" />
+      <p class="rd__none-txt">Opening the read...</p>
+    </div>
+    <div v-else-if="!readers.length && !activeRead && !models.readersProbed" class="rd__none">
       <Icon name="spinner" :size="24" class="rd__none-icon spin" />
       <p class="rd__none-txt">Looking for a running model that reads...</p>
     </div>
-    <div v-else-if="!readers.length" class="rd__none">
+    <div v-else-if="!readers.length && !activeRead" class="rd__none">
       <Icon name="list-checks" :size="32" class="rd__none-icon" />
       <p class="rd__none-title">No model that can read is running</p>
       <p class="rd__none-txt">
@@ -638,6 +814,10 @@ async function copyCurl(): Promise<void> {
 
     <template v-else>
       <div v-if="pageError" class="rd__error" role="alert">{{ pageError }}</div>
+      <p v-if="!readers.length" class="rd__noreader">
+        No model that can read is running, so this read cannot run again until DiffusionGemma is
+        started in the Manager.
+      </p>
 
       <div class="rd__cols">
         <div class="rd__left">
@@ -849,20 +1029,24 @@ async function copyCurl(): Promise<void> {
 
         <div class="rd__right">
           <div class="rd__card rd__card--answers">
+            <button v-if="readSaveFailed && activeRead" type="button" class="pk-btn pk-btn--sm" :disabled="busy" @click="persistRead(activeRead)">Retry saving</button>
+            <p v-if="run?.stateMissing" class="rd__meta">The original input was not retained with this older result.</p>
             <AnswersCard
               :run="run"
-              :history="history"
-              :selected="historyIdx"
+              :run-index="runIdx"
+              :run-count="activeRead?.runs.length ?? 0"
               :busy="busy"
               :stale="stale"
               :can-example="!!current && !busy"
-              @select="selectHistory"
+              @step="stepRun"
               @example="loadExample"
             />
           </div>
         </div>
       </div>
     </template>
+    </div>
+    </div>
 
     <Dialog :open="saveOpen" title="Save read set" icon="save" size="sm" :busy="saving" @close="saveOpen = false">
       <label class="rd__field">
@@ -889,19 +1073,23 @@ async function copyCurl(): Promise<void> {
     </Dialog>
 
     <Dialog
-      :open="newOpen"
-      title="Start a new read?"
-      icon="plus"
+      :open="!!leaving"
+      title="Leave this read?"
+      icon="alert-triangle"
       role="alertdialog"
       size="sm"
-      @close="newOpen = false"
+      @close="leaving = null"
     >
       <p class="rd__dlgtext">
-        The text and the questions here are not saved. Save the set first, or start over without them.
+        {{
+          activeRead
+            ? 'The edits made since this read last ran are not kept. Run it to keep them.'
+            : 'This text and these questions have not been run, so they are not kept yet.'
+        }}
       </p>
       <template #footer>
-        <button class="pk-btn" type="button" @click="newOpen = false">Cancel</button>
-        <button class="pk-btn pk-btn--primary" type="button" @click="resetRead">Start over</button>
+        <button class="pk-btn" type="button" @click="leaving = null">Cancel</button>
+        <button class="pk-btn pk-btn--primary" type="button" @click="confirmLeave">Leave without them</button>
       </template>
     </Dialog>
 
@@ -916,7 +1104,8 @@ async function copyCurl(): Promise<void> {
       @close="deleteOpen = false"
     >
       <p class="rd__dlgtext">
-        "{{ activeSet?.name }}" and its run history here are removed. The questions stay in the editor.
+        "{{ activeSet?.name }}" is removed. The questions stay in the editor, and reads made with it
+        stay in the list.
       </p>
       <template #footer>
         <button class="pk-btn" type="button" :disabled="saving" @click="deleteOpen = false">Cancel</button>
@@ -929,10 +1118,47 @@ async function copyCurl(): Promise<void> {
 </template>
 
 <style scoped>
+/* two panes, the chat shape: the history on the left at full height, the
+   workspace scrolling on its own beside it */
 .rd {
+  display: flex;
   width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+.rd__main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 32px;
+}
+.rd__inner {
   max-width: var(--pk-panel-width);
   margin: 0 auto;
+}
+.rd__rail {
+  flex: none;
+  width: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 0;
+  background: var(--pk-bg-surface);
+  border-right: 1px solid var(--pk-border-default);
+}
+.rd__railbtn {
+  width: 34px;
+  height: 34px;
+}
+.rd__noreader {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: var(--pk-radius-md);
+  background: var(--pk-bg-surface);
+  border: 1px solid var(--pk-border-default);
+  color: var(--pk-text-secondary);
+  font-size: var(--pk-font-size-sm);
 }
 .rd__head {
   display: flex;
@@ -953,17 +1179,11 @@ async function copyCurl(): Promise<void> {
   color: var(--pk-text-muted);
   font-size: var(--pk-font-size-sm);
 }
-/* the button takes the dropdown's height: pk-btn is 34px and the Select
-   trigger sizes from its padding, so stretching is what keeps the pair
-   level in both themes and at every font */
 .rd__headr {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   gap: 8px;
   flex: none;
-}
-.rd__headr .pk-btn {
-  height: auto;
 }
 .rd__none {
   display: flex;
@@ -1012,7 +1232,7 @@ async function copyCurl(): Promise<void> {
 /* two columns once both fit: the answers stay in view while the questions
    are edited, which is the whole loop */
 @media (min-width: 1200px) {
-  .rd {
+  .rd__inner {
     max-width: 1400px;
   }
   .rd__cols {

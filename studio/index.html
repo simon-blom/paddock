@@ -10,13 +10,9 @@
     <meta name="theme-color" media="(prefers-color-scheme: dark)"  content="#0A1118" />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#F5F5F7" />
     <script>
-      // Anti-FOUC: apply the stored (or system) theme before the bundle loads,
-      // so there's no flash of the wrong theme on first paint.
+      // Use the OS appearance until SQLite preferences load before app mounting.
       (function () {
-        var stored = localStorage.getItem('pk_theme');
-        var t = (stored === 'light' || stored === 'dark')
-          ? stored
-          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        var t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
         document.documentElement.setAttribute('data-theme', t);
       })();
     </script>

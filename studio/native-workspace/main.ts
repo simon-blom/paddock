@@ -6,6 +6,7 @@ import { useFleetStore } from '@/stores/fleet'
 import { useRegistryStore } from '@/stores/registry'
 import { usePushStore } from '@/stores/push'
 import EmbeddedViewers from './EmbeddedViewers.vue'
+import PersistenceStatus from '@/components/ui/PersistenceStatus.vue'
 import { NATIVE_CONTENT } from '@/lib/native-content'
 import { createController } from './controller'
 import { restorePreferences } from './preferences'
@@ -26,7 +27,7 @@ const router = createRouter({ history: createMemoryHistory(), routes: [
 const pinia = createPinia()
 setActivePinia(pinia)
 const controller = createController(router)
-createApp({ render: () => h(RouterView) }).use(pinia).use(router).provide(NATIVE_CONTENT, controller.host).mount('#app')
+createApp({ render: () => [h(RouterView), h(PersistenceStatus)] }).use(pinia).use(router).provide(NATIVE_CONTENT, controller.host).mount('#app')
 await router.isReady()
 await controller.initialized
 window.paddockWorkspace = controller

@@ -46,7 +46,7 @@ export interface AnnotationPresetsCapability {
     getPreset(name: string): AnnotationPreset | undefined;
     /** Activate a preset by name (or clear with `null`). */
     setActivePreset(name: string | null): void;
-    /** Save or replace a preset. User-supplied presets are persisted to localStorage. */
+    /** Save or replace a preset. User-supplied presets are persisted to host preference store. */
     savePreset(preset: AnnotationPreset): void;
     /** Delete a non-builtin preset by name. Returns false for builtin/missing. */
     deletePreset(name: string): boolean;
@@ -64,7 +64,7 @@ export interface AnnotationPresetsCapability {
  * Presets are sourced from two places:
  *  1. `engine.annotationPresets` config — flagged `builtin: true` and
  *     therefore non-deletable from the UI.
- *  2. The user's localStorage entry under `lector.annotationPresets.user`
+ *  2. The user's host preference store entry under `lector.annotationPresets.user`
  *     — created via `saveCurrentAsPreset()`.
  *
  * If both sources define the same name, the user entry wins (the user

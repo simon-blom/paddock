@@ -1,18 +1,30 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { nextTick } from 'vue'
 vi.mock('@/lib/chat-title', () => ({ titleGenerator: { cancel: vi.fn() } }))
 import { useSettingsStore } from '@/stores/settings'
 import { restorePreferences } from '../../native-workspace/preferences'
 import { preferencePresentation, saveStudioPreferences, validatePreferences } from '../../native-workspace/studio-preferences'
+import { uiPreferences } from './ui-preferences'
+
+let database: Record<string, unknown>
+function sqliteFetch(_url: unknown, init?: RequestInit) {
+  if (init?.method === 'PUT') Object.assign(database, JSON.parse(String(init.body)))
+  return Promise.resolve(Response.json(database))
+}
 
 describe('native preferences use the shared settings store', () => {
   beforeEach(async () => {
-    const entries = new Map<string, string>()
-    vi.stubGlobal('localStorage', { getItem: (k: string) => entries.get(k) ?? null, setItem: (k: string, v: string) => entries.set(k, v), removeItem: (k: string) => entries.delete(k) })
-    vi.stubGlobal('window', { matchMedia: () => ({ matches: false }) })
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({})))
+    database = { 'studio.pk_max_tokens_v2': '1' }
+    vi.stubGlobal('window', { matchMedia: () => ({ matches: false }), addEventListener: vi.fn() })
+    vi.stubGlobal('document', { addEventListener: vi.fn() })
+    vi.stubGlobal('fetch', vi.fn(sqliteFetch))
     setActivePinia(createPinia()); await restorePreferences()
+  })
+  afterEach(async () => {
+    vi.stubGlobal('fetch', vi.fn(sqliteFetch))
+    await uiPreferences.flush()
+    vi.unstubAllGlobals()
   })
   it('validates the whole patch before touching live preferences', async () => {
     const s = useSettingsStore()
@@ -25,16 +37,16 @@ describe('native preferences use the shared settings store', () => {
     expect(preferencePresentation()).toMatchObject({ maxTokens: 32768, maxToolCalls: 50, mapHost: 'tiles.openfreemap.org' })
     const calls = vi.mocked(fetch).mock.calls
     const put = calls.find(([, init]) => init?.method === 'PUT')!
-    const data = JSON.parse(String(put[1]?.body)).macos_studio_preferences
-    expect(data.pk_max_tokens).toBe('32768'); expect(data.pk_max_tokens_v2).toBe('1')
+    const data = JSON.parse(String(put[1]?.body))
+    expect(data['studio.pk_max_tokens']).toBe('32768'); expect(database['studio.pk_max_tokens_v2']).toBe('1')
     expect(JSON.stringify(data)).not.toMatch(/credential|apiKey/)
   })
-  it('rolls back runtime and localStorage on failed persistence', async () => {
+  it('rolls back runtime without a browser fallback on failed persistence', async () => {
     const s = useSettingsStore()
     vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 503 })))
     await expect(saveStudioPreferences({ changes: { summarize: false, maxToolCalls: 10 }, expected: { summarize: true, maxToolCalls: null } })).rejects.toThrow('could not be saved')
     expect(s.summarize).toBe(true); expect(s.maxToolCalls).toBe(null)
-    expect(localStorage.getItem('pk_summarize')).toBe('on')
+    expect(uiPreferences.getItem('pk_summarize')).toBe('on')
   })
   it('rejects stale drafts rather than overwriting a changed setting', async () => {
     const s = useSettingsStore(); s.maxToolCalls = 5; await nextTick()
@@ -42,7 +54,8 @@ describe('native preferences use the shared settings store', () => {
     expect(s.maxToolCalls).toBe(5)
   })
   it('restores an explicit 8192 from older native snapshots without rerunning the web migration', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ macos_studio_preferences: { pk_max_tokens: '8192' } })))
+    database = { macos_studio_preferences: { pk_max_tokens: '8192' } }
+    vi.stubGlobal('fetch', vi.fn(sqliteFetch))
     await restorePreferences()
     expect(useSettingsStore().maxTokens).toBe(8192)
   })
