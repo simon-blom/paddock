@@ -1049,7 +1049,7 @@ impl Engine {
                         let _ = ready_tx.send(Err("serial-only TP=2 requires max_batch=1".into()));
                         return;
                     }
-                    tracing::info!("paddock: Phase 9 TP=2 serial eager scheduler selected");
+                    tracing::info!("paddock: TP=2 serial eager scheduler selected");
                     (1, false)
                 } else if diffusion {
                     let cap = if max_batch > 1 {

@@ -210,9 +210,10 @@
 #   (equivalently: --tp-size 2 --tp-rank 1 with --tp-master-addr; the
 #   --tp-worker flag is the supported form and refuses to serve)
 #
-# The rank-1 process uses GPU ordinal 0 on its own machine. CUDA graphs for
-# the TP lane are opt-in via PADDOCK_TP_GRAPH=1 (set it on the coordinator;
-# the resolved mode rides the handshake, so the worker follows).
+# The rank-1 process uses GPU ordinal 0 on its own machine; the coordinator's
+# --gpu selection applies to rank 0 only (the worker refuses --gpu). CUDA
+# graphs for the TP lane are opt-in via PADDOCK_TP_GRAPH=1 (set it on the
+# coordinator; the resolved mode rides the handshake, so the worker follows).
 # Env: PADDOCK_TP_SIZE / PADDOCK_TP_RANK / PADDOCK_TP_MASTER_ADDR /
 #      PADDOCK_TP_MASTER_PORT   CLI: --tp-size / --tp-rank / --tp-worker /
 #      --tp-master-addr / --tp-master-port
