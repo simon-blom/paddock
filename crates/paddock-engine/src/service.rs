@@ -500,6 +500,17 @@ pub struct CanvasReadRequest {
     pub canvas: Vec<u32>,
     /// the label ids whose probabilities are wanted at every position
     pub label_ids: Vec<u32>,
+    /// denoising steps before the probabilities are read: 1 is one forward
+    /// of the seeded canvas; N runs N - 1 ordinary steps first (the model's
+    /// own sampling schedule, accept and re-noise), each followed by the
+    /// `pinned` positions going back to their seeded ids, and reads the
+    /// N-th forward - so the answer slots condition on each other's
+    /// partly settled values while the template holds. Past 1 it needs
+    /// `Engine::canvas_read_steps` > 1.
+    pub steps: u32,
+    /// canvas positions held at their seeded ids between steps (every
+    /// position but the answer slots); unused at one step
+    pub pinned: Vec<u32>,
     /// where the `[canvas.len()][label_ids.len()]` probabilities, entropies
     /// and argmaxes go
     pub reply: std::sync::mpsc::Sender<crate::generator::CanvasReadOut>,
@@ -976,6 +987,28 @@ pub struct Engine {
     /// ones - sampled at startup like `vision_budget`, so the serving layer
     /// can offer (or refuse) the structured read without a round trip.
     canvas_width: usize,
+    /// The most denoising steps a structured read may take: `READ_MAX_STEPS`
+    /// on a block-diffusion backend that pins canvas positions (either
+    /// loop), 1 on one that cannot, 0 on a next-token model.
+    canvas_read_steps: u32,
+    /// True when a structured read (and a canvas generation) may carry
+    /// images: a vision companion is attached, and the loop in use prefills
+    /// image prompts (the serial loop's whole-prompt pass, or the batched
+    /// loop's slot path).
+    canvas_images: bool,
+}
+
+/// The step cap of a multi-step structured read - the reference example
+/// server's clamp. Past a handful of steps the answer slots are generating,
+/// not being read.
+pub const READ_MAX_STEPS: u32 = 8;
+
+/// What the engine thread reports once the generator is built and warm.
+struct Ready {
+    vision_budget: Option<crate::generator::VisionBudget>,
+    canvas_width: usize,
+    canvas_read_steps: u32,
+    canvas_images: bool,
 }
 
 impl Engine {
@@ -1006,9 +1039,7 @@ impl Engine {
         // Ok carries the generator's vision budget (None = no tower) - the one
         // fact the outside needs from the generator itself, read on the engine
         // thread that owns it.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<
-            Result<(Option<crate::generator::VisionBudget>, usize), String>,
-        >();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Ready, String>>();
 
         let thread_metrics = metrics.clone();
         let shutdown = Arc::new(ShutdownCtl::new());
@@ -1307,7 +1338,25 @@ impl Engine {
                 // right after build(), so the server starts listening only once warm.
                 // That moves the one-time cold-start cost into load time (a slightly
                 // longer "model ready") and makes request #1 fast, like every other.
-                let _ = ready_tx.send(Ok((generator.vision_budget(), generator.canvas_width())));
+                let canvas_width = generator.canvas_width();
+                let batched_canvas = batched && diffusion;
+                let _ = ready_tx.send(Ok(Ready {
+                    vision_budget: generator.vision_budget(),
+                    canvas_width,
+                    canvas_read_steps: if canvas_width == 0 {
+                        0
+                    } else if generator.canvas_pins() {
+                        READ_MAX_STEPS
+                    } else {
+                        1
+                    },
+                    canvas_images: canvas_width > 0
+                        && if batched_canvas {
+                            generator.supports_mm_slots()
+                        } else {
+                            generator.vision_budget().is_some()
+                        },
+                }));
                 if batched && diffusion {
                     run_batched_diffusion(generator.as_mut(), &rx, cap.max(1), &metrics, &ctl);
                 } else if batched {
@@ -1335,12 +1384,14 @@ impl Engine {
             .map_err(|e| format!("failed to spawn engine thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok((vision_budget, canvas_width))) => Ok(Self {
+            Ok(Ok(ready)) => Ok(Self {
                 tx,
                 shutdown,
                 metrics,
-                vision_budget,
-                canvas_width,
+                vision_budget: ready.vision_budget,
+                canvas_width: ready.canvas_width,
+                canvas_read_steps: ready.canvas_read_steps,
+                canvas_images: ready.canvas_images,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("engine thread died during startup".into()),
@@ -1369,6 +1420,18 @@ impl Engine {
     /// (the structured read's ceiling), 0 on a next-token model.
     pub fn canvas_width(&self) -> usize {
         self.canvas_width
+    }
+
+    /// The most denoising steps one structured read may take (see
+    /// `READ_MAX_STEPS`); 1 where only single-pass reads are served, 0 on a
+    /// next-token model.
+    pub fn canvas_read_steps(&self) -> u32 {
+        self.canvas_read_steps
+    }
+
+    /// True when structured reads may carry images.
+    pub fn canvas_images(&self) -> bool {
+        self.canvas_images
     }
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
@@ -1649,8 +1712,10 @@ fn run_batched_diffusion(
     loop {
         // ── admission: fill the free slots, blocking only when nothing is live
         let mut pending: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut mm_pending: Vec<(usize, Vec<MmChunk>)> = Vec::new();
         while let Some(k) = slots.iter().position(Option::is_none) {
-            let idle = slots.iter().all(Option::is_none) && pending.is_empty();
+            let idle =
+                slots.iter().all(Option::is_none) && pending.is_empty() && mm_pending.is_empty();
             let req = if idle {
                 match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(r) => r,
@@ -1674,11 +1739,15 @@ fn run_batched_diffusion(
                 .submitted
                 .map_or(0, |t| dur_ms(t_admit.saturating_duration_since(t)));
             // what a canvas cannot carry, refused by name (the serial loop's
-            // rules); a read's canvas is checked like the serial path's
-            if req.mm_chunks.is_some() {
+            // rules); a read's canvas is checked like the serial path's. An
+            // image prompt prefills through the backend's multimodal slot
+            // path (the chat lane's own), which a model loaded without its
+            // vision companion does not have.
+            if req.mm_chunks.is_some() && !generator.supports_mm_slots() {
                 refuse(
                     &req.events,
-                    "images are not served on a block-diffusion model",
+                    "this block-diffusion model was loaded without its vision companion \
+                     (mmproj), so it cannot take images",
                 );
                 continue;
             }
@@ -1715,6 +1784,19 @@ fn run_batched_diffusion(
                 );
                 continue;
             }
+            if let Some(r) = &req.canvas_read
+                && (r.steps == 0
+                    || r.steps > READ_MAX_STEPS
+                    || (r.steps > 1 && !generator.canvas_pins())
+                    || r.pinned.iter().any(|&p| p as usize >= r.canvas.len()))
+            {
+                refuse(
+                    &req.events,
+                    "a read takes 1 denoising step here, or up to 8 on a backend that pins \
+                     canvas positions, with every pinned position inside the canvas",
+                );
+                continue;
+            }
             if req.prompt.len() + tail > max_ctx {
                 let _ = req
                     .events
@@ -1744,7 +1826,50 @@ fn run_batched_diffusion(
                 t_admit,
                 t_prefilled: t_admit,
             });
-            pending.push((k, req.prompt));
+            match req.mm_chunks {
+                Some(chunks) => mm_pending.push((k, chunks)),
+                None => pending.push((k, req.prompt)),
+            }
+        }
+        // image prompts: the backend's batched vision encode, then each
+        // slot's prefill; the rows it reports (image rows included) are where
+        // the slot's canvas starts
+        if !mm_pending.is_empty() {
+            metrics.phase.store(PHASE_PREFILL, Relaxed);
+            for (k, r) in
+                generator.forward_prefill_multimodal_batch(std::mem::take(&mut mm_pending))
+            {
+                let Some(s) = slots[k].as_mut() else {
+                    continue;
+                };
+                let tail = s
+                    .read
+                    .as_ref()
+                    .map_or(width.min(s.max_tokens.max(1)), |r| r.canvas.len());
+                match r {
+                    Ok((_, rows)) if rows + tail <= max_ctx => {
+                        s.base = rows;
+                        s.t_prefilled = std::time::Instant::now();
+                        let _ = s.events.send(TokenEvent::Prefilled {
+                            cached: 0,
+                            rows: rows as u32,
+                        });
+                    }
+                    Ok((_, rows)) => {
+                        let s = slots[k].take().expect("live");
+                        let _ = s
+                            .events
+                            .send(TokenEvent::Error(EngineError::context_overflow(
+                                rows + tail,
+                                max_ctx,
+                            )));
+                    }
+                    Err(e) => {
+                        let s = slots[k].take().expect("live");
+                        let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                    }
+                }
+            }
         }
         if !pending.is_empty() {
             metrics.phase.store(PHASE_PREFILL, Relaxed);
@@ -1754,6 +1879,10 @@ fn run_batched_diffusion(
                     for (k, _) in &pending {
                         if let Some(s) = slots[*k].as_mut() {
                             s.t_prefilled = now;
+                            let _ = s.events.send(TokenEvent::Prefilled {
+                                cached: 0,
+                                rows: s.base as u32,
+                            });
                         }
                     }
                 }
@@ -1778,7 +1907,7 @@ fn run_batched_diffusion(
                 if let Some(read) = &s.read {
                     let h = generator.canvas_open(read.canvas.len())?;
                     generator.canvas_set(h, &read.canvas)?;
-                    return Ok((h, read.canvas.len(), 0));
+                    return Ok((h, read.canvas.len(), s.seed));
                 }
                 let w = width.min(s.max_tokens - s.emitted).max(1);
                 let block_offset = (s.base as u32).wrapping_mul(2_654_435_761);
@@ -1816,13 +1945,17 @@ fn run_batched_diffusion(
                         handle,
                         slot: k,
                         base: s.base,
-                        temperature: if s.read.is_some() {
-                            Some(1.0)
-                        } else {
-                            s.temperature
+                        // a read's LAST step reads at temperature 1 and
+                        // accepts nothing; its earlier steps (a multi-step
+                        // read) denoise like generation, on the model's own
+                        // schedule
+                        temperature: match &s.read {
+                            Some(r) if s.steps + 1 >= r.steps => Some(1.0),
+                            Some(_) => None,
+                            None => s.temperature,
                         },
                         seed,
-                        accept: s.read.is_none(),
+                        accept: s.read.as_ref().is_none_or(|r| s.steps + 1 < r.steps),
                     }
                 })
                 .collect();
@@ -1847,6 +1980,20 @@ fn run_batched_diffusion(
             };
             let (h, _, _) = s.canvas.expect("ticked");
             s.steps += 1;
+            // between the steps of a multi-step read the template goes back
+            // on top of what the step accepted and re-noised
+            let pin = s.read.as_ref().filter(|r| s.steps < r.steps).map(|r| {
+                let ids: Vec<u32> = r.pinned.iter().map(|&p| r.canvas[p as usize]).collect();
+                (r.pinned.clone(), ids)
+            });
+            if let Some((positions, ids)) = pin {
+                if let Err(e) = generator.canvas_pin(h, &positions, &ids) {
+                    generator.canvas_close(h);
+                    let s = slots[k].take().expect("live");
+                    let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                }
+                continue;
+            }
             if let Some(read) = &s.read {
                 let res = generator.canvas_result(h, &read.label_ids);
                 generator.canvas_close(h);
@@ -2059,6 +2206,17 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
             )));
             return;
         }
+        if read.steps == 0
+            || read.steps > READ_MAX_STEPS
+            || (read.steps > 1 && !generator.canvas_pins())
+            || read.pinned.iter().any(|&p| p as usize >= read.canvas.len())
+        {
+            let _ = req.events.send(TokenEvent::Error(EngineError::invalid(
+                "a read takes 1 denoising step here, or up to 8 on a backend that pins canvas \
+                 positions, with every pinned position inside the canvas",
+            )));
+            return;
+        }
         if rows as usize + read.canvas.len() > max_ctx {
             let _ = req
                 .events
@@ -2069,7 +2227,14 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
             return;
         }
         let t_read = std::time::Instant::now();
-        match generator.canvas_read(rows as usize, &read.canvas, &read.label_ids) {
+        match generator.canvas_read_steps(
+            rows as usize,
+            &read.canvas,
+            &read.label_ids,
+            read.steps,
+            &read.pinned,
+            req.sampler.seed,
+        ) {
             Ok(out) => {
                 let _ = read.reply.send(out);
                 let _ = req.events.send(TokenEvent::Done(
@@ -5466,7 +5631,13 @@ fn run_batched(
             // 2b-dev below)? Hoisted out of its `else if` so the controller can
             // be consulted once per tick, before either branch commits to a
             // round - see the k=0 arm.
+            // The device round drafts from a model drafter only (it has no
+            // n-gram fallback), so without one every chunk is the pending
+            // token alone: a one-row verify - the decode tick's work through
+            // the verify path's state save, uncaptured walk and commit. On
+            // Flash Next that is 23 tok/s where the captured tick is 25.5.
             let dev_ok = !greedy
+                && generator.spec_capable()
                 && !live.is_empty()
                 && live.len() <= dev_spec_live_max
                 && live.len() <= {
@@ -5595,7 +5766,19 @@ fn run_batched(
                     }
                     reqs.push((k, slot.pos as usize, chunk));
                 }
-                match generator.forward_spec_batch(&reqs) {
+                // Nothing to verify: no drafter, and the n-gram lookup found
+                // no continuation for any slot. The round would be a decode
+                // tick done the expensive way; the dense tick below is the
+                // same token at its own speed. No cooldown - the next tick's
+                // lookup may find one. (With a drafter, all-length-1 rounds
+                // still run: the verify re-points cold slots' heads.)
+                let nothing_to_verify =
+                    !generator.spec_capable() && reqs.iter().all(|r| r.2.len() == 1);
+                match if nothing_to_verify {
+                    Ok(None)
+                } else {
+                    generator.forward_spec_batch(&reqs)
+                } {
                     Ok(Some(picks)) => {
                         let mut base = 0usize;
                         let mut accs: Vec<usize> = Vec::with_capacity(live.len());
@@ -5667,10 +5850,11 @@ fn run_batched(
                     }
                     // backend can't spec this tick (no support, or model-draft
                     // state stale) - cool down and re-probe later
-                    Ok(None) => {
+                    Ok(None) if !nothing_to_verify => {
                         spec_retry_at = spec_ticks + 256;
                         st[4].1 += t0s.elapsed().as_nanos() as u64;
                     }
+                    Ok(None) => {}
                     Err(e) => {
                         for slot in slots.iter_mut() {
                             if let Some(s) = slot.take() {
@@ -7080,6 +7264,87 @@ fn sample_slot_row(slot_opt: &mut Option<Slot>, row: &mut [f32]) {
     slot.draft.push(next);
     if !slot.accept(next, lp) {
         *slot_opt = None;
+    }
+}
+
+#[cfg(test)]
+mod diffusion_billing_tests {
+    use super::*;
+
+    struct Prefill;
+    impl Generator for Prefill {
+        fn reset(&mut self) {}
+        fn vocab(&self) -> usize {
+            2
+        }
+        fn forward(&mut self, _: u32) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0.; 2])
+        }
+        fn canvas_width(&self) -> usize {
+            4
+        }
+        fn supports_mm_slots(&self) -> bool {
+            true
+        }
+        fn forward_prefill_batch(
+            &mut self,
+            items: &[(usize, Vec<u32>)],
+        ) -> Result<Vec<Vec<f32>>, GenError> {
+            Ok(items.iter().map(|_| vec![0.; 2]).collect())
+        }
+        fn forward_prefill_multimodal(
+            &mut self,
+            _: usize,
+            _: &[MmChunk],
+        ) -> Result<(Vec<f32>, usize), GenError> {
+            Ok((vec![0.; 2], 283))
+        }
+    }
+
+    #[test]
+    fn diffusion_reports_actual_rows_before_canvas_dispatch() {
+        let (send, requests) = std::sync::mpsc::channel();
+        let mut receivers = Vec::new();
+        for image in [false, true] {
+            let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+            receivers.push(receiver);
+            send.send(GenRequest {
+                prompt: vec![0, 1, 0],
+                max_tokens: 1,
+                sampler: SamplingParams::default(),
+                stop_tokens: vec![],
+                events,
+                mm_chunks: image.then(|| {
+                    vec![MmChunk::Image {
+                        rgb: vec![0; 3],
+                        w: 1,
+                        h: 1,
+                    }]
+                }),
+                constraint: None,
+                logprobs: None,
+                submitted: None,
+                canvas_read: None,
+            })
+            .unwrap();
+        }
+        drop(send);
+        // The stub deliberately ends at canvas_open. Billing belongs to
+        // successful prefill, before either chat or JEV starts its canvas.
+        run_batched_diffusion(
+            &mut Prefill,
+            &requests,
+            2,
+            &Arc::new(EngineMetrics::default()),
+            &ShutdownCtl::new(),
+        );
+        for (receiver, expected) in receivers.iter_mut().zip([3, 283]) {
+            assert!(
+                matches!(receiver.try_recv().unwrap(), TokenEvent::Prefilled { cached: 0, rows } if rows == expected)
+            );
+            assert!(matches!(receiver.try_recv().unwrap(), TokenEvent::Error(_)));
+            assert!(receiver.try_recv().is_err());
+        }
     }
 }
 

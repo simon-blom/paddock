@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn diffusion_metal_catalog_exposes_three_text_formats_without_cuda_drift() {
+fn diffusion_metal_catalog_exposes_vision_in_three_formats_without_cuda_drift() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("diffusiongemma-26b-a4b").unwrap();
     assert_eq!(
@@ -11,14 +11,15 @@ fn diffusion_metal_catalog_exposes_three_text_formats_without_cuda_drift() {
     for id in ["q8", "q4", "mlx-4bit"] {
         let a = model.artifact(id).unwrap();
         assert!(a.runtime.supports_backend("metal"));
-        assert_eq!(a.capabilities(model), ["chat", "reasoning"]);
+        assert_eq!(a.capabilities(model), ["chat", "vision", "reasoning"]);
         assert_eq!(a.runtime.default_spec.as_deref(), Some("off"));
         assert_eq!(metal.default_envelope(&model.id, Some(id)), (32768, 1));
         assert_eq!(a.runtime.memory.as_ref().unwrap().max_batch, 8);
-        assert!(!a.runtime.embedded_vision);
+        assert_eq!(a.runtime.embedded_vision, id == "mlx-4bit");
         assert!(!crate::backend_contract::metal_kv_offload(model, a));
         let (_, tower, drafter) = metal.planned_paths(&model.id, Some(id)).unwrap();
-        assert!(tower.is_none() && drafter.is_none());
+        assert_eq!(tower.is_some(), id != "mlx-4bit");
+        assert!(drafter.is_none());
         assert_eq!(a.runtime.checkpoint_dir, id == "mlx-4bit");
         assert!(a.files.iter().all(|f| f.size > 0 && f.sha256.len() == 64));
         assert!(
@@ -51,13 +52,27 @@ fn diffusion_metal_catalog_exposes_three_text_formats_without_cuda_drift() {
             .unwrap()
             .ends_with("diffusiongemma-26B-A4B-it-MLX-4bit")
     );
+    // CUDA serves the Q4_K_M too, on the k-quant lane, priced from its own
+    // measured shape: the Metal probe above never reaches CUDA, and the CUDA
+    // measurement never reaches Metal
+    let metal_q4 = model.artifact("q4").unwrap();
+    assert_eq!(
+        metal_q4.shape.as_ref().unwrap().weight_bytes,
+        16_806_810_208
+    );
+    assert_eq!(metal_q4.workspace, Some(4_294_967_296));
     let cuda = metal.with_backend("cuda");
     let model = cuda.catalog_of("diffusiongemma-26b-a4b").unwrap();
     assert_eq!(model.default_weights().unwrap().id, "q8");
-    assert_eq!(cuda.default_envelope(&model.id, Some("q8")), (4096, 32));
-    for id in ["q4", "mlx-4bit"] {
-        assert!(cuda.planned_paths(&model.id, Some(id)).is_none());
+    for id in ["q8", "q4"] {
+        assert_eq!(cuda.default_envelope(&model.id, Some(id)), (4096, 32));
+        assert!(cuda.planned_paths(&model.id, Some(id)).is_some(), "{id}");
     }
+    let q4 = model.artifact("q4").unwrap();
+    assert_eq!(q4.shape.as_ref().unwrap().weight_bytes, 19_101_029_376);
+    assert_eq!(q4.workspace, Some(6_338_927_036));
+    assert!(q4.runtime.kv_cache_dtype.is_none());
+    assert!(cuda.planned_paths(&model.id, Some("mlx-4bit")).is_none());
 }
 
 #[test]
@@ -1064,7 +1079,7 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 !matches!(
                     artifact.id.as_str(),
                     "mlx-4bit" | "mlx-2bit" | "splash-4bit"
-                ) && !(model.id == "diffusiongemma-26b-a4b" && artifact.id == "q4"),
+                ),
                 "{}/{}",
                 model.id,
                 artifact.id

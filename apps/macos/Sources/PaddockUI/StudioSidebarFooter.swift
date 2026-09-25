@@ -6,7 +6,11 @@ struct StudioSidebarFooter: View {
   @AppStorage("workspaceAppearance") private var appearance: WorkspaceAppearance = .system
   var body: some View {
     VStack(spacing: 3) {
-      destination(.reads, title: "Reads")
+      if navigation.showsReadsHistory {
+        destination(.chats, title: "Chats")
+      } else {
+        destination(.reads, title: "Reads")
+      }
       destination(.prompts, title: "Prompt library")
       HStack(spacing: 2) {
         destination(.settings, title: "Settings")

@@ -61,20 +61,17 @@ struct StudioHistoryRow: View {
             }.font(.system(size: 10)).foregroundStyle(.secondary)
           }
           Spacer(minLength: 0)
-          if row.busy == true || row.titleState == "generating" || changing {
-            ProgressView().controlSize(.mini).help(row.busy == true ? "Answering" : "Saving")
-          } else if let status = row.titleState, !status.isEmpty {
-            Image(systemName: "exclamationmark.circle").foregroundStyle(.secondary).help(status)
-          }
         }.font(.system(size: 13)).padding(.vertical, compact ? 8 : 12)
           .padding(.leading, 10).contentShape(Rectangle())
       }.buttonStyle(QuietButtonStyle()).disabled(!canOpen || changing)
         .help(row.title).accessibilityLabel(row.title)
         .accessibilityIdentifier("open-chat-\(row.id)")
-      if !selecting {
-        StudioHistoryActionsMenu(title: row.title, id: row.id) { actions }
-          .disabled(changing).padding(.top, 3)
-      }
+      StudioHistoryRowControls(
+        title: row.title, id: row.id,
+        busy: row.busy == true || row.titleState == "generating" || changing,
+        status: row.titleState, progressLabel: row.busy == true ? "Answering" : "Saving",
+        showsActions: !selecting, actionsEnabled: !changing
+      ) { actions }.padding(.top, compact ? 3 : 7)
     }.padding(.trailing, 6)
       .background(
         selected ? PaddockStyle.elevated : .clear,

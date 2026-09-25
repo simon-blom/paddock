@@ -261,7 +261,13 @@ impl Vision {
     }
     fn mm(cmd: &Commands<'_>, w: &Weight, x: &Buffer, out: &Buffer, rows: usize) {
         if w.ty == 0x101 {
-            super::mlx::dense(cmd, w, x, out, None, rows, 0);
+            cmd.dispatch(
+                "gmlx_vmm64",
+                &[&w.buffer, x, out, &w.buffer],
+                &[w.k as u32, w.n as u32, rows as u32, 0],
+                [w.n.div_ceil(64), rows.div_ceil(64), 1],
+                128,
+            );
             return;
         }
         cmd.dispatch(
@@ -289,7 +295,7 @@ impl Vision {
             cmd.dispatch(
                 "gmlx_norm",
                 &[x, &w.buffer, out],
-                &[E as u32, if weighted { 1 } else { 2 }, self.eps.to_bits()],
+                &[E as u32, if weighted { 0 } else { 2 }, self.eps.to_bits()],
                 [rows, 1, 1],
                 E.div_ceil(128) * 32,
             );
@@ -503,7 +509,7 @@ impl Vision {
                     "gv_attention"
                 },
                 &[&job.qh, &job.kh, &job.vh, &job.attn, &job.tiles],
-                &[0],
+                &[if self.mlx { 31 } else { 0 }],
                 [16, job.tile_count, 1],
                 64,
             );
@@ -523,7 +529,7 @@ impl Vision {
                 ],
                 &[
                     E as u32,
-                    u32::from(self.mlx),
+                    0,
                     if self.mlx { self.eps.to_bits() } else { 0 },
                     self.eps.to_bits(),
                     1f32.to_bits(),
@@ -564,7 +570,7 @@ impl Vision {
                 ],
                 &[
                     E as u32,
-                    u32::from(self.mlx),
+                    0,
                     if self.mlx { self.eps.to_bits() } else { 0 },
                     self.eps.to_bits(),
                     1f32.to_bits(),

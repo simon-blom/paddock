@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 32 32" fill="none">
+  <!-- Alternative menu bar template image for the inner-stem mark: a solid
+       roof slab, the stem hanging from it, two layers cut free. Black only. -->
+  <path d="M2.56 8.384 L16 1.664 L29.44 8.384 L29.44 11.184 L16 17.904 L2.56 11.184 Z" fill="#000"/>
+  <path d="M2.56 8.384 L6.48 10.344 L6.48 28.04 L2.56 26.08 Z" fill="#000"/>
+  <path d="M10.68 19.646 L16 22.306 L27.76 16.426 M10.68 25.929 L16 28.589 L27.76 22.709"
+        stroke="#000" stroke-width="3.36" stroke-linecap="round" stroke-linejoin="miter"/>
+</svg>

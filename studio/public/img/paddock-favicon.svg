@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="155.702 141.702 676.596 676.596">
+  <!-- The browser tab's icon: the mark's lit top slab kept whole, the two
+       slabs under it drawn as chevrons so they still read at 16 px. The ink
+       follows the browser's theme. The exes and the app keep the full mark
+       via paddock.ico. -->
+  <style>svg{--ink:#3B4A5F}@media (prefers-color-scheme:dark){svg{--ink:#9FB2CC}}</style>
+  <defs><linearGradient id="lit" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8FE3FF"/><stop offset="1" stop-color="#2F68FF"/></linearGradient></defs>
+  <path d="M304 516 L544 636 L784 516" fill="none" stroke="var(--ink)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/><path d="M304 644 L544 764 L784 644" fill="none" stroke="var(--ink)" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M304 380 L544 500 L544 544 L304 424 Z" fill="#1F5AC4"/>
+  <path d="M544 500 L784 380 L784 424 L544 544 Z" fill="#17459A"/>
+  <path d="M240 412 L304 444 L304 488 L240 456 Z" fill="#1F5AC4"/>
+  <path d="M304 444 L368 412 L368 456 L304 488 Z" fill="#17459A"/>
+  <path d="M240 412 L304 380 L544 260 L784 380 L544 500 L368 412 L304 444 Z" fill="url(#lit)"/>
+</svg>

@@ -7,7 +7,14 @@
 // Every type's criteria are kept on the question at once, so the type
 // picker is lossless: switch to score and back and the options are still
 // there.
+//
+// Conditions (the example server's `ask_if` / `depends_on` / `alone`) sit
+// under the criteria, one line each, added from the row's menu: "ask only
+// if <question> is <answers>", "knows the answer to <question>", and "read
+// on its own canvas". They name other rows by key, so an id that is still
+// being typed never breaks one.
 import { ref, computed } from 'vue'
+import Checkbox from '@/components/ui/Checkbox.vue'
 import Icon from '@/components/Icon.vue'
 import Menu from '@/components/ui/Menu.vue'
 import MenuContent from '@/components/ui/MenuContent.vue'
@@ -22,6 +29,7 @@ import {
   confidenceBin,
   fmtP,
   type ReadAnswer,
+  type ReadCondition,
   type ReadOption,
   type ReadQuestion,
   type ReadType,
@@ -40,6 +48,13 @@ const props = defineProps<{
   /** this question's answer in the read on show, so the row says what it
    *  got without a trip to the other column */
   answer?: ReadAnswer | undefined
+  /** the read on show left this question unasked (its condition failed) */
+  skipped?: boolean
+  /** the model takes conditions, so the menu offers them */
+  conditional?: boolean
+  /** the other rows, for the conditions to name: key, a display name, and
+   *  the answers each can give */
+  others?: { key: string; name: string; answers: string[] }[]
 }>()
 const emit = defineEmits<{
   (e: 'patch', patch: Partial<ReadQuestion>): void
@@ -61,6 +76,55 @@ const typeOptions = computed<SelectOption[]>(() =>
 
 function setType(v: string | number): void {
   emit('patch', { type: v as ReadType })
+}
+
+// conditions
+const otherOptions = computed<SelectOption[]>(() =>
+  (props.others ?? []).map((o) => ({ value: o.key, label: o.name })),
+)
+function answersOf(key: string): string[] {
+  return props.others?.find((o) => o.key === key)?.answers ?? []
+}
+function nameOf(key: string): string {
+  return props.others?.find((o) => o.key === key)?.name ?? 'a removed question'
+}
+/** a question not yet named by another condition on this row, else any */
+function freeKey(): string | undefined {
+  const taken = new Set([...props.q.askIf.map((c) => c.key), ...props.q.after])
+  const list = props.others ?? []
+  return (list.find((o) => !taken.has(o.key)) ?? list[0])?.key
+}
+function addAskIf(): void {
+  const key = freeKey()
+  if (key) emit('patch', { askIf: [...props.q.askIf, { key, values: [] }] })
+}
+function setAskIf(i: number, c: ReadCondition): void {
+  emit('patch', { askIf: props.q.askIf.map((x, j) => (j === i ? c : x)) })
+}
+function setAskIfKey(i: number, v: string | number): void {
+  // another question gives other answers: the picked ones do not carry over
+  setAskIf(i, { key: String(v), values: [] })
+}
+function toggleValue(i: number, name: string, on: boolean | 'indeterminate'): void {
+  const c = props.q.askIf[i]
+  const values = on === true ? [...c.values.filter((v) => v !== name), name] : c.values.filter((v) => v !== name)
+  // keep the answers in the question's own order, whatever order they were ticked in
+  const order = answersOf(c.key)
+  values.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+  setAskIf(i, { key: c.key, values })
+}
+function removeAskIf(i: number): void {
+  emit('patch', { askIf: props.q.askIf.filter((_, j) => j !== i) })
+}
+function addAfter(): void {
+  const key = freeKey()
+  if (key) emit('patch', { after: [...props.q.after, key] })
+}
+function setAfter(i: number, v: string | number): void {
+  emit('patch', { after: props.q.after.map((k, j) => (j === i ? String(v) : k)) })
+}
+function removeAfter(i: number): void {
+  emit('patch', { after: props.q.after.filter((_, j) => j !== i) })
 }
 function input(e: Event): string {
   return (e.target as HTMLInputElement | HTMLTextAreaElement).value
@@ -155,6 +219,7 @@ function onDragEnd(): void {
         <i class="qr__dot" :class="`qr__dot--${confidenceBin(answer.confidence)}`" />
         {{ answerLabel(answer) }} <span class="qr__ansp">{{ fmtP(answer.confidence) }}</span>
       </span>
+      <span v-else-if="skipped" class="qr__ans qr__ans--skip">not asked</span>
       <Menu>
         <MenuTrigger>
           <button class="pk-icon-btn qr__more" type="button" aria-label="Question actions">
@@ -169,6 +234,18 @@ function onDragEnd(): void {
             <Icon name="arrow-down" :size="14" /> Move down
           </MenuItem>
           <MenuItem @select="emit('duplicate')"><Icon name="copy" :size="14" /> Duplicate</MenuItem>
+          <template v-if="conditional">
+            <MenuSeparator />
+            <MenuItem :disabled="!others?.length" @select="addAskIf">
+              <Icon name="git-branch" :size="14" /> Ask only if...
+            </MenuItem>
+            <MenuItem :disabled="!others?.length" @select="addAfter">
+              <Icon name="corner-down-right" :size="14" /> Knows the answer to...
+            </MenuItem>
+            <MenuItem @select="emit('patch', { alone: !q.alone })">
+              <Icon name="square" :size="14" /> {{ q.alone ? 'Read with the others' : 'Read on its own canvas' }}
+            </MenuItem>
+          </template>
           <MenuSeparator />
           <MenuItem danger @select="emit('remove')"><Icon name="trash" :size="14" /> Delete</MenuItem>
         </MenuContent>
@@ -281,6 +358,57 @@ function onDragEnd(): void {
       </button>
     </div>
 
+    <div v-if="q.askIf.length || q.after.length || q.alone" class="qr__conds">
+      <div v-for="(c, i) in q.askIf" :key="`if-${i}`" class="qr__cond">
+        <span class="qr__condlead">Ask only if</span>
+        <Select
+          :model-value="c.key"
+          :options="otherOptions"
+          :placeholder="nameOf(c.key)"
+          @update:model-value="setAskIfKey(i, $event)"
+        />
+        <span class="qr__condlead">is</span>
+        <span class="qr__vals">
+          <Checkbox
+            v-for="n in answersOf(c.key)"
+            :key="n"
+            class="qr__val"
+            :size="14"
+            :model-value="c.values.includes(n)"
+            @update:model-value="toggleValue(i, n, $event)"
+          >
+            {{ n || '(unnamed)' }}
+          </Checkbox>
+        </span>
+        <button class="pk-icon-btn qr__rm" type="button" aria-label="Remove the condition" @click="removeAskIf(i)">
+          <Icon name="x" :size="14" />
+        </button>
+      </div>
+      <div v-for="(k, i) in q.after" :key="`after-${i}`" class="qr__cond">
+        <span class="qr__condlead">Knows the answer to</span>
+        <Select
+          :model-value="k"
+          :options="otherOptions"
+          :placeholder="nameOf(k)"
+          @update:model-value="setAfter(i, $event)"
+        />
+        <button class="pk-icon-btn qr__rm" type="button" aria-label="Remove" @click="removeAfter(i)">
+          <Icon name="x" :size="14" />
+        </button>
+      </div>
+      <div v-if="q.alone" class="qr__cond">
+        <span class="qr__condlead">Read on its own canvas</span>
+        <button
+          class="pk-icon-btn qr__rm"
+          type="button"
+          aria-label="Read with the others"
+          @click="emit('patch', { alone: false })"
+        >
+          <Icon name="x" :size="14" />
+        </button>
+      </div>
+    </div>
+
     <p v-if="error" class="qr__err" role="alert">{{ error }}</p>
   </div>
 </template>
@@ -359,6 +487,11 @@ function onDragEnd(): void {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.qr__ans--skip {
+  background: var(--pk-bg-inset);
+  color: var(--pk-text-muted);
+  font-weight: 500;
 }
 .qr__ansp {
   font-family: var(--pk-font-mono);
@@ -468,6 +601,39 @@ function onDragEnd(): void {
 .qr__add {
   align-self: flex-start;
   margin-left: 2ch;
+}
+/* one line per condition, set in from the criteria like an option row */
+.qr__conds {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 0 2ch;
+  border-top: 1px dashed var(--pk-border-default);
+}
+.qr__cond {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.qr__condlead {
+  font-size: var(--pk-font-size-xs);
+  color: var(--pk-text-secondary);
+}
+.qr__vals {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-width: 0;
+}
+/* the Checkbox root is Reka's clone: the scope attribute does not reach it */
+.qr__vals :deep(.qr__val) {
+  font-size: var(--pk-font-size-xs);
+  color: var(--pk-text-primary);
+}
+.qr__cond .qr__rm {
+  margin-left: auto;
 }
 .qr__err {
   margin: 0;

@@ -58,6 +58,10 @@ clap = { version = "4.6.6", features = ["derive"] }
 # HF's reference tokenization library - fancy-regex backend (pure Rust, supports
 # the original tokenizer.json regexes incl. (?i:) groups and lookahead)
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+# Python's character model for the Laya router port (general category for
+# `str.isalpha`, canonical combining class for `unicodedata.combining`)
+unicode-properties = "0.1.4"
+unicode-normalization = "0.1.25"
 # CUDA driver bindings; dynamic loading so binaries run (and degrade gracefully)
 # on machines without CUDA - users need only the display driver
 # No cublas/cublaslt - default-features would sneak them

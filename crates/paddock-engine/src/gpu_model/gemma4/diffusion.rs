@@ -614,6 +614,48 @@ impl GpuGemma4 {
         })
     }
 
+    /// The multi-step structured read for the serial service
+    /// (`Generator::canvas_read_steps`): `steps - 1` ordinary denoising
+    /// steps of the seeded canvas in slot 0, the `pinned` positions put back
+    /// after each, then the read's forward at temperature 1 - which sees the
+    /// last step's probs through the self-conditioning MLP, exactly as the
+    /// batched loop's final tick does.
+    pub(crate) fn canvas_read_steps_impl(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        label_ids: &[u32],
+        steps: u32,
+        pinned: &[u32],
+        seed: u64,
+    ) -> Result<crate::generator::CanvasReadOut, GpuError> {
+        let cfg = self.lane()?.cfg;
+        let mut st = self.canvas_new(canvas.len())?;
+        self.canvas_seed(&mut st, canvas)?;
+        for _ in 1..steps.max(1) {
+            let temp = cfg.temperature(st.step);
+            self.canvas_step(0, base, &mut st, temp, seed)?;
+            let mut next = st.host.clone();
+            for &p in pinned {
+                let p = p as usize;
+                if p >= next.len() {
+                    return Err(GpuError::Driver(format!(
+                        "canvas_read_steps: pinned position {p} is past the {}-wide canvas",
+                        next.len()
+                    )));
+                }
+                next[p] = canvas[p];
+            }
+            self.canvas_seed(&mut st, &next)?;
+        }
+        let probs = self.canvas_read(0, base, &mut st, label_ids)?;
+        Ok(crate::generator::CanvasReadOut {
+            probs,
+            entropy: st.last_entropy,
+            argmax: st.last_argmax,
+        })
+    }
+
     // ── the batched tick: several canvases, several slots, ONE forward ──
 
     /// Open a canvas for the batched loop and hand back its handle (the
@@ -643,6 +685,49 @@ impl GpuGemma4 {
             .and_then(Option::take)
             .ok_or_else(|| GpuError::Driver(format!("canvas handle {h} is not open")))?;
         let r = self.canvas_seed(&mut st, ids);
+        self.canvases[h] = Some(st);
+        r
+    }
+
+    /// Hold `positions` of canvas `h` at `ids` for its next step
+    /// (`Generator::canvas_pin`): the last accepting tick left the next
+    /// input in `st.host` - accepted draws where the canvas settled, fresh
+    /// noise elsewhere - and the pinned positions go back on top of it, so a
+    /// multi-step read denoises its answer slots against a template that
+    /// never moves.
+    pub(crate) fn canvas_pin_impl(
+        &mut self,
+        h: usize,
+        positions: &[u32],
+        ids: &[u32],
+    ) -> Result<(), GpuError> {
+        if positions.len() != ids.len() {
+            return Err(GpuError::Driver(format!(
+                "canvas_pin: {} positions for {} ids",
+                positions.len(),
+                ids.len()
+            )));
+        }
+        let mut st = self
+            .canvases
+            .get_mut(h)
+            .and_then(Option::take)
+            .ok_or_else(|| GpuError::Driver(format!("canvas handle {h} is not open")))?;
+        let mut next = st.host.clone();
+        let mut bad = None;
+        for (&p, &id) in positions.iter().zip(ids) {
+            match next.get_mut(p as usize) {
+                Some(slot) => *slot = id,
+                None => bad = Some(p),
+            }
+        }
+        let r = match bad {
+            Some(p) => Err(GpuError::Driver(format!(
+                "canvas_pin: position {p} is past the {}-wide canvas",
+                st.w
+            ))),
+            None => self.canvas_seed(&mut st, &next),
+        };
         self.canvases[h] = Some(st);
         r
     }

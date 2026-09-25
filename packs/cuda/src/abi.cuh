@@ -26,6 +26,7 @@
 #include <mma.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 // Exported C launcher visibility: MSVC dllexport on Windows, default ELF
 // visibility elsewhere (gcc/clang host compilers reject __declspec).
@@ -3327,6 +3328,28 @@ struct KernelTableV1 {
     int (*q4x_qsa_logits_mma)(const void*, const void*, const void*, const void*, void*,
                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
                               uint32_t, void*);
+    // 671: f16_gemm_h_relu - slot 618's landing with bias (nullable) + ReLU in
+    // the epilogue (gemm/f16_dense.cuh). Pure append - no PD_ABI_VERSION bump.
+    int (*f16_gemm_h_relu)(const void*, const void*, void*, const void*, unsigned int,
+                           unsigned int, unsigned int, void*);
+    // 672: f16_gemm_h_geglu - gelu(input) * gate, half the landing width, off a
+    // 16-row-block re-laid weight (gemm/f16_dense.cuh). Pure append.
+    int (*f16_gemm_h_geglu)(const void*, const void*, void*, unsigned int, unsigned int,
+                            unsigned int, void*);
+    // 673: enc_attn_h - packed varlen bidirectional attention off a fused qkv
+    // landing: rope, window, qkv bias ride the staging (attn/varlen.cuh).
+    int (*enc_attn_h)(const void*, const void*, const void*, uint32_t, const void*,
+                      const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 674-678: text-encoder seams (encoder.cuh). Pure appends.
+    int (*enc_embed_ln)(const void*, const void*, const void*, const void*, void*, void*,
+                        uint32_t, uint32_t, float, void*);
+    int (*laya_head_entry)(void*, const void*, const void*, const void*, const void*,
+                           const void*, void*, uint32_t, uint32_t, float, void*);
+    int (*gather_rows)(const void*, const void*, void*, uint32_t, uint32_t, void*);
+    int (*laya_rowdot)(const void*, const void*, float, void*, uint32_t, uint32_t, void*);
+    int (*laya_act_head)(const void*, const void*, const void*, const void*, const void*,
+                         const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
 };
 
 } // extern "C"
@@ -3404,6 +3427,48 @@ static unsigned int pd_pf_runs_maxn = 0;
 #define PD_PDL_ARM_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
 #define PD_PDL_RELEASE() asm volatile("griddepcontrol.launch_dependents;")
 #endif
+
+// L2 bulk prefetch of a contiguous byte range (sm_90+; 16 B aligned, size a
+// multiple of 16). A hint: no data dependency, no numerics - and safe ahead
+// of griddepcontrol.wait, since L2 is the die's point of coherence. The
+// decode GEMVs use it to present a CTA's whole row block to DRAM as one
+// request ahead of their warps' narrow steps (GB10: the b=1 nvf4 gemv
+// 2026-09-10, the k-quant W4A8 gemv 2026-09-25).
+__device__ __forceinline__ void pd_l2_prefetch_bulk(const void* p, uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if ((bytes & 15u) == 0u && bytes != 0u && (((uintptr_t)p) & 15u) == 0u)
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+#else
+    (void)p; (void)bytes;
+#endif
+}
+
+// PD_LAST_BLOCK_FOLD - the read side of a last-block-out fold (split-K GEMVs,
+// split attention merges, slot combines). The writers each store a partial,
+// __threadfence(), then bump a ticket; the block that draws the last ticket
+// folds every partial. That reader needs two things the writers' fence does
+// not give it: an ACQUIRE fence after the ticket (__threadfence() again -
+// without it its partial loads are unordered against the atomic), and loads
+// that cannot hit a stale L1 line (__ldcg): L1 is not coherent across SMs, and
+// one 128-byte line holds the partials of 16 split-2 rows, so a block whose SM
+// cached that line for an earlier row folds another block's PREVIOUS partial.
+// The CUDA guide's version of the pattern reads through `volatile` for the
+// same reason. Found 2026-09-25 (GB10): Flash-Next greedy decoding with the
+// MTP head diverged on ~1 request in 16 (4 in 16 once the host stopped
+// stalling between rounds) - a stale hc down partial nudging a low-margin
+// token; bisected with PADDOCK_PDL_DENY to the Q8_0 K-split GEMV. Bit-identical
+// whenever the old read happened to be fresh.
+// The decode GEMVs' row-block prefetch election: on small dies (< 128 SMs,
+// the pack's small-die rule - GB10's 48 is where it was measured), and a
+// family's pin ("0" off, anything else on) overrides it anywhere. The big
+// dies' walks are unmeasured with it.
+static inline bool pd_gemv_pf_elect(const char* pin) {
+    if (pin != nullptr && pin[0] != '\0') return pin[0] != '0';
+    int dev = 0, nsm = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    return nsm > 0 && nsm < 128;
+}
 
 // ---- gated-FFN activation  ----------------------------------
 // Which nonlinearity the gate half of a GLU FFN runs. Lives here, in the
@@ -3624,6 +3689,26 @@ static inline bool pd_pdl_dev_ok() {
     }
     return ok == 1;
 }
+// Race bisection instrument: PADDOCK_PDL_DENY=sub1,sub2 launches every kernel
+// whose (mangled) name contains one of the substrings plainly. Dev only.
+static inline bool pd_pdl_denied(const void* kern) {
+    static const char* deny = pd_env("PADDOCK_PDL_DENY");
+    if (deny == nullptr || deny[0] == '\0') return false;
+    const char* name = nullptr;
+    if (cudaFuncGetName(&name, kern) != cudaSuccess || name == nullptr) return false;
+    const char* p = deny;
+    while (*p) {
+        const char* e = p;
+        while (*e && *e != ',') ++e;
+        const size_t n = (size_t)(e - p);
+        if (n > 0) {
+            for (const char* h = name; *h; ++h)
+                if (strncmp(h, p, n) == 0) return true;
+        }
+        p = *e ? e + 1 : e;
+    }
+    return false;
+}
 template <typename K, typename... Args>
 // Args by const reference, not by value: a CUtensorMap argument is 128-aligned
 // under /Zc:__cplusplus and MSVC refuses an over-aligned BY-VALUE parameter
@@ -3631,7 +3716,7 @@ template <typename K, typename... Args>
 // PdTmap parameter (tma_desc.cuh).
 static inline void pd_pdl_go(K kern, dim3 grid, dim3 block, uint32_t smem,
                              cudaStream_t st, const Args&... args) {
-    if (pd_pdl_off() || !pd_pdl_dev_ok()) {
+    if (pd_pdl_off() || !pd_pdl_dev_ok() || pd_pdl_denied((const void*)kern)) {
         kern<<<grid, block, smem, st>>>(args...);
         return;
     }

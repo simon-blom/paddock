@@ -71,7 +71,9 @@ public struct WorkspaceView: View {
             WorkspacePanelGrip(
               width: Binding(get: { width }, set: { navigation.panelWidth = $0 }),
               range: WorkspacePanelMetrics.limits(navigation.mode).lowerBound...maximum,
-              label: navigation.mode == .studio ? "Resize chats panel" : "Resize Settings panel"
+              label: navigation.mode == .studio
+                ? (navigation.showsReadsHistory ? "Resize reads panel" : "Resize chats panel")
+                : "Resize Settings panel"
             ).id(navigation.mode)
           }
           VStack(spacing: 0) {
@@ -187,7 +189,9 @@ public struct WorkspaceView: View {
         chat: model.chat, draft: $model.draft, notices: hasNotices ? AnyView(notices) : nil)
     case .prompts: StudioLibraryView(model: model.studioLibrary)
     case .reads:
-      NativeReadsView(model: model.reads) { navigation.showManager(.runners) }
+      NativeReadsView(model: model.reads, showsHistorySidebar: navigation.showsSidebar) {
+        navigation.showManager(.runners)
+      }
     case .settings:
       StudioPreferencesView(model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
     }
@@ -281,10 +285,14 @@ public struct WorkspaceView: View {
   @ViewBuilder private var sidebar: some View {
     if navigation.mode == .studio {
       VStack(spacing: 0) {
-        StudioConversationSidebar(
-          chat: model.chat, hasDraft: draft.hasContent, onNewChat: newChat,
-          onFold: { navigation.sidebarVisible = false },
-          onOpen: { navigation.studio = .chats }, searchRequest: model.historySearchRequest)
+        if navigation.showsReadsHistory {
+          NativeReadsSidebar(model: model.reads)
+        } else {
+          StudioConversationSidebar(
+            chat: model.chat, hasDraft: draft.hasContent, onNewChat: newChat,
+            onFold: { navigation.sidebarVisible = false },
+            onOpen: { navigation.studio = .chats }, searchRequest: model.historySearchRequest)
+        }
         StudioSidebarFooter(navigation: $model.navigation)
       }
     } else {

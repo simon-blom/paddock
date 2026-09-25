@@ -8,7 +8,7 @@ import { isHarmony, isVisionModel } from '@/lib/model-caps'
 import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
 import { DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_SAMPLES, type StructuredReadCaps } from '@/lib/reads'
 
-export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image'
+export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader'
 
 /** Can this kind hold a lane in the chat surface - i.e. does it ANSWER a user
  *  turn? Chat models reply in text, transcribers reply with a transcript; both
@@ -336,6 +336,10 @@ interface ServerBody {
     canvas_width?: number
     max_questions?: number
     max_samples?: number
+    max_steps?: number
+    images?: boolean
+    conditional?: boolean
+    think?: boolean
     types?: string[]
   } | null
   web_search?: boolean
@@ -433,6 +437,12 @@ function parseCaps(body: ServerBody): ModelCaps {
           canvasWidth: body.structured_read.canvas_width ?? 0,
           maxQuestions: body.structured_read.max_questions ?? DEFAULT_MAX_QUESTIONS,
           maxSamples: body.structured_read.max_samples ?? DEFAULT_MAX_SAMPLES,
+          // a runner from before these fields reads in one pass, text only,
+          // every question at once
+          maxSteps: Math.max(1, body.structured_read.max_steps ?? 1),
+          images: body.structured_read.images === true,
+          conditional: body.structured_read.conditional === true,
+          think: body.structured_read.think === true,
           types: body.structured_read.types ?? ['noul', 'choice', 'score'],
         }
       : undefined,
@@ -468,6 +478,9 @@ interface RunnerRow {
   aligner?: string | null
   /** image-generation runner: /v1/images/* and nothing else */
   image?: string | null
+  /** decision-model runner (Laya): /v1/systemone and nothing else - it reads,
+   *  it never chats */
+  reader?: string | null
   display?: string | null
   vendor?: string | null
   status?: string
@@ -656,6 +669,8 @@ export const useModelsStore = defineStore('models', () => {
         model?: string
         asr?: string
         embedder?: string
+        /** a decision model (Laya): it reads and serves nothing else */
+        reader?: string
       }
       const c = parseCaps(body)
       // A runner answers /server before its model attaches, and caching that
@@ -667,7 +682,7 @@ export const useModelsStore = defineStore('models', () => {
       // and there is none while the runner just loads. `capsPending` is the
       // composer's honest signal for this exact window: confirmed loading,
       // not merely unfetched.
-      if (!(body.model || body.asr || body.embedder || body.aligner || body.image_model)) {
+      if (!(body.model || body.asr || body.embedder || body.aligner || body.image_model || body.reader)) {
         retry()
         return hit ?? c
       }
@@ -695,7 +710,9 @@ export const useModelsStore = defineStore('models', () => {
    *  id: a chat model cannot read, and an id heuristic would have to know
    *  every block-diffusion family by name. */
   const readers = computed(() =>
-    models.value.filter((m) => m.kind === 'chat' && !m.cloud && caps.value[m.id]?.structuredRead),
+    models.value.filter(
+      (m) => (m.kind === 'chat' || m.kind === 'reader') && !m.cloud && caps.value[m.id]?.structuredRead,
+    ),
   )
   /** True once every local chat runner has been asked (or is being retried
    *  through capsFor's own loop) - the Reads page's "still looking" state
@@ -710,7 +727,9 @@ export const useModelsStore = defineStore('models', () => {
     // before the first runner list there is nothing to probe, and saying
     // "probed, none found" now would flash the empty state on every load
     if (!loadedOnce) return
-    const local = models.value.filter((m) => m.kind === 'chat' && !m.cloud)
+    // a decision model (Laya) reads and does nothing else; a chat model reads
+    // only if its server says so
+    const local = models.value.filter((m) => (m.kind === 'chat' || m.kind === 'reader') && !m.cloud)
     await Promise.all(local.filter((m) => !caps.value[m.id]).map((m) => capsFor(m.id)))
     readersProbed.value = true
   }
@@ -968,9 +987,9 @@ export const useModelsStore = defineStore('models', () => {
   function integrateRunnerRows(rows: RunnerRow[]): void {
     const prevById = new Map(models.value.map((m) => [m.id, m]))
     const local: ModelInfo[] = rows
-      .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image)
+      .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image || r.reader)
       .map((r) => {
-        const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image) as string
+        const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.image) as string
         const prev = prevById.get(id)
         const raw = r.status ?? 'unknown'
         return {
@@ -987,7 +1006,9 @@ export const useModelsStore = defineStore('models', () => {
                 ? ('transcriber' as const)
                 : r.aligner
                   ? ('aligner' as const)
-                  : ('image' as const),
+                  : r.reader
+                    ? ('reader' as const)
+                    : ('image' as const),
           status: raw === 'unreachable' && prev?.status ? prev.status : raw,
           vision: prev?.vision,
           spec: r.spec ?? undefined,
@@ -1056,9 +1077,9 @@ export const useModelsStore = defineStore('models', () => {
       // whose tools never changed - smooth it over with the last real status.
       const prevById = new Map(models.value.map((m) => [m.id, m]))
       const local: ModelInfo[] = rows
-        .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image)
+        .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image || r.reader)
         .map((r) => {
-          const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image) as string
+          const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.image) as string
           const prev = prevById.get(id)
           const raw = r.status ?? 'unknown'
           return {
@@ -1075,7 +1096,9 @@ export const useModelsStore = defineStore('models', () => {
                   ? ('transcriber' as const)
                   : r.aligner
                     ? ('aligner' as const)
-                    : ('image' as const),
+                    : r.reader
+                      ? ('reader' as const)
+                      : ('image' as const),
             status: raw === 'unreachable' && prev?.status ? prev.status : raw,
             vision: prev?.vision,
             spec: r.spec ?? undefined,

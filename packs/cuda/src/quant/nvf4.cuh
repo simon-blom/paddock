@@ -4428,19 +4428,6 @@ int pd_nvf4_dequant(const void* data, const void* scale, float scale2, void* y,
         acc += s * ((float)eb[0] * xv.x + (float)eb[1] * xv.y              \
                   + (float)eb[2] * xv.z + (float)eb[3] * xv.w);            \
     }
-// L2 bulk prefetch of a contiguous byte range (sm_90+; 16 B aligned, size a
-// multiple of 16). A hint: no data dependency, no numerics. Used by the
-// gemv below to present the CTA's whole row block to DRAM as one request
-// ahead of the warps' 64-byte steps (GB10 2026-09-10, session 19).
-__device__ __forceinline__ void pd_l2_prefetch_bulk(const void* p, uint32_t bytes) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if ((bytes & 15u) == 0u && bytes != 0u && (((uintptr_t)p) & 15u) == 0u)
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
-#else
-    (void)p; (void)bytes;
-#endif
-}
-
 // PF: L2 prefetch of the CTA's row block (weights + scales) by one thread
 // before the warps start walking it, plus the row block AHEAD CTAs later
 // in the grid (AHEAD = 0: own block only). Bit-exact: prefetch is a hint.

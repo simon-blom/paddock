@@ -336,6 +336,21 @@ impl ShardedSafetensors {
     pub fn bytes(&self, name: &str) -> Option<(&StTensor, &[u8])> {
         self.shards[*self.index.get(name)?].bytes(name)
     }
+
+    /// Hint how `ranges` (byte offset, length inside tensor `name`) are about
+    /// to be read - see [`crate::mapped::MapAccess`]. Best effort; `None`
+    /// only when the tensor is absent.
+    pub fn advise_tensor(
+        &self,
+        name: &str,
+        access: crate::mapped::MapAccess,
+        ranges: &[(usize, usize)],
+    ) -> Option<()> {
+        let file = &self.shards[*self.index.get(name)?];
+        let (_, bytes) = file.bytes(name)?;
+        crate::mapped::advise_ranges(&file.map, bytes, access, ranges);
+        Some(())
+    }
 }
 
 /// DFlash drafter checkpoint config - the config.json beside a

@@ -89,6 +89,51 @@ pub enum MapError {
     TooManySplits { count: u64 },
 }
 
+/// How a consumer is about to read a mapped tensor - kernel hints over the
+/// mapping (`madvise`), inert where the platform has none. Hints change when
+/// bytes arrive, never what they are, so every caller may ignore a refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapAccess {
+    /// Scattered small reads: fault in the page asked for, not the readahead
+    /// window around it (128 KB on a default ext4 mount - for a 90-byte
+    /// n-gram row that is 1400x the bytes, and the latency of reading them).
+    Random,
+    /// These bytes are read next: queue their page-in now, asynchronously,
+    /// so a batch of scattered misses waits for the device once, in
+    /// parallel, instead of once per fault in series.
+    WillNeed,
+}
+
+/// `access` over `ranges` (offset, length) of `bytes`, a slice of `map`.
+/// Best effort: an out-of-range entry is skipped, a refused hint ignored.
+pub(crate) fn advise_ranges(
+    map: &memmap2::Mmap,
+    bytes: &[u8],
+    access: MapAccess,
+    ranges: &[(usize, usize)],
+) {
+    #[cfg(unix)]
+    {
+        use memmap2::Advice;
+        let advice = match access {
+            MapAccess::Random => Advice::Random,
+            MapAccess::WillNeed => Advice::WillNeed,
+        };
+        let base = bytes.as_ptr() as usize - map.as_ptr() as usize;
+        for &(off, len) in ranges {
+            if len == 0 || off.checked_add(len).is_none_or(|end| end > bytes.len()) {
+                continue;
+            }
+            // memmap2 widens the range out to page boundaries
+            let _ = map.advise_range(advice, base + off, len);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (map, bytes, access, ranges);
+    }
+}
+
 /// One mmapped file of the model (the whole model, or one shard of it).
 struct Shard {
     mmap: memmap2::Mmap,
@@ -274,6 +319,24 @@ impl MappedGguf {
     pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         let &(si, ti) = self.by_name.get(name)?;
         Some(&self.shards[si].gguf.tensors[ti])
+    }
+
+    /// Hint how `ranges` (byte offset, length inside tensor `name`) are about
+    /// to be read - see [`MapAccess`]. Best effort; only a missing tensor is
+    /// an error.
+    pub fn advise_tensor(
+        &self,
+        name: &str,
+        access: MapAccess,
+        ranges: &[(usize, usize)],
+    ) -> Result<(), MapError> {
+        let (_, bytes) = self.tensor_bytes(name)?;
+        let &(si, _) = self
+            .by_name
+            .get(name)
+            .ok_or_else(|| MapError::NoSuchTensor(name.to_owned()))?;
+        advise_ranges(&self.shards[si].mmap, bytes, access, ranges);
+        Ok(())
     }
 
     /// Raw quantized/typed bytes of a tensor, straight from its shard's map.

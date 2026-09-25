@@ -5003,11 +5003,13 @@ __global__ void pd_f8lin_gemv_kernel(
     if (tid == 0) last = atomicInc(&ticket[bt], nz - 1u);
     __syncthreads();
     if (last != nz - 1u) return;
+    // acquire, then the other CTAs' partials from L2 (abi.cuh, PD_LAST_BLOCK_FOLD)
+    __threadfence();
     for (uint32_t rr = tid; rr < BM; rr += THREADS) {
         const uint32_t o = rt * 128u + slice * BM + rr;
         if (o >= out_dim) continue;
         float v = 0.0f;
-        for (uint32_t zz = 0; zz < nz; ++zz) v += part[(size_t)zz * out_dim + o];
+        for (uint32_t zz = 0; zz < nz; ++zz) v += __ldcg(&part[(size_t)zz * out_dim + o]);
         y[o] = v;
     }
 #else

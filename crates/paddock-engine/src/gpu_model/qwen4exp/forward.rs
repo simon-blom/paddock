@@ -39,7 +39,7 @@ use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use crate::gpu_model::st_load::bf16_bytes;
 use paddock_kernels::reference::qwen4exp as rq;
 use paddock_models::ggml_type::GgmlType;
-use paddock_models::mapped::MappedGguf;
+use paddock_models::mapped::{MapAccess, MappedGguf};
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig};
 use paddock_models::safetensors::{ShardedSafetensors, StDtype};
 
@@ -571,6 +571,9 @@ pub struct Qwen4ExpGpu {
     mtp: Option<Box<mtp::Mtp>>,
     /// The verify round's planes (forward/spec.rs), built at its first round.
     verify: Option<Box<spec::Verify>>,
+    /// the host-sampled verify round between its walk and its commit
+    /// (`verify_open` / `verify_close`)
+    spec_open: Option<Vec<Run>>,
     /// Prompts queued for chunked prefill (forward/chunked.rs), FIFO.
     chunked: Vec<chunked::ChunkedPrefill>,
     /// Canonical RS (PADDOCK_SPEC_RS): this round's per-slot chain draws, put
@@ -995,6 +998,11 @@ impl Qwen4ExpGpu {
             let row_bytes = ple_row_bytes(info.ggml_type, width).ok_or_else(|| {
                 GpuModelError::Unsupported(format!("{name}: type {:?}", info.ggml_type))
             })?;
+            // the host gather reads single rows at hashed offsets: a fault
+            // should bring in its page, not the readahead window around it
+            // (the gather hints its own batch - see gather_ple_rows_gguf)
+            let len = map.tensor_bytes(&name).map(|(_, b)| b.len()).unwrap_or(0);
+            let _ = map.advise_tensor(&name, MapAccess::Random, &[(0, len)]);
             PleSource::Gguf {
                 ty: info.ggml_type,
                 row_bytes,
@@ -1298,6 +1306,7 @@ impl Qwen4ExpGpu {
             reply_track: vec![false; slots],
             mtp: None,
             verify: None,
+            spec_open: None,
             chunked: Vec::new(),
             spec_rs_draws: None,
         };
@@ -4061,6 +4070,9 @@ fn warm_ple_table(st: &ShardedSafetensors, c: &Qwen4ExpConfig, li: usize) {
             // a shard that has no scale plane is the FP8 table, not an error
             if let Ok(n) = st.warm_tensor(&name) {
                 bytes += n;
+                // what the cache cannot keep faults back one row at a time:
+                // its page only, never the readahead window around it
+                let _ = st.advise_tensor(&name, MapAccess::Random, &[(0, n)]);
             }
         }
     }
@@ -4158,16 +4170,46 @@ fn gather_ple_rows(
     // (vLLM's `ngram_context`), so a decode step hashes the same window a
     // prefill of the whole sequence would have.
     let eos = c.bos_id as i64;
+    let ids: Vec<Vec<i64>> = (0..n)
+        .map(|t| {
+            let w3 = rq::ple_window(stream, first + t, eos);
+            rq::ple_ngram_ids(
+                &w3,
+                &ple.multipliers,
+                &ple.head_vocab,
+                &ple.head_offset,
+                c.heads_per_ngram,
+            )
+        })
+        .collect();
+    // every row (and group-scale row) hinted before any is read - the page-in
+    // batching `gather_ple_rows_gguf` explains; a shard plane per hint call
+    {
+        let mut by_plane: std::collections::BTreeMap<String, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        for &rid in ids.iter().flatten() {
+            let rid = rid as usize;
+            let (sh, local) = (rid / rows_per_shard, rid % rows_per_shard);
+            let name = format!("{emb_p}.ngram_embedding.shard_{sh}.weight");
+            let packed = st.bytes(&name).is_some_and(|(t, _)| t.dtype == StDtype::U8);
+            let rb = if packed { width / 2 } else { width };
+            by_plane
+                .entry(name.clone())
+                .or_default()
+                .push((local * rb, rb));
+            if packed {
+                by_plane
+                    .entry(format!("{name}_scale"))
+                    .or_default()
+                    .push((local * (width / 16), width / 16));
+            }
+        }
+        for (name, ranges) in &by_plane {
+            let _ = st.advise_tensor(name, MapAccess::WillNeed, ranges);
+        }
+    }
     let mut out = vec![0f32; n * c.ple_embed];
-    for t in 0..n {
-        let w3 = rq::ple_window(stream, first + t, eos);
-        let row_ids = rq::ple_ngram_ids(
-            &w3,
-            &ple.multipliers,
-            &ple.head_vocab,
-            &ple.head_offset,
-            c.heads_per_ngram,
-        );
+    for (t, row_ids) in ids.iter().enumerate() {
         for (hh, &rid) in row_ids.iter().enumerate() {
             let rid = rid as usize;
             let (sh, local) = (rid / rows_per_shard, rid % rows_per_shard);
@@ -4222,7 +4264,6 @@ fn gather_ple_rows(
     Ok(out)
 }
 
-/// Gated DeltaNet mixer. Writes `d_mix` `[n, hidden]` and advances `state`.
 /// The GGUF twin of `gather_ple_rows`: the same hashed row ids, rows read
 /// straight out of the mmapped table tensor and decoded per 32-wide block.
 #[allow(clippy::too_many_arguments)]
@@ -4237,37 +4278,44 @@ fn gather_ple_rows_gguf(
     first: usize,
     n: usize,
 ) -> Result<Vec<f32>, GpuModelError> {
-    let width = c.ple_embed / c.ple_heads();
+    let (heads, width) = (c.ple_heads(), c.ple_embed / c.ple_heads());
     let (_, table) = map
         .tensor_bytes(name)
         .map_err(|e| GpuModelError::Unsupported(format!("{name}: {e}")))?;
     let rows = table.len() / row_bytes;
-    let eos = c.bos_id as i64;
+    // Every row the walk reads, hinted before any of them is read. The table
+    // is tens of GB of hashed, effectively random rows (26.8 GiB IQ4_NL in
+    // the Flash-Next GGUF), and on a unified-memory die the page cache holds
+    // only part of it beside a resident model - GB10 kept 2-47% of it however
+    // it was warmed. Read one at a time, each miss was a device round trip in
+    // series with the next: a 4-row speculative verify gathers 64 rows, and
+    // the GPU sat idle 4-30 ms (median 16) in every round while they came in
+    // one by one. Hinted together (`MapAccess::WillNeed`), the misses go to
+    // the device at once and the gather waits for the slowest instead of
+    // their sum. Timing only - the bytes read are the same. (The ids are the
+    // device lane's hash: one pass over the stream, not one per row.)
+    let ids = ple_row_ids(c, ple, stream, first, n)?;
+    if let Some(&rid) = ids.iter().find(|&&r| r as usize >= rows) {
+        return Err(GpuModelError::Unsupported(format!(
+            "{name}: n-gram row {rid} past the table's {rows} rows"
+        )));
+    }
+    let ranges: Vec<(usize, usize)> = ids
+        .iter()
+        .map(|&r| (r as usize * row_bytes, row_bytes))
+        .collect();
+    let _ = map.advise_tensor(name, MapAccess::WillNeed, &ranges);
     let mut out = vec![0f32; n * c.ple_embed];
-    for t in 0..n {
-        let w3 = rq::ple_window(stream, first + t, eos);
-        let row_ids = rq::ple_ngram_ids(
-            &w3,
-            &ple.multipliers,
-            &ple.head_vocab,
-            &ple.head_offset,
-            c.heads_per_ngram,
-        );
-        for (hh, &rid) in row_ids.iter().enumerate() {
-            let rid = rid as usize;
-            if rid >= rows {
-                return Err(GpuModelError::Unsupported(format!(
-                    "{name}: n-gram row {rid} past the table's {rows} rows"
-                )));
-            }
-            let row = &table[rid * row_bytes..(rid + 1) * row_bytes];
-            let dst = t * c.ple_embed + hh * width;
-            ple_row_dequant(ty, row, &mut out[dst..dst + width]);
-        }
+    for (i, &rid) in ids.iter().enumerate() {
+        let rid = rid as usize;
+        let row = &table[rid * row_bytes..(rid + 1) * row_bytes];
+        let dst = (i / heads) * c.ple_embed + (i % heads) * width;
+        ple_row_dequant(ty, row, &mut out[dst..dst + width]);
     }
     Ok(out)
 }
 
+/// Gated DeltaNet mixer. Writes `d_mix` `[n, hidden]` and advances `state`.
 #[allow(clippy::too_many_arguments)]
 fn gdn_pass(
     e: &GpuExecutor,
@@ -7536,6 +7584,21 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         plans: &[crate::sampler::DevicePlan],
     ) -> Result<Option<Vec<u32>>, crate::generator::GenError> {
         self.verify_round_plans(reqs, plans).map_err(q4x_gen_err)
+    }
+
+    /// The host-sampled round - the one constrained slots, i.e. every
+    /// tool-carrying request, speculate through: raw row logits out, the
+    /// service samples them through the slot's sampler and grammar, then
+    /// `spec_commit` keeps what it accepted (see `verify_open`).
+    fn forward_spec_verify(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, crate::generator::GenError> {
+        self.verify_open(reqs).map_err(q4x_gen_err)
+    }
+
+    fn spec_commit(&mut self, committed: &[u32]) -> Result<(), crate::generator::GenError> {
+        self.verify_close(committed).map_err(q4x_gen_err)
     }
 
     fn spec_draft_batch(

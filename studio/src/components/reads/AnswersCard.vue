@@ -5,7 +5,11 @@
 // yes/no is a marker on a 0-1 rail with faint reference marks; a choice is
 // ranked bars with the outside-the-options mass as its own bar; a score is
 // the marker on its level scale over the per-level bars. Colour is a binned
-// confidence swatch with a legend, and the number is always printed.
+// confidence swatch with a legend, and the number is always printed. Past one
+// read the standard error sits beside the agreement: how far the reported
+// probability would move on another set of reads. A question its conditions
+// left unasked keeps its place and says why; a thought written before the
+// read opens above the answers.
 import { computed } from 'vue'
 import Collapsible from '@/components/ui/Collapsible.vue'
 import Icon from '@/components/Icon.vue'
@@ -20,13 +24,16 @@ import {
   confidenceBin,
   entropyWord,
   fmtP,
+  levelText,
   nearTie,
   scoreBars,
   scorePosition,
+  thoughtsOf,
   type Bar,
   type ReadAnswer,
   type ReadAnswerScore,
   type ReadRun,
+  type ReadSkip,
 } from '@/lib/reads'
 
 const props = defineProps<{
@@ -42,6 +49,8 @@ const props = defineProps<{
   stale: boolean
   /** a reader is up and the page can fill and run its worked example */
   canExample: boolean
+  /** the read's kept pictures, by key - the run names the ones it read */
+  images?: Record<string, string> | undefined
 }>()
 const emit = defineEmits<{ (e: 'step', delta: number): void; (e: 'example'): void }>()
 
@@ -55,25 +64,42 @@ interface Block {
   bars: Bar[] | null
   tie: boolean
   entropy: number
+  /** `entropy` is the answer's (a current runner) or the slot's (an older run) */
+  entropyOf: 'answer' | 'slot'
   reads: number
   agreement: string | null
 }
+interface Skipped {
+  id: string
+  instructions: string
+  why: string
+}
 
-const blocks = computed<Block[]>(() => {
+/** "kind answered question; asked only if it is bug" */
+function skipText(s: ReadSkip): string {
+  const wanted = s.wanted.length === 1 ? s.wanted[0] : `one of ${s.wanted.join(', ')}`
+  return `${s.because} answered ${s.was}; asked only if it is ${wanted}`
+}
+
+const blocks = computed<(Block | Skipped)[]>(() => {
   const run = props.run
   if (!run) return []
+  const skipped = run.response.diagnostics.skipped ?? {}
   const reads = run.response.diagnostics.reads
   const diag = new Map(run.response.diagnostics.questions.map((d) => [d.id, d]))
   // the run's own question order; answers the runner added on its own (none
   // today) trail behind
   const ids = Object.keys(run.questions)
   for (const id of Object.keys(run.response.answers)) if (!ids.includes(id)) ids.push(id)
-  return ids.flatMap((id) => {
+  return ids.flatMap((id): (Block | Skipped)[] => {
     const answer = run.response.answers[id]
-    if (!answer) return []
+    if (!answer) {
+      const s = skipped[id]
+      return s ? [{ id, instructions: run.questions[id]?.instructions ?? '', why: skipText(s) }] : []
+    }
     const bars =
       answer.type === 'choice' ? choiceBars(answer) : answer.type === 'score' ? scoreBars(answer) : null
-    const k = Math.round(answer.agreement * reads)
+    const k = Math.round((answer.agreement ?? 1) * reads)
     return [
       {
         id,
@@ -83,6 +109,12 @@ const blocks = computed<Block[]>(() => {
         bars,
         tie: bars ? nearTie(bars) : Math.abs((answer.type === 'noul' ? answer.noul : 0.5) - 0.5) < 0.025,
         entropy: diag.get(id)?.entropy ?? Number.NaN,
+        // a decision model's entropy is its answer's by construction; on a
+        // canvas reader a missing slot figure marks a run from before it
+        entropyOf:
+          run.response.diagnostics.backend === 'laya' || diag.get(id)?.slot_entropy !== undefined
+            ? 'answer'
+            : 'slot',
         reads,
         agreement: reads > 1 ? `${k} of ${reads} reads agree` : null,
       },
@@ -103,7 +135,7 @@ function scaleLabels(a: ReadAnswerScore): { name: string; at: number; show: bool
   const names = Object.keys(a.legend)
     .map(Number)
     .sort((x, y) => x - y)
-    .map((i) => a.legend[String(i)])
+    .map((i) => levelText(a.legend[String(i)]))
   const n = names.length
   return names.map((name, i) => ({
     name,
@@ -115,6 +147,30 @@ function scaleLabels(a: ReadAnswerScore): { name: string; at: number; show: bool
 }
 
 const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null, 2) : ''))
+
+const thoughts = computed(() => (props.run ? thoughtsOf(props.run.response) : []))
+const pictures = computed(() =>
+  (props.run?.images ?? []).flatMap((i) => {
+    const url = props.images?.[i.ref]
+    return url ? [{ name: i.name, url }] : []
+  }),
+)
+const steps = computed(() => props.run?.response.diagnostics.steps ?? 1)
+const diag = computed(() => props.run?.response.diagnostics)
+/** the tokens a question's reads put first over the whole vocabulary,
+ *  each once, in order */
+function topTokens(reads: { argmax?: string }[] | undefined): string {
+  const seen: string[] = []
+  for (const r of reads ?? []) {
+    if (r.argmax === undefined) continue
+    const t = JSON.stringify(r.argmax)
+    if (!seen.includes(t)) seen.push(t)
+  }
+  return seen.join(' ') || '-'
+}
+function isSkipped(b: Block | Skipped): b is Skipped {
+  return 'why' in b
+}
 </script>
 
 <template>
@@ -126,7 +182,8 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
       </span>
       <span v-else-if="run" class="ac__meta">
         {{ run.ms }} ms · {{ run.response.diagnostics.reads }}
-        read{{ run.response.diagnostics.reads === 1 ? '' : 's' }}
+        read{{ run.response.diagnostics.reads === 1 ? '' : 's' }}<template v-if="steps > 1">
+          · {{ steps }} steps</template>
       </span>
       <span v-if="run && stale && !busy" class="ac__stale">edited since this run</span>
       <!-- the same < 2/3 > a chat turn shows for its versions: here, the runs
@@ -172,7 +229,29 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
     </div>
 
     <template v-else>
-      <article v-for="b in blocks" :key="b.id" class="ac__q">
+      <div v-if="pictures.length" class="ac__pics" aria-label="Images read with the text">
+        <img v-for="(pic, i) in pictures" :key="i" class="ac__pic" :src="pic.url" :alt="pic.name" />
+      </div>
+
+      <Collapsible
+        v-for="(t, i) in thoughts"
+        :key="`thought-${i}`"
+        class="ac__thought"
+        :summary="thoughts.length > 1 ? `Thought ${i + 1}` : 'Thought'"
+        :hint="`${t.tokens} tokens, ${t.closed ? 'finished' : 'cut at the budget'}, ${Math.round(t.ms)} ms`"
+      >
+        <p class="ac__thoughttext">{{ t.text.trim() || '(empty)' }}</p>
+      </Collapsible>
+
+      <template v-for="b in blocks" :key="b.id">
+      <article v-if="isSkipped(b)" class="ac__q ac__q--skip">
+        <header class="ac__qhead">
+          <span class="ac__qid">{{ b.id }}</span>
+          <span class="ac__qtext">{{ b.instructions }}</span>
+        </header>
+        <p class="ac__line">Not asked: {{ b.why }}.</p>
+      </article>
+      <article v-else class="ac__q">
         <header class="ac__qhead">
           <span class="ac__qid">{{ b.id }}</span>
           <span class="ac__qtext">{{ b.instructions }}</span>
@@ -222,7 +301,11 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
               {{ l.name }}
             </span>
           </div>
-          <p class="ac__score">score {{ b.answer.score.toFixed(2) }} on 0 to {{ Object.keys(b.answer.legend).length - 1 }}</p>
+          <p class="ac__score">
+            score {{ b.answer.score.toFixed(2) }}<template v-if="b.answer.score_stderr !== undefined">
+              ± {{ b.answer.score_stderr.toFixed(2) }}</template>
+            on 0 to {{ Object.keys(b.answer.legend).length - 1 }}
+          </p>
           <ProbBars v-if="b.bars" :bars="b.bars" />
         </div>
 
@@ -230,11 +313,14 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
 
         <p class="ac__line">
           <template v-if="b.agreement">{{ b.agreement }} · </template>
-          <template v-if="Number.isFinite(b.entropy)">slot entropy {{ b.entropy.toFixed(2) }} ({{ entropyWord(b.entropy) }})</template>
-          <template v-else>slot entropy unknown</template>
-          · outside {{ fmtP(b.answer.outside) }}
+          <template v-if="b.answer.stderr !== undefined">standard error {{ fmtP(b.answer.stderr) }} · </template>
+          <template v-if="Number.isFinite(b.entropy)">{{ b.entropyOf }} entropy {{ b.entropy.toFixed(2) }} ({{ entropyWord(b.entropy) }})</template>
+          <template v-else>entropy unknown</template>
+          <template v-if="b.answer.outside !== undefined"> · outside {{ fmtP(b.answer.outside) }}</template>
+          <template v-if="b.answer.answer_confidence !== undefined"> · calibrated {{ fmtP(b.answer.answer_confidence) }}</template>
         </p>
       </article>
+      </template>
 
       <div class="ac__legend">
         <span class="ac__legend-h">confidence</span>
@@ -244,7 +330,51 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
       </div>
 
       <Collapsible class="ac__diag" summary="Diagnostics" :hint="run.model">
-        <table class="ac__table">
+        <table v-if="diag?.backend === 'laya'" class="ac__table">
+          <tbody>
+            <tr>
+              <th>checkpoint</th>
+              <td>{{ diag.checkpoint ?? '-' }}</td>
+              <th>state</th>
+              <td class="c-num">{{ diag.state_tokens ?? '-' }} tokens</td>
+              <th>read</th>
+              <td class="c-num">{{ run.response.usage?.input_tokens ?? '-' }} tokens</td>
+              <th>time</th>
+              <td class="c-num">{{ Math.round(diag.timing.total_ms) }} ms</td>
+            </tr>
+            <tr v-if="run.response.routing">
+              <th>routed</th>
+              <td colspan="7">{{ run.response.routing.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="diag?.backend === 'laya'" class="ac__scroll">
+          <table class="ac__table ac__table--q">
+            <thead>
+              <tr>
+                <th>question</th>
+                <th>answer</th>
+                <th class="c-num">options</th>
+                <th class="c-num">tokens</th>
+                <th class="c-num">temperature</th>
+                <th class="c-num">entropy confidence</th>
+                <th v-if="diag.windowed">window</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="d in diag.questions" :key="d.id">
+                <td class="ac__mono">{{ d.id }}</td>
+                <td class="ac__mono">{{ d.label }}</td>
+                <td class="c-num">{{ d.options ?? '-' }}</td>
+                <td class="c-num">{{ d.tokens?.join(', ') ?? '-' }}</td>
+                <td class="c-num">{{ d.temperature?.toFixed(2) ?? '-' }}</td>
+                <td class="c-num">{{ fmtP(d.entropy_confidence) }}</td>
+                <td v-if="diag.windowed">{{ d.window ? `${d.window.index + 1} of ${d.window.count} (tokens ${d.window.token_start}-${d.window.token_end})` : '-' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <table v-if="diag?.backend !== 'laya'" class="ac__table">
           <tbody>
             <tr>
               <th>canvas</th>
@@ -256,28 +386,44 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
               <th>time</th>
               <td class="c-num">{{ Math.round(run.response.diagnostics.timing.total_ms) }} ms</td>
             </tr>
-          </tbody>
-        </table>
-        <table class="ac__table ac__table--q">
-          <thead>
-            <tr>
-              <th>question</th>
-              <th>label</th>
-              <th class="c-num">position</th>
-              <th class="c-num">entropy</th>
-              <th class="c-num">label mass</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="d in run.response.diagnostics.questions" :key="d.id">
-              <td class="ac__mono">{{ d.id }}</td>
-              <td class="ac__mono">{{ d.label }}</td>
-              <td class="c-num">{{ d.position }}</td>
-              <td class="c-num">{{ Number.isFinite(d.entropy) ? d.entropy.toFixed(3) : '-' }}</td>
-              <td class="c-num">{{ fmtP(d.label_mass) }}</td>
+            <tr v-if="diag && (diag.steps !== undefined || diag.stages)">
+              <th>steps</th>
+              <td class="c-num">{{ diag.steps ?? 1 }}</td>
+              <th>stages</th>
+              <td class="c-num">{{ diag.stages?.length ?? 1 }}</td>
+              <th>canvases</th>
+              <td class="c-num">{{ diag.chunks?.length ?? 1 }}</td>
+              <th>layout</th>
+              <td>{{ diag.format ?? 'lines' }}<template v-if="diag.conditioning">, earlier answers {{ diag.conditioning === 'prefill' ? 'in the prompt' : 'restated' }}</template></td>
             </tr>
           </tbody>
         </table>
+        <div v-if="diag?.backend !== 'laya'" class="ac__scroll">
+          <table class="ac__table ac__table--q">
+            <thead>
+              <tr>
+                <th>question</th>
+                <th>label</th>
+                <th class="c-num">position</th>
+                <th class="c-num">entropy</th>
+                <th class="c-num">vocabulary entropy</th>
+                <th class="c-num">label mass</th>
+                <th>top token</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="d in run.response.diagnostics.questions" :key="d.id">
+                <td class="ac__mono">{{ d.id }}</td>
+                <td class="ac__mono">{{ d.label }}</td>
+                <td class="c-num">{{ d.position }}</td>
+                <td class="c-num">{{ Number.isFinite(d.entropy) ? d.entropy.toFixed(3) : '-' }}</td>
+                <td class="c-num">{{ d.slot_entropy !== undefined && Number.isFinite(d.slot_entropy) ? d.slot_entropy.toFixed(3) : '-' }}</td>
+                <td class="c-num">{{ fmtP(d.label_mass) }}</td>
+                <td class="ac__mono">{{ topTokens(d.reads) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
         <ReadHeatmap v-if="heatRows.length" :rows="heatRows" />
         <pre class="ac__raw">{{ raw }}</pre>
       </Collapsible>
@@ -373,6 +519,31 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
   gap: 8px;
   padding: 12px 0 14px;
   border-top: 1px solid var(--pk-border-default);
+}
+.ac__q--skip {
+  opacity: 0.75;
+}
+.ac__pics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ac__pic {
+  width: 56px;
+  height: 42px;
+  object-fit: cover;
+  border-radius: var(--pk-radius-sm);
+  border: 1px solid var(--pk-border-default);
+  background: var(--pk-bg-inset);
+}
+.ac__thoughttext {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: var(--pk-font-size-sm);
+  line-height: 1.5;
+  color: var(--pk-text-secondary);
+  max-height: 320px;
+  overflow: auto;
 }
 .ac__qhead {
   display: flex;
@@ -591,6 +762,10 @@ const raw = computed(() => (props.run ? JSON.stringify(props.run.response, null,
   flex-direction: column;
   gap: 10px;
   padding-left: 0;
+}
+/* the question tables can outgrow the card: they scroll, the page never does */
+.ac__scroll {
+  overflow-x: auto;
 }
 .ac__table {
   width: 100%;

@@ -84,11 +84,21 @@ public struct ReadQuestion: Identifiable, Equatable, Codable, Sendable {
 
 public struct ReadDraft: Equatable, Sendable {
   public var state = ""
+  public var images: [ReadPicture] = []
+  public var steps = 1
+  public var think = 0
   public var questions = [ReadQuestion(questionID: "q1")]
   /// 0 is auto locally; wire format always sends "auto", never 0.
   public var samples = 0
   public init() {}
   public func validation(maxQuestions: Int = 64, maxSamples: Int = 32) -> String? {
+    if images.count > 16 { return "A read takes up to 16 images." }
+    if !(1...8).contains(steps) || !(0...4096).contains(think) {
+      return "Use 1–8 steps and 0–4096 thought tokens."
+    }
+    if images.reduce(0, { $0 + $1.url.utf8.count }) > 8 * 1024 * 1024 {
+      return "The images exceed the read's 8 MiB storage budget. Use fewer or smaller images."
+    }
     if questions.isEmpty || questions.count > maxQuestions {
       return "Use 1 to \(maxQuestions) questions."
     }
@@ -101,12 +111,15 @@ public struct ReadDraft: Equatable, Sendable {
     return questions.compactMap(\.validation).first
   }
   public var setBody: ConversationValue {
-    .object([
+    var fields: [String: ConversationValue] = [
       "samples": samples == 0 ? .string("auto") : .number(Decimal(samples)),
       "questions": .object(
         Dictionary(
           questions.map { ($0.questionID, $0.wire) }, uniquingKeysWith: { _, last in last })),
-    ])
+    ]
+    if steps > 1 { fields["steps"] = .number(Decimal(steps)) }
+    if think > 0 { fields["think"] = .number(Decimal(think)) }
+    return .object(fields)
   }
   public var ordering: [[String]] {
     questions.map { [$0.questionID] + ($0.kind == .choice ? $0.options.map(\.name) : []) }
@@ -115,6 +128,7 @@ public struct ReadDraft: Equatable, Sendable {
     var v = setBody.object!
     v["model"] = .string(model)
     v["state"] = .string(state)
+    if !images.isEmpty { v["images"] = .array(images.map { .string($0.url) }) }
     return .object(v)
   }
   public static func parse(_ data: Data) throws -> ReadDraft {
@@ -124,6 +138,22 @@ public struct ReadDraft: Equatable, Sendable {
       throw ConversationFailure.invalid("Use a questions object or a complete read request.")
     }
     var draft = ReadDraft()
+    if root["images"] != nil {
+      throw ConversationFailure.invalid(
+        "Attach images in the State panel; question-set JSON does not import image data.")
+    }
+    if let value = root["steps"] {
+      guard let n = value.integer, (1...8).contains(n) else {
+        throw ConversationFailure.invalid("Use 1–8 steps.")
+      }
+      draft.steps = n
+    }
+    if let value = root["think"] {
+      guard let n = value.integer, (0...4096).contains(n) else {
+        throw ConversationFailure.invalid("Use 0–4096 thought tokens.")
+      }
+      draft.think = n
+    }
     if let state = root["state"]?.string { draft.state = state }
     if let s = root["samples"] {
       if s == .string("auto") {
@@ -138,6 +168,11 @@ public struct ReadDraft: Equatable, Sendable {
     let path = root["questions"] == nil ? [] : ["questions"]
     draft.questions = try (order.keys[path] ?? []).map { id in
       let raw = map[id]!
+      if ["depends_on", "ask_if", "alone"].contains(where: { raw[$0] != nil }) {
+        throw ConversationFailure.invalid(
+          "\(id): conditional question editing is not supported in this native editor yet. The request was not changed."
+        )
+      }
       let type = raw["type"]?.string ?? ""
       guard
         let kind = ReadQuestion.Kind(rawValue: ["bool", "boolean"].contains(type) ? "noul" : type)

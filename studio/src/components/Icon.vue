@@ -8,6 +8,8 @@ import {
   PhDotsSixVertical,
   PhFloppyDisk,
   PhListChecks,
+  PhGitBranch,
+  PhArrowElbowDownRight,
   PhUploadSimple,
   PhArrowsClockwise,
   PhArrowsDownUp,
@@ -115,6 +117,8 @@ const MAP: Record<string, Component> = {
   'arrow-up': PhArrowUp,
   // Reads: a fixed list of questions, each answered - the checklist glyph.
   'list-checks': PhListChecks,
+  'git-branch': PhGitBranch,
+  'corner-down-right': PhArrowElbowDownRight,
   // the grab handle on a reorderable row (six dots, the platform idiom)
   'drag-handle': PhDotsSixVertical,
   upload: PhUploadSimple,

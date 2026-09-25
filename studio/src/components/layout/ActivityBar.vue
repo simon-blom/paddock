@@ -34,23 +34,23 @@ const noChats = computed(() => chat.loaded && chat.conversations.length === 0)
 // is not a bad one - it serves, under a warning.
 const canRunHere = computed(() => !readiness.blocked)
 
-// Reads is a page for a running model that READS (a block-diffusion model
-// answering fixed questions in one pass) - the first entry gated on what a
-// server advertises rather than on which kind of model it is. The probe
-// asks each local chat runner once, into the same caps cache the composer
-// uses; the entry appears when one answers `structured_read` and goes with
-// it when that model stops.
+// Reads keeps a history the way the chat does - earlier reads open, and can be
+// renamed or deleted, with no model running - so the entry is offered on any
+// box that can serve, like Embeddings, and never comes and goes with a
+// runner. Whether a model that READS (one answering `structured_read`) is up
+// only decides whether a read can run; the page and the header's reader
+// picker say so. The probe asks each local chat runner once, into the same
+// caps cache the composer uses, for both of them.
 const models = useModelsStore()
 watch(
   () =>
     models.models
-      .filter((m) => m.kind === 'chat' && !m.cloud)
+      .filter((m) => (m.kind === 'chat' || m.kind === 'reader') && !m.cloud)
       .map((m) => `${m.id}:${m.port ?? ''}`)
       .join(','),
   () => void models.probeReaders(),
   { immediate: true },
 )
-const canRead = computed(() => canRunHere.value && models.readers.length > 0)
 
 function go(name: string): void {
   // instrument's route requires a :tab param - a bare { name } push aborts
@@ -131,7 +131,7 @@ function active(name: string): boolean {
           <Icon name="sliders" :size="20" />
         </button>
       </Tooltip>
-      <Tooltip v-if="canRead" label="Reads" side="right">
+      <Tooltip v-if="canRunHere" label="Reads" side="right">
         <button
           class="activity-bar__btn"
           :class="{ 'activity-bar__btn--active': active('reads') }"

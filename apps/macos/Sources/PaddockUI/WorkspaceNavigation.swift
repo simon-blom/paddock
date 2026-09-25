@@ -93,6 +93,7 @@ struct WorkspaceNavigation {
   var showsSidebar: Bool {
     sidebarVisible
   }
+  var showsReadsHistory: Bool { mode == .studio && studio == .reads }
 
   mutating func showStudioChats() {
     mode = .studio

@@ -354,6 +354,28 @@ pub trait Generator: Send {
         Err(GenError::Backend("not a block-diffusion backend".into()))
     }
 
+    /// `canvas_read` after `steps - 1` ordinary denoising steps (the model's
+    /// own schedule, accept and re-noise, keyed by `seed`), with the
+    /// `pinned` positions put back to their seeded ids after each - the
+    /// serial twin of the batched loop's multi-step read. The default reads
+    /// in one step and refuses more; a backend with `canvas_pins` overrides.
+    fn canvas_read_steps(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        label_ids: &[u32],
+        steps: u32,
+        _pinned: &[u32],
+        _seed: u64,
+    ) -> Result<CanvasReadOut, GenError> {
+        if steps <= 1 {
+            return self.canvas_read(base, canvas, label_ids);
+        }
+        Err(GenError::Backend(
+            "this block-diffusion backend reads in one step".into(),
+        ))
+    }
+
     // ── batched block diffusion: canvases held by the backend as handles,
     // denoised several at a time in ONE forward (`run_batched_diffusion`).
     // Each canvas sits in its own batch slot past that slot's committed rows;
@@ -382,6 +404,24 @@ pub trait Generator: Send {
     /// seeded template, or a pin on top of the last step's output).
     fn canvas_set(&mut self, _h: usize, _ids: &[u32]) -> Result<(), GenError> {
         Err(GenError::Backend("not a block-diffusion backend".into()))
+    }
+
+    /// Hold `positions` of canvas `h` at `ids` for its next step, on top of
+    /// what the last accepting tick left there. A multi-step structured read
+    /// keeps its answer template this way while only the answer slots
+    /// denoise (the step re-noises every position it did not accept, so
+    /// without the pin the template itself would drift). Only called when
+    /// `canvas_pins` says the backend has it.
+    fn canvas_pin(&mut self, _h: usize, _positions: &[u32], _ids: &[u32]) -> Result<(), GenError> {
+        Err(GenError::Backend(
+            "this block-diffusion backend cannot pin canvas positions".into(),
+        ))
+    }
+
+    /// True when `canvas_pin` is implemented - what a structured read of more
+    /// than one denoising step needs.
+    fn canvas_pins(&self) -> bool {
+        false
     }
 
     /// Release canvas `h` (its device planes go back with it).

@@ -5,15 +5,15 @@ import UniformTypeIdentifiers
 
 struct NativeReadsView: View {
   @Bindable var model: NativeReadsModel
+  var showsHistorySidebar = false
   var onStart: () -> Void
   @State private var jsonMode = false
-  @State private var importFile = false
-  @State private var importJSON = false
+  @State private var showFilePicker = false
+  @State private var importKind = NativeReadImport.state
   @State private var confirmNew = false
   @State private var confirmDelete = false
   @State private var confirmExample = false
   @State private var pendingSet: NativeReadsModel.SavedSet?
-  @State private var pendingSession: NativeReadsModel.Session?
   @State private var confirmDeleteRead = false
   var body: some View {
     GeometryReader { geometry in
@@ -54,11 +54,14 @@ struct NativeReadsView: View {
           do { try await Task.sleep(for: .seconds(5)) } catch { return }
         } while !Task.isCancelled
       }
-      .fileImporter(isPresented: $importFile, allowedContentTypes: [.item]) { result in
-        if case .success(let url) = result { Task { await model.loadFile(url) } }
-      }
-      .fileImporter(isPresented: $importJSON, allowedContentTypes: [.json]) { result in
-        if case .success(let url) = result { Task { await model.loadFile(url, asJSON: true) } }
+      // A single presentation owner: stacked fileImporter modifiers on this
+      // view left only the last (images) picker reachable on macOS.
+      .fileImporter(
+        isPresented: $showFilePicker, allowedContentTypes: importKind.contentTypes,
+        allowsMultipleSelection: importKind.allowsMultipleSelection
+      ) { result in
+        let kind = importKind
+        Task { await model.importSelection(result, kind: kind) }
       }
       .confirmationDialog("Start a new read?", isPresented: $confirmNew, titleVisibility: .visible)
     {
@@ -87,20 +90,6 @@ struct NativeReadsView: View {
       }
       .accessibilityIdentifier("native-reads")
       .confirmationDialog(
-        "Open this read?",
-        isPresented: Binding(
-          get: { pendingSession != nil }, set: { if !$0 { pendingSession = nil } }),
-        titleVisibility: .visible
-      ) {
-        if let session = pendingSession {
-          Button("Open \(session.title)") {
-            pendingSession = nil
-            Task { await model.openSession(session.id) }
-          }
-        }
-        Button("Cancel", role: .cancel) { pendingSession = nil }
-      }
-      .confirmationDialog(
         "Delete this read and its runs?", isPresented: $confirmDeleteRead, titleVisibility: .visible
       ) {
         Button("Delete read", role: .destructive) { Task { await model.clearHistory() } }
@@ -121,34 +110,24 @@ struct NativeReadsView: View {
         Text("Reads").font(.system(size: 25, weight: .semibold)).tracking(-0.5)
           .fixedSize().accessibilityAddTraits(.isHeader)
         Spacer(minLength: 8)
-        Button("New read", systemImage: "plus") {
-          if model.hasWork { confirmNew = true } else { model.reset() }
+        if !showsHistorySidebar {
+          Button("New read", systemImage: "plus") {
+            if model.unsavedRead { confirmNew = true } else { model.reset() }
+          }
+          .buttonStyle(FlatButtonStyle()).fixedSize()
+          .disabled(model.historyNavigationBlocked)
         }
-        .buttonStyle(FlatButtonStyle()).fixedSize()
-        .disabled(model.busy || model.saving || model.importing)
         if !stacked, !model.readers.isEmpty { modelPicker.frame(width: 270) }
       }
       if stacked, !model.readers.isEmpty { modelPicker }
-      HStack {
-        Dropdown(
-          title: "Earlier reads", value: model.activeSession?.value["title"]?.string ?? "History"
-        ) {
-          ForEach(model.sessions) { session in
-            Button(session.title) {
-              if model.hasWork {
-                pendingSession = session
-              } else {
-                Task { await model.openSession(session.id) }
-              }
-            }
+      if model.openingSession || model.historyUnsaved {
+        HStack {
+          if model.openingSession { ProgressView().controlSize(.small) }
+          Spacer()
+          if model.historyUnsaved {
+            Button("Retry saving") { Task { await model.saveHistory() } }
+              .buttonStyle(FlatButtonStyle()).disabled(model.busy || model.saving)
           }
-        }.disabled(model.busy || model.saving || model.sessions.isEmpty)
-          .accessibilityIdentifier("reads-sessions")
-        if model.openingSession { ProgressView().controlSize(.small) }
-        Spacer()
-        if model.historyUnsaved {
-          Button("Retry saving") { Task { await model.saveHistory() } }
-            .buttonStyle(FlatButtonStyle()).disabled(model.busy || model.saving)
         }
       }
     }.accessibilityIdentifier("reads-header")
@@ -172,28 +151,64 @@ struct NativeReadsView: View {
   private var editor: some View {
     VStack(alignment: .leading, spacing: 16) {
       card("State") {
-        PaddockTextEditor(text: $model.draft.state).frame(height: 160)
-          .onChange(of: model.draft.state) { _, _ in model.stateError = nil }
-          .clipShape(RoundedRectangle(cornerRadius: PaddockStyle.Radius.control))
-          .accessibilityLabel("Text to read")
-          .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first, url.isFileURL, !model.importing, !model.busy else {
-              return false
-            }
-            Task { await model.loadFile(url) }
-            return true
+        NativeReadStateEditor(text: $model.draft.state, onPasteImages: model.pastePictures).frame(
+          height: 160
+        )
+        .onChange(of: model.draft.state) { _, _ in model.stateError = nil }
+        .clipShape(RoundedRectangle(cornerRadius: PaddockStyle.Radius.control))
+        .accessibilityLabel("Text to read")
+        .dropDestination(for: URL.self) { urls, _ in
+          guard let url = urls.first, url.isFileURL, !model.importing, !model.busy else {
+            return false
           }
-        HStack {
-          Button("Load a file", systemImage: "paperclip") { importFile = true }
-            .buttonStyle(FlatButtonStyle()).fixedSize().disabled(model.importing || model.busy)
-          if model.importing { ProgressView().controlSize(.small) }
-          Text(model.fileName).lineLimit(1).foregroundStyle(.secondary)
+          if urls.allSatisfy({
+            UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true
+          }) {
+            Task { await model.addPictures(urls) }
+          } else {
+            Task { await model.loadFile(url) }
+          }
+          return true
+        }
+        HStack(spacing: 8) {
+          Button("Load a file", systemImage: "paperclip") { chooseFile(.state) }
+            .buttonStyle(FlatButtonStyle()).fixedSize().disabled(model.historyNavigationBlocked)
+            .accessibilityIdentifier("reads-load-file")
+          Button("Try an example", systemImage: "play") {
+            if model.hasWork { confirmExample = true } else { model.runExample() }
+          }.buttonStyle(FlatButtonStyle()).fixedSize()
+            .accessibilityIdentifier("reads-example")
+            .disabled(model.current == nil || model.historyNavigationBlocked)
           Spacer()
           if !model.draft.state.isEmpty {
             Button("Clear") {
               model.draft.state = ""
               model.fileName = ""
             }.buttonStyle(QuietButtonStyle())
+          }
+        }.accessibilityIdentifier("reads-input-actions")
+        if model.current?.images == true {
+          Button("Add images", systemImage: "photo.badge.plus") { chooseFile(.images) }
+            .buttonStyle(FlatButtonStyle()).disabled(
+              model.historyNavigationBlocked || model.draft.images.count >= 16
+            )
+            .accessibilityIdentifier("reads-add-images")
+        }
+        if !model.draft.images.isEmpty {
+          LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 180), alignment: .leading)], alignment: .leading
+          ) {
+            ForEach(Array(model.draft.images.enumerated()), id: \.offset) { index, picture in
+              NativeReadPictureChip(picture: picture) { model.draft.images.remove(at: index) }
+                .disabled(model.historyNavigationBlocked)
+            }
+          }.accessibilityIdentifier("reads-images")
+        }
+        if model.importing || !model.fileName.isEmpty {
+          HStack(spacing: 8) {
+            if model.importing { ProgressView().controlSize(.small) }
+            Text(model.fileName).lineLimit(1).truncationMode(.middle)
+              .foregroundStyle(.secondary).help(model.fileName)
           }
         }
         if let error = model.stateError {
@@ -216,7 +231,8 @@ struct NativeReadsView: View {
             Divider()
             Button("Save as new set") { Task { await model.save(asNew: true) } }
               .disabled(model.validation != nil || model.setName.isEmpty)
-            Button("Import JSON…") { importJSON = true }
+            Button("Import JSON…") { chooseFile(.questions) }
+              .accessibilityIdentifier("reads-import-json")
             Button("Export JSON…") {
               exportText((try? model.draft.orderedJSON()) ?? "", name: "read-questions.json")
             }
@@ -227,7 +243,7 @@ struct NativeReadsView: View {
             Image(systemName: "ellipsis").frame(width: 28, height: 28)
           }
           .menuStyle(.button).menuIndicator(.hidden).buttonStyle(QuietButtonStyle()).fixedSize()
-          .accessibilityLabel("Question set actions").disabled(model.saving || model.busy)
+          .accessibilityLabel("Question set actions").disabled(model.historyNavigationBlocked)
         }
         editorControls
         if jsonMode {
@@ -273,7 +289,8 @@ struct NativeReadsView: View {
           .disabled(
             jsonMode
               ? model.current == nil || model.busy || model.importing
-                || model.draft.state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || (model.draft.state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  && model.draft.images.isEmpty)
               : !model.canRun
           ).keyboardShortcut(.return, modifiers: .command)
           if model.busy {
@@ -285,25 +302,56 @@ struct NativeReadsView: View {
       }
       DisclosureGroup("API request") {
         let request =
-          (try? model.draft.orderedJSON(model: model.current?.model ?? "")) ?? ""
+          (try? model.draft.orderedJSON(model: model.current?.model ?? "", includeImageData: false))
+          ?? ""
         Text("POST /v1/systemone\n\n" + request).font(.system(size: 11, design: .monospaced))
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
-        Button("Copy request") { copy(request) }.buttonStyle(QuietButtonStyle())
+        Button("Copy request") {
+          let draft = model.draft
+          let name = model.current?.model ?? ""
+          Task {
+            if let full = await Task.detached(
+              priority: .userInitiated, operation: { try? draft.orderedJSON(model: name) }
+            ).value {
+              copy(full)
+            }
+          }
+        }.buttonStyle(QuietButtonStyle())
       }
     }
   }
 
   private var editorControls: some View {
-    ViewThatFits(in: .horizontal) {
-      HStack(spacing: 16) {
-        editorTabs
-        Spacer(minLength: 0)
-        samplePicker
+    VStack(alignment: .leading, spacing: 12) {
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 16) {
+          editorTabs
+          Spacer(minLength: 0)
+          samplePicker
+        }
+        VStack(alignment: .leading, spacing: 12) {
+          editorTabs
+          samplePicker
+        }
       }
-      VStack(alignment: .leading, spacing: 12) {
-        editorTabs
-        samplePicker
+      HStack(spacing: 16) {
+        if let max = model.current?.maxSteps, max > 1 {
+          Text("Steps").font(.system(size: 12)).foregroundStyle(.secondary)
+          Dropdown(title: "Steps", value: "\(model.draft.steps)") {
+            ForEach(1...max, id: \.self) { n in Button("\(n)") { model.draft.steps = n } }
+          }.accessibilityIdentifier("reads-steps")
+        }
+        if model.current?.think == true {
+          Text("Thought").font(.system(size: 12)).foregroundStyle(.secondary)
+          Dropdown(
+            title: "Thought", value: model.draft.think == 0 ? "None" : "\(model.draft.think) tokens"
+          ) {
+            ForEach([0, 128, 256, 512, 1024, 2048, 4096], id: \.self) { n in
+              Button(n == 0 ? "None" : "\(n) tokens") { model.draft.think = n }
+            }
+          }.accessibilityIdentifier("reads-thought")
+        }
       }
     }
     .onChange(of: jsonMode) { _, json in
@@ -371,6 +419,15 @@ struct NativeReadsView: View {
         } else if model.previousRead {
           Text("Previous read · " + result.excerpt).font(.caption).foregroundStyle(.secondary)
         }
+        if !result.pictures.isEmpty {
+          LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 180), alignment: .leading)], alignment: .leading
+          ) {
+            ForEach(Array(result.pictures.enumerated()), id: \.offset) { _, picture in
+              NativeReadPictureChip(picture: picture)
+            }
+          }
+        }
         ForEach(result.questions) { question in
           if let answer = result.response.answers[question.questionID] {
             NativeReadAnswerView(
@@ -391,10 +448,6 @@ struct NativeReadsView: View {
       } else {
         Text(model.busy ? "Reading…" : "Run a read to see answers.").foregroundStyle(.secondary)
           .padding(.vertical, 24)
-        Button("Try an example") {
-          if model.hasWork { confirmExample = true } else { model.runExample() }
-        }.buttonStyle(FlatButtonStyle())
-          .disabled(model.current == nil || model.busy || model.saving || model.importing)
       }
     }
   }
@@ -417,6 +470,11 @@ struct NativeReadsView: View {
   private func copy(_ text: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(text, forType: .string)
+  }
+  private func chooseFile(_ kind: NativeReadImport) {
+    guard !showFilePicker, !model.historyNavigationBlocked else { return }
+    importKind = kind
+    showFilePicker = true
   }
   private func export(_ value: ConversationValue, name: String) {
     do { exportText(try ReadDraft.json(value), name: name) } catch {

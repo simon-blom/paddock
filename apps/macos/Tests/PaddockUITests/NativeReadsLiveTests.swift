@@ -22,7 +22,8 @@ struct NativeReadsLiveTests {
     #expect(model.error == nil)
     _ = try #require(
       model.current, "No running structured-read model discovered in isolated configuration")
-    model.draft = .example
+    let example = try ReadDraft.example
+    model.draft = example
     model.draft.samples = 1
     model.setName = "Native Reads qualification"
     await model.save()
@@ -54,7 +55,7 @@ struct NativeReadsLiveTests {
     await restored.openSession(session)
     #expect(restored.runs.count == 2 && restored.draft.state == model.draft.state)
     #expect(
-      restored.draft.questions.map(\.questionID) == ReadDraft.example.questions.map(\.questionID))
+      restored.draft.questions.map(\.questionID) == example.questions.map(\.questionID))
     await restored.clearHistory()
     restored.open(set)
     await restored.remove()

@@ -8,6 +8,31 @@ import Testing
 
 @Suite("Native Reads layout", .serialized) @MainActor
 struct NativeReadsLayoutTests {
+  @Test func readsHistoryFitsTheSameSidebarWidthsInBothThemes() async throws {
+    let model = NativeReadsModel(client: NativeManager())
+    model.api = { _, _, _, _ in
+      try JSONDecoder().decode(
+        ConversationValue.self,
+        from: Data(
+          #"[{"id":"one","title":"A long saved read title that must truncate inside the sidebar instead of expanding its width","model":"diffusion","runs":3,"updatedAt":1000}]"#
+            .utf8))
+    }
+    await model.refreshHistory()
+    for dark in [false, true] {
+      for width: CGFloat in [220, 260, 340] {
+        let host = NSHostingController(
+          rootView: NativeReadsSidebar(model: model).environment(
+            \.colorScheme, dark ? .dark : .light))
+        let size = host.sizeThatFits(in: NSSize(width: width, height: 650))
+        #expect(size.width <= width + 1 && size.height <= 650)
+        var navigation = WorkspaceNavigation()
+        navigation.studio = .reads
+        let footer = NSHostingController(
+          rootView: StudioSidebarFooter(navigation: .constant(navigation)))
+        #expect(footer.sizeThatFits(in: NSSize(width: width, height: 130)).height <= 130)
+      }
+    }
+  }
   @Test func nativeMenuCannotExpandProviderArtworkToItsOriginalSVGSize() {
     for vendor in ProviderArtwork.names.keys.sorted() {
       let host = NSHostingController(
@@ -35,13 +60,16 @@ struct NativeReadsLayoutTests {
           #"[{"port":1234,"model":"diffusiongemma","display":"DiffusionGemma 26B A4B","vendor":"Google"}]"#
       } else if path.hasSuffix("/server") {
         raw =
-          #"{"structured_read":{"canvas_width":256,"max_questions":64,"max_samples":32,"types":["noul","choice","score"]}}"#
+          #"{"structured_read":{"canvas_width":256,"max_questions":64,"max_samples":32,"types":["noul","choice","score"],"images":true,"max_steps":8,"think":true}}"#
       } else {
         raw = "[]"
       }
       return try JSONDecoder().decode(ConversationValue.self, from: Data(raw.utf8))
     }
     await model.refresh()
+    model.draft.images = [
+      ReadPicture(name: "A long image filename with spaces.png", url: "data:image/png;base64,YQ==")
+    ]
     for dark in [false, true] {
       for width: CGFloat in [440, 680, 1200] {
         let host = NSHostingController(

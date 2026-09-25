@@ -22,6 +22,7 @@ final class BenchmarksModel {
   }
   func start(_ runner: RunnerInfo) {
     guard !running else { return }
+    selected = runner.id
     running = true
     error = nil
     cancelled = false
@@ -72,89 +73,55 @@ struct BenchmarksView: View {
   @Bindable var model: BenchmarksModel
   let runners: [RunnerInfo]
   @State private var confirm = false
+  @State private var reviewed: RunnerInfo?
   private var choices: [RunnerInfo] { runners.filter { $0.model != nil && $0.status == "ok" } }
-  private var selected: RunnerInfo? { choices.first { $0.id == model.selected } ?? choices.first }
+  private var selected: RunnerInfo? {
+    model.selected == nil ? choices.first : choices.first { $0.id == model.selected }
+  }
   var body: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 28) {
-        PageHeading(title: "Benchmarks") { EmptyView() }
-        SettingsGroup(title: "Text generation") {
-          if let selected {
-            SettingsRow(title: "Instance", compact: true) {
-              Dropdown(title: "Instance", value: selected.title) {
-                ForEach(choices) { choice in Button(choice.title) { model.selected = choice.id } }
-              }.disabled(model.running)
+    GeometryReader { geometry in
+      let stacked = geometry.size.width < 600
+      PaddockScrollView {
+        VStack(alignment: .leading, spacing: 28) {
+          PageHeading(title: "Benchmarks") { EmptyView() }
+          SettingsGroup(title: "Text generation") {
+            configuration(stacked: stacked)
+            actions
+            if model.cancelled {
+              Text("Benchmark cancelled.").foregroundStyle(.secondary)
             }
-            SettingsRow(title: "Prompt", compact: true) {
-              Picker("Prompt", selection: $model.long) {
-                Text("Short").tag(false)
-                Text("Long").tag(true)
-              }.pickerStyle(.segmented).frame(width: 190).disabled(model.running)
+            if let error = model.error {
+              Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("benchmark-error")
             }
-            SettingsRow(title: "Concurrency", compact: true) {
-              Picker("Concurrency", selection: $model.concurrency) {
-                Text("1 request").tag(1)
-                Text("4 requests").tag(4)
-              }.pickerStyle(.segmented).frame(width: 190).disabled(model.running)
-            }
-            HStack {
-              if model.running {
-                ProgressView().controlSize(.small)
-                Text("Measuring…")
-                Button("Cancel") { model.cancel() }
-              } else {
-                Button("Run benchmark", systemImage: "speedometer") { confirm = true }
-                  .disabled(selected.inFlight != 0)
+          }
+          if !model.reports.isEmpty {
+            VStack(alignment: .leading, spacing: 16) {
+              Text("Results").fontWeight(.semibold).accessibilityAddTraits(.isHeader)
+              LazyVStack(spacing: 16) {
+                ForEach(model.reports) { report in
+                  BenchmarkResultCard(report: report, stacked: stacked) { model.export(report) }
+                }
               }
             }
-          } else {
-            Text("Start a local chat model to run a benchmark.").foregroundStyle(.secondary)
           }
-          if model.cancelled {
-            Text("Benchmark cancelled. Only completed runs appear in history.").foregroundStyle(
-              .secondary)
-          }
-          if let error = model.error {
-            Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
-          }
-        }
-        ForEach(model.reports) { report in
-          SettingsGroup(title: report.model) {
-            HStack {
-              Text(
-                "\(Date(timeIntervalSince1970: Double(report.createdAtMs) / 1000).formatted(date: .abbreviated, time: .shortened)) · c=\(report.concurrency) · \(report.promptWords) prompt words"
-              ).foregroundStyle(.secondary)
-              Spacer()
-              Button("Export…", systemImage: "square.and.arrow.up") { model.export(report) }
-            }
-            measure("Aggregate output · end-to-end", report.aggregateOutputTokS, unit: "tok/s")
-            measure("Median first token", report.ttftMedianMs.map { $0 / 1000 }, unit: "s")
-            measure("Streaming-event gap · p99", report.streamEventGapP99Ms, unit: "ms")
-            DisclosureGroup("Measurement details") {
-              VStack(alignment: .leading, spacing: 10) {
-                Text(
-                  "\(report.trials) trials · \(report.warmups) excluded warmup · \(report.outputLimit)-token reply limit"
-                )
-                Text(report.cachePolicy)
-                if let context = report.maxCtx {
-                  Text("Context: \(context.formatted()) · Workload: \(report.maxBatch ?? 1)")
-                }
-                ForEach(Array(report.samples.enumerated()), id: \.offset) { index, sample in
-                  Text(
-                    "Request \(index + 1): \(sample.inputTokens) input · \(sample.outputTokens) output · \(sample.finishReason)"
-                  )
-                }
-              }.font(.caption).foregroundStyle(.secondary).padding(.top, 10)
-            }
-          }
-        }
-      }.padding(32).frame(maxWidth: 900).frame(maxWidth: .infinity)
-    }.font(.system(size: 13)).buttonStyle(FlatButtonStyle())
+        }.padding(stacked ? 20 : 32).frame(maxWidth: 820).frame(maxWidth: .infinity)
+      }
+    }.font(.system(size: 13)).buttonStyle(FlatButtonStyle()).background(PaddockStyle.canvas)
       .task { await model.load() }
       .confirmationDialog(
         "Run a local benchmark?", isPresented: $confirm, titleVisibility: .visible
       ) {
-        Button("Run") { if let selected { model.start(selected) } }
+        Button("Run") {
+          // Confirm the same process the user reviewed, never another runner
+          // that happened to take its place while the dialog was open.
+          if let reviewed, let current = choices.first(where: { $0.id == reviewed.id }),
+            current.inFlight == 0
+          {
+            model.start(current)
+          }
+        }
         Button("Cancel", role: .cancel) {}
       } message: {
         Text(
@@ -162,12 +129,62 @@ struct BenchmarksView: View {
         )
       }
   }
-  private func measure(_ label: String, _ value: Double?, unit: String) -> some View {
-    HStack {
-      Text(label).foregroundStyle(.secondary)
-      Spacer()
-      Text(value.map { "\($0.formatted(.number.precision(.fractionLength(2)))) \(unit)" } ?? "—")
-        .monospacedDigit()
+
+  private func configuration(stacked: Bool) -> some View {
+    VStack(alignment: .leading, spacing: 18) {
+      SettingsRow(title: "Instance", stacked: stacked) {
+        Dropdown(
+          title: "Instance", value: selected?.title ?? "Choose an instance", fillsWidth: true
+        ) {
+          ForEach(choices) { choice in
+            Button("\(choice.title) · \(choice.port)") { model.selected = choice.id }
+          }
+        }.disabled(choices.isEmpty).accessibilityIdentifier("benchmark-instance")
+      }
+      SettingsRow(title: "Prompt", stacked: stacked) {
+        BenchmarkSegments(
+          title: "Prompt", options: [(false, "Short"), (true, "Long")], selection: $model.long
+        ).frame(height: 30)
+          .accessibilityIdentifier("benchmark-prompt")
+      }
+      SettingsRow(title: "Concurrency", stacked: stacked) {
+        BenchmarkSegments(
+          title: "Concurrency", options: [(1, "1 request"), (4, "4 requests")],
+          selection: $model.concurrency
+        ).frame(height: 30)
+          .accessibilityIdentifier("benchmark-concurrency")
+      }
+    }.disabled(model.running)
+  }
+
+  private var actions: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      if !model.running {
+        if choices.isEmpty {
+          Text("Start a local chat model to run a benchmark.").foregroundStyle(.secondary)
+        } else if selected == nil {
+          Text("The selected instance stopped. Choose another instance.").foregroundStyle(
+            .secondary)
+        } else if selected?.inFlight != 0 {
+          Text("Waiting for this instance to finish its requests.").foregroundStyle(.secondary)
+        }
+      }
+      HStack(spacing: 8) {
+        if model.running {
+          ProgressView().controlSize(.small)
+          Text("Measuring…").foregroundStyle(.secondary)
+          Spacer(minLength: 12)
+          Button("Cancel") { model.cancel() }.accessibilityIdentifier("benchmark-cancel")
+        } else {
+          Spacer(minLength: 0)
+          Button("Run benchmark", systemImage: "speedometer") {
+            reviewed = selected
+            confirm = true
+          }.buttonStyle(FlatButtonStyle(primary: true))
+            .disabled(selected == nil || selected?.inFlight != 0)
+            .accessibilityIdentifier("benchmark-run")
+        }
+      }.frame(maxWidth: .infinity)
     }
   }
 }

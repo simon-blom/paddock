@@ -118,7 +118,9 @@ async fn assert_native_client_read_routes() {
                     assert_eq!(artifact["backend_supported"], true);
                     assert_eq!(artifact["runtime"]["default_max_batch"], 1);
                     assert_eq!(artifact["runtime"]["default_spec"], "off");
-                    assert_eq!(artifact["runtime"]["embedded_vision"], false);
+                    // the MLX checkpoint carries its own tower; the GGUF
+                    // weights take the vision companion (backend_tests agrees)
+                    assert_eq!(artifact["runtime"]["embedded_vision"], id == "mlx-4bit");
                     let files = artifact["files"]
                         .as_array()
                         .expect("DiffusionGemma download manifest");

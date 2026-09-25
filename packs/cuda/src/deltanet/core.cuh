@@ -2542,6 +2542,69 @@ __global__ void pd_q8_0_gemv_repacked_kernel(
     }
 }
 
+// Warp-per-row twin of pd_q8_0_gemv_repacked_kernel for SHORT rows (at most
+// 64 chunks of 16). There the block kernel hands each thread one chunk, so
+// most of its 128 threads idle behind two barriers and a 4-warp fold per row:
+// qwen4_exp's hc up plane [320 -> 10240] kept 20 of 128 threads busy across
+// 10240 blocks, 3.4 ms of a 39 ms decode tick against a 1.5 ms byte floor.
+// Here warp w of a block owns row 4*blockIdx.x + w and walks the block
+// kernel's four warps as four chunk GROUPS in order - lane c of group g holds
+// chunk 32g + c (zero past the row), with the block kernel's chunk
+// expression verbatim, its shuffle tree per group, and the same ascending
+// sum from 0.0f over all four groups (the empty ones are the block kernel's
+// all-zero warps). The same float operations in the same order: bit-identical
+// to the block kernel. pd_q8_0_gemv_repacked_rows (slot 598, gemm/q8_rows.cuh)
+// runs this body - or the block one, as this launcher elects - over several
+// tokens per weight read, so a speculative verify row still lands where the
+// decode tick does. Any edit here is an edit there too. No shared memory, no
+// barrier.
+__global__ void pd_q8_0_gemv_repacked_warp_kernel(
+    const int8_t* __restrict__ data, const __half* __restrict__ scale,
+    const float* __restrict__ bias, const float* __restrict__ x, float* __restrict__ y,
+    uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t o = blockIdx.x * 4u + warp;
+    const uint32_t nchunks = in_dim >> 4;
+    const bool live = o < out_dim;
+    const int8_t* row = data + (size_t)(live ? o : 0u) * in_dim;
+    const __half* srow = scale + (size_t)(live ? o : 0u) * (in_dim >> 5);
+    // the scales are weights, not chain data: read them in the drain
+    float sc[4];
+    #pragma unroll
+    for (uint32_t g = 0; g < 4u; ++g) {
+        const uint32_t c = g * 32u + lane;
+        sc[g] = live && c < nchunks ? __half2float(srow[(c * 16u) >> 5]) : 0.0f;
+    }
+    PD_PDL_ARM();
+    if (!live) return;   // warp-uniform
+    float v = 0.0f;
+    #pragma unroll
+    for (uint32_t g = 0; g < 4u; ++g) {
+        const uint32_t c = g * 32u + lane;
+        float acc = 0.0f;
+        if (c < nchunks) {
+            const uint32_t base = c * 16u;
+            int4 wv = *reinterpret_cast<const int4*>(row + base);
+            const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
+            float4 x0 = *reinterpret_cast<const float4*>(x + base);
+            float4 x1 = *reinterpret_cast<const float4*>(x + base + 4);
+            float4 x2 = *reinterpret_cast<const float4*>(x + base + 8);
+            float4 x3 = *reinterpret_cast<const float4*>(x + base + 12);
+            float s = (float)wb[0] * x0.x + (float)wb[1] * x0.y + (float)wb[2] * x0.z + (float)wb[3] * x0.w
+                    + (float)wb[4] * x1.x + (float)wb[5] * x1.y + (float)wb[6] * x1.z + (float)wb[7] * x1.w
+                    + (float)wb[8] * x2.x + (float)wb[9] * x2.y + (float)wb[10] * x2.z + (float)wb[11] * x2.w
+                    + (float)wb[12] * x3.x + (float)wb[13] * x3.y + (float)wb[14] * x3.z + (float)wb[15] * x3.w;
+            acc += sc[g] * s;
+        }
+        for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s2);
+        v += acc;   // lane 0's is the group's fold
+    }
+    if (lane == 0) {
+        if (bias) v += bias[o];
+        y[o] = v;
+    }
+}
+
 PD_EXPORT
 int pd_q8_0_gemv_repacked(const void* data, const void* scale, const void* bias,
                           const void* x, void* y, uint32_t in_dim, uint32_t out_dim,
@@ -2560,106 +2623,19 @@ int pd_q8_0_gemv_repacked(const void* data, const void* scale, const void* bias,
     // 512 threads (3 blk/SM) is worse everywhere; not swept further since
     // 128 already ties or beats every narrower width tested.
     uint32_t threads = 128;
+    // short rows: the warp-per-row twin (bit-identical, see its note);
+    // PADDOCK_Q8_NO_WARPROW keeps the block kernel for A/B
+    static const bool no_warp = pd_env("PADDOCK_Q8_NO_WARPROW") != nullptr;
+    if (!no_warp && (in_dim >> 4) <= 64u) {
+        pd_pdl_go(pd_q8_0_gemv_repacked_warp_kernel, (out_dim + 3u) / 4u, threads, 0u,
+                  (cudaStream_t)stream, (const int8_t*)data, (const __half*)scale,
+                  (const float*)bias, (const float*)x, (float*)y, in_dim, out_dim);
+        return pd_launch_status();
+    }
     uint32_t shmem = (in_dim >> 5) * sizeof(float);
     pd_pdl_go(pd_q8_0_gemv_repacked_kernel, out_dim, threads, shmem, (cudaStream_t)stream,
         (const int8_t*)data, (const __half*)scale, (const float*)bias, (const float*)x,
         (float*)y, in_dim, out_dim);
-    return pd_launch_status();
-}
-
-// ---- K-SPLIT Q8_0 GEMV/GEMM for NARROW-OUT planes (slot 588) --------------
-// One block per output row is the right shape until the row count stops
-// filling the die: the hyper-connection down plane is [in 10240, out 320], so
-// the plain GEMV launches 320 blocks on a 148-SM machine (2 per SM against
-// the 12 it can hold) and the batched mt kernel is worse - its 16-row tile
-// makes TWENTY blocks. The plane is 3.5 MB and the walk runs 96 of these a
-// tick, which is how a bandwidth-shaped kernel ended up at ~175 GB/s.
-//
-// Here the row's dot is split over `split` blocks of K, each accumulating its
-// own chunk; the last block to finish a row folds the partials in ASCENDING
-// split order and writes. Deterministic (fixed fold order, counters reset to
-// zero so a captured graph replays identically), and the per-chunk math is
-// the plain kernel's - only the outer sum is regrouped, the same class the
-// f32 split-K matvec already carries.
-__global__ void pd_q8_0_gemv_sk_kernel(
-    const int8_t* __restrict__ data, const __half* __restrict__ scale,
-    const float* __restrict__ bias, const float* __restrict__ x,
-    float* __restrict__ y, float* __restrict__ partials,
-    unsigned int* __restrict__ counters, uint32_t in_dim, uint32_t out_dim,
-    uint32_t split) {
-    const uint32_t o = blockIdx.x, sp = blockIdx.y, b = blockIdx.z;
-    if (o >= out_dim) return;
-    const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const uint32_t n_blocks = in_dim >> 5;
-    // 32-aligned chunks: a 16-element thread chunk then lies wholly inside one
-    // Q8_0 block, exactly as in the plain kernel, so the scale lookup is the
-    // same single shared read.
-    const uint32_t cblocks = (n_blocks + split - 1u) / split;
-    const uint32_t k0 = sp * cblocks * 32u;
-    const uint32_t k1 = min(k0 + cblocks * 32u, in_dim);
-    extern __shared__ float ssc[];
-    const __half* srow = scale + (size_t)o * n_blocks;
-    for (uint32_t i = tid; k0 + i * 32u < k1; i += nth)
-        ssc[i] = __half2float(srow[(k0 >> 5) + i]);
-    PD_PDL_ARM();
-    __shared__ float wsum[32];
-    __syncthreads();
-    const int8_t* row = data + (size_t)o * in_dim;
-    const float* xr = x + (size_t)b * in_dim;
-    float acc = 0.0f;
-    for (uint32_t base = k0 + tid * 16u; base < k1; base += nth * 16u) {
-        int4 wv = *reinterpret_cast<const int4*>(row + base);
-        const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
-        float4 x0 = *reinterpret_cast<const float4*>(xr + base);
-        float4 x1 = *reinterpret_cast<const float4*>(xr + base + 4);
-        float4 x2 = *reinterpret_cast<const float4*>(xr + base + 8);
-        float4 x3 = *reinterpret_cast<const float4*>(xr + base + 12);
-        float s = (float)wb[0] * x0.x + (float)wb[1] * x0.y + (float)wb[2] * x0.z + (float)wb[3] * x0.w
-                + (float)wb[4] * x1.x + (float)wb[5] * x1.y + (float)wb[6] * x1.z + (float)wb[7] * x1.w
-                + (float)wb[8] * x2.x + (float)wb[9] * x2.y + (float)wb[10] * x2.z + (float)wb[11] * x2.w
-                + (float)wb[12] * x3.x + (float)wb[13] * x3.y + (float)wb[14] * x3.z + (float)wb[15] * x3.w;
-        acc += ssc[(base - k0) >> 5] * s;
-    }
-    for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s2);
-    const uint32_t warp = tid >> 5, lane = tid & 31u;
-    if (lane == 0) wsum[warp] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float v = 0.0f;
-        const uint32_t nwarps = (nth + 31u) >> 5;
-        for (uint32_t w = 0; w < nwarps; ++w) v += wsum[w];
-        const size_t oi = (size_t)b * out_dim + o;
-        partials[oi * split + sp] = v;
-        __threadfence();
-        const unsigned int prev = atomicAdd(&counters[oi], 1u);
-        if (prev == split - 1u) {
-            float sum = 0.0f;
-            for (uint32_t t = 0; t < split; ++t) sum += partials[oi * split + t];
-            if (bias) sum += bias[o];
-            y[oi] = sum;
-            counters[oi] = 0u;   // graph-replay safe: back to the initial state
-        }
-    }
-}
-
-PD_EXPORT
-int pd_q8_0_gemv_sk(const void* data, const void* scale, const void* bias,
-                    const void* x, void* y, void* partials, void* counters,
-                    uint32_t in_dim, uint32_t out_dim, uint32_t batch,
-                    uint32_t split, void* stream) {
-    if (out_dim == 0 || batch == 0) return 0;
-    if (split < 2u || split > 32u) return cudaErrorInvalidValue;
-    if (in_dim & 31u) return cudaErrorInvalidValue;
-    const uint32_t n_blocks = in_dim >> 5;
-    if (split > n_blocks) return cudaErrorInvalidValue;
-    const uint32_t threads = 128;
-    const uint32_t cblocks = (n_blocks + split - 1u) / split;
-    const uint32_t shmem = cblocks * (uint32_t)sizeof(float);
-    dim3 grid(out_dim, split, batch);
-    pd_pdl_go(pd_q8_0_gemv_sk_kernel, grid, threads, shmem, (cudaStream_t)stream,
-        (const int8_t*)data, (const __half*)scale, (const float*)bias,
-        (const float*)x, (float*)y, (float*)partials, (unsigned int*)counters,
-        in_dim, out_dim, split);
     return pd_launch_status();
 }
 

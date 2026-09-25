@@ -1,4 +1,4 @@
-//! Exact text-graph contract for the mixed affine4/8 DiffusionGemma export.
+//! Exact text and vision graph contracts for the mixed affine4/8 DiffusionGemma export.
 use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
@@ -6,6 +6,7 @@ use std::path::Path;
 pub struct DiffusionConfig {
     pub context: usize,
     pub quantization: Value,
+    vision: Value,
 }
 impl DiffusionConfig {
     pub fn read(path: &Path) -> Result<Self, String> {
@@ -110,7 +111,44 @@ impl DiffusionConfig {
         Ok(Self {
             context,
             quantization: q.clone(),
+            vision: v["vision_config"].clone(),
         })
+    }
+    /// Validate before uploading any tower weights. Language-only graph
+    /// inspection remains usable by CPU-side catalog and memory probes.
+    pub fn validate_vision(&self) -> Result<(), String> {
+        let v = &self.vision;
+        for (key, expected) in [
+            ("hidden_size", 1152),
+            ("intermediate_size", 4304),
+            ("num_hidden_layers", 27),
+            ("num_attention_heads", 16),
+            ("num_key_value_heads", 16),
+            ("head_dim", 72),
+            ("patch_size", 16),
+            ("pooling_kernel_size", 3),
+            ("position_embedding_size", 10240),
+            ("default_output_length", 280),
+        ] {
+            if v[key] != expected {
+                return Err(format!("DiffusionGemma vision requires {key}={expected}"));
+            }
+        }
+        if v["model_type"] != "gemma4_vision"
+            || v["attention_bias"] != false
+            || v["use_clipped_linears"] != false
+            || v["standardize"] != true
+            || v["hidden_activation"] != "gelu_pytorch_tanh"
+            || v["rms_norm_eps"].as_f64() != Some(1e-6)
+            || v["rope_parameters"]["rope_theta"].as_f64() != Some(100.)
+            || v["rope_parameters"]["rope_type"] != "default"
+        {
+            return Err("unsupported DiffusionGemma vision graph".into());
+        }
+        if self.bits("model.encoder.embed_vision.embedding_projection")? != 4 {
+            return Err("DiffusionGemma vision projection requires affine4/group64".into());
+        }
+        Ok(())
     }
     pub fn bits(&self, name: &str) -> Result<usize, String> {
         let q = self.quantization.get(name).unwrap_or(&self.quantization);
@@ -143,6 +181,53 @@ mod tests {
                 "max_position_embeddings":262144,"rms_norm_eps":1e-6,"final_logit_softcapping":30.0,
                 "rope_parameters":{"full_attention":{"rope_type":"proportional","rope_theta":1000000.0,"partial_rotary_factor":0.25},"sliding_attention":{"rope_type":"default","rope_theta":10000.0}},
                 "layer_types":(0..30).map(|i|if i%6==5 {"full_attention"} else {"sliding_attention"}).collect::<Vec<_>>()}})
+    }
+    #[test]
+    fn vision_graph_is_validated_before_upload() {
+        let mut v = fixture();
+        assert!(
+            DiffusionConfig::parse(&v)
+                .unwrap()
+                .validate_vision()
+                .is_err()
+        );
+        v["vision_config"] = json!({"model_type":"gemma4_vision", "hidden_size":1152,
+            "intermediate_size":4304, "num_hidden_layers":27, "num_attention_heads":16,
+            "num_key_value_heads":16, "head_dim":72, "patch_size":16, "pooling_kernel_size":3,
+            "position_embedding_size":10240, "default_output_length":280, "attention_bias":false,
+            "use_clipped_linears":false, "standardize":true, "hidden_activation":"gelu_pytorch_tanh",
+            "rms_norm_eps":1e-6, "rope_parameters":{"rope_theta":100.0,"rope_type":"default"}});
+        assert!(
+            DiffusionConfig::parse(&v)
+                .unwrap()
+                .validate_vision()
+                .is_ok()
+        );
+        for (key, value) in [
+            ("hidden_size", json!(5376)),
+            ("default_output_length", json!(560)),
+            ("standardize", json!(false)),
+            ("use_clipped_linears", json!(true)),
+            ("rms_norm_eps", json!(1e-5)),
+        ] {
+            let mut changed = v.clone();
+            changed["vision_config"][key] = value;
+            assert!(
+                DiffusionConfig::parse(&changed)
+                    .unwrap()
+                    .validate_vision()
+                    .is_err(),
+                "{key}"
+            );
+        }
+        v["quantization"]["model.encoder.embed_vision.embedding_projection"] =
+            json!({"bits":8,"group_size":64});
+        assert!(
+            DiffusionConfig::parse(&v)
+                .unwrap()
+                .validate_vision()
+                .is_err()
+        );
     }
     #[test]
     fn mixed_precision_is_per_tensor_not_a_filename_assumption() {

@@ -11,6 +11,20 @@ import Testing
     #expect(!navigation.sidebarVisible)
     #expect(!StudioDraft().hasContent)
   }
+  @Test func readsHistoryReplacesChatsOnlyInTheReadsWorkspace() {
+    var navigation = WorkspaceNavigation()
+    navigation.sidebarVisible = true
+    navigation.studio = .reads
+    #expect(navigation.showsReadsHistory && navigation.showsSidebar)
+    navigation.toggleSidebar()
+    #expect(navigation.showsReadsHistory && !navigation.showsSidebar)
+    navigation.showManager(.runners)
+    #expect(!navigation.showsReadsHistory)
+    navigation.mode = .studio
+    #expect(navigation.showsReadsHistory)
+    navigation.showStudioChats()
+    #expect(!navigation.showsReadsHistory && navigation.studio == .chats && navigation.showsSidebar)
+  }
 
   @Test func modeSwitchingKeepsIndependentSidebarAndDestinationState() {
     var navigation = WorkspaceNavigation()

@@ -25,9 +25,17 @@ pub(in super::super) fn resize(w: usize, h: usize) -> Result<(usize, usize)> {
 }
 impl Vision {
     pub(in super::super) fn load_mlx(d: &MetalDevice, s: &Source) -> Result<Self> {
+        Self::load_mlx_at(d, s, "", 5376)
+    }
+    pub(in super::super) fn load_mlx_at(
+        d: &MetalDevice,
+        s: &Source,
+        root: &str,
+        width: usize,
+    ) -> Result<Self> {
         let mut blocks = Vec::new();
         for i in 0..27 {
-            let prefix = format!("vision_tower.encoder.layers.{i}");
+            let prefix = format!("{root}vision_tower.encoder.layers.{i}");
             let norm = |name: &str, n| s.raw(d, &format!("{prefix}.{name}.weight"), &[n], true);
             let mat = |name: &str, k, n| {
                 s.raw(d, &format!("{prefix}.{name}.linear.weight"), &[n, k], false)
@@ -55,19 +63,24 @@ impl Vision {
             quick_gelu: false,
             patch: s.raw(
                 d,
-                "vision_tower.patch_embedder.input_proj.weight",
+                &format!("{root}vision_tower.patch_embedder.input_proj.weight"),
                 &[E, 768],
                 false,
             )?,
             pos: s.raw(
                 d,
-                "vision_tower.patch_embedder.position_embedding_table",
+                &format!("{root}vision_tower.patch_embedder.position_embedding_table"),
                 &[2, 10240, E],
                 true,
             )?,
-            bias: s.raw(d, "vision_tower.std_bias", &[E], true)?,
-            scale: s.raw(d, "vision_tower.std_scale", &[E], true)?,
-            projection: s.affine(d, "embed_vision.embedding_projection", E, 5376)?,
+            bias: s.raw(d, &format!("{root}vision_tower.std_bias"), &[E], true)?,
+            scale: s.raw(d, &format!("{root}vision_tower.std_scale"), &[E], true)?,
+            projection: s.affine(
+                d,
+                &format!("{root}embed_vision.embedding_projection"),
+                E,
+                width,
+            )?,
         })
     }
 }

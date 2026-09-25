@@ -706,8 +706,10 @@ pd_mxfp4_moe_down_bs_kernel(
                 const uint32_t rr = row_base + r;
                 if (rr >= embd) continue;
                 float accv = 0.0f;
+                // the other slot CTAs' partials from L2 (abi.cuh,
+                // PD_LAST_BLOCK_FOLD)
                 for (uint32_t k = 0; k < n_active; ++k)
-                    accv += part[((size_t)token * n_active + k) * embd + rr];
+                    accv += __ldcg(&part[((size_t)token * n_active + k) * embd + rr]);
                 residual[(size_t)token * embd + rr] += accv;
             }
         }

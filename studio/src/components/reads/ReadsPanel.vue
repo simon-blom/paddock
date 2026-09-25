@@ -3,7 +3,7 @@
 // answered with probabilities: the Studio's surface for POST /v1/systemone
 // on a block-diffusion model (DiffusionGemma). The body is the Jev request
 // shape; the answer carries the runner's own outside-the-labels mass,
-// agreement across re-reads and slot entropy on top of it. A read yields
+// agreement across re-reads and answer entropy on top of it. A read yields
 // answers, not a reply, so this is a workbench beside Embeddings and never
 // a chat lane. The loop is edit -> run -> read -> edit, so above 1200px the
 // answers stay in view beside the editor. Everything runs through the same
@@ -12,8 +12,12 @@
 // Earlier reads sit in a side panel the way a chat lists conversations: a
 // read is the text, its questions and every run of them, kept by the manager
 // and named in the URL, so a read opens again from any browser.
+// What a reader advertises decides what the page offers: pictures beside the
+// text (a vision companion is loaded), denoising steps, a thought before the
+// read, and conditional questions.
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { storeToRefs } from 'pinia'
 import { useModelsStore } from '@/stores/models'
 import { useReadsStore } from '@/stores/reads'
 import { useToastsStore } from '@/stores/toasts'
@@ -32,18 +36,25 @@ import Tabs, { type TabOption } from '@/components/ui/Tabs.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 import { uuid } from '@/lib/uuid'
 import { readsPreferencesApi } from '@/lib/api'
+import { readExample } from '@/lib/reads-example'
 import QuestionRow from './QuestionRow.vue'
 import AnswersCard from './AnswersCard.vue'
 import ReadsSidebar from './ReadsSidebar.vue'
 import {
   DEFAULT_MAX_QUESTIONS,
   DEFAULT_MAX_SAMPLES,
+  MAX_IMAGES,
+  answerNames,
   cleanId,
   curlFor,
   deriveId,
+  dropReferences,
   duplicateQuestion,
   excerptOf,
+  followRename,
   fromWire,
+  imageRef,
+  keptImages,
   newQuestion,
   parseQuestionsJson,
   requestBody,
@@ -82,7 +93,8 @@ onMounted(() => {
 onUnmounted(() => clearInterval(timer))
 
 const readers = computed(() => models.readers)
-const port = ref<number>(0)
+// picked in the header (AppHeader's reader picker), shared through the store
+const { readerPort: port } = storeToRefs(sets)
 watch(
   readers,
   (list) => {
@@ -93,15 +105,6 @@ watch(
 const current = computed(() => readers.value.find((m) => m.port === port.value))
 const caps = computed(() => (current.value ? models.structuredReadFor(current.value.id) : undefined))
 const maxQuestions = computed(() => caps.value?.maxQuestions ?? DEFAULT_MAX_QUESTIONS)
-const modelOptions = computed<SelectOption[]>(() =>
-  readers.value.map((m) => ({
-    value: m.port ?? 0,
-    label: m.display ?? modelLabel(m.id),
-    hint: `port ${m.port}`,
-    vendor: m.vendor,
-    title: m.id,
-  })),
-)
 
 // ── the state: the user's text, pasted or loaded from a file ───────────────
 const state = ref('')
@@ -166,8 +169,15 @@ async function loadFile(f: File): Promise<void> {
     extracting.value = false
   }
 }
+/** Pictures dropped on a reader that takes them are attached; anything
+ *  else is the text, read from the file. */
 function onDrop(e: DragEvent): void {
-  const f = e.dataTransfer?.files?.[0]
+  const files = [...(e.dataTransfer?.files ?? [])]
+  if (takesImages.value && files.length && files.every(isImage)) {
+    void addPictures(files)
+    return
+  }
+  const f = files[0]
   if (f) void loadFile(f)
 }
 /** The text goes, file or pasted - the one way back from a loaded file
@@ -185,6 +195,92 @@ function onPick(e: Event): void {
   el.value = ''
 }
 
+// ── pictures read with the text (a reader with its vision companion) ─────────
+interface Picture {
+  name: string
+  url: string
+  /** the key its bytes are kept under in the read's history */
+  ref: string
+}
+const pictures = ref<Picture[]>([])
+const takesImages = computed(() => caps.value?.images ?? false)
+const imageInput = ref<HTMLInputElement | null>(null)
+/** The long side the Studio sends at most. Gemma 4's tower tops out near
+ *  1,600 px at its largest token budget and the runner resizes to the
+ *  endpoint's budget anyway, so a 2,048 px copy loses nothing the model
+ *  would see - and a read keeps every picture in its history, where a
+ *  12-megapixel original would crowd out the runs. */
+const PICTURE_SIDE = 2048
+const PICTURE_BYTES = 3 * 1024 * 1024
+function dataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(r.error ?? new Error('the file could not be read'))
+    r.readAsDataURL(blob)
+  })
+}
+/** The picture as a data URL: the file's own bytes when it is already small
+ *  enough, else a JPEG redrawn to PICTURE_SIDE (upright - the browser applies
+ *  the EXIF orientation while decoding). A format the browser cannot draw
+ *  goes as it is, and the runner decides. */
+async function fitPicture(f: File): Promise<string> {
+  let bmp: ImageBitmap
+  try {
+    bmp = await createImageBitmap(f, { imageOrientation: 'from-image' })
+  } catch {
+    return dataUrl(f)
+  }
+  try {
+    const long = Math.max(bmp.width, bmp.height)
+    if (long <= PICTURE_SIDE && f.size <= PICTURE_BYTES) return await dataUrl(f)
+    const k = Math.min(1, PICTURE_SIDE / long)
+    const c = document.createElement('canvas')
+    c.width = Math.max(1, Math.round(bmp.width * k))
+    c.height = Math.max(1, Math.round(bmp.height * k))
+    const g = c.getContext('2d')
+    if (!g) return await dataUrl(f)
+    g.drawImage(bmp, 0, 0, c.width, c.height)
+    return c.toDataURL('image/jpeg', 0.92)
+  } finally {
+    bmp.close()
+  }
+}
+async function addPictures(files: File[]): Promise<void> {
+  stateError.value = null
+  const room = MAX_IMAGES - pictures.value.length
+  if (files.length > room) {
+    stateError.value = `A read takes up to ${MAX_IMAGES} images.`
+    files = files.slice(0, Math.max(0, room))
+  }
+  for (const f of files) {
+    try {
+      const url = await fitPicture(f)
+      pictures.value.push({ name: f.name || 'pasted image', url, ref: imageRef(url) })
+    } catch (e) {
+      stateError.value = `${f.name}: ${e instanceof Error ? e.message : String(e)}`
+    }
+  }
+}
+function removePicture(i: number): void {
+  pictures.value.splice(i, 1)
+}
+function onPickImages(e: Event): void {
+  const el = e.target as HTMLInputElement
+  const files = [...(el.files ?? [])]
+  el.value = ''
+  if (files.length) void addPictures(files)
+}
+const isImage = (f: File) => f.type.startsWith('image/')
+/** A picture pasted into the text is attached, not pasted as a path. */
+function onPaste(e: ClipboardEvent): void {
+  if (!takesImages.value) return
+  const files = [...(e.clipboardData?.files ?? [])].filter(isImage)
+  if (!files.length) return
+  e.preventDefault()
+  void addPictures(files)
+}
+
 // ── the questions ──────────────────────────────────────────────────────────
 const questions = ref<ReadQuestion[]>([newQuestion()])
 const samples = ref<Samples>('auto')
@@ -198,15 +294,58 @@ const sampleOptions = computed<SelectOption[]>(() => {
 function setSamples(v: string | number): void {
   samples.value = v === 'auto' ? 'auto' : Number(v)
 }
+// Denoising steps before the answer is read, where the reader takes more
+// than one: the slots settle together over the steps, as the model's own
+// decode would, with the template pinned. One is a single pass.
+const steps = ref(1)
+const maxSteps = computed(() => caps.value?.maxSteps ?? 1)
+const stepOptions = computed<SelectOption[]>(() => {
+  const list = [1, 2, 4, 8].filter((n) => n <= maxSteps.value)
+  if (!list.includes(steps.value) && steps.value <= maxSteps.value) list.push(steps.value)
+  return list
+    .sort((a, b) => a - b)
+    .map((n) => ({ value: n, label: String(n), hint: n === 1 ? 'one pass' : undefined }))
+})
+// A thought before the read: the model writes up to this many tokens with
+// its thinking on, and every slot is read with the thought in its prompt.
+const think = ref(0)
+const thinkOptions = computed<SelectOption[]>(() => {
+  const list = [0, 256, 1024, 4096]
+  if (!list.includes(think.value)) list.push(think.value)
+  return list
+    .sort((a, b) => a - b)
+    .map((n) => ({ value: n, label: n ? `${n} tokens` : 'off' }))
+})
+/** What the request carries: a setting the reader does not take is left out. */
+const stepsSent = computed(() => (maxSteps.value > 1 ? Math.min(steps.value, maxSteps.value) : 1))
+const thinkSent = computed(() => (caps.value?.think ? think.value : 0))
 
 function otherIds(key: string): string[] {
   return questions.value.filter((q) => q.key !== key).map((q) => q.id)
+}
+/** Every row as a condition can name it: by key, with its id (or its place
+ *  while it has none) and the answers it can give. */
+const rowRefs = computed(() =>
+  questions.value.map((q, i) => ({
+    key: q.key,
+    name: q.id.trim() || `question ${i + 1}`,
+    answers: answerNames(q),
+  })),
+)
+function othersFor(q: ReadQuestion): { key: string; name: string; answers: string[] }[] {
+  return rowRefs.value.filter((r) => r.key !== q.key)
 }
 /** Row edits arrive as patches. The id follows the instructions until the
  *  user writes one; clearing it hands it back to the derivation. */
 function onPatch(q: ReadQuestion, patch: Partial<ReadQuestion>): void {
   const { id, ...rest } = patch
+  const before = answerNames(q)
   Object.assign(q, rest)
+  // an option or level renamed in place: conditions naming it follow
+  const after = answerNames(q)
+  if ((rest.options || rest.levels) && before.length === after.length) {
+    followRename(questions.value, q.key, before, after)
+  }
   if (id !== undefined) {
     if (!id.trim()) {
       q.idTouched = false
@@ -245,7 +384,8 @@ function duplicate(i: number): void {
   )
 }
 function remove(i: number): void {
-  questions.value.splice(i, 1)
+  const [gone] = questions.value.splice(i, 1)
+  if (gone) dropReferences(questions.value, gone.key)
 }
 // native drag between rows: the dragged row follows the pointer, so the
 // order is live while dragging and settled on drop without a second step
@@ -305,6 +445,8 @@ function applyJson(): boolean {
   jsonNotes.value = p.errors
   questions.value = p.questions
   if (p.samples !== undefined) samples.value = p.samples
+  if (p.steps !== undefined) steps.value = p.steps
+  if (p.think !== undefined) think.value = p.think
   if (p.state !== undefined && !state.value.trim()) state.value = p.state
   return true
 }
@@ -321,7 +463,7 @@ function onJsonPick(e: Event): void {
   })
 }
 function exportJson(): void {
-  const text = JSON.stringify({ questions: toWire(questions.value), samples: samples.value }, null, 2)
+  const text = setBody.value
   const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }))
   const a = document.createElement('a')
   a.href = url
@@ -343,11 +485,41 @@ const readSaveFailed = ref(false)
 const runIdx = ref(0)
 const run = computed<ReadRun | null>(() => activeRead.value?.runs[runIdx.value] ?? null)
 const lastMs = ref<number | null>(null)
-const canRun = computed(
-  () => !!current.value && !busy.value && state.value.trim().length > 0 && validation.value.ok,
+/** Pictures on a reader without its vision companion cannot be read. */
+const picturesError = computed(() =>
+  pictures.value.length && current.value && !takesImages.value
+    ? 'This model was started without its vision companion, so it reads text only. Remove the images or start it with vision.'
+    : null,
 )
-const body = computed(() => requestBody(state.value, questions.value, samples.value))
-const curl = computed(() => (current.value ? curlFor(port.value, body.value) : ''))
+const canRun = computed(
+  () =>
+    !!current.value &&
+    !busy.value &&
+    (state.value.trim().length > 0 || pictures.value.length > 0) &&
+    validation.value.ok &&
+    !picturesError.value,
+)
+const body = computed(() =>
+  requestBody(state.value, questions.value, samples.value, {
+    steps: stepsSent.value,
+    think: thinkSent.value,
+    images: pictures.value.map((p) => p.url),
+  }),
+)
+const curl = computed(() =>
+  current.value ? curlFor(port.value, body.value, pictures.value.map((p) => p.name)) : '',
+)
+/** The pictures of a run and of the page, compared by their bytes' key. */
+const pictureKey = (refs: { ref: string }[] | undefined) => (refs ?? []).map((r) => r.ref).join(',')
+/** A run was made with the settings on screen now. */
+function sameSettings(r: ReadRun): boolean {
+  return (
+    r.samples === samples.value &&
+    (r.steps ?? 1) === stepsSent.value &&
+    (r.think ?? 0) === thinkSent.value &&
+    pictureKey(r.images) === pictureKey(pictures.value)
+  )
+}
 
 async function doRun(): Promise<void> {
   if (!canRun.value || !current.value) return
@@ -358,6 +530,7 @@ async function doRun(): Promise<void> {
   serverRowErrors.value = {}
   const req = body.value
   const sourceFile = fileName.value
+  const pics = [...pictures.value]
   const p = port.value
   const model = current.value
   const t0 = performance.now()
@@ -398,8 +571,11 @@ async function doRun(): Promise<void> {
       response: json as ReadResponse,
       ms,
     }
+    if (req.steps) r.steps = req.steps
+    if (req.think) r.think = req.think
+    if (pics.length) r.images = pics.map((x) => ({ name: x.name, ref: x.ref }))
     lastMs.value = ms
-    await keepRun(r)
+    await keepRun(r, Object.fromEntries(pics.map((x) => [x.ref, x.url])))
   } catch (e) {
     pageError.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -409,18 +585,22 @@ async function doRun(): Promise<void> {
 /** A run lands on the read on screen - a new read is created by its first
  *  run, the way a chat is created by its first message - and the read is
  *  saved whole. A failed save keeps the answers on screen and says so. */
-async function keepRun(r: ReadRun): Promise<void> {
+async function keepRun(r: ReadRun, added: Record<string, string>): Promise<void> {
   const prev = activeRead.value
   const doc: ReadDoc = prev
     ? { ...prev, model: r.model, updatedAt: r.at, runs: withRun(prev.runs, r) }
     : {
         id: uuid(),
-        title: readTitle(r.state, r.fileName),
+        title: readTitle(r.state, r.fileName || r.images?.[0]?.name || ''),
         model: r.model,
         createdAt: r.at,
         updatedAt: r.at,
         runs: [r],
       }
+  // each picture is kept once for the read, and goes with the last run that used it
+  const images = keptImages(doc.runs, prev?.images, added)
+  if (images) doc.images = images
+  else delete doc.images
   activeRead.value = doc
   runIdx.value = doc.runs.length - 1
   if (!prev) void router.replace({ name: 'reads', params: { id: doc.id } })
@@ -452,7 +632,7 @@ const stale = computed(() => {
     b.state !== undefined &&
     ((r.state ?? '') !== b.state ||
       JSON.stringify(r.questions) !== JSON.stringify(b.questions) ||
-      r.samples !== samples.value)
+      !sameSettings(r))
   )
 })
 
@@ -460,52 +640,21 @@ const stale = computed(() => {
 // content, never sample prose), but a page that cannot show what a read
 // looks like until one has been authored explains nothing. One click fills
 // a support ticket and the three question types, then runs.
-const EXAMPLE_STATE = [
-  'Subject: Portal down again',
-  '',
-  'Hi, this is the third time this week the customer portal has gone down during business hours. We have 40 agents unable to log in right now and customers are calling. I need someone on this immediately - we are paying for the enterprise tier and this is unacceptable. Please call me back on the number on file.',
-  '',
-  '- Dana, Ops lead at Northwind',
-].join('\n')
-// The ids are DERIVED, as the editor derives them, and not short hand-picked
-// words: the id is written into the answer template the model reads, and
-// measured on the Q4_K_M file `urgent` / `topic` / `mood` left 0.43-0.50 of
-// the mass outside the labels on every question (slot entropy 1.1-1.9)
-// where `need_action_within` / `message_about` / `upset_sender` left
-// 0.00-0.04 (entropy 0.05-0.22) with the same picks. A descriptive id reads
-// cleaner, so the example shows the practice it recommends.
-function exampleQuestions(): ReadQuestion[] {
-  const urgent = newQuestion('noul')
-  urgent.instructions = 'Does this message need action within the hour?'
-  urgent.yesMeans = 'an outage or blocker affecting many people now'
-  urgent.noMeans = 'a request that can wait a day'
-  const topic = newQuestion('choice')
-  topic.instructions = 'What is this message about?'
-  topic.options = [
-    { name: 'outage', description: 'a service is down or broken' },
-    { name: 'billing', description: 'invoices, plans or payment' },
-    { name: 'feature', description: 'a request for something new' },
-    { name: 'other', description: 'none of these' },
-  ]
-  const mood = newQuestion('score')
-  mood.instructions = 'How upset is the sender?'
-  mood.levels = ['calm', 'annoyed', 'furious']
-  const qs = [urgent, topic, mood]
-  const taken: string[] = []
-  for (const q of qs) {
-    q.id = deriveId(q.instructions, taken)
-    taken.push(q.id)
-  }
-  return qs
-}
 function loadExample(): void {
-  state.value = EXAMPLE_STATE
-  questions.value = exampleQuestions()
-  samples.value = 'auto'
-  serverRowErrors.value = {}
-  questionsError.value = null
-  if (tab.value === 'json') jsonText.value = JSON.stringify(toWire(questions.value), null, 2)
-  void doRun()
+  if (!current.value || busy.value) return
+  try {
+    const example = readExample()
+    state.value = example.state
+    questions.value = example.questions
+    samples.value = example.samples
+    pictures.value = []
+    serverRowErrors.value = {}
+    questionsError.value = null
+    if (tab.value === 'json') jsonText.value = JSON.stringify(toWire(questions.value), null, 2)
+    void doRun()
+  } catch (e) {
+    pageError.value = e instanceof Error ? e.message : String(e)
+  }
 }
 function onKey(e: KeyboardEvent): void {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -518,7 +667,16 @@ function onKey(e: KeyboardEvent): void {
 const activeSetId = ref<string | undefined>(undefined)
 const activeSet = computed(() => sets.sets.find((s) => s.id === activeSetId.value))
 const setBody = computed(() =>
-  JSON.stringify({ questions: toWire(questions.value), samples: samples.value }, null, 2),
+  JSON.stringify(
+    {
+      questions: toWire(questions.value),
+      samples: samples.value,
+      ...(steps.value > 1 ? { steps: steps.value } : {}),
+      ...(think.value > 0 ? { think: think.value } : {}),
+    },
+    null,
+    2,
+  ),
 )
 const dirty = computed(() => !!activeSet.value && activeSet.value.body !== setBody.value)
 const setOptions = computed<SelectOption[]>(() => [
@@ -533,6 +691,8 @@ function selectSet(v: string | number): void {
       const p = fromWire(JSON.parse(s.body))
       questions.value = p.questions.length ? p.questions : [newQuestion()]
       samples.value = p.samples ?? 'auto'
+      steps.value = p.steps ?? 1
+      think.value = p.think ?? 0
     } catch {
       toasts.push({ tone: 'bad', title: 'This set could not be read', description: s.name })
     }
@@ -604,6 +764,7 @@ async function confirmDelete(): Promise<void> {
 const hasWork = computed(
   () =>
     state.value.trim().length > 0 ||
+    pictures.value.length > 0 ||
     questions.value.some((q) => q.instructions.trim().length > 0 || q.idTouched),
 )
 const unsaved = computed(() => {
@@ -616,7 +777,7 @@ const unsaved = computed(() => {
   return (
     latest.state !== b.state ||
     JSON.stringify(latest.questions) !== JSON.stringify(b.questions) ||
-    latest.samples !== samples.value
+    !sameSettings(latest)
   )
 })
 /** Where a confirmed leave goes: a new read, or an earlier one. */
@@ -646,6 +807,9 @@ function resetRead(): void {
   clearState()
   questions.value = [newQuestion()]
   samples.value = 'auto'
+  steps.value = 1
+  think.value = 0
+  pictures.value = []
   activeSetId.value = undefined
   activeRead.value = null
   readSaveFailed.value = false
@@ -678,6 +842,13 @@ async function loadRead(id: string): Promise<void> {
       const p = fromWire({ questions: latest.questions, samples: latest.samples })
       questions.value = p.questions.length ? p.questions : [newQuestion()]
       samples.value = p.samples ?? latest.samples
+      steps.value = latest.steps ?? 1
+      think.value = latest.think ?? 0
+      // a picture whose bytes are missing from the record is not invented
+      pictures.value = (latest.images ?? []).flatMap((i) => {
+        const url = doc.images?.[i.ref]
+        return url ? [{ name: i.name, url, ref: i.ref }] : []
+      })
       lastMs.value = latest.ms
     }
   } catch (e) {
@@ -788,9 +959,6 @@ async function copyCurl(): Promise<void> {
           code calls.
         </p>
       </div>
-      <div v-if="readers.length" class="rd__headr">
-        <Select v-model="port" :options="modelOptions" />
-      </div>
     </div>
 
     <div v-if="opening && !activeRead" class="rd__none">
@@ -805,7 +973,7 @@ async function copyCurl(): Promise<void> {
       <Icon name="list-checks" :size="32" class="rd__none-icon" />
       <p class="rd__none-title">No model that can read is running</p>
       <p class="rd__none-txt">
-        Reads need a block-diffusion model - start DiffusionGemma in the Manager.
+        Reads need a model that reads - start DiffusionGemma or Laya in the Manager.
       </p>
       <RouterLink class="pk-btn pk-btn--primary" :to="{ name: 'server-new' }">
         <Icon name="play" :size="14" /> Start a model
@@ -815,8 +983,8 @@ async function copyCurl(): Promise<void> {
     <template v-else>
       <div v-if="pageError" class="rd__error" role="alert">{{ pageError }}</div>
       <p v-if="!readers.length" class="rd__noreader">
-        No model that can read is running, so this read cannot run again until DiffusionGemma is
-        started in the Manager.
+        No model that can read is running, so this read cannot run again until DiffusionGemma or
+        Laya is started in the Manager.
       </p>
 
       <div class="rd__cols">
@@ -824,7 +992,10 @@ async function copyCurl(): Promise<void> {
           <section class="rd__card">
             <div class="rd__cardhead">
               <h2 class="rd__h2">State</h2>
-              <span class="rd__count">{{ state.length }} characters</span>
+              <span class="rd__count">
+                {{ state.length }} characters<template v-if="pictures.length">
+                  · {{ pictures.length }} image{{ pictures.length === 1 ? '' : 's' }}</template>
+              </span>
             </div>
             <textarea
               v-model="state"
@@ -834,7 +1005,22 @@ async function copyCurl(): Promise<void> {
               placeholder="Paste the text to read - an email, a ticket, a transcript, a document."
               @dragover.prevent
               @drop.prevent="onDrop"
+              @paste="onPaste"
             />
+            <div v-if="pictures.length" class="rd__pics">
+              <figure v-for="(pic, i) in pictures" :key="`${pic.ref}-${i}`" class="rd__pic">
+                <img class="rd__picimg" :src="pic.url" :alt="pic.name" />
+                <figcaption class="rd__picname">{{ pic.name }}</figcaption>
+                <button
+                  class="rd__picx"
+                  type="button"
+                  :aria-label="`Remove ${pic.name}`"
+                  @click="removePicture(i)"
+                >
+                  <Icon name="x" :size="11" />
+                </button>
+              </figure>
+            </div>
             <div class="rd__filerow">
               <button
                 class="pk-btn pk-btn--sm"
@@ -846,6 +1032,23 @@ async function copyCurl(): Promise<void> {
                 {{ extracting ? 'Reading the file...' : 'Load a file' }}
               </button>
               <input ref="fileInput" type="file" class="rd__hidden" @change="onPick" />
+              <button
+                v-if="takesImages"
+                class="pk-btn pk-btn--sm"
+                type="button"
+                :disabled="pictures.length >= MAX_IMAGES"
+                @click="imageInput?.click()"
+              >
+                <Icon name="image" :size="13" /> Add images
+              </button>
+              <input
+                ref="imageInput"
+                type="file"
+                accept="image/*"
+                multiple
+                class="rd__hidden"
+                @change="onPickImages"
+              />
               <span v-if="fileName" class="rd__chip">
                 <Icon name="file" :size="12" />
                 <span class="rd__chipname">{{ fileName }}</span>
@@ -864,6 +1067,7 @@ async function copyCurl(): Promise<void> {
               <span v-else class="rd__hintline">or drop a file on the text</span>
             </div>
             <p v-if="stateError" class="rd__hint rd__hint--warn" role="alert">{{ stateError }}</p>
+            <p v-if="picturesError" class="rd__hint rd__hint--warn" role="alert">{{ picturesError }}</p>
           </section>
 
           <section class="rd__card">
@@ -916,10 +1120,28 @@ async function copyCurl(): Promise<void> {
 
             <div class="rd__qbar">
               <Tabs :model-value="tab" :tabs="tabs" @update:model-value="setTab" />
-              <label class="rd__samples">
-                <span>Reads per question</span>
-                <Select :model-value="samples" :options="sampleOptions" @update:model-value="setSamples" />
-              </label>
+              <div class="rd__settings">
+                <label class="rd__samples">
+                  <span>Reads per question</span>
+                  <Select :model-value="samples" :options="sampleOptions" @update:model-value="setSamples" />
+                </label>
+                <label v-if="maxSteps > 1" class="rd__samples">
+                  <span>Steps</span>
+                  <Select
+                    :model-value="stepsSent"
+                    :options="stepOptions"
+                    @update:model-value="steps = Number($event)"
+                  />
+                </label>
+                <label v-if="caps?.think" class="rd__samples">
+                  <span>Think first</span>
+                  <Select
+                    :model-value="think"
+                    :options="thinkOptions"
+                    @update:model-value="think = Number($event)"
+                  />
+                </label>
+              </div>
             </div>
 
             <p v-if="questionsError" class="rd__hint rd__hint--warn" role="alert">{{ questionsError }}</p>
@@ -943,7 +1165,10 @@ async function copyCurl(): Promise<void> {
                   :error="rowError(q)"
                   :types="caps?.types ?? []"
                   :dragging="dragFrom === i"
-                  :answer="run?.response.answers[q.id]"
+                  :answer="run?.response.answers[q.id] ?? undefined"
+                  :skipped="!!run?.response.diagnostics.skipped?.[q.id]"
+                  :conditional="caps?.conditional ?? false"
+                  :others="othersFor(q)"
                   @patch="onPatch(q, $event)"
                   @move="move(i, $event)"
                   @duplicate="duplicate(i)"
@@ -1033,6 +1258,7 @@ async function copyCurl(): Promise<void> {
             <p v-if="run?.stateMissing" class="rd__meta">The original input was not retained with this older result.</p>
             <AnswersCard
               :run="run"
+              :images="activeRead?.images"
               :run-index="runIdx"
               :run-count="activeRead?.runs.length ?? 0"
               :busy="busy"
@@ -1126,15 +1352,23 @@ async function copyCurl(): Promise<void> {
   height: 100%;
   min-height: 0;
 }
+/* The pane scrolls; its bottom padding lives on the content instead, because
+   a sticky child sticks at the scroll container's padding edge - with 32px
+   of padding here the Run bar floated 32px up and the rows scrolled on below
+   it. The pane is also the query container: whether the answers fit beside
+   the editor depends on the room left beside the side panel and the GPU
+   dock, not on the window. */
 .rd__main {
   flex: 1;
   min-width: 0;
   overflow: auto;
-  padding: 32px;
+  padding: 32px 32px 0;
+  container-type: inline-size;
 }
 .rd__inner {
   max-width: var(--pk-panel-width);
   margin: 0 auto;
+  padding-bottom: 32px;
 }
 .rd__rail {
   flex: none;
@@ -1178,12 +1412,6 @@ async function copyCurl(): Promise<void> {
   margin: 0;
   color: var(--pk-text-muted);
   font-size: var(--pk-font-size-sm);
-}
-.rd__headr {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
 }
 .rd__none {
   display: flex;
@@ -1230,8 +1458,9 @@ async function copyCurl(): Promise<void> {
   min-width: 0;
 }
 /* two columns once both fit: the answers stay in view while the questions
-   are edited, which is the whole loop */
-@media (min-width: 1200px) {
+   are edited, which is the whole loop. Each column needs ~520px for a
+   question row's type, id, answer chip and menu. */
+@container (min-width: 1100px) {
   .rd__inner {
     max-width: 1400px;
   }
@@ -1350,6 +1579,64 @@ async function copyCurl(): Promise<void> {
 }
 .rd__hint--warn {
   color: var(--pk-status-warning);
+}
+.rd__settings {
+  display: flex;
+  align-items: center;
+  gap: 4px 16px;
+  flex-wrap: wrap;
+}
+/* three short values: the shared trigger's 220px floor would put each
+   setting on a line of its own */
+.rd__settings :deep(.pk-select) {
+  min-width: 72px;
+}
+/* the pictures read with the text: thumbnails in a strip under it */
+.rd__pics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.rd__pic {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 96px;
+  margin: 0;
+}
+.rd__picimg {
+  width: 96px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: var(--pk-radius-md);
+  border: 1px solid var(--pk-border-default);
+  background: var(--pk-bg-inset);
+}
+.rd__picname {
+  font-size: var(--pk-font-size-xs);
+  color: var(--pk-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rd__picx {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--pk-border-default);
+  border-radius: var(--pk-radius-full);
+  background: var(--pk-bg-surface);
+  color: var(--pk-text-secondary);
+  cursor: pointer;
+}
+.rd__picx:hover {
+  color: var(--pk-text-primary);
 }
 .rd__qbar {
   display: flex;

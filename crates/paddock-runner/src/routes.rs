@@ -282,6 +282,9 @@ pub struct AppState {
     /// The loaded dense-prediction model (tic-forestry: DINOv3 + decoder), if
     /// one was configured - serves `/v1/segmentations` only.
     pub segmenter: Option<crate::serving::SegmentModel>,
+    /// The loaded decision model (a Laya bundle), if one was configured -
+    /// serves `POST /v1/systemone` only.
+    pub laya: Option<crate::systemone::laya::LayaModel>,
     /// The loaded image-generation model (Qwen-Image), if one was configured
     /// - serves `/v1/images/*` only.
     pub image: Option<crate::serving::ImageModel>,
@@ -415,6 +418,7 @@ impl AppState {
             asr: None,
             aligner: None,
             segmenter: None,
+            laya: None,
             image: None,
             max_ctx: 8192,
             vad_gate: false,
@@ -916,9 +920,18 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                 "canvas_width": s.engine.canvas_width(),
                 "max_questions": crate::systemone::MAX_QUESTIONS,
                 "max_samples": crate::systemone::MAX_SAMPLES,
+                "max_steps": s.engine.canvas_read_steps(),
+                "images": s.supports_vision && s.engine.canvas_images(),
+                "conditional": true,
+                "think": true,
                 "types": ["noul", "choice", "score"],
             })
-        }),
+        // a decision model reads and does nothing else: the same key, its
+        // own values (one read, one step, text only, no thought)
+        }).or_else(|| state.laya.as_ref().map(|l| l.caps())),
+        // Decision model id (Laya): POST /v1/systemone works iff this is set,
+        // and it is the ONLY thing such a runner serves - the sixth role.
+        "reader": state.laya.as_ref().map(|l| l.id.clone()),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
         // as the alignment cap above. Null means no ceiling worth
         // publishing: whisper windows a clip into 30 s pieces, so length costs
@@ -1412,6 +1425,35 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                 }),
                 vec!["response_format".to_owned(), "logits".to_owned()],
                 0,
+            ),
+        );
+    }
+    if let Some(lm) = &state.laya {
+        // a decision model only: a state and typed questions in, calibrated
+        // answers out - /v1/systemone and nothing else. Its context is the
+        // longest sequence a checkpoint reads (the question + options + one
+        // window of the state), not a chat window.
+        let max_len = lm
+            .decider
+            .info()
+            .checkpoints
+            .iter()
+            .map(|(_, c)| c.max_len)
+            .max()
+            .unwrap_or(0);
+        data.push(
+            ModelObject::new(lm.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["text"],
+                    "output_modalities": ["decision"],
+                    "modality": "text->decision",
+                }),
+                serde_json::json!({
+                    "structured_read": true,
+                    "checkpoints": lm.checkpoints().iter().map(|c| c.name()).collect::<Vec<_>>(),
+                }),
+                vec!["model".to_owned(), "lang".to_owned(), "ask".to_owned()],
+                max_len,
             ),
         );
     }

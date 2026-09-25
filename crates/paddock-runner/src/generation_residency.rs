@@ -23,6 +23,7 @@ struct Resident {
     pool: Pool<Engine>,
     metrics: Arc<EngineMetrics>,
     budget: u64,
+    vision: Option<VisionBudget>,
     admission: Arc<tokio::sync::Semaphore>,
 }
 impl From<Engine> for Handle {
@@ -55,9 +56,24 @@ impl Handle {
             Inner::Loaded(e) => e.canvas_width(),
         }
     }
+    /// The most denoising steps one structured read may take; a resident
+    /// canvas keeps the same capability while unloaded.
+    pub fn canvas_read_steps(&self) -> u32 {
+        match &self.0 {
+            Inner::Resident(_) => paddock_engine::service::READ_MAX_STEPS,
+            Inner::Loaded(e) => e.canvas_read_steps(),
+        }
+    }
+    /// True when structured reads may carry images.
+    pub fn canvas_images(&self) -> bool {
+        match &self.0 {
+            Inner::Resident(r) => r.vision.is_some(),
+            Inner::Loaded(e) => e.canvas_images(),
+        }
+    }
     pub fn vision_budget(&self) -> Option<VisionBudget> {
         match &self.0 {
-            Inner::Resident(_) => None,
+            Inner::Resident(r) => r.vision,
             Inner::Loaded(e) => e.vision_budget(),
         }
     }
@@ -134,6 +150,8 @@ pub(crate) struct Options {
     pub policy: Config,
     pub config_path: Option<PathBuf>,
     signature: Signature,
+    companion: Option<(PathBuf, Signature)>,
+    vision: Option<VisionBudget>,
 }
 impl Options {
     pub fn new(policy: Config, path: &Path, config_path: Option<PathBuf>) -> Result<Self, String> {
@@ -142,7 +160,21 @@ impl Options {
             policy,
             config_path,
             signature: signature(path)?,
+            companion: None,
+            vision: None,
         })
+    }
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    pub fn with_vision(
+        mut self,
+        companion: Option<&Path>,
+        vision: Option<VisionBudget>,
+    ) -> Result<Self, String> {
+        self.companion = companion
+            .map(|p| signature(p).map(|s| (p.to_owned(), s)))
+            .transpose()?;
+        self.vision = vision;
+        Ok(self)
     }
 }
 
@@ -204,10 +236,15 @@ pub(crate) fn configure(
     build: impl Fn() -> Result<Engine, String> + Send + Sync + 'static,
 ) -> Result<Handle, String> {
     let loaded_metrics = metrics.clone();
+    let vision = options.vision;
     let build = move || {
         let _gate = crate::device_admission::load_lock(&device, gpu)?;
         let check = || {
-            if signature(&path)? == options.signature {
+            let companion_matches = match &options.companion {
+                Some((p, saved)) => signature(p)? == *saved,
+                None => true,
+            };
+            if signature(&path)? == options.signature && companion_matches {
                 Ok(())
             } else {
                 Err("model_changed: checkpoint changed; restart this endpoint".to_owned())
@@ -216,10 +253,16 @@ pub(crate) fn configure(
         check()?;
         let engine = build()?;
         if let Err(error) = check().and_then(|_| {
-            if engine.canvas_width() == 256 && engine.vision_budget().is_none() {
+            if engine.canvas_width() == 256
+                && engine.vision_budget() == vision
+                && engine.canvas_read_steps() == paddock_engine::service::READ_MAX_STEPS
+            {
                 Ok(())
             } else {
-                Err("model_changed: loaded capabilities differ from DiffusionGemma text".into())
+                Err(
+                    "model_changed: loaded capabilities differ from configured DiffusionGemma"
+                        .into(),
+                )
             }
         }) {
             dispose(engine, &loaded_metrics);
@@ -243,6 +286,7 @@ pub(crate) fn configure(
         pool,
         metrics,
         budget: reservation,
+        vision,
         admission: Arc::new(tokio::sync::Semaphore::new(32)),
     }))))
 }
@@ -284,6 +328,7 @@ mod tests {
             pool,
             metrics: Arc::new(EngineMetrics::default()),
             budget: 4096,
+            vision: None,
             admission: Arc::new(tokio::sync::Semaphore::new(32)),
         })))
     }
@@ -339,6 +384,16 @@ mod tests {
         let a = signature(d.path()).unwrap();
         assert_eq!(a, signature(d.path()).unwrap());
         std::fs::write(d.path().join("new.json"), "{}").unwrap();
+        // A real replacement is written after the file it replaces. Say so:
+        // two writes microseconds apart can carry one NTFS timestamp, and on
+        // Windows the stamp has no inode to tell the files apart, so without
+        // this the test failed about two runs in five there.
+        std::fs::File::options()
+            .write(true)
+            .open(d.path().join("new.json"))
+            .unwrap()
+            .set_modified(a[0].modified + Duration::from_secs(2))
+            .unwrap();
         std::fs::rename(d.path().join("new.json"), &p).unwrap();
         assert_ne!(a, signature(d.path()).unwrap());
         let b = signature(d.path()).unwrap();

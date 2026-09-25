@@ -9,7 +9,8 @@ import './styles/base.css'
 import './styles/components.css'
 
 import { initializeStudioPersistence } from '@/lib/browser-storage-migration'
-import { installPreferenceLifecycle } from '@/lib/ui-preferences'
+import { installPreferenceLifecycle, isKeyRequired } from '@/lib/ui-preferences'
+import KeyGate from '@/components/KeyGate.vue'
 
 async function start() {
   const root = document.getElementById('app')!
@@ -17,7 +18,16 @@ async function start() {
     await initializeStudioPersistence()
     installPreferenceLifecycle()
     createApp(App).use(createPinia()).use(router).mount(root)
-  } catch {
+  } catch (e) {
+    // A browser on another machine reaches a keyed manager: every /api call,
+    // this first read of the saved preferences included, is refused until it
+    // unlocks. The key gate lives in the app that has not mounted yet, so it
+    // mounts here on its own; its login reloads the page into a session that
+    // can read the preferences.
+    if (isKeyRequired(e)) {
+      createApp(KeyGate).mount(root)
+      return
+    }
     // Do not mount default preferences over a database we failed to read.
     const message = document.createElement('p')
     message.textContent = 'Studio could not open its saved data.'

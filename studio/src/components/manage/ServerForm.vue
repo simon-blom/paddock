@@ -1210,7 +1210,11 @@ const canSpeculate = computed(
 // that has no context. Encoders and speech models are NOT in this set: an
 // embedder batches inputs and bounds their length, whisper windows a clip.
 const singlePass = computed(() =>
-  selectedCapabilities.value.some((c) => c === 'image-generation' || c === 'segmentation'),
+  selectedCapabilities.value.some(
+    // a decision model reads each question in one pass at the checkpoint's
+    // own sequence length and packs its own passes, so neither knob exists
+    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision',
+  ),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
 watch(selectedWeights, (weights, previous) => {

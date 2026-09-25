@@ -49,11 +49,15 @@ function servePdfium() {
   }
 }
 
-// The browser tab's icon, taken from the same file the two exes are branded
-// with (assets/paddock.ico, via winresource in each crate's build.rs) rather
-// than a copy in public/. One source of truth: a duplicate would let the
-// desktop icon change while the tab kept the old one, and nobody would notice
-// for months.
+// The .ico the two exes are branded with (assets/paddock.ico, via winresource
+// in each crate's build.rs), served from there rather than copied into
+// public/. It is the tab icon for browsers without SVG favicons and the source
+// of the apple-touch-icon below. The tab itself shows
+// public/img/paddock-favicon.svg, a separate drawing cut for 16 px, so a new
+// mark means redrawing that one too: it will not follow the .ico on its own.
+// index.html gives the .ico sizes="32x32" on purpose. With its full size list
+// Chrome fetches both icons and may keep the .ico; with one size it takes the
+// SVG and never asks for the .ico.
 //
 // Until this existed the Studio had no favicon at all, which was worse than it
 // sounds - the manager falls unmatched paths back to the SPA shell, so

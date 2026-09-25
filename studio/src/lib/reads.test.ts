@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import {
+  answerNames,
   choiceBars,
   cleanId,
   confidenceBin,
   curlFor,
   deriveId,
+  dropReferences,
   duplicateQuestion,
   entropyWord,
+  followRename,
   fromWire,
+  imageRef,
+  keptImages,
   nearTie,
   newQuestion,
   noulBars,
@@ -18,8 +23,11 @@ import {
   scorePosition,
   toWire,
   validate,
+  thoughtsOf,
   type ReadAnswerChoice,
   type ReadAnswerScore,
+  type ReadResponse,
+  type ReadRun,
 } from './reads'
 
 function choice(id: string, names: string[]): ReturnType<typeof newQuestion> {
@@ -71,7 +79,7 @@ describe('validate', () => {
   })
   it('caps the set at the advertised maximum', () => {
     const qs = Array.from({ length: 3 }, (_, i) => choice(`q${i}`, ['x', 'y']))
-    const v = validate(qs, { canvasWidth: 256, maxQuestions: 2, maxSamples: 32, types: [] })
+    const v = validate(qs, { canvasWidth: 256, maxQuestions: 2, maxSamples: 32, maxSteps: 1, images: false, conditional: false, think: false, types: [] })
     expect(v.set[0]).toMatch(/up to 2 per call/)
     expect(validate([]).set[0]).toMatch(/at least one/)
   })
@@ -212,5 +220,134 @@ describe('error routing', () => {
     })
     expect(routeError('questions: 70 given, at most 64 per request')).toEqual({ where: 'questions' })
     expect(routeError('no chat model is loaded')).toEqual({ where: 'page' })
+  })
+})
+
+describe('conditions', () => {
+  function staged() {
+    const kind = choice('kind', ['bug', 'question'])
+    const severity = newQuestion('score')
+    severity.id = 'severity'
+    severity.instructions = 'How severe?'
+    severity.levels = ['minor', 'major', 'critical']
+    severity.askIf = [{ key: kind.key, values: ['bug'] }]
+    const page = newQuestion('noul')
+    page.id = 'page_oncall'
+    page.instructions = 'Page on-call?'
+    page.after = [severity.key]
+    page.alone = true
+    return { kind, severity, page, qs: [kind, severity, page] }
+  }
+
+  it('sends ask_if, depends_on and alone by id, and reads them back by row', () => {
+    const { qs } = staged()
+    const w = toWire(qs)
+    expect(w.severity.ask_if).toEqual({ kind: ['bug'] })
+    expect(w.severity.depends_on).toBeUndefined()
+    expect(w.page_oncall.depends_on).toEqual(['severity'])
+    expect(w.page_oncall.alone).toBe(true)
+    expect(w.kind.ask_if).toBeUndefined()
+    const back = fromWire({ questions: w })
+    expect(back.errors).toEqual([])
+    const [k, sv, pg] = back.questions
+    expect(sv.askIf).toEqual([{ key: k.key, values: ['bug'] }])
+    expect(pg.after).toEqual([sv.key])
+    expect(pg.alone).toBe(true)
+    expect(toWire(back.questions)).toEqual(w)
+  })
+
+  it('resolves a condition on a question written after it, and drops one on no question', () => {
+    const p = fromWire({
+      questions: {
+        a: { type: 'noul', instructions: 'A?', ask_if: { b: ['yes'] }, depends_on: ['b', 'nope'] },
+        b: { type: 'noul', instructions: 'B?' },
+      },
+    })
+    const [a, b] = p.questions
+    expect(a.askIf).toEqual([{ key: b.key, values: ['yes'] }])
+    // ask_if's question is not repeated in `after`
+    expect(a.after).toEqual([])
+    expect(p.errors).toEqual(['a: its condition names "nope", which is not a question here.'])
+  })
+
+  it('refuses answers a question cannot give, empty picks, loops, and a model without conditions', () => {
+    const { kind, severity, page, qs } = staged()
+    expect(validate(qs).ok).toBe(true)
+    severity.askIf = [{ key: kind.key, values: ['feature'] }]
+    expect(validate(qs).rows[severity.key]).toBe('"kind" cannot answer "feature".')
+    severity.askIf = [{ key: kind.key, values: [] }]
+    expect(validate(qs).rows[severity.key]).toMatch(/Pick the answers of "kind"/)
+    severity.askIf = [{ key: page.key, values: ['yes'] }]
+    expect(validate(qs).set).toContain('These questions wait on each other: severity, page_oncall.')
+    severity.askIf = []
+    const old = { canvasWidth: 256, maxQuestions: 64, maxSamples: 32, maxSteps: 1, images: false, conditional: false, think: false, types: [] }
+    expect(validate(qs, old).set[0]).toMatch(/conditions need a newer runner/)
+  })
+
+  it('follows an option renamed in place, and forgets a removed question', () => {
+    const { kind, severity, page, qs } = staged()
+    const before = answerNames(kind)
+    kind.options[0].name = 'defect'
+    followRename(qs, kind.key, before, answerNames(kind))
+    expect(severity.askIf[0].values).toEqual(['defect'])
+    expect(answerNames(page)).toEqual(['yes', 'no'])
+    qs.splice(1, 1)
+    dropReferences(qs, severity.key)
+    expect(page.after).toEqual([])
+  })
+
+  it('copies conditions when a row is duplicated, without sharing them', () => {
+    const { severity, qs } = staged()
+    const copy = duplicateQuestion(severity, qs.map((q) => q.id))
+    copy.askIf[0].values.push('question')
+    expect(severity.askIf[0].values).toEqual(['bug'])
+  })
+})
+
+describe('read settings and pictures', () => {
+  it('sends steps, think and images only when they are set', () => {
+    const q = choice('topic', ['a', 'b'])
+    expect(requestBody('t', [q], 'auto', { steps: 1, think: 0, images: [] })).toEqual({
+      state: 't',
+      questions: toWire([q]),
+    })
+    const b = requestBody('t', [q], 2, { steps: 4, think: 256, images: ['data:image/png;base64,AA=='] })
+    expect(b.steps).toBe(4)
+    expect(b.think).toBe(256)
+    expect(b.images).toEqual(['data:image/png;base64,AA=='])
+    const p = fromWire(JSON.parse(JSON.stringify(b)))
+    expect(p.steps).toBe(4)
+    expect(p.think).toBe(256)
+  })
+
+  it('writes the multipart curl with the files named, never the base64', () => {
+    const q = choice('topic', ['a', 'b'])
+    const b = requestBody('t', [q], 'auto', { images: ['data:image/png;base64,QUFBQQ=='] })
+    const c = curlFor(8080, b, ['my "photo";1.png'])
+    expect(c).not.toContain('QUFBQQ')
+    expect(c).toContain('-F "request=<request.json;type=application/json"')
+    expect(c).toContain('-F "image=@my _photo__1.png"')
+    expect(c.trimEnd().endsWith('\\')).toBe(false)
+  })
+
+  it('keys a picture by its bytes and keeps only the pictures a run still uses', () => {
+    const a = 'data:image/png;base64,AAAA'
+    const b = 'data:image/png;base64,BBBB'
+    expect(imageRef(a)).toBe(imageRef(a))
+    expect(imageRef(a)).not.toBe(imageRef(b))
+    const run = (refs: string[]): ReadRun =>
+      ({ images: refs.map((ref) => ({ name: 'x.png', ref })) }) as unknown as ReadRun
+    const ra = imageRef(a)
+    const rb = imageRef(b)
+    expect(keptImages([run([ra])], { [rb]: b }, { [ra]: a })).toEqual({ [ra]: a })
+    expect(keptImages([run([])], { [ra]: a }, {})).toBeUndefined()
+  })
+
+  it('lists a response\'s thoughts, one or many', () => {
+    const r = (thought: unknown) => ({ diagnostics: { thought } }) as unknown as ReadResponse
+    const t = { text: 'x', tokens: 1, closed: true, ms: 1 }
+    expect(thoughtsOf(r(null))).toEqual([])
+    expect(thoughtsOf(r(t))).toEqual([t])
+    expect(thoughtsOf(r([t, t]))).toHaveLength(2)
   })
 })

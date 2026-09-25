@@ -25,7 +25,9 @@ let package = Package(
   targets: [
     .target(name: "PaddockClient"),
     // Native state/transport only. No UI framework, JavaScript engine or viewer.
-    .target(name: "PaddockConversationCore", dependencies: ["PaddockClient"]),
+    .target(
+      name: "PaddockConversationCore", dependencies: ["PaddockClient"],
+      resources: [.process("Resources")]),
     .target(name: "PaddockDesign", resources: [.process("Resources")]),
     .target(name: "PaddockWebAssets"),
     .target(name: "PaddockRendererHost", dependencies: ["PaddockWebAssets"]),

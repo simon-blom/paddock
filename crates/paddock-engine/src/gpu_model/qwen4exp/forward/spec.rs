@@ -262,105 +262,12 @@ impl Qwen4ExpGpu {
         reqs: &[(usize, usize, Vec<u32>)],
         plans: Option<&[crate::sampler::DevicePlan]>,
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
-        if reqs.is_empty() {
-            return Ok(None);
-        }
-        let total: usize = reqs.iter().map(|r| r.2.len()).sum();
-        let mut seen = vec![false; self.slots];
-        for (slot, pos, chunk) in reqs {
-            let (slot, pos) = (*slot, *pos);
-            if slot >= self.slots || seen[slot] {
-                return Err(GpuModelError::Unsupported(format!(
-                    "verify: slot {slot} out of range or repeated"
-                )));
-            }
-            seen[slot] = true;
-            if pos == 0 || self.pos[slot] != pos || self.stream[slot].len() != pos + 2 {
-                return Err(GpuModelError::Unsupported(format!(
-                    "verify: slot {slot}: scheduler says position {pos}, model is at {} \
-                     (stream {})",
-                    self.pos[slot],
-                    self.stream[slot].len()
-                )));
-            }
-            if chunk.is_empty()
-                || chunk.len() > VERIFY_MAX_CHUNK
-                || pos + chunk.len() > self.max_tokens
-            {
-                return Ok(None);
-            }
-        }
-        // Plans preflight, before the state copies: one plan per verify row in
-        // request order (the service's flat layout), and every mode this round
-        // will spell has to have a kernel in the loaded pack. A pack without
-        // the truncation samplers is a decline, not an error - the round falls
-        // back to the dense tick and the serve keeps going.
-        if let Some(plans) = plans {
-            if plans.len() != total {
-                return Err(GpuModelError::Unsupported(format!(
-                    "verify: {} plans for {total} verify rows",
-                    plans.len()
-                )));
-            }
-            if !self.exec.has_sample_rows() {
-                return Ok(None);
-            }
-            let mut trunc = false;
-            for p in plans {
-                match p {
-                    crate::sampler::DevicePlan::Greedy
-                    | crate::sampler::DevicePlan::Categorical { .. } => {}
-                    crate::sampler::DevicePlan::TruncCat { .. } => trunc = true,
-                    // see the doc comment: mode-0 rows would keep whatever the
-                    // pick plane held
-                    crate::sampler::DevicePlan::RsVerify { .. }
-                    | crate::sampler::DevicePlan::RsTrunc { .. } => return Ok(None),
-                }
-            }
-            if trunc && !(self.exec.has_sample_rows_t() && self.exec.has_sample_rows_p()) {
-                return Ok(None);
-            }
-        }
-        if self.verify.is_none() {
-            let v = Verify::new(&self.exec, &self.cfg, self.slots, self.max_tokens)?;
-            self.verify = Some(Box::new(v));
-        }
-        if total > self.verify.as_ref().expect("built").rows_cap {
-            return Ok(None);
-        }
         let timing = std::env::var_os("PADDOCK_Q38FN_TIMING").is_some();
         let t0 = std::time::Instant::now();
-        for (slot, _, _) in reqs {
-            self.verify_save(*slot)?;
-        }
-        if timing {
-            self.exec.synchronize()?;
-        }
-        let d_save = t0.elapsed();
-        let mut runs = Vec::with_capacity(reqs.len());
-        let mut ids = Vec::with_capacity(total);
-        for (slot, pos, chunk) in reqs {
-            self.stream[*slot].extend(chunk.iter().map(|&t| t as i64));
-            runs.push(Run {
-                slot: *slot,
-                off: ids.len(),
-                len: chunk.len(),
-                row0: *pos,
-            });
-            ids.extend_from_slice(chunk);
-        }
-        self.cur_slots = runs
-            .iter()
-            .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
-            .collect();
-        self.stage_inputs_runs_ids(&ids, &runs, 0)?;
-        self.cur_runs = runs.clone();
-        self.walk_qsa = self.qsa_for_runs(&runs);
-        self.verify.as_mut().expect("built").active = true;
-        let walked = self.device_walk(total, Phase::PrefillRuns);
-        self.verify.as_mut().expect("built").active = false;
-        self.cur_runs.clear();
-        walked?;
+        let Some(runs) = self.verify_walk(reqs, plans)? else {
+            return Ok(None);
+        };
+        let total: usize = runs.iter().map(|r| r.len).sum();
         let picks: Vec<u32> = {
             let Self {
                 exec, verify, cfg, ..
@@ -439,34 +346,212 @@ impl Qwen4ExpGpu {
                 .map_err(crate::gpu::from_driver)?
         };
         let d_walk = t0.elapsed();
-        let mut committed = 0usize;
-        for (r, (slot, pos, chunk)) in runs.iter().zip(reqs) {
-            // the service's accept walk, re-derived so the state commit can
-            // never disagree with the tokens it streams
-            let mut a = 0usize;
-            while a + 1 < chunk.len() && chunk[a + 1] == picks[r.off + a] {
-                a += 1;
-            }
-            let c = a + 1;
-            self.mtp_note_verify(*slot, r.off, *pos, c)?;
-            if c < chunk.len() {
-                self.verify_rollback(*slot, r.off, *pos, c, chunk.len())?;
-            }
-            self.pos[*slot] = pos + c;
-            committed += c;
-        }
+        // the service's accept walk, re-derived so the state commit can never
+        // disagree with the tokens it streams
+        let counts: Vec<usize> = runs
+            .iter()
+            .zip(reqs)
+            .map(|(r, (_, _, chunk))| {
+                let mut a = 0usize;
+                while a + 1 < chunk.len() && chunk[a + 1] == picks[r.off + a] {
+                    a += 1;
+                }
+                a + 1
+            })
+            .collect();
+        self.verify_commit(&runs, &counts)?;
         if timing {
             self.exec.synchronize()?;
-            let d_commit = t0.elapsed();
             eprintln!(
-                "[spec-verify] rows {total} committed {committed} | save {:7.2} ms walk+picks {:7.2} ms commit {:7.2} ms",
-                d_save.as_secs_f64() * 1e3,
-                (d_walk - d_save).as_secs_f64() * 1e3,
-                (d_commit - d_walk).as_secs_f64() * 1e3
+                "[spec-verify] rows {total} committed {} | walk+picks {:7.2} ms commit {:7.2} ms",
+                counts.iter().sum::<usize>(),
+                d_walk.as_secs_f64() * 1e3,
+                (t0.elapsed() - d_walk).as_secs_f64() * 1e3
             );
         }
-        self.mtp_flush()?;
         Ok(Some(picks))
+    }
+
+    /// The HOST-SAMPLED verify round, phase 1 (`Generator::forward_spec_verify`):
+    /// the same walk, then the raw row logits ([rows, vocab], request order)
+    /// for the service to sample - each row through the slot's own sampler
+    /// and, for a constrained slot, through its grammar machine. That is the
+    /// round every tool-carrying request speculates through (a constraint
+    /// keeps a slot out of the greedy and device rounds, whose acceptance
+    /// resolves where no machine can sit); without it every one of them
+    /// declined here into the service's cooldown and decoded dense - Claude
+    /// Code's requests all carry tools (measured on its replayed requests:
+    /// the MTP head bought 25.1 vs 25.0 tok/s). The round stays open until
+    /// [`Self::verify_close`] commits what the service accepted.
+    pub(super) fn verify_open(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, GpuModelError> {
+        if self.spec_open.take().is_some() {
+            // the service closes every round it opens; one left open means
+            // its commit never came - refuse rather than walk on top of it
+            return Err(GpuModelError::Unsupported(
+                "verify: the previous sampled round was never committed".into(),
+            ));
+        }
+        let Some(runs) = self.verify_walk(reqs, None)? else {
+            return Ok(None);
+        };
+        let total: usize = runs.iter().map(|r| r.len).sum();
+        let logits = self.exec.to_host_len(
+            &self.verify.as_ref().expect("built").logits,
+            total * self.cfg.vocab,
+        )?;
+        self.spec_open = Some(runs);
+        static ENGAGED: std::sync::Once = std::sync::Once::new();
+        ENGAGED.call_once(|| {
+            eprintln!("[q4x-spec-sampled] host-sampled verify engaged: {total} rows");
+        });
+        Ok(Some(logits))
+    }
+
+    /// The host-sampled round, phase 2 (`Generator::spec_commit`): commit
+    /// `committed[i]` rows of request i of the open round - the accepted
+    /// drafts plus the row whose sample replaced the first mismatch.
+    pub(super) fn verify_close(&mut self, committed: &[u32]) -> Result<(), GpuModelError> {
+        let runs = self.spec_open.take().ok_or_else(|| {
+            GpuModelError::Unsupported("spec_commit without an open verify round".into())
+        })?;
+        if committed.len() != runs.len() {
+            return Err(GpuModelError::Unsupported(format!(
+                "spec_commit: {} counts for {} requests",
+                committed.len(),
+                runs.len()
+            )));
+        }
+        let counts: Vec<usize> = committed.iter().map(|&c| c as usize).collect();
+        for (r, &c) in runs.iter().zip(&counts) {
+            if c == 0 || c > r.len {
+                return Err(GpuModelError::Unsupported(format!(
+                    "spec_commit: slot {} commits {c} of {} rows",
+                    r.slot, r.len
+                )));
+            }
+        }
+        self.verify_commit(&runs, &counts)
+    }
+
+    /// Preflight, save the slots' carried state, and walk the ragged chunks
+    /// as one `PrefillRuns` walk that captures each row's logits and the GDN
+    /// inputs a rollback replays. `Ok(None)` declines (nothing touched).
+    fn verify_walk(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: Option<&[crate::sampler::DevicePlan]>,
+    ) -> Result<Option<Vec<Run>>, GpuModelError> {
+        if reqs.is_empty() {
+            return Ok(None);
+        }
+        let total: usize = reqs.iter().map(|r| r.2.len()).sum();
+        let mut seen = vec![false; self.slots];
+        for (slot, pos, chunk) in reqs {
+            let (slot, pos) = (*slot, *pos);
+            if slot >= self.slots || seen[slot] {
+                return Err(GpuModelError::Unsupported(format!(
+                    "verify: slot {slot} out of range or repeated"
+                )));
+            }
+            seen[slot] = true;
+            if pos == 0 || self.pos[slot] != pos || self.stream[slot].len() != pos + 2 {
+                return Err(GpuModelError::Unsupported(format!(
+                    "verify: slot {slot}: scheduler says position {pos}, model is at {} \
+                     (stream {})",
+                    self.pos[slot],
+                    self.stream[slot].len()
+                )));
+            }
+            if chunk.is_empty()
+                || chunk.len() > VERIFY_MAX_CHUNK
+                || pos + chunk.len() > self.max_tokens
+            {
+                return Ok(None);
+            }
+        }
+        // Plans preflight, before the state copies: one plan per verify row in
+        // request order (the service's flat layout), and every mode this round
+        // will spell has to have a kernel in the loaded pack. A pack without
+        // the truncation samplers is a decline, not an error - the round falls
+        // back to the dense tick and the serve keeps going.
+        if let Some(plans) = plans {
+            if plans.len() != total {
+                return Err(GpuModelError::Unsupported(format!(
+                    "verify: {} plans for {total} verify rows",
+                    plans.len()
+                )));
+            }
+            if !self.exec.has_sample_rows() {
+                return Ok(None);
+            }
+            let mut trunc = false;
+            for p in plans {
+                match p {
+                    crate::sampler::DevicePlan::Greedy
+                    | crate::sampler::DevicePlan::Categorical { .. } => {}
+                    crate::sampler::DevicePlan::TruncCat { .. } => trunc = true,
+                    // see the doc comment: mode-0 rows would keep whatever the
+                    // pick plane held
+                    crate::sampler::DevicePlan::RsVerify { .. }
+                    | crate::sampler::DevicePlan::RsTrunc { .. } => return Ok(None),
+                }
+            }
+            if trunc && !(self.exec.has_sample_rows_t() && self.exec.has_sample_rows_p()) {
+                return Ok(None);
+            }
+        }
+        if self.verify.is_none() {
+            let v = Verify::new(&self.exec, &self.cfg, self.slots, self.max_tokens)?;
+            self.verify = Some(Box::new(v));
+        }
+        if total > self.verify.as_ref().expect("built").rows_cap {
+            return Ok(None);
+        }
+        for (slot, _, _) in reqs {
+            self.verify_save(*slot)?;
+        }
+        let mut runs = Vec::with_capacity(reqs.len());
+        let mut ids = Vec::with_capacity(total);
+        for (slot, pos, chunk) in reqs {
+            self.stream[*slot].extend(chunk.iter().map(|&t| t as i64));
+            runs.push(Run {
+                slot: *slot,
+                off: ids.len(),
+                len: chunk.len(),
+                row0: *pos,
+            });
+            ids.extend_from_slice(chunk);
+        }
+        self.cur_slots = runs
+            .iter()
+            .flat_map(|r| std::iter::repeat_n(r.slot, r.len))
+            .collect();
+        self.stage_inputs_runs_ids(&ids, &runs, 0)?;
+        self.cur_runs = runs.clone();
+        self.walk_qsa = self.qsa_for_runs(&runs);
+        self.verify.as_mut().expect("built").active = true;
+        let walked = self.device_walk(total, Phase::PrefillRuns);
+        self.verify.as_mut().expect("built").active = false;
+        self.cur_runs.clear();
+        walked?;
+        Ok(Some(runs))
+    }
+
+    /// Commit `counts[i]` rows of verify run i: the drafter catches up on
+    /// them, and a run that did not keep every row rolls its carried state
+    /// back to the state after them.
+    fn verify_commit(&mut self, runs: &[Run], counts: &[usize]) -> Result<(), GpuModelError> {
+        for (r, &c) in runs.iter().zip(counts) {
+            self.mtp_note_verify(r.slot, r.off, r.row0, c)?;
+            if c < r.len {
+                self.verify_rollback(r.slot, r.off, r.row0, c, r.len)?;
+            }
+            self.pos[r.slot] = r.row0 + c;
+        }
+        self.mtp_flush()
     }
 
     /// Copy `slot`'s carried state before a verify walk moves it.

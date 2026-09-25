@@ -1,6 +1,123 @@
 use super::*;
 
 #[test]
+#[ignore = "requires DiffusionGemma MLX and PADDOCK_DG_VISION_DIR"]
+fn diffusion_vision_reference_capture() {
+    use std::io::Write;
+    let path = std::env::var("PADDOCK_DG_MODEL").unwrap();
+    let out = std::env::var("PADDOCK_DG_VISION_DIR").unwrap();
+    let source = super::super::mlx::Source::open(Path::new(&path)).unwrap();
+    let device = MetalDevice::new(None).unwrap();
+    let vision = Vision::load_mlx_at(&device, &source, "model.encoder.", 2816).unwrap();
+    for (case, (w, h)) in [(96, 96), (511, 317), (1920, 1080)].into_iter().enumerate() {
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                rgb.extend([
+                    (x * 17 + y * 3) as u8,
+                    (x * 5 + y * 11) as u8,
+                    (x ^ y) as u8,
+                ]);
+            }
+        }
+        let started = std::time::Instant::now();
+        let mut job = vision.start(&device, &[(&rgb, w, h)]).unwrap();
+        let capture = |stage: usize, job: &Job| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(Path::new(&out).join(format!("vision-{case}-layer-{stage}.f32")))
+                .unwrap();
+            let bytes: Vec<_> = unsafe { job.x.read_f32(0, job.rows * E) }
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            file.write_all(&bytes).unwrap();
+        };
+        capture(0, &job);
+        let output = loop {
+            if let Some(outputs) = vision
+                .step(&device, &mut job, Duration::from_millis(10))
+                .unwrap()
+            {
+                capture(27, &job);
+                break outputs;
+            }
+            if job.layer == 1 {
+                capture(1, &job);
+                for (name, buffer) in [("qh", &job.qh), ("kh", &job.kh), ("vh", &job.vh)] {
+                    // SAFETY: the layer submission is complete. Two BF16
+                    // values share each word in the padded head buffer.
+                    let words = unsafe { buffer.read_u32(job.rows * 16 * 80 / 2) };
+                    let bytes: Vec<_> = words
+                        .iter()
+                        .flat_map(|v| [f32::from_bits(v << 16), f32::from_bits(v & 0xffff0000)])
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(Path::new(&out).join(format!("vision-{case}-{name}.f32")))
+                        .unwrap();
+                    file.write_all(&bytes).unwrap();
+                }
+                for (name, buffer, count) in [
+                    ("q", &job.q, job.rows * E),
+                    ("attn", &job.attn, job.rows * E),
+                    ("gate", &job.gate, job.rows * F),
+                    ("down", &job.delta, job.rows * E),
+                ] {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(Path::new(&out).join(format!("vision-{case}-{name}.f32")))
+                        .unwrap();
+                    let bytes: Vec<_> = unsafe { buffer.read_f32(0, count) }
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    file.write_all(&bytes).unwrap();
+                }
+            }
+        };
+        let values = unsafe { output[0].embd.read_f32(0, output[0].tokens * 2816) };
+        assert!(values.iter().all(|v| v.is_finite()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(Path::new(&out).join(format!("vision-{case}.f32")))
+            .unwrap();
+        let bytes: Vec<_> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        file.write_all(&bytes).unwrap();
+        eprintln!(
+            "DG_VISION case={case} rows={} gpu_ms={} wall_ms={}",
+            output[0].tokens,
+            job.gpu_seconds * 1000.,
+            started.elapsed().as_secs_f64() * 1000.
+        );
+        let mut warm = Vec::new();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let mut job = vision.start(&device, &[(&rgb, w, h)]).unwrap();
+            while vision
+                .step(&device, &mut job, Duration::from_millis(10))
+                .unwrap()
+                .is_none()
+            {}
+            warm.push(serde_json::json!({"gpu_ms":job.gpu_seconds * 1000., "wall_ms":started.elapsed().as_secs_f64() * 1000.}));
+        }
+        let report = serde_json::json!({"case":case,"warm":warm});
+        eprintln!("DG_VISION_WARM {report}");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(Path::new(&out).join(format!("native-{case}.json")))
+            .unwrap();
+        serde_json::to_writer_pretty(&mut file, &report).unwrap();
+    }
+}
+
+#[test]
 fn gemma_vision_channel_metadata_is_fail_closed() {
     assert!(channels(Some(&Value::Array(vec![Value::F32(0.); 3])), 0.));
     assert!(channels(Some(&Value::Array(vec![Value::F32(1.); 3])), 1.));

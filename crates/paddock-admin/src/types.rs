@@ -46,6 +46,13 @@ pub struct Identify {
     /// the wire so an older runner still identifies.
     #[serde(default)]
     pub image: Option<String>,
+    /// Served decision model id (Laya: typed questions in, calibrated answers
+    /// out, `/v1/systemone` and nothing else), if one is loaded. The sixth
+    /// serving role, for the reason the others are separate: a reader
+    /// refuses chat, so a picker that took it for a chat model would offer a
+    /// conversation it cannot have. Optional on the wire for older runners.
+    #[serde(default)]
+    pub reader: Option<String>,
     /// Unix seconds when the runner started. Reset DETECTION only (the
     /// `process_start_time_seconds` job) - never an identity key: it is
     /// second-resolution, and two generations on one port inside the same

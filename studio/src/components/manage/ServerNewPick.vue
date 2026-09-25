@@ -37,6 +37,7 @@ onUnmounted(() => release?.())
 // subtitle (loud attribution).
 const BRANDS: Record<string, { title: string; sub: string }> = {
   Alibaba: { title: 'Qwen', sub: 'by Alibaba' },
+  'ConvAI Innovations': { title: 'Laya', sub: 'by ConvAI Innovations' },
   OpenAI: { title: 'OpenAI', sub: 'GPT-OSS' },
   Google: { title: 'Google', sub: 'Gemma' },
   // The Nordic speech vendors are national-library and research groups rather
@@ -63,6 +64,9 @@ const CAP_META = [
   // Word timing for an existing transcript (the karaoke enrichment) - like
   // transcription, the chip is the whole of what an aligner does.
   { key: 'alignment', icon: 'clock', label: 'Word timing' },
+  // Typed questions about a text in, a calibrated answer each out - the Reads
+  // page's model. It neither chats nor generates, so the chip is all it does.
+  { key: 'decision', icon: 'list-checks', label: 'Decisions' },
   // Aerial photographs in, maps out (what the ground is, how tall the trees
   // are). It reads images but it is no vision chat - it answers with rasters,
   // so it gets its own chip rather than borrowing 'Vision'.
@@ -133,6 +137,8 @@ function sectionOf(m: CatalogModel): string {
   // An aligner cannot chat either - it times the words of a transcript some
   // other model produced, so it files with the speech tools.
   if (m.capability.includes('alignment')) return 'Speech to text'
+  // Answers questions with probabilities, never with text of its own.
+  if (m.capability.includes('decision')) return 'Decisions'
   // Chips in, rasters out - it has no text surface at all, so filing it under
   // 'Chat' would promise the one thing it refuses.
   if (m.capability.includes('segmentation')) return 'Maps from imagery'

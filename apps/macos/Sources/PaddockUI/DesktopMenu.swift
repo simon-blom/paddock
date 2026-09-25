@@ -32,7 +32,8 @@ public struct DesktopMenu: View {
       }
       if active.isEmpty { Text("No running models") }
       ForEach(active) { row in
-        Menu("\(row.title) · \(row.desktopStatus) · :\(String(row.port))") {
+        Menu(row.desktopMenuTitle(in: active)) {
+          Text("Port \(String(row.port))")
           if let runner = row.runner {
             Text(
               "\(runner.inFlight.map { "\($0) active requests" } ?? "Active request count unavailable")"
@@ -76,8 +77,9 @@ public struct DesktopMenu: View {
       }
     }
     Menu("Start Model") {
-      ForEach(workspace.desktopRows.filter(\.canQuickStart)) { row in
-        Button("\(row.title) · :\(String(row.port))") {
+      let stopped = workspace.desktopRows.filter(\.canQuickStart)
+      ForEach(stopped) { row in
+        Button(row.desktopMenuTitle(in: stopped)) {
           guard let revision = row.configured?.revision else { return }
           Task {
             if !((await workspace.submit(.start(port: row.port, revision: revision)))) {
@@ -103,6 +105,14 @@ public struct DesktopMenu: View {
 
 extension EndpointRow {
   var desktopStatus: String { status == "Running" ? "Ready" : status }
+  func desktopMenuTitle(in rows: [EndpointRow]) -> String {
+    let duplicate = rows.contains {
+      $0.port != port && $0.title.localizedCaseInsensitiveCompare(title) == .orderedSame
+    }
+    let name = duplicate ? "\(title) (Port \(String(port)))" : title
+    // Keep failures/transitions visible, without appending "Ready" to every model.
+    return ["Ready", "Stopped"].contains(desktopStatus) ? name : "\(name) — \(desktopStatus)"
+  }
   var canQuickStart: Bool {
     runner == nil && configured?.running == false && configured?.localOnly == true
       && configured?.revision != nil && job?.isActive != true

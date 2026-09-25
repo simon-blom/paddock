@@ -49,7 +49,7 @@ inline float vis_gelu(float x) {
 // Producer-side epilogues: 0 raw F32; 1 +bias F32; 2 (+bias)+residual
 // F32; 3 bias+GELU in the activation type. Ragged N/K are dynamic tensor
 // extents, never a static slice that can read the following matrix row.
-template<uint BM,typename T,typename X,bool Relaxed=false>
+template<uint BM,typename T,typename X,bool Relaxed=false,bool BF16Output=false>
 inline void vis_project(device T* w,device X* x,device uint* out,
                         device const float* bias,constant uint* p,uint2 g) {
     uint K=p[0],N=p[1],M=p[2],m=g.y*BM,n=g.x*64;
@@ -67,7 +67,7 @@ inline void vis_project(device T* w,device X* x,device uint* out,
             if(p[3]==3)reinterpret_cast<device X*>(out)[ix]=X(vis_gelu(v));
             else {
                 if(p[3]==2)v+=reinterpret_cast<device float*>(out)[ix];
-                reinterpret_cast<device float*>(out)[ix]=v;
+                reinterpret_cast<device float*>(out)[ix]=BF16Output?float(bfloat(v)):v;
             }
         }
     }
@@ -277,8 +277,11 @@ inline void vis_attention_impl(device T* q,device T* k,device T* v,device ushort
         if(it.is_valid_element() && ij[0]<HD && ij[1]<count) {
             ulong ix=(ulong(t.x+first+ij[1])*Heads+head)*HD+ij[0];
             float value=*it/normalizer[first+ij[1]];
+            // MLX vision retains F32 scratch storage, but its SDPA result
+            // crosses a BF16 operation boundary before the output projection.
+            if(p[0]==31)value=float(bfloat(value));
             if(p[0]==30)reinterpret_cast<device bfloat*>(out)[ix]=bfloat(value);
-            else if(p[0]==0)reinterpret_cast<device float*>(out)[ix]=value;
+            else if(p[0]==0 || p[0]==31)reinterpret_cast<device float*>(out)[ix]=value;
             else reinterpret_cast<device half*>(out)[ix]=half(value);
         }
     }

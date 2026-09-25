@@ -612,8 +612,12 @@ kv_default = "fp8_e4m3"
 # `diffusion-gemma`), plus the self-conditioning MLP and a transposed
 # embedding the lane holds resident. Google ships no GGUF; unsloth's is the
 # only one, and the engine was gated on it (2026-09-23, A6000: a sentence in
-# 11 steps / 4.2 s; the yes/no structured read at 80 % label mass). Text
-# only: the tower is Gemma 4's class but no mmproj ships for this file.
+# 11 steps / 4.2 s; the yes/no structured read at 80 % label mass). Vision:
+# no quantizer ships a tower for it, and Gemma 4 26B's is not a stand-in -
+# DiffusionGemma kept Gemma 4's vision encoder layers but retrained the patch
+# embedder, the position table and the projection. Its own mmproj is built
+# from the official checkpoint (353 of 356 tensors are Gemma 4's, byte for
+# byte). Both CUDA and Metal use this companion; MLX embeds its own tower.
 # Sampling: the file's own schedule (temperature 0.8 -> 0.4 over the steps,
 # entropy bound 0.1, stop at mean entropy < 0.005) - not a customer knob.
 [[model]]
@@ -621,7 +625,7 @@ id = "diffusiongemma-26b-a4b"
 vendor = "Google"
 display = "DiffusionGemma 26B A4B"
 family = "gemma-4"
-capability = ["chat", "reasoning"]
+capability = ["chat", "vision", "reasoning"]
 license = "apache-2.0"
 revision = "2026-09-23"
 kv_default = "fp8_e4m3"
@@ -641,7 +645,7 @@ kv_default = "fp8_e4m3"
   tradeoffs = [
     "Trails Gemma 4 26B on hard reasoning (MMLU Pro 77.6 vs 82.6, AIME 69 vs 88)",
     "27 GB of weights plus 1.5 GB for the block sampler and ~6 GB of expert working memory",
-    "Text only for now",
+    "GGUF image input takes a 1.2 GB vision companion; MLX includes its tower",
   ]
 
   [[model.artifact]]
@@ -654,7 +658,7 @@ kv_default = "fp8_e4m3"
   # the 26B-A4B MoE scratch (gemma-4-26b-a4b's measured 6.07 GiB at 32
   # slots) plus one canvas' logits plane (256 x 262144 x 4 B)
   workspace = 6338927036
-  runtime = { backends = ["cuda", "metal"], default_spec = "off", backend_overrides = { metal = { default = false, companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 26878831200, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 26878831200, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } } } }
+  runtime = { backends = ["cuda", "metal"], default_spec = "off", backend_overrides = { metal = { default = false, companions = ["vision"], capability = ["chat", "vision", "reasoning"], kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 26878831200, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 4294967296, published_shape = { weight_bytes = 26878831200, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } } } }
 
   [model.artifact.shape]
   # file bytes + the lane's resident planes (E^T bf16 1,476,395,008 B + the
@@ -685,6 +689,9 @@ kv_default = "fp8_e4m3"
     size = 26878831200
 
 
+  # CUDA serves the file on the k-quant W4A8 lane: the body planes stay 4-bit
+  # (a Q5_0 / Q8_0 seat where a 256-block recipe cannot encode the row), the
+  # diffusion lane keeps its resident E^T and self-cond planes, fp8 KV.
   # Metal keeps packed weights. No resident E^T copy, vision or drafter.
   # The conservative Metal shape covers two sliding banks (ring up to 1536),
   # encoder + decoder global KV and the spare sequence. Workspace covers all
@@ -695,8 +702,35 @@ kv_default = "fp8_e4m3"
   format = "gguf"
   label = "Compact"
   quant = "Q4_K_M"
-  runtime = { backends = ["metal"], companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "f16", default_max_ctx = 32768, default_max_batch = 1, default_spec = "off", memory = { weight_bytes = 16806810208, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 16806810208, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } }
+  # the q8 row's envelope: the same activation shapes, and above the 5.68 GB
+  # this file's lane measured at 8K x 4 on an A6000. Like the q8 figure it
+  # holds one canvas' logits plane; each further slot adds ~256 MiB.
+  workspace = 6338927036
+  runtime = { backends = ["cuda", "metal"], default_spec = "off", backend_overrides = { metal = { companions = ["vision"], capability = ["chat", "vision", "reasoning"], kv_cache_dtype = "f16", default_max_batch = 1, memory = { weight_bytes = 16806810208, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 4294967296, published_shape = { weight_bytes = 16806810208, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } } } }
   source = { repo = "unsloth/diffusiongemma-26B-A4B-it-GGUF", revision = "f4183a2c7a354128d02545752303c4354d165bf0", base_model = "google/diffusiongemma-26B-A4B-it", license = "apache-2.0", license_url = "https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/main/LICENSE" }
+
+  [model.artifact.shape]
+  # the lane's resident planes as weights_mem_bytes reports them (4-bit body
+  # 16.41 GiB after repack + E^T bf16 and the self-cond MLP 1.39 GiB),
+  # measured on an A6000 - Metal reads its own shape above
+  weight_bytes = 19101029376
+  kind = "generative"
+  vocab = 262144
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 1024, v_dim = 1024, count = 1 },
+  ]
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
@@ -704,13 +738,31 @@ kv_default = "fp8_e4m3"
     sha256 = "24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a103645353114c8028bc5"
     size = 16806810208
 
+  # built from the official checkpoint's own vision tensors - the Gemma 4
+  # 26B mmproj's layout and hyper-parameters, DiffusionGemma's weights (see
+  # the note above the row); the native Metal lane shares the Gemma tower
+  [[model.artifact]]
+  id = "vision"
+  runtime = { backends = ["cuda", "metal"] }
+  kind = "vision"
+  format = "gguf"
+  label = "Vision (image input)"
+  default = true
+  source = { repo = "google/diffusiongemma-26B-A4B-it", revision = "f7f5b7f5fa82ffc52addd066915886d497f5517b", base_model = "google/diffusiongemma-26B-A4B-it", license = "apache-2.0", license_url = "https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/main/LICENSE" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-mmproj-BF16.gguf"
+    dest = "diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-mmproj-BF16.gguf"
+    sha256 = "0f08531e3bc6cb9175729d5fc5169778aa6ececce3305abdc26d845c862cc3bf"
+    size = 1194828192
+
   [[model.artifact]]
   id = "mlx-4bit"
   kind = "weights"
   format = "safetensors"
   label = "MLX 4-bit"
   quant = "affine-4/8"
-  runtime = { backends = ["metal"], checkpoint_dir = true, companions = [], capability = ["chat", "reasoning"], kv_cache_dtype = "auto", default_max_ctx = 32768, default_max_batch = 1, default_spec = "off", backend_overrides = { metal = { default = true } }, memory = { weight_bytes = 16543055405, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 3221225472, published_shape = { weight_bytes = 16543055405, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } }
+  runtime = { backends = ["metal"], checkpoint_dir = true, embedded_vision = true, companions = [], capability = ["chat", "vision", "reasoning"], kv_cache_dtype = "auto", default_max_ctx = 32768, default_max_batch = 1, default_spec = "off", backend_overrides = { metal = { default = true } }, memory = { weight_bytes = 16543055405, source = "probed", max_ctx = 32768, max_batch = 8, full_paged_kv = false, kv_reserve_sequences = 1, workspace_bytes = 4294967296, published_shape = { weight_bytes = 16543055405, kind = "generative", vocab = 262144, max_ctx = 32768, nextn_bytes = 0, source = "probed", kv_layers = [{ k_dim = 6144, v_dim = 6144, window = 1024, count = 25 }, { k_dim = 2048, v_dim = 2048, count = 5 }] } } }
   source = { repo = "mlx-community/diffusiongemma-26B-A4B-it-4bit", revision = "a7a81407613811e8ba63af92ac0d852b809e191f", base_model = "google/diffusiongemma-26B-A4B-it", license = "apache-2.0", license_url = "https://huggingface.co/google/diffusiongemma-26B-A4B-it/blob/main/LICENSE" }
 
     [[model.artifact.file]]
@@ -5817,6 +5869,161 @@ revision = "2026-08-01"
     dest = "Qwen3-Reranker-8B-GGUF/Qwen3-Reranker-8B.Q8_0.gguf"
     sha256 = "ba16c501a74929b6c9f71033420172c028b85e216f8d03bef1c9a758fbf3f71a"
     size = 8707188736
+
+# ── decision models ──────────────────────────────────────────────────────────
+# Laya (ConvAI Innovations): ModernBERT under a trained head that scores each
+# option of a typed question at its own [MASK] - the open model built for
+# TypeSafe Jev's /v1/systemone. Nothing is generated; one bidirectional pass
+# per question. One bundle, three checkpoints behind the model's own language
+# router: English at the root (ModernBERT-large), multilingual (mmBERT-base,
+# 100+ languages) and typed-decisions (English, fine-tuned on four workflows,
+# chosen only by name). Mirrored unchanged from HF convaiinnovations/laya at
+# commit 55cf4c4ebb4e, the model card with it.
+#
+# A single-pass model: no KV cache, no context window to choose. The shape is
+# the loader's own count (weights of all three checkpoints; the workspace is
+# one pass of 16384 tokens / 512 questions), measured on the A6000 2026-09-25.
+
+[[model]]
+id = "laya"
+vendor = "ConvAI Innovations"
+display = "Laya"
+family = "laya"
+capability = ["decision"]
+license = "apache-2.0"
+revision = "2026-09-25"
+
+  [model.specs]
+  params = "421M + 322M + 421M"
+  context = "512 tokens (English), 1K (multilingual)"
+  homepage = "https://huggingface.co/convaiinnovations/laya"
+  about = "Answers fixed questions about a text - pick one of these, score it on this scale, yes or no - each with a calibrated probability, in milliseconds. It writes nothing: every option is scored in one pass, the same /v1/systemone call Jev clients make."
+  strengths = [
+    "About 4 ms a question on a desktop GPU - no generation, one pass",
+    "Calibrated per question type and option count",
+    "English and 100+ languages - it picks the checkpoint from the text itself",
+  ]
+  tradeoffs = [
+    "Weak on a new task without examples - the base checkpoints trail the majority-class baseline on the vendor's own typed-decisions benchmark",
+    "Reads 512 tokens of English (1K multilingual) per question; longer text is read in windows",
+    "Accuracy falls off past about 20 options; text only",
+  ]
+
+  [[model.artifact]]
+  id = "f16"
+  kind = "weights"
+  format = "safetensors"
+  label = "Official F16 checkpoints (all three)"
+  quant = "F16"
+  default = true
+  workspace = 337865736
+
+  [model.artifact.shape]
+  weight_bytes = 2330884120
+  kind = "encoder"
+  vocab = 256000
+  max_ctx = 1024
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/model.safetensors"
+    dest = "laya/model.safetensors"
+    sha256 = "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c"
+    size = 842609210
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/encoder/config.json"
+    dest = "laya/encoder/config.json"
+    sha256 = "bf3ab80598fdccf414855a2ce80f22859e4492d06ca8a62ddd1cfb63972f8979"
+    size = 2083
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/multilingual/encoder/config.json"
+    dest = "laya/multilingual/encoder/config.json"
+    sha256 = "83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4"
+    size = 1938
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/multilingual/model.safetensors"
+    dest = "laya/multilingual/model.safetensors"
+    sha256 = "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+    size = 643835514
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/multilingual/rl_agent_config.json"
+    dest = "laya/multilingual/rl_agent_config.json"
+    sha256 = "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6"
+    size = 472
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/multilingual/tokenizer/tokenizer.json"
+    dest = "laya/multilingual/tokenizer/tokenizer.json"
+    sha256 = "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f"
+    size = 34363188
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/multilingual/tokenizer/tokenizer_config.json"
+    dest = "laya/multilingual/tokenizer/tokenizer_config.json"
+    sha256 = "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+    size = 524
+
+    # Upstream's own card, licence statement included - the loud-attribution
+    # file, kept in the mirror deliberately.
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/README.md"
+    dest = "laya/README.md"
+    sha256 = "00355613796b3f5860b0d5b20392381d26580ec242e04a1fd150c7f116858602"
+    size = 23187
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/rl_agent_config.json"
+    dest = "laya/rl_agent_config.json"
+    sha256 = "ae287b56bbcf5f8c4f4541ae9dfd00c914c4c48b940b8398c3058af37ba92bbd"
+    size = 745
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/tokenizer/tokenizer.json"
+    dest = "laya/tokenizer/tokenizer.json"
+    sha256 = "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+    size = 3583228
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/tokenizer/tokenizer_config.json"
+    dest = "laya/tokenizer/tokenizer_config.json"
+    sha256 = "50044de60daaa73df97d262e15a40d4faf0160e7d742df64b377877a1320dd12"
+    size = 308
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/typed-decisions/encoder/config.json"
+    dest = "laya/typed-decisions/encoder/config.json"
+    sha256 = "5268d24ad3b77c8151de5dcb0762ba4391619aad9ab0bda33e36fb083cfeae6d"
+    size = 2084
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/typed-decisions/model.safetensors"
+    dest = "laya/typed-decisions/model.safetensors"
+    sha256 = "4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
+    size = 842609220
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/typed-decisions/rl_agent_config.json"
+    dest = "laya/typed-decisions/rl_agent_config.json"
+    sha256 = "ebf0cd524d92342a6be5e48e9fca3d7c2babfb5a56ccd79d2171ef5d8c7f7be8"
+    size = 847
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/typed-decisions/tokenizer/tokenizer.json"
+    dest = "laya/typed-decisions/tokenizer/tokenizer.json"
+    sha256 = "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+    size = 3583228
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/laya/typed-decisions/tokenizer/tokenizer_config.json"
+    dest = "laya/typed-decisions/tokenizer/tokenizer_config.json"
+    sha256 = "08d4cf3ac4dca381759441b85b91a6d40e688471dcd33d15d6649eb0a9a854d1"
+    size = 337
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Speech-to-text. Four ASR models in two shapes, and the shapes

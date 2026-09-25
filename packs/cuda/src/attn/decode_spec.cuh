@@ -1683,15 +1683,17 @@ __global__ void __launch_bounds__(256, 1) pd_attn_spec_fa_lco_kernel(
                 if (j2 >= nrows) continue;
                 const uint32_t h2 = kvh * G + g2;
                 const size_t pb = ((size_t)h2 * rows + (rb + j2)) * n_splits;
+                // the other splits' partials from L2 (abi.cuh,
+                // PD_LAST_BLOCK_FOLD)
                 float gm = sinks[h2];
                 for (uint32_t ss = 0; ss < n_splits; ++ss)
-                    gm = fmaxf(gm, out_ml[(pb + ss) * 2 + 0]);
+                    gm = fmaxf(gm, __ldcg(&out_ml[(pb + ss) * 2 + 0]));
                 float acc2 = 0.0f, l2 = 0.0f;
                 for (uint32_t ss = 0; ss < n_splits; ++ss) {
-                    const float m2 = out_ml[(pb + ss) * 2 + 0];
-                    const float ls2 = out_ml[(pb + ss) * 2 + 1];
+                    const float m2 = __ldcg(&out_ml[(pb + ss) * 2 + 0]);
+                    const float ls2 = __ldcg(&out_ml[(pb + ss) * 2 + 1]);
                     const float sc2 = __expf(m2 - gm);
-                    acc2 += sc2 * out_o[(pb + ss) * head_dim + d2];
+                    acc2 += sc2 * __ldcg(&out_o[(pb + ss) * head_dim + d2]);
                     l2 += sc2 * ls2;
                 }
                 l2 += __expf(sinks[h2] - gm);

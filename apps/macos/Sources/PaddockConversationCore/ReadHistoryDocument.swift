@@ -43,6 +43,8 @@ public struct ReadHistoryDocument: Sendable {
         ConversationValue.object([
           "questions": run["questions"] ?? .object([:]),
           "samples": run["samples"] ?? .string("auto"),
+          "steps": run["steps"] ?? .number(1),
+          "think": run["think"] ?? .number(0),
         ])))
     if let order = run["questionOrder"]?.array {
       let original = result.questions

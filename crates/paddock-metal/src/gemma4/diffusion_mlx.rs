@@ -11,6 +11,7 @@ impl Gemma4 {
         budget: Option<u64>,
     ) -> Result<Self> {
         let cfg = DiffusionConfig::read(path).map_err(MetalError::Model)?;
+        cfg.validate_vision().map_err(MetalError::Model)?;
         if context == 0 || context > cfg.context.min(32768) || !(1..=8).contains(&max_batch) {
             return Err(MetalError::Model(
                 "DiffusionGemma Metal requires context 1..32768 and 1..8 slots".into(),
@@ -33,6 +34,8 @@ impl Gemma4 {
             .bytes()
             .saturating_add(kv_bytes)
             .saturating_add(scratch_bytes)
+            // Bounded four-image encoder wave, casts and cached features.
+            .saturating_add(1 << 30)
             .saturating_add(64 << 20);
         diffusion_residency::admit(required, source.bytes(), budget)?;
         let device = MetalDevice::new_planned(budget, required)?;
@@ -99,7 +102,24 @@ impl Gemma4 {
         let gate = packed("model.decoder.self_conditioning.gate_proj", width, ff)?;
         let up = packed("model.decoder.self_conditioning.up_proj", width, ff)?;
         let down = packed("model.decoder.self_conditioning.down_proj", ff, width)?;
-        source.finish_diffusion_text()?;
+        let vision = vision::Vision::load_mlx_at(&device, &source, "model.encoder.", width)?;
+        source.finish()?;
+        let tokenizer: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join("tokenizer.json"))
+                .map_err(|e| MetalError::Model(e.to_string()))?,
+        )
+        .map_err(|e| MetalError::Model(e.to_string()))?;
+        let marker = |text: &str| {
+            tokenizer["added_tokens"]
+                .as_array()
+                .and_then(|a| a.iter().find(|v| v["content"] == text))
+                .and_then(|v| v["id"].as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| (n as usize) < vocab)
+        };
+        let image_markers = Some(marker("<|image>").zip(marker("<image|>")).ok_or_else(|| {
+            MetalError::Model("DiffusionGemma tokenizer lacks image markers".into())
+        })?);
         let weight_bytes = device.allocated_bytes() - kv_bytes;
         let lane = diffusion::Lane::new(&device, max_batch, pre, gate, up, down)?;
         let a = |n| device.alloc(CHUNK * n * 4);
@@ -147,8 +167,8 @@ impl Gemma4 {
             moe_scratch,
             mtp: None,
             dflash: None,
-            vision: None,
-            image_markers: None,
+            vision: Some(tower::Tower::Gemma(Box::new(vision))),
+            image_markers,
             image_cache: Vec::new(),
             image_cache_reused: 0,
             encoding: VecDeque::new(),

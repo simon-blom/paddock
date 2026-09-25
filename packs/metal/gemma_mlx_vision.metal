@@ -1,6 +1,12 @@
 // Native MLX vision boundaries. Spatial transforms run on the GPU from RGB
 // bytes; the host computes only bounded integer image/window descriptors.
 // Keep text/vision storage compressed and share the ragged attention engine.
+// Vision inputs already carry BF16-rounded values in the shared F32 scratch.
+// Direct tensor loads avoid staging every K tile through threadgroup memory;
+// the producer still preserves the MLX BF16 projection boundary.
+kernel void gmlx_vmm64(device bfloat* w [[buffer(0)]],device float* x [[buffer(1)]],
+    device uint* out [[buffer(2)]],device const float* bias [[buffer(3)]],constant uint* p [[buffer(4)]],
+    uint2 g [[threadgroup_position_in_grid]]) {vis_project<64,bfloat,float,true,true>(w,x,out,bias,p,g);}
 inline float gmlx_erf_activation(float x) {
     // Same original Hastings polynomial as mv_gelu_value, but preserve the
     // checkpoint graph's BF16 division, erf, add, multiply and division.

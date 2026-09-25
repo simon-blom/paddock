@@ -16,6 +16,18 @@ export interface PreferenceAPI {
   importMissing(patch: Record<string, unknown>): Promise<Record<string, unknown>>
   save(patch: Record<string, unknown>): Promise<void>
 }
+/** A preferences request the manager answered with an error status. */
+export class PreferencesHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'PreferencesHttpError'
+  }
+}
+/** The manager wants the API key: a browser on another machine that has
+ *  not unlocked yet. That is a login to show, not saved data that failed. */
+export function isKeyRequired(e: unknown): boolean {
+  return e instanceof PreferencesHttpError && e.status === 401
+}
 async function request(path: string, patch?: Record<string, unknown>) {
   const body = patch === undefined ? undefined : JSON.stringify(patch)
   const response = await fetch(path, patch === undefined ? { cache: 'no-store' } : {
@@ -24,7 +36,12 @@ async function request(path: string, patch?: Record<string, unknown>) {
     // browser's keepalive quota is 64 KiB; larger viewer lists use normal HTTP.
     keepalive: new TextEncoder().encode(body).length < 60 * 1024,
   })
-  if (!response.ok) throw new Error(`Preferences could not be ${patch ? 'saved' : 'opened'} (HTTP ${response.status})`)
+  if (!response.ok) {
+    throw new PreferencesHttpError(
+      `Preferences could not be ${patch ? 'saved' : 'opened'} (HTTP ${response.status})`,
+      response.status,
+    )
+  }
   return await response.json() as Record<string, unknown>
 }
 const api: PreferenceAPI = {

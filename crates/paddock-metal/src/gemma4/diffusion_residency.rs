@@ -2,6 +2,9 @@
 use super::*;
 
 impl Gemma4 {
+    pub fn diffusion_vision_budget() -> paddock_engine::generator::VisionBudget {
+        vision::BUDGET
+    }
     pub fn diffusion_residency_bytes(path: &Path, context: usize, slots: usize) -> Result<u64> {
         if !(1..=32768).contains(&context) || !(1..=8).contains(&slots) {
             return Err(MetalError::Model(
@@ -43,7 +46,9 @@ impl Gemma4 {
             }
             map.total_len()
         };
-        Ok(source_bytes + Self::diffusion_workspace_bytes(context, slots))
+        Ok(source_bytes
+            + Self::diffusion_workspace_bytes(context, slots)
+            + if path.is_dir() { 1 << 30 } else { 0 })
     }
 
     fn diffusion_workspace_bytes(context: usize, slots: usize) -> u64 {

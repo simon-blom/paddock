@@ -321,6 +321,27 @@ impl Gemma4 {
             *c = None;
         }
     }
+    pub(super) fn pin_canvas(&mut self, h: usize, positions: &[u32], ids: &[u32]) -> Result<()> {
+        let c = self
+            .diffusion
+            .as_mut()
+            .and_then(|d| d.canvases.get_mut(h))
+            .and_then(Option::as_mut)
+            .ok_or_else(|| MetalError::Model("invalid canvas handle".into()))?;
+        // Validate the entire edit before mutating; keep the probability plane
+        // and step intact for the next self-conditioning pass.
+        if !c.seeded
+            || positions.len() != ids.len()
+            || positions.iter().any(|&p| p as usize >= c.ids.len())
+            || ids.iter().any(|&id| id as usize >= self.vocab)
+        {
+            return Err(MetalError::Model("invalid canvas pins".into()));
+        }
+        for (&p, &id) in positions.iter().zip(ids) {
+            c.ids[p as usize] = id;
+        }
+        Ok(())
+    }
     pub(super) fn tick_canvases(&mut self, ticks: &[CanvasTickReq]) -> Result<Vec<CanvasStatus>> {
         self.require_committed()?;
         let lane = self.lane()?;

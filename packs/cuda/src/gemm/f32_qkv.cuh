@@ -1136,9 +1136,12 @@ __global__ __launch_bounds__(256) void pd_matvec_f32_sk_kernel(
         __threadfence();
         unsigned int prev = atomicAdd(&counters[o], 1u);
         if (prev == split - 1u) {
+            // acquire, then the other blocks' partials from L2 (abi.cuh,
+            // PD_LAST_BLOCK_FOLD)
+            __threadfence();
             float sum = 0.0f;
             for (uint32_t t = 0; t < split; ++t)
-                sum += partials[(size_t)o * split + t];
+                sum += __ldcg(&partials[(size_t)o * split + t]);
             out[o] = sum;
             counters[o] = 0u;      // graph-replay safe: back to initial state
         }

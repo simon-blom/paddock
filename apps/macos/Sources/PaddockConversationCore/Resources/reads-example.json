@@ -1,0 +1,29 @@
+{
+  "state": "Subject: Portal down again\n\nHi, this is the third time this week the customer portal has gone down during business hours. We have 40 agents unable to log in right now and customers are calling. I need someone on this immediately - we are paying for the enterprise tier and this is unacceptable. Please call me back on the number on file.\n\n- Dana, Ops lead at Northwind",
+  "samples": "auto",
+  "questions": {
+    "need_action_within": {
+      "type": "noul",
+      "instructions": "Does this message need action within the hour?",
+      "criteria": {
+        "true": "an outage or blocker affecting many people now",
+        "false": "a request that can wait a day"
+      }
+    },
+    "message_about": {
+      "type": "choice",
+      "instructions": "What is this message about?",
+      "criteria": {
+        "outage": "a service is down or broken",
+        "billing": "invoices, plans or payment",
+        "feature": "a request for something new",
+        "other": "none of these"
+      }
+    },
+    "upset_sender": {
+      "type": "score",
+      "instructions": "How upset is the sender?",
+      "criteria": ["calm", "annoyed", "furious"]
+    }
+  }
+}

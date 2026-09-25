@@ -25,6 +25,8 @@ mod canvas;
 mod deltanet;
 mod dense_pred;
 mod dit;
+mod encoder;
+pub use encoder::{ENC_ATTN_QTILE, ENC_ATTN_TILE_SHIFT};
 mod error;
 mod fp4;
 mod fp8;

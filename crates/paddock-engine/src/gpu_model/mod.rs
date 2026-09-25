@@ -9,6 +9,7 @@ pub mod gemma4;
 pub mod gpt_oss;
 pub mod granite;
 pub mod laguna;
+pub mod laya;
 pub mod nemotron;
 pub mod paddleocr_vl;
 pub mod pillow;

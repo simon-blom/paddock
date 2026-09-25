@@ -15,6 +15,10 @@ import type { ReadDoc, ReadSummary } from '@/lib/reads'
  *  conversations. The list holds summaries; a read is fetched whole to open
  *  it and saved whole after each run, never from a summary. */
 export const useReadsStore = defineStore('reads', () => {
+  /** The running reader the page sends to, chosen in the header's model
+   *  picker while the Reads page is open - the one place a model is picked,
+   *  as on the chat page. 0 until a reader is running. */
+  const readerPort = ref(0)
   const sets = ref<SavedReadSet[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -126,6 +130,7 @@ export const useReadsStore = defineStore('reads', () => {
   }
 
   return {
+    readerPort,
     sets,
     loading,
     error,

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="560" viewBox="232 242 560 560" fill="none">
+  <!-- Alternative Paddock mark, "inner stem": the stack's own left edge is lit
+       from the top slab down. Not wired in anywhere; make-icon.swift renders
+       the icns and ico next to this file. Same 1024 grid as the main mark. -->
+  <defs>
+    <linearGradient id="lit" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8FE3FF"/>
+      <stop offset="1" stop-color="#2F68FF"/>
+    </linearGradient>
+    <linearGradient id="stem" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8FE3FF"/>
+      <stop offset="1" stop-color="#2F68FF"/>
+    </linearGradient>
+    <clipPath id="top">
+      <path d="M272 380 L512 260 L752 380 L512 500 Z"/>
+    </clipPath>
+  </defs>
+  <path d="M272 620 L512 740 L512 784 L272 664 Z" fill="#1B222B"/>
+  <path d="M512 740 L752 620 L752 664 L512 784 Z" fill="#141A21"/>
+  <path d="M512 500 L752 620 L512 740 L272 620 Z" fill="#2F3A49"/>
+  <path d="M272 500 L512 620 L512 664 L272 544 Z" fill="#223247"/>
+  <path d="M512 620 L752 500 L752 544 L512 664 Z" fill="#1A2637"/>
+  <path d="M512 380 L752 500 L512 620 L272 500 Z" fill="#3A5272"/>
+  <path d="M272 380 L512 500 L512 544 L272 424 Z" fill="#1F5AC4"/>
+  <path d="M512 500 L752 380 L752 424 L512 544 Z" fill="#17459A"/>
+  <path d="M272 380 L512 260 L752 380 L512 500 Z" fill="url(#lit)"/>
+  <path d="M272 380 L318 403 L318 687 L272 664 Z" fill="url(#stem)"/>
+  <path d="M272 380 L512 260 L752 380 L512 500 Z" clip-path="url(#top)"
+        stroke="#D2F5FF" stroke-opacity="0.55" stroke-width="10" stroke-linejoin="round"/>
+</svg>

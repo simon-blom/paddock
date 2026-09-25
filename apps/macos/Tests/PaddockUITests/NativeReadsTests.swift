@@ -7,6 +7,64 @@ import Testing
 
 @Suite("Native Reads state", .serialized) @MainActor
 struct NativeReadsTests {
+  @Test func visionReadsRetainPixelsAndStepsInSharedHistory() async throws {
+    let m = model()
+    let originalAPI = m.api
+    m.api = { path, method, body, query in
+      if path.hasSuffix("1234/server") {
+        return try value(
+          #"{"structured_read":{"canvas_width":256,"images":true,"max_steps":8,"think":true}}"#)
+      }
+      return try await originalAPI(path, method, body, query)
+    }
+    await m.refresh()
+    let picture = ReadPicture(name: "picture.png", url: "data:image/png;base64,YQ==")
+    m.draft.images = [picture]
+    m.draft.steps = 2
+    m.draft.think = 128
+    #expect(m.canRun && m.hasWork && m.current?.maxSteps == 8)
+    m.beginJSON()
+    #expect(m.applyJSON(m.jsonText) && m.draft.images == [picture])
+    var saved: ConversationValue?
+    m.api = { path, method, body, _ in
+      if path == "api/runners/1234/v1/systemone" {
+        #expect(method == "POST" && body?["images"] == .array([.string(picture.url)]))
+        #expect(body?["steps"] == .number(2) && body?["think"] == .number(128))
+        return try value(
+          #"{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.99,"confidence":0.98,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":256,"questions":[],"timing":{"total_ms":12}}}"#
+        )
+      }
+      if path.hasPrefix("api/read-history/") {
+        if method == "PUT" {
+          saved = try JSONDecoder().decode(
+            ConversationValue.self, from: Data(body!["doc"]!.string!.utf8))
+          return .object(["read": .object(["revision": .string("saved")])])
+        }
+        return .object(["revision": .string("saved"), "doc": .string(try ReadDraft.json(saved!))])
+      }
+      return .array([])
+    }
+    m.run()
+    await m.settle()
+    #expect(m.error == nil && m.historyError == nil && !m.unsavedRead)
+    #expect(saved?["images"]?[picture.ref] == .string(picture.url))
+    #expect(saved?["runs"]?.array?.first?["images"] == .array([picture.historyReference]))
+    let id = try #require(m.activeSession?.id)
+    m.reset()
+    await m.openSession(id)
+    #expect(m.draft.images == [picture] && m.draft.steps == 2 && m.draft.think == 128)
+    #expect(!m.unsavedRead && !m.stale)
+    m.draft.images = []
+    #expect(m.unsavedRead && m.stale)
+  }
+  @Test func textOnlyReaderNeverSilentlyDiscardsPictures() async {
+    let m = model()
+    await m.refresh()
+    m.draft.images = [ReadPicture(name: "picture.png", url: "data:image/png;base64,YQ==")]
+    #expect(!m.canRun && m.validation != nil)
+    m.routeError("images: the image is too large")
+    #expect(m.stateError != nil)
+  }
   func value(_ json: String) throws -> ConversationValue {
     try JSONDecoder().decode(ConversationValue.self, from: Data(json.utf8))
   }
@@ -35,6 +93,48 @@ struct NativeReadsTests {
     #expect(m.readers.count == 1 && m.port == 1234 && !m.canRun)
     m.draft.state = "The sky is blue."
     #expect(m.canRun)
+  }
+  @Test func exampleRunsAllThreeQuestionsOnTheSelectedReaderAndRetainsHistory() async throws {
+    let m = model()
+    await m.refresh()
+    let example = try ReadDraft.example
+    var requests = 0
+    m.api = { path, method, body, _ in
+      if path == "api/read-history" { return .array([]) }
+      if path.hasPrefix("api/read-history/") {
+        return .object(["read": .object(["revision": .string("saved")])])
+      }
+      requests += 1
+      #expect(path == "api/runners/1234/v1/systemone" && method == "POST")
+      #expect(body == example.request(model: "diffusion"))
+      return try value(
+        #"{"model":"diffusion","answers":{"need_action_within":{"type":"noul","noul":0.99,"confidence":0.98,"agreement":1,"outside":0.01},"message_about":{"type":"choice","choice":"outage","probabilities":{"outage":0.97,"billing":0.01,"feature":0.01,"other":0.01},"confidence":0.96,"agreement":1,"outside":0.01},"upset_sender":{"type":"score","score":1.9,"level":"furious","legend":{"0":"calm","1":"annoyed","2":"furious"},"probabilities":{"0":0,"1":0.1,"2":0.9},"confidence":0.85,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":256,"questions":[],"timing":{"total_ms":12}}}"#
+      )
+    }
+    m.draft.state = "Draft replaced only after the view's confirmation"
+    m.jsonText = "{unfinished"
+    m.fileName = "previous.txt"
+    m.runExample()
+    m.runExample()  // A second click during the request cannot start another run.
+    await m.settle()
+    #expect(requests == 1 && !m.busy && !m.stale)
+    #expect(m.error == nil && m.questionsError == nil && m.historyError == nil)
+    #expect(m.result?.response.answers.count == 3 && m.activeSession?.runs.count == 1)
+    #expect(m.result?.state == example.state && m.fileName.isEmpty)
+    let expectedJSON = try example.orderedJSON()
+    #expect(!m.hasUnappliedJSON && m.jsonText == expectedJSON)
+    #expect(m.draft.ordering == example.ordering)
+    m.editInstructions(m.draft.questions[0].id, text: "Is the customer angry?")
+    #expect(m.draft.questions[0].questionID == "customer_angry")
+  }
+  @Test func exampleWithoutAReaderNeverDiscardsTheDraft() async {
+    let m = model()
+    m.draft.state = "Keep this"
+    m.jsonText = "{unfinished"
+    let before = m.draft
+    m.runExample()
+    await m.settle()
+    #expect(m.draft == before && m.jsonText == "{unfinished" && m.result == nil)
   }
   @Test func invalidJsonKeepsTheCompleteEditor() {
     let m = model()
@@ -309,5 +409,146 @@ struct NativeReadsTests {
     }
     await m.openSession("session")
     #expect(m.draft.state == "Newer input" && m.activeSession == nil && !m.openingSession)
+  }
+
+  @Test func sidebarSearchAndOrderingMatchWebHistoryAndRecoverAfterFailure() async throws {
+    let m = model()
+    let rows = try value(
+      #"[{"id":"old","title":"Older","model":"diffusion","runs":3,"updatedAt":1},{"id":"new","title":"Café ticket","model":"diffusion","runs":2,"updatedAt":3},{"id":"middle","title":"Middle","model":"diffusion","runs":1,"updatedAt":2}]"#
+    )
+    m.api = { _, _, _, _ in rows }
+    await m.refreshHistory()
+    #expect(m.historyLoaded && m.visibleSessions(search: "").map(\.id) == ["new", "middle", "old"])
+    #expect(m.visibleSessions(search: "  CAFÉ ").map(\.id) == ["new"])
+    #expect(m.visibleSessions(search: "absent").isEmpty)
+    m.api = { _, _, _, _ in throw ConversationFailure.http(503) }
+    await m.refreshHistory()
+    #expect(m.historyListError != nil && m.sessions.count == 3)
+    m.api = { _, _, _, _ in rows }
+    await m.refreshHistory()
+    #expect(m.historyListError == nil && m.historyLoaded)
+  }
+
+  func savedRead(_ id: String, title: String = "Ticket") throws -> String {
+    var doc = try value(
+      #"{"id":"read","title":"Ticket","model":"diffusion","createdAt":1000,"updatedAt":2000,"runs":[{"id":"73D49A22-9423-4601-95D9-6F855224A452","at":2000,"port":1234,"state":"The complete ticket","fileName":"ticket.txt","questions":{"q1":{"type":"noul","instructions":"Urgent?"}},"samples":"auto","response":{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.9,"confidence":0.8,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":256,"questions":[],"timing":{"total_ms":12}}},"ms":15}]}"#
+    ).object!
+    doc["id"] = .string(id)
+    doc["title"] = .string(title)
+    return try ReadDraft.json(.object(doc))
+  }
+
+  @Test func sidebarOpensWithoutARunningReaderAndOnlyPromptsForActualEdits() async throws {
+    let m = model()
+    let doc = try savedRead("one")
+    m.api = { _, _, _, _ in .object(["doc": .string(doc), "revision": .string("r1")]) }
+    await m.openSession("one")
+    #expect(m.current == nil && m.result?.state == "The complete ticket")
+    #expect(m.activeSession?.id == "one" && !m.unsavedRead && !m.historyNavigationBlocked)
+    m.draft.state += " edited"
+    #expect(m.unsavedRead)
+    m.draft.state = "The complete ticket"
+    #expect(!m.unsavedRead)
+    m.jsonText = "{unfinished"
+    #expect(m.unsavedRead)
+  }
+
+  @Test func sidebarRenamePreservesAllRunsAndDraftWhileUpdatingTheRevision() async throws {
+    let m = model()
+    let original = try savedRead("one")
+    m.api = { _, _, _, _ in .object(["doc": .string(original), "revision": .string("r1")]) }
+    await m.openSession("one")
+    m.draft.state = "Newer unsent input"
+    var writes = 0
+    m.api = { _, method, body, query in
+      if method == "GET" { return .object(["doc": .string(original), "revision": .string("r1")]) }
+      #expect(query["revision"] == (method == "PUT" ? "r1" : "r2"))
+      if method == "PUT" {
+        writes += 1
+        let renamed = try ReadHistoryDocument(json: #require(body?["doc"]?.string))
+        let before = try ReadHistoryDocument(json: original)
+        #expect(
+          renamed.runs == before.runs && renamed.value["updatedAt"] == before.value["updatedAt"])
+        #expect(renamed.value["title"] == .string("Renamed"))
+        return .object(["read": .object(["revision": .string("r2")])])
+      }
+      #expect(method == "DELETE")
+      return .null
+    }
+    await m.renameSession("one", title: " Renamed ")
+    #expect(writes == 1 && m.activeSession?.value["title"] == .string("Renamed"))
+    #expect(m.draft.state == "Newer unsent input" && m.runs.count == 1 && m.historyError == nil)
+    await m.removeSession("one")
+    #expect(m.activeSession == nil && m.runs.isEmpty && m.draft.state.isEmpty)
+  }
+
+  @Test func sidebarCanDeleteAnUnopenedReadWithoutChangingTheOpenRead() async throws {
+    let m = model()
+    let one = try savedRead("one")
+    let two = try savedRead("two")
+    m.api = { path, method, _, query in
+      if method == "DELETE" {
+        #expect(path == "api/read-history/two" && query["revision"] == "two-revision")
+        return .null
+      }
+      let isTwo = path.hasSuffix("/two")
+      return .object([
+        "doc": .string(isTwo ? two : one),
+        "revision": .string(isTwo ? "two-revision" : "one-revision"),
+      ])
+    }
+    await m.openSession("one")
+    let before = m.draft
+    await m.removeSession("two")
+    #expect(m.activeSession?.id == "one" && m.draft == before && m.runs.count == 1)
+  }
+
+  @Test func sidebarRevisionConflictsRetainTheReadAndItsInput() async throws {
+    let m = model()
+    let original = try savedRead("one")
+    m.api = { _, _, _, _ in .object(["doc": .string(original), "revision": .string("r1")]) }
+    await m.openSession("one")
+    let before = m.draft
+    m.api = { _, method, _, _ in
+      if method == "GET" { return .object(["doc": .string(original), "revision": .string("r1")]) }
+      throw ConversationFailure.http(409)
+    }
+    await m.renameSession("one", title: "Not saved")
+    #expect(m.historyError != nil && m.activeSession?.value["title"] == .string("Ticket"))
+    await m.removeSession("one")
+    #expect(m.historyError != nil && m.activeSession?.id == "one" && m.draft == before)
+    #expect(!m.saving && m.runs.count == 1)
+  }
+
+  @Test func staleListRefreshCannotResurrectADeletedRead() async throws {
+    let m = model()
+    let doc = try savedRead("one")
+    let rows = try value(
+      #"[{"id":"one","title":"Ticket","model":"diffusion","runs":1,"updatedAt":2000}]"#)
+    m.api = { _, _, _, _ in rows }
+    await m.refreshHistory()
+    m.api = { path, method, _, _ in
+      if path == "api/read-history" {
+        await m.removeSession("one")
+        return rows  // This GET started before the DELETE was acknowledged.
+      }
+      if method == "GET" { return .object(["doc": .string(doc), "revision": .string("r1")]) }
+      return .null
+    }
+    await m.refreshHistory()
+    #expect(m.sessions.isEmpty && m.historyError == nil)
+  }
+
+  @Test func renameCannotAdoptAnExternallyChangedReadOverTheOpenSnapshot() async throws {
+    let m = model()
+    let original = try savedRead("one")
+    m.api = { _, _, _, _ in .object(["doc": .string(original), "revision": .string("r1")]) }
+    await m.openSession("one")
+    m.api = { _, method, _, _ in
+      #expect(method == "GET")
+      return .object(["doc": .string(original), "revision": .string("r2")])
+    }
+    await m.renameSession("one", title: "Changed")
+    #expect(m.historyError != nil && m.activeSession?.value["title"] == .string("Ticket"))
   }
 }

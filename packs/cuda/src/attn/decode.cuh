@@ -1591,7 +1591,32 @@ __global__ void pd_matvec_f32_batch_kernel(const float* __restrict__ w,
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const float* wr = w + (size_t)o * in_dim;
     float acc[BT] = {};
-    for (uint32_t i = tid; i < in_dim; i += nth) {
+    // U strided steps' loads issued before their FMAs, which then run in the
+    // original order (i, i+nth, ..): the same per-thread sums, bit for bit,
+    // with the loads' DRAM latency overlapped instead of paid per step. The
+    // plain loop could not overlap them (a runtime trip count): a narrow
+    // plane - qwen4_exp's hc inject, out=4 over in=10240, 4 blocks walking 40
+    // steps each - ran 23.5 us to read 160 KB (GB10 decode profile).
+    constexpr uint32_t U = BT <= 2u ? 8u : (BT <= 4u ? 4u : 2u);
+    uint32_t i = tid;
+    for (; i + (U - 1u) * nth < in_dim; i += U * nth) {
+        float wv[U];
+        float xv[U][BT];
+        #pragma unroll
+        for (uint32_t u = 0; u < U; ++u) {
+            wv[u] = wr[i + u * nth];
+            #pragma unroll
+            for (uint32_t b = 0; b < BT; ++b)
+                xv[u][b] = t0 + b < batch ? x[(size_t)(t0 + b) * in_dim + i + u * nth] : 0.0f;
+        }
+        #pragma unroll
+        for (uint32_t u = 0; u < U; ++u) {
+            #pragma unroll
+            for (uint32_t b = 0; b < BT; ++b)
+                if (t0 + b < batch) acc[b] += wv[u] * xv[u][b];
+        }
+    }
+    for (; i < in_dim; i += nth) {
         const float wv = wr[i];
         #pragma unroll
         for (uint32_t b = 0; b < BT; ++b)

@@ -7405,7 +7405,140 @@ pub struct KernelTableV1 {
     /// cores (16 query rows x 4 heads against 64-block key tiles, relu-sum
     /// across lanes). Returns -1 unless 4 heads x 128 and 4-token blocks.
     pub q4x_qsa_logits_mma: Option<Q4xQsaLogitsFn>,
+    /// Slot 671: `pd_f16_gemm_h_relu` - slot 618's f16 landing with an
+    /// optional per-output bias and ReLU in the epilogue (a post-norm
+    /// transformer FFN's up projection). Same K order as 618.
+    pub f16_gemm_h_relu: Option<F16GemmHBiasFn>,
+    /// Slot 672: `pd_f16_gemm_h_geglu` - `gelu(input) * gate` in the
+    /// epilogue, landing half the GEMM width, off a weight re-laid in 16-row
+    /// blocks (8 input rows, then their 8 gate rows). `out_dim` % 16 == 0.
+    pub f16_gemm_h_geglu: Option<F16GemmHFn>,
+    /// Slot 673: `pd_enc_attn_h` - bidirectional attention over packed
+    /// variable-length sequences, read straight off a fused qkv landing,
+    /// with rope / a symmetric window / the q-k-v bias riding the staging.
+    pub enc_attn_h: Option<EncAttnHFn>,
+    /// Slot 674: `pd_enc_embed_ln` - token gather + embedding LayerNorm into
+    /// the f32 residual and its f16 twin.
+    pub enc_embed_ln: Option<EncEmbedLnFn>,
+    /// Slot 675: `pd_laya_head_entry` - final norm + question-type embedding
+    /// (in place) + the head's first pre-norm at f16.
+    pub laya_head_entry: Option<LayaHeadEntryFn>,
+    /// Slot 676: `pd_gather_rows` - `dst[i] = src[idx[i]]` over 16-byte rows.
+    pub gather_rows: Option<GatherRowsFn>,
+    /// Slot 677: `pd_laya_rowdot` - one output per row: `g[i] . w + b`.
+    pub laya_rowdot: Option<LayaRowdotFn>,
+    /// Slot 678: `pd_laya_act_head` - the Laya act/escalate head, one block a
+    /// question, off its [CLS] row and its option distribution.
+    pub laya_act_head: Option<LayaActHeadFn>,
 }
+
+/// `(w, x, y, bias, in_dim, out_dim, batch, stream)` - an f16-landing GEMM
+/// with a nullable per-output f32 bias.
+pub type F16GemmHBiasFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(w, x, y, in_dim, out_dim, batch, stream)` - an f16-landing GEMM.
+pub type F16GemmHFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(qkv, cu, tiles, n_tiles, cos, sin, bias, out, n_heads, head_dim,
+/// window, stream)` - see `KernelTableV1::enc_attn_h`.
+pub type EncAttnHFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(emb, ids, w, b, x, x16, rows, n, eps, stream)`.
+pub type EncEmbedLnFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, fw, temb, rtype, w1, b1, n16, rows, n, eps, stream)`.
+pub type LayaHeadEntryFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(src, idx, dst, n_idx, row_bytes, stream)`.
+pub type GatherRowsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(g, w, b, out, m, n, stream)`.
+pub type LayaRowdotFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    f32,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(logits, qoff, xcls, w0, b0, w2, b2, out, nq, d, hid, n_act, stream)`.
+pub type LayaActHeadFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// QSA attention over the selection (see `KernelTableV1::q4x_qsa_attn`).
 pub type Q4xQsaAttnFn = unsafe extern "C" fn(
@@ -8140,7 +8273,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 656;
+pub const KERNEL_TABLE_SLOTS: usize = 664;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

@@ -75,6 +75,45 @@ fn single_file_without_split_kvs_behaves_as_before() {
     assert_eq!(m.path(), path);
 }
 
+/// The read hints are timing only: advising a tensor - whole, in pieces,
+/// with ranges running past its end or empty - leaves every byte as it was,
+/// and only a tensor that does not exist is an error.
+#[test]
+fn access_hints_never_change_bytes_or_fail_on_ranges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = write_family(
+        dir.path(),
+        "m",
+        &[
+            shard_bytes(0, 2, 2, "blk.0.w"),
+            shard_bytes(1, 2, 2, "blk.1.w"),
+        ],
+    );
+    let m = MappedGguf::open(&first).expect("split model opens");
+    for (shard, name) in [(0u8, "blk.0.w"), (1, "blk.1.w")] {
+        let len = m.tensor_bytes(name).expect(name).1.len();
+        for access in [MapAccess::Random, MapAccess::WillNeed] {
+            m.advise_tensor(name, access, &[(0, len), (4, 8), (len - 1, 1)])
+                .expect("valid ranges");
+            // past the end, overflowing, empty: skipped, not an error
+            m.advise_tensor(name, access, &[(len, 1), (usize::MAX, 2), (3, 0)])
+                .expect("bad ranges are skipped");
+        }
+        assert!(
+            m.tensor_bytes(name)
+                .expect(name)
+                .1
+                .iter()
+                .all(|&b| b == shard + 1),
+            "{name}: a hint changed the bytes"
+        );
+    }
+    assert!(matches!(
+        m.advise_tensor("nope", MapAccess::WillNeed, &[(0, 1)]),
+        Err(MapError::NoSuchTensor(_))
+    ));
+}
+
 #[test]
 fn opening_a_later_shard_names_the_first() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -8,6 +8,8 @@ import { useDownloadsStore, jobActive, type DownloadJob } from '@/stores/downloa
 import { useReadinessStore } from '@/stores/readiness'
 import { useFleetStore } from '@/stores/fleet'
 import { useUpdatesStore } from '@/stores/updates'
+import { useReadsStore } from '@/stores/reads'
+import { modelLabel } from '@/lib/model-name'
 import { selectStudioModel } from '@/lib/select-model'
 import { studioModelHeader } from '@/lib/studio-model-header'
 import { fmtBytes, fmtEta, fmtRate } from '@/lib/format'
@@ -120,6 +122,26 @@ const modelSel = computed<string | number>({
   get: () => currentModel.value,
   set: (v) => selectStudioModel(String(v)),
 })
+
+// On the Reads page the picker chooses the READER: the running models that
+// answer /v1/systemone, which the page sends to. The chat's model has no
+// part in a read, so the page never shows it - one picker, in one place, as
+// on the chat page.
+const readsStore = useReadsStore()
+const onReads = computed(() => route.name === 'reads')
+const readerOptions = computed(() =>
+  models.readers.map((m) => ({
+    value: m.port ?? 0,
+    label: m.display ?? modelLabel(m.id),
+    hint: `port ${m.port}`,
+    vendor: m.vendor,
+    title: m.id,
+  })),
+)
+const readerSel = computed<string | number>({
+  get: () => readsStore.readerPort,
+  set: (v) => (readsStore.readerPort = Number(v)),
+})
 </script>
 
 <template>
@@ -143,7 +165,13 @@ const modelSel = computed<string | number>({
       <!-- no decorative box icon here: the vendor mark inside the picker
            already identifies the model, and the cube glyph read as a second
            caret -->
-      <template v-if="area === 'studio' && currentModel && pickerOptions.length">
+      <template v-if="onReads">
+        <template v-if="readerOptions.length">
+          <span class="header__sep">/</span>
+          <Select v-model="readerSel" :options="readerOptions" ghost />
+        </template>
+      </template>
+      <template v-else-if="area === 'studio' && currentModel && pickerOptions.length">
         <span class="header__sep">/</span>
         <span v-if="comparing" class="header__model header__cmp">
           <template v-for="(l, i) in compareLanes" :key="l.id">

@@ -886,6 +886,7 @@ impl MetalDevice {
             "gmlx_geglu",
             "gmlx_softcap",
             "gmlx_bmm",
+            "gmlx_vmm64",
             "gmlx_erfgelu",
             "gmlx_layer_norm",
             "gmlx_gv_patches",

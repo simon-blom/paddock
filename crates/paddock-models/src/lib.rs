@@ -17,6 +17,7 @@ pub mod granite;
 pub mod hadamard;
 pub mod hardening;
 pub mod kv_tier_geom;
+pub mod laya;
 pub mod mapped;
 pub mod mlx;
 pub mod modelopt;

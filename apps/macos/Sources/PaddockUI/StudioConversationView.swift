@@ -99,7 +99,7 @@ struct StudioConversationView: View {
       let column = StudioColumnLayout.resolve(
         available: geometry.size.width, viewport: nil,
         comparison: chat.state?.nativeTranscript?.hasComparisons == true)
-      StudioConversationChrome(title: chat.conversation?.title) {
+      StudioConversationChrome(title: chat.conversation?.title, titleColumn: column) {
         Group {
           // NativeStudioRuntime owns streaming; no hidden WebView is required.
           // Attach web content only in the allowlisted viewer panels above.
@@ -126,6 +126,9 @@ struct StudioConversationView: View {
         .frame(maxHeight: .infinity)
         .background(PaddockStyle.canvas)
       }
+      // When a left document pane is open, it owns the window buttons; the
+      // conversation header must not reserve their width a second time.
+      .environment(\.workspaceLeadingPaneInset, conversationTopInset)
     }
   }
 

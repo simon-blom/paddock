@@ -147,6 +147,11 @@ pub struct RunnerView {
     /// them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Served decision model id (Laya) - the sixth serving role: a reader
+    /// answers `/v1/systemone` only and refuses chat, so it must not be
+    /// offered as a chat model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reader: Option<String>,
     /// The catalog's human name for the served model ("Qwen 3.5 9B") + its
     /// maker - the labels every UI surface shows, with the technical id kept
     /// for tooltips. Absent when the catalog doesn't know the model.
@@ -2272,6 +2277,7 @@ impl Supervisor {
                         .or(id.asr.as_deref())
                         .or(id.aligner.as_deref())
                         .or(id.image.as_deref())
+                        .or(id.reader.as_deref())
                         .and_then(|n| self.registry.display_of(n))
                         // The runner names its weights FILE. When the catalog
                         // does not know that file - a copy, a rename, a quant
@@ -2298,6 +2304,7 @@ impl Supervisor {
                         asr: id.asr,
                         aligner: id.aligner,
                         image: id.image,
+                        reader: id.reader,
                         display: labels.as_ref().map(|(d, _)| d.clone()),
                         vendor: labels.and_then(|(_, v)| v),
                         version: Some(id.version),
@@ -2332,6 +2339,7 @@ impl Supervisor {
                             asr: None,
                             aligner: None,
                             image: None,
+                            reader: None,
                             display: labels.as_ref().map(|(d, _)| d.clone()),
                             vendor: labels.and_then(|(_, v)| v),
                             version: None,
@@ -2364,6 +2372,7 @@ impl Supervisor {
                             asr: None,
                             aligner: None,
                             image: None,
+                            reader: None,
                             display: None,
                             vendor: None,
                             version: None,

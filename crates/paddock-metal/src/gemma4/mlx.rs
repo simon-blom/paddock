@@ -81,18 +81,6 @@ impl Source {
             n,
         })
     }
-    pub(super) fn finish_diffusion_text(&self) -> Result<()> {
-        // The bundled image tower is not loaded or advertised by the text
-        // adapter. Only its named namespaces may remain unused.
-        for name in self.map.names() {
-            if name.starts_with("model.encoder.vision_tower.")
-                || name.starts_with("model.encoder.embed_vision.")
-            {
-                self.used.borrow_mut().insert(name.to_owned());
-            }
-        }
-        self.finish()
-    }
     pub(super) fn affine(&self, d: &MetalDevice, base: &str, k: usize, n: usize) -> Result<Weight> {
         let w = crate::affine::load(d, &self.map, &format!("{base}.weight"), k, n)?;
         for suffix in ["weight", "scales", "biases"] {
@@ -164,7 +152,7 @@ impl Source {
         }
         Ok(w)
     }
-    fn finish(&self) -> Result<()> {
+    pub(super) fn finish(&self) -> Result<()> {
         let used = self.used.borrow();
         let mut extra: Vec<_> = self.map.names().filter(|n| !used.contains(*n)).collect();
         extra.sort();

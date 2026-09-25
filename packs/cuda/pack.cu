@@ -23,6 +23,7 @@
 #include "src/attn/fmha16.cuh"      // Q16xKv128 tensor-core decode attention, muse hd128/G16 (needs bf16_dense's pd_bf16m_ldm/mma)
 #include "src/deltanet/core.cuh"
 #include "src/vision.cuh"
+#include "src/attn/varlen.cuh"     // packed variable-length bidirectional attention (text encoders: ModernBERT / Laya); needs decode_spec's pd_fa_mma16 + f32_qkv's launch helpers
 #include "src/gemm/int8_mma.cuh"
 #include"src/gemm/f16_dense.cuh"   // in-house f16xf16->f32 wmma GEMM (PADDOCK_INHOUSE_F16 cuBLAS-removal); needs int8_mma's PD_MMA_OK
 #include "src/deltanet/split.cuh"   // split walk/o-pass + shared tf32 mma helpers (needs int8_mma's PD_DNC_* defines; stage2_sample's launcher dispatches it)
@@ -30,7 +31,7 @@
 #include "src/deltanet/stage2_sample.cuh"
 #include "src/deltanet/spec_rs.cuh"   // canonical spec rejection sampling (sampled drafts + full-q verify)
 #include "src/deltanet/slots_runs.cuh"  // row-exact verify GDN walk: slot 564's decode body over a run's rows (needs stage2_sample's slots env + abi's state helpers)
-#include "src/gemm/q8_rows.cuh"        // row-exact multi-row twin of the batch-1 Q8_0 GEMV (abi.cuh helpers only)
+#include "src/gemm/q8_rows.cuh"        // row-exact multi-row twins of the batch-1 Q8_0 GEMVs + the K-split Q8_0 GEMV (abi.cuh helpers only)
 #include "src/mamba/core.cuh"       // Mamba-2 SSD lane (nemotron_h_moe): conv step w/ bias, seq scan, grouped gated norm, f8r GEMV (needs deltanet core's PD_CONV_K_MAX)
 #include"src/mamba/ssd.cuh"        // chunked SSD prefill scan: defines pd_mamba2_ssd_run, elected by core.cuh's seq launchers for long segments
 #include "src/gemm/mmq.cuh"
@@ -63,6 +64,7 @@
 #include "src/asr/whisper.cuh"      // whisper decode lane (flash-decoding attn + fused decode epilogues)
 #include "src/asr/granite_speech.cuh"  // granite-speech conformer tower (macaron FFN, GLU, centered dwconv, Shaw-RPE attention)
 #include "src/dense_pred.cuh"     // dense prediction: DINOv3 LayerScale ViT epilogues + conv decoder ops (needs whisper.cuh's staged LayerNorm)
+#include "src/encoder.cuh"        // text-encoder seams: ModernBERT embed+norm, the Laya decision head entry / row gather / scorer dot / act head (needs whisper.cuh's staged LayerNorm + f16_dense's exact GELU)
 #include "src/dit.cuh"            // diffusion-transformer glue (qwen-image): 3-axis rope, Philox noise, gated residual, row softmax; plain CUDA, abi.cuh helpers only
 #include "src/conv/vae.cuh"       // image VAE conv glue: per-pixel channel RMSNorm, stripe/upsample im2row, DupUp shortcut; plain CUDA
 #include "src/diffusion/canvas.cuh" // block-diffusion canvas (DiffusionGemma): E^T bf16 plane, row sampler, EB accept/re-noise, label gather; needs dit.cuh's Philox

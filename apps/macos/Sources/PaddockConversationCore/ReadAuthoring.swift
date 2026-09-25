@@ -38,40 +38,21 @@ extension ReadQuestion {
 
 extension ReadDraft {
   public static var example: ReadDraft {
-    var draft = ReadDraft()
-    draft.state = """
-      Subject: Portal down again
-
-      Hi, this is the third time this week the customer portal has gone down during business hours. We have 40 agents unable to log in right now and customers are calling. I need someone on this immediately - we are paying for the enterprise tier and this is unacceptable. Please call me back on the number on file.
-
-      - Dana, Ops lead at Northwind
-      """
-    var urgent = ReadQuestion(questionID: "")
-    urgent.instructions = "Does this message need action within the hour?"
-    urgent.yesMeans = "an outage or blocker affecting many people now"
-    urgent.noMeans = "a request that can wait a day"
-    var topic = ReadQuestion(questionID: "", kind: .choice)
-    topic.instructions = "What is this message about?"
-    topic.options = [
-      .init(name: "outage", description: "a service is down or broken"),
-      .init(name: "billing", description: "invoices, plans or payment"),
-      .init(name: "feature", description: "a request for something new"),
-      .init(name: "other", description: "none of these"),
-    ]
-    var mood = ReadQuestion(questionID: "", kind: .score)
-    mood.instructions = "How upset is the sender?"
-    mood.levels = ["calm", "annoyed", "furious"].map { .init(name: $0) }
-    draft.questions = [urgent, topic, mood]
-    for index in draft.questions.indices {
-      draft.questions[index].questionID = ReadQuestion.derivedID(
-        draft.questions[index].instructions,
-        taken: draft.questions.prefix(index).map(\.questionID))
+    get throws {
+      // The web Studio imports this same request; no independently maintained sample prose.
+      guard let url = Bundle.module.url(forResource: "reads-example", withExtension: "json") else {
+        throw ConversationFailure.invalid("The Reads example is missing from this installation.")
+      }
+      var draft = try parse(Data(contentsOf: url))
+      // These descriptive IDs follow the instructions until the user overrides them.
+      // Imports normally pin IDs, but the example is an editable starting point.
+      for index in draft.questions.indices { draft.questions[index].idTouched = false }
+      return draft
     }
-    return draft
   }
   /// JSON objects are unordered in ConversationValue. Keep authored question
   /// and option order in saved sets and exports without changing chat's codec.
-  public func orderedJSON(model: String? = nil) throws -> String {
+  public func orderedJSON(model: String? = nil, includeImageData: Bool = true) throws -> String {
     func quoted(_ text: String) throws -> String { try Self.json(.string(text)) }
     let rows = try questions.map { q in
       var fields = q.wire.object ?? [:]
@@ -94,9 +75,18 @@ extension ReadDraft {
       "  \"samples\": " + (try Self.json(setBody["samples"]!)),
       "  \"questions\": {\n" + rows.joined(separator: ",\n") + "\n  }",
     ]
+    if steps > 1 { fields.append("  \"steps\": \(steps)") }
+    if think > 0 { fields.append("  \"think\": \(think)") }
     if let model {
       fields.insert(try "  \"model\": " + quoted(model), at: 0)
       fields.insert(try "  \"state\": " + quoted(state), at: 1)
+      if !images.isEmpty {
+        fields.append(
+          "  \"images\": "
+            + (try Self.json(
+              .array(images.map { .string(includeImageData ? $0.url : "<attached: \($0.name)>") })))
+        )
+      }
     }
     return "{\n" + fields.joined(separator: ",\n") + "\n}"
   }

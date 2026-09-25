@@ -5,6 +5,75 @@ import Testing
 
 @Suite("Structured Reads wire parity")
 struct StructuredReadsTests {
+  @Test func picturesUseTheWebReferenceAndDoNotLeakIntoQuestionSets() throws {
+    let url = "data:image/png;base64,YQ=="
+    #expect(ReadPicture.reference(url) == "q-g1g74vqtuh")
+    #expect(ReadPicture.reference("🖼️ Swedish å") == "d-2fj4t9chyqx")
+    var draft = ReadDraft()
+    draft.images = [ReadPicture(name: "image.png", url: url)]
+    draft.steps = 2
+    draft.think = 512
+    #expect(draft.setBody["images"] == nil)
+    #expect(draft.request(model: "diffusion")["images"] == .array([.string(url)]))
+    #expect(
+      try draft.orderedJSON(model: "diffusion", includeImageData: false).contains(
+        "<attached: image.png>"))
+    let restored = try ReadDraft.parse(Data(draft.orderedJSON().utf8))
+    #expect(restored.steps == 2 && restored.think == 512 && restored.images.isEmpty)
+    #expect(throws: (any Error).self) {
+      try ReadDraft.parse(Data(draft.orderedJSON(model: "diffusion").utf8))
+    }
+    #expect(throws: (any Error).self) {
+      try ReadDraft.parse(
+        Data(#"{"questions":{"q1":{"type":"noul","ask_if":{"q0":["yes"]}}}}"#.utf8))
+    }
+    let run = ConversationValue.object(["images": .array(draft.images.map(\.historyReference))])
+    let table = ConversationValue.object([draft.images[0].ref: .string(url)])
+    #expect(try ReadPicture.restore(run, table: table) == draft.images)
+    #expect(throws: (any Error).self) { try ReadPicture.restore(run, table: .object([:])) }
+    #expect(throws: (any Error).self) {
+      try ReadPicture.restore(
+        run, table: .object([draft.images[0].ref: .string("https://example.com/image.png")]))
+    }
+    draft.images = Array(repeating: draft.images[0], count: 17)
+    #expect(draft.validation() != nil)
+  }
+  @Test func bundledExampleMatchesTheSharedRequestAndKeepsAuthoredOrder() throws {
+    let draft = try ReadDraft.example
+    #expect(draft.validation() == nil && draft.samples == 0)
+    #expect(draft.state.hasPrefix("Subject: Portal down again\n\n"))
+    #expect(draft.state.hasSuffix("\n\n- Dana, Ops lead at Northwind"))
+    #expect(
+      draft.questions.map(\.questionID) == [
+        "need_action_within", "message_about", "upset_sender",
+      ])
+    #expect(draft.questions.map(\.kind) == [.noul, .choice, .score])
+    #expect(draft.questions[0].yesMeans == "an outage or blocker affecting many people now")
+    #expect(draft.questions[0].noMeans == "a request that can wait a day")
+    #expect(draft.questions[1].options.map(\.name) == ["outage", "billing", "feature", "other"])
+    #expect(draft.questions[2].levels.map(\.name) == ["calm", "annoyed", "furious"])
+    for (index, question) in draft.questions.enumerated() {
+      #expect(!question.idTouched)
+      #expect(
+        question.questionID
+          == ReadQuestion.derivedID(
+            question.instructions, taken: draft.questions.prefix(index).map(\.questionID)))
+    }
+    let again = try ReadDraft.parse(Data(draft.orderedJSON(model: "diffusion").utf8))
+    #expect(again.request(model: "diffusion") == draft.request(model: "diffusion"))
+    #expect(again.ordering == draft.ordering)
+  }
+  @Test func loadingTheExampleCreatesIndependentEditableRows() throws {
+    var draft = try ReadDraft.example
+    let another = try ReadDraft.example
+    #expect(Set(draft.questions.map(\.id)).isDisjoint(with: another.questions.map(\.id)))
+    draft.questions[1].options[0].name = "Changed"
+    draft.questions[2].levels[0].name = "Changed"
+    draft.state = "Changed"
+    #expect(another.questions[1].options[0].name == "outage")
+    #expect(another.questions[2].levels[0].name == "calm")
+    #expect(try ReadDraft.example.request(model: "m") == another.request(model: "m"))
+  }
   @Test func descriptiveIDsMatchWebRulesAndCollisions() {
     #expect(ReadQuestion.derivedID("Is the customer angry?") == "customer_angry")
     #expect(ReadQuestion.derivedID("What is this message about?") == "message_about")

@@ -420,6 +420,104 @@ pub fn load_segmenter(
     Ok(SegmentModel { id, segmenter })
 }
 
+/// The decision-model (Laya) bundle directory for `path`, if it is one: its
+/// root holds a checkpoint (`rl_agent_config.json` + `encoder/` +
+/// `model.safetensors`). The directory, or the root `model.safetensors` the
+/// manager's spawn path hands every model.
+pub fn laya_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_dir() {
+        path
+    } else if path.extension().is_some_and(|x| x == "safetensors") {
+        path.parent()?
+    } else {
+        return None;
+    };
+    paddock_models::laya::LayaBundle::is_ours(dir).then(|| dir.to_path_buf())
+}
+
+/// Tokens one decision pass packs, and questions (sequences) - the resident
+/// workspace's shape. A question is one sequence of at most 1024 tokens, so
+/// sixteen thousand rows is sixteen long questions or a hundred short ones a
+/// pass - wide enough to fill the GEMMs, ~0.3 GB of workspace on the English
+/// checkpoint's planes.
+const LAYA_PASS_TOKENS: usize = 16_384;
+const LAYA_PASS_SEQUENCES: usize = 512;
+
+/// Load a Laya bundle: every checkpoint it holds on one engine thread, one
+/// shared workspace, a tokenizer per checkpoint. CUDA only.
+pub fn load_laya(
+    id: String,
+    dir: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    vram_budget: Option<u64>,
+) -> Result<crate::systemone::laya::LayaModel, ServeError> {
+    use crate::systemone::laya::{LayaModel, sequence::LayaTok};
+    use paddock_engine::gpu_model::laya::{GpuLaya, LayaWorkspace};
+    if device != "cuda" {
+        return Err(ServeError::Engine(format!(
+            "decision models need cuda (got {device:?})"
+        )));
+    }
+    let bundle = paddock_models::laya::LayaBundle::read(dir)
+        .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+    let mut toks = Vec::new();
+    for (c, cfg) in &bundle.checkpoints {
+        let t = LayaTok::load(cfg).map_err(|e| ServeError::Open(cfg.dir.clone(), e))?;
+        let clamped = cfg.clamped_temperatures();
+        if !clamped.is_empty() {
+            tracing::warn!(
+                checkpoint = c.name(),
+                entries = ?clamped,
+                "laya: shipped temperatures outside [0.5, 5] are applied clamped - confidence \
+                 from those buckets is uncalibrated"
+            );
+        }
+        toks.push((*c, Arc::new(t)));
+    }
+    let pack = pack.map(Path::to_path_buf);
+    let decider = paddock_engine::decision::Decider::spawn(move || {
+        let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+            .map_err(|e| e.to_string())?;
+        note_device_cc(&exec);
+        if let Some(b) = vram_budget {
+            exec.set_vram_budget(b);
+        }
+        let exec = Arc::new(exec);
+        let mut models = Vec::with_capacity(bundle.checkpoints.len());
+        for (c, cfg) in &bundle.checkpoints {
+            let m = GpuLaya::load(Arc::clone(&exec), cfg)
+                .map_err(|e| format!("laya {}: {e}", c.name()))?;
+            models.push((*c, m));
+        }
+        let (d, wide) = models
+            .iter()
+            .map(|(_, m)| m.plane_dims())
+            .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+        let ws_bytes = LayaWorkspace::bytes_for(d, wide, LAYA_PASS_TOKENS, LAYA_PASS_SEQUENCES);
+        exec.vram_load_gate(ws_bytes, "laya workspace")?;
+        let mut ws = LayaWorkspace::new(&exec, d, wide, LAYA_PASS_TOKENS, LAYA_PASS_SEQUENCES)
+            .map_err(|e| e.to_string())?;
+        // One tiny pass per checkpoint before the first request: the first
+        // launch of each kernel pays its module load (the first live read
+        // measured 56 ms against ~4 ms warm), and that belongs to startup.
+        for (c, m) in &models {
+            let ids = [1u32, 2, 3, 4, 5, 6];
+            let seq = paddock_engine::gpu_model::laya::LayaSeq {
+                ids: &ids,
+                markers: &[2, 4],
+                qtype: paddock_models::laya::QTYPE_CHOICE,
+            };
+            m.forward(&mut ws, std::slice::from_ref(&seq))
+                .map_err(|e| format!("laya {} warm-up: {e}", c.name()))?;
+        }
+        Ok((models, ws))
+    })
+    .map_err(ServeError::Engine)?;
+    Ok(LayaModel::new(id, decider, toks))
+}
+
 /// The image-generation served model (Qwen-Image): serves `/v1/images/*`
 /// only. Three files - the DiT GGUF, the Qwen3-VL text-encoder GGUF and the
 /// VAE safetensors - behind one engine thread; the tokenizer is the text
@@ -1136,7 +1234,7 @@ static DEVICE_CC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 
 /// Called by every executor constructor, for the reason `make_exec` gives
 /// about the VRAM budget: put it where a new family arm cannot forget it.
-fn note_device_cc(exec: &paddock_engine::gpu::GpuExecutor) {
+pub(crate) fn note_device_cc(exec: &paddock_engine::gpu::GpuExecutor) {
     let (major, minor) = exec.compute_capability();
     DEVICE_CC.store(major * 100 + minor, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1724,6 +1822,8 @@ pub(crate) fn load_with_residency(
             && (arch == "qwen35"
                 || arch == "qwen35moe"
                 || arch == "gemma4"
+                // the gemma4 body again, with its own converted tower
+                || arch == "diffusion-gemma"
                 || arch == "muse-glimmer"
                 || arch == "granite"
                 || arch == "deepseek2-ocr"
@@ -1908,7 +2008,9 @@ fn load_hf_dir(
         });
     let bonsai = model_type == "prism_hadamard_qwen35";
     let supports_vision = device == "metal"
-        && (splash || bonsai || matches!(arch.as_str(), "gemma4" | "muse-glimmer"));
+        && (splash
+            || bonsai
+            || matches!(arch.as_str(), "gemma4" | "muse-glimmer" | "diffusion-gemma"));
     let image_pad_id = if supports_vision {
         tokenizer.token_to_id(if splash || bonsai {
             "<|image_pad|>"
@@ -1996,30 +2098,43 @@ fn build_engine(
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
 ) -> Result<crate::generation_residency::Handle, ServeError> {
-    let reservation = if residency.is_some() {
+    let (residency, reservation) = if let Some(options) = residency {
         if arch != "diffusion-gemma"
             || device != "metal"
-            || mmproj.is_some()
             || mtp.is_some()
             || pack.is_some()
             || fp8_native.is_some()
             || max_image_tokens.is_some()
         {
-            return Err(ServeError::Engine("text-engine residency currently supports native Metal DiffusionGemma without companions".into()));
+            return Err(ServeError::Engine("text-engine residency currently supports native Metal DiffusionGemma and its vision companion".into()));
         }
         #[cfg(all(feature = "metal", target_os = "macos"))]
         {
-            paddock_metal::Gemma4::diffusion_residency_bytes(&path, max_ctx, max_batch)
+            let vision = (path.is_dir() || mmproj.is_some())
+                .then(paddock_metal::Gemma4::diffusion_vision_budget);
+            let options = options
+                .with_vision(mmproj.as_deref(), vision)
+                .map_err(ServeError::Engine)?;
+            let companion_bytes = mmproj
+                .as_ref()
+                .map(|p| std::fs::metadata(p).map(|m| m.len() + (1 << 30)))
+                .transpose()
                 .map_err(|e| ServeError::Engine(e.to_string()))?
+                .unwrap_or(0);
+            let bytes = paddock_metal::Gemma4::diffusion_residency_bytes(&path, max_ctx, max_batch)
+                .map_err(|e| ServeError::Engine(e.to_string()))?
+                + companion_bytes;
+            (Some(options), bytes)
         }
         #[cfg(not(all(feature = "metal", target_os = "macos")))]
         {
+            let _ = options;
             return Err(ServeError::Engine(
                 "DiffusionGemma residency requires a Metal build".into(),
             ));
         }
     } else {
-        0
+        (None, 0)
     };
     let resident_path = path.clone();
     let resident_device = device.to_owned();
@@ -2137,11 +2252,20 @@ fn build_generator(
                     .map_err(|e| e.to_string());
             }
             if arch == "diffusion-gemma" {
-                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
-                    return Err("DiffusionGemma Metal currently implements text diffusion; vision companions, speculative drafters and CUDA packs are not supported".into());
+                if mtp.is_some()
+                    || fp8_native.is_some()
+                    || pack.is_some()
+                    || (path.is_dir() && mmproj.is_some())
+                {
+                    return Err("DiffusionGemma uses its own denoising sampler, not speculative drafters or CUDA packs; MLX uses its embedded vision tower".into());
                 }
                 return paddock_metal::Gemma4::load(path, max_ctx, max_batch, vram_budget)
-                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .and_then(|mut m| {
+                        if let Some(mp) = mmproj {
+                            m.attach_vision(mp)?;
+                        }
+                        Ok(Box::new(m) as Box<dyn Generator>)
+                    })
                     .map_err(|e| e.to_string());
             }
             if arch == "qwen4exp" && path.is_dir() {

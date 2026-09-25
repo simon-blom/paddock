@@ -1126,16 +1126,51 @@ __device__ __forceinline__ float pd_kq_w4a8_row_acc(
     return acc;
 }
 
-template <uint32_t ROWS, uint32_t NT = 256u>
+// ROW-BLOCK PREFETCH (the PF arms of the three decode GEMVs below). A CTA's
+// rows are contiguous in the repacked plane - [r0, r0 + nr) is one span of
+// data rows and one of scale records - so thread 0 hands both spans to L2 as
+// bulk prefetches before the x staging, and the warps' 16-byte loads then
+// hit lines already in flight. GB10 (48 SMs, LPDDR5X ~273 GB/s), UD-IQ3_XXS
+// Q6_K planes, DRAM-cold (bench/fn_dense_gemv_gb10_bench.cu): 178-192 -> 211-
+// 239 GB/s at every decode shape, lm_head 2.96 -> 2.30 ms, +9.2% Flash-Next
+// decode on the wall; the same fix as the b=1 nvf4 gemv's (landed
+// 2026-09-10). What it hides is the staging prologue: a CTA's first weight
+// load used to wait for the x staging and its barrier. Byte-identical: a
+// hint, no data dependency - and issued ahead of the PDL wait, since the
+// weights are no predecessor's output. Elected on small dies
+// (pd_kq_gemv_pf_on).
+__device__ __forceinline__ void pd_kq_pf_rows(const uint8_t* data, const uint8_t* scales,
+                                              uint32_t r0, uint32_t nr, uint32_t n_super,
+                                              uint32_t datab) {
+    pd_l2_prefetch_bulk(data + (size_t)r0 * n_super * datab, nr * n_super * datab);
+    pd_l2_prefetch_bulk(scales + (size_t)r0 * n_super * PD_KQ_SCB, nr * n_super * PD_KQ_SCB);
+}
+
+// one segment's share [max(r0, base), min(r1, base + od)) of a CTA's rows
+__device__ __forceinline__ void pd_kq_pf_seg(const uint8_t* data, const uint8_t* scales,
+                                             uint32_t od, uint32_t dtype, uint32_t base,
+                                             uint32_t r0, uint32_t r1, uint32_t n_super) {
+    const uint32_t end = base + od;
+    const uint32_t a = r0 > base ? r0 : base, b = r1 < end ? r1 : end;
+    if (a < b) pd_kq_pf_rows(data, scales, a - base, b - a, n_super, pd_kq_datab(dtype));
+}
+
+template <uint32_t ROWS, uint32_t NT = 256u, bool PF = false>
 __global__ void __launch_bounds__(NT) pd_kquant_gemv_w4a8_kernel(
         const uint8_t* __restrict__ data, const uint8_t* __restrict__ scales,
         const int8_t* __restrict__ xq, const float* __restrict__ xs,
         const float* __restrict__ xsums, float* __restrict__ y,
         uint32_t in_dim, uint32_t out_dim, uint32_t dtype) {
+    if (PF && threadIdx.x == 0u) {
+        const uint32_t r0 = blockIdx.x * ROWS;
+        if (r0 < out_dim)
+            pd_kq_pf_rows(data, scales, r0, out_dim - r0 < ROWS ? out_dim - r0 : ROWS,
+                          in_dim >> 8u, pd_kq_datab(dtype));
+    }
     //  PDL cascade (launched via pd_pdl_go): every input here (xq/xs/
-    // xsums) is the predecessor quantize's output, so the arm sits at the very
-    // top - no dep-free prologue to hide, the win is launch-ramp overlap.
-    // No-op under plain launches and below sm_90.
+    // xsums) is the predecessor quantize's output, so the arm sits right
+    // after the weight prefetch - the one dep-free prologue; the rest of the
+    // win is launch-ramp overlap. No-op under plain launches and below sm_90.
     PD_PDL_ARM();
     constexpr uint32_t TPR = NT / ROWS;            // threads per row
     const uint32_t tid = threadIdx.x;
@@ -1204,6 +1239,30 @@ static inline uint32_t pd_kq_smem_per_sm() {
     return (uint32_t)v;
 }
 
+// The PF election (the row-block prefetch above, pd_gemv_pf_elect's
+// small-die rule); PADDOCK_KQ_GEMV_PF=0|1 pins it. Not PD_EXPORT, as below.
+static inline bool pd_kq_gemv_pf_on() {
+    static const bool on = pd_gemv_pf_elect(pd_env("PADDOCK_KQ_GEMV_PF"));
+    return on;
+}
+
+// one single-plane launch at (4 rows, NT), the PF arm per the election
+template <uint32_t NT>
+static inline void pd_kq_gemv_go(uint32_t smem, cudaStream_t st, const void* data,
+                                 const void* scales, const void* xq, const void* xs,
+                                 const void* xsums, void* y, uint32_t in_dim,
+                                 uint32_t out_dim, uint32_t dtype) {
+    const uint32_t grid = (out_dim + 3u) / 4u;
+    if (pd_kq_gemv_pf_on())
+        pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, NT, true>, grid, NT, smem, st,
+            (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
+            (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim, dtype);
+    else
+        pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, NT, false>, grid, NT, smem, st,
+            (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
+            (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim, dtype);
+}
+
 int pd_kquant_gemv_w4a8(const void* data, const void* scales, const void* xq,
                         const void* xs, const void* xsums, void* y,
                         uint32_t in_dim, uint32_t out_dim, uint32_t dtype,
@@ -1252,37 +1311,21 @@ int pd_kquant_gemv_w4a8(const void* data, const void* scales, const void* xq,
                 const uint32_t res = (bsm < cap ? bsm : cap) * nt;
                 if (res > res_best) { res_best = res; nt_best = nt; }
             }
-            if (nt_best == 512u) {
-                pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, 512u>, (out_dim + 3u) / 4u, 512, smem, st,
-                    (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
-                    (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim,
-                    dtype);
-            } else if (nt_best == 256u) {
-                pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, 256u>, (out_dim + 3u) / 4u, 256, smem, st,
-                    (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
-                    (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim,
-                    dtype);
-            } else {
-                pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, 128u>, (out_dim + 3u) / 4u, 128, smem, st,
-                    (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
-                    (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim,
-                    dtype);
-            }
+            if (nt_best == 512u)
+                pd_kq_gemv_go<512u>(smem, st, data, scales, xq, xs, xsums, y, in_dim, out_dim, dtype);
+            else if (nt_best == 256u)
+                pd_kq_gemv_go<256u>(smem, st, data, scales, xq, xs, xsums, y, in_dim, out_dim, dtype);
+            else
+                pd_kq_gemv_go<128u>(smem, st, data, scales, xq, xs, xsums, y, in_dim, out_dim, dtype);
         } else {
-            pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, 256u>, (out_dim + 3u) / 4u, 256, smem, st,
-                (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
-                (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim,
-                dtype);
+            pd_kq_gemv_go<256u>(smem, st, data, scales, xq, xs, xsums, y, in_dim, out_dim, dtype);
         }
     } else {
         // 4 rows/512 threads beat the old 2 rows/256 threads on granite-30b's
         // k (-12%, ROWS=4/NT=512 vs ROWS=2/NT=256) and tied on v (both real
         // shapes, same bench) -- a dtype-agnostic win in this bucket, unlike
         // the >=2048 bucket above where Q4_K and Q6_K want different NT.
-        pd_pdl_go(pd_kquant_gemv_w4a8_kernel<4u, 512u>, (out_dim + 3u) / 4u, 512, smem, st,
-            (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq,
-            (const float*)xs, (const float*)xsums, (float*)y, in_dim, out_dim,
-            dtype);
+        pd_kq_gemv_go<512u>(smem, st, data, scales, xq, xs, xsums, y, in_dim, out_dim, dtype);
     }
     return pd_launch_status();
 }
@@ -1319,11 +1362,20 @@ struct PdKqGemvSeg {
 };
 struct PdKqGemvSegs3 { PdKqGemvSeg s[3]; };
 
-template <uint32_t ROWS, uint32_t NT>
+template <uint32_t ROWS, uint32_t NT, bool PF = false>
 __global__ void __launch_bounds__(NT) pd_kquant_gemv_w4a8_multi_kernel(
         PdKqGemvSegs3 segs, const int8_t* __restrict__ xq,
         const float* __restrict__ xs, const float* __restrict__ xsums,
         uint32_t in_dim) {
+    if (PF && threadIdx.x == 0u) {
+        // a CTA's rows may straddle a segment boundary: each side its own
+        // span (constant-index resolve, the STACK trap below)
+        const uint32_t r0 = blockIdx.x * ROWS, r1 = r0 + ROWS, ns = in_dim >> 8u;
+        const uint32_t b1 = segs.s[0].out_dim, b2 = b1 + segs.s[1].out_dim;
+        pd_kq_pf_seg(segs.s[0].data, segs.s[0].scales, segs.s[0].out_dim, segs.s[0].dtype, 0u, r0, r1, ns);
+        pd_kq_pf_seg(segs.s[1].data, segs.s[1].scales, segs.s[1].out_dim, segs.s[1].dtype, b1, r0, r1, ns);
+        pd_kq_pf_seg(segs.s[2].data, segs.s[2].scales, segs.s[2].out_dim, segs.s[2].dtype, b2, r0, r1, ns);
+    }
     PD_PDL_ARM();
     constexpr uint32_t TPR = NT / ROWS;
     const uint32_t tid = threadIdx.x;
@@ -1453,9 +1505,14 @@ int pd_kquant_gemv_w4a8_multi(
     // at TPR=32 instead of their solo 128 - merged-grid economics beat the
     // small planes' solo election (bench: split QKV 22.6 us, merged measured
     // in the bench's multi section).
-    pd_pdl_go(pd_kquant_gemv_w4a8_multi_kernel<4u, 128u>, (total + 3u) / 4u, 128,
-              smem, (cudaStream_t)stream, segs, (const int8_t*)xq,
-              (const float*)xs, (const float*)(mu ? xsums : nullptr), in_dim);
+    if (pd_kq_gemv_pf_on())
+        pd_pdl_go(pd_kquant_gemv_w4a8_multi_kernel<4u, 128u, true>, (total + 3u) / 4u, 128,
+                  smem, (cudaStream_t)stream, segs, (const int8_t*)xq,
+                  (const float*)xs, (const float*)(mu ? xsums : nullptr), in_dim);
+    else
+        pd_pdl_go(pd_kquant_gemv_w4a8_multi_kernel<4u, 128u, false>, (total + 3u) / 4u, 128,
+                  smem, (cudaStream_t)stream, segs, (const int8_t*)xq,
+                  (const float*)xs, (const float*)(mu ? xsums : nullptr), in_dim);
     return pd_launch_status();
 }
 
@@ -1596,12 +1653,18 @@ __device__ __forceinline__ uint32_t pd_kgn_swz(uint32_t i4) {
 // cycle, and small enough that r=5 stays under the 48 KB default window.
 #define PD_KGN_WIN 4096u
 
-template <uint32_t ROWS, uint32_t NCOLS>
+template <uint32_t ROWS, uint32_t NCOLS, bool PF = false>
 __global__ void __launch_bounds__(256) pd_kquant_gemv_w4a8_nc_kernel(
         const uint8_t* __restrict__ data, const uint8_t* __restrict__ scales,
         const int8_t* __restrict__ xq, const float* __restrict__ xs,
         const float* __restrict__ xsums, float* __restrict__ y,
         uint32_t in_dim, uint32_t out_dim, uint32_t dtype) {
+    if (PF && threadIdx.x == 0u) {
+        const uint32_t r0 = blockIdx.x * ROWS;
+        if (r0 < out_dim)
+            pd_kq_pf_rows(data, scales, r0, out_dim - r0 < ROWS ? out_dim - r0 : ROWS,
+                          in_dim >> 8u, pd_kq_datab(dtype));
+    }
     constexpr uint32_t TPR = 256u / ROWS;          // threads per row
     // NCOLS >= 4: the Q4/Q5 mu term folds once per (row, sub-block) in a
     // separate pass instead of inline per chunk - the inline fold's 2 ssm
@@ -1932,13 +1995,21 @@ int pd_kquant_gemv_w4a8_nc(const void* data, const void* scales, const void* xq,
     const uint32_t w = in_dim < PD_KGN_WIN ? in_dim : PD_KGN_WIN;
     const uint32_t smem = ncols * (w + (w >> 3u) + (mu ? w >> 2u : 0u));
     cudaStream_t st = (cudaStream_t)stream;
+    const bool pf = pd_kq_gemv_pf_on();
     #define PD_KGN_LAUNCH(RV, NCV)                                                \
         do {                                                                      \
-            pd_kquant_gemv_w4a8_nc_kernel<RV, NCV>                                \
-                <<<(out_dim + RV - 1u) / RV, 256, smem, st>>>(                    \
-                    (const uint8_t*)data, (const uint8_t*)scales,                 \
-                    (const int8_t*)xq, (const float*)xs, (const float*)xsums,     \
-                    (float*)y, in_dim, out_dim, dtype);                           \
+            if (pf)                                                               \
+                pd_kquant_gemv_w4a8_nc_kernel<RV, NCV, true>                      \
+                    <<<(out_dim + RV - 1u) / RV, 256, smem, st>>>(                \
+                        (const uint8_t*)data, (const uint8_t*)scales,             \
+                        (const int8_t*)xq, (const float*)xs, (const float*)xsums, \
+                        (float*)y, in_dim, out_dim, dtype);                       \
+            else                                                                  \
+                pd_kquant_gemv_w4a8_nc_kernel<RV, NCV, false>                     \
+                    <<<(out_dim + RV - 1u) / RV, 256, smem, st>>>(                \
+                        (const uint8_t*)data, (const uint8_t*)scales,             \
+                        (const int8_t*)xq, (const float*)xs, (const float*)xsums, \
+                        (float*)y, in_dim, out_dim, dtype);                       \
         } while (0)
     #define PD_KGN_ROWS(NCV)                                                      \
         do {                                                                      \

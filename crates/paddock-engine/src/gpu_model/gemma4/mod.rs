@@ -1296,6 +1296,19 @@ impl Generator for GpuGemma4 {
             .map_err(gen_err)
     }
 
+    fn canvas_read_steps(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        label_ids: &[u32],
+        steps: u32,
+        pinned: &[u32],
+        seed: u64,
+    ) -> Result<crate::generator::CanvasReadOut, GenError> {
+        self.canvas_read_steps_impl(base, canvas, label_ids, steps, pinned, seed)
+            .map_err(gen_err)
+    }
+
     fn canvas_max_steps(&self) -> u32 {
         self.diffusion_config().map_or(0, |c| c.max_steps)
     }
@@ -1310,6 +1323,14 @@ impl Generator for GpuGemma4 {
 
     fn canvas_set(&mut self, h: usize, ids: &[u32]) -> Result<(), GenError> {
         self.canvas_set_impl(h, ids).map_err(gen_err)
+    }
+
+    fn canvas_pin(&mut self, h: usize, positions: &[u32], ids: &[u32]) -> Result<(), GenError> {
+        self.canvas_pin_impl(h, positions, ids).map_err(gen_err)
+    }
+
+    fn canvas_pins(&self) -> bool {
+        self.diffusion.is_some()
     }
 
     fn canvas_close(&mut self, h: usize) {

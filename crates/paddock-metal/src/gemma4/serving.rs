@@ -117,6 +117,61 @@ impl Generator for Gemma4 {
     fn canvas_set(&mut self, h: usize, ids: &[u32]) -> std::result::Result<(), GenError> {
         Ok(self.set_canvas(h, ids)?)
     }
+    fn canvas_pins(&self) -> bool {
+        self.diffusion.is_some()
+    }
+    fn canvas_pin(
+        &mut self,
+        h: usize,
+        positions: &[u32],
+        ids: &[u32],
+    ) -> std::result::Result<(), GenError> {
+        Ok(self.pin_canvas(h, positions, ids)?)
+    }
+    fn canvas_read_steps(
+        &mut self,
+        base: usize,
+        canvas: &[u32],
+        labels: &[u32],
+        steps: u32,
+        pinned: &[u32],
+        seed: u64,
+    ) -> std::result::Result<paddock_engine::generator::CanvasReadOut, GenError> {
+        if steps > paddock_engine::service::READ_MAX_STEPS
+            || pinned.iter().any(|&p| p as usize >= canvas.len())
+        {
+            return Err(GenError::Backend(
+                "invalid structured-read steps or pins".into(),
+            ));
+        }
+        let h = self.open_canvas(canvas.len())?;
+        let result = (|| {
+            self.set_canvas(h, canvas)?;
+            let pins: Vec<_> = pinned.iter().map(|&p| canvas[p as usize]).collect();
+            for _ in 1..steps.max(1) {
+                self.tick_canvases(&[paddock_engine::generator::CanvasTickReq {
+                    handle: h,
+                    slot: 0,
+                    base,
+                    temperature: None,
+                    seed,
+                    accept: true,
+                }])?;
+                self.pin_canvas(h, pinned, &pins)?;
+            }
+            self.tick_canvases(&[paddock_engine::generator::CanvasTickReq {
+                handle: h,
+                slot: 0,
+                base,
+                temperature: Some(1.),
+                seed,
+                accept: false,
+            }])?;
+            self.canvas_output(h, labels)
+        })();
+        self.close_canvas(h);
+        Ok(result?)
+    }
     fn canvas_close(&mut self, h: usize) {
         self.close_canvas(h);
     }

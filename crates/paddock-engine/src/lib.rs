@@ -15,6 +15,8 @@ pub mod audio;
 pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod decision;
 pub mod encoder;
 pub mod envset;
 pub mod generator;

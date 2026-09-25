@@ -646,6 +646,14 @@ extern "C" int pd_q4x_qsa_combine(const void*, const void*, void*, uint32_t, uin
 extern "C" int pd_q4x_qsa_logits_mma(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_qsa_attn_mma(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 extern "C" int pd_kquant_moe_down_mma_e_tail(void);
+extern "C" int pd_f16_gemm_h_relu(const void*, const void*, void*, const void*, unsigned int, unsigned int, unsigned int, void*);
+extern "C" int pd_f16_gemm_h_geglu(const void*, const void*, void*, unsigned int, unsigned int, unsigned int, void*);
+extern "C" int pd_enc_attn_h(const void*, const void*, const void*, uint32_t, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_enc_embed_ln(const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, float, void*);
+extern "C" int pd_laya_head_entry(void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+extern "C" int pd_gather_rows(const void*, const void*, void*, uint32_t, uint32_t, void*);
+extern "C" int pd_laya_rowdot(const void*, const void*, float, void*, uint32_t, uint32_t, void*);
+extern "C" int pd_laya_act_head(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 
 static const KernelTableV1 PD_KERNELS = {
     (uint32_t)sizeof(KernelTableV1),
@@ -1693,6 +1701,18 @@ static const KernelTableV1 PD_KERNELS = {
     pd_q4x_qsa_attn_mma,
     // 670: QSA block scores on tensor cores (attn/qsa.cuh)
     pd_q4x_qsa_logits_mma,
+    // 671-672: the f16 landing's bias+ReLU and GEGLU epilogues (gemm/f16_dense.cuh)
+    pd_f16_gemm_h_relu,
+    pd_f16_gemm_h_geglu,
+    // 673: packed variable-length bidirectional attention (attn/varlen.cuh)
+    pd_enc_attn_h,
+    // 674-678: text-encoder seams - ModernBERT embed+norm, the Laya decision
+    // head's entry, row gather, scorer dot and act head (encoder.cuh)
+    pd_enc_embed_ln,
+    pd_laya_head_entry,
+    pd_gather_rows,
+    pd_laya_rowdot,
+    pd_laya_act_head,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

@@ -371,6 +371,7 @@ pub async fn run(
     // are generative and serve chat/completions.
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
     let mut segmenter = None;
+    let mut laya = None;
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
@@ -497,6 +498,34 @@ pub async fn run(
             )?;
             tracing::info!(model = %m.id, "image-generation model ready");
             image = Some(m);
+        } else if let Some(dir) = serving::laya_dir(path) {
+            // A decision model (Laya): typed questions in, calibrated answers
+            // out, /v1/systemone and nothing else. The bundle directory holds
+            // up to three checkpoints (English at its root, multilingual and
+            // typed-decisions beside it) behind the reference's language
+            // router; its honest id is the directory's name.
+            let dir_id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(id);
+            let m = serving::load_laya(
+                cfg.served_model_name.clone().unwrap_or(dir_id),
+                &dir,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            // the loader's own count of what it put on the device - the
+            // catalog's measured weight / workspace figures are these
+            tracing::info!(
+                model = %m.id,
+                checkpoints = ?m.checkpoints().iter().map(|c| c.name()).collect::<Vec<_>>(),
+                weight_bytes = m.decider.info().weight_bytes,
+                workspace_bytes = m.decider.info().workspace_bytes,
+                "decision model ready"
+            );
+            laya = Some(m);
         } else if let Some(dir) = serving::segment_dir(path) {
             // Dense prediction (tic-forestry: DINOv3 + decoder): chips in,
             // rasters out, /v1/segmentations and nothing else. Like the
@@ -934,6 +963,7 @@ pub async fn run(
         asr,
         aligner,
         segmenter,
+        laya,
         image,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,
