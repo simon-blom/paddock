@@ -66,6 +66,9 @@ paddock.db*
 # Local machine dev config (machine-specific paths)
 paddock.toml
 
+# Local two-node TP operator config; keep the portable template tracked.
+/docs/tp/qwen38-tp2-two-node.env
+
 crates/paddock-runner/tests/python/__pycache__/
 
 # manager runtime logs (paddock writes these next to the data dir when run
