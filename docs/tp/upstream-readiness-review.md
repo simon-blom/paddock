@@ -685,3 +685,31 @@ revalidation required: the two-Spark graph-mode pair (coordinator
 `PADDOCK_TP_GRAPH=1` with a worker whose local value is unset/`0`) rerun
 against the corrected execution-mode state before any further graph-path
 acceptance claim.
+
+---
+
+## 21. Target revalidation of corrected I4 graph execution
+
+Follow-up target revalidation was run from `c24966208249746d46084b42c078323a60e5fb73` on the same two-DGX-Spark topology. The corrected design is runtime state: `TpInit.use_graphs` is resolved by rank 0, both rank-local `Qwen35TpRank` instances call `enable_tp_graphs()`, and successful capture sets the stored `graphs_enabled=true`; token execution then uses that stored state rather than rereading the worker environment.
+
+### Identity and transport
+
+- rank 0/head: `gx10-d28a` / `192.168.100.10`; rank 1/worker: `gx10-d28b` / `192.168.100.11`;
+- checkpoint SHA-256 (both nodes): `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`;
+- freshly rebuilt CUDA pack `pd-cuda-sm120.so` SHA-256 (both nodes): `70b069faba0a1ba078af30bcbbc2ee0461cb0124726a7553708443bd919a00f3`;
+- release runner SHA-256 (both nodes): `68f70d3c1590def934fbf96eee8145906bb7d7157691b7df3658d0cc6171685c`;
+- `qwen35_two_slot_oracle` SHA-256 (both nodes): `c7a842b406bc9a19547b555d0512d19150e973c0d676221240f5076791fbd742`;
+- CUDA toolkit `13.0`; NVIDIA driver `580.173.02`; NCCL `2.30.4+cuda13.2`;
+- NCCL/RoCE pins on both ranks: `NCCL_SOCKET_IFNAME=enp1s0f0np0`, `NCCL_IB_HCA=rocep1s0f0`, `NCCL_IB_DISABLE=0`, `NCCL_NET=IB`.
+
+### I4 corrected execution gate: PASS
+
+A normal two-node TP=2 serve used the supported explicit `--tp-worker` path, `--max-batch 2`, F16 KV, and no speculation. Rank 0 explicitly set `PADDOCK_TP_GRAPH=1`; rank 1 explicitly set the deliberately conflicting local value `PADDOCK_TP_GRAPH=0` and did not force graph execution. The service completed three HTTP completions: two concurrent requests returned HTTP 200 with 12 generated tokens each, and a separate 361-token prompt returned HTTP 200 with 20 generated tokens, crossing the 16-token logical KV page boundary. The coordinator log recorded TP decode-pipe begin/drain events for the concurrent and boundary requests. Both ranks participated in bootstrap, model load, graph setup, multi-token decode and the same NCCL sequence; no collective mismatch, timeout/hang, graph capture/replay failure, mirror mismatch, panic, or exit 139 was observed. Rank 0 and rank 1 exited 0 after coordinated shutdown; the worker exposed no API.
+
+This is behavioral evidence that rank 1 executed the coordinator's `TpInit`-selected graph mode despite its conflicting local environment. The serving logs do not expose a graph-count counter, so no graph-count claim is made beyond successful setup and multi-token execution.
+
+### Two-slot oracle: PASS
+
+The freshly matching `qwen35_two_slot_oracle` completed normally with `PADDOCK_NO_SPEC=1` and exited 0 on both ranks. Its scripted interleaved two-slot lifecycle covered admission and decode, cancellation, synchronized slot release, reuse/readmission, flush/reset replay, and the final rank-1 shutdown handshake; the output included all three scripted replay segments and both rank processes exited cleanly. The earlier auxiliary stall was not reproduced.
+
+The corrected I4 target gate and the retained two-slot oracle now close the target revalidation required by section 20. No technical blocker remains before history regroup/rebase; no source architecture or product code was changed for this validation.
