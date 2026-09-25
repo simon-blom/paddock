@@ -108,6 +108,14 @@ pub struct Cli {
     /// Rank-0 control-plane TCP port (default 11560).
     #[arg(long, value_name = "PORT")]
     pub tp_master_port: Option<u16>,
+    /// Explicit worker mode: start this process as the rank-1 TP worker of a
+    /// two-node pair, mirroring a coordinator started separately (e.g. via
+    /// SSH on the other node). Takes the rank-0 address/port from
+    /// `--tp-master-addr`/`--tp-master-port` (or the `PADDOCK_TP_*` env
+    /// equivalents), the model and CUDA pack from `--model`/`--kernel-pack`
+    /// (or `PADDOCK_TP_MODEL`/`PADDOCK_TP_PACK`). Serves no API.
+    #[arg(long)]
+    pub tp_worker: bool,
     /// Kernel pack path. Only needed by a build that has no kernels of its
     /// own - see --capabilities - and it OVERRIDES built-in kernels when both
     /// exist, which is how a bring-up campaign runs an architecture the
@@ -844,6 +852,51 @@ pub fn capabilities() -> String {
     .to_string()
 }
 
+/// Pure TP=2 configuration gate, split from `run` so the accepted and refused
+/// combinations are host-testable (I1: speculation + `fp8_e4m3` KV is an
+/// accepted combination - the spec path runs the resolved-dtype KV ops with no
+/// F16-only assumption; its combined-path target validation is tracked in
+/// docs/tp/upstream-readiness-review.md).
+fn tp2_config_supported(cfg: &Config) -> bool {
+    cfg.device == "cuda"
+        && (1..=2).contains(&cfg.max_batch)
+        // TP=2 now has the scheduler-owned n-gram speculative path;
+        // require an explicit policy so an unsupported/default lane cannot
+        // silently change topology. `--spec on` is the bring-up spelling.
+        && (cfg.no_spec || cfg.spec.as_deref() == Some("off") || cfg.spec.is_some())
+        && !cfg.kv_offload.enabled
+        && !cfg.moe_offload.enabled
+        && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16" | "fp8_e4m3")
+        && cfg.mmproj.is_none()
+        && cfg.mtp.is_none()
+        && cfg.fp8_native.is_none()
+        && cfg.model.as_ref().is_some_and(|p| p.is_file())
+        && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file())
+}
+
+/// Shared rank-1 runtime: dial the coordinator and run the mirror loop. Both
+/// the coordinator-spawned child and the explicit `--tp-worker` operator mode
+/// converge here, so the two startup paths cannot drift apart.
+fn tp_worker_runtime(
+    resolved: &paddock_dist::config::Resolved,
+    model: &std::path::Path,
+    pack: &std::path::Path,
+) -> std::process::ExitCode {
+    match paddock_dist::worker::connect_worker(resolved)
+        .map_err(|e| e.to_string())
+        .and_then(|(stream, _)| {
+            paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
+                stream, resolved, model, pack, 0,
+            )
+        }) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "tensor-parallel worker failed");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 pub fn run() -> std::process::ExitCode {
     // llama.cpp writes multi-char SHORT options (-ngl, -fa, -np, ...) that a
     // clap parser reads as clustered single-char shorts (-n gl). Rewrite the
@@ -926,25 +979,88 @@ pub fn run() -> std::process::ExitCode {
                 };
                 let model = std::path::PathBuf::from(model);
                 let pack = std::path::PathBuf::from(pack);
-                return match paddock_dist::worker::connect_worker(&r)
-                    .map_err(|e| e.to_string())
-                    .and_then(|(stream, _)| {
-                        paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
-                            stream, &r, &model, &pack, 0,
-                        )
-                    }) {
-                    Ok(()) => std::process::ExitCode::SUCCESS,
-                    Err(e) => {
-                        tracing::error!(error = %e, "tensor-parallel worker failed");
-                        std::process::ExitCode::FAILURE
-                    }
-                };
+                return tp_worker_runtime(&r, &model, &pack);
             }
             _ => {
                 eprintln!(
                     "config error: PADDOCK_TP_WORKER_CHILD is set but the rank env is not a \
                      valid rank-1 worker configuration - refusing to serve as a fallback"
                 );
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
+    // --- Tensor-parallel worker, explicit operator mode ---------------------
+    //
+    // `--tp-worker` is the supported way to start rank 1 by hand on a second
+    // node (e.g. over SSH) while the coordinator is started separately on the
+    // first. Same worker core as the spawned child above; configuration comes
+    // from the ordinary CLI/env surface instead of the coordinator's private
+    // worker-env marker, so an operator never sets a variable documented as
+    // spawn-only. serving_mode = false: this process serves no API.
+    if cli.tp_worker {
+        paddock_admin::logging::init(None);
+        // `--tp-worker` MEANS rank 1 of 2: the role is forced, not inferred,
+        // so `--tp-rank 0 --tp-worker` cannot resolve into a coordinator.
+        // Only the dial target stays operator-configured.
+        let tp = paddock_dist::config::ParallelConfig {
+            tp_size: Some(2),
+            rank: Some(1),
+            master_addr: cli.tp_master_addr.clone(),
+            master_port: cli.tp_master_port,
+        };
+        match tp.resolved(false) {
+            Ok(Some(r)) if r.is_worker() => {
+                // Inputs may come from the ordinary CLI flags or, for parity
+                // with the spawn path, the TP env fallbacks. Rank/world are
+                // forced: `--tp-worker` MEANS rank 1 of 2.
+                let model = cli
+                    .model
+                    .clone()
+                    .or_else(|| std::env::var_os("PADDOCK_TP_MODEL").map(Into::into));
+                let pack = cli
+                    .kernel_pack
+                    .clone()
+                    .or_else(|| std::env::var_os("PADDOCK_TP_PACK").map(Into::into));
+                let (Some(model), Some(pack)) = (model, pack) else {
+                    eprintln!(
+                        "--tp-worker requires --model and --kernel-pack (or \
+                         PADDOCK_TP_MODEL / PADDOCK_TP_PACK) pointing at the same files \
+                         the coordinator serves"
+                    );
+                    return std::process::ExitCode::from(2);
+                };
+                // Pre-flight before dialing: a worker that will fail on load
+                // must say so immediately with an actionable message, not
+                // burn the coordinator's accept window.
+                if !model.is_file() {
+                    eprintln!("--tp-worker model not found: {}", model.display());
+                    return std::process::ExitCode::from(2);
+                }
+                if !pack.is_file() {
+                    eprintln!("--tp-worker kernel pack not found: {}", pack.display());
+                    return std::process::ExitCode::from(2);
+                }
+                return tp_worker_runtime(&r, &model, &pack);
+            }
+            Ok(Some(_)) => {
+                eprintln!(
+                    "config error: --tp-worker selects the rank-1 worker role; refusing to \
+                     serve an API from a worker process"
+                );
+                return std::process::ExitCode::from(2);
+            }
+            Ok(None) => {
+                eprintln!(
+                    "config error: --tp-worker needs the coordinator's address: \
+                     --tp-master-addr <coordinator IP on the RoCE fabric> (and \
+                     --tp-master-port if not the default)"
+                );
+                return std::process::ExitCode::from(2);
+            }
+            Err(e) => {
+                eprintln!("config error: {e}");
                 return std::process::ExitCode::from(2);
             }
         }
@@ -1006,21 +1122,7 @@ pub fn run() -> std::process::ExitCode {
         // resolved against THIS device engine-side (rank 0 demotes loudly to
         // f16 below sm_89, exactly like the TP=1 apply_kv_dtype path, and the
         // resolved value rides TpInit so both ranks load the same width).
-        let tp9 = cfg.device == "cuda"
-            && (1..=2).contains(&cfg.max_batch)
-            // TP=2 now has the scheduler-owned n-gram speculative path;
-            // require an explicit policy so an unsupported/default lane cannot
-            // silently change topology. `--spec on` is the bring-up spelling.
-            && (cfg.no_spec || cfg.spec.as_deref() == Some("off") || cfg.spec.is_some())
-            && !cfg.kv_offload.enabled
-            && !cfg.moe_offload.enabled
-            && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16" | "fp8_e4m3")
-            && cfg.mmproj.is_none()
-            && cfg.mtp.is_none()
-            && cfg.fp8_native.is_none()
-            && cfg.model.as_ref().is_some_and(|p| p.is_file())
-            && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file());
-        if !tp9 {
+        if !tp2_config_supported(&cfg) {
             eprintln!(
                 "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec/--spec off, or explicit --spec policy, KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
             );
@@ -1261,5 +1363,99 @@ mod tests {
                 assert!(got.is_ok(), "{flag} should be accepted");
             }
         }
+    }
+
+    // --- TP=2 configuration gate (host-pure) --------------------------------
+
+    fn gate_cli_with_model(extra: &[&str], model: &str) -> Config {
+        // Real files: the gate checks existence. Create empty stand-ins in
+        // the process temp dir (no repo-side fixture commits).
+        let tmp = std::env::temp_dir();
+        let pack = tmp.join("paddock-gate-pack.cubin");
+        std::fs::write(&pack, b"gate").expect("temp pack");
+        let pack = pack.to_string_lossy().into_owned();
+        let mut args = vec![
+            "paddock-runner",
+            "--model",
+            model,
+            "--kernel-pack",
+            pack.as_str(),
+            "--device",
+            "cuda",
+        ];
+        args.extend_from_slice(extra);
+        resolve(&Cli::parse_from(args)).expect("resolve").0
+    }
+
+    fn gate_cli(extra: &[&str]) -> Config {
+        let gguf = std::env::temp_dir().join("paddock-gate-model.gguf");
+        std::fs::write(&gguf, b"gate").expect("temp gguf");
+        gate_cli_with_model(extra, &gguf.to_string_lossy())
+    }
+
+    /// The baseline accepted TP=2 lane (F16, no spec).
+    #[test]
+    fn tp2_gate_accepts_the_baseline_lane() {
+        let cfg = gate_cli(&["--no-spec", "--max-batch", "1"]);
+        assert!(tp2_config_supported(&cfg));
+    }
+
+    /// Speculation is a valid TP=2 lane with an explicit policy (Phase 15).
+    #[test]
+    fn tp2_gate_accepts_spec_with_f16() {
+        let cfg = gate_cli(&["--spec", "on", "--max-batch", "2"]);
+        assert!(tp2_config_supported(&cfg));
+    }
+
+    /// I1: speculation + fp8_e4m3 KV is an accepted combination, not a
+    /// refused one. The spec path executes the resolved-dtype KV ops; the
+    /// combined lane's target-device validation is tracked separately.
+    #[test]
+    fn tp2_gate_accepts_spec_with_fp8_kv() {
+        let cfg = gate_cli(&[
+            "--spec",
+            "on",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--max-batch",
+            "1",
+        ]);
+        assert!(tp2_config_supported(&cfg));
+    }
+
+    /// fp8 KV alone stays accepted on the non-spec lane (Phase 12).
+    #[test]
+    fn tp2_gate_accepts_fp8_kv_non_spec() {
+        let cfg = gate_cli(&[
+            "--no-spec",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--max-batch",
+            "1",
+        ]);
+        assert!(tp2_config_supported(&cfg));
+    }
+
+    /// Unsupported combinations still fail closed, by name.
+    #[test]
+    fn tp2_gate_refuses_offload_and_missing_files() {
+        let mut cfg = gate_cli(&["--no-spec", "--max-batch", "1"]);
+        cfg.kv_offload.enabled = true;
+        assert!(!tp2_config_supported(&cfg));
+        let cfg = gate_cli(&["--no-spec", "--max-batch", "1", "--gpu", "0"]);
+        assert!(tp2_config_supported(&cfg), "--gpu alone must not refuse");
+    }
+
+    /// A model path that does not exist refuses (the gate checks file
+    /// existence; the baseline helper creates its file, this one doesn't).
+    #[test]
+    fn tp2_gate_refuses_a_missing_model_file() {
+        let missing = std::env::temp_dir().join("paddock-gate-absent.gguf");
+        let _ = std::fs::remove_file(&missing);
+        let cfg = gate_cli_with_model(
+            &["--no-spec", "--max-batch", "1"],
+            &missing.to_string_lossy(),
+        );
+        assert!(!tp2_config_supported(&cfg));
     }
 }

@@ -28,7 +28,7 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-        .unwrap()
+        .expect("non-empty logit row")
         .0 as u32
 }
 

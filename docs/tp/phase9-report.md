@@ -10,6 +10,29 @@ This lane supports one active slot, token-serial prompt processing, FP16 KV, exp
 
 ## Two-Spark gate
 
+### Supported two-node startup (upstream-readiness remediation)
+
+The operator-supported worker path is `--tp-worker`; it replaces the old
+hand-set `PADDOCK_TP_WORKER_CHILD` recipe, which was never a documented
+surface:
+
+```sh
+# worker box (192.168.100.11):
+./paddock-runner --tp-worker \
+  --model /models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --kernel-pack /packs/pd-cuda-sm120.so \
+  --tp-master-addr 192.168.100.10 --tp-master-port 11982
+
+# head box (192.168.100.10) - waits for the manual worker:
+PADDOCK_TP_NO_SPAWN=1 PADDOCK_TP_SIZE=2 PADDOCK_TP_MASTER_ADDR=0.0.0.0 \
+  ./paddock-runner --model ... --kernel-pack ...
+```
+
+`--tp-worker` requires `--model`/`--kernel-pack` (or the coordinator-spawn
+`PADDOCK_TP_MODEL`/`PADDOCK_TP_PACK` env fallbacks) and the coordinator's
+address; missing inputs fail before dialing. The spawned child and the
+manual worker run the same worker runtime.
+
 Checkpoint SHA-256 on both ranks: `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`. Pack SHA-256 on both ranks: `059bb62d2e6d863b32ac47208d29da7492618b2fa33015a3ee0ad6fe2a9c4d54`. Release runner SHA-256 on both ranks: `f5bc035c8d3b4e8efaa670766ac44e3cc45b6e5ce459533cad05d8670ebf3f5f`. Head/worker used the Phase 8 NCCL 2.30.4 aliases and the same socket/IB interface pins, with rank 0 bound to 192.168.100.10 and the second Spark reached over SSH at 192.168.100.11 (the control connection appeared to rank 0 from 192.168.100.15). Each run used `--device cuda --max-batch 1 --kv-cache-dtype f16 --no-spec` and a loopback-only HTTP API on rank 0; rank 1 used its manually started worker-child path. Sampling was greedy (`temperature=0, top_k=1`). TP=1 references were started only after both TP=2 processes exited, so the models did not compete for memory.
 
 - With max context 16, two sequential `/v1/completions` requests (`prompt="Hi", max_tokens=2`) each returned HTTP 200, text `", I"`, prompt 1 token, completion 2 tokens, finish `length`. The separately run TP=1 server returned the same text, token counts and finish reason for each request. Both TP=2 processes and the TP=1 process shut down with exit code 0. The second request exercises reset/replay, not a single long-lived KV continuation.

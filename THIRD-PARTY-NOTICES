@@ -957,6 +957,17 @@ NATIVE COMPONENTS
 These ship as binaries rather than source, and are not covered by the crate
 or npm listings above.
 
+Adapted source: ErikBPF/paddock `contrib/tp-*` (MIT OR Apache-2.0). The
+Qwen3.8 tensor-parallel primitives in `crates/paddock-engine/src/gpu_model/
+qwen35/` (tensor_slice.rs, gqa_tp.rs, ffn_tp.rs, delta_tp.rs and their
+attribution headers) are materially adapted from ErikBPF's paddock
+`contrib/tp-05/06/09/10/11/12` sketches for rank-local processes: the
+same-process `Link` transport is replaced by Paddock's `Communicator`
+(NCCL) and the rank-0-authoritative control plane. Copyright the ErikBPF
+paddock contributors; the licence is identical to Paddock's own (MIT OR
+Apache-2.0), so no additional terms apply. Zack Barra's earlier layer-split
+work in the same fork is prior-art reference only - no derived code ships.
+
 PDFium (chromium/8009). Renders PDF pages to images for the vision lane. Built from
 source and statically linked into paddock-runner - there is no separate pdfium
 library file. PDFium is BSD-3-Clause (The PDFium Authors); further third-party

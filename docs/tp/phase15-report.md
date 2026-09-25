@@ -1,6 +1,6 @@
 # Phase 15 — Qwen3.8-27B TP=2 speculative decoding
 
-Status: accepted for the pinned Qwen3.8-27B UD-Q4_K_M checkpoint, TP=2 target, scheduler-owned n-gram speculation, and F16 KV. FP8 KV remains a separate follow-up lane.
+Status: accepted for the pinned Qwen3.8-27B UD-Q4_K_M checkpoint, TP=2 target, scheduler-owned n-gram speculation, and F16 KV. (Upstream-readiness remediation: the speculation path is KV-dtype-agnostic by construction - it flows through the same `forward_token_*` pipeline, with all strides/sizes derived from the `TpInit` dtype - so the TP gate accepts speculation with `fp8_e4m3` KV too; the combined lane passed the host-side dtype audit but its dedicated two-Spark oracle run is still outstanding, see `docs/tp/upstream-readiness-review.md`.)
 
 ## Baseline topology
 

@@ -211,6 +211,15 @@ All six are in `ENV_SURFACE`; none are read anywhere outside
 
 ## 5. How to run it
 
+> Historical note (upstream-readiness remediation): the two-node worker line
+> below is the ORIGINAL Phase 2 recipe and did not work as written - a
+> manually started worker refused with `WorkerMustNotServe` unless the
+> operator also set the internal `PADDOCK_TP_WORKER_CHILD` marker plus
+> `PADDOCK_TP_MODEL`/`PADDOCK_TP_PACK`. The supported operator path is now
+> `--tp-worker` (see the current runbook in `docs/tp/phase9-report.md` or
+> `paddock.example.toml`); the lines below are kept for phase-report
+> provenance and are superseded.
+
 ```sh
 # Single box, two processes (what the smoke test ran):
 PADDOCK_PORT=11981 PADDOCK_TP_SIZE=2 PADDOCK_TP_MASTER_PORT=11982 ./paddock-runner

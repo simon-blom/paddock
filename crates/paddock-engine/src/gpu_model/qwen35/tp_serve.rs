@@ -22,7 +22,7 @@ use paddock_models::mapped::MappedGguf;
 
 use super::{
     tp_kv::{Event, MirroredKv, Operation, Snapshot},
-    tp_model::{Qwen35TpRank, TpSlotSnapshot},
+    tp_model::Qwen35TpRank,
 };
 use crate::{
     generator::{GenError, Generator, RowSample, SampledStep},
@@ -187,7 +187,9 @@ fn active_rows(
 }
 
 fn argmax_logits(logits: &[f32]) -> Result<u32, String> {
-    let first = logits.first().ok_or("TP speculative verify returned no logits")?;
+    let first = logits
+        .first()
+        .ok_or("TP speculative verify returned no logits")?;
     if !first.is_finite() {
         return Err("TP speculative verify returned non-finite logits".into());
     }
@@ -254,183 +256,6 @@ struct PipeFlight {
     mapped: bool,
 }
 
-/// Probe-only rank-local oracle for the fixed direct Stage-2 example. No
-/// checkpoint bytes cross ranks: each rank compares its own TP shard against
-/// its own reset-eager replay after the actual GPU/NCCL drain boundary.
-struct TpAcceptanceProbe {
-    eager: Option<(Snapshot, Vec<TpSlotSnapshot>)>,
-    reuse: Option<(Snapshot, Vec<TpSlotSnapshot>)>,
-    survivor: Option<TpSlotSnapshot>,
-    overlap_checked: bool,
-    reuse_checked: bool,
-    completed_logged: bool,
-    releases: usize,
-    pipe_drained: bool,
-    span_finished: bool,
-}
-
-impl TpAcceptanceProbe {
-    fn enabled() -> Option<Self> {
-        std::env::var_os("PADDOCK_TP_STATE_PROBE").map(|_| Self {
-            eager: None,
-            reuse: None,
-            survivor: None,
-            overlap_checked: false,
-            reuse_checked: false,
-            completed_logged: false,
-            releases: 0,
-            pipe_drained: false,
-            span_finished: false,
-        })
-    }
-
-    fn capture(
-        model: &Qwen35TpRank,
-        logical: &MirroredKv,
-        group: &NcclCommunicator,
-        positions: &[usize],
-    ) -> Result<(Snapshot, Vec<TpSlotSnapshot>), String> {
-        group.stream().synchronize().map_err(|e| e.to_string())?;
-        model.synchronize().map_err(|e| e.to_string())?;
-        let state = logical.snapshot();
-        let slots = positions
-            .iter()
-            .enumerate()
-            .map(|(slot, &pos)| {
-                model
-                    .slot_snapshot(slot, pos, logical.slot_blocks(slot).ok_or("probe slot invalid")?)
-                    .map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((state, slots))
-    }
-
-    fn compare(
-        rank: usize,
-        label: &str,
-        expected: &(Snapshot, Vec<TpSlotSnapshot>),
-        got: &(Snapshot, Vec<TpSlotSnapshot>),
-    ) -> Result<(), String> {
-        // Reset-eager and span enqueue allocate blocks in a different order.
-        // Compare each slot's logical table and refcount sequence, not raw
-        // physical block numbers; the owned payload below uses slot order.
-        let logical_shape = |s: &Snapshot| {
-            (s.free, s.tables.iter().map(|table| {
-                table.iter().map(|&block| s.refcounts[block as usize]).collect::<Vec<_>>()
-            }).collect::<Vec<_>>())
-        };
-        if logical_shape(&expected.0) != logical_shape(&got.0) {
-            return Err(format!("rank {rank} {label}: mirrored KV table/refcount shape diverged"));
-        }
-        for (slot, (a, b)) in expected.1.iter().zip(&got.1).enumerate() {
-            if a.blocks.len() != b.blocks.len() || a.layers.len() != b.layers.len() {
-                return Err(format!("rank {rank} {label}: slot {slot} KV membership/state shape diverged"));
-            }
-            for (layer, (x, y)) in a.layers.iter().zip(&b.layers).enumerate() {
-                if x != y {
-                    return Err(format!("rank {rank} {label}: slot {slot} payload component {layer} diverged ({} vs {})", blake3::hash(x), blake3::hash(y)));
-                }
-            }
-        }
-        println!("TP rank {rank} probe {label}: KV table and owned payload/DeltaNet state bit-identical");
-        Ok(())
-    }
-
-    fn after_batch(
-        &mut self,
-        rank: usize,
-        model: &Qwen35TpRank,
-        logical: &MirroredKv,
-        group: &NcclCommunicator,
-        positions: &[usize],
-        rows: &[(usize, u32, usize)],
-    ) -> Result<(), String> {
-        if positions.len() != 2 {
-            return Err("TP acceptance probe requires two slots".into());
-        }
-        if rows == [(1, 23, 19)] && positions == [3, 20] && self.eager.is_none() {
-            self.eager = Some(Self::capture(model, logical, group, positions)?);
-            println!("TP rank {rank} probe eager baseline captured");
-        }
-        if rows == [(1, 302, 1)] && positions == [4, 2] {
-            let got = Self::capture(model, logical, group, positions)?;
-            if let Some(expected) = &self.reuse {
-                Self::compare(rank, "release/reuse", expected, &got)?;
-                self.reuse_checked = true;
-            } else {
-                self.reuse = Some(got);
-                println!("TP rank {rank} probe reuse baseline captured");
-            }
-        }
-        if rows.len() == 2 && rows[0].0 == 0 && rows[0].2 == 3 && rows[1].0 == 1 && rows[1].2 == 20 && self.releases < 2 {
-            self.survivor = Some(Self::capture(model, logical, group, positions)?.1.remove(0));
-        }
-        if self.reuse_checked && !self.completed_logged {
-            self.complete(rank)?;
-            println!("TP rank {rank} probe complete: promotion, drain, release, and reuse verified");
-            self.completed_logged = true;
-        }
-        Ok(())
-    }
-
-    fn after_span(
-        &mut self,
-        rank: usize,
-        model: &Qwen35TpRank,
-        logical: &MirroredKv,
-        group: &NcclCommunicator,
-        positions: &[usize],
-    ) -> Result<(), String> {
-        if !self.overlap_checked && positions == [3, 20] {
-            let eager = self.eager.as_ref().ok_or("missing rank-local eager baseline")?;
-            let got = Self::capture(model, logical, group, positions)?;
-            Self::compare(rank, "span finish/promotion", eager, &got)?;
-            self.overlap_checked = true;
-        }
-        self.span_finished = true;
-        Ok(())
-    }
-
-    fn after_release(
-        &mut self,
-        rank: usize,
-        model: &Qwen35TpRank,
-        logical: &MirroredKv,
-        group: &NcclCommunicator,
-        positions: &[usize],
-    ) -> Result<(), String> {
-        if positions != [4, 0] || self.releases >= 2 {
-            return Ok(());
-        }
-        if self.releases == 1 && (!self.pipe_drained || !self.span_finished || !model.prefill_lane_done()) {
-            return Err(format!("rank {rank}: released before pipe, span, and prefill lane drained"));
-        }
-        let saved = self.survivor.take().ok_or("missing pre-release survivor snapshot")?;
-        let (_, slots) = Self::capture(model, logical, group, positions)?;
-        if saved != slots[0] || !logical.slot_blocks(1).ok_or("missing slot")?.is_empty() {
-            return Err(format!("rank {rank}: survivor/slot table changed on release"));
-        }
-        if slots[1].layers.iter().any(|bytes| bytes.iter().any(|&byte| byte != 0)) {
-            return Err(format!("rank {rank}: released decode DeltaNet state not zeroed"));
-        }
-        let lane = model.lane_slot_snapshot(1, 0, &[]).map_err(|e| e.to_string())?
-            .ok_or("missing prefill lane")?;
-        if lane.layers.iter().any(|bytes| bytes.iter().any(|&byte| byte != 0)) {
-            return Err(format!("rank {rank}: released prefill DeltaNet state not zeroed"));
-        }
-        self.releases += 1;
-        println!("TP rank {rank} probe release {}: survivor unchanged, slot table empty, both DeltaNet lanes reset after drain", self.releases);
-        Ok(())
-    }
-
-    fn complete(&self, rank: usize) -> Result<(), String> {
-        if !self.overlap_checked || !self.reuse_checked || self.releases != 2 {
-            return Err(format!("rank {rank}: incomplete direct state assertions (promotion={}, reuse={}, releases={})", self.overlap_checked, self.reuse_checked, self.releases));
-        }
-        Ok(())
-    }
-}
-
 /// Runs on the production engine thread; owns the control stream until drop.
 pub struct TpCoordinator {
     stream: TcpStream,
@@ -449,7 +274,6 @@ pub struct TpCoordinator {
     /// Shared span-done flag for the send-only proxy's `unified_span_done`
     /// (`&self`, no request round-trip). Published after every command.
     span_done: Option<Arc<std::sync::atomic::AtomicBool>>,
-    probe: Option<TpAcceptanceProbe>,
     poisoned: Option<String>,
 }
 
@@ -479,6 +303,13 @@ struct SpanFlight {
     /// Distinct slots with rows inside this span, row order. A prefill
     /// abort must not drop a slot whose rows are in flight here.
     slots: Vec<usize>,
+}
+
+/// Parse the wire KV-mirror end state on the worker side. Fails closed on
+/// any malformed value: an unparseable snapshot is a protocol mismatch, not
+/// a best-effort mirror.
+fn wire_kv_state(value: serde_json::Value) -> Result<Snapshot, String> {
+    serde_json::from_value(value).map_err(|e| format!("TP wire KV state malformed: {e}"))
 }
 
 /// Engine `DevicePlan` -> wire plan. Unsupported plans fail closed before
@@ -526,6 +357,11 @@ impl TpCoordinator {
         // what TpInit carries - rank 1 never has to know the runner's env.
         let exec = Arc::new(GpuExecutor::new(gpu, pack).map_err(|e| e.to_string())?);
         let kv_dtype = kv_dtype_serve(exec.compute_capability());
+        // Graph mode is rank-0-authoritative too (upstream-readiness I4):
+        // the resolved value rides TpInit, so a hand-started remote worker
+        // cannot disagree with the coordinator's env and mispair the
+        // graphed/eager collective sequencing.
+        let use_graphs = Qwen35TpRank::tp_graph_enabled_for_serve();
         let (checkpoint_sha256, pack_blake3) = hashes(model, pack)?;
         ControlMessage::TpInit {
             checkpoint_sha256,
@@ -533,6 +369,7 @@ impl TpCoordinator {
             max_ctx,
             slots,
             kv_dtype: kv_dtype_wire(kv_dtype).to_owned(),
+            use_graphs,
         }
         .to_stream(&mut stream)
         .map_err(|e| e.to_string())?;
@@ -553,9 +390,9 @@ impl TpCoordinator {
             .enable_prefill_lane(&group, &map)
             .map_err(|e| e.to_string())?;
         drop(map);
-        // Phase 11 Stage A opt-in: BOTH ranks must read the identical env
-        // value or the graphed/eager sequencing mispairs the collectives.
-        if Qwen35TpRank::tp_graph_enabled_for_serve() {
+        // The worker enables graphs from the TpInit value (never its own env),
+        // so both ranks run the identical graphed/eager sequencing.
+        if use_graphs {
             model
                 .enable_tp_graphs(&group)
                 .map_err(|e| e.to_string())?;
@@ -576,7 +413,6 @@ impl TpCoordinator {
             chunks: VecDeque::new(),
             span: None,
             span_done: Some(span_done),
-            probe: TpAcceptanceProbe::enabled(),
             poisoned: None,
         })
     }
@@ -637,36 +473,33 @@ impl TpCoordinator {
         if slots.is_empty() {
             return Ok(());
         }
-        if self.probe.is_some() {
-            if self.pipe.is_some() || self.span.is_some() || !self.model.prefill_lane_done() {
-                return Err("TP probe: release before GPU flight drained".into());
-            }
-            self.model.prefill_lane_join().map_err(|e| e.to_string())?;
-            self.group.stream().synchronize().map_err(|e| e.to_string())?;
-            self.model.synchronize().map_err(|e| e.to_string())?;
+        // Fail closed before touching slot state: a release while the decode
+        // pipe or a prefill span still owns the slot would race the in-flight
+        // kernels against the reset below.
+        if self.pipe.is_some() || self.span.is_some() || !self.model.prefill_lane_done() {
+            return Err("TP release before GPU flight drained".into());
         }
-        let kv_events = slots
-            .iter()
-            .map(|&slot| {
-                self.logical
-                    .authorize(Operation::Release { slot })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        self.model.prefill_lane_join().map_err(|e| e.to_string())?;
+        self.group
+            .stream()
+            .synchronize()
+            .map_err(|e| e.to_string())?;
+        self.model.synchronize().map_err(|e| e.to_string())?;
+        let ops: Vec<Operation> = slots.iter().map(|&slot| Operation::Release { slot }).collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         self.exchange(ControlMessage::TpRelease {
             sequence: self.sequence + 1,
             slots: slots.clone(),
-            kv_events,
+            kv_state,
         })?;
         for slot in slots {
             self.model.reset_slot(slot).map_err(|e| e.to_string())?;
-            self.model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
+            self.model
+                .reset_lane_slot(slot)
+                .map_err(|e| e.to_string())?;
             self.positions[slot] = 0;
             self.occupied[slot] = false;
-        }
-        if let Some(probe) = self.probe.as_mut() {
-            probe.after_release(0, &self.model, &self.logical, &self.group, &self.positions)?;
         }
         Ok(())
     }
@@ -681,7 +514,12 @@ impl TpCoordinator {
 
     /// Greedy speculative verification using the scheduler-owned draft.
     /// Execute the proposed rows until the first rejection. Both TP ranks
-    /// consume exactly the same accepted-prefix target sequence.
+    /// consume exactly the same accepted-prefix target sequence. The path is
+    /// KV-dtype-agnostic (f16 / fp8_e4m3): rows flow through the same
+    /// `forward_token_*` pipeline as decode, and every element size and slab
+    /// stride derives from the load-time dtype carried in `TpInit`. Rejected
+    /// draft rows are never executed, so no KV or position state advances
+    /// past the verified prefix.
     fn spec_batch(
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
@@ -827,20 +665,17 @@ impl TpCoordinator {
         {
             return Err("TP pipe begin position invalid".into());
         }
-        let kv_events = rows
+        let ops: Vec<Operation> = rows
             .iter()
-            .map(|&(slot, _, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
         ControlMessage::TpPipeBegin {
             sequence: seq,
             rows: rows.clone(),
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -932,20 +767,17 @@ impl TpCoordinator {
             .collect();
         let wire_plans: Vec<crate::sampler::DevicePlan> =
             order.iter().map(|&i| devices[i]).collect();
-        let kv_events = wire_rows
+        let ops: Vec<Operation> = wire_rows
             .iter()
-            .map(|&(slot, _, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
         ControlMessage::TpPipeBegin {
             sequence: seq,
             rows: wire_rows.clone(),
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -1004,22 +836,19 @@ impl TpCoordinator {
         }
         let source_plane = flight.plane;
         let next_plane = source_plane ^ 1;
-        let kv_events = rows
+        let ops: Vec<Operation> = rows
             .iter()
-            .map(|&(slot, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
         ControlMessage::TpPipeNext {
             sequence: seq,
             rows: rows.clone(),
             source_plane,
             next_plane,
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -1071,9 +900,6 @@ impl TpCoordinator {
         self.model.synchronize().map_err(|e| e.to_string())?;
         self.sequence = seq;
         self.pipe = None;
-        if let Some(probe) = self.probe.as_mut() {
-            probe.pipe_drained = true;
-        }
         tracing::info!(sequence = seq, "TP decode pipe drained");
         Ok(ids)
     }
@@ -1226,19 +1052,16 @@ impl TpCoordinator {
                         .map(|ri| (ri, (fi, fin.plan)))
                 })
                 .collect();
-        let kv_events = rows
+        let ops: Vec<Operation> = rows
             .iter()
-            .map(|&(slot, _, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         ControlMessage::TpMixed {
             sequence: self.sequence + 1,
             rows: rows.clone(),
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -1393,12 +1216,18 @@ impl TpCoordinator {
                 break;
             }
             let (slot, take, finishing, plan) = {
-                let chunk = self.chunks.front().unwrap();
+                let chunk = self
+                    .chunks
+                    .front()
+                    .expect("chunk front is Some: the go guard just matched it");
                 let take = chunk.rows.len().min(budget - rows.len());
                 (chunk.slot, take, chunk.rows.len() == take, chunk.fin_plan)
             };
             let drained: Vec<_> = {
-                let chunk = self.chunks.front_mut().unwrap();
+                let chunk = self
+                    .chunks
+                    .front_mut()
+                    .expect("chunk front is Some: the go guard just matched it");
                 chunk.rows.drain(..take).collect()
             };
             rows.extend(drained);
@@ -1462,23 +1291,23 @@ impl TpCoordinator {
             }
             cursor[s] += 1;
         }
-        // Authorize + mirror every KV Ensure first: failed validation must
-        // not leave the ranks' logical tables diverged mid-span.
-        let kv_events = rows
+        // Authorize the whole span's KV mutation first: failed validation must
+        // not leave the ranks' logical tables diverged mid-span. The wire
+        // carries the ordered rows plus ONE end-of-tick snapshot (v2 protocol,
+        // B2) instead of one full-snapshot event per row, so long prefills
+        // stay far below the 1 MiB frame cap.
+        let ops: Vec<Operation> = rows
             .iter()
-            .map(|&(slot, _, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
         ControlMessage::TpSpanLaunch {
             sequence: seq,
             rows: rows.clone(),
             finishers: wire_finishers,
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -1585,9 +1414,6 @@ impl TpCoordinator {
                 .promote_lane_slot(&mark, fin.slot, &live)
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(probe) = self.probe.as_mut() {
-            probe.after_span(0, &self.model, &self.logical, &self.group, &self.positions)?;
-        }
         let mut results = Vec::with_capacity(flight.finishing.len());
         for (fin, ev) in flight.finishing.into_iter().zip(flight.events) {
             match fin.plan {
@@ -1671,19 +1497,16 @@ impl TpCoordinator {
         if let Some(plans) = plans {
             validate_sampled_rows(rows, plans, width)?;
         }
-        let kv_events = rows
+        let ops: Vec<Operation> = rows
             .iter()
-            .map(|&(slot, _, position)| {
-                self.logical
-                    .authorize(Operation::Ensure { slot, position })
-                    .map_err(str::to_owned)
-                    .and_then(|event| serde_json::to_value(event).map_err(|e| e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+            .collect();
+        let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+            .map_err(|e| e.to_string())?;
         ControlMessage::TpBatch {
             sequence: self.sequence + 1,
             rows: rows.to_vec(),
-            kv_events,
+            kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
@@ -1722,9 +1545,6 @@ impl TpCoordinator {
         for &(slot, _, _) in rows {
             self.positions[slot] += 1;
             self.occupied[slot] = true;
-        }
-        if let Some(probe) = self.probe.as_mut() {
-            probe.after_batch(0, &self.model, &self.logical, &self.group, &self.positions, rows)?;
         }
         Ok(step)
     }
@@ -2230,7 +2050,7 @@ pub fn run_worker(
         .set_write_timeout(Some(STEP_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let run = (|| -> Result<(), String> {
-        let (max_ctx, slots, kv_dtype) =
+        let (max_ctx, slots, kv_dtype, use_graphs) =
             match ControlMessage::from_stream(&mut stream).map_err(|e| e.to_string())? {
                 ControlMessage::TpInit {
                     checkpoint_sha256,
@@ -2238,6 +2058,7 @@ pub fn run_worker(
                     max_ctx,
                     slots,
                     kv_dtype,
+                    use_graphs,
                 } => {
                     let (own_checkpoint, own_pack) = hashes(model_path, pack)?;
                     // The dtype parses BEFORE the hash compare so an unknown
@@ -2253,7 +2074,7 @@ pub fn run_worker(
                             "rank-1 checkpoint, CUDA pack or context disagrees with rank 0".into(),
                         );
                     }
-                    (max_ctx, slots, kv_dtype)
+                    (max_ctx, slots, kv_dtype, use_graphs)
                 }
                 ControlMessage::Shutdown { graceful: true } => return Ok(()),
                 other => return Err(format!("expected Phase 9 init: {other:?}")),
@@ -2276,16 +2097,16 @@ pub fn run_worker(
             .enable_prefill_lane(&group, &map)
             .map_err(|e| e.to_string())?;
         drop(map);
-        // Phase 11 Stage A opt-in, worker side: the SAME env read gates both
-        // ranks (per-process OnceLock), so graphed/eager sequencing pairs.
-        if Qwen35TpRank::tp_graph_enabled_for_serve() {
+        // Graph mode is rank-0-authoritative via TpInit (protocol v2): a
+        // manually started worker must not resolve its own env value, or the
+        // ranks could pair graphed and eager sequencing.
+        if use_graphs {
             model
                 .enable_tp_graphs(&group)
                 .map_err(|e| e.to_string())?;
         }
         let mut logical = logical(max_ctx, slots)?;
         let mut positions = vec![0; slots];
-        let mut probe = TpAcceptanceProbe::enabled();
         let mut pipe_slots: Option<Vec<usize>> = None;
         let mut span_in_flight = false;
         // Finishing chunks of the in-flight span (wire shape, chunk order):
@@ -2315,9 +2136,6 @@ pub fn run_worker(
                 ControlMessage::Shutdown { graceful: true }
                     if pipe_slots.is_none() && !span_in_flight =>
                 {
-                    if let Some(probe) = &probe {
-                        probe.complete(1)?;
-                    }
                     return Ok(());
                 }
                 ControlMessage::Shutdown { graceful: true } => {
@@ -2355,26 +2173,26 @@ pub fn run_worker(
             }
             match msg {
                 ControlMessage::TpPipeBegin {
-                    rows, kv_events, ..
+                    rows, kv_state, ..
                 } => {
                     if rows.is_empty()
                         || rows.len() > slots
-                        || rows.len() != kv_events.len()
                         || rows.windows(2).any(|w| w[0].0 >= w[1].0)
                     {
                         return Err("invalid TP pipe begin membership".into());
                     }
-                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
+                    for &(slot, _, position) in &rows {
                         if slot >= slots || position >= max_ctx || position != positions[slot] {
                             return Err("TP pipe begin position mismatch".into());
                         }
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Ensure { slot, position }) {
-                            return Err("TP pipe begin KV event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
                     }
+                    let ops: Vec<Operation> = rows
+                        .iter()
+                        .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+                        .collect();
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -2392,30 +2210,28 @@ pub fn run_worker(
                     rows,
                     source_plane,
                     next_plane,
-                    kv_events,
+                    kv_state,
                     ..
                 } => {
                     let members = pipe_slots.as_ref().ok_or("TP pipe next without begin")?;
                     if rows.len() != members.len()
-                        || rows.len() != kv_events.len()
                         || source_plane != pipe_plane
                         || next_plane != (source_plane ^ 1)
                     {
                         return Err("TP pipe next shape or plane mismatch".into());
                     }
-                    for ((&(slot, position), &member), value) in
-                        rows.iter().zip(members).zip(kv_events)
-                    {
+                    for (&(slot, position), &member) in rows.iter().zip(members) {
                         if slot != member || position >= max_ctx || position != positions[slot] {
                             return Err("TP pipe next position or membership mismatch".into());
                         }
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Ensure { slot, position }) {
-                            return Err("TP pipe next KV event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
                     }
+                    let ops: Vec<Operation> = rows
+                        .iter()
+                        .map(|&(slot, position)| Operation::Ensure { slot, position })
+                        .collect();
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -2447,9 +2263,6 @@ pub fn run_worker(
                     }
                     exec.synchronize().map_err(|e| e.to_string())?;
                     group.stream().synchronize().map_err(|e| e.to_string())?;
-                    if let Some(probe) = probe.as_mut() {
-                        probe.pipe_drained = true;
-                    }
                     pipe_slots = None;
                     let previous = pending_pipe.take().ok_or("TP pipe missing pending tick")?;
                     ControlMessage::TpReady { sequence: previous }
@@ -2471,64 +2284,57 @@ pub fn run_worker(
                 }
                 ControlMessage::TpRelease {
                     slots: freed,
-                    kv_events,
+                    kv_state,
                     ..
                 } => {
                     if freed.is_empty()
-                        || freed.len() != kv_events.len()
                         || freed.windows(2).any(|w| w[0] >= w[1])
+                        || freed.iter().any(|&slot| slot >= slots)
                     {
                         return Err("invalid TP release membership".into());
                     }
-                    if probe.is_some() {
-                        if pipe_slots.is_some() || span_in_flight || !model.prefill_lane_done() {
-                            return Err("TP worker probe: release before GPU flight drained".into());
-                        }
-                        model.prefill_lane_join().map_err(|e| e.to_string())?;
-                        group.stream().synchronize().map_err(|e| e.to_string())?;
-                        model.synchronize().map_err(|e| e.to_string())?;
+                    // Fail closed before touching slot state, mirroring rank 0:
+                    // a release while the decode pipe or a prefill span still
+                    // owns the slot would race the in-flight kernels against
+                    // the resets below.
+                    if pipe_slots.is_some() || span_in_flight || !model.prefill_lane_done() {
+                        return Err("TP worker release before GPU flight drained".into());
                     }
-                    for (&slot, value) in freed.iter().zip(kv_events) {
-                        if slot >= slots || positions[slot] == 0 {
-                            return Err("TP release slot invalid".into());
-                        }
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Release { slot }) {
-                            return Err("TP release event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
-                    }
+                    model.prefill_lane_join().map_err(|e| e.to_string())?;
+                    group.stream().synchronize().map_err(|e| e.to_string())?;
+                    model.synchronize().map_err(|e| e.to_string())?;
+                    let ops: Vec<Operation> = freed
+                        .iter()
+                        .map(|&slot| Operation::Release { slot })
+                        .collect();
+                    logical.mirror_tick(&ops, &wire_kv_state(kv_state)?).map_err(str::to_owned)?;
                     for slot in freed {
                         model.reset_slot(slot).map_err(|e| e.to_string())?;
                         model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
                         positions[slot] = 0;
                     }
-                    if let Some(probe) = probe.as_mut() {
-                        probe.after_release(1, &model, &logical, &group, &positions)?;
-                    }
                 }
                 ControlMessage::TpBatch {
-                    rows, kv_events, ..
+                    rows, kv_state, ..
                 } => {
                     if rows.is_empty()
                         || rows.len() > slots
-                        || rows.len() != kv_events.len()
                         || rows.windows(2).any(|w| w[0].0 >= w[1].0)
                     {
                         return Err("TP batch membership invalid".into());
                     }
-                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
+                    for &(slot, _, position) in &rows {
                         if slot >= slots || position >= max_ctx || position != positions[slot] {
                             return Err("TP worker position diverged".into());
                         }
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Ensure { slot, position }) {
-                            return Err("TP batch KV event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
                     }
+                    let ops: Vec<Operation> = rows
+                        .iter()
+                        .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+                        .collect();
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -2538,12 +2344,9 @@ pub fn run_worker(
                             .map_err(|e| e.to_string())?;
                         positions[slot] += 1;
                     }
-                    if let Some(probe) = probe.as_mut() {
-                        probe.after_batch(1, &model, &logical, &group, &positions, &rows)?;
-                    }
                 }
                 ControlMessage::TpMixed {
-                    rows, kv_events, ..
+                    rows, kv_state, ..
                 } => {
                     // Mixed tick (decode + chunk rows in one pass): rows may
                     // exceed the slot count - a chunk advances multiple rows
@@ -2551,18 +2354,17 @@ pub fn run_worker(
                     // TpBatch: mirror KV, Prepared, then one eager forward
                     // per row in wire order (no logits, no sampling - rank 0
                     // owns both).
-                    if rows.is_empty() || rows.len() != kv_events.len() {
+                    if rows.is_empty() {
                         return Err("TP mixed tick membership invalid".into());
                     }
                     validate_multistep_positions(&rows, &positions, max_ctx)?;
-                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Ensure { slot, position }) {
-                            return Err("TP mixed KV event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
-                    }
+                    let ops: Vec<Operation> = rows
+                        .iter()
+                        .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+                        .collect();
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -2576,7 +2378,7 @@ pub fn run_worker(
                 ControlMessage::TpSpanLaunch {
                     rows,
                     finishers,
-                    kv_events,
+                    kv_state,
                     ..
                 } => {
                     // The whole prompt span enqueues on rank 1's prefill lane:
@@ -2585,18 +2387,17 @@ pub fn run_worker(
                     // finisher sampler has no collectives and runs only on
                     // rank 0; the finisher list exists so this rank promotes
                     // the same slots at the span finish.
-                    if rows.is_empty() || rows.len() != kv_events.len() {
+                    if rows.is_empty() {
                         return Err("TP span launch membership invalid".into());
                     }
                     validate_multistep_positions(&rows, &positions, max_ctx)?;
-                    for (&(slot, _, position), value) in rows.iter().zip(kv_events) {
-                        let event: Event =
-                            serde_json::from_value(value).map_err(|e| e.to_string())?;
-                        if event.operation != (Operation::Ensure { slot, position }) {
-                            return Err("TP span KV event mismatch".into());
-                        }
-                        logical.mirror(&event).map_err(str::to_owned)?;
-                    }
+                    let ops: Vec<Operation> = rows
+                        .iter()
+                        .map(|&(slot, _, position)| Operation::Ensure { slot, position })
+                        .collect();
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -2606,10 +2407,15 @@ pub fn run_worker(
                             .map_err(|e| e.to_string())?;
                         positions[*slot] += 1;
                     }
-                    // Rank 1 does not sample, but its completion probe must
-                    // track this span even when no chunk finishes in this tick.
+                    // Rank 1 does not sample; its lane finisher marks span
+                    // completion for the promotion at the span finish.
                     model
-                        .prefill_lane_finisher(rows.last().unwrap().0, None)
+                        .prefill_lane_finisher(
+                            rows.last()
+                                .expect("span launch rows are non-empty: checked above")
+                                .0,
+                            None,
+                        )
                         .map_err(|e| e.to_string())?;
                     span_in_flight = true;
                     span_finishers = finishers;
@@ -2639,9 +2445,6 @@ pub fn run_worker(
                         model
                             .promote_lane_slot(&mark, *slot, &live)
                             .map_err(|e| e.to_string())?;
-                    }
-                    if let Some(probe) = probe.as_mut() {
-                        probe.after_span(1, &model, &logical, &group, &positions)?;
                     }
                     span_in_flight = false;
                     span_finishers.clear();
