@@ -111,6 +111,14 @@ pub enum ControlMessage {
         pack_blake3: String,
         max_ctx: usize,
         slots: usize,
+        /// KV cache dtype for BOTH ranks (Phase 12 per-layer KV types: the
+        /// TP=2 path serves fp8-e4m3 KV where the device supports it, like
+        /// TP=1). `"fp16"` or `"fp8_e4m3"`; anything else fails rank 1's
+        /// identity check closed before NCCL init. Rank 0 resolves the
+        /// runner's `PADDOCK_KV_CACHE_DTYPE` gate (including its sm_89
+        /// device check) and sends the resolved value, so the ranks can
+        /// never disagree.
+        kv_dtype: String,
     },
     /// Rank-0-authorized ordered active rows; holes are omitted.
     TpBatch {

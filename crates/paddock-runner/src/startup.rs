@@ -1002,12 +1002,16 @@ pub fn run() -> std::process::ExitCode {
         // Phase 9 only implements the pinned, eager, serial Qwen3.8 lane.
         // Refuse unsupported configurations before joining rank 1: never
         // acknowledge a TP pair and then quietly fall back to TP=1.
+        // Phase 12 widens the KV dtype arm: fp8_e4m3 is accepted here and
+        // resolved against THIS device engine-side (rank 0 demotes loudly to
+        // f16 below sm_89, exactly like the TP=1 apply_kv_dtype path, and the
+        // resolved value rides TpInit so both ranks load the same width).
         let tp9 = cfg.device == "cuda"
             && (1..=2).contains(&cfg.max_batch)
             && (cfg.no_spec || cfg.spec.as_deref() == Some("off"))
             && !cfg.kv_offload.enabled
             && !cfg.moe_offload.enabled
-            && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16")
+            && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16" | "fp8_e4m3")
             && cfg.mmproj.is_none()
             && cfg.mtp.is_none()
             && cfg.fp8_native.is_none()
@@ -1015,7 +1019,7 @@ pub fn run() -> std::process::ExitCode {
             && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file());
         if !tp9 {
             eprintln!(
-                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec (or spec=off), F16 KV, and no vision/companions/offload"
+                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec (or spec=off), KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
             );
             return std::process::ExitCode::from(2);
         }
