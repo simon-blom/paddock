@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "paddock-dist"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",
