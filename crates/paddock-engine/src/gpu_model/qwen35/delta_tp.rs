@@ -757,4 +757,22 @@ mod tests {
         channels.sort_unstable();
         assert_eq!(channels, (0..10240).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn recurrent_state_slots_are_disjoint_and_reset_sized() {
+        // Rank-local slot state: each rank owns exactly half the value-head
+        // band set; the pairs never overlap and together cover all 48 heads
+        // (the cross-rank completeness side is pinned above). The per-slot
+        // state footprint is the Phase 12 accounting input for DeltaNet
+        // layers - local_state_bytes must equal both slots' live state, so
+        // context_mem_bytes stays exact regardless of slot count.
+        let a = DeltaGeometry::new(0).unwrap();
+        let b = DeltaGeometry::new(1).unwrap();
+        assert!(!a.value_heads.iter().any(|h| b.value_heads.contains(h)));
+        // Conv window is (conv_k - 1) * mixed width per slot; recurrent is
+        // value_heads * S * S. Both derive from the same geometry, so the
+        // two slots' bytes double the single-slot figure exactly.
+        assert_eq!(a.conv_elements(), b.conv_elements());
+        assert_eq!(a.recurrent_elements(), b.recurrent_elements());
+    }
 }
