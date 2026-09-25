@@ -1,9 +1,9 @@
 # Phase 12 — KV/offload compatibility under rank-local TP geometry
 
-Status: IMPLEMENTATION COMPLETE, HOST VERIFICATION COMPLETE, two-Spark
-validation DEFERRED (this session's Sparks serve the local GLM 5.3 Flash
-workload; per session rules no GPU work was attempted and no serving process
-was touched).
+Status: ACCEPTED — implementation, host verification, and the required
+Phase 12 two-Spark correctness/accounting/wire gates passed on the pinned
+Qwen3.8-27B TP=2 fixture. Performance measurements remain a separate deferred
+follow-up; TP offload remains refused by design for the hybrid checkpoint.
 
 Baseline: Phase 10 (TP=2 decode pipe + unified prefill/decode overlap,
 accepted), Phase 11 Stage A (rank-local CUDA graphs, accepted), tree
@@ -216,3 +216,90 @@ throughput regression beyond noise on the attention kernel arm.
   reports rank 0's, matching how the scheduler already treats rank 0 as
   authoritative).
 - No cross-rank KV migration was introduced (per plan).
+
+## Target-device validation — 2026-09-25
+
+The deferred Phase 12 gates were run on both DGX Sparks in the documented
+configuration:
+
+- rank 0/head: `192.168.100.10`; rank 1/worker: `192.168.100.11`;
+- NCCL: `NCCL_SOCKET_IFNAME=enp1s0f0np0`, `NCCL_IB_HCA=rocep1s0f0`,
+  `NCCL_IB_DISABLE=0`, `NCCL_NET=IB`;
+- checkpoint: `/home/sime/models/Qwen3.8-27B-UD-Q4_K_M.gguf` on rank 0 and
+  `/home/sime/ffn-tp/Qwen3.8-27B-UD-Q4_K_M.gguf` on rank 1,
+  SHA-256 `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`;
+- CUDA pack `pd-cuda-sm120.so`, SHA-256
+  `059bb62d2e6d863b32ac47208d29da7492618b2fa33015a3ee0ad6fe2a9c4d54`;
+- release runner used on both ranks, SHA-256
+  `34383bdccbb5897d0d8266b6e83585e408cbae839e7c2abd2cf914038f93d3d2`;
+- `max_ctx=256`, `max_batch=2`, speculation disabled.
+
+### F16 regression
+
+`phase10_live_scheduler.py` completed the accepted decode-pipe workload with
+both rank processes exiting `0 0`. Its six result records were byte-for-byte
+equal to `phase10-phase11-final-baseline-pipe-results.json`. The unified
+prefill/decode run completed `10` span launches/finishes and both ranks exited
+`0 0`; the direct two-rank oracle additionally passed categorical decode and
+finisher IDs, full final-row/next-row logits, page crossing, drain,
+release/reuse, and reset/replay (`qwen35_tp_pipe` and `qwen35_tp_overlap`).
+
+Evidence: `~/.hermes/cache/scratch/phase10-phase12-f16-pipe-results.json`,
+`phase10-phase12-f16-{pipe,unified}-{head,worker}.log`, and
+`phase12-f16-direct-{pipe,overlap}-head.log` (worker logs were retained on the
+worker host under `/home/sime/ffn-tp/phase12-f16-*-worker.log`).
+
+### FP8 E4M3 KV
+
+With `PADDOCK_KV_CACHE_DTYPE=fp8_e4m3` set on both ranks, the direct pipe and
+unified-overlap probes both exited `0 0`. The eager-vs-pipe oracle passed
+through position 20 and the 16-token page boundary; the overlap oracle passed
+categorical decode/finisher IDs, final-row and next-row logits, page crossing,
+drain and release/reuse. The HTTP pipe workload also exited `0 0`; for the
+same six-scenario harness, records 0, 1, 3 and 4 matched the F16 run exactly.
+Records 2 and 5 differed in generated text in the expected lossy-FP8 numerical
+lane (the fixed 4-token companion rows remained equal); there was no crash,
+rank divergence, malformed response, or non-finite-result indication.
+
+Evidence: `phase12-fp8-direct-{pipe,overlap}-head.log`, worker logs under
+`/home/sime/ffn-tp/phase12-fp8-*-worker.log`, and
+`phase10-phase12-fp8-http-results.json`. The two direct probes use the same
+reset/eager oracle within FP8, so they establish FP8 pipe/overlap correctness,
+not bit identity with F16; the HTTP comparison records the cross-dtype result
+differences explicitly rather than treating them as failures.
+
+### Rank-local accounting
+
+The loaded pair exercised the production rank-local allocation path for both
+F16 and FP8. `context_mem_bytes()` is the exact sum of every local GQA K/V slab
+and local DeltaNet state allocation; the FP8 run therefore uses one byte per KV
+element while F16 uses two, with identical geometry and slot/context settings,
+so the KV component is exactly 2:1 before allocator overhead. `process_mem_used`
+is the measured executor process-pool allocation and `weights_mem_bytes` is its
+non-negative `process - context` upper-bound accounting. Both rank processes
+completed the allocation, decode, prefill, and teardown probes independently.
+
+The Spark GB10 `nvidia-smi` interface reports FB memory as `N/A` even while the
+pair is live, so an independent process-level used-memory byte cross-check is
+not available from that tool. This is an environment limitation, not silently
+replaced with an invented value; exact model/context accounting is distinguished
+from allocator/process-pool overhead as required.
+
+### Fail-closed negative gates
+
+The host wire tests passed for both dtype strings and reject junk (`int8` and
+empty strings) before a worker can load. A live runner invocation with
+`PADDOCK_KV_CACHE_DTYPE=int8` exited `2` before serving and printed the accepted
+`auto/f16/fp8_e4m3` surface. Worker dtype is parsed from rank 0's `TpInit` before
+model load, so rank 1 does not independently resolve an environment value and
+cannot silently diverge. The existing Phase 12 wire-order/hash/handshake
+checks remained unchanged.
+
+## Remaining Phase 12 follow-up
+
+The required correctness gates are accepted. Decode/prefill throughput and
+allocator-overhead measurements for F16 versus FP8 remain unmeasured and must
+be collected before making performance or capacity claims; they are not used as
+correctness evidence. TP host/NVMe offload remains refused until the documented
+DeltaNet checkpoint-pool/aux-restore and coordinator Publish/Reuse machinery is
+implemented and validated.

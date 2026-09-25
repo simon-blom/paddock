@@ -1,13 +1,12 @@
 # Where the TP sequence stops without target access — Phase 14/15 blocking analysis
 
-Status: STOP POINT documented per the session rules ("If a later phase
-depends materially on a GPU/runtime property that has not been validated,
-stop at the clean checkpoint and document exactly which target-device gate
-blocks further safe progress").
+Status: Phase 12/13 target validation is complete for the pinned
+Qwen3.8-27B checkpoint. The stop point remains in force: Phase 14 and Phase
+15 are still blocked by their target-gated prerequisites below.
 
-Clean checkpoint: Phase 12 `17efad0`, Phase 13 `481d092` (both
-implementation-complete and host-verified; two-Spark gates deferred and
-listed in their reports).
+Clean checkpoint: Phase 12 validation/report milestone (this commit), with
+implementation origin `17efad0`, and Phase 13 implementation `481d092`.
+Phase 13 target evidence is limited to the same pinned checkpoint.
 
 ## Phase 14 (MoE + expert streaming) — blocked by checkpoint absence + target gates
 
