@@ -1015,12 +1015,28 @@ pub fn run() -> std::process::ExitCode {
         }
         // `--tp-worker` MEANS rank 1 of 2: the role is forced, not inferred,
         // so `--tp-rank 0 --tp-worker` cannot resolve into a coordinator.
-        // Only the dial target stays operator-configured.
+        // Only the dial target stays operator-configured: CLI first, then
+        // the documented PADDOCK_TP_MASTER_ADDR/PADDOCK_TP_MASTER_PORT env
+        // fallback (the same surface the spawned child reads; both names
+        // are ENV_SURFACE-registered, so hardened seals keep them). A bad
+        // env port fails here, before any dial.
+        let (dial_addr, dial_port) = match paddock_dist::config::resolve_worker_dial(
+            cli.tp_master_addr.clone(),
+            cli.tp_master_port,
+            std::env::var("PADDOCK_TP_MASTER_ADDR").ok(),
+            std::env::var("PADDOCK_TP_MASTER_PORT").ok(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("config error: tensor-parallel worker dial target invalid: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        };
         let tp = paddock_dist::config::ParallelConfig {
             tp_size: Some(2),
             rank: Some(1),
-            master_addr: cli.tp_master_addr.clone(),
-            master_port: cli.tp_master_port,
+            master_addr: dial_addr,
+            master_port: dial_port,
         };
         match tp.resolved(false) {
             Ok(Some(r)) if r.is_worker() => {

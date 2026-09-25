@@ -362,8 +362,10 @@ impl TpCoordinator {
         // Graph mode is rank-0-authoritative too (upstream-readiness I4):
         // the resolved value rides TpInit, so a hand-started remote worker
         // cannot disagree with the coordinator's env and mispair the
-        // graphed/eager collective sequencing.
-        let use_graphs = Qwen35TpRank::tp_graph_enabled_for_serve();
+        // graphed/eager collective sequencing. Both ranks then convert the
+        // decision into model state via enable_tp_graphs; execution reads
+        // that state, never the environment.
+        let use_graphs = Qwen35TpRank::resolve_graph_mode_for_serve();
         let (checkpoint_sha256, pack_blake3) = hashes(model, pack)?;
         ControlMessage::TpInit {
             checkpoint_sha256,

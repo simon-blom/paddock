@@ -355,3 +355,107 @@ fn unexpected_message_shape_is_rejected() {
     assert_eq!(s2, session);
     shutdown_worker(&mut stream, true).unwrap();
 }
+
+// --- explicit --tp-worker dial-target precedence (CLI > env) ------------
+
+use paddock_dist::config::resolve_worker_dial;
+
+#[test]
+fn worker_dial_cli_address_and_port_win() {
+    let (addr, port) = resolve_worker_dial(
+        Some("10.0.0.9".into()),
+        Some(12345),
+        Some("192.168.100.10".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.0.0.9"));
+    assert_eq!(port, Some(12345));
+}
+
+#[test]
+fn worker_dial_env_fills_missing_cli_fields() {
+    let (addr, port) = resolve_worker_dial(
+        None,
+        None,
+        Some("192.168.100.10".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("192.168.100.10"));
+    assert_eq!(port, Some(11982));
+}
+
+#[test]
+fn worker_dial_cli_overrides_env_per_field() {
+    // CLI port + env address (each field resolves independently).
+    let (addr, port) = resolve_worker_dial(
+        None,
+        Some(7777),
+        Some("10.1.1.1".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.1.1.1"));
+    assert_eq!(port, Some(7777));
+    // CLI address + env port.
+    let (addr, port) = resolve_worker_dial(
+        Some("10.0.0.9".into()),
+        None,
+        Some("10.1.1.1".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.0.0.9"));
+    assert_eq!(port, Some(11982));
+}
+
+#[test]
+fn worker_dial_invalid_env_port_fails_actionably() {
+    let err = resolve_worker_dial(
+        None,
+        None,
+        Some("10.1.1.1".into()),
+        Some("not-a-port".into()),
+    )
+    .expect_err("bad port must fail");
+    assert!(
+        err.to_string().contains("PADDOCK_TP_MASTER_PORT"),
+        "error must name the offending variable: {err}"
+    );
+    // An out-of-range numeric port fails the same way.
+    assert!(resolve_worker_dial(None, None, None, Some("70000".into())).is_err());
+}
+
+#[test]
+fn worker_dial_missing_address_still_fails_at_resolution() {
+    // Nothing configured: the resolver returns empty fields; the existing
+    // EmptyMasterAddr refusal (rank 1 requires the coordinator's address)
+    // is where the actionable failure must come from.
+    let (addr, port) = resolve_worker_dial(None, None, None, None).expect("no env error");
+    assert_eq!(addr, None);
+    assert_eq!(port, None);
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(1),
+        master_addr: addr,
+        master_port: port,
+    };
+    assert!(
+        matches!(
+            cfg.resolved(false),
+            Err(ParallelConfigError::EmptyMasterAddr)
+        ),
+        "missing dial address must refuse with EmptyMasterAddr"
+    );
+}
+
+#[test]
+fn worker_dial_empty_env_strings_are_treated_as_unset() {
+    // An empty env value behaves like an absent one (same rule merge_env
+    // applies), not as a bogus address.
+    let (addr, port) =
+        resolve_worker_dial(None, None, Some(String::new()), Some(String::new())).expect("valid");
+    assert_eq!(addr, None);
+    assert_eq!(port, None);
+}

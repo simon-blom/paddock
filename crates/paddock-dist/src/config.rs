@@ -249,6 +249,33 @@ impl Resolved {
 /// family) so a same-box smoke test can run both roles side by side.
 pub const DEFAULT_MASTER_PORT: u16 = 11560;
 
+/// Dial-target resolution for the explicit `--tp-worker` operator mode: CLI
+/// wins, then the documented `PADDOCK_TP_MASTER_ADDR` / `PADDOCK_TP_MASTER_PORT`
+/// environment fallback (the same surface the coordinator-spawned child reads).
+/// A bad env port fails here with an actionable error instead of surfacing as
+/// a dial failure. Host-pure given the env values, so the precedence matrix is
+/// testable without spawning a runner.
+pub fn resolve_worker_dial(
+    cli_addr: Option<String>,
+    cli_port: Option<u16>,
+    env_addr: Option<String>,
+    env_port: Option<String>,
+) -> Result<(Option<String>, Option<u16>), ParallelConfigError> {
+    // CLI wins outright; env fills only the gaps.
+    let addr = cli_addr.or_else(|| env_addr.filter(|s| !s.is_empty()));
+    let port = match (cli_port, env_port) {
+        (Some(p), _) => Some(p),
+        (None, Some(v)) if !v.is_empty() => {
+            Some(v.parse::<u16>().map_err(|_| ParallelConfigError::BadInt {
+                field: "PADDOCK_TP_MASTER_PORT",
+                value: v.clone(),
+            })?)
+        }
+        _ => None,
+    };
+    Ok((addr, port))
+}
+
 fn env_str(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }

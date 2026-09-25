@@ -321,8 +321,11 @@ cleanup commit). See section 17 for evidence.
   product code; the production drain-before-release invariant (already
   enforced independently of the probe via `prefill_lane_done()` checks) is
   retained.
-- I4 — fixed: `TpInit` now carries the resolved graph mode; rank 0 is
-  authoritative; the worker no longer reads `PADDOCK_TP_GRAPH` locally.
+- I4 — fixed at the protocol level (see section 20 for the follow-up that
+  completed it): `TpInit` now carries the resolved graph mode; rank 0 is
+  authoritative. NOTE: the first fix stopped capture-time divergence only;
+  token EXECUTION still consulted a process-global env-backed flag until the
+  section 20 correction.
 - I6 — fixed: `spawn_worker_local()` (zero production callers) deleted;
   `work()` made `#[cfg(test)]` with its two bootstrap-loop tests moved from
   `tests/bootstrap.rs` into `worker.rs`'s unit-test module.
@@ -447,13 +450,19 @@ requests, cancellation, survivor continuation, categorical reuse and the
 FP8 resolution plus prefill-span, slot-mapped-pipe and decode-pipe activity;
 both ranks exited `0`. No FP8 output was required to match F16 exactly.
 
-### I4 graph-mode handshake: PASS
+### I4 graph-mode handshake: PASS (capture authority only — see section 20)
 
 The coordinator runs set `PADDOCK_TP_GRAPH=1`; the explicit remote worker ran
 with `PADDOCK_TP_GRAPH` unset in B1/B2 and unset or `0` in the live/direct
 regressions. All graph-enabled pairs completed the same collectives and exited
 cleanly. This validates the rank-0-resolved `TpInit.use_graphs` propagation in
-practice; rank 1 did not independently elect eager/graph mode.
+practice for graph CAPTURE; rank 1 did not independently elect capture mode.
+What this evidence did NOT cover: token execution still routed through a
+process-global env-backed flag, so the runs could not have detected an
+execution-mode divergence under the pre-section-20 code (a worker whose local
+value disagreed would have captured per TpInit but executed per its own env).
+The section 20 fix removes that residual path; revalidating the corrected
+graph-authoritative invariant on the two-Spark pair remains open.
 
 ### Clean exit and performance observations
 
@@ -587,3 +596,92 @@ repo-wide `cargo fmt --check` reports the same 56 hunks as at `333512a`
 (pre-existing drift in untouched files); per-file rustfmt comparison before
 vs after shows byte-identical drift content in every touched file, so no
 formatting was applied to avoid mass-formatting unrelated code.
+
+---
+
+## 20. Follow-up fixes after the independent source review of `8b165a1`
+
+Host-only bounded follow-up on `qwen38-tp2-prepr`. No rebases, no history
+rewrites, no further pruning.
+
+### I4 completed: graph-execution mode is runtime model state
+
+An independent source review found that the first I4 fix was incomplete. It
+made graph CAPTURE rank-0-authoritative (`TpInit.use_graphs` decides whether
+each rank calls `enable_tp_graphs()`), but token EXECUTION still routed
+through `Qwen35TpRank::tp_graph_enabled()` - a process-global `OnceLock`
+backed by `PADDOCK_TP_GRAPH`. `forward_token_gpu`/`forward_token_enqueue`
+(and the device-feedback path) consulted that global, so a worker process
+whose local env disagreed with rank 0 would CAPTURE per `TpInit` but EXECUTE
+per its own environment: the mispairing I4 set out to prevent remained
+reachable at execution time.
+
+Fix (structural, host-tested):
+
+- `Qwen35TpRank` gains a `graphs_enabled: bool` runtime field, default
+  false (eager) on every construction path including the prefill lane;
+- `enable_tp_graphs()` performs capture and flips the field true only after
+  successful setup; eager paths never touch it;
+- every token forward (`forward_token_enqueue`, `forward_token_gpu`,
+  `forward_device_feedback`) passes `self.graphs_enabled` to
+  `forward_token_body`; the prefill lane passes literal `false` (never
+  captured by design);
+- the global/OnceLock resolver is deleted. Graph mode is resolved exactly
+  once at serving setup via `Qwen35TpRank::resolve_graph_mode_for_serve()`
+  (`dev_var!`, the repo-standard dev-switch mechanism), rank 0 composes it
+  into `TpInit`, and both ranks convert the decision into model state via
+  `enable_tp_graphs()`. No production code reads `PADDOCK_TP_GRAPH` after
+  initialization; direct/probe callers configure graph mode explicitly by
+  calling `enable_tp_graphs()`.
+
+Host tests (tp_model.rs unit module): the resolver is a pure env read (no
+global memoization); `graphs_enabled` is initialized false at exactly the
+two construction sites and flipped true in exactly one place inside
+`enable_tp_graphs`; every `forward_token_body` invocation consults the
+stored field; exactly one executable `PADDOCK_TP_GRAPH` read exists in
+production code (the setup-time resolver). The section 17 I4 evidence above
+is reclassified as capture-authority-only; the corrected graph-authoritative
+execution invariant has NOT been revalidated on the two-Spark pair and
+requires target revalidation before any new GPU acceptance claim.
+
+### B2 context bound: measured, no gate required
+
+The v2 mirror wire sends one full `Snapshot` per mutating command, so frame
+size grows with CONTEXT (the refcount array dominates: one u32 per physical
+block, blocks = ctx/16 x 2 slots). Measured through the real `to_frame()`
+encoder with the supported slot maximum (2):
+
+- 16,384 ctx: 4,206 B (0.4% of the 1 MiB MAX_FRAME)
+- 65,536 ctx: 16,494 B (1.6%)
+- 131,072 ctx: 32,879 B (3.1%)
+- 262,144 ctx: 65,647 B (6.3%)
+- 1,048,576 ctx: 262,256 B (25.0%) - still under the cap
+
+Growth is ~0.25 B per context token; extrapolation puts the frame-cap
+crossing at ~4.19M tokens of context. No context Paddock currently claims or
+supports for this TP lane approaches that, so NO fail-closed startup gate
+was added (adding one would gate nothing reachable). `MAX_FRAME` is
+unchanged and the wire format is untouched. The measured sizes are pinned by
+`b2_snapshot_frame_growth_and_context_bound` in `tests/tp_wire_frame.rs`, so
+a future wire change that breaks this bound fails in host CI first.
+
+### Explicit `--tp-worker` dial-target env fallback fixed
+
+The `--tp-worker` help documented a `PADDOCK_TP_MASTER_ADDR` /
+`PADDOCK_TP_MASTER_PORT` fallback, but the branch constructed
+`ParallelConfig` from the CLI fields only, so the documented env fallback
+never applied. Fixed with a host-pure `paddock_dist::config::
+resolve_worker_dial(cli_addr, cli_port, env_addr, env_port)`: CLI wins per
+field, env fills only the gaps, an invalid env port fails early with the
+actionable `BadInt` error naming `PADDOCK_TP_MASTER_PORT`, an empty env
+string is treated as unset (the same rule `merge_env` applies), and a
+missing address still refuses via the existing `EmptyMasterAddr` check. Both
+env names are ENV_SURFACE-registered, so hardened seals keep them. Covered
+by six new tests in `crates/paddock-dist/tests/bootstrap.rs` (CLI only, env
+only, per-field CLI-over-env, invalid port, missing address, empty strings).
+
+Validation for this follow-up (host-only): see the commit message. GPU
+revalidation required: the two-Spark graph-mode pair (coordinator
+`PADDOCK_TP_GRAPH=1` with a worker whose local value is unset/`0`) rerun
+against the corrected execution-mode state before any further graph-path
+acceptance claim.
