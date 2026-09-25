@@ -148,12 +148,7 @@ impl ParallelConfig {
             (Some(2), Some(rank)) if rank >= 2 => {
                 Err(ParallelConfigError::RankOutOfRange { tp: 2, rank })
             }
-            (Some(2), Some(rank)) => {
-                if rank == 1 && serving_mode {
-                    return Err(ParallelConfigError::WorkerMustNotServe);
-                }
-                self.resolved_tp2(rank, serving_mode)
-            }
+            (Some(2), Some(rank)) => self.resolved_tp2(rank, serving_mode),
             // World size without a rank defaults to rank 0 (coordinator) -
             // "start the pair from this box". A rank-1 start is always
             // explicit: the spawned child's env, or a hand-set rank for a
@@ -168,9 +163,10 @@ impl ParallelConfig {
     fn resolved_tp2(
         &self,
         rank: usize,
-        _serving_mode: bool,
+        serving_mode: bool,
     ) -> Result<Option<Resolved>, ParallelConfigError> {
-        if rank == 1 && _serving_mode {
+        // A rank-1 worker never serves an API, no matter how it was started.
+        if rank == 1 && serving_mode {
             return Err(ParallelConfigError::WorkerMustNotServe);
         }
         let master_addr = match self.master_addr.as_deref().map(str::trim) {

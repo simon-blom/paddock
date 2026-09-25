@@ -89,7 +89,9 @@ pub struct Cli {
     #[arg(long, value_name = "DEVICE")]
     pub device: Option<String>,
     /// Which GPU to serve on: a CUDA ordinal ("1") or a device UUID
-    /// ("GPU-..." as nvidia-smi prints it; a unique prefix is enough)
+    /// ("GPU-..." as nvidia-smi prints it; a unique prefix is enough).
+    /// In a TP=2 pair this selects the rank-0 coordinator's device only;
+    /// the rank-1 worker always uses GPU ordinal 0 on its own node.
     #[arg(long, value_name = "ID")]
     pub gpu: Option<String>,
     /// Tensor-parallel world size (1 or 2). 2 starts this process as the
@@ -1001,6 +1003,16 @@ pub fn run() -> std::process::ExitCode {
     // spawn-only. serving_mode = false: this process serves no API.
     if cli.tp_worker {
         paddock_admin::logging::init(None);
+        // The worker always serves from GPU ordinal 0 on its own node; a
+        // --gpu value here would be silently ignored, so refuse it instead
+        // (no-silent-failures). Per-rank GPU selection is future work.
+        if cli.gpu.is_some() {
+            eprintln!(
+                "config error: --gpu does not apply to --tp-worker: the rank-1 worker \
+                 always uses GPU ordinal 0 on its own node"
+            );
+            return std::process::ExitCode::from(2);
+        }
         // `--tp-worker` MEANS rank 1 of 2: the role is forced, not inferred,
         // so `--tp-rank 0 --tp-worker` cannot resolve into a coordinator.
         // Only the dial target stays operator-configured.

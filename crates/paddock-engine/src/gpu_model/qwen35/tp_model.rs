@@ -775,10 +775,11 @@ impl Qwen35TpRank {
     /// The coordinator's resolved value rides TpInit to the worker (protocol
     /// v2), so the pair cannot diverge; a worker process must never decide
     /// graph mode from its own environment (that would pair an eager
-    /// all_reduce with a graphed one and hang the row).
+    /// all_reduce with a graphed one and hang the row). Experimental dev
+    /// switch: `dev_var!` keeps it out of hardened builds entirely.
     fn tp_graph_enabled() -> bool {
         static TP_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *TP_GRAPH.get_or_init(|| std::env::var("PADDOCK_TP_GRAPH").as_deref() == Ok("1"))
+        *TP_GRAPH.get_or_init(|| paddock_models::dev_var!("PADDOCK_TP_GRAPH").as_deref() == Ok("1"))
     }
 
     /// Serving-side gate (rank 0 only, public for tp_serve): the resolved

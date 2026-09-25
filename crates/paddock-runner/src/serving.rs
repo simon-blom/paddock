@@ -1637,7 +1637,7 @@ pub(crate) fn load_with_residency(
     if tp.is_some() && arch != "qwen35" {
         return Err(ServeError::Open(
             path.to_path_buf(),
-            format!("Phase 9 TP=2 requires Qwen3.8 qwen35 architecture, got {arch}"),
+            format!("TP=2 serving requires the Qwen3.8 qwen35 architecture, got {arch}"),
         ));
     }
 
@@ -2202,7 +2202,7 @@ fn build_engine(
                 }
                 let pack = pack
                     .as_deref()
-                    .ok_or("TP=2 requires an explicit CUDA pack")?;
+                    .ok_or("TP=2 serving requires an explicit CUDA pack (--kernel-pack)")?;
                 let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
                 let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
                     stream, resolved, &path, pack, gpu, max_ctx, max_batch,

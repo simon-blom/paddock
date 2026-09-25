@@ -117,7 +117,7 @@ fn hashes(model: &Path, pack: &Path) -> Result<(String, String), String> {
     let checkpoint: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if checkpoint != PINNED_SHA256 {
         return Err(format!(
-            "Phase 9 requires pinned Qwen3.8 GGUF SHA-256 {PINNED_SHA256}, got {checkpoint}"
+            "TP=2 serving requires the pinned Qwen3.8 GGUF with SHA-256 {PINNED_SHA256}, got {checkpoint}"
         ));
     }
     let mut file = std::fs::File::open(pack).map_err(|e| format!("CUDA pack open: {e}"))?;
@@ -341,7 +341,9 @@ impl TpCoordinator {
         span_done: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         if !resolved.is_coordinator() || max_ctx == 0 || !(1..=2).contains(&slots) {
-            return Err("Phase 9 requires TP=2 rank 0 and nonzero context".into());
+            return Err(
+                "TP=2 serving requires the rank-0 coordinator and a nonzero context".into(),
+            );
         }
         stream
             .set_read_timeout(Some(READY_TIMEOUT))
@@ -578,10 +580,13 @@ impl TpCoordinator {
             expected_positions[slot] += 1;
         }
         let mut picks = Vec::with_capacity(rows.len());
+        // One row is live per verify step, so one scratch plan vector reused
+        // across the loop replaces a fresh dense allocation per row.
+        let mut dense_plans = vec![crate::generator::RowSample::Hole; self.positions.len()];
         let mut plan_idx = 0;
         for (slot, start, chunk) in reqs.iter().cloned() {
             for (i, token) in chunk.iter().copied().enumerate() {
-                let mut dense_plans = vec![crate::generator::RowSample::Hole; self.positions.len()];
+                dense_plans.fill(crate::generator::RowSample::Hole);
                 dense_plans[slot] = crate::generator::RowSample::Device(plans[plan_idx]);
                 let step = self.run_rows_impl(
                     &[(slot, token, start + i)],
@@ -2038,6 +2043,9 @@ pub fn run_worker(
     resolved: &Resolved,
     model_path: &Path,
     pack: &Path,
+    // The worker's local GPU ordinal. The runner's worker paths always pass 0:
+    // each rank process owns one GPU on its own node, and the coordinator's
+    // --gpu selection applies to rank 0 only.
     gpu: usize,
 ) -> Result<(), String> {
     if !resolved.is_worker() {
@@ -2077,7 +2085,11 @@ pub fn run_worker(
                     (max_ctx, slots, kv_dtype, use_graphs)
                 }
                 ControlMessage::Shutdown { graceful: true } => return Ok(()),
-                other => return Err(format!("expected Phase 9 init: {other:?}")),
+                other => {
+                    return Err(format!(
+                        "TP worker expected the rank-0 TpInit handshake, got: {other:?}"
+                    ));
+                }
             };
         ControlMessage::TpReady { sequence: 0 }
             .to_stream(&mut stream)

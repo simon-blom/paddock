@@ -298,7 +298,8 @@ separate draft models) is refused by name at startup, not silently unsupported.
 
 ## 16. Remediation status
 
-Updated after the bounded pre-PR cleanup pass. See section 17 for evidence.
+Updated after the bounded pre-PR cleanup pass (and again after the N1-N8
+cleanup commit). See section 17 for evidence.
 
 - B1 — fixed: explicit `--tp-worker` operator mode; the worker branch no
   longer requires the internal `PADDOCK_TP_WORKER_CHILD` marker; runbook and
@@ -330,9 +331,8 @@ Updated after the bounded pre-PR cleanup pass. See section 17 for evidence.
 - I5 — partially fixed: `THIRD-PARTY-NOTICES` gains the ErikBPF entry; the
   FFN tp-06 commit-message repair is documented in section 18 for the later
   history pass (rewriting history is forbidden here).
-- N1-N8 — intentionally deferred to the PR-preparation pass except where a fix
-  fell out of the above (the probe removal removes its phase-number string
-  sites; graph-mode doc note added).
+- N1-N8 — resolved by the bounded cleanup commit on `qwen38-tp2-prepr`
+  (details below and in section 19).
 
 ## 17. Validation evidence
 
@@ -500,6 +500,90 @@ that history work is intentionally not performed in this session.
   commits).
 - Commit-message attribution repair: `2546d17` needs its tp-06 credit added
   when the history is regrouped (content fix, not a rewrite of meaning).
-- Example pruning (N8) and docs/tp condensation.
-- Phase-number error strings (N1), worker GPU ordinal (N2), `dev_var!` for
-  `PADDOCK_TP_GRAPH` (N5), `resolved_tp2` naming (N3).
+- docs/tp condensation into one upstream doc (N6/N7 already resolved; the
+  full condensation still belongs to this pass).
+
+---
+
+## 19. N1-N8 cleanup resolution
+
+Bounded cleanup commit on `qwen38-tp2-prepr` (branched from `333512a`),
+host-only; no GPU revalidation was required and none was run. Every change
+below preserves the accepted runtime semantics: strings/naming/docs only,
+one no-op control-flow simplification (N3), one allocation hoist that
+provably produces the identical per-row plan vector (N4), and one config
+read routed through the repo's dev-switch mechanism with an identical
+resolved value in dev builds (N5).
+
+- N1 — FIXED. All six product-facing phase-number strings replaced with
+  capability-oriented wording (tp_serve.rs checkpoint-hash and init-shape
+  errors plus the worker's TpInit-expectation error, service.rs scheduler
+  selection log, serving.rs architecture and CUDA-pack errors). Comments,
+  headers and historical phase reports retain their phase terminology.
+- N2 — DOCUMENTED + one fail-closed guard. `--gpu` help now states it
+  selects the rank-0 coordinator's device only; `run_worker` documents its
+  always-0 worker ordinal; paddock.example.toml spells out the same. The
+  explicit `--tp-worker` path now refuses `--gpu` with exit 2 and an
+  actionable message instead of silently ignoring it. Device placement
+  semantics unchanged (the worker still uses local GPU ordinal 0).
+- N3 — FIXED, no behavioral change. The `WorkerMustNotServe` check moved
+  from `resolved`'s explicit-rank arm into `resolved_tp2` (single check
+  site; the `(Some(2), None)` default-rank arm passes rank 0 and is
+  unaffected). The used-but-underscored `_serving_mode` parameter is now
+  named `serving_mode`. The `rank1_may_not_serve_but_a_child_may_exist`
+  dist test passes unchanged.
+- N4 — FIXED, code changed. `spec_batch_plans` allocated a fresh dense
+  `Vec<RowSample>` per verify row; it now allocates one scratch vector
+  before the loop and refills it (`fill(Hole)` + one slot overwrite) per
+  step. Since exactly one row is live per verify step, the plan vector
+  passed to `run_rows_impl` is element-for-element identical; deterministic
+  sampled semantics unchanged.
+- N5 — FIXED. `PADDOCK_TP_GRAPH` is read via `paddock_models::dev_var!`
+  (the repo's dev-switch mechanism, compile-time-dead in hardened builds)
+  instead of raw `std::env::var`. Rank 0 still resolves graph mode and the
+  worker still receives it via `TpInit.use_graphs`; no worker-local
+  election. Dev-build resolved value identical (`"1"` ⇒ graphs on).
+- N6 — RESOLVED as superseded-with-pointer. `docs/tp/phase14-15-stop-point.md`
+  opens with a SUPERSEDED banner pointing at `phase15-report.md` and this
+  review; the historical body is untouched. Final reports unaltered.
+- N7 — FIXED. The `engine_finisher_plan` sentence in phase10-progress.md now
+  states the symbol no longer exists and names the current one
+  (`wire_finisher_plan`). No other Phase 10 content touched.
+- N8 — PRUNED: seven examples removed
+  (`qwen35_ffn_tp`, `qwen35_gqa_tp`, `qwen35_delta_tp`, `qwen35_model_tp`,
+  `qwen35_tp_pipe`, `qwen35_tp_feedback`, `qwen35_tp_overlap`, ~2.2k lines).
+  Classification: the five component/whole-model parity probes are REMOVE —
+  their coverage was phase-gate evidence duplicated by the retained oracles
+  and by the tp_serve/tp_model/gqa_tp/ffn_tp/delta_tp/tp_kv unit tests; the
+  three pipe/feedback/overlap probes are REMOVE — each validated a stage
+  that the later production gates (phase15-report, section 17 here)
+  superseded. `qwen35_tp_sampled` is RETAINED (bonus, beyond the review's
+  original trio): it is the only direct probe of the production-generator
+  device-sampling path (device+host rows in one batch, hole handling,
+  categorical replay) that no unit test or other example covers. Final
+  retained set: `qwen35_two_slot_oracle`, `qwen35_tp_spec`,
+  `qwen35_tp_sampled`, `nccl_bench`. The oracle was kept deliberately: it
+  remains the only interleaved two-slot cancellation/reuse/reset-replay
+  oracle. It compiles clean
+  against the current architecture; the one auxiliary stall in section 17
+  (the legacy direct control sequence not completing even with
+  `PADDOCK_NO_SPEC=1` supplied) was not reproduced or diagnosed in this
+  host-only pass - the required cancellation/reuse evidence remains the
+  production HTTP regressions, and a fresh target run of the oracle is
+  advisable in the later PR-preparation pass before relying on it again.
+  `qwen35_tp_spec` compiles
+  clean against the current architecture. No docs/scripts referenced the
+  removed examples outside historical phase reports (untouched by design).
+
+Validation for this cleanup (host-only, branch `qwen38-tp2-prepr`):
+`cargo test -q -p paddock-dist` 18/18; `cargo test -q -p paddock-engine
+--lib` 463; `cargo test -q -p paddock-engine --test tp_wire_frame` 4;
+`cargo test -q -p paddock-runner --lib` 572; `cargo check --workspace
+--all-targets` clean; `cargo clippy --workspace --all-targets` error-free
+with only the pre-existing warning set (same six engine-lib sites as at
+`333512a` plus the two retained examples' own pre-existing warnings;
+clippy `-D clippy::unwrap_used` clean); `git diff --check` clean. Formatting:
+repo-wide `cargo fmt --check` reports the same 56 hunks as at `333512a`
+(pre-existing drift in untouched files); per-file rustfmt comparison before
+vs after shows byte-identical drift content in every touched file, so no
+formatting was applied to avoid mass-formatting unrelated code.

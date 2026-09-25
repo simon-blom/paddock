@@ -1,5 +1,11 @@
 # Where the TP sequence stops without target access — Phase 14/15 blocking analysis
 
+> **SUPERSEDED — historical record only.** Written while Phase 14/15 were
+> still blocked for lack of target access. Phase 15 (TP speculative decoding)
+> and the upstream-readiness pass have since completed on the two-Spark pair;
+> see `phase15-report.md` and `upstream-readiness-review.md` for the accepted
+> final state. The gates below describe planning history, not current status.
+
 Status: Phase 12/13 target validation is complete for the pinned
 Qwen3.8-27B checkpoint. The stop point remains in force: Phase 14 and Phase
 15 are still blocked by their target-gated prerequisites below.

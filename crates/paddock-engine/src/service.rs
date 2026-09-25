@@ -1081,7 +1081,14 @@ impl Engine {
                 // the same `enable_batch`; a width of 1 (or a pool that does
                 // not fit) keeps the serial loop.
                 let diffusion = generator.canvas_width() > 0;
-                let (cap, batched) = if diffusion {
+                let (cap, batched) = if generator.serial_only() {
+                    if max_batch != 1 {
+                        let _ = ready_tx.send(Err("serial-only TP=2 requires max_batch=1".into()));
+                        return;
+                    }
+                    tracing::info!("paddock: TP=2 serial eager scheduler selected");
+                    (1, false)
+                } else if diffusion {
                     let cap = if max_batch > 1 {
                         match generator.enable_batch(max_batch) {
                             Ok(c) => c,
