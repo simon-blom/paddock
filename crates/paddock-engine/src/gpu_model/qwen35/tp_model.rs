@@ -67,6 +67,10 @@ pub struct Qwen35TpRank {
     vocab: usize,
     max_ctx: usize,
     slots: usize,
+    /// The KV dtype both this lane and the prefill lane must serve (Phase 12).
+    /// The lane fork re-reads it, so lane and decode slab widths can never
+    /// silently diverge the way the hardcoded Fp16 they replaced allowed.
+    kv_dtype: KvDtype,
     eps: f32,
     tok_embd: TokEmbd,
     layers: Vec<TpLayer>,
@@ -277,6 +281,7 @@ impl Qwen35TpRank {
             layers,
             out_norm,
             output,
+            kv_dtype: dtype,
         })
     }
 
@@ -403,6 +408,27 @@ impl Qwen35TpRank {
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
     }
+    /// The KV dtype this rank (and its prefill lane) serves - Phase 12. The
+    /// coordinator reports it in its ready handshake and the tier namespace
+    /// includes it, so an fp8 serve can never adopt an f16 tier store.
+    pub fn kv_dtype(&self) -> KvDtype {
+        self.kv_dtype
+    }
+    /// This rank's context-state bytes, exactly (Phase 12 rank-local memory
+    /// accounting): each full-attn layer's rank-local K/V slab pair plus each
+    /// DeltaNet layer's rank-local recurrent/conv slot state. Identical on
+    /// both ranks by construction (the shard geometry is symmetric), so the
+    /// service's memory-breakdown API can report "per rank" honestly without
+    /// any cross-rank query.
+    pub fn context_mem_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.mixer {
+                TpMixer::Full(gqa) => gqa.local_kv_bytes() as u64,
+                TpMixer::Linear(delta) => delta.local_state_bytes() as u64,
+            })
+            .sum()
+    }
 
     pub fn supports_device_sampling(&self) -> bool {
         self.rank == 0 && self.exec.has_sample_rows()
@@ -411,6 +437,13 @@ impl Qwen35TpRank {
     pub fn synchronize(&self) -> Result<(), Qwen35TpError> {
         self.exec.synchronize()?;
         Ok(())
+    }
+    /// This process's device-pool bytes (weights + context planes + scratch)
+    /// as measured at load - the rank-local memory-accounting line that
+    /// bounds `weights_mem_bytes` + `context_mem_bytes`. None when the
+    /// driver cannot say; the accounting then reports context only.
+    pub fn process_mem_used_bytes(&self) -> Option<u64> {
+        self.exec.process_mem_used()
     }
 
     /// Advance one token through the entire backbone and return all logits.
@@ -1040,6 +1073,11 @@ impl Qwen35TpRank {
             sample_chain: None,
             prefill: None,
             graphs: TpGraphs::default(),
+            // Phase 12: the lane serves the SAME KV dtype as the decode lane.
+            // The hardcoded Fp16 here was a latent divergence: a future fp8
+            // decode lane would have forked an f16 lane whose slabs and
+            // attention kernels disagree with every promotion copy.
+            kv_dtype: self.kv_dtype,
         };
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("blk.{i}.");
@@ -1054,7 +1092,7 @@ impl Qwen35TpRank {
                         i,
                         group,
                         self.max_ctx,
-                        KvDtype::Fp16,
+                        self.kv_dtype,
                         blocks,
                         self.slots,
                     )

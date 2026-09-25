@@ -36,6 +36,70 @@ const PINNED_SHA256: &str = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The wire spelling of a KV dtype, shared by both ranks (Phase 12). Rank 0
+/// resolves the runner's dtype gate and sends the resolved value; rank 1
+/// parses the same string. Only the two dtypes the TP GQA path implements
+/// exist - anything else fails closed at both ends before any allocation.
+pub(super) fn kv_dtype_wire(dtype: KvDtype) -> &'static str {
+    match dtype {
+        KvDtype::Fp16 => "fp16",
+        KvDtype::Fp8E4m3 => "fp8_e4m3",
+    }
+}
+
+pub(super) fn kv_dtype_parse(wire: &str) -> Result<KvDtype, String> {
+    match wire {
+        "fp16" => Ok(KvDtype::Fp16),
+        "fp8_e4m3" => Ok(KvDtype::Fp8E4m3),
+        other => Err(format!(
+            "TP kv_dtype {other:?} not recognized (expected fp16 or fp8_e4m3)"
+        )),
+    }
+}
+
+/// The KV dtype this serve runs. Rank 0 resolves it against the device's
+/// compute capability (the same sm_89 rule the runner's `apply_kv_dtype`
+/// applies for TP=1) and SENDS the resolved value; rank 1 parses what
+/// arrives. The ranks can therefore never disagree, which is what the old
+/// hardcoded `KvDtype::Fp16` pair silently guaranteed - and what an fp8 KV
+/// serve must keep guaranteeing before either rank allocates.
+fn kv_dtype_serve(cc: (u32, u32)) -> KvDtype {
+    kv_dtype_from_env(
+        std::env::var("PADDOCK_KV_CACHE_DTYPE").ok().as_deref(),
+        cc,
+    )
+}
+
+/// Pure core of [`kv_dtype_serve`] (host-testable): `PADDOCK_KV_CACHE_DTYPE`
+/// value in, dtype out. `fp8_e4m3` is honored wherever
+/// `gpu_support::fp8_kv_blocked` says the die can store fp8 KV - which is
+/// every die this build serves today (fp8 STORAGE is software-emulated and
+/// byte-exact; the arch allowlist has already refused the rest). If the
+/// seam ever answers blocked again, demote LOUDLY to f16 (the fp8 ask halves
+/// KV bytes; getting f16 doubles the pool and must stay attributable) - the
+/// same rule the TP=1 runner applies, with the threshold living beside the
+/// support table, not duplicated here.
+fn kv_dtype_from_env(env: Option<&str>, cc: (u32, u32)) -> KvDtype {
+    match env {
+        Some("fp8_e4m3") => {
+            if let Some(why) = paddock_models::gpu_support::fp8_kv_blocked(cc) {
+                tracing::error!(
+                    "kv cache: TP=2 asked for fp8_e4m3, but {why} (this GPU is sm_{:#02}{:#02}). \
+                     Serving f16 instead. The KV pool is twice the size it would have been - \
+                     lower max_ctx if the server no longer fits.",
+                    cc.0,
+                    cc.1
+                );
+                KvDtype::Fp16
+            } else {
+                tracing::info!("kv cache: fp8-e4m3 (--kv-cache-dtype; halves per-rank KV bytes)");
+                KvDtype::Fp8E4m3
+            }
+        }
+        _ => KvDtype::Fp16,
+    }
+}
+
 fn hashes(model: &Path, pack: &Path) -> Result<(String, String), String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(model).map_err(|e| format!("model open: {e}"))?;
@@ -437,12 +501,21 @@ impl TpCoordinator {
         stream
             .set_write_timeout(Some(STEP_TIMEOUT))
             .map_err(|e| e.to_string())?;
+        // Phase 12 fp8 KV gate, rank-0-authoritative like everything else
+        // here: the executor exists before any wire traffic, so ask THIS
+        // device the same question the TP=1 apply_kv_dtype path asks. A
+        // below-sm_89 card demotes LOUDLY to f16 (the fp8 ask doubles the KV
+        // pool; the serve must stay attributable), and the demoted value is
+        // what TpInit carries - rank 1 never has to know the runner's env.
+        let exec = Arc::new(GpuExecutor::new(gpu, pack).map_err(|e| e.to_string())?);
+        let kv_dtype = kv_dtype_serve(exec.compute_capability());
         let (checkpoint_sha256, pack_blake3) = hashes(model, pack)?;
         ControlMessage::TpInit {
             checkpoint_sha256,
             pack_blake3,
             max_ctx,
             slots,
+            kv_dtype: kv_dtype_wire(kv_dtype).to_owned(),
         }
         .to_stream(&mut stream)
         .map_err(|e| e.to_string())?;
@@ -450,13 +523,12 @@ impl TpCoordinator {
         ready(&mut stream, 0)?;
         let id = create_unique_id().map_err(|e| e.to_string())?;
         send_nccl_id(&mut stream, &id).map_err(|e| e.to_string())?;
-        let exec = Arc::new(GpuExecutor::new(gpu, pack).map_err(|e| e.to_string())?);
         let group = NcclCommunicator::from_resolved(Some(resolved), exec.stream.context(), id)
             .map_err(|e| e.to_string())?
             .ok_or("TP group absent")?;
         let map = MappedGguf::open(model).map_err(|e| e.to_string())?;
         let mut model =
-            Qwen35TpRank::load_slots(exec, &map, &group, max_ctx, KvDtype::Fp16, slots)
+            Qwen35TpRank::load_slots(exec, &map, &group, max_ctx, kv_dtype, slots)
                 .map_err(|e| e.to_string())?;
         // The lane's weights re-upload from the same mapped file, so the map
         // must outlive load.
@@ -1607,6 +1679,11 @@ pub struct TpGenerator {
     slots: usize,
     device_sampling: bool,
     overlap: bool,
+    /// Rank-local accounting captured at load (Phase 12): exact per-rank
+    /// context bytes (GQA slabs + DeltaNet slot state), and this rank
+    /// process's device-pool measurement at the same point.
+    context_bytes: u64,
+    process_bytes: Option<u64>,
     /// Shared with the coordinator thread: false while a prefill span is in
     /// flight (published after every command). `unified_span_done` polls it.
     span_done: Arc<std::sync::atomic::AtomicBool>,
@@ -1656,6 +1733,13 @@ impl TpGenerator {
                         coordinator.model.vocab(),
                         coordinator.model.max_ctx(),
                         coordinator.model.supports_device_sampling(),
+                        // Phase 12 rank-local accounting: measured at load.
+                        // Context bytes are exact per-rank geometry (GQA
+                        // slabs + DeltaNet slot state); weights bytes come
+                        // from the executor's process-pool measurement with
+                        // the context planes allocated but idle.
+                        coordinator.model.context_mem_bytes(),
+                        coordinator.model.process_mem_used_bytes(),
                     )))
                     .is_err()
                 {
@@ -1742,7 +1826,8 @@ impl TpGenerator {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (vocab, max_ctx, device_sampling) = ready_rx.recv().map_err(|e| e.to_string())??;
+        let (vocab, max_ctx, device_sampling, context_bytes, process_bytes) =
+            ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Self {
             commands,
             vocab,
@@ -1751,6 +1836,8 @@ impl TpGenerator {
             device_sampling,
             // The mapped decode pipe requires resident device sampling.
             overlap: device_sampling,
+            context_bytes,
+            process_bytes,
             span_done,
             poisoned: None,
         })
@@ -1967,6 +2054,21 @@ impl Generator for TpGenerator {
     fn max_context(&self) -> usize {
         self.max_ctx
     }
+    /// Rank-local context bytes, exact (Phase 12): the GQA K/V slab pairs and
+    /// DeltaNet recurrent/conv slot state THIS rank holds. Both ranks build
+    /// identical geometry, so the number reads as "per rank" honestly.
+    fn kv_mem_bytes(&self) -> Option<u64> {
+        Some(self.context_bytes)
+    }
+    /// This rank's device-pool measurement at load, minus the exact context
+    /// bytes - an upper bound on resident weights + scratch (the pool may
+    /// hold transient frees; the TP=1 family reports the same way).
+    fn weights_mem_bytes(&self) -> Option<u64> {
+        self.process_bytes.map(|p| p.saturating_sub(self.context_bytes))
+    }
+    fn device_mem_used(&self) -> Option<u64> {
+        self.process_bytes
+    }
 }
 
 impl Drop for TpCoordinator {
@@ -1993,15 +2095,20 @@ pub fn run_worker(
         .set_write_timeout(Some(STEP_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let run = (|| -> Result<(), String> {
-        let (max_ctx, slots) =
+        let (max_ctx, slots, kv_dtype) =
             match ControlMessage::from_stream(&mut stream).map_err(|e| e.to_string())? {
                 ControlMessage::TpInit {
                     checkpoint_sha256,
                     pack_blake3,
                     max_ctx,
                     slots,
+                    kv_dtype,
                 } => {
                     let (own_checkpoint, own_pack) = hashes(model_path, pack)?;
+                    // The dtype parses BEFORE the hash compare so an unknown
+                    // wire value reads as what it is - a protocol mismatch -
+                    // not as an identity failure.
+                    let kv_dtype = kv_dtype_parse(&kv_dtype)?;
                     if own_checkpoint != checkpoint_sha256
                         || own_pack != pack_blake3
                         || max_ctx == 0
@@ -2011,7 +2118,7 @@ pub fn run_worker(
                             "rank-1 checkpoint, CUDA pack or context disagrees with rank 0".into(),
                         );
                     }
-                    (max_ctx, slots)
+                    (max_ctx, slots, kv_dtype)
                 }
                 ControlMessage::Shutdown { graceful: true } => return Ok(()),
                 other => return Err(format!("expected Phase 9 init: {other:?}")),
@@ -2026,7 +2133,7 @@ pub fn run_worker(
             .ok_or("TP group absent")?;
         let map = MappedGguf::open(model_path).map_err(|e| e.to_string())?;
         let mut model =
-            Qwen35TpRank::load_slots(exec.clone(), &map, &group, max_ctx, KvDtype::Fp16, slots)
+            Qwen35TpRank::load_slots(exec.clone(), &map, &group, max_ctx, kv_dtype, slots)
                 .map_err(|e| e.to_string())?;
         // The lane's weights re-upload from the same mapped file (same
         // map-lifetime reorder as the coordinator's load).
@@ -2430,6 +2537,46 @@ mod tests {
         let worker = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (head, _) = listener.accept().unwrap();
         (head, worker)
+    }
+
+    #[test]
+    fn kv_dtype_from_env_defaults_to_f16_and_demotes_below_sm89_loudly() {
+        // Unset/auto/f16 serve f16 regardless of device.
+        for env in [None, Some("auto"), Some("f16"), Some("")] {
+            assert_eq!(
+                kv_dtype_from_env(env, (12, 0)),
+                KvDtype::Fp16,
+                "env {env:?} must serve f16"
+            );
+        }
+        // Spark sm_121 and consumer sm_89 both honor the fp8 ask: today
+        // gpu_support::fp8_kv answers yes on every die this build serves
+        // (fp8 storage is software-emulated and byte-exact), so the device
+        // gate never fires. The seam stays for a future broken-e4m3 die.
+        assert_eq!(
+            kv_dtype_from_env(Some("fp8_e4m3"), (12, 1)),
+            KvDtype::Fp8E4m3
+        );
+        assert_eq!(
+            kv_dtype_from_env(Some("fp8_e4m3"), (8, 9)),
+            KvDtype::Fp8E4m3
+        );
+        // Unknown values never silently pick a dtype.
+        assert_eq!(kv_dtype_from_env(Some("int8"), (12, 1)), KvDtype::Fp16);
+    }
+
+    #[test]
+    fn kv_dtype_wire_roundtrip_covers_both_dtypes() {
+        for dtype in [KvDtype::Fp16, KvDtype::Fp8E4m3] {
+            let wire = kv_dtype_wire(dtype);
+            assert_eq!(
+                kv_dtype_parse(wire).unwrap(),
+                dtype,
+                "wire {wire:?} must round-trip {dtype:?}"
+            );
+        }
+        assert!(kv_dtype_parse("int8").is_err());
+        assert!(kv_dtype_parse("").is_err());
     }
 
     #[test]
