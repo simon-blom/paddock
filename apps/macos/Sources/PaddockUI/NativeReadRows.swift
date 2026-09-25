@@ -6,35 +6,70 @@ struct NativeReadQuestionRow: View {
   let onDuplicate: () -> Void
   let onMove: (Int) -> Void
   let onRemove: () -> Void
+  var position = 0
+  var count = 1
+  var supportedTypes = ReadQuestion.Kind.allCases.map(\.rawValue)
+  var serverError: String?
+  var onID: ((String) -> Void)?
+  var onInstructions: ((String) -> Void)?
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
-      HStack {
-        TextField("Question ID", text: $question.questionID).textFieldStyle(
-          StudioPopoverFieldStyle()
+      HStack(spacing: 8) {
+        Text("\(position + 1)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+          .frame(minWidth: 12)
+        Dropdown(title: "Question type", value: question.kind.title) {
+          ForEach(
+            ReadQuestion.Kind.allCases.filter { supportedTypes.contains($0.rawValue) }, id: \.self
+          ) { kind in
+            Button(kind.title) { question.kind = kind }
+          }
+        }.fixedSize()
+        TextField(
+          "Question ID",
+          text: Binding(
+            get: { question.questionID },
+            set: {
+              if let onID { onID($0) } else { question.questionID = $0 }
+            })
         )
-        .accessibilityLabel("Question ID")
-        Picker("Type", selection: $question.kind) {
-          ForEach(ReadQuestion.Kind.allCases, id: \.self) { Text($0.title).tag($0) }
-        }.labelsHidden().fixedSize()
+        .textFieldStyle(StudioPopoverFieldStyle())
+        .font(.system(size: 12, design: .monospaced))
+        .frame(minWidth: 60, maxWidth: 220).accessibilityLabel("Question ID")
+        Spacer(minLength: 0)
         Menu {
-          Button("Move up", systemImage: "arrow.up") { onMove(-1) }
-          Button("Move down", systemImage: "arrow.down") { onMove(1) }
+          Button("Move up", systemImage: "arrow.up") { onMove(-1) }.disabled(position == 0)
+          Button("Move down", systemImage: "arrow.down") { onMove(1) }.disabled(
+            position == count - 1)
           Button("Duplicate", systemImage: "plus.square.on.square", action: onDuplicate)
           Button("Remove", systemImage: "trash", role: .destructive, action: onRemove)
         } label: {
           Image(systemName: "ellipsis").frame(width: 24, height: 28)
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().accessibilityLabel(
+        .menuStyle(.button).menuIndicator(.hidden).buttonStyle(QuietButtonStyle()).fixedSize()
+        .accessibilityLabel(
           "Question actions")
       }
-      TextField("What should the model decide?", text: $question.instructions, axis: .vertical)
-        .textFieldStyle(StudioPopoverFieldStyle()).lineLimit(2...5)
+      TextField(
+        "What should the model decide?",
+        text: Binding(
+          get: { question.instructions },
+          set: {
+            if let onInstructions { onInstructions($0) } else { question.instructions = $0 }
+          }), axis: .vertical
+      )
+      .textFieldStyle(StudioPopoverFieldStyle()).lineLimit(1...5)
       switch question.kind {
       case .noul:
-        TextField("Yes means (optional)", text: $question.yesMeans).textFieldStyle(
-          StudioPopoverFieldStyle())
-        TextField("No means (optional)", text: $question.noMeans).textFieldStyle(
-          StudioPopoverFieldStyle())
+        ViewThatFits(in: .horizontal) {
+          HStack(spacing: 8) {
+            yesField.frame(minWidth: 180)
+            noField.frame(minWidth: 180)
+          }
+          VStack(spacing: 8) {
+            yesField
+            noField
+          }
+        }
       case .choice:
         ForEach($question.options) { $option in
           HStack {
@@ -47,7 +82,8 @@ struct NativeReadQuestionRow: View {
             } label: {
               Image(systemName: "minus.circle")
             }
-            .buttonStyle(QuietButtonStyle()).accessibilityLabel("Remove option")
+            .buttonStyle(QuietButtonStyle()).disabled(question.options.count <= 2)
+            .accessibilityLabel("Remove option")
           }
         }
         Button("Add option", systemImage: "plus") { question.options.append(.init()) }
@@ -55,13 +91,31 @@ struct NativeReadQuestionRow: View {
       case .score:
         ForEach($question.levels) { $level in
           HStack {
+            let index = question.levels.firstIndex { $0.id == level.id } ?? 0
+            Text("\(index + 1)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+              .frame(width: 16)
             TextField("Level", text: $level.name).textFieldStyle(StudioPopoverFieldStyle())
+            Button {
+              question.levels.swapAt(index, index - 1)
+            } label: {
+              Image(systemName: "arrow.up")
+            }
+            .buttonStyle(QuietButtonStyle()).disabled(index == 0).accessibilityLabel(
+              "Move level up")
+            Button {
+              question.levels.swapAt(index, index + 1)
+            } label: {
+              Image(systemName: "arrow.down")
+            }
+            .buttonStyle(QuietButtonStyle()).disabled(index == question.levels.count - 1)
+            .accessibilityLabel("Move level down")
             Button {
               question.levels.removeAll { $0.id == level.id }
             } label: {
               Image(systemName: "minus.circle")
             }
-            .buttonStyle(QuietButtonStyle()).accessibilityLabel("Remove level")
+            .buttonStyle(QuietButtonStyle()).disabled(question.levels.count <= 2)
+            .accessibilityLabel("Remove level")
           }
         }
         Button("Add level", systemImage: "plus") { question.levels.append(.init()) }
@@ -70,7 +124,20 @@ struct NativeReadQuestionRow: View {
       if let validation = question.validation {
         Text(validation).font(.caption).foregroundStyle(PaddockStyle.caution)
       }
+      if let serverError {
+        Text(serverError).font(.caption).foregroundStyle(PaddockStyle.caution).textSelection(
+          .enabled)
+      }
     }.padding(12).background(PaddockStyle.canvas, in: RoundedRectangle(cornerRadius: 8))
+  }
+
+  private var yesField: some View {
+    TextField("Yes means (optional)", text: $question.yesMeans).textFieldStyle(
+      StudioPopoverFieldStyle())
+  }
+  private var noField: some View {
+    TextField("No means (optional)", text: $question.noMeans).textFieldStyle(
+      StudioPopoverFieldStyle())
   }
 }
 
@@ -78,6 +145,7 @@ struct NativeReadAnswerView: View {
   let question: ReadQuestion
   let answer: ReadResponse.Answer
   let diagnostic: ReadResponse.Diagnostics.Question?
+  var readCount = 1
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
       Text(question.questionID).font(.caption).foregroundStyle(.secondary)
@@ -88,7 +156,22 @@ struct NativeReadAnswerView: View {
           Text(score, format: .number.precision(.fractionLength(2))).monospacedDigit()
         }
         Spacer()
-        Text("Confidence \(answer.confidence, specifier: "%.2f")").foregroundStyle(.secondary)
+        HStack(spacing: 5) {
+          ReadConfidenceSwatch(value: answer.confidence)
+          Text("Confidence \(answer.confidence, specifier: "%.2f")").foregroundStyle(.secondary)
+        }.font(.caption).fixedSize()
+      }
+      if answer.nearTie {
+        Text("Near tie").font(.caption.weight(.medium)).foregroundStyle(PaddockStyle.caution)
+      }
+      if let noul = answer.noul { ReadScale(value: noul, lower: "No", upper: "Yes") }
+      if let score = answer.score, let legend = answer.legend, legend.count > 1 {
+        ReadScale(
+          value: answer.scorePosition, lower: answer.bars.first?.name ?? "0",
+          upper: answer.bars.last?.name ?? "\(legend.count - 1)",
+          ticks: (0..<legend.count).map { Double($0) / Double(legend.count - 1) })
+        Text("Score \(score, specifier: "%.2f") on 0 to \(legend.count - 1)")
+          .font(.caption).foregroundStyle(.secondary)
       }
       ForEach(Array(answer.bars.enumerated()), id: \.offset) { _, bar in
         probability(bar.name, bar.probability)
@@ -102,9 +185,15 @@ struct NativeReadAnswerView: View {
       }
       if let diagnostic {
         HStack {
-          Text("Entropy \(diagnostic.entropy, specifier: "%.3f")")
+          Text(
+            "Entropy \(diagnostic.entropy, specifier: "%.3f") · \(diagnostic.entropy < 0.1 ? "settled" : diagnostic.entropy < log(2) ? "unsettled" : "split")"
+          )
           Spacer()
-          Text("Agreement \(answer.agreement * 100, specifier: "%.0f")%")
+          if readCount > 1 {
+            Text(
+              "\(Int((answer.agreement * Double(readCount)).rounded())) of \(readCount) reads agree"
+            )
+          }
         }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
         if let reads = diagnostic.reads, reads.count > 1 {
           DisclosureGroup("Individual reads") {

@@ -2,7 +2,7 @@ import Foundation
 
 /// The same /v1/systemone wire contract as studio/src/lib/reads.ts. No chat
 /// generation, inferred confidence, hidden prompt, or cloud-model fallback.
-public struct ReadQuestion: Identifiable, Equatable, Sendable {
+public struct ReadQuestion: Identifiable, Equatable, Codable, Sendable {
   public enum Kind: String, CaseIterable, Codable, Sendable {
     case noul, choice, score
     public var title: String {
@@ -13,7 +13,7 @@ public struct ReadQuestion: Identifiable, Equatable, Sendable {
       }
     }
   }
-  public struct Option: Identifiable, Equatable, Sendable {
+  public struct Option: Identifiable, Equatable, Codable, Sendable {
     public var id = UUID()
     public var name = ""
     public var description = ""
@@ -24,6 +24,7 @@ public struct ReadQuestion: Identifiable, Equatable, Sendable {
   }
   public var id = UUID()
   public var questionID: String
+  public var idTouched = false
   public var kind: Kind
   public var instructions = ""
   public var yesMeans = ""
@@ -50,13 +51,16 @@ public struct ReadQuestion: Identifiable, Equatable, Sendable {
   }
   public var wire: ConversationValue {
     var q: [String: ConversationValue] = [
-      "type": .string(kind.rawValue), "instructions": .string(instructions),
+      "type": .string(kind.rawValue),
+      "instructions": .string(instructions.trimmingCharacters(in: .whitespacesAndNewlines)),
     ]
     switch kind {
     case .noul:
       var criteria: [String: ConversationValue] = [:]
-      if !yesMeans.isEmpty { criteria["true"] = .string(yesMeans) }
-      if !noMeans.isEmpty { criteria["false"] = .string(noMeans) }
+      let yes = yesMeans.trimmingCharacters(in: .whitespacesAndNewlines)
+      let no = noMeans.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !yes.isEmpty { criteria["true"] = .string(yes) }
+      if !no.isEmpty { criteria["false"] = .string(no) }
       if !criteria.isEmpty { q["criteria"] = .object(criteria) }
     case .choice:
       // Invalid duplicate names are diagnosed before sending; never trap here
@@ -66,7 +70,8 @@ public struct ReadQuestion: Identifiable, Equatable, Sendable {
           options.map {
             (
               $0.name.trimmingCharacters(in: .whitespacesAndNewlines),
-              ConversationValue.string($0.description)
+              ConversationValue.string(
+                $0.description.trimmingCharacters(in: .whitespacesAndNewlines))
             )
           }, uniquingKeysWith: { _, last in last }))
     case .score:
@@ -103,6 +108,9 @@ public struct ReadDraft: Equatable, Sendable {
           questions.map { ($0.questionID, $0.wire) }, uniquingKeysWith: { _, last in last })),
     ])
   }
+  public var ordering: [[String]] {
+    questions.map { [$0.questionID] + ($0.kind == .choice ? $0.options.map(\.name) : []) }
+  }
   public func request(model: String) -> ConversationValue {
     var v = setBody.object!
     v["model"] = .string(model)
@@ -126,7 +134,9 @@ public struct ReadDraft: Equatable, Sendable {
         throw ConversationFailure.invalid("Reads must be auto or a positive integer.")
       }
     }
-    draft.questions = try map.keys.sorted().map { id in
+    let order = try ReadJSONOrder(data)
+    let path = root["questions"] == nil ? [] : ["questions"]
+    draft.questions = try (order.keys[path] ?? []).map { id in
       let raw = map[id]!
       let type = raw["type"]?.string ?? ""
       guard
@@ -135,6 +145,7 @@ public struct ReadDraft: Equatable, Sendable {
         throw ConversationFailure.invalid("\(id): unsupported question type.")
       }
       var q = ReadQuestion(questionID: id, kind: kind)
+      q.idTouched = true
       q.instructions = raw["instructions"]?.string ?? ""
       let criteria = raw["criteria"]
       switch kind {
@@ -145,7 +156,7 @@ public struct ReadDraft: Equatable, Sendable {
         guard let options = criteria?.object else {
           throw ConversationFailure.invalid("\(id): choice criteria must be an object.")
         }
-        q.options = try options.keys.sorted().map { name in
+        q.options = try (order.keys[path + [id, "criteria"]] ?? []).map { name in
           guard let text = options[name]?.string else {
             throw ConversationFailure.invalid("\(id): option descriptions must be text.")
           }
@@ -201,6 +212,19 @@ public struct ReadResponse: Decodable, Sendable {
       }
       .map { ($0.key, $0.value) }
     }
+    public var nearTie: Bool {
+      let probabilities = bars.map(\.probability).sorted(by: >)
+      return probabilities.count >= 2 && probabilities[0] - probabilities[1] < 0.05
+    }
+    public var scorePosition: Double {
+      guard let score, let legend, legend.count > 1 else { return 0 }
+      return min(1, max(0, score / Double(legend.count - 1)))
+    }
+    public static func confidenceBin(_ value: Double) -> Int {
+      if !(value >= 0.5) { return 0 }
+      if value < 0.7 { return 1 }
+      return value < 0.9 ? 2 : 3
+    }
   }
   public struct Diagnostics: Decodable, Sendable {
     public struct Question: Decodable, Sendable {
@@ -213,9 +237,10 @@ public struct ReadResponse: Decodable, Sendable {
       public let label: String
       public let entropy: Double
       public let labelMass: Double
+      public let position: Int?
       public let reads: [Sample]?
       private enum CodingKeys: String, CodingKey {
-        case id, label, entropy, reads
+        case id, label, entropy, reads, position
         case labelMass = "label_mass"
       }
     }
@@ -231,4 +256,49 @@ public struct ReadResponse: Decodable, Sendable {
   public let model: String
   public let answers: [String: Answer]
   public let diagnostics: Diagnostics
+  public struct Usage: Decodable, Sendable {
+    public let inputTokens: Int?
+    public let outputTokens: Int?
+    private enum CodingKeys: String, CodingKey {
+      case inputTokens = "input_tokens"
+      case outputTokens = "output_tokens"
+    }
+  }
+  public let usage: Usage?
+  public func validate(for questions: [ReadQuestion]) throws {
+    func probability(_ p: Double) -> Bool { p.isFinite && (0...1).contains(p) }
+    guard Set(answers.keys) == Set(questions.map(\.questionID)),
+      (1...32).contains(diagnostics.reads), diagnostics.canvas > 0,
+      diagnostics.timing.totalMilliseconds.isFinite, diagnostics.timing.totalMilliseconds >= 0
+    else {
+      throw ConversationFailure.invalid("The runner returned an incomplete or invalid read result.")
+    }
+    for question in questions {
+      let answer = answers[question.questionID]!
+      guard answer.type == question.kind.rawValue,
+        probability(answer.confidence), probability(answer.agreement), probability(answer.outside),
+        answer.probabilities?.values.allSatisfy(probability) ?? true
+      else {
+        throw ConversationFailure.invalid("Invalid probabilities for \(question.questionID).")
+      }
+      let valid: Bool
+      switch question.kind {
+      case .noul: valid = answer.noul.map(probability) == true
+      case .choice:
+        valid =
+          answer.choice.map { answer.probabilities?[$0] != nil } == true
+          && Set(answer.probabilities?.keys.map { $0 } ?? [])
+            == Set(question.options.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines) })
+      case .score:
+        valid =
+          answer.score.map { $0.isFinite && $0 >= 0 && $0 <= Double(question.levels.count - 1) }
+          == true
+          && answer.legend?.count == question.levels.count
+          && answer.level.map { answer.legend?.values.contains($0) == true } == true
+      }
+      guard valid else {
+        throw ConversationFailure.invalid("Invalid answer for \(question.questionID).")
+      }
+    }
+  }
 }

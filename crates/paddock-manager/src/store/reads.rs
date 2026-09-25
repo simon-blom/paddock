@@ -99,6 +99,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         check(current(&tx, id)?.as_ref(), revision)?;
         tx.execute("DELETE FROM read_sets WHERE id=?1", [id])?;
+        tx.execute("DELETE FROM read_runs WHERE scope=?1", [id])?;
         tx.commit()?;
         Ok(())
     }

@@ -5,6 +5,37 @@ import Testing
 
 @Suite("Structured Reads wire parity")
 struct StructuredReadsTests {
+  @Test func descriptiveIDsMatchWebRulesAndCollisions() {
+    #expect(ReadQuestion.derivedID("Is the customer angry?") == "customer_angry")
+    #expect(ReadQuestion.derivedID("What is this message about?") == "message_about")
+    #expect(ReadQuestion.derivedID("", taken: ["q", "q_2"]) == "q_3")
+    #expect(ReadQuestion.derivedID("Is this urgent?", taken: ["urgent"]) == "urgent_2")
+  }
+  @Test func orderedJSONRoundTripsQuestionsAndEscapedOptionsWithoutAlphabetizing() throws {
+    let json =
+      #"{"questions":{"z_last":{"type":"choice","instructions":"Team?","criteria":{"Zebra":"first","A \"quoted\" option":"second"}},"a_first":{"type":"noul","instructions":"OK?"}},"samples":2}"#
+    let draft = try ReadDraft.parse(Data(json.utf8))
+    #expect(draft.questions.map(\.questionID) == ["z_last", "a_first"])
+    #expect(draft.questions[0].options.map(\.name) == ["Zebra", "A \"quoted\" option"])
+    let again = try ReadDraft.parse(Data(draft.orderedJSON().utf8))
+    #expect(again.questions.map(\.questionID) == draft.questions.map(\.questionID))
+    #expect(again.questions[0].options.map(\.name) == draft.questions[0].options.map(\.name))
+    #expect(again.setBody == draft.setBody)
+    #expect(throws: (any Error).self) {
+      try ReadDraft.parse(Data(#"{"q":{"type":"noul"},"q":{"type":"noul"}}"#.utf8))
+    }
+  }
+  @Test func confidenceBandsAndNearTiesUseTheWebThresholds() throws {
+    #expect(
+      [0.49, 0.5, 0.69, 0.7, 0.89, 0.9].map(ReadResponse.Answer.confidenceBin) == [
+        0, 1, 1, 2, 2, 3,
+      ])
+    let answer = try JSONDecoder().decode(
+      ReadResponse.Answer.self,
+      from: Data(
+        #"{"type":"noul","noul":0.51,"confidence":0.02,"agreement":0.5,"outside":0.8}"#.utf8))
+    #expect(answer.nearTie)
+  }
   @Test func allQuestionKindsRoundTripWithoutChangingTheWire() throws {
     let data = Data(
       #"{"samples":"auto","state":"A ticket","questions":{"urgent":{"type":"boolean","instructions":"Urgent?","criteria":{"true":"Needs help","false":"No action"}},"team":{"type":"choice","instructions":"Which team?","criteria":{"Support":"Help","Sales":"Purchase"}},"priority":{"type":"score","instructions":"Priority?","criteria":["Low","Medium","High"]}}}"#

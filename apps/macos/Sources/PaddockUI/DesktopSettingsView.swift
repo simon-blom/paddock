@@ -28,7 +28,8 @@ public struct DesktopSettingsView: View {
               notifications.enabled = false
             }
           }),
-        sounds: $notifications.sounds, notificationBusy: notifications.requesting,
+        sounds: $notifications.sounds, previews: $notifications.responsePreviews,
+        notificationBusy: notifications.requesting,
         notificationBlocked: notifications.permissionBlocked,
         notificationError: notifications.error,
         openNotifications: { notifications.openSettings() })
@@ -53,6 +54,7 @@ struct DesktopSettingsContent: View {
   @Bindable var preferences: DesktopPreferences
   @Binding var notify: Bool
   @Binding var sounds: Bool
+  @Binding var previews: Bool
   var notificationBusy: Bool
   var notificationBlocked: Bool
   var notificationError: String?
@@ -113,6 +115,9 @@ struct DesktopSettingsContent: View {
         switchRow("Play sounds", isOn: $sounds)
           .disabled(!notify || notificationBusy)
           .accessibilityIdentifier("application-notification-sounds")
+        switchRow("Response previews", isOn: $previews)
+          .disabled(!notify || notificationBusy)
+          .accessibilityIdentifier("application-notification-previews")
         if let error = notificationError { errorText(error) }
       }
     }

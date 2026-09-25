@@ -150,6 +150,12 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "gpu", "stream"] => *method == Method::GET,
         ["api", "models", "catalog" | "estimate" | "pulls"] => *method == Method::GET,
         ["api", "usage", "history"] => *method == Method::GET,
+        ["api", "reads"] => matches!(*method, Method::GET | Method::POST),
+        ["api", "read-runs", _] => matches!(*method, Method::GET | Method::POST | Method::DELETE),
+        ["api", "reads", _] => matches!(*method, Method::GET | Method::PUT | Method::DELETE),
+        ["api", "runners", port, "v1", "systemone"] if port.parse::<u16>().is_ok() => {
+            *method == Method::POST
+        }
         ["api", "mcp", "artifacts" | "graph" | "tools"] => true,
         ["api", "connectors"] => *method == Method::GET,
         ["api", "cloud"] | ["api", "cloud", _, "models"] => *method == Method::GET,
@@ -252,7 +258,7 @@ async fn guard(
         };
     }
     if !api_allowed(req.method(), &path) {
-        return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"message":"This operation belongs to the native Manager."}}))).into_response();
+        return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"message":"This operation is not available in this app session."}}))).into_response();
     }
     if path == "/api/events" {
         return events(core).await;
@@ -563,6 +569,130 @@ async fn asset(policy: &Policy, path: &str, head: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[test]
+    fn native_reads_allow_only_the_reading_contract() {
+        for (method, path) in [
+            (Method::GET, "/api/reads"),
+            (Method::POST, "/api/reads"),
+            (Method::GET, "/api/reads/set-1"),
+            (Method::PUT, "/api/reads/set-1"),
+            (Method::DELETE, "/api/reads/set-1"),
+            (Method::POST, "/api/runners/12587/v1/systemone"),
+        ] {
+            assert!(api_allowed(&method, path));
+            assert!(!authorized(
+                &policy(),
+                &Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header("host", "127.0.0.1:1234")
+                    .body(Body::empty())
+                    .unwrap()
+            ));
+            assert!(authorized(
+                &policy(),
+                &request(path).method(method).body(Body::empty()).unwrap()
+            ));
+        }
+        for (method, path) in [
+            (Method::DELETE, "/api/reads"),
+            (Method::POST, "/api/reads/set-1"),
+            (Method::GET, "/api/reads/set-1/secret"),
+            (Method::GET, "/api/runners/12587/v1/systemone"),
+            (Method::POST, "/api/runners/invalid/v1/systemone"),
+            (Method::POST, "/api/runners/12587/stop"),
+        ] {
+            assert!(!api_allowed(&method, path));
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_crud_and_inference_pass_through_the_real_native_guard() {
+        let state = Arc::new(paddock_manager::routes::AppState::for_tests());
+        let app = paddock_manager::routes::router(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(policy()),
+                guard,
+            ))
+            .layer(axum::Extension(state));
+        let call = |method: Method, path: &str, body: serde_json::Value| {
+            app.clone().oneshot(
+                request(path)
+                    .method(method)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+        };
+        let response = call(Method::GET, "/api/reads", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let doc = serde_json::json!({"id":"reading","name":"Check","body":"{}","revision":""});
+        let response = call(Method::POST, "/api/reads", doc.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let revision = saved["set"]["revision"].as_str().unwrap();
+        let response = call(Method::GET, "/api/reads/reading", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = call(Method::PUT, "/api/reads/reading", doc).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = call(
+            Method::DELETE,
+            &format!("/api/reads/reading?revision={revision}"),
+            serde_json::Value::Null,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // An isolated loopback runner proves inference crosses the same guard,
+        // not just a policy predicate. Never contact a user's model/port.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let runner = axum::Router::new().route("/v1/systemone", axum::routing::post(
+            |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                assert_eq!(body["model"], "reading-model");
+                assert_eq!(body["state"], "The sky is blue.");
+                axum::Json(serde_json::json!({"model":"reading-model","answers":{"q1":{"type":"noul","noul":0.9}}}))
+            }
+        ));
+        let task = tokio::spawn(async move { axum::serve(listener, runner).await.unwrap() });
+        let response = call(
+            Method::POST,
+            &format!("/api/runners/{port}/v1/systemone"),
+            serde_json::json!({"model":"reading-model","state":"The sky is blue.","questions":{"q1":{"type":"noul","instructions":"Is the sky blue?"}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["answers"]["q1"]["noul"], 0.9);
+        task.abort();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/reads")
+                    .header("host", "127.0.0.1:1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn native_image_relay_keeps_the_session_boundary() {
         for suffix in ["generations", "edits"] {

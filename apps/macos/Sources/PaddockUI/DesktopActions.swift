@@ -20,7 +20,12 @@ public struct DesktopRequest: Identifiable, Equatable {
 
 extension WorkspaceModel {
   public func isDesktopDestinationVisible(_ action: DesktopAction) -> Bool {
-    guard NSApp.isActive, NSApp.keyWindow?.title == "Paddock" else { return false }
+    isDesktopDestinationVisible(
+      action, workspaceActive: NSApp.isActive && NSApp.keyWindow?.title == "Paddock")
+  }
+
+  func isDesktopDestinationVisible(_ action: DesktopAction, workspaceActive: Bool) -> Bool {
+    guard workspaceActive else { return false }
     switch action {
     case .settings: return navigation.mode == .manager
     case .manager, .endpoint:
@@ -32,10 +37,10 @@ extension WorkspaceModel {
       return navigation.mode == .manager && navigation.manager == .models
         && navigation.libraryPurpose == .speech
     case .conversation(let id):
-      return navigation.mode == .studio && navigation.studio == .newChat
+      return navigation.mode == .studio && navigation.studio.isConversation
         && chat.conversation?.id == id
     case .chat: return navigation.mode == .manager && navigation.manager == .runners
-    default: return navigation.mode == .studio && navigation.studio == .newChat
+    default: return navigation.mode == .studio && navigation.studio.isConversation
     }
   }
   public var desktopRows: [EndpointRow] {

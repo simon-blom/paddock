@@ -59,7 +59,7 @@ extension Checks {
       events.filter { $0.kind == .replyReady }.count == 1
     }
     print(
-      "PASS: quick question uses one shared workspace, saves its conversation and emits one content-free completion"
+      "PASS: quick question uses one shared workspace, saves its conversation and emits one completion"
     )
     let quickID = session.conversation!.id
     await model.handleDesktopRequest(DesktopRequest(.conversation(quickID)))

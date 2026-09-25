@@ -1,5 +1,6 @@
 import Foundation
 import PaddockClient
+import PaddockNativeMarkdown
 import PaddockStudio
 
 struct DesktopEvent: Equatable, Sendable {
@@ -7,6 +8,7 @@ struct DesktopEvent: Equatable, Sendable {
   let id: String
   let kind: Kind
   let route: DesktopAction
+  var preview: String? = nil
   var title: String {
     switch kind {
     case .modelReady: "Your model is ready"
@@ -96,7 +98,39 @@ struct DesktopEventTracker {
 
   mutating func studio(_ value: StudioState) -> [DesktopEvent] {
     guard let activity = value.activity else { return [] }
-    return studio(conversationID: value.conversation?.id, busy: value.busy, activity: activity)
+    let events = studio(
+      conversationID: value.conversation?.id, busy: value.busy, activity: activity)
+    return events.map { event in
+      guard event.kind == .replyReady,
+        case .conversation(let id) = event.route, id == value.conversation?.id,
+        value.nativeTranscript?.conversationId == id,
+        let messages = value.nativeTranscript?.messages
+      else { return event }
+      let start = messages.lastIndex { $0.role == "user" }.map { $0 + 1 } ?? messages.endIndex
+      let replies = messages[start...].filter { message in
+        message.role == "assistant" && !message.streaming && !message.stopped
+          && message.error.isEmpty
+          && activity.replies.contains(where: { $0.id == message.id && $0.state == "completed" })
+      }
+      let reply: StudioState.NativeTranscript.Message?
+      if event.id.hasPrefix("reply-") {
+        reply = replies.first { event.id == "reply-\($0.id)" }
+      } else if let group = replies.last?.group {
+        reply = replies.first { $0.group == group && !$0.text.isEmpty }
+      } else {
+        reply = replies.last
+      }
+      guard let reply, let excerpt = NotificationExcerpt.text(reply.text) else { return event }
+      var event = event
+      // Compare sends one banner. Name the lane supplying the excerpt rather
+      // than suggesting that both models gave this answer.
+      let name = reply.chrome?.modelName ?? reply.model
+      event.preview =
+        reply.group == nil || name.isEmpty
+        ? excerpt
+        : NotificationExcerpt.text("\(name): \(excerpt)")
+      return event
+    }
   }
 
   mutating func studio(conversationID: String?, busy: Bool, activity: StudioState.Activity)

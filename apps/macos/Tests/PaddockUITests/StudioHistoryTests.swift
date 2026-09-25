@@ -4,10 +4,56 @@ import PaddockStudio
 import SwiftUI
 import Testing
 
+@testable import PaddockConversationCore
+@testable import PaddockStudio
 @testable import PaddockUI
 
 @Suite("Native conversation management", .serialized) @MainActor
 struct StudioHistoryTests {
+  @Test func selectingAConversationLeavesReadsBeforeAnyPresentationArrives() async {
+    let workspace = WorkspaceModel(client: HistoryNoCore())
+    workspace.navigation.studio = .reads
+    workspace.reads.draft.state = "Keep my read"
+    let sidebar = StudioConversationSidebar(
+      chat: workspace.chat,
+      onNewChat: {}, onFold: {}, onOpen: { workspace.navigation.returnToChat() })
+    sidebar.openConversation("saved-chat")
+    #expect(workspace.navigation.studio.isConversation)
+    #expect(workspace.reads.draft.state == "Keep my read")
+    // No runtime was started: navigation cannot depend on a later chat snapshot.
+    #expect(workspace.chat.conversation == nil)
+    await workspace.chat.shutdown()
+  }
+  @Test func currentConversationRemainsReachableWhileBusyOrHoldingADraft() async throws {
+    let workspace = WorkspaceModel(client: HistoryNoCore())
+    let host = try JSONDecoder().decode(
+      StudioHost.self,
+      from: Data(
+        #"{"origin":"http://127.0.0.1:43219","cookieName":"paddock_desktop_session","session":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+          .utf8))
+    let runtime = NativeStudioRuntime(transport: try NativeConversationTransport(host: host)) { _ in
+    }
+    var fields = await runtime.presentation()
+    fields["revision"] = .number(1)
+    fields["busy"] = .bool(true)
+    fields["conversation"] = .object([
+      "id": .string("active"), "title": .string("Fixture"), "model": .string("fixture"),
+      "messageCount": .number(1),
+    ])
+    workspace.chat.apply(
+      try JSONDecoder().decode(StudioState.self, from: JSONEncoder().encode(fields)))
+    workspace.navigation.studio = .reads
+    workspace.draft.message = "Keep draft"
+    workspace.chat.microphoneStarting = true
+    let sidebar = StudioConversationSidebar(
+      chat: workspace.chat, hasDraft: true,
+      onNewChat: {}, onFold: {}, onOpen: { workspace.navigation.returnToChat() })
+    #expect(sidebar.canOpenConversation("active") && !sidebar.canOpenConversation("different"))
+    sidebar.openConversation("active")
+    #expect(workspace.navigation.studio.isConversation && workspace.chat.busy)
+    #expect(workspace.draft.message == "Keep draft")
+    await workspace.chat.shutdown()
+  }
   @Test func actionMenuHasAButtonSizedLabelInBothThemes() {
     _ = NSApplication.shared
     for dark in [false, true] {

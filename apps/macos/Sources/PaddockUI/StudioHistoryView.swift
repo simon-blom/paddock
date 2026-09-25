@@ -170,6 +170,16 @@ struct StudioConversationSidebar: View {
   private var canNavigate: Bool {
     !chat.busy && !chat.uploading && !chat.hasAttachments && !hasDraft && !chat.hasMessageEdit
   }
+  func canOpenConversation(_ id: String) -> Bool {
+    canNavigate || chat.conversation?.id == id
+  }
+  func openConversation(_ id: String) {
+    guard canOpenConversation(id) else { return }
+    // Navigation must not wait for the runtime's separate presentation stream.
+    onOpen()
+    guard chat.conversation?.id != id else { return }
+    Task { await chat.open(id) }
+  }
   private var canDeleteSelection: Bool {
     !selection.isEmpty
       && selection.allSatisfy { id in
@@ -248,7 +258,8 @@ struct StudioConversationSidebar: View {
           }
           ForEach(rows) { row in
             StudioHistoryRow(
-              chat: chat, row: row, compact: true, canOpen: selecting || canNavigate,
+              chat: chat, row: row, compact: true,
+              canOpen: selecting || canOpenConversation(row.id),
               canDelete: row.id != chat.conversation?.id || canNavigate,
               selected: selecting ? selection.contains(row.id) : chat.conversation?.id == row.id,
               selecting: selecting
@@ -260,10 +271,7 @@ struct StudioConversationSidebar: View {
                   selection.insert(row.id)
                 }
               } else {
-                Task {
-                  await chat.open(row.id)
-                  if chat.conversation?.id == row.id { onOpen() }
-                }
+                openConversation(row.id)
               }
             }
           }

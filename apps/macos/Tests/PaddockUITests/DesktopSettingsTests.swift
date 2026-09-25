@@ -123,6 +123,7 @@ struct DesktopSettingsTests {
           let content = DesktopSettingsSurface(embedded: true) {
             DesktopSettingsContent(
               preferences: fixture.preferences, notify: .constant(false), sounds: .constant(false),
+              previews: .constant(true),
               notificationBusy: false, notificationBlocked: needsAction, notificationError: nil,
               openNotifications: { Issue.record("Layout must not open System Settings") })
           }

@@ -11,39 +11,64 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   public var effectiveEnabled: Bool { enabled && Self.allowsDelivery(authorization) }
   public private(set) var error: String?
   public private(set) var requesting = false
-  @ObservationIgnored private let center: UNUserNotificationCenter
+  @ObservationIgnored private let delivery: any DesktopNotificationDelivering
   @ObservationIgnored private let defaults: UserDefaults
   @ObservationIgnored private var tracker = DesktopEventTracker()
   @ObservationIgnored public var open: ((DesktopAction) -> Void)?
   @ObservationIgnored public var isVisible: ((DesktopAction) -> Bool)?
   @ObservationIgnored private var pending: [String: (UUID, Task<Void, Never>)] = [:]
+  @ObservationIgnored private var authorizationTask: Task<Void, Never>?
+  @ObservationIgnored private var studioBusy = false
   public var enabled: Bool {
     didSet {
       defaults.set(enabled, forKey: "desktopNotifications")
       if !enabled {
         cancelPending()
-        center.removeAllDeliveredNotifications()
+        delivery.removeDelivered(nil)
       }
     }
   }
   public var sounds: Bool { didSet { defaults.set(sounds, forKey: "desktopNotificationSounds") } }
+  public var responsePreviews: Bool {
+    didSet {
+      defaults.set(responsePreviews, forKey: "desktopNotificationPreviews")
+      if !responsePreviews {
+        cancelPending()
+        delivery.removeDelivered(nil)
+      }
+    }
+  }
 
-  public init(defaults: UserDefaults = .standard) {
-    self.defaults = defaults
-    enabled = defaults.bool(forKey: "desktopNotifications")
-    sounds = defaults.bool(forKey: "desktopNotificationSounds")
-    center = .current()
-    super.init()
-    center.delegate = self
+  public convenience init(defaults: UserDefaults = .standard) {
+    let delivery = SystemNotificationDelivery()
+    self.init(defaults: defaults, delivery: delivery)
+    delivery.center.delegate = self
     let open = UNNotificationAction(
       identifier: "open", title: "Open Paddock", options: [.foreground])
-    center.setNotificationCategories([
-      UNNotificationCategory(identifier: "paddock.activity", actions: [open], intentIdentifiers: [])
+    delivery.center.setNotificationCategories([
+      UNNotificationCategory(
+        identifier: "paddock.activity", actions: [open], intentIdentifiers: [],
+        hiddenPreviewsBodyPlaceholder: "Open Paddock to view this activity.", options: [])
     ])
   }
 
+  init(defaults: UserDefaults, delivery: any DesktopNotificationDelivering) {
+    self.defaults = defaults
+    // An absent preference is not a refusal. macOS permission still gates
+    // every delivery; an explicit in-app opt-out remains off after upgrades.
+    enabled =
+      defaults.object(forKey: "desktopNotifications") == nil
+      || defaults.bool(forKey: "desktopNotifications")
+    sounds = defaults.bool(forKey: "desktopNotificationSounds")
+    responsePreviews =
+      defaults.object(forKey: "desktopNotificationPreviews") == nil
+      || defaults.bool(forKey: "desktopNotificationPreviews")
+    self.delivery = delivery
+    super.init()
+  }
+
   public func refreshAuthorization() async {
-    authorization = await center.notificationSettings().authorizationStatus
+    authorization = await delivery.settings().authorization
   }
 
   static func allowsDelivery(_ authorization: UNAuthorizationStatus?) -> Bool {
@@ -71,7 +96,8 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
         openSettings()
         return
       }
-      enabled = try await center.requestAuthorization(options: [.alert, .sound])
+      try await delivery.requestAuthorization()
+      enabled = true
       await refreshAuthorization()
     } catch { self.error = error.localizedDescription }
   }
@@ -79,9 +105,35 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   public func management(_ value: PaddockClient.ManagerSnapshot) {
     deliver(tracker.management(value))
   }
-  public func studio(_ value: PaddockStudio.StudioState) { deliver(tracker.studio(value)) }
+  public func studio(_ value: PaddockStudio.StudioState) {
+    if value.busy && !studioBusy { prepareForBackgroundWork() }
+    studioBusy = value.busy
+    deliver(tracker.studio(value))
+  }
 
-  private func deliver(_ events: [DesktopEvent]) {
+  /// Called by actual work, never startup/history restoration. A completion
+  /// waits for the same permission request, including very fast replies.
+  func prepareForBackgroundWork() {
+    guard enabled, authorizationTask == nil else { return }
+    authorizationTask = Task { [weak self] in
+      guard let self else { return }
+      defer { authorizationTask = nil }
+      await refreshAuthorization()
+      guard enabled, authorization == .notDetermined, !requesting,
+        !defaults.bool(forKey: "desktopNotificationsPrompted")
+      else { return }
+      defaults.set(true, forKey: "desktopNotificationsPrompted")
+      requesting = true
+      defer { requesting = false }
+      do {
+        error = nil
+        try await delivery.requestAuthorization()
+        await refreshAuthorization()
+      } catch { self.error = error.localizedDescription }
+    }
+  }
+
+  func deliver(_ events: [DesktopEvent]) {
     for event in events where enabled && isVisible?(event.route) != true {
       // Group approvals and compare lanes by conversation. Stable identifiers
       // replace the existing banner; they do not grow an unbounded history.
@@ -91,21 +143,29 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
       let task = Task { [weak self] in
         guard let self else { return }
         defer { if pending[key]?.0 == generation { pending[key] = nil } }
-        let settings = await center.notificationSettings()
+        prepareForBackgroundWork()
+        await authorizationTask?.value
+        let settings = await delivery.settings()
         guard !Task.isCancelled, enabled, isVisible?(event.route) != true,
-          Self.allowsDelivery(settings.authorizationStatus)
+          Self.allowsDelivery(settings.authorization)
         else { return }
         let content = UNMutableNotificationContent()
         content.title = event.title
-        content.body = event.body
+        // macOS handles When Unlocked redaction. Never put a preview in the
+        // title, identifiers or routing payload where it could bypass that.
+        content.body =
+          responsePreviews && settings.showPreviews != .never
+          ? event.preview ?? event.body : event.body
         content.categoryIdentifier = "paddock.activity"
         content.threadIdentifier = key
         content.userInfo = Self.payload(event.route)
-        if sounds && settings.soundSetting == .enabled { content.sound = .default }
+        if sounds && settings.soundEnabled { content.sound = .default }
         do {
-          try await center.add(
+          try await delivery.add(
             UNNotificationRequest(identifier: key, content: content, trigger: nil))
-          if !enabled { center.removeDeliveredNotifications(withIdentifiers: [key]) }
+          if !enabled || (!responsePreviews && content.body != event.body) {
+            delivery.removeDelivered([key])
+          }
         } catch { self.error = "Could not deliver a notification: \(error.localizedDescription)" }
       }
       pending[key] = (generation, task)
@@ -115,7 +175,17 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   private func cancelPending() {
     for task in pending.values { task.1.cancel() }
     pending.removeAll()
-    center.removeAllPendingNotificationRequests()
+    delivery.removePending()
+  }
+
+  func settle() async {
+    await authorizationTask?.value
+    for (_, task) in pending.values { await task.value }
+  }
+
+  func presentation(for route: DesktopAction) -> UNNotificationPresentationOptions {
+    guard enabled, isVisible?(route) != true else { return [] }
+    return sounds ? [.banner, .list, .sound] : [.banner, .list]
   }
 
   static func identifier(_ event: DesktopEvent) -> String {
@@ -162,8 +232,7 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   ) async -> UNNotificationPresentationOptions {
     guard let route = Self.route(notification.request.content.userInfo) else { return [] }
     return await MainActor.run {
-      guard enabled, isVisible?(route) != true else { return [] }
-      return sounds ? [.banner, .list, .sound] : [.banner, .list]
+      presentation(for: route)
     }
   }
 }

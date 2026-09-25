@@ -19,6 +19,7 @@ mod integrations;
 mod model_profiles;
 mod native_benchmarks;
 mod prompts;
+mod read_runs;
 mod reads;
 
 pub struct Store {
@@ -389,6 +390,15 @@ CREATE TABLE IF NOT EXISTS read_sets (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS read_runs (
+    scope TEXT NOT NULL,
+    id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY(scope,id)
+);
+CREATE INDEX IF NOT EXISTS read_runs_recent ON read_runs(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,

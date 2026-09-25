@@ -6,7 +6,10 @@ struct ModelProviderLogo: View {
   var size: CGFloat = 18
   var body: some View {
     Group {
-      if let image = ProviderArtwork.image(for: vendor) {
+      // AppKit menu triggers may extract NSImage and ignore SwiftUI frames.
+      // Use bounded intrinsic dimensions as well as the visible frame; the
+      // copied SVG representation remains vector at every requested size.
+      if let image = ProviderArtwork.menuImage(for: vendor) {
         Image(nsImage: image).resizable()
           .renderingMode(ProviderArtwork.usesTemplate(for: vendor) ? .template : .original)
           .scaledToFit()

@@ -43,6 +43,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         // the Reads page's saved question sets - the prompt library's shape
         .route("/api/reads", get(list_read_sets).post(create_read_set))
         .route(
+            "/api/read-runs/{scope}",
+            get(list_read_runs)
+                .post(save_read_run)
+                .delete(clear_read_runs),
+        )
+        .route(
             "/api/reads/{id}",
             get(get_read_set)
                 .put(update_read_set)
@@ -182,6 +188,29 @@ async fn delete_prompt(
 }
 
 // ── read sets ────────────────────────────────────────────────────────────────
+
+async fn list_read_runs(State(s): State<Arc<AppState>>, Path(scope): Path<String>) -> Response {
+    match s.db.read_runs(&scope) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+async fn save_read_run(
+    State(s): State<Arc<AppState>>,
+    Path(scope): Path<String>,
+    Json(doc): Json<Value>,
+) -> Response {
+    match s.db.save_read_run(&scope, &doc) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
+async fn clear_read_runs(State(s): State<Arc<AppState>>, Path(scope): Path<String>) -> Response {
+    match s.db.clear_read_runs(&scope) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => prompt_error(e),
+    }
+}
 
 async fn list_read_sets(State(s): State<Arc<AppState>>) -> Response {
     match s.db.list_read_sets() {
