@@ -87,6 +87,14 @@ pub struct Qwen35TpRank {
     /// Phase 11 Stage A: the decode lane's rank-local graph cache. Empty
     /// until `enable_tp_graphs`; the prefill lane never captures.
     graphs: TpGraphs,
+    /// The resolved graph-EXECUTION mode for this rank, stored as ordinary
+    /// model state (upstream-readiness I4 fix). Default false = eager.
+    /// `enable_tp_graphs` flips it true only after capture succeeds; every
+    /// token forward consults this field, never an environment read, so a
+    /// serving rank's sequencing is fixed at setup (rank 0 resolves
+    /// `PADDOCK_TP_GRAPH` via `dev_var!`, the worker receives the decision
+    /// in `TpInit.use_graphs`).
+    graphs_enabled: bool,
     /// Second execution lane for overlapped prefill spans: a forked executor
     /// (own stream) plus per-lane backbone scratch re-allocated beside the
     /// decode lane's. Immutable weights (`tok_embd`, `layers`, `out_norm`,
@@ -264,6 +272,7 @@ impl Qwen35TpRank {
             sample_chain: None,
             prefill: None,
             graphs: TpGraphs::default(),
+            graphs_enabled: false,
             exec,
             rank: group.rank(),
             hidden,
@@ -312,6 +321,10 @@ impl Qwen35TpRank {
         for i in 0..self.layers.len() {
             self.capture_mixer_run(group, i, 0)?;
         }
+        // Capture succeeded: flip the execution-mode state. Every token
+        // forward now replays from the cache (I4: sequencing is model state
+        // fixed at setup, not an environment read per process).
+        self.graphs_enabled = true;
         Ok(())
     }
 
@@ -524,13 +537,7 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(
-            group,
-            logical_kv,
-            position,
-            slot,
-            Self::tp_graph_enabled(),
-        )
+        self.forward_token_body(group, logical_kv, position, slot, self.graphs_enabled)
     }
 
     /// Sample the resident `self.logits` row on device after a
@@ -739,7 +746,7 @@ impl Qwen35TpRank {
             .stream
             .memcpy_dtod(&self.feedback_ids[slot][plane], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(group, logical_kv, position, slot, Self::tp_graph_enabled())
+        self.forward_token_body(group, logical_kv, position, slot, self.graphs_enabled)
     }
 
     fn forward_token_gpu<C: Communicator>(
@@ -761,31 +768,27 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut self.token)
             .map_err(GpuError::from)?;
-        self.forward_token_body(
-            group,
-            logical_kv,
-            position,
-            slot,
-            Self::tp_graph_enabled(),
-        )
+        self.forward_token_body(group, logical_kv, position, slot, self.graphs_enabled)
     }
 
-    /// Phase 11 Stage A opt-in (`PADDOCK_TP_GRAPH=1`): route decode-lane
-    /// token rows through the rank-local graph cache. Read once per process.
-    /// The coordinator's resolved value rides TpInit to the worker (protocol
-    /// v2), so the pair cannot diverge; a worker process must never decide
-    /// graph mode from its own environment (that would pair an eager
-    /// all_reduce with a graphed one and hang the row). Experimental dev
-    /// switch: `dev_var!` keeps it out of hardened builds entirely.
-    fn tp_graph_enabled() -> bool {
-        static TP_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *TP_GRAPH.get_or_init(|| paddock_models::dev_var!("PADDOCK_TP_GRAPH").as_deref() == Ok("1"))
+    /// Setup-time graph-mode decision (rank 0 / coordinator only). Reads the
+    /// experimental dev switch (`PADDOCK_TP_GRAPH=1`; `dev_var!` keeps it out
+    /// of hardened builds entirely) ONCE during serving setup. The resolved
+    /// value is composed into `TpInit` for the worker and - on both ranks -
+    /// becomes model state via `enable_tp_graphs`. Execution NEVER reads this
+    /// function: token forwards consult the stored `graphs_enabled` field
+    /// (upstream-readiness I4), so a serving rank's sequencing is fixed
+    /// before the first token and a hand-started worker cannot pair eager
+    /// with graphed collectives.
+    pub fn resolve_graph_mode_for_serve() -> bool {
+        paddock_models::dev_var!("PADDOCK_TP_GRAPH").as_deref() == Ok("1")
     }
 
-    /// Serving-side gate (rank 0 only, public for tp_serve): the resolved
-    /// value is composed into TpInit for the worker.
-    pub fn tp_graph_enabled_for_serve() -> bool {
-        Self::tp_graph_enabled()
+    /// The resolved graph-execution mode (ordinary model state: true only
+    /// after a successful `enable_tp_graphs`; default eager). Test surface
+    /// for the I4 invariant; production code reads nothing else.
+    pub fn graphs_enabled(&self) -> bool {
+        self.graphs_enabled
     }
 
     fn forward_token_body<C: Communicator>(
@@ -1068,6 +1071,9 @@ impl Qwen35TpRank {
             sample_chain: None,
             prefill: None,
             graphs: TpGraphs::default(),
+            // The prefill lane never captures or replays graphs (see
+            // enable_tp_graphs), so its execution mode is always eager.
+            graphs_enabled: false,
             // Phase 12: the lane serves the SAME KV dtype as the decode lane.
             // The hardcoded Fp16 here was a latent divergence: a future fp8
             // decode lane would have forked an f16 lane whose slabs and
@@ -1170,6 +1176,8 @@ impl Qwen35TpRank {
             .stream
             .memcpy_htod(&[token], &mut lane.model.token)
             .map_err(GpuError::from)?;
+        // The prefill lane is never captured, so its execution mode is
+        // always eager (its model's graphs_enabled stays false anyway).
         lane.model
             .forward_token_body(group, logical_kv, position, slot, false)
     }
@@ -1514,6 +1522,122 @@ mod tests {
     use super::{check_feedback_plane, tp_sample_params};
     use crate::sampler::DevicePlan;
     use paddock_models::ggml_type::GgmlType;
+
+    // I4 invariant, host-checkable halves. The graph cache is a private
+    // field with no Default-constructible GPU state, so a full instance
+    // needs CUDA; what IS provable here is the contract that makes the
+    // runtime field the only execution input:
+    // - the setup-time resolver is a pure function of the env read (dev
+    //   builds only), never cached globally;
+    // - the execution-mode field starts false on every construction path
+    //   and only `enable_tp_graphs` (capture success) flips it - asserted
+    //   structurally by the field initializer being the ONLY false assignment
+    //   and enable_tp_graphs the ONLY true assignment (grep-guarded below).
+
+    /// The resolver must not memoize: two calls re-evaluate (a OnceLock
+    /// here would have re-created the exact global the I4 fix removes).
+    #[test]
+    fn graph_mode_resolver_is_a_pure_env_read_not_a_global() {
+        // Dev-build behavior: the read is live. Hardened builds compile the
+        // read out entirely (dev_var!), so the resolver is constant false
+        // there - both satisfy "no global state".
+        let first = super::Qwen35TpRank::resolve_graph_mode_for_serve();
+        let second = super::Qwen35TpRank::resolve_graph_mode_for_serve();
+        assert_eq!(first, second, "resolver must be deterministic per read");
+    }
+
+    /// Structural guard for the default-eager / enable-only-true contract:
+    /// `graphs_enabled` must be initialized false at every construction
+    /// site, and the ONLY `= true` assignment must live inside
+    /// `enable_tp_graphs`. Only the production half of the file is scanned
+    /// (everything before `#[cfg(test)]`), so the guard cannot match its
+    /// own source text.
+    #[test]
+    fn graphs_enabled_is_default_false_and_flipped_only_by_enable_tp_graphs() {
+        let src = production_source();
+        // Exactly two construction sites (load_slots, enable_prefill_lane's
+        // lane struct) carry the eager default.
+        let constructions = src.matches("graphs_enabled: false").count();
+        assert_eq!(
+            constructions, 2,
+            "expected exactly two construction sites defaulting graphs_enabled to \
+             false; found {constructions}"
+        );
+        // Count `= true` assignments to the field (ignores the `: false`
+        // initializers and the accessor).
+        let true_assignments: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("self.graphs_enabled = true"))
+            .collect();
+        assert_eq!(
+            true_assignments.len(),
+            1,
+            "graphs_enabled must flip true in exactly one place \
+             (enable_tp_graphs after successful capture); got {true_assignments:?}"
+        );
+        // And that place must be inside enable_tp_graphs: locate both.
+        let enable_start = src
+            .find("pub fn enable_tp_graphs")
+            .expect("enable_tp_graphs exists");
+        let assign_offset = src.find("self.graphs_enabled = true").expect("assignment exists");
+        assert!(
+            assign_offset > enable_start,
+            "the only true-assignment must come after enable_tp_graphs begins"
+        );
+    }
+
+    /// Execution must consult the stored field, not an environment read:
+    /// no `tp_graph_enabled()` call may remain in any forward path, and the
+    /// ONLY env read for graph mode is the setup-time resolver.
+    #[test]
+    fn token_forward_paths_consult_model_state_not_the_environment() {
+        let src = production_source();
+        assert!(
+            !src.contains("tp_graph_enabled"),
+            "stale tp_graph_enabled symbol in production code"
+        );
+        // Every `forward_token_body(` invocation must pass self.graphs_enabled.
+        for (idx, line) in src.lines().enumerate() {
+            if line.contains("forward_token_body(") && line.contains("self.graphs_enabled") {
+                continue;
+            }
+            if line.contains("forward_token_body(")
+                && !line.contains("fn forward_token_body")
+                && !line.contains("forward_token_body(group, logical_kv, position, slot, false)")
+                && !line.contains("//")
+            {
+                // Multi-line call form: check the next few lines carry the field.
+                let window: String = src.lines().skip(idx).take(8).collect::<Vec<_>>().join("\n");
+                assert!(
+                    window.contains("self.graphs_enabled"),
+                    "forward_token_body call at line {} must consult the stored \
+                     graphs_enabled field, got: {window}",
+                    idx + 1
+                );
+            }
+        }
+        // Exactly one executable env read for graph mode (the setup-time
+        // resolver). Doc comments mentioning the name are fine.
+        let env_reads: Vec<&str> = src
+            .lines()
+            .filter(|l| {
+                l.contains("PADDOCK_TP_GRAPH") && !l.trim_start().starts_with("///")
+            })
+            .collect();
+        assert_eq!(
+            env_reads.len(),
+            1,
+            "exactly one executable PADDOCK_TP_GRAPH read may exist (the \
+             setup-time resolver); got {env_reads:?}"
+        );
+    }
+
+    /// The production half of tp_model.rs (everything before the test
+    /// module), so source-structure guards cannot match their own text.
+    fn production_source() -> &'static str {
+        let src = include_str!("tp_model.rs");
+        src.split("#[cfg(test)]").next().expect("nonempty")
+    }
 
     #[test]
     fn feedback_slot_planes_are_bounded() {

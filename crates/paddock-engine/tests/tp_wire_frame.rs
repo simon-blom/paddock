@@ -118,6 +118,85 @@ fn b2_new_design_stays_bounded_far_below_the_cap() {
     );
 }
 
+/// Serialize a `TpBatch` (the smallest mutating command: ordered rows plus
+/// the one end-of-tick snapshot) at an arbitrary context with the supported
+/// maximum of two slots, through the real `to_frame()` encoder. This is the
+/// per-tick floor for the mirror wire: every mutating command carries the
+/// same full `Snapshot`, so its frame size bounds the whole family.
+fn snapshot_frame_at_context(max_ctx: usize) -> usize {
+    let blocks = (max_ctx.div_ceil(16) * SLOTS) as u32;
+    let mut coord = MirroredKv::new(blocks, SLOTS, max_ctx).expect("geometry");
+    // One decode row: the snapshot dominates; rows add ~40 B each.
+    let ops = [Operation::Ensure {
+        slot: 0,
+        position: 0,
+    }];
+    let end: Snapshot = coord.authorize_all(&ops).expect("authorize_all");
+    let kv_state = serde_json::to_value(&end).expect("snapshot json");
+    let msg = ControlMessage::TpBatch {
+        sequence: 1,
+        rows: vec![(0usize, 7u32, 0usize)],
+        kv_state,
+    };
+    msg.to_frame().expect("frame").len()
+}
+
+/// B2 context bound (upstream-readiness review follow-up): the v2 mirror wire
+/// sends one full `Snapshot` per mutating command, so frame size grows with
+/// CONTEXT. Measure the real serialized frame at the supported geometry
+/// ceiling (2 slots) across the candidate context sizes. Measured growth is
+/// almost exactly 0.25 B per context token (the refcount array dominates:
+/// one u32 per physical block, and blocks = ctx/16 x 2 slots), so even 1M
+/// context stays at ~25% of the 1 MiB frame cap and the wire does not cross
+/// MAX_FRAME until ~4.19M tokens of context - two orders of magnitude above
+/// any context the pinned Qwen3.8 TP lane claims. No startup gate needed;
+/// this test pins the measured sizes so a future wire change that breaks
+/// the bound fails here first.
+#[test]
+fn b2_snapshot_frame_growth_and_context_bound() {
+    let mut sizes = Vec::new();
+    for ctx in [16_384usize, 65_536, 131_072, 262_144, 1_048_576] {
+        let size = snapshot_frame_at_context(ctx);
+        sizes.push((ctx, size));
+        println!(
+            "B2 snapshot @ ctx={ctx} (2 slots): frame={size}B ({:.1}% of MAX_FRAME={MAX_FRAME})",
+            100.0 * size as f64 / MAX_FRAME as f64
+        );
+    }
+    let cap = MAX_FRAME as usize;
+    // Headroom at every measured size: even 1M context is ~25% of the cap,
+    // so no documented or plausible TP context comes near the frame limit.
+    // (The 1M point is included to anchor the extrapolation below, not as a
+    // supported regime.)
+    for (ctx, size) in &sizes {
+        assert!(
+            *size <= cap,
+            "snapshot frame at ctx={ctx} must stay under MAX_FRAME: {size}B"
+        );
+    }
+    // Growth is monotone in context (the snapshot's refcount array is the
+    // dominant term) and tracks the measured ~0.25 B/token closely enough
+    // to extrapolate where the wire would cross the cap.
+    for ((c1, s1), (c2, s2)) in sizes.iter().zip(sizes.iter().skip(1)) {
+        assert!(s2 > s1, "frame must grow with context: {c1}->{c2}");
+    }
+    let (c1, s1) = sizes[0];
+    let (c2, s2) = sizes[sizes.len() - 1];
+    let slope = (s2 - s1) as f64 / (c2 - c1) as f64;
+    assert!(
+        (0.20..=0.30).contains(&slope),
+        "snapshot growth should be ~0.25 B/context-token, got {slope}"
+    );
+    let extrapolated_crossing = (cap as f64 - s1 as f64) / slope + c1 as f64;
+    println!(
+        "B2 snapshot: frame cap crossed at ~{extrapolated_crossing:.0} tokens context (2 slots)"
+    );
+    assert!(
+        extrapolated_crossing > 4_000_000.0,
+        "the wire bound must stay far above any supported context: {extrapolated_crossing}"
+    );
+}
+
 #[test]
 fn b2_new_design_worker_mirror_accepts_then_fails_closed() {
     // End-to-end over the real wire: coordinator authorizes a tick, the frame
