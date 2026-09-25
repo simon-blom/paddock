@@ -33,6 +33,7 @@ pub struct Event {
     pub state: Snapshot,
 }
 
+#[derive(Clone)]
 pub struct MirroredKv {
     pool: KvPool,
     tables: Vec<BlockTable>,
@@ -131,15 +132,17 @@ impl MirroredKv {
     /// authorized grew the wire O(rows x context); the resulting end state is
     /// the only thing the mirror needs to validate, because every apply is a
     /// deterministic function of the (already-agreed) prior state and the
-    /// ordered operations. Fails closed before anything is sent if any
-    /// operation is invalid; the mirror state is unchanged in that case
-    /// (apply validates before mutating, per operation).
+    /// ordered operations. Stage the full tick and commit only after every
+    /// operation succeeds, so an invalid later operation cannot half-apply.
     pub fn authorize_all(&mut self, operations: &[Operation]) -> Result<Snapshot, &'static str> {
+        let mut staged = self.clone();
         for op in operations {
-            self.apply(op)?;
+            staged.apply(op)?;
         }
-        self.sequence += operations.len() as u64;
-        Ok(self.snapshot())
+        staged.sequence += operations.len() as u64;
+        let snapshot = staged.snapshot();
+        *self = staged;
+        Ok(snapshot)
     }
 
     /// Rank 1 replays a rank-0 event; mismatched sequence or state fails closed.
@@ -176,13 +179,15 @@ impl MirroredKv {
             // a malformed frame from reading as silent progress.
             return Err("KV tick carries no operations");
         }
+        let mut staged = self.clone();
         for op in operations {
-            self.apply(op)?;
+            staged.apply(op)?;
         }
-        self.sequence += operations.len() as u64;
-        if self.snapshot() != *end_state {
+        staged.sequence += operations.len() as u64;
+        if staged.snapshot() != *end_state {
             return Err("KV logical state diverged");
         }
+        *self = staged;
         Ok(())
     }
 
@@ -413,6 +418,8 @@ mod tests {
         // An invalid operation inside the tick fails and leaves no partial
         // sequence advance on the coordinator either.
         let mut e = MirroredKv::new(1, 2, 48).unwrap();
+        let before = e.snapshot();
+        let before_sequence = e.sequence;
         let bad = vec![
             Operation::Ensure {
                 slot: 0,
@@ -424,17 +431,23 @@ mod tests {
             },
         ];
         assert!(e.authorize_all(&bad).is_err());
-        assert_eq!(e.sequence, 0);
+        assert_eq!(e.snapshot(), before);
+        assert_eq!(e.sequence, before_sequence);
         // An empty tick is malformed, never silent progress.
         assert!(e.mirror_tick(&[], &a.snapshot()).is_err());
 
         // A wrong END STATE with valid ops fails closed (the failure mode the
         // per-row design caught mid-tick: end-state equality still catches it).
         let mut f = MirroredKv::new(4, 2, 48).unwrap();
+        let before = f.snapshot();
+        let before_sequence = f.sequence;
         let mut wrong_end = end.clone();
         wrong_end.free += 1;
         assert!(f.mirror_tick(&ops, &wrong_end).is_err());
-        // And the failed mirror is not half-applied: replaying correctly works.
+        assert_eq!(f.snapshot(), before);
+        assert_eq!(f.sequence, before_sequence);
+        // The failed tick did not consume the valid operations; replaying the
+        // correct end state must still succeed from the original state.
         assert!(f.mirror_tick(&ops, &end).is_ok());
     }
 

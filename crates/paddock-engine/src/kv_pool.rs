@@ -34,7 +34,7 @@ pub struct PoolExhausted;
 /// Fixed-capacity pool of physical KV blocks shared by every active sequence and
 /// (later) the radix prefix cache. Refcounted: a block referenced by K sequences
 /// or radix nodes has refcount K; only refcount-0 blocks are free.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KvPool {
     /// refcount per block; 0 = free (present in `free`).
     refcount: Vec<u32>,
@@ -126,7 +126,7 @@ impl KvPool {
 /// Per-sequence logical->physical block map for a `Paged` (full-attention) layer.
 /// Grows by whole blocks as the sequence decodes; entry `i` backs logical tokens
 /// `[i*BLOCK_TOKENS, (i+1)*BLOCK_TOKENS)`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct BlockTable {
     blocks: Vec<BlockId>,
 }

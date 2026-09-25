@@ -539,12 +539,11 @@ impl TpCoordinator {
         }
         let mut picks = Vec::new();
         for &(slot, start, ref chunk) in reqs {
-            let mut position = start;
             for (i, &token) in chunk.iter().enumerate() {
+                let position = start + i;
                 let logits = self.run_rows(&[(slot, token, position)], 0)?;
                 let next = argmax_logits(&logits)?;
                 picks.push(next);
-                position += 1;
                 if i + 1 < chunk.len() && next != chunk[i + 1] {
                     picks.extend(std::iter::repeat_n(0, chunk.len() - i - 1));
                     break;
@@ -1193,10 +1192,8 @@ impl TpCoordinator {
                 continue;
             }
             for &(slot, plan) in fin_plans {
-                if slot == chunk.slot {
-                    if let RowSample::Device(p) = plan {
-                        chunk.fin_plan = Some(p);
-                    }
+                if let (true, RowSample::Device(p)) = (slot == chunk.slot, plan) {
+                    chunk.fin_plan = Some(p);
                 }
             }
         }

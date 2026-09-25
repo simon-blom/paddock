@@ -40,6 +40,7 @@ fn hash_block(tokens: &[u32]) -> u64 {
     h
 }
 
+#[derive(Clone)]
 struct Node {
     parent: u32,
     /// the `KvPool` block this node caches (retained while the node is alive).
@@ -105,6 +106,7 @@ pub struct LruPathEntry {
 
 /// A radix tree of block-aligned token prefixes over the shared `KvPool`. Node 0
 /// is the dummy root (no block).
+#[derive(Clone)]
 pub struct PagedRadix {
     nodes: Vec<Node>,
     free_nodes: Vec<u32>,

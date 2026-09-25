@@ -713,3 +713,11 @@ This is behavioral evidence that rank 1 executed the coordinator's `TpInit`-sele
 The freshly matching `qwen35_two_slot_oracle` completed normally with `PADDOCK_NO_SPEC=1` and exited 0 on both ranks. Its scripted interleaved two-slot lifecycle covered admission and decode, cancellation, synchronized slot release, reuse/readmission, flush/reset replay, and the final rank-1 shutdown handshake; the output included all three scripted replay segments and both rank processes exited cleanly. The earlier auxiliary stall was not reproduced.
 
 The corrected I4 target gate and the retained two-slot oracle now close the target revalidation required by section 20. No technical blocker remains before history regroup/rebase; no source architecture or product code was changed for this validation.
+
+---
+
+## 22. Post-review TP KV atomicity and Clippy follow-up
+
+An independent source review identified that batched `authorize_all()` and `mirror_tick()` could mutate logical KV state before a later operation or final end-state comparison failed. Both methods now stage a cloned `MirroredKv` state and commit it only after the complete tick succeeds. Failed coordinator partial-operation ticks and failed worker end-state comparisons therefore preserve the exact snapshot and sequence; the latter is then replayed successfully with the correct end state. Existing successful lifecycle, page-boundary, release, flush, and prefix-reuse tests remain in place.
+
+The five TP-specific Clippy findings were fixed narrowly: graph run-key variants were renamed to remove the shared `Pre` prefix; `TpMixer` variants now box the large rank-local mixer values; the redundant `GpuError` conversion was removed; the speculative loop derives position from its enumerated index; and finisher-plan assignment uses a single conditional pattern. Strict Clippy now leaves only the known upstream CUDA unnecessary-cast warning in `crates/paddock-engine/src/cuda.rs`. This is host-only cleanup evidence; no GPU revalidation claim is added here.

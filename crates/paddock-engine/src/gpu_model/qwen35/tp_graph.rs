@@ -47,11 +47,11 @@ use super::SendGraph;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum TpRunKey {
     /// rmsnorm + the layer's GQA attention run (paged mode, slot-agnostic).
-    PreAttn(usize),
+    Attn(usize),
     /// rmsnorm + DeltaNet one-row run + partial staging for `slot`.
-    PreAttnDelta(usize, usize),
+    AttnDelta(usize, usize),
     /// rmsnorm + the FFN rank-local run.
-    PreFfn(usize),
+    Ffn(usize),
 }
 
 /// The rank-local graph cache. Lives on the decode-lane `Qwen35TpRank`

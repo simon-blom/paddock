@@ -40,8 +40,8 @@ pub enum Qwen35TpError {
 }
 
 enum TpMixer {
-    Full(GqaTpRank),
-    Linear(DeltaTpRank),
+    Full(Box<GqaTpRank>),
+    Linear(Box<DeltaTpRank>),
 }
 struct TpLayer {
     attn_norm: DeviceTensor,
@@ -235,19 +235,19 @@ impl Qwen35TpRank {
             let attn_norm = exec.upload(map, &format!("{prefix}attn_norm.weight"))?;
             let post_norm = exec.upload(map, &format!("{prefix}post_attention_norm.weight"))?;
             let mixer = if (i + 1) % interval == 0 {
-                TpMixer::Full(
+                TpMixer::Full(Box::new(
                     GqaTpRank::load_paged(&exec, map, i, group, max_ctx, dtype, blocks, slots)
                         .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
-                )
+                ))
             } else {
-                TpMixer::Linear({
+                TpMixer::Linear(Box::new({
                     let mut delta = DeltaTpRank::load(&exec, map, i, group)
                         .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
                     if slots > 1 {
                         delta.enable_slots(&exec, slots)?;
                     }
                     delta
-                })
+                }))
             };
             let ffn = FfnTpRank::load(&exec, map, i, group)
                 .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
@@ -364,8 +364,8 @@ impl Qwen35TpRank {
         let graph =
             graph?.ok_or_else(|| GpuError::Driver("tp capture produced no graph".into()))?;
         let key = match &self.layers[layer].mixer {
-            TpMixer::Full(_) => TpRunKey::PreAttn(layer),
-            TpMixer::Linear(_) => TpRunKey::PreAttnDelta(layer, slot),
+            TpMixer::Full(_) => TpRunKey::Attn(layer),
+            TpMixer::Linear(_) => TpRunKey::AttnDelta(layer, slot),
         };
         self.graphs.insert(key, super::SendGraph(graph));
         Ok(())
@@ -895,8 +895,8 @@ impl Qwen35TpRank {
                 }
             }
             let key = match &self.layers[i].mixer {
-                TpMixer::Full(_) => TpRunKey::PreAttn(i),
-                TpMixer::Linear(_) => TpRunKey::PreAttnDelta(i, slot),
+                TpMixer::Full(_) => TpRunKey::Attn(i),
+                TpMixer::Linear(_) => TpRunKey::AttnDelta(i, slot),
             };
             if self.graphs.get(key).is_none() {
                 // First graphed row for this (layer, slot): capture the run
@@ -921,14 +921,14 @@ impl Qwen35TpRank {
                 }
             };
             self.exec.add(&mut self.x, mixed_ref, self.hidden)?;
-            // ── FFN half: the captured PreFfn graph IS the norm + run (no
+            // ── FFN half: the captured Ffn graph IS the norm + run (no
             // eager norm here - RMSNorm is not idempotent and the graph
             // bakes it).
-            if self.graphs.get(TpRunKey::PreFfn(i)).is_none() {
+            if self.graphs.get(TpRunKey::Ffn(i)).is_none() {
                 self.capture_ffn_run(group, i)?;
             }
             self.graphs
-                .get(TpRunKey::PreFfn(i))
+                .get(TpRunKey::Ffn(i))
                 .expect("captured above")
                 .0
                 .launch()
@@ -978,7 +978,7 @@ impl Qwen35TpRank {
         let graph =
             graph?.ok_or_else(|| GpuError::Driver("tp ffn capture produced no graph".into()))?;
         self.graphs
-            .insert(TpRunKey::PreFfn(layer), super::SendGraph(graph));
+            .insert(TpRunKey::Ffn(layer), super::SendGraph(graph));
         Ok(())
     }
 
@@ -1086,7 +1086,7 @@ impl Qwen35TpRank {
             let post_norm =
                 lane_exec.upload(map, &format!("{prefix}post_attention_norm.weight"))?;
             let mixer = match &layer.mixer {
-                TpMixer::Full(_) => TpMixer::Full(
+                TpMixer::Full(_) => TpMixer::Full(Box::new(
                     GqaTpRank::load_paged(
                         &lane_exec,
                         map,
@@ -1098,7 +1098,7 @@ impl Qwen35TpRank {
                         self.slots,
                     )
                     .map_err(|e| Qwen35TpError::Shape(e.to_string()))?,
-                ),
+                )),
                 TpMixer::Linear(_) => {
                     let mut delta = DeltaTpRank::load(&lane_exec, map, i, group)
                         .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
@@ -1107,7 +1107,7 @@ impl Qwen35TpRank {
                             .enable_slots(&lane_exec, self.slots)
                             .map_err(Qwen35TpError::from)?;
                     }
-                    TpMixer::Linear(delta)
+                    TpMixer::Linear(Box::new(delta))
                 }
             };
             let ffn = FfnTpRank::load(&lane_exec, map, i, group).map_err(Qwen35TpError::from)?;
@@ -1305,7 +1305,7 @@ impl Qwen35TpRank {
             .prefill
             .as_mut()
             .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
-        Ok(lane.model.exec.record_event().map_err(GpuError::from)?)
+        Ok(lane.model.exec.record_event()?)
     }
 
     /// Promote one finished prefill slot's lane-local state onto the decode
