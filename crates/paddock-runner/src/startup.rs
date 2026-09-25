@@ -1008,7 +1008,10 @@ pub fn run() -> std::process::ExitCode {
         // resolved value rides TpInit so both ranks load the same width).
         let tp9 = cfg.device == "cuda"
             && (1..=2).contains(&cfg.max_batch)
-            && (cfg.no_spec || cfg.spec.as_deref() == Some("off"))
+            // TP=2 now has the scheduler-owned n-gram speculative path;
+            // require an explicit policy so an unsupported/default lane cannot
+            // silently change topology. `--spec on` is the bring-up spelling.
+            && (cfg.no_spec || cfg.spec.as_deref() == Some("off") || cfg.spec.is_some())
             && !cfg.kv_offload.enabled
             && !cfg.moe_offload.enabled
             && matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16" | "fp8_e4m3")
@@ -1019,7 +1022,7 @@ pub fn run() -> std::process::ExitCode {
             && cfg.kernel_pack.as_ref().is_some_and(|p| p.is_file());
         if !tp9 {
             eprintln!(
-                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec (or spec=off), KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
+                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec/--spec off, or explicit --spec policy, KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
             );
             return std::process::ExitCode::from(2);
         }

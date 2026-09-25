@@ -186,6 +186,23 @@ fn active_rows(
         .collect())
 }
 
+fn argmax_logits(logits: &[f32]) -> Result<u32, String> {
+    let first = logits.first().ok_or("TP speculative verify returned no logits")?;
+    if !first.is_finite() {
+        return Err("TP speculative verify returned non-finite logits".into());
+    }
+    let mut best = 0usize;
+    for (i, &value) in logits.iter().enumerate().skip(1) {
+        if !value.is_finite() {
+            return Err("TP speculative verify returned non-finite logits".into());
+        }
+        if value > logits[best] {
+            best = i;
+        }
+    }
+    u32::try_from(best).map_err(|_| "TP vocabulary exceeds u32 token IDs".into())
+}
+
 fn validate_sampled_rows(
     rows: &[(usize, u32, usize)],
     plans: &[RowSample],
@@ -660,6 +677,90 @@ impl TpCoordinator {
             return Ok(vec![0.0; tokens.len() * self.model.vocab()]);
         }
         self.run_rows(&rows, tokens.len())
+    }
+
+    /// Greedy speculative verification using the scheduler-owned draft.
+    /// Execute the proposed rows until the first rejection. Both TP ranks
+    /// consume exactly the same accepted-prefix target sequence.
+    fn spec_batch(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Vec<u32>, String> {
+        if reqs.is_empty()
+            || reqs.iter().any(|(slot, pos, chunk)| {
+                *slot >= self.positions.len()
+                    || *pos != self.positions[*slot]
+                    || chunk.is_empty()
+            })
+        {
+            return Err("TP speculative request shape or position invalid".into());
+        }
+        let mut picks = Vec::new();
+        for &(slot, start, ref chunk) in reqs {
+            let mut position = start;
+            for (i, &token) in chunk.iter().enumerate() {
+                let logits = self.run_rows(&[(slot, token, position)], 0)?;
+                let next = argmax_logits(&logits)?;
+                picks.push(next);
+                position += 1;
+                if i + 1 < chunk.len() && next != chunk[i + 1] {
+                    picks.extend(std::iter::repeat_n(0, chunk.len() - i - 1));
+                    break;
+                }
+            }
+        }
+        Ok(picks)
+    }
+
+    fn spec_batch_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Vec<u32>, String> {
+        let rows: Vec<(usize, u32, usize)> = reqs
+            .iter()
+            .flat_map(|&(slot, start, ref chunk)| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &token)| (slot, token, start + i))
+            })
+            .collect();
+        if rows.is_empty()
+            || rows.len() != plans.len()
+            || rows.windows(2).any(|w| w[0].0 > w[1].0)
+        {
+            return Err("TP speculative sampled rows or plans invalid".into());
+        }
+        let mut expected_positions = self.positions.clone();
+        for &(slot, _, position) in &rows {
+            if slot >= expected_positions.len() || position != expected_positions[slot] {
+                return Err("TP speculative sampled position disagrees with rank-0 plan".into());
+            }
+            expected_positions[slot] += 1;
+        }
+        let mut picks = Vec::with_capacity(rows.len());
+        let mut plan_idx = 0;
+        for (slot, start, chunk) in reqs.iter().cloned() {
+            for (i, token) in chunk.iter().copied().enumerate() {
+                let mut dense_plans = vec![crate::generator::RowSample::Hole; self.positions.len()];
+                dense_plans[slot] = crate::generator::RowSample::Device(plans[plan_idx]);
+                let step = self.run_rows_impl(
+                    &[(slot, token, start + i)],
+                    self.positions.len(),
+                    Some(&dense_plans),
+                )?;
+                let pick = step.ids[slot];
+                plan_idx += 1;
+                picks.push(pick);
+                if i + 1 < chunk.len() && pick != chunk[i + 1] {
+                    picks.extend(std::iter::repeat_n(0, chunk.len() - i - 1));
+                    plan_idx += chunk.len() - i - 1;
+                    break;
+                }
+            }
+        }
+        Ok(picks)
     }
 
     fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
@@ -1635,6 +1736,8 @@ enum Command {
     Prefill(usize, Vec<u32>),
     Batch(Vec<u32>, Vec<u32>),
     BatchSampled(Vec<u32>, Vec<u32>, Vec<RowSample>),
+    Spec(Vec<(usize, usize, Vec<u32>)>),
+    SpecPlans(Vec<(usize, usize, Vec<u32>)>, Vec<crate::sampler::DevicePlan>),
     PipeBegin(Vec<u32>, Vec<u32>, Vec<RowSample>),
     PipeNext(Vec<RowSample>),
     PipeDrain,
@@ -1784,6 +1887,10 @@ impl TpGenerator {
                             Command::BatchSampled(tokens, positions, plans) => coordinator
                                 .sampled(&tokens, &positions, &plans)
                                 .map(Response::Sampled),
+                            Command::Spec(reqs) => coordinator.spec_batch(&reqs).map(Response::Ids),
+                            Command::SpecPlans(reqs, plans) => coordinator
+                                .spec_batch_plans(&reqs, &plans)
+                                .map(Response::Ids),
                             Command::PipeBegin(tokens, positions, plans) => coordinator
                                 .pipe_begin(&tokens, &positions, &plans)
                                 .map(|_| Response::Logits(Vec::new())),
@@ -1890,6 +1997,34 @@ impl Generator for TpGenerator {
     }
     fn supports_device_sampling(&self) -> bool {
         self.device_sampling
+    }
+    fn spec_capable(&self) -> bool {
+        true
+    }
+    fn forward_spec_batch(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<u32>>, GenError> {
+        match self
+            .request(Command::Spec(reqs.to_vec()))
+            .map_err(GenError::Backend)?
+        {
+            Response::Ids(ids) => Ok(Some(ids)),
+            _ => Err(GenError::Backend("TP spec reply kind mismatch".into())),
+        }
+    }
+    fn forward_spec_batch_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<u32>>, GenError> {
+        match self
+            .request(Command::SpecPlans(reqs.to_vec(), plans.to_vec()))
+            .map_err(GenError::Backend)?
+        {
+            Response::Ids(ids) => Ok(Some(ids)),
+            _ => Err(GenError::Backend("TP sampled spec reply kind mismatch".into())),
+        }
     }
     fn supports_decode_pipe(&self) -> bool {
         self.device_sampling
