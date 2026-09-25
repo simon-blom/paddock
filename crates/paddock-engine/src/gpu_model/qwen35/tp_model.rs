@@ -50,12 +50,6 @@ struct TpLayer {
     ffn: FfnTpRank,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct TpSlotSnapshot {
-    pub blocks: Vec<u32>,
-    pub layers: Vec<Vec<u8>>,
-}
-
 /// One process's rank-local model path for deterministic TP=2 parity.
 /// Inputs are fed one token at a time; CUDA graphs, speculation, scheduler
 /// concurrency, and offload are deliberately not part of this API. The
@@ -777,18 +771,18 @@ impl Qwen35TpRank {
     }
 
     /// Phase 11 Stage A opt-in (`PADDOCK_TP_GRAPH=1`): route decode-lane
-    /// token rows through the rank-local graph cache. Read once per process;
-    /// BOTH ranks must run with the identical value or the NCCL collectives
-    /// mispair (an eager all_reduce meets a graphed one and the row hangs).
-    /// The runner exports its environment to the worker rank, so setting it
-    /// on the coordinator covers the pair.
+    /// token rows through the rank-local graph cache. Read once per process.
+    /// The coordinator's resolved value rides TpInit to the worker (protocol
+    /// v2), so the pair cannot diverge; a worker process must never decide
+    /// graph mode from its own environment (that would pair an eager
+    /// all_reduce with a graphed one and hang the row).
     fn tp_graph_enabled() -> bool {
         static TP_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *TP_GRAPH.get_or_init(|| std::env::var("PADDOCK_TP_GRAPH").as_deref() == Ok("1"))
     }
 
-    /// Serving-side probe (public for tp_serve): identical semantics, one
-    /// shared OnceLock so coordinator and worker cannot diverge mid-process.
+    /// Serving-side gate (rank 0 only, public for tp_serve): the resolved
+    /// value is composed into TpInit for the worker.
     pub fn tp_graph_enabled_for_serve() -> bool {
         Self::tp_graph_enabled()
     }
@@ -1401,57 +1395,6 @@ impl Qwen35TpRank {
         Ok(())
     }
 
-    /// Probe-only, rank-local readback. Call only after decode, prefill, and
-    /// collective streams have drained; never read stale unowned KV pages.
-    pub(super) fn slot_snapshot(
-        &self,
-        slot: usize,
-        position: usize,
-        blocks: &[u32],
-    ) -> Result<TpSlotSnapshot, Qwen35TpError> {
-        let page = crate::kv_pool::BLOCK_TOKENS;
-        if slot >= self.slots || position > self.max_ctx || blocks.len() != position.div_ceil(page) {
-            return Err(Qwen35TpError::Shape("TP snapshot membership invalid".into()));
-        }
-        self.exec.synchronize()?;
-        let mut layers = Vec::new();
-        for layer in &self.layers {
-            match &layer.mixer {
-                TpMixer::Full(gqa) => {
-                    let (k, v) = gqa.kv_slabs();
-                    let stride = gqa.block_stride();
-                    for (i, &block) in blocks.iter().enumerate() {
-                        let offset = (block as usize).checked_mul(stride).ok_or_else(|| {
-                            Qwen35TpError::Shape("TP snapshot offset overflow".into())
-                        })?;
-                        let n = stride * (position - i * page).min(page) / page;
-                        layers.push(self.exec.to_host_range_u8(k, offset, n)?);
-                        layers.push(self.exec.to_host_range_u8(v, offset, n)?);
-                    }
-                }
-                TpMixer::Linear(delta) => {
-                    let (rec, conv) = delta.slot_state(slot).ok_or_else(|| {
-                        Qwen35TpError::Shape("TP snapshot state missing".into())
-                    })?;
-                    layers.push(self.exec.to_host(rec)?.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect());
-                    layers.push(self.exec.to_host(conv)?.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect());
-                }
-            }
-        }
-        Ok(TpSlotSnapshot { blocks: blocks.to_vec(), layers })
-    }
-
-    pub(super) fn lane_slot_snapshot(
-        &self,
-        slot: usize,
-        position: usize,
-        blocks: &[u32],
-    ) -> Result<Option<TpSlotSnapshot>, Qwen35TpError> {
-        self.prefill
-            .as_ref()
-            .map(|lane| lane.model.slot_snapshot(slot, position, blocks))
-            .transpose()
-    }
 
     /// Reset one logical slot's lane-local state (DeltaNet recurrent/conv;
     /// paged KV is masked by position and rewritten from zero). Called on

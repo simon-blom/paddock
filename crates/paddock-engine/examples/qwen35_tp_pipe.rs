@@ -15,7 +15,7 @@ fn greedy(row: &[f32]) -> u32 {
     row.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-        .unwrap()
+        .expect("non-empty logit row")
         .0 as u32
 }
 
@@ -76,11 +76,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(
         engine.decode_pipe_drain()?,
-        expected.last().unwrap().as_slice()
+        expected.last().expect("drain produced rows").as_slice()
     );
     engine.release_inactive_slots(&[true, false]);
     engine.forward_prefill(1, &[301, 302])?;
-    let after = engine.forward_batch(&[expected.last().unwrap()[0], 303], &[21, 2])?;
+    let after = engine.forward_batch(
+        &[expected.last().expect("drain produced rows")[0], 303],
+        &[21, 2],
+    )?;
     assert_eq!(after.len(), 2 * vocab);
     engine.reset();
     for (slot, prompt) in prompts.iter().enumerate() {

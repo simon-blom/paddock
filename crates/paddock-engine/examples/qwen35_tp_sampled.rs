@@ -12,12 +12,12 @@ use paddock_engine::{
 use std::{error::Error, path::Path};
 
 fn greedy(logits: &[f32]) -> u32 {
-    logits
+    let (idx, _) = logits
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-        .unwrap()
-        .0 as u32
+        .expect("non-empty logit row");
+    idx as u32
 }
 
 fn main() -> Result<(), Box<dyn Error>> {

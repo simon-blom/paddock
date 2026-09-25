@@ -34,19 +34,6 @@ pub enum BootstrapError {
     Aborted,
 }
 
-/// Spawn the rank-1 worker as a local child process running the same binary,
-/// with the rank-1 env layered over this process's environment.
-///
-/// The child is started WITHOUT extra args: the runner's startup branch sees
-/// [`crate::config::WORKER_CHILD_ENV`] plus the rank env and enters worker
-/// mode before any HTTP surface exists. The worker inherits the
-/// coordinator's config surface (model, device, kernel pack, ...) through
-/// the environment - the same mechanism the manager uses to start runners -
-/// so no second config file exists to drift.
-pub fn spawn_worker_local(resolved: &Resolved) -> Result<std::process::Child, BootstrapError> {
-    spawn_worker_local_with_paths(resolved, None, None)
-}
-
 fn spawn_worker_local_with_paths(
     resolved: &Resolved,
     model: Option<&std::path::Path>,
@@ -184,11 +171,10 @@ fn greet(
 /// the control loop until Shutdown (graceful -> Ok, non-graceful ->
 /// [`BootstrapError::Aborted`]).
 ///
-/// This is the whole worker runtime for Phase 2. It deliberately does not
-/// touch the engine: the runner wiring decides what else the worker process
-/// does around this loop in later phases (shard load, control-driven
-/// execution); today it is a bootstrap skeleton that validates the
-/// coordination plane end to end.
+/// Test-only harness for the bootstrap plane: the production worker entry is
+/// `run_worker` in paddock-engine (shard load + ordered execution). This loop
+/// validates coordination end to end without touching the engine.
+#[cfg(test)]
 pub fn work(resolved: &Resolved) -> Result<(), BootstrapError> {
     let (mut stream, session) = connect_worker(resolved)?;
     tracing::info!("accepted by coordinator (session {session})");
@@ -332,5 +318,71 @@ impl Resolved {
     /// the serving stack.
     pub fn is_worker(&self) -> bool {
         self.role == RankRole::Worker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host coverage for the Phase 2 bootstrap loop. `work` is the loop's
+    //! test harness (the production worker entry is `run_worker`, which
+    //! needs the engine and a GPU), so it and these tests live together
+    //! here rather than in the crate's public API.
+
+    use super::*;
+    use crate::config::ParallelConfig;
+
+    fn resolved(rank: usize, port: u16) -> Resolved {
+        let cfg = ParallelConfig {
+            tp_size: Some(2),
+            rank: Some(rank),
+            master_addr: Some("127.0.0.1".into()),
+            master_port: Some(port),
+        };
+        cfg.resolved(false).expect("valid").expect("tp2")
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind probe")
+            .local_addr()
+            .expect("addr")
+            .port()
+    }
+
+    #[test]
+    fn worker_loop_exits_cleanly_on_graceful_shutdown() {
+        let port = free_port();
+        let coord = resolved(0, port);
+        let work_cfg = resolved(1, port);
+
+        let t = std::thread::spawn(move || coordinate(&coord, false));
+        std::thread::sleep(Duration::from_millis(100));
+        let w = std::thread::spawn(move || work(&work_cfg));
+
+        let Ok((mut stream, session)) = t.join().unwrap() else {
+            panic!("coordinate failed")
+        };
+        // Session ids are a process-global monotonic counter shared by every
+        // test in this binary - assert "was assigned", not a specific value.
+        assert!(session >= 1);
+        shutdown_worker(&mut stream, true).unwrap();
+        assert!(w.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn worker_loop_errors_on_non_graceful_shutdown() {
+        let port = free_port();
+        let coord = resolved(0, port);
+        let work_cfg = resolved(1, port);
+
+        let t = std::thread::spawn(move || coordinate(&coord, false));
+        std::thread::sleep(Duration::from_millis(100));
+        let w = std::thread::spawn(move || work(&work_cfg));
+
+        let Ok((mut stream, _session)) = t.join().unwrap() else {
+            panic!("coordinate failed")
+        };
+        shutdown_worker(&mut stream, false).unwrap();
+        assert!(matches!(w.join().unwrap(), Err(BootstrapError::Aborted)));
     }
 }

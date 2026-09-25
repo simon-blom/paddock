@@ -63,7 +63,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let decode = engine.forward_batch_sampled(&[103, 0], &[2, 0], &[cat, hole])?;
     let expected_decode = decode.ids[0];
     let final_row =
-        engine.forward_batch_sampled(&[0, *prompt.last().unwrap()], &[0, 19], &[hole, cat])?;
+        engine
+        .forward_batch_sampled(&[0, *prompt.last().expect("non-empty prompt")], &[0, 19], &[hole, cat])?;
     let expected_finisher = final_row.ids[1];
     let expected_next = engine.forward_batch(&[expected_decode, expected_finisher], &[3, 20])?;
     engine.release_inactive_slots(&[true, false]);

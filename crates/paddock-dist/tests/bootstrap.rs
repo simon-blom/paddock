@@ -3,8 +3,10 @@
 //! coordinator/worker handshake tests here over localhost.
 
 use paddock_dist::config::{DEFAULT_MASTER_PORT, ParallelConfig, ParallelConfigError, RankRole};
-use paddock_dist::protocol::{ControlMessage, ProtocolError, receive_nccl_id, send_nccl_id};
-use paddock_dist::worker::{BootstrapError, coordinate, shutdown_worker, work};
+use paddock_dist::protocol::{
+    ControlMessage, PROTOCOL_VERSION, ProtocolError, receive_nccl_id, send_nccl_id,
+};
+use paddock_dist::worker::{coordinate, shutdown_worker};
 use std::io::Write as _;
 use std::time::Duration;
 
@@ -227,7 +229,10 @@ fn nccl_id_roundtrip_and_malformed_length_rejected() {
         let (mut stream, _) = listener.accept().unwrap();
         let id = receive_nccl_id(&mut stream).unwrap();
         assert_eq!(id, [0x9a; 128]);
-        assert!(matches!(receive_nccl_id(&mut stream), Err(ProtocolError::BadNcclId(3))));
+        assert!(matches!(
+            receive_nccl_id(&mut stream),
+            Err(ProtocolError::BadNcclId(3))
+        ));
     });
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     send_nccl_id(&mut client, &[0x9a; 128]).unwrap();
@@ -238,43 +243,6 @@ fn nccl_id_roundtrip_and_malformed_length_rejected() {
 }
 
 // --- two-role handshake end to end ---------------------------------------
-
-#[test]
-fn worker_loop_exits_cleanly_on_graceful_shutdown() {
-    let port = free_port();
-    let coord = resolved(0, port);
-    let work_cfg = resolved(1, port);
-
-    let t = std::thread::spawn(move || coordinate(&coord, false));
-    std::thread::sleep(Duration::from_millis(100));
-    let w = std::thread::spawn(move || work(&work_cfg));
-
-    let Ok((mut stream, session)) = t.join().unwrap() else {
-        panic!("coordinate failed")
-    };
-    // Session ids are a process-global monotonic counter shared by every
-    // test in this binary - assert "was assigned", not a specific value.
-    assert!(session >= 1);
-    shutdown_worker(&mut stream, true).unwrap();
-    assert!(w.join().unwrap().is_ok());
-}
-
-#[test]
-fn worker_loop_errors_on_non_graceful_shutdown() {
-    let port = free_port();
-    let coord = resolved(0, port);
-    let work_cfg = resolved(1, port);
-
-    let t = std::thread::spawn(move || coordinate(&coord, false));
-    std::thread::sleep(Duration::from_millis(100));
-    let w = std::thread::spawn(move || work(&work_cfg));
-
-    let Ok((mut stream, _session)) = t.join().unwrap() else {
-        panic!("coordinate failed")
-    };
-    shutdown_worker(&mut stream, false).unwrap();
-    assert!(matches!(w.join().unwrap(), Err(BootstrapError::Aborted)));
-}
 
 #[test]
 fn mismatched_world_size_is_rejected_and_coordinator_keeps_waiting() {
@@ -319,6 +287,20 @@ fn protocol_version_mismatch_is_rejected() {
 
     let t = std::thread::spawn(move || coordinate(&coord, false));
     std::thread::sleep(Duration::from_millis(100));
+
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // The previous wire version must ALSO be refused (mixed-fleet case),
+    // not just a nonsense future version.
+    ControlMessage::Hello {
+        version: PROTOCOL_VERSION - 1,
+        tp_size: 2,
+        who: "v1-worker".into(),
+    }
+    .to_stream(&mut c)
+    .unwrap();
+    let reply = ControlMessage::from_stream(&mut c).unwrap();
+    assert!(matches!(reply, ControlMessage::Reject { .. }));
+    drop(c);
 
     let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     ControlMessage::Hello {

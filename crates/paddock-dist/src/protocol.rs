@@ -73,7 +73,8 @@ pub enum TpSpanFinisherPlan {
 pub enum ControlMessage {
     /// Rank 1 -> rank 0, first message after connect.
     Hello {
-        /// Protocol version, for future-gating. 1 = this wire format.
+        /// Protocol version, for future-gating. 2 = this wire format (v2:
+        /// end-of-tick KV snapshots, coordinator-resolved graph mode).
         version: u32,
         /// The world size the worker was configured with. Must match the
         /// coordinator's or the handshake fails (mismatched world-size gate).
@@ -119,28 +120,45 @@ pub enum ControlMessage {
         /// device check) and sends the resolved value, so the ranks can
         /// never disagree.
         kv_dtype: String,
+        /// CUDA-graph mode for BOTH ranks (upstream-readiness I4). Rank 0
+        /// resolves `PADDOCK_TP_GRAPH` on the coordinator and sends the
+        /// resolved value; rank 1 must not read that variable itself, so a
+        /// hand-started remote worker cannot disagree with rank 0 about
+        /// graphed/eager sequencing (a mispair hangs the collectives).
+        use_graphs: bool,
     },
     /// Rank-0-authorized ordered active rows; holes are omitted.
+    ///
+    /// KV mirror transport (upstream-readiness B2): every mutating command
+    /// carries the ordered rows - each row IS its `Ensure { slot, position }`
+    /// logical operation - plus ONE end-of-tick `Snapshot` (the coordinator's
+    /// logical state after the whole tick). The worker applies the ordered
+    /// operations on its mirror, then requires the resulting state to equal
+    /// the snapshot; any divergence fails closed before GPU work. One
+    /// snapshot per tick bounds every frame at O(context), where the old
+    /// one-full-snapshot-per-row design grew O(rows x context) and overflowed
+    /// the 1 MiB frame cap for prefill spans beyond ~250 rows at 16k context.
     TpBatch {
         sequence: u64,
         rows: Vec<(usize, u32, usize)>,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
     /// Mixed decode+chunked-prefill tick: like `TpBatch` but rows may exceed
     /// the slot count (a prompt chunk advances multiple rows per tick alongside
-    /// the decode rows). Same execution contract: the worker mirrors every KV
-    /// event, then runs one eager forward per row in order (no logits, no
-    /// sampling - rank 0 owns both).
+    /// the decode rows). Same execution contract: the worker applies the
+    /// ordered row operations and validates the end-of-tick snapshot, then
+    /// runs one eager forward per row in order (no logits, no sampling -
+    /// rank 0 owns both).
     TpMixed {
         sequence: u64,
         rows: Vec<(usize, u32, usize)>,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
     /// Start an ordered device-feedback decode segment with host tokens.
     TpPipeBegin {
         sequence: u64,
         rows: Vec<(usize, u32, usize)>,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
     /// Next tick consumes rank-0's previous device IDs via NCCL broadcast.
     TpPipeNext {
@@ -148,7 +166,7 @@ pub enum ControlMessage {
         rows: Vec<(usize, usize)>,
         source_plane: usize,
         next_plane: usize,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
     /// Fence the final tick on both ranks before slot release or reuse.
     TpPipeDrain {
@@ -160,7 +178,8 @@ pub enum ControlMessage {
     /// and ascending by position; each finishing chunk's last row may device-
     /// sample or read logits back. The wire finisher plan is a plain enum
     /// because paddock-dist depends on no engine crate: rank 0 converts its
-    /// `DevicePlan` to this, the worker converts back.
+    /// `DevicePlan` to this, the worker converts back. `kv_state` is the
+    /// end-of-tick mirror snapshot (see TpBatch).
     TpSpanLaunch {
         sequence: u64,
         rows: Vec<(usize, u32, usize)>,
@@ -168,7 +187,7 @@ pub enum ControlMessage {
         /// chunk reads full logits for the host sampler. Rank 1 promotes
         /// exactly these slots' lane-local state at the span finish.
         finishers: Vec<(usize, Option<TpSpanFinisherPlan>)>,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
     /// Fence the in-flight span: join both lanes, promote each finished
     /// slot's lane-local state lane->decode (both ranks, own executors), and
@@ -176,14 +195,17 @@ pub enum ControlMessage {
     TpSpanFinish {
         sequence: u64,
     },
-    /// Release completed/cancelled slots before the next admission.
+    /// Release completed/cancelled slots before the next admission. Each
+    /// freed slot is its `Release { slot }` logical operation; `kv_state`
+    /// is the end-of-tick mirror snapshot (see TpBatch).
     TpRelease {
         sequence: u64,
         slots: Vec<usize>,
-        kv_events: Vec<serde_json::Value>,
+        kv_state: serde_json::Value,
     },
-    /// Worker has mirrored and validated a step's logical KV operation. Rank 0
-    /// must see this before launching any collective for the step.
+    /// Worker has mirrored and validated a tick's logical KV operations
+    /// (ordered rows applied, end-of-tick snapshot matched). Rank 0 must see
+    /// this before launching any collective for the tick.
     TpPrepared {
         sequence: u64,
     },
@@ -275,4 +297,8 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 }
 
 /// Wire format version. Bumped when the control vocabulary changes shape.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2: mutating commands carry one end-of-tick KV mirror snapshot
+/// instead of one full-snapshot event per row (B2: bounded frames), and
+/// `TpInit` carries the coordinator-resolved CUDA-graph mode (I4).
+pub const PROTOCOL_VERSION: u32 = 2;

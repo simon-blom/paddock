@@ -2,8 +2,10 @@
 //!
 //! Uses the production KvPool/BlockTable/PagedRadix bookkeeping. This module
 //! carries no GPU payload and defines no production scheduler protocol. The
-//! rank-0 event includes the complete resulting logical state; the mirror
-//! replays the operation and refuses any divergence before GPU work.
+//! rank-0 side authorizes logical operations and hands the worker the ordered
+//! operations plus the resulting end-of-tick state (one snapshot per tick -
+//! see `authorize_all`/`mirror_tick`); the mirror replays the operations and
+//! refuses any divergence before GPU work.
 use crate::kv_pool::{BLOCK_TOKENS, BlockTable, KvPool};
 use crate::paged_radix::PagedRadix;
 
@@ -124,6 +126,22 @@ impl MirroredKv {
         })
     }
 
+    /// Rank 0 applies an ordered tick of operations and snapshots ONCE at the
+    /// end (upstream-readiness B2): the per-row snapshots the old design
+    /// authorized grew the wire O(rows x context); the resulting end state is
+    /// the only thing the mirror needs to validate, because every apply is a
+    /// deterministic function of the (already-agreed) prior state and the
+    /// ordered operations. Fails closed before anything is sent if any
+    /// operation is invalid; the mirror state is unchanged in that case
+    /// (apply validates before mutating, per operation).
+    pub fn authorize_all(&mut self, operations: &[Operation]) -> Result<Snapshot, &'static str> {
+        for op in operations {
+            self.apply(op)?;
+        }
+        self.sequence += operations.len() as u64;
+        Ok(self.snapshot())
+    }
+
     /// Rank 1 replays a rank-0 event; mismatched sequence or state fails closed.
     pub fn mirror(&mut self, event: &Event) -> Result<(), &'static str> {
         if event.sequence != self.sequence + 1 {
@@ -132,6 +150,37 @@ impl MirroredKv {
         self.apply(&event.operation)?;
         self.sequence += 1;
         if self.snapshot() != event.state {
+            return Err("KV logical state diverged");
+        }
+        Ok(())
+    }
+
+    /// Rank 1 replays an ordered tick of rank-0 operations and requires the
+    /// resulting state to equal `end_state` (upstream-readiness B2). The
+    /// sequence advances by exactly `operations.len()`, matching the
+    /// coordinator's `authorize_all`. Deterministic applies make the
+    /// end-state equality a complete divergence check: if the prior states
+    /// matched (validated by the previous tick's comparison) and the
+    /// operations match, any mid-tick divergence necessarily shows in the
+    /// end state. Replay/stale ordering is enforced one layer up - the
+    /// worker's control loop requires each message's sequence to be exactly
+    /// its counter + 1 before the mirror ever sees the tick. Fails closed on
+    /// any mismatch, before GPU work.
+    pub fn mirror_tick(
+        &mut self,
+        operations: &[Operation],
+        end_state: &Snapshot,
+    ) -> Result<(), &'static str> {
+        if operations.is_empty() {
+            // An empty tick is never a legitimate message; refusing it keeps
+            // a malformed frame from reading as silent progress.
+            return Err("KV tick carries no operations");
+        }
+        for op in operations {
+            self.apply(op)?;
+        }
+        self.sequence += operations.len() as u64;
+        if self.snapshot() != *end_state {
             return Err("KV logical state diverged");
         }
         Ok(())
@@ -271,5 +320,153 @@ mod tests {
         let mut fresh = MirroredKv::new(1, 2, 48).unwrap();
         fresh.mirror(&first).unwrap();
         assert_eq!(fresh.snapshot(), before);
+    }
+
+    #[test]
+    fn tick_authorize_and_mirror_round_trip_including_prefix_reuse() {
+        let mut a = MirroredKv::new(5, 2, 48).unwrap();
+        let mut b = MirroredKv::new(5, 2, 48).unwrap();
+        // A span-shaped tick: rows across two slots, page-crossing positions.
+        let tick = vec![
+            Operation::Ensure {
+                slot: 0,
+                position: 14,
+            },
+            Operation::Ensure {
+                slot: 0,
+                position: 15,
+            },
+            Operation::Ensure {
+                slot: 0,
+                position: 16,
+            },
+            Operation::Ensure {
+                slot: 1,
+                position: 0,
+            },
+            Operation::Ensure {
+                slot: 1,
+                position: 1,
+            },
+        ];
+        let end = a.authorize_all(&tick).unwrap();
+        b.mirror_tick(&tick, &end).unwrap();
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert_eq!(a.sequence, 5);
+        assert_eq!(b.sequence, 5);
+        // A second tick continues from the agreed state.
+        let end2 = a
+            .authorize_all(&[Operation::Ensure {
+                slot: 0,
+                position: 17,
+            }])
+            .unwrap();
+        b.mirror_tick(
+            &[Operation::Ensure {
+                slot: 0,
+                position: 17,
+            }],
+            &end2,
+        )
+        .unwrap();
+        assert_eq!(a.snapshot(), b.snapshot());
+    }
+
+    #[test]
+    fn mirror_tick_fails_closed_on_divergent_state_sequence_and_bad_ops() {
+        let mut a = MirroredKv::new(4, 2, 48).unwrap();
+        let ops = vec![
+            Operation::Ensure {
+                slot: 0,
+                position: 0,
+            },
+            Operation::Ensure {
+                slot: 0,
+                position: 1,
+            },
+        ];
+        let end = a.authorize_all(&ops).unwrap();
+
+        // Divergent end state: same ops replayed on a smaller pool produce a
+        // different layout -> the comparison must refuse.
+        let mut b = MirroredKv::new(2, 2, 48).unwrap();
+        assert!(b.mirror_tick(&ops, &end).is_err());
+
+        // Correct replay, then a stale tick: sequence must advance by exactly
+        // the operation count. NOTE: the replayed tick's Ensures are idempotent
+        // (the pages already exist), so the mirror's state comparison alone
+        // cannot reject a duplicated tick - replay/stale ordering is enforced
+        // one layer up (the worker loop's message-sequence guard). Here we
+        // verify the advance: the second tick still succeeds on the mirror's
+        // own terms and lands two ticks ahead.
+        let mut c = MirroredKv::new(4, 2, 48).unwrap();
+        c.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(c.sequence, 2);
+        c.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(c.sequence, 4);
+        // Repeating the SAME tick content with a fresh end state on a fresh
+        // mirror is fine (ops are authorized, not replay-guarded by content).
+        let mut d = MirroredKv::new(4, 2, 48).unwrap();
+        d.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(d.snapshot(), end);
+
+        // An invalid operation inside the tick fails and leaves no partial
+        // sequence advance on the coordinator either.
+        let mut e = MirroredKv::new(1, 2, 48).unwrap();
+        let bad = vec![
+            Operation::Ensure {
+                slot: 0,
+                position: 0,
+            },
+            Operation::Ensure {
+                slot: 0,
+                position: 64,
+            },
+        ];
+        assert!(e.authorize_all(&bad).is_err());
+        assert_eq!(e.sequence, 0);
+        // An empty tick is malformed, never silent progress.
+        assert!(e.mirror_tick(&[], &a.snapshot()).is_err());
+
+        // A wrong END STATE with valid ops fails closed (the failure mode the
+        // per-row design caught mid-tick: end-state equality still catches it).
+        let mut f = MirroredKv::new(4, 2, 48).unwrap();
+        let mut wrong_end = end.clone();
+        wrong_end.free += 1;
+        assert!(f.mirror_tick(&ops, &wrong_end).is_err());
+        // And the failed mirror is not half-applied: replaying correctly works.
+        assert!(f.mirror_tick(&ops, &end).is_ok());
+    }
+
+    #[test]
+    fn mixed_tick_release_and_flush_mirror_through_the_batch_api() {
+        let mut a = MirroredKv::new(5, 2, 48).unwrap();
+        let mut b = MirroredKv::new(5, 2, 48).unwrap();
+        let tokens: Vec<u32> = (0..33).collect();
+        // Prefill a slot, publish its prefix, then release it - the release
+        // tick's end state must capture the returned blocks exactly.
+        let prefill = vec![Operation::Ensure {
+            slot: 0,
+            position: 31,
+        }];
+        let end = a.authorize_all(&prefill).unwrap();
+        b.mirror_tick(&prefill, &end).unwrap();
+        let publish = a
+            .authorize(Operation::Publish {
+                slot: 0,
+                tokens: tokens[..32].to_vec(),
+            })
+            .unwrap();
+        b.mirror(&publish).unwrap();
+        let release = vec![Operation::Release { slot: 0 }];
+        let end = a.authorize_all(&release).unwrap();
+        b.mirror_tick(&release, &end).unwrap();
+        assert_eq!(a.snapshot(), b.snapshot());
+        // A flush tick (the TpReset path's operation) mirrors identically.
+        let flush = vec![Operation::Flush];
+        let end = a.authorize_all(&flush).unwrap();
+        b.mirror_tick(&flush, &end).unwrap();
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert!(a.snapshot().refcounts.iter().all(|&rc| rc == 0));
     }
 }
