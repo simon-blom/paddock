@@ -1518,6 +1518,16 @@ fn validate_dense_gemv_coverage(
 ) -> Result<(), Qwen35TpError> {
     use paddock_models::ggml_type::GgmlType;
 
+    // A MoE qwen35 file (e.g. Qwen3.6-35B-A3B) has no dense per-layer
+    // ffn_gate/up/down - without this check it fails below with
+    // "missing tensor blk.0.ffn_gate.weight", which names nothing a person
+    // can act on. Name the architecture instead. (qwen35moe TP is Phase 14
+    // scope; the dense TP lane never accepts an expert quartet.)
+    if map.gguf().arch_field("expert_count").is_some() {
+        return Err(Qwen35TpError::Shape(
+            "this is an MoE qwen35 checkpoint (expert_count present); the TP lane serves dense backbones only".into(),
+        ));
+    }
     for layer in 0..n_layers {
         let mut parts = vec!["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
         if (layer + 1) % interval == 0 {

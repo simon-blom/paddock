@@ -632,4 +632,20 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn head_dim_pin_is_exact_and_fp8_halves_kv_bytes() {
+        // head_dim is baked into the append/decode kernels' addressing (the
+        // pack instantiates 256-wide qwen3.8 heads only); any other qwen35
+        // size must refuse here, not misaddress.
+        assert!(GqaGeometry::new(5120, 24, 4, 128, 0).is_err());
+        assert!(GqaGeometry::new(5120, 24, 4, 512, 0).is_err());
+        assert!(GqaGeometry::new(2559, 24, 4, 256, 0).is_err()); // non-256-multiple width
+        // fp8_e4m3 KV halves the per-rank payload at identical geometry -
+        // the Phase 12 accounting invariant the two-Spark gate cross-checks.
+        let g = GqaGeometry::new(5120, 24, 4, 256, 0).unwrap();
+        let f16 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp16).unwrap();
+        let fp8 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp8E4m3).unwrap();
+        assert_eq!(fp8 * 2, f16);
+    }
 }
