@@ -1050,7 +1050,7 @@ impl Qwen35TpRank {
             .map(|l| &l.mixer)
             .find(|m| matches!(m, TpMixer::Full(_)))
         {
-            let stride = gqa.geometry.kv_dim() * self.kv_dtype.bytes();
+            let stride = crate::kv_pool::BLOCK_TOKENS * gqa.geometry.kv_dim() * self.kv_dtype.bytes();
             let pool_blocks = u32::try_from(gqa.kv_slabs().0.len() / stride)
                 .map_err(|_| Qwen35TpError::Shape("KV pool too large".into()))?;
             logical_kv
