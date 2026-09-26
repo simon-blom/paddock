@@ -44,7 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_CTX: usize = 256;
+const BASE_MAX_CTX: usize = 256;
 const SLOTS: usize = 1;
 // The two-slot TP oracle's accepted tolerance (identical numeric classes).
 const ABS: f32 = 1e-2;
@@ -110,18 +110,27 @@ fn cases(spans: usize) -> Vec<(String, Vec<Action>)> {
     out
 }
 
-fn operation(action: &Action) -> Operation {
+fn operation(action: &Action, running_position: usize) -> Result<Operation, Box<dyn Error>> {
     match action {
         // The coordinator's Ensure covers the span's LAST position; the pool
-        // backing it covers every earlier row of the contiguous span.
-        Action::Span { rows } => Operation::Ensure {
-            slot: 0,
-            position: rows.saturating_sub(1),
-        },
-        Action::Decode { position, .. } => Operation::Ensure {
+        // backing it covers every earlier row of the contiguous span. The
+        // caller supplies the span's running start, so repeated spans ensure
+        // their actual cumulative end rather than reusing rows - 1.
+        Action::Span { rows } => {
+            let last = rows
+                .checked_sub(1)
+                .and_then(|offset| running_position.checked_add(offset))
+                .ok_or("span end position overflow or empty span")?;
+            Ok(Operation::Ensure {
+                slot: 0,
+                position: last,
+            })
+        }
+        // Decode actions retain their explicit position semantics.
+        Action::Decode { position, .. } => Ok(Operation::Ensure {
             slot: 0,
             position: *position,
-        },
+        }),
     }
 }
 
@@ -218,7 +227,7 @@ fn run_arm(
     let started = Instant::now();
     for (sequence, action) in actions.iter().enumerate() {
         let packet = if rank == 0 {
-            let event = kv.authorize(operation(action))?;
+            let event = kv.authorize(operation(action, position)?)?;
             let packet = Packet {
                 sequence,
                 action: action.clone(),
@@ -294,10 +303,19 @@ fn run(
     let group = NcclCommunicator::from_resolved(Some(resolved), exec.stream.context(), id)?
         .ok_or("TP group absent")?;
     let map = MappedGguf::open(model)?;
+    // The default normal case contains `spans` consecutive 64-row spans and
+    // a decode at their end. Size this standalone probe's own KV mirror for
+    // that requested case; production context/KV planning is untouched.
+    let max_ctx = BASE_MAX_CTX.max(
+        spans
+            .checked_mul(64)
+            .and_then(|rows| rows.checked_add(1))
+            .ok_or("probe span count context overflow")?,
+    );
     let mut tp =
-        Qwen35TpRank::load_slots(exec.clone(), &map, &group, MAX_CTX, KvDtype::Fp16, SLOTS)?;
-    let blocks = u32::try_from(MAX_CTX.div_ceil(paddock_engine::kv_pool::BLOCK_TOKENS) * SLOTS)?;
-    let mut kv = MirroredKv::new(blocks, SLOTS, MAX_CTX)?;
+        Qwen35TpRank::load_slots(exec.clone(), &map, &group, max_ctx, KvDtype::Fp16, SLOTS)?;
+    let blocks = u32::try_from(max_ctx.div_ceil(paddock_engine::kv_pool::BLOCK_TOKENS) * SLOTS)?;
+    let mut kv = MirroredKv::new(blocks, SLOTS, max_ctx)?;
     if rank == 0 {
         let mut violations = Vec::new();
         for (name, actions) in cases(spans) {
@@ -363,6 +381,54 @@ fn run(
     group.stream().synchronize()?;
     exec.synchronize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_spans_ensure_their_cumulative_end_positions() {
+        let first = operation(&Action::Span { rows: 64 }, 0).unwrap();
+        assert_eq!(
+            first,
+            Operation::Ensure {
+                slot: 0,
+                position: 63,
+            }
+        );
+
+        let second = operation(&Action::Span { rows: 64 }, 64).unwrap();
+        assert_eq!(
+            second,
+            Operation::Ensure {
+                slot: 0,
+                position: 127,
+            }
+        );
+
+        let decode = operation(
+            &Action::Decode {
+                token: 42,
+                position: 128,
+            },
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            decode,
+            Operation::Ensure {
+                slot: 0,
+                position: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_or_overflowing_span_is_rejected() {
+        assert!(operation(&Action::Span { rows: 0 }, 0).is_err());
+        assert!(operation(&Action::Span { rows: 2 }, usize::MAX).is_err());
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
