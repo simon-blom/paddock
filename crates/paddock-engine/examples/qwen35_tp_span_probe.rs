@@ -78,6 +78,9 @@ fn cases(spans: usize) -> Vec<(String, Vec<Action>)> {
                 },
             ],
         ));
+        if std::env::var_os("PADDOCK_PROBE_ONE_ROW").is_some() {
+            return out;
+        }
     }
     // ~1k prompt rows as repeated 64-row spans plus one decode row on top.
     let mut many = vec![Action::Span { rows: 64 }; spans];

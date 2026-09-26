@@ -159,17 +159,10 @@ impl FfnTpRank {
         Ok(&self.reduced)
     }
 
-    /// Batched prefill rows (prototype): `rows` post-attention-normalized rows
-    /// through this FFN in one traversal — batched gate/up projections via the
-    /// existing row-batched prefill helpers, one SwiGLU, one batched down
-    /// projection, and ONE all-reduce over the row span's capacity-sized
-    /// partial plane. Row `r` lands at `reduced[r * hidden ..]` in input order.
-    ///
-    /// `span`/`q` are the caller's shared span planes (tp_span.rs), allocated
-    /// once per rank rather than per layer. The math per row is exactly the
-    /// one-row `forward`'s run (same projection helpers' rows<=64 strided
-    /// band); only the execution granularity differs.
-    pub(crate) fn forward_rows<'a, C: Communicator>(
+    /// Batched span adapter. `xn` is the fixed-capacity activation plane;
+    /// `rows` is the logical prefix consumed by every kernel. The capacity
+    /// contract is explicit here rather than weakening exact-size callers.
+    pub(crate) fn forward_rows_capacity<'a, C: Communicator>(
         &'a mut self,
         exec: &GpuExecutor,
         group: &C,
@@ -182,12 +175,14 @@ impl FfnTpRank {
             || group.rank() != self.rank
             || rows == 0
             || rows > span.cap
-            || xn.len() != rows * self.hidden
+            || xn.len() < rows * self.hidden
             || xn.context().cu_ctx() != exec.stream.context().cu_ctx()
         {
-            return Err(FfnTpError::Shape(
-                "group, span size or normalized input width changed".into(),
-            ));
+            return Err(FfnTpError::Shape(format!(
+                "span capacity/input mismatch: expected world=2 rank={} logical_rows=1..{} input_len>=rows*{}; actual world={} rank={} rows={} input_len={} context_match={}",
+                self.rank, span.cap, self.hidden, group.world_size(), group.rank(), rows,
+                xn.len(), xn.context().cu_ctx() == exec.stream.context().cu_ctx()
+            )));
         }
         prefill_mm_any(
             exec,

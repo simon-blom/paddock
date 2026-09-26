@@ -1160,7 +1160,7 @@ impl Qwen35TpRank {
                 let q = &mut planes.q;
                 layer
                     .ffn
-                    .forward_rows(&self.exec, group, &planes.act.xn, rows, span, q)?
+                    .forward_rows_capacity(&self.exec, group, &planes.act.xn, rows, span, q)?
             };
             self.exec
                 .add(&mut planes.act.x, ffn_rows, rows * self.hidden)?;
