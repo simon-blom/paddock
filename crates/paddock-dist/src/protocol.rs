@@ -1,18 +1,19 @@
 //! The rank0<->rank1 control protocol: length-prefixed JSON over TCP.
 //!
-//! Bootstrap, model identity and rank-0-authoritative serial execution
-//! share this channel. Tensor payloads and collectives stay on the GPU.
+//! Bootstrap, model identity and TP serving execution share this channel.
+//! Tensor payloads and collectives stay on the GPU.
 //!
-//! Framing: u32 little-endian length, then JSON. One request, one response,
-//! per exchange - no pipelining, no fragmentation. Every buffer is capped
-//! ([`MAX_FRAME`]) so a confused peer cannot exhaust memory.
+//! Framing: u32 little-endian length, then JSON. Each exchange uses bounded
+//! frames; the decode pipe may defer a Ready until the next Prepared.
+//! Every buffer is capped ([`MAX_FRAME`]) so a confused peer cannot exhaust
+//! memory.
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-/// Hard cap on a single control frame. Bootstrap messages are tiny; the
-/// future execution vocabulary carries batch descriptions, not tensors.
+/// Hard cap on a single control frame. Bootstrap messages are tiny;
+/// serving commands carry bounded row lists and KV snapshots, not tensors.
 pub const MAX_FRAME: u32 = 1 << 20; // 1 MiB
 
 /// Errors from the control protocol.
@@ -67,7 +68,7 @@ pub enum TpSpanFinisherPlan {
     Categorical { inv_t: f32, u: f32 },
 }
 
-/// A control-plane message. Bootstrap messages only, per the phase scope.
+/// Control-plane messages for bootstrap and rank-0-authoritative TP serving.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {

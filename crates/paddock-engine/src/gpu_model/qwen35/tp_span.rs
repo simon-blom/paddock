@@ -1,10 +1,11 @@
-//! Bounded batched-prefill span scratch for the Qwen3.8 TP rank (prototype).
+//! Bounded batched-prefill span scratch for the Qwen3.8 TP rank.
 //!
-//! One lazily-allocated plane set per rank serving
-//! `Qwen35TpRank::forward_prefill_span`: whole-model activation planes, the
-//! row-batched GQA/FFN mixer planes, and one shared quantized-GEMM staging
-//! set. Capacity is fixed at [`TP_SPAN_CAP`] rows so memory use is bounded and
-//! explicit (~16 MB at the Qwen3.8 geometry). Nothing here exists until the
+//! One lazily-allocated plane set per rank serving the production span
+//! advance/head path and the `forward_prefill_span` probe wrapper:
+//! whole-model activation planes, the row-batched GQA/FFN mixer planes,
+//! and one shared quantized-GEMM staging set. Capacity is fixed at
+//! [`TP_SPAN_CAP`] rows so memory use is bounded and explicit (~16 MB at
+//! the Qwen3.8 geometry). Nothing here exists until the
 //! first span forward, so the one-token decode paths never pay for it.
 //!
 //! The staging set rides the rows<=64 strided quantize band exclusively
@@ -16,11 +17,13 @@ use cudarc::driver::CudaSlice;
 use super::gqa_tp::GqaGeometry;
 use crate::gpu::{GpuError, GpuExecutor};
 
-/// Row cap of the batched prefill span prototype. Must not exceed the
-/// DeltaNet span primitive's own cap (`delta_tp::SPAN_CAP`): the whole-model
-/// traversal reuses `DeltaTpRank::prefill(rows)` verbatim, and a wider cap
-/// here would turn into a DeltaNet refusal mid-span. Guarded by a host test.
+/// Row cap of the batched prefill span. It must not exceed the
+/// DeltaNet primitive's own cap: the whole-model traversal reuses
+/// `DeltaTpRank::prefill(rows)` and a wider cap would fail mid-span.
+/// Guarded by a compile-time assertion.
 pub(super) const TP_SPAN_CAP: usize = 64;
+// The whole-model traversal passes this count directly to DeltaNet prefill.
+const _: () = assert!(TP_SPAN_CAP <= super::delta_tp::SPAN_CAP);
 
 /// Whole-model activation planes for one span: residual stream, normalized
 /// rows, and the span's token ids.
@@ -78,9 +81,8 @@ pub(crate) struct SpanGemmStaging {
     pub(crate) skfix: CudaSlice<f32>,
 }
 
-/// The complete span plane set owned by a `Qwen35TpRank` (prototype: the main
-/// model; production integration is expected to re-home it onto the prefill
-/// lane beside the existing one-row lane scratch).
+/// The complete span plane set owned by each `Qwen35TpRank`, including
+/// the dedicated prefill-lane rank.
 pub(super) struct TpSpanPlanes {
     pub(super) act: SpanAct,
     pub(super) gqa: SpanGqa,
@@ -149,36 +151,5 @@ impl TpSpanPlanes {
                 skfix: e.alloc(1)?,
             },
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TP_SPAN_CAP;
-
-    /// The whole-model span traversal hands `rows` straight to
-    /// `DeltaTpRank::prefill`, whose own cap (`SPAN_CAP` in delta_tp.rs) is
-    /// the authority for span width. A wider cap here would turn into a
-    /// DeltaNet refusal mid-span. Both constants are private, so the guard
-    /// reads them from source (the tp_model.rs guard pattern) rather than
-    /// folding them at compile time.
-    #[test]
-    fn span_cap_never_exceeds_the_deltanet_primitive() {
-        let delta_src = include_str!("delta_tp.rs");
-        let read_cap = |src: &str, name: &str| -> usize {
-            let line = src
-                .lines()
-                .find(|l| l.contains(&format!("const {name}: usize = ")))
-                .unwrap_or_else(|| panic!("{name} declaration missing"));
-            let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
-            value
-                .parse()
-                .unwrap_or_else(|_| panic!("{name} is not a plain integer: {value}"))
-        };
-        let delta_cap = read_cap(delta_src, "SPAN_CAP");
-        assert!(
-            TP_SPAN_CAP <= delta_cap,
-            "TP_SPAN_CAP {TP_SPAN_CAP} exceeds the DeltaNet span cap {delta_cap}"
-        );
     }
 }

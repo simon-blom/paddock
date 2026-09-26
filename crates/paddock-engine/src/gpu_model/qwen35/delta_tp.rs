@@ -22,9 +22,8 @@ const NK: usize = 16;
 const NV: usize = 48;
 const CONV_K: usize = 4;
 /// Span row cap of the DeltaNet batched prefill primitive. The whole-model
-/// TP prefill span's cap (tp_span.rs `TP_SPAN_CAP`) is guarded against this
-/// value by a source-reading test, since this constant stays private.
-const SPAN_CAP: usize = 64;
+/// TP prefill span's cap (tp_span.rs `TP_SPAN_CAP`) is checked against it.
+pub(super) const SPAN_CAP: usize = 64;
 
 fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
     let Some(expected) = rows.checked_mul(WIDTH) else {

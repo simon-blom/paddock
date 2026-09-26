@@ -1756,9 +1756,9 @@ impl Qwen35TpRank {
     /// no host sync). Per GQA layer, each of the slot's live physical blocks
     /// (K and V, block-strided slices at the same pool-wide block id - the
     /// paged pool layout is `[n_blocks, 16, kv_dim]` on every rank's slab);
-    /// plus the DeltaNet recurrent/conv pair. The lane's dtype is Fp16,
-    /// matching both executors' KV loads. Host cost is a few cudaMemcpy D2D
-    /// launches (~1-3 ms per finished prompt) - the TTFT win survives.
+    /// plus the DeltaNet recurrent/conv pair. Both executors use the same
+    /// KV dtype resolved by rank 0 and carried in TpInit. Host cost is a few
+    /// cudaMemcpy D2D launches (~1-3 ms per finished prompt) - the TTFT win survives.
     ///
     /// Leaves a decode-stream event in the lane's `drained` slot: the next
     /// lane enqueue waits it so a relaunched span (or a released slot's
