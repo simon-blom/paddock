@@ -13,17 +13,15 @@
 //! and nothing after it.
 //!
 //! Comparisons compare equivalent mathematical tensors only:
-//! - whole-model stages (layer-in/post-norm/mixer-out/post-mixer/ffn-norm/
-//!   ffn-out/layer-out/final-norm) compare row 0 of each engine's
-//!   replicated residual/norm planes directly;
-//! - sharded rank-local planes (GQA q/k/v/gate, DeltaNet mixed/z, FFN
-//!   gate/up) compare rank 0's contiguous shard of the full tensor (rank r
-//!   owns output rows [r*local .. (r+1)*local), so rank 0's shard is the
-//!   first contiguous half on BOTH sides);
-//! - the fused Q|gate planes interleave Q and gate per head (split_qg
-//!   layout): compared as interleaved pairs over rank 0's Q rows;
-//! - per-head f32 planes (DeltaNet gate/beta/q/k/v) slice the same way
-//!   (rank r owns value heads [r*H/2 .. (r+1)*H/2)).
+//! - whole-model stages materialized by both arms (layer-in, mixer-out,
+//!   ffn-out, final-norm) compare row 0 of the replicated planes directly;
+//! - rank-0 GQA/FFN shards compare against C's matching full-row prefix;
+//! - fused Q|gate compares both Q and gate lanes for B's local heads
+//!   against the same head-aligned prefix in C;
+//! - DeltaNet mixed and value-head planes compare B's local head order
+//!   against explicit gathers from C's full row (value-head bands
+//!   0..7, 16..23, 32..39). Unmaterialized or incompatible stages remain
+//!   unmatched, not silently paired.
 //!
 //! Probe-only: no serving path is touched, no guard or tolerance is
 //! changed, and the trace is compiled out of hardened builds. C's prefill
@@ -233,7 +231,7 @@ fn gather_lanes(
     };
     let mut out = Vec::with_capacity(heads.len() * head_w);
     for &code in heads {
-        let base = if row.len() == 5120 {
+        let base = if row.len() == 10240 {
             seg_lane(code)
         } else {
             // Plain per-head plane: code IS the head index.
@@ -252,40 +250,32 @@ fn gather_lanes(
 enum Cmp {
     /// Replicated plane: whole rows compare directly.
     Full,
-    /// Rank-sharded plane whose rank-0 shard is the first contiguous half
-    /// of the full row (GQA head groups and FFN output rows shard this way).
-    Half,
-    /// Rank-sharded plane whose rank-0 shard is an explicit head-indexed
-    /// gather of the full row (DeltaGeometry's value-head bands), each head
-    /// `head_w` lanes wide. `heads` = the rank-0 head index list.
+    /// B is already the rank-0 shard; C is the full row in head/output order.
+    Prefix,
+    /// B is the rank-0 DeltaNet shard in local head order; C is the full row.
     Lanes { heads: &'static [usize], head_w: usize },
-    /// Fused Q|gate plane: `split_qg` interleaves Q and gate per head, so
-    /// rank 0's Q rows are ALL of the shard's Q lanes and rank 0's heads are
-    /// the first contiguous half of the full head list. `head_dim` = 256.
-    Qg { head_dim: usize },
 }
 
-/// Stage keys in traversal order with their comparison class. Names match
-/// the tp_trace stage tails after the `{layer}-` prefix.
+/// Explicit stage keys and layout classes. Trace labels are literal `b.KEY`
+/// and `c.KEY`; the layer number is stored separately.
 const SUBSTAGES: &[(&str, Cmp)] = &[
-    ("gqa-qg", Cmp::Qg { head_dim: 256 }),
-    ("gqa-q", Cmp::Half),
-    ("gqa-k", Cmp::Half),
-    ("gqa-v", Cmp::Half),
-    ("gqa-gate", Cmp::Half),
-    ("gqa-qn", Cmp::Half),
-    ("gqa-kn", Cmp::Half),
-    ("gqa-rope-q", Cmp::Half),
-    ("gqa-rope-k", Cmp::Half),
-    ("gqa-attn", Cmp::Half),
-    ("gqa-out", Cmp::Half),
+    ("gqa-qg", Cmp::Prefix),
+    ("gqa-q", Cmp::Prefix),
+    ("gqa-k", Cmp::Prefix),
+    ("gqa-v", Cmp::Prefix),
+    ("gqa-gate", Cmp::Prefix),
+    ("gqa-qn", Cmp::Prefix),
+    ("gqa-kn", Cmp::Prefix),
+    ("gqa-rope-q", Cmp::Prefix),
+    ("gqa-rope-k", Cmp::Prefix),
+    ("gqa-attn", Cmp::Prefix),
+    ("gqa-out", Cmp::Prefix),
     // DeltaNet planes compare through DeltaGeometry's exact rank maps
     // (rank 0 = value heads &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39] - bands, NOT a contiguous half). The mixed
     // shard is key-head q || key-head k || value-head v lanes of those
     // heads; per-head planes gather head-strided at 128 lanes per head.
-    // dn-conv is intentionally NOT compared: B's conv runs over the
-    // rank-order mixed shard while C's runs over the full mixed row, so
-    // its channel lanes/windows are not elementwise mappable.
+    // dn-conv is intentionally NOT compared: C may use fused conv/split
+    // and never materialize its conv plane.
     (
         "dn-mixed",
         Cmp::Lanes {
@@ -328,20 +318,6 @@ const SUBSTAGES: &[(&str, Cmp)] = &[
         },
     ),
     (
-        "dn-rec",
-        Cmp::Lanes {
-            heads: &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39],
-            head_w: 128,
-        },
-    ),
-    (
-        "dn-core",
-        Cmp::Lanes {
-            heads: &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39],
-            head_w: 128,
-        },
-    ),
-    (
         "dn-gate",
         Cmp::Lanes {
             heads: &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39],
@@ -355,21 +331,22 @@ const SUBSTAGES: &[(&str, Cmp)] = &[
             head_w: 1,
         },
     ),
-    ("ffn-gate", Cmp::Half),
-    ("ffn-up", Cmp::Half),
-];
-
-/// The whole-model spine, per layer, in traversal order (`{k}` = layer).
-/// Stage keys without a C-side counterpart (post-norm/ffn-norm: C's fused
-/// quantizing norm does not materialize the f32 rows; dn-in: echoed by the
-/// B-side only) are intentionally absent - the probe compares stages both
-/// arms actually captured.
-const SPINE: &[&str] = &[
-    "layer-in",
-    "mixer-out",
-    "post-mixer",
-    "ffn-out",
-    "layer-out",
+    (
+        "dn-rec",
+        Cmp::Lanes {
+            heads: &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39],
+            head_w: 128,
+        },
+    ),
+    (
+        "dn-core",
+        Cmp::Lanes {
+            heads: &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39],
+            head_w: 128,
+        },
+    ),
+    ("ffn-gate", Cmp::Prefix),
+    ("ffn-up", Cmp::Prefix),
 ];
 
 /// One compare report line; returns the max-abs (None = skipped stage).
@@ -387,127 +364,117 @@ fn compare_stage(
     };
     let m = match cmp {
         Cmp::Full => max_abs(bd, cd)?,
-        Cmp::Half => {
-            if bd.len() % 2 != 0 {
-                return Err(format!("{bn}: odd shard length {}", bd.len()).into());
+        Cmp::Prefix => {
+            if cd.len() != bd.len() * 2 {
+                return Err(format!("{bn}: expected full row twice shard length, got {}/{}", bd.len(), cd.len()).into());
             }
-            max_abs(&bd[..bd.len() / 2], &cd[..cd.len() / 2])?
+            max_abs(bd, &cd[..bd.len()])?
         }
         Cmp::Lanes { heads, head_w } => {
-            // Both sides gather DeltaGeometry's rank-0 heads: B's shard
-            // already IS that gather (identity map over its own rows), C's
-            // full row gathers the same head indices. The mixed map is
-            // segment-qualified (s*100+h encodes segment s, head h).
-            let bg = gather_lanes(bd, heads, *head_w)?;
-            let cg = gather_lanes(cd, heads, *head_w)?;
-            max_abs(&bg, &cg)?
-        }
-        Cmp::Qg { head_dim } => {
-            // split_qg layout: [head, [head_dim Q || head_dim gate]] per row.
-            // Extract every head's Q block; rank 0's local heads are the
-            // first contiguous half of the full Q lanes, i.e. ALL of the
-            // B-side (shard) Q lanes against the same-length prefix of C's.
-            let h = *head_dim;
-            let bq: Vec<f32> = bd
-                .chunks_exact(2 * h)
-                .flat_map(|blk| blk[..h].iter().copied())
-                .collect();
-            let cq: Vec<f32> = cd
-                .chunks_exact(2 * h)
-                .flat_map(|blk| blk[..h].iter().copied())
-                .collect();
-            if cq.len() < bq.len() {
-                return Err(format!("{bn}: full plane shorter than shard").into());
+            // B's local row is already in rank-0 head order. Gather only
+            // C's full row; mixed head codes qualify the q/k/v segment.
+            if bd.len() != heads.len() * head_w || cd.len() != bd.len() * 2 {
+                return Err(format!("{bn}: incompatible local/full lengths {}/{} for {} heads of width {head_w}", bd.len(), cd.len(), heads.len()).into());
             }
-            max_abs(&bq, &cq[..bq.len()])?
+            let cg = gather_lanes(cd, heads, *head_w)?;
+            max_abs(bd, &cg)?
         }
     };
     Ok(Some((m, bd.len(), cd.len())))
 }
 
-/// Print the per-layer trace until the first material divergence. Returns
-/// the number of stage pairs actually compared (both arms present) - the
-/// caller treats zero pairs as an infrastructure failure even when both
-/// buffers are nonempty.
+/// Canonical pairs use the trace's literal stage label plus its separate layer
+/// index. Only the explicit stage tables are admitted; a shared suffix alone
+/// never makes two layouts comparable.
 fn compare_arms(
     b: Vec<(String, usize, Vec<f32>)>,
     c: Vec<(String, usize, Vec<f32>)>,
     stop: f32,
 ) -> Result<usize, Box<dyn Error>> {
-    if b.is_empty() {
-        return Err("B arm captured zero trace stages (PADDOCK_TP_ABC_TRACE \
-                    did not reach the span path?)"
-            .into());
+    if b.is_empty() || c.is_empty() {
+        return Err(format!("empty trace arm: b_stages={} c_stages={}", b.len(), c.len()).into());
     }
-    if c.is_empty() {
-        return Err("C arm captured zero trace stages (PADDOCK_TP_ABC_TRACE \
-                    did not reach the trusted TP=1 prefill, or the single \
-                    trace buffer was drained once for both arms?)"
-            .into());
-    }
+    let b_count = b.len();
+    let c_count = c.len();
     let index = |v: Vec<(String, usize, Vec<f32>)>| -> HashMap<(String, usize), Vec<f32>> {
         v.into_iter().map(|(s, l, d)| ((s, l), d)).collect()
     };
     let bm = index(b);
     let cm = index(c);
     let layers = bm.keys().map(|(_, l)| *l).max().unwrap_or(0) + 1;
-    let mut compared = 0usize;
+    let mut pairs = Vec::new();
     for layer in 0..layers {
-        // Mixer substages first (in traversal order), then the spine.
-        for (key, cmp) in SUBSTAGES {
-            if let Some((m, bl, cl)) =
-                compare_stage(&format!("b.{layer}-{key}"), &format!("c.{layer}-{key}"), layer, cmp, &bm, &cm)?
-            {
-                compared += 1;
-                println!(
-                    "layer {layer:>2} {key:<12} len {bl}/{cl} max_abs {m:.3e}"
-                );
-                if m > stop {
-                    println!(
-                        "first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}"
-                    );
-                    return Ok(compared);
-                }
-            }
-        }
-        for key in SPINE {
-            if let Some((m, bl, cl)) = compare_stage(
-                &format!("b.{layer}-{key}"),
-                &format!("c.{layer}-{key}"),
-                layer,
-                &Cmp::Full,
-                &bm,
-                &cm,
-            )? {
-                compared += 1;
-                println!("layer {layer:>2} {key:<12} len {bl}/{cl} max_abs {m:.3e}");
-                if m > stop {
-                    println!(
-                        "first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}"
-                    );
-                    return Ok(compared);
-                }
+        // Execution order: residual input, mixer projections, reduced output,
+        // residual add, FFN projections, reduced output, residual add.
+        let stages = std::iter::once(("layer-in", &Cmp::Full))
+            .chain(SUBSTAGES.iter().filter(|(key, _)| !key.starts_with("ffn-")).map(|(key, cmp)| (*key, cmp)))
+            .chain([("mixer-out", &Cmp::Full), ("post-mixer", &Cmp::Full)])
+            .chain(SUBSTAGES.iter().filter(|(key, _)| key.starts_with("ffn-")).map(|(key, cmp)| (*key, cmp)))
+            .chain([("ffn-out", &Cmp::Full), ("layer-out", &Cmp::Full)]);
+        for (key, cmp) in stages {
+            let bn = format!("b.{key}");
+            let cn = format!("c.{key}");
+            if bm.contains_key(&(bn.clone(), layer)) && cm.contains_key(&(cn.clone(), layer)) {
+                pairs.push((layer, key, bn, cn, cmp));
             }
         }
     }
-    if compared == 0 {
-        return Err(
-            "no comparable stage pairs between the arms (stage-name mismatch; \
-             both buffers nonempty but every lookup missed)"
-                .into(),
-        );
+    if bm.contains_key(&("b.final-norm".into(), 0)) && cm.contains_key(&("c.final-norm".into(), 0)) {
+        pairs.push((0, "final-norm", "b.final-norm".into(), "c.final-norm".into(), &Cmp::Full));
     }
-    // Final norm (layer key 0 on both arms).
-    if let Some((m, bl, cl)) = compare_stage("b.0-final-norm", "c.0-final-norm", 0, &Cmp::Full, &bm, &cm)? {
+    // Counts include duplicate capture records (e.g. b.dn-in), which have
+    // no additional canonical counterpart. Stages after an early stop are
+    // still matched, not spuriously reported as unmatched.
+    println!("unmatched_b_stages={} unmatched_c_stages={}",
+        b_count - pairs.len(), c_count - pairs.len());
+    if pairs.is_empty() {
+        return Err("no valid canonical stage pairs between B and C".into());
+    }
+    let mut compared = 0;
+    let mut divergent = false;
+    for (layer, key, bn, cn, cmp) in pairs {
+        let (m, bl, cl) = compare_stage(&bn, &cn, layer, cmp, &bm, &cm)?
+            .ok_or("canonical stage vanished from trace index")?;
         compared += 1;
-        println!("final-norm          len {bl}/{cl} max_abs {m:.3e}");
+        println!("layer {layer:>2} {key:<12} len {bl}/{cl} max_abs {m:.3e}");
         if m > stop {
-            println!("first material divergence: final-norm max_abs {m:.3e} > {stop:e}");
-            return Ok(compared);
+            println!("first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}");
+            divergent = true;
+            break;
         }
     }
-    println!("no stage exceeded the reporting threshold {stop:e}");
+    println!("compared_stage_pairs={compared}");
+    if !divergent {
+        println!("no stage exceeded the reporting threshold {stop:e}");
+    }
     Ok(compared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_stage_names_and_layer_index_pair() {
+        let b = vec![("b.layer-in".into(), 3, vec![1.0, 2.0])];
+        let c = vec![("c.layer-in".into(), 3, vec![1.0, 2.0])];
+        assert_eq!(compare_arms(b, c, 1e-3).unwrap(), 1);
+        assert!(compare_arms(
+            vec![("b.dn-in".into(), 0, vec![1.0])],
+            vec![("c.layer-in".into(), 0, vec![1.0])],
+            1e-3,
+        ).is_err());
+    }
+
+    #[test]
+    fn shard_compares_whole_local_row_to_exact_full_gather() {
+        let bm = HashMap::from([(("b.ffn-gate".into(), 0), vec![1.0, 2.0])]);
+        let cm = HashMap::from([(("c.ffn-gate".into(), 0), vec![1.0, 2.0, 9.0, 9.0])]);
+        assert_eq!(compare_stage("b.ffn-gate", "c.ffn-gate", 0, &Cmp::Prefix, &bm, &cm).unwrap().unwrap().0, 0.0);
+        let bm = HashMap::from([(("b.dn-z".into(), 0), vec![1.0, 2.0])]);
+        let cm = HashMap::from([(("c.dn-z".into(), 0), vec![1.0, 9.0, 2.0, 9.0])]);
+        assert_eq!(compare_stage("b.dn-z", "c.dn-z", 0, &Cmp::Lanes { heads: &[0, 2], head_w: 1 }, &bm, &cm).unwrap().unwrap().0, 0.0);
+    }
 }
 
 fn run(
@@ -572,8 +539,7 @@ fn run(
                 b.len(),
                 c.len()
             );
-            let compared = compare_arms(b, c, stop)?;
-            println!("compared_stage_pairs={compared}");
+            compare_arms(b, c, stop)?;
         }
     }
     group.stream().synchronize()?;

@@ -262,9 +262,9 @@ emit "infrastructure: $INFRA (rank exit codes only - does not imply the comparis
 # run summarized as PASS on exits alone - the failure mode this fixes).
 COMPARISON="INVALID: no probe verdict found in rank0 log"
 if [[ "$PROBE" == "abc" ]]; then
-  if grep -qE "b_stages=0" "$R0_LOG"; then
+  if grep -qE '^abc_probe .* b_stages=0( |$)' "$R0_LOG"; then
     COMPARISON="INVALID: B arm traced zero stages"
-  elif grep -qE "c_stages=0" "$R0_LOG"; then
+  elif grep -qE '^abc_probe .* c_stages=0( |$)' "$R0_LOG"; then
     COMPARISON="INVALID: C arm traced zero stages"
   elif grep -q "first material divergence" "$R0_LOG"; then
     COMPARISON="DIVERGENCE ($(grep -m1 'first material divergence' "$R0_LOG" | sed 's/^first material divergence: //'))"
@@ -290,11 +290,11 @@ else
 fi
 emit ""
 emit "--- probe result lines (rank0) ---"
-grep -E "span_probe|abc_probe|compared_stage_pairs|first material divergence|no stage exceeded|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
+grep -E "span_probe|abc_probe|compared_stage_pairs|unmatched_[bc]_stages|first material divergence|no stage exceeded|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
 if [[ "$PROBE" == "abc" ]]; then
   emit ""
   emit "--- B-C per-layer trace (rank0) ---"
-  grep -E "^layer [0-9]+ |final-norm|first material divergence|no stage exceeded|compared_stage_pairs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
+  grep -E "^layer +[0-9]+ |final-norm|first material divergence|no stage exceeded|compared_stage_pairs|unmatched_[bc]_stages" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
 fi
 emit ""
 emit "--- WARN/ERROR/VIOLATION lines ---"
