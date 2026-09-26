@@ -89,6 +89,30 @@ fi
 read -r -a SSH_ARGS <<< "$SSH_OPTS"
 remote_pid=""
 
+if [[ "$TP_DRY_RUN" != 1 ]]; then
+  # Refuse an older remote runner before either rank loads the model or joins
+  # NCCL. Stage a copy at REMOTE_RUNNER first; never overwrite it implicitly.
+  local_runner_hash="$(sha256sum "$RUNNER")"
+  local_runner_hash="${local_runner_hash%% *}"
+  local_pack_hash="$(sha256sum "$PACK")"
+  local_pack_hash="${local_pack_hash%% *}"
+  remote_hashes="$(ssh "${SSH_ARGS[@]}" "$WORKER_HOST" bash -s -- "$REMOTE_RUNNER" "$REMOTE_MODEL" "$REMOTE_PACK" <<'REMOTE_PREFLIGHT'
+set -euo pipefail
+[[ -x "$1" ]] || { printf 'remote runner missing/not executable: %s\n' "$1" >&2; exit 2; }
+[[ -f "$2" ]] || { printf 'remote model missing: %s\n' "$2" >&2; exit 2; }
+[[ -f "$3" ]] || { printf 'remote pack missing: %s\n' "$3" >&2; exit 2; }
+runner_hash="$(sha256sum "$1")"
+pack_hash="$(sha256sum "$3")"
+printf '%s\n%s\n' "${runner_hash%% *}" "${pack_hash%% *}"
+REMOTE_PREFLIGHT
+)"
+  mapfile -t remote_hash_lines <<< "$remote_hashes"
+  if [[ "${remote_hash_lines[0]:-}" != "$local_runner_hash" || "${remote_hash_lines[1]:-}" != "$local_pack_hash" ]]; then
+    printf 'TP worker runner/pack hash differs from coordinator; stage the exact local binaries and set REMOTE_RUNNER/REMOTE_PACK before launch\n' >&2
+    exit 2
+  fi
+fi
+
 quote_remote() {
   printf '%q' "$1"
 }

@@ -5,7 +5,8 @@ Reviewed branch `review/qwen38-tp2-final` from starting HEAD `71837643c37153f365
 ## Findings, ordered by severity
 
 - Blocker: no static defect confirmed in the inspected serving traversal. Target-device production behavior remains an acceptance gate, not a proven pass.
-- High: no confidently fixable defect confirmed. Rank-specific GPU failure after Prepared can still leave the peer in a collective; the TCP timeout is not a NCCL timeout. A two-rank target run is required.
+- High/operational: the configured remote runner was stale: SHA-256 `50fe4a17…` versus the rebuilt local `558c17ac…`. The launcher previously started it without an identity preflight. A fail-closed remote runner/pack hash check and remote path preflight now run before starting either rank. For smoke, an exact-hash copy was staged under the worker's cache and selected with `REMOTE_RUNNER`; no existing worker binary was overwritten.
+- High/runtime: no confidently fixable model/protocol defect confirmed. Rank-specific GPU failure after Prepared can still leave the peer in a collective; the TCP timeout is not a NCCL timeout. A two-rank target run is required.
 - Medium/test quality: the span-cap test parsed source text for a private constant and could fail merely on a formatting change. Replaced it with a direct compile-time comparison of actual constants. Other tests in `tp_serve.rs` reconstruct finisher arithmetic and compare a pure chunker to itself; these establish geometry but do not exercise a running scheduler or GPU event/promotion path. Do not mistake them for a two-rank test.
 - Low: `tp_span.rs` still described production-owned scratch as a future prototype; `protocol.rs` described a serial/bootstrap-only channel and no pipelining; the lane-promotion comment asserted F16 even though TpInit carries the chosen dtype. Comments corrected. Opt-in `tp_trace` still has real ABC-probe consumers; removing it in this review would sacrifice a diagnostic rather than eliminate dead code.
 
@@ -24,6 +25,18 @@ Intermediate spans skip the head and readback. No prompt-row whole-model serial 
 - `git diff --check`: pass.
 - `cargo build --release -p paddock-runner --bin paddock-runner`: pass on the post-edit source.
 
+## Production GPU smoke (two DGX Spark ranks, SPEC=off, TP_GRAPH=0)
+
+The dry run passed. Local and staged worker runner hashes matched (`558c17ac6305e25a0f655131d15eed0a4ee20a329df0f60868cff0915baef7f2`); local and worker pack SHA-256 matched (`c58133072ed1f339201168b5f5eb7ecf0056ad7edb251e8f1224554d0e9b321e`). The configured older worker runner was left untouched. Rank 0 joined the worker and `/v1/models` returned HTTP 200. Prompt-token counts below are from response usage, not word estimates:
+
+- 4 prompt / 8 completion tokens: 0.557 s, output returned.
+- 71 prompt / 1 completion tokens: 0.392 s; repeated `alpha` prompted immediate empty-text termination, so this is a structural boundary check, not greedy prose sanity.
+- 250 prompt / 24 completion tokens: 2.608 s, coherent Rayleigh-scattering answer across several spans/pages.
+- 1051 prompt / 1 completion tokens: 4.802 s; same repeated-word early termination caveat.
+- Concurrent 15398-prompt-token request plus 9-prompt-token request: 78.523 s and 78.136 s wall respectively; both returned 32 completion tokens and coherent responses. Aggregate long-request prompt tokens / request wall = 196.1/s, NOT an isolated prefill throughput or TTFT metric. Coordinator logged two mixed-phase stalls (37795 and 34554 ms), a decode pipe begin/drain (sequence 108/136), and no span-launch event. This exercise used `mixed` and decode pipe, not a demonstrated async prefill-lane overlap. No NCCL/KV error appeared in the coordinator log.
+
+The coordinator terminated gracefully and freed device memory when the launcher was stopped; the worker pidfile was removed and the API stopped responding. The worker was terminated by launcher cleanup; its log does not contain a recorded numeric exit status. Neither a live cancellation/reuse trace nor a direct TP=1 token/logit oracle was run. Rank-1 KV mirror and first decode are indirectly exercised by the completed requests, not independently traced. No ~20k Hermes request was sent.
+
 ## Open target gates / readiness
 
-Production smoke must establish both-rank startup/exits, ACK progression, actual mixed/overlap routes, first decode, 64-boundary/repeated spans, page crossing, nonzero slot/concurrent decode, cancellation/reuse, greedy sanity and measured TTFT. Direct TP=1 token/logit parity is distinct from HTTP text sanity; known serial GEMV-vs-batched GEMM numerical-class differences remain unchanged and tolerances were not altered. The ~20k Hermes test is **not ready** until the production smoke passes. No 20k test belongs to this review session.
+The exact 1/63/64/65 tokenized edges (71 crossed the boundary; 4 did not), async span-launch/promotion route (gated by `PADDOCK_UNIFIED`, which was unset for this smoke), cancellation/reuse, direct oracle parity, both-rank numeric exit codes, protocol frame byte measurement, and independently timed TTFT remain open. Production `mixed` smoke passed without an observed hang, but the branch is **not ready for the ~20k Hermes acceptance test** until the ownership and parity gates above are established. Known serial GEMV-vs-batched GEMM numerical-class differences remain unchanged and tolerances were not altered.
