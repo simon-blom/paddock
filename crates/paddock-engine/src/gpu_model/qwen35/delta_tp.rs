@@ -26,6 +26,17 @@ const CONV_K: usize = 4;
 /// value by a source-reading test, since this constant stays private.
 const SPAN_CAP: usize = 64;
 
+fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
+    let Some(expected) = rows.checked_mul(WIDTH) else {
+        return false;
+    };
+    if prefill {
+        input_len >= expected
+    } else {
+        input_len == expected
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeltaTpError {
     #[error(transparent)]
@@ -623,7 +634,8 @@ impl DeltaTpRank {
         let input_len = input.len();
         let context_match = input.context().cu_ctx() == e.stream.context().cu_ctx();
         if world != 2 || rank != self.rank || rows == 0 || rows > SPAN_CAP
-            || input_len < rows * WIDTH || !context_match
+            || !input_len_matches(input_len, rows, prefill)
+            || !context_match
         {
             return Err(DeltaTpError::Shape(format!(
                 "rank/input/span mismatch: expected world=2 rank={} input_len=rows*{} span_len=1..{} state_pair={}; actual world={} rank={} rows={} input_len={} span_len={} context_match={}",
@@ -946,6 +958,17 @@ mod tests {
         channels.extend(b.channels.iter().copied());
         channels.sort_unstable();
         assert_eq!(channels, (0..10240).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn input_len_contract_is_mode_specific() {
+        assert!(input_len_matches(WIDTH, 1, false));
+        assert!(!input_len_matches(WIDTH + 1, 1, false));
+        assert!(!input_len_matches(WIDTH - 1, 1, false));
+        assert!(input_len_matches(WIDTH + 1, 1, true));
+        assert!(!input_len_matches(WIDTH - 1, 1, true));
+        assert!(input_len_matches(64 * WIDTH + 1024, 64, true));
+        assert!(!input_len_matches(usize::MAX, usize::MAX, false));
     }
 
     #[test]

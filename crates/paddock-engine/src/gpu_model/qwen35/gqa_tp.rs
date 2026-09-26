@@ -691,7 +691,7 @@ impl GqaTpRank {
                 .memcpy_htod(&axes_h, &mut span.axes.slice_mut(0..4 * rows))
                 .map_err(GpuError::from)?;
         }
-        self.span_run(e, group, xn, rows, Some(position), logical, span, q, layer)
+        self.span_run(e, group, xn, rows, span, q, layer)
     }
 
     /// The [4, rows] axis-major M-RoPE plane for a text span: the row's
@@ -707,8 +707,7 @@ impl GqaTpRank {
     /// The collective-free batched span run: QKV GEMMs, head split, per-head
     /// norms, M-RoPE, one paged KV append per plane, paged prefill attention,
     /// sigmoid gate and the row-parallel down GEMM into the span's `partial`.
-    /// `position` (when staged, the Some arm) only selects the block-table
-    /// validation point; the appended rows carry their own positions.
+    /// The block table and row metadata were staged by `forward_paged_span`.
     /// `layer` feeds the probe-only `PADDOCK_TP_ABC_TRACE` stage readbacks.
     #[allow(clippy::too_many_arguments)]
     fn span_run<'a, C: Communicator>(
@@ -717,8 +716,6 @@ impl GqaTpRank {
         group: &C,
         xn: &CudaSlice<f32>,
         rows: usize,
-        position: Option<usize>,
-        logical: &MirroredKv,
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
         layer: usize,
@@ -728,15 +725,6 @@ impl GqaTpRank {
             || xn.context().cu_ctx() != e.stream.context().cu_ctx()
         {
             return Err(GqaTpError::Shape("rank or context changed".into()));
-        }
-        if let Some(pos) = position {
-            // validate the span's last position against the mirrored pool
-            let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
-            let blocks = u32::try_from(self.kc.len() / stride)
-                .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-            logical
-                .checked_device_table(0, pos, blocks, self.slots_count, self.max_ctx)
-                .map_err(|err| GqaTpError::Shape(err.into()))?;
         }
         let g = self.geometry;
         prefill_mm_any(
@@ -856,7 +844,7 @@ impl GqaTpRank {
         )?;
         super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
         super::tp_trace::trace_row_last(e, "b.gqa-rope-k-last", layer, &span.kn, rows, g.kv_dim())?;
-        let bt = self.block_tables.as_ref().expect("paged checked above");
+        let bt = &span.block_table;
         e.kv_append_batch_paged(
             &span.kn,
             &mut self.kc,
@@ -972,6 +960,34 @@ mod tests {
         let f16 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp16).unwrap();
         let fp8 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp8E4m3).unwrap();
         assert_eq!(fp8 * 2, f16);
+    }
+
+    #[test]
+    fn span_validation_uses_nonzero_slot_and_last_row_position() {
+        use super::super::tp_kv::Operation;
+
+        let mut kv = MirroredKv::new(4, 2, 48).unwrap();
+        kv.authorize(Operation::Ensure {
+            slot: 1,
+            position: 31,
+        })
+        .unwrap();
+        // A 16-row span starting at 16 ends at 31. Its table is valid for
+        // slot 1; the old hard-coded slot 0 validation would reject it.
+        assert!(kv.checked_device_table(1, 31, 4, 2, 48).is_ok());
+        assert!(kv.checked_device_table(0, 31, 4, 2, 48).is_err());
+    }
+
+    #[test]
+    fn span_run_uses_the_staged_span_block_table() {
+        let source = include_str!("gqa_tp.rs");
+        let span_run = source
+            .split_once("fn span_run")
+            .map(|(_, body)| body)
+            .and_then(|body| body.split_once("\n#[cfg(test)]").map(|(body, _)| body))
+            .expect("span_run definition");
+        assert!(span_run.contains("let bt = &span.block_table;"));
+        assert!(!span_run.contains("self.block_tables.as_ref()"));
     }
 
     /// Regression: the TP span's M-RoPE text staging must fill ALL FOUR axes
