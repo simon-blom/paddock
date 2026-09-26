@@ -237,9 +237,7 @@ fn run_arm(
                 if batched {
                     let tokens: Vec<u32> = (0..*rows).map(|i| prompt_token(position + i)).collect();
                     let logits = tp.forward_prefill_span(group, kv, 0, &tokens, position)?;
-                    if rank == 0 {
-                        last_span_logits = Some(logits);
-                    }
+                    last_span_logits = Some(logits);
                 } else {
                     let mut logits = Vec::new();
                     for i in 0..*rows {
@@ -251,9 +249,7 @@ fn run_arm(
                             0,
                         )?;
                     }
-                    if rank == 0 {
-                        last_span_logits = Some(logits);
-                    }
+                    last_span_logits = Some(logits);
                 }
                 position += rows;
             }
@@ -403,6 +399,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if rank == 0 {
         shutdown_worker(&mut control, result.is_ok())?;
     } else {
+        if let Err(ref error) = result {
+            eprintln!("rank1 probe run failed before shutdown: {error}");
+        }
         match ControlMessage::from_stream(&mut control)? {
             ControlMessage::Shutdown { graceful } if graceful == result.is_ok() => {}
             other => return Err(format!("unexpected shutdown {other:?}").into()),
