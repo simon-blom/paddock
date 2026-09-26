@@ -472,7 +472,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, 1).map(|_| ());
+        let result = self.forward(e, group, input, 1, slot).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -515,7 +515,7 @@ impl DeltaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, 1)
+        self.forward(e, group, input, 1, 0)
     }
     pub fn prefill<'a, C: Communicator>(
         &'a mut self,
@@ -524,14 +524,12 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, rows)
+        self.forward(e, group, input, rows, 0)
     }
 
     /// Slot-addressed span prefill (prototype): identical math to `prefill`
     /// with the addressed slot's recurrent/conv pair swapped in for the span
-    /// and swapped back after it - the same pointer surgery `decode_slot`
-    /// performs for one row, so the whole-model span traversal can drive a
-    /// non-zero slot without redesigning state ownership.
+    /// and swapped back after it.
     pub(crate) fn prefill_slot<'a, C: Communicator>(
         &'a mut self,
         e: &GpuExecutor,
@@ -541,7 +539,7 @@ impl DeltaTpRank {
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         if slot == 0 {
-            return self.forward(e, group, input, rows);
+            return self.forward(e, group, input, rows, slot);
         }
         let state = self
             .slot_states
@@ -549,7 +547,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, rows).map(|_| ());
+        let result = self.forward(e, group, input, rows, slot).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -562,15 +560,20 @@ impl DeltaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
         rows: usize,
+        slot: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
-            || rows == 0
-            || rows > SPAN_CAP
-            || input.len() != rows * WIDTH
-            || input.context().cu_ctx() != e.stream.context().cu_ctx()
+        let world = group.world_size();
+        let rank = group.rank();
+        let input_len = input.len();
+        let context_match = input.context().cu_ctx() == e.stream.context().cu_ctx();
+        if world != 2 || rank != self.rank || rows == 0 || rows > SPAN_CAP
+            || input_len < rows * WIDTH || !context_match
         {
-            return Err(DeltaTpError::Shape("rank, input, or span mismatch".into()));
+            return Err(DeltaTpError::Shape(format!(
+                "rank/input/span mismatch: expected world=2 rank={} input_len=rows*{} span_len=1..{} state_pair={}; actual world={} rank={} rows={} input_len={} span_len={} context_match={}",
+                self.rank, WIDTH, SPAN_CAP, if slot == 0 { "home" } else { "slot" },
+                world, rank, rows, input_len, rows, context_match
+            )));
         }
         self.decode_run(e, input, rows)?;
         self.finish_partial(e, rows)?;
