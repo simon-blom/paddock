@@ -1065,24 +1065,33 @@ impl Qwen35TpRank {
         }
         // Allocate the span planes on first use only (bounded, explicit).
         if self.span_planes.is_none() {
-            let (local_ff, width, g) = {
-                let layer = &self.layers[0];
-                match &layer.mixer {
-                    TpMixer::Full(gqa) => (layer.ffn.local_ff(), gqa.geometry.width, gqa.geometry),
-                    TpMixer::Linear(_) => {
-                        return Err(Qwen35TpError::Shape(
-                            "first layer must be a GQA layer for span scratch sizing".into(),
-                        ))
-                    }
-                }
-            };
+            let g = self
+                .layers
+                .iter()
+                .find_map(|layer| match &layer.mixer {
+                    TpMixer::Full(gqa) => Some(gqa.geometry),
+                    TpMixer::Linear(_) => None,
+                })
+                .ok_or_else(|| {
+                    Qwen35TpError::Shape("model has no GQA layer for span scratch sizing".into())
+                })?;
+            let local_ff = self
+                .layers
+                .iter()
+                .map(|layer| layer.ffn.local_ff())
+                .max()
+                .ok_or_else(|| Qwen35TpError::Shape("model has no layers for span scratch sizing".into()))?;
             let table_len = self
                 .max_ctx
                 .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
                 .checked_mul(self.slots)
                 .ok_or_else(|| Qwen35TpError::Shape("block table length overflow".into()))?;
             self.span_planes = Some(super::tp_span::TpSpanPlanes::new(
-                &self.exec, width, &g, local_ff, table_len,
+                &self.exec,
+                self.hidden,
+                &g,
+                local_ff,
+                table_len,
             )?);
         }
         let planes = self.span_planes.as_mut().expect("allocated above");
