@@ -21,6 +21,9 @@ const S: usize = 128;
 const NK: usize = 16;
 const NV: usize = 48;
 const CONV_K: usize = 4;
+/// Span row cap of the DeltaNet batched prefill primitive. The whole-model
+/// TP prefill span's cap (tp_span.rs `TP_SPAN_CAP`) is guarded against this
+/// value by a source-reading test, since this constant stays private.
 const SPAN_CAP: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
@@ -522,6 +525,36 @@ impl DeltaTpRank {
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         self.forward(e, group, input, rows)
+    }
+
+    /// Slot-addressed span prefill (prototype): identical math to `prefill`
+    /// with the addressed slot's recurrent/conv pair swapped in for the span
+    /// and swapped back after it - the same pointer surgery `decode_slot`
+    /// performs for one row, so the whole-model span traversal can drive a
+    /// non-zero slot without redesigning state ownership.
+    pub(crate) fn prefill_slot<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        input: &CudaSlice<f32>,
+        slot: usize,
+        rows: usize,
+    ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
+        if slot == 0 {
+            return self.forward(e, group, input, rows);
+        }
+        let state = self
+            .slot_states
+            .get_mut(slot - 1)
+            .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+        std::mem::swap(&mut self.recurrent, &mut state.0);
+        std::mem::swap(&mut self.conv, &mut state.1);
+        let result = self.forward(e, group, input, rows).map(|_| ());
+        let state = &mut self.slot_states[slot - 1];
+        std::mem::swap(&mut self.recurrent, &mut state.0);
+        std::mem::swap(&mut self.conv, &mut state.1);
+        result?;
+        Ok(&self.span.reduced)
     }
     fn forward<'a, C: Communicator>(
         &'a mut self,

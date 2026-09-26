@@ -44,6 +44,7 @@ mod spec;
 pub mod tp_kv;
 mod tp_graph;
 mod tp_model;
+mod tp_span;
 pub mod tp_serve;
 pub use tp_model::{Qwen35TpError, Qwen35TpRank};
 pub mod vision;

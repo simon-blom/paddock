@@ -16,7 +16,8 @@ use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 
-use super::ops::gemv_any;
+use super::ops::{gemv_any, prefill_ffn_down_any, prefill_mm_any};
+use super::tp_span::{SpanFfn, SpanGemmStaging};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FfnTpError {
@@ -99,6 +100,12 @@ impl FfnTpRank {
         })
     }
 
+    /// The rank-local FFN shard width (the down projection's input width) —
+    /// the span planes size their FFN scratch from it.
+    pub(crate) fn local_ff(&self) -> usize {
+        self.local_ff
+    }
+
     /// Decode-only: input is already post-attention-normalized on each rank.
     /// The result is `down(silu(gate(x)) * up(x))`, identical on both ranks
     /// after the sum; the caller applies residual exactly once afterward.
@@ -150,6 +157,88 @@ impl FfnTpRank {
         group.all_reduce(&self.partial, &mut self.reduced)?;
         group.before_compute(&exec.stream)?;
         Ok(&self.reduced)
+    }
+
+    /// Batched prefill rows (prototype): `rows` post-attention-normalized rows
+    /// through this FFN in one traversal — batched gate/up projections via the
+    /// existing row-batched prefill helpers, one SwiGLU, one batched down
+    /// projection, and ONE all-reduce over the row span's capacity-sized
+    /// partial plane. Row `r` lands at `reduced[r * hidden ..]` in input order.
+    ///
+    /// `span`/`q` are the caller's shared span planes (tp_span.rs), allocated
+    /// once per rank rather than per layer. The math per row is exactly the
+    /// one-row `forward`'s run (same projection helpers' rows<=64 strided
+    /// band); only the execution granularity differs.
+    pub(crate) fn forward_rows<'a, C: Communicator>(
+        &'a mut self,
+        exec: &GpuExecutor,
+        group: &C,
+        xn: &CudaSlice<f32>,
+        rows: usize,
+        span: &'a mut SpanFfn,
+        q: &mut SpanGemmStaging,
+    ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
+        if group.world_size() != 2
+            || group.rank() != self.rank
+            || rows == 0
+            || rows > span.cap
+            || xn.len() != rows * self.hidden
+            || xn.context().cu_ctx() != exec.stream.context().cu_ctx()
+        {
+            return Err(FfnTpError::Shape(
+                "group, span size or normalized input width changed".into(),
+            ));
+        }
+        prefill_mm_any(
+            exec,
+            &self.gate,
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            xn,
+            &mut span.gate,
+            rows,
+        )?;
+        prefill_mm_any(
+            exec,
+            &self.up,
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            xn,
+            &mut span.up,
+            rows,
+        )?;
+        prefill_ffn_down_any(
+            exec,
+            &self.down,
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            &mut span.gate,
+            &span.up,
+            &mut span.partial,
+            self.local_ff,
+            rows,
+        )?;
+        // Zero the capacity-sized partial's unused suffix so the whole-plane
+        // collective sums over live rows only (mirrors the GQA span path).
+        exec.stream
+            .memset_zeros(&mut span.partial.slice_mut(rows * self.hidden..))
+            .map_err(GpuError::from)?;
+        group.after_compute(&exec.stream)?;
+        group.all_reduce(&span.partial, &mut span.reduced)?;
+        group.before_compute(&exec.stream)?;
+        Ok(&span.reduced)
     }
 }
 

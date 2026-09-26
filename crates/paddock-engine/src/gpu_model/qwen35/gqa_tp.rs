@@ -9,12 +9,14 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{gemv_any, read_sections};
+use super::ops::{gemv_any, prefill_attn, prefill_mm_any, read_sections};
 use super::tp_kv::MirroredKv;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::kv_pool::BLOCK_TOKENS;
+
+use super::tp_span::{SpanGemmStaging, SpanGqa};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GqaTpError {
@@ -602,6 +604,273 @@ impl GqaTpRank {
     /// this mode only.
     pub(crate) fn is_paged(&self) -> bool {
         self.block_tables.is_some()
+    }
+
+    /// Batched paged prefill span (prototype): `rows` prompt rows of ONE slot
+    /// at contiguous positions `position..position+rows` through this layer in
+    /// one traversal — batched rank-local Q/K/V projections, batched head
+    /// norms, per-row M-RoPE, one paged KV append per plane for the whole
+    /// span, the existing paged prefill-attention dispatch, and ONE all-reduce
+    /// over the row span's capacity-sized partial plane.
+    ///
+    /// `span`/`q` are the caller's shared span planes (tp_span.rs), allocated
+    /// once per rank rather than per layer. Row ordering is preserved
+    /// end-to-end: row `r` lands at `reduced[r * width ..]`.
+    ///
+    /// State semantics match `forward_paged` exactly: the span's KV rows are
+    /// appended at their own logical positions through the mirrored block
+    /// table, so a following decode row at `position + rows` sees them.
+    pub(crate) fn forward_paged_span<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        xn: &CudaSlice<f32>,
+        slot: usize,
+        position: usize,
+        rows: usize,
+        logical: &MirroredKv,
+        span: &'a mut SpanGqa,
+        q: &mut SpanGemmStaging,
+    ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
+        if self.block_tables.is_none() {
+            return Err(GqaTpError::Shape("not a paged GQA rank".into()));
+        }
+        if rows == 0
+            || rows > span.cap
+            || position
+                .checked_add(rows)
+                .is_none_or(|end| end > self.max_ctx)
+        {
+            return Err(GqaTpError::Shape("span geometry out of range".into()));
+        }
+        let g = self.geometry;
+        // One shared block-table upload covers the whole span (the host table
+        // is slot-indexed and position-independent; validation mirrors
+        // `forward_paged`).
+        let stride = BLOCK_TOKENS * g.kv_dim() * self.dtype.bytes();
+        let blocks = u32::try_from(self.kc.len() / stride)
+            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
+        let table = logical
+            .checked_device_table(
+                slot,
+                position + rows - 1,
+                blocks,
+                self.slots_count,
+                self.max_ctx,
+            )
+            .map_err(|err| GqaTpError::Shape(err.into()))?;
+        if table.len() != span.block_table.len() {
+            return Err(GqaTpError::Shape(
+                "span block table geometry mismatch".into(),
+            ));
+        }
+        e.stream
+            .memcpy_htod(&table, &mut span.block_table)
+            .map_err(GpuError::from)?;
+        // Per-row positions (contiguous), slots and the [4, rows] axis-major
+        // mrope plane, staged once for the span.
+        let pos_h: Vec<u32> = (0..rows as u32).map(|r| position as u32 + r).collect();
+        e.stream
+            .memcpy_htod(&pos_h, &mut span.positions.slice_mut(0..rows))
+            .map_err(GpuError::from)?;
+        e.stream
+            .memcpy_htod(&vec![slot as u32; rows], &mut span.slots.slice_mut(0..rows))
+            .map_err(GpuError::from)?;
+        {
+            let mut staged = vec![0u32; 4 * rows];
+            staged[..rows].copy_from_slice(&pos_h);
+            let mut axes = span.axes.slice_mut(0..4 * rows);
+            e.stream
+                .memcpy_htod(&staged, &mut axes)
+                .map_err(GpuError::from)?;
+        }
+        self.span_run(e, group, xn, rows, Some(position), logical, span, q)
+    }
+
+    /// The collective-free batched span run: QKV GEMMs, head split, per-head
+    /// norms, M-RoPE, one paged KV append per plane, paged prefill attention,
+    /// sigmoid gate and the row-parallel down GEMM into the span's `partial`.
+    /// `position` (when staged, the Some arm) only selects the block-table
+    /// validation point; the appended rows carry their own positions.
+    #[allow(clippy::too_many_arguments)]
+    fn span_run<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        xn: &CudaSlice<f32>,
+        rows: usize,
+        position: Option<usize>,
+        logical: &MirroredKv,
+        span: &'a mut SpanGqa,
+        q: &mut SpanGemmStaging,
+    ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
+        if group.world_size() != 2
+            || group.rank() != self.rank
+            || xn.context().cu_ctx() != e.stream.context().cu_ctx()
+        {
+            return Err(GqaTpError::Shape("rank or context changed".into()));
+        }
+        if let Some(pos) = position {
+            // validate the span's last position against the mirrored pool
+            let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
+            let blocks = u32::try_from(self.kc.len() / stride)
+                .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
+            logical
+                .checked_device_table(0, pos, blocks, self.slots_count, self.max_ctx)
+                .map_err(|err| GqaTpError::Shape(err.into()))?;
+        }
+        let g = self.geometry;
+        prefill_mm_any(
+            e,
+            &self.weights[0],
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            xn,
+            &mut span.qg,
+            rows,
+        )?;
+        prefill_mm_any(
+            e,
+            &self.weights[1],
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            xn,
+            &mut span.k,
+            rows,
+        )?;
+        prefill_mm_any(
+            e,
+            &self.weights[2],
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            xn,
+            &mut span.v,
+            rows,
+        )?;
+        e.split_qg(
+            &span.qg,
+            &mut span.q,
+            &mut span.gate,
+            rows,
+            g.local_heads,
+            g.head_dim,
+        )?;
+        e.rmsnorm_batch(
+            &span.q,
+            &self.qnorm,
+            &mut span.qn,
+            g.head_dim,
+            self.eps,
+            rows * g.local_heads,
+        )?;
+        e.rmsnorm_batch(
+            &span.k,
+            &self.knorm,
+            &mut span.kn,
+            g.head_dim,
+            self.eps,
+            rows * g.local_kv_heads,
+        )?;
+        e.mrope(
+            &mut span.qn,
+            &span.axes,
+            rows,
+            g.local_heads,
+            g.head_dim,
+            self.nrot,
+            self.yarn,
+            self.sections,
+        )?;
+        e.mrope(
+            &mut span.kn,
+            &span.axes,
+            rows,
+            g.local_kv_heads,
+            g.head_dim,
+            self.nrot,
+            self.yarn,
+            self.sections,
+        )?;
+        let bt = self.block_tables.as_ref().expect("paged checked above");
+        e.kv_append_batch_paged(
+            &span.kn,
+            &mut self.kc,
+            &span.positions,
+            Some(&span.slots),
+            bt,
+            self.blocks_per_slot,
+            g.kv_dim(),
+            rows,
+            self.dtype,
+        )?;
+        e.kv_append_batch_paged(
+            &span.v,
+            &mut self.vc,
+            &span.positions,
+            Some(&span.slots),
+            bt,
+            self.blocks_per_slot,
+            g.kv_dim(),
+            rows,
+            self.dtype,
+        )?;
+        prefill_attn(
+            e,
+            &span.qn,
+            &self.kc,
+            &self.vc,
+            &self.sinks,
+            &mut span.attn,
+            &span.positions,
+            &span.slots,
+            g.local_heads,
+            g.local_kv_heads,
+            g.head_dim,
+            self.max_ctx,
+            g.kv_dim(),
+            rows,
+            1.0 / (g.head_dim as f32).sqrt(),
+            self.dtype,
+            Some((bt, self.blocks_per_slot)),
+            None,
+        )?;
+        e.mul_sigmoid(&mut span.attn, &span.gate, rows * g.q_dim())?;
+        prefill_mm_any(
+            e,
+            &self.weights[3],
+            &mut q.xq,
+            &mut q.xs,
+            &mut q.yq,
+            &mut q.xsums,
+            &mut q.ssums,
+            &mut q.skfix,
+            &span.attn,
+            &mut span.partial,
+            rows,
+        )?;
+        // The span's all-reduce pair is capacity-sized; the unused suffix must
+        // be zero so the whole-plane collective is a sum over live rows only.
+        // Zero it on the span path itself (cheap, once per layer, and keeps
+        // the invariant local to the plane's owner).
+        e.stream
+            .memset_zeros(&mut span.partial.slice_mut(rows * g.width..))
+            .map_err(GpuError::from)?;
+        group.after_compute(&e.stream)?;
+        group.all_reduce(&span.partial, &mut span.reduced)?;
+        group.before_compute(&e.stream)?;
+        Ok(&span.reduced)
     }
 }
 #[cfg(test)]

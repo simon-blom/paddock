@@ -101,6 +101,11 @@ pub struct Qwen35TpRank {
     /// `output`) are shared; GQA KV, DeltaNet recurrent/conv and all working
     /// buffers stay single-lane. `None` until `enable_prefill_lane`.
     prefill: Option<Box<PreFillLane>>,
+    /// Batched prefill-span planes (prototype, `forward_prefill_span`):
+    /// allocated lazily on the first span forward, never on decode paths.
+    /// The whole-model traversal processes up to `TP_SPAN_CAP` rows per pass
+    /// through one shared plane set.
+    span_planes: Option<super::tp_span::TpSpanPlanes>,
 }
 
 /// Prefill-lane execution state. `model` is a structural re-home of the same
@@ -285,6 +290,7 @@ impl Qwen35TpRank {
             out_norm,
             output,
             kv_dtype: dtype,
+            span_planes: None,
         })
     }
 
@@ -994,6 +1000,185 @@ impl Qwen35TpRank {
         Ok(())
     }
 
+    /// Batched whole-model prefill span (prototype, not wired into serving):
+    /// `tokens` are ONE slot's prompt at contiguous positions
+    /// `position..position+len` — embedded as a batch, taken through all
+    /// layers in ONE traversal (batched GQA / DeltaNet / FFN per layer, two
+    /// span all-reduces per layer), final norm, and the head GEMV on the last
+    /// row only. Returns the final row's logits.
+    ///
+    /// Semantics are designed to match the serial one-row path exactly: KV
+    /// rows append at their own logical positions, DeltaNet recurrent/conv
+    /// state advances over the span as one native prefill (the primitive the
+    /// parity work already validated), row order is preserved, and the
+    /// collectives pair across ranks (both ranks must call with identical
+    /// slot/position/rows). Rows beyond `TP_SPAN_CAP` are NOT accepted — the
+    /// caller slices longer prompts into spans.
+    pub fn forward_prefill_span<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        tokens: &[u32],
+        position: usize,
+    ) -> Result<Vec<f32>, Qwen35TpError> {
+        if group.world_size() != 2
+            || group.rank() != self.rank
+            || slot >= self.slots
+            || position >= self.max_ctx
+        {
+            return Err(Qwen35TpError::Shape("rank, slot or position changed".into()));
+        }
+        let rows = tokens.len();
+        if rows == 0 || rows > super::tp_span::TP_SPAN_CAP {
+            return Err(Qwen35TpError::Shape(format!(
+                "span rows {rows} outside the 1..={} prototype cap",
+                super::tp_span::TP_SPAN_CAP
+            )));
+        }
+        if position.checked_add(rows).is_none_or(|end| end > self.max_ctx) {
+            return Err(Qwen35TpError::Shape("span exceeds the context".into()));
+        }
+        // The GQA span path appends through the mirrored pool, so every page
+        // the span touches must be live on both ranks before the collectives
+        // pair. Validate (and implicitly require the caller to have ensured)
+        // the LAST position's coverage once up front; the per-layer path
+        // re-validates identically on both ranks.
+        if let Some(TpMixer::Full(gqa)) = self
+            .layers
+            .iter()
+            .map(|l| &l.mixer)
+            .find(|m| matches!(m, TpMixer::Full(_)))
+        {
+            let stride = gqa.geometry.kv_dim() * self.kv_dtype.bytes();
+            let pool_blocks = u32::try_from(gqa.kv_slabs().0.len() / stride)
+                .map_err(|_| Qwen35TpError::Shape("KV pool too large".into()))?;
+            logical_kv
+                .checked_device_table(
+                    slot,
+                    position + rows - 1,
+                    pool_blocks,
+                    self.slots,
+                    self.max_ctx,
+                )
+                .map_err(|e| Qwen35TpError::Shape(e.into()))?;
+        }
+        // Allocate the span planes on first use only (bounded, explicit).
+        if self.span_planes.is_none() {
+            let (local_ff, width, g) = {
+                let layer = &self.layers[0];
+                match &layer.mixer {
+                    TpMixer::Full(gqa) => (layer.ffn.local_ff(), gqa.geometry.width, gqa.geometry),
+                    TpMixer::Linear(_) => {
+                        return Err(Qwen35TpError::Shape(
+                            "first layer must be a GQA layer for span scratch sizing".into(),
+                        ))
+                    }
+                }
+            };
+            let table_len = self
+                .max_ctx
+                .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
+                .checked_mul(self.slots)
+                .ok_or_else(|| Qwen35TpError::Shape("block table length overflow".into()))?;
+            self.span_planes = Some(super::tp_span::TpSpanPlanes::new(
+                &self.exec, width, &g, local_ff, table_len,
+            )?);
+        }
+        let planes = self.span_planes.as_mut().expect("allocated above");
+        // Batched embedding: all rows in one gather.
+        self.exec
+            .stream
+            .memcpy_htod(tokens, &mut planes.act.tokens.slice_mut(0..rows))
+            .map_err(GpuError::from)?;
+        embed_any(
+            &self.exec,
+            &self.tok_embd,
+            &planes.act.tokens,
+            &mut planes.act.x,
+            self.hidden,
+            rows,
+            None,
+        )?;
+        for layer in &mut self.layers {
+            self.exec.rmsnorm_batch(
+                &planes.act.x,
+                &layer.attn_norm.buf,
+                &mut planes.act.xn,
+                self.hidden,
+                self.eps,
+                rows,
+            )?;
+            let mixed_rows = match &mut layer.mixer {
+                TpMixer::Full(gqa) => {
+                    let span = &mut planes.gqa;
+                    let q = &mut planes.q;
+                    gqa.forward_paged_span(
+                        &self.exec,
+                        group,
+                        &planes.act.xn,
+                        slot,
+                        position,
+                        rows,
+                        logical_kv,
+                        span,
+                        q,
+                    )?
+                }
+                TpMixer::Linear(delta) => delta.prefill_slot(
+                    &self.exec,
+                    group,
+                    &planes.act.xn,
+                    slot,
+                    rows,
+                )?,
+            };
+            // The reduced span planes carry live data in their first
+            // rows*hidden elements, so a flat elementwise add covers the
+            // batch (row-wise residual without a row-broadcast kernel).
+            self.exec
+                .add(&mut planes.act.x, mixed_rows, rows * self.hidden)?;
+            self.exec.rmsnorm_batch(
+                &planes.act.x,
+                &layer.post_norm.buf,
+                &mut planes.act.xn,
+                self.hidden,
+                self.eps,
+                rows,
+            )?;
+            let ffn_rows = {
+                let span = &mut planes.ffn;
+                let q = &mut planes.q;
+                layer
+                    .ffn
+                    .forward_rows(&self.exec, group, &planes.act.xn, rows, span, q)?
+            };
+            self.exec
+                .add(&mut planes.act.x, ffn_rows, rows * self.hidden)?;
+        }
+        self.exec.rmsnorm_batch(
+            &planes.act.x,
+            &self.out_norm.buf,
+            &mut planes.act.xn,
+            self.hidden,
+            self.eps,
+            rows,
+        )?;
+        // Head GEMV on the LAST row only: copy the final normalized row into
+        // the one-row staging plane (gemv_any takes a whole `&CudaSlice`, not
+        // an offset view) and project that.
+        self.exec.copy_region(
+            &planes.act.xn,
+            (rows - 1) * self.hidden,
+            &mut planes.act.x_last,
+            0,
+            self.hidden,
+        )?;
+        gemv_any(&self.exec, &self.output, &planes.act.x_last, &mut self.logits)?;
+        self.exec.synchronize()?;
+        Ok(self.exec.to_host(&self.logits)?)
+    }
+
     /// Build the second execution lane for overlapped prefill spans.
     ///
     /// The decode lane's `Qwen35TpRank` keeps every weight it loaded; the
@@ -1079,6 +1264,7 @@ impl Qwen35TpRank {
             // decode lane would have forked an f16 lane whose slabs and
             // attention kernels disagree with every promotion copy.
             kv_dtype: self.kv_dtype,
+            span_planes: None,
         };
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("blk.{i}.");
