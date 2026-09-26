@@ -293,7 +293,7 @@ fn run(
     let map = MappedGguf::open(model)?;
     let mut tp =
         Qwen35TpRank::load_slots(exec.clone(), &map, &group, MAX_CTX, KvDtype::Fp16, SLOTS)?;
-    let blocks = u32::try_from(MAX_CTX.div_ceil(paddock_engine::kv_pool::BLOCK_TOKENS) * SLOTS)?;
+    let blocks = u32::try_from(MAX_CTX * SLOTS)?;
     let mut kv = MirroredKv::new(blocks, SLOTS, MAX_CTX)?;
     if rank == 0 {
         let mut violations = Vec::new();
