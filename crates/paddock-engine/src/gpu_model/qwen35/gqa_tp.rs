@@ -88,6 +88,23 @@ impl GqaGeometry {
     }
 }
 
+/// The span path has one freshly staged table for all paged consumers. Keep
+/// the three uses named so they cannot silently drift to separate sources.
+#[derive(Clone, Copy)]
+struct SpanPagedTableRefs<'a, T> {
+    k_append: &'a T,
+    v_append: &'a T,
+    attention: &'a T,
+}
+
+fn span_paged_table_refs<'a, T>(table: &'a T) -> SpanPagedTableRefs<'a, T> {
+    SpanPagedTableRefs {
+        k_append: table,
+        v_append: table,
+        attention: table,
+    }
+}
+
 /// `input` is post-attention-norm, identical on both ranks. The output is
 /// attention's hidden-width projection (without residual/FFN), identical after
 /// NCCL sum. KV buffers are owned locally and never communicated.
@@ -844,13 +861,13 @@ impl GqaTpRank {
         )?;
         super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
         super::tp_trace::trace_row_last(e, "b.gqa-rope-k-last", layer, &span.kn, rows, g.kv_dim())?;
-        let bt = &span.block_table;
+        let bt = span_paged_table_refs(&span.block_table);
         e.kv_append_batch_paged(
             &span.kn,
             &mut self.kc,
             &span.positions,
             Some(&span.slots),
-            bt,
+            bt.k_append,
             self.blocks_per_slot,
             g.kv_dim(),
             rows,
@@ -861,7 +878,7 @@ impl GqaTpRank {
             &mut self.vc,
             &span.positions,
             Some(&span.slots),
-            bt,
+            bt.v_append,
             self.blocks_per_slot,
             g.kv_dim(),
             rows,
@@ -884,7 +901,7 @@ impl GqaTpRank {
             rows,
             1.0 / (g.head_dim as f32).sqrt(),
             self.dtype,
-            Some((bt, self.blocks_per_slot)),
+            Some((bt.attention, self.blocks_per_slot)),
             None,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
@@ -979,15 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn span_run_uses_the_staged_span_block_table() {
-        let source = include_str!("gqa_tp.rs");
-        let span_run = source
-            .split_once("fn span_run")
-            .map(|(_, body)| body)
-            .and_then(|body| body.split_once("\n#[cfg(test)]").map(|(body, _)| body))
-            .expect("span_run definition");
-        assert!(span_run.contains("let bt = &span.block_table;"));
-        assert!(!span_run.contains("self.block_tables.as_ref()"));
+    fn span_paged_table_refs_share_one_staged_table() {
+        let staged = vec![11_u32, 22, 33];
+        let refs = span_paged_table_refs(&staged);
+        assert!(std::ptr::eq(refs.k_append, &staged));
+        assert!(std::ptr::eq(refs.v_append, &staged));
+        assert!(std::ptr::eq(refs.attention, &staged));
     }
 
     /// Regression: the TP span's M-RoPE text staging must fill ALL FOUR axes
