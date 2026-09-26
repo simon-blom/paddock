@@ -11,7 +11,7 @@ use paddock_models::gguf::Value;
 use paddock_models::mapped::MappedGguf;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest, gguf_shard};
 
-use super::ops::gemv_any;
+use super::ops::{gemv_any, prefill_mm_any};
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
@@ -199,6 +199,54 @@ fn f32_select(
     Ok(e.to_device(&data)?)
 }
 
+struct PrefillGemm {
+    xq: CudaSlice<i8>,
+    xs: CudaSlice<f32>,
+    yq: CudaSlice<u8>,
+    xsums: CudaSlice<f32>,
+    ssums: CudaSlice<f32>,
+    skfix: CudaSlice<f32>,
+}
+
+impl PrefillGemm {
+    fn new(e: &GpuExecutor) -> Result<Self, DeltaTpError> {
+        // All three rank-local projections have input width <= WIDTH. The
+        // span cap is <=64, so prefill_mm_any uses strided int8 + dp4a/mma.
+        Ok(Self {
+            xq: e.alloc_i8(SPAN_CAP * WIDTH)?,
+            xs: e.alloc(SPAN_CAP * WIDTH / 32)?,
+            yq: e.alloc_u8(1)?,
+            xsums: e.alloc(1)?,
+            ssums: e.alloc(SPAN_CAP * WIDTH / 16)?,
+            skfix: e.alloc(1)?,
+        })
+    }
+
+    fn project(
+        &mut self,
+        e: &GpuExecutor,
+        w: &QuantW,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), DeltaTpError> {
+        prefill_mm_any(
+            e,
+            w,
+            &mut self.xq,
+            &mut self.xs,
+            &mut self.yq,
+            &mut self.xsums,
+            &mut self.ssums,
+            &mut self.skfix,
+            x,
+            y,
+            rows,
+        )?;
+        Ok(())
+    }
+}
+
 struct Span {
     input: CudaSlice<f32>,
     mixed: CudaSlice<f32>,
@@ -261,6 +309,7 @@ pub struct DeltaTpRank {
     /// Slot 0 lives in recurrent/conv; other slots swap into that pair for a step.
     slot_states: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     span: Span,
+    prefill_gemm: Option<PrefillGemm>,
     eps: f32,
     rank: usize,
 }
@@ -362,6 +411,7 @@ impl DeltaTpRank {
             .collect();
         let mut r = Self {
             span: Span::new(e, &g)?,
+            prefill_gemm: None,
             recurrent: e.alloc(g.recurrent_elements())?,
             conv: e.alloc(g.conv_elements())?,
             slot_states: Vec::new(),
@@ -472,7 +522,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, 1, slot).map(|_| ());
+        let result = self.forward(e, group, input, 1, slot, false).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -515,7 +565,7 @@ impl DeltaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, 1, 0)
+        self.forward(e, group, input, 1, 0, false)
     }
     pub fn prefill<'a, C: Communicator>(
         &'a mut self,
@@ -524,7 +574,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, rows, 0)
+        self.forward(e, group, input, rows, 0, true)
     }
 
     /// Slot-addressed span prefill (prototype): identical math to `prefill`
@@ -539,7 +589,7 @@ impl DeltaTpRank {
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         if slot == 0 {
-            return self.forward(e, group, input, rows, slot);
+            return self.forward(e, group, input, rows, slot, true);
         }
         let state = self
             .slot_states
@@ -547,7 +597,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, rows, slot).map(|_| ());
+        let result = self.forward(e, group, input, rows, slot, true).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -561,6 +611,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
         slot: usize,
+        prefill: bool,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let world = group.world_size();
         let rank = group.rank();
@@ -575,8 +626,16 @@ impl DeltaTpRank {
                 world, rank, rows, input_len, rows, context_match
             )));
         }
-        self.decode_run(e, input, rows)?;
-        self.finish_partial(e, rows)?;
+        if prefill {
+            if self.prefill_gemm.is_none() {
+                self.prefill_gemm = Some(PrefillGemm::new(e)?);
+            }
+            self.prefill_run(e, input, rows)?;
+            self.finish_partial_prefill(e, rows)?;
+        } else {
+            self.decode_run(e, input, rows)?;
+            self.finish_partial(e, rows)?;
+        }
         group.after_compute(&e.stream)?;
         group.all_reduce(&self.span.partial, &mut self.span.reduced)?;
         group.before_compute(&e.stream)?;
@@ -611,6 +670,18 @@ impl DeltaTpRank {
         Ok(())
     }
 
+    fn finish_partial_prefill(&mut self, e: &GpuExecutor, rows: usize) -> Result<(), DeltaTpError> {
+        // NCCL reduces the entire capacity buffer, including the unused rows.
+        e.stream
+            .memset_zeros(&mut self.span.partial)
+            .map_err(GpuError::from)?;
+        self.prefill_gemm
+            .as_mut()
+            .expect("prefill scratch allocated")
+            .project(e, &self.weights[2], &self.span.core, &mut self.span.partial, rows)?;
+        Ok(())
+    }
+
     /// The post-run NCCL fences + all-reduce over the staged `partial`;
     /// returns the reduced output. `forward` calls this after
     /// `finish_partial`; the graphed path runs the fences + all-reduce
@@ -639,12 +710,38 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<(), DeltaTpError> {
+        self.run(e, input, rows, false)
+    }
+
+    fn prefill_run(
+        &mut self,
+        e: &GpuExecutor,
+        input: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), DeltaTpError> {
+        self.run(e, input, rows, true)
+    }
+
+    fn run(
+        &mut self,
+        e: &GpuExecutor,
+        input: &CudaSlice<f32>,
+        rows: usize,
+        prefill: bool,
+    ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
-        // One-token decode uses the exact serial conv_step arithmetic.
-        // Prefill stages the old window and executes a true causal-conv span.
+        if prefill {
+            let mm = self.prefill_gemm.as_mut().expect("prefill scratch allocated");
+            mm.project(e, &self.weights[0], input, &mut s.mixed, rows)?;
+            mm.project(e, &self.weights[1], input, &mut s.z, rows)?;
+        }
+        // One row keeps the existing conv_step arithmetic in both modes.
+        // Multi-row spans keep the existing causal-conv/state path.
         if rows == 1 {
-            gemv_any(e, &self.weights[0], input, &mut s.mixed)?;
+            if !prefill {
+                gemv_any(e, &self.weights[0], input, &mut s.mixed)?;
+            }
             e.conv_step(
                 &mut self.conv,
                 &s.mixed,
@@ -673,14 +770,18 @@ impl DeltaTpRank {
                 &mut s.beta,
                 g.values(),
             )?;
-            gemv_any(e, &self.weights[1], input, &mut s.z)?;
+            if !prefill {
+                gemv_any(e, &self.weights[1], input, &mut s.z)?;
+            }
         } else {
             for t in 0..rows {
                 e.copy_region(input, t * WIDTH, &mut s.input, 0, WIDTH)?;
-                gemv_any(e, &self.weights[0], &s.input, &mut s.convolved)?;
-                e.copy_region(&s.convolved, 0, &mut s.mixed, t * g.mixed(), g.mixed())?;
-                gemv_any(e, &self.weights[1], &s.input, &mut s.core)?;
-                e.copy_region(&s.core, 0, &mut s.z, t * g.value_dim(), g.value_dim())?;
+                if !prefill {
+                    gemv_any(e, &self.weights[0], &s.input, &mut s.convolved)?;
+                    e.copy_region(&s.convolved, 0, &mut s.mixed, t * g.mixed(), g.mixed())?;
+                    gemv_any(e, &self.weights[1], &s.input, &mut s.core)?;
+                    e.copy_region(&s.core, 0, &mut s.z, t * g.value_dim(), g.value_dim())?;
+                }
                 e.deltanet_alpha_beta_gate(
                     &self.alpha,
                     &self.beta_w,
