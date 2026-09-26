@@ -22,6 +22,11 @@
 //!   against explicit gathers from C's full row (value-head bands
 //!   0..7, 16..23, 32..39). Unmaterialized or incompatible stages remain
 //!   unmatched, not silently paired.
+//! - the `gqa-*-last` stages compare the FINAL row of each pass (row 15 in
+//!   the 16-row case): M-RoPE rotates every row with its own text position,
+//!   so the row-0 compares above sit at position 0 where all four axes
+//!   agree and a position-staging bug is invisible there. The final row is
+//!   where such a bug materializes (~0.175 Q / ~0.181 K before the fix).
 //!
 //! Probe-only: no serving path is touched, no guard or tolerance is
 //! changed, and the trace is compiled out of hardened builds. C's prefill
@@ -265,10 +270,20 @@ const SUBSTAGES: &[(&str, Cmp)] = &[
     ("gqa-v", Cmp::Prefix),
     ("gqa-gate", Cmp::Prefix),
     ("gqa-qn", Cmp::Prefix),
+    ("gqa-qn-last", Cmp::Prefix),
     ("gqa-kn", Cmp::Prefix),
+    ("gqa-kn-last", Cmp::Prefix),
     ("gqa-rope-q", Cmp::Prefix),
+    // Last-row twins (final span row = highest text position, row 15 in the
+    // 16-row case): M-RoPE rotates each row with its own position, so the
+    // row-0 compares above sit at position 0 where all four axes agree and
+    // a text-position staging bug is invisible. These are where the ~0.175
+    // Q / ~0.181 K staging divergence appears (and must collapse to noise).
+    ("gqa-rope-q-last", Cmp::Prefix),
     ("gqa-rope-k", Cmp::Prefix),
+    ("gqa-rope-k-last", Cmp::Prefix),
     ("gqa-attn", Cmp::Prefix),
+    ("gqa-attn-last", Cmp::Prefix),
     ("gqa-out", Cmp::Prefix),
     // DeltaNet planes compare through DeltaGeometry's exact rank maps
     // (rank 0 = value heads &[0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 32, 33, 34, 35, 36, 37, 38, 39] - bands, NOT a contiguous half). The mixed
@@ -440,7 +455,16 @@ fn compare_arms(
         if m > stop {
             println!("first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}");
             divergent = true;
-            break;
+            // Keep the four row-last GQA checkpoints together: they are the
+            // Task A decision surface, so a pre-RoPE divergence must still
+            // report the corresponding post-RoPE Q/K values in this run.
+            let required = matches!(
+                key,
+                "gqa-qn-last" | "gqa-kn-last" | "gqa-rope-q-last" | "gqa-rope-k-last"
+            );
+            if !required {
+                break;
+            }
         }
     }
     println!("compared_stage_pairs={compared}");

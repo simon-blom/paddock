@@ -136,6 +136,25 @@ if [[ "$BUILD" == 1 && "$TP_DRY_RUN" != 1 ]]; then
   fi
 fi
 
+# --- build provenance (sampled AFTER the build: Cargo may reconcile
+# Cargo.lock during it, and that reconciliation belongs in the record) ------
+# HEAD alone is ambiguous when testing uncommitted changes, so the summary
+# also records whether the tracked tree was dirty (the probe env file is
+# intentionally ignored) and whether the probe binary was rebuilt during
+# this run (BUILD=1) or reused from an earlier build - the stale-binary
+# ambiguity that makes two runs with identical HEAD non-comparable.
+TREE_DIRTY="yes"
+[[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no)" ]] && TREE_DIRTY="no"
+if [[ "$TP_DRY_RUN" == 1 ]]; then
+  BUILD_NOTE="dry run - nothing built or executed (BUILD=$BUILD)"
+elif [[ "$BUILD" == 1 ]]; then
+  BUILD_NOTE="rebuilt during this run (BUILD=1)"
+elif [[ -x "$LOCAL_BIN" ]]; then
+  BUILD_NOTE="reused existing binary (BUILD=0)"
+else
+  BUILD_NOTE="MISSING (BUILD=0, no binary at $LOCAL_BIN)"
+fi
+
 # --- plan values ------------------------------------------------------------
 RANK0_ENV_PREFIX="PADDOCK_TP_ABC_TRACE=1 NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
 RANK1_ENV_PREFIX="PADDOCK_TP_ABC_TRACE=1 NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
@@ -156,6 +175,8 @@ REMOTE_BIN="$REMOTE_PROBE_DIR/$PROBE_BIN"
 read -r -a SSH_ARGS <<< "$SSH_OPTS"
 
 emit "git HEAD: $HEAD_SHA"
+emit "tree dirty (tracked): $TREE_DIRTY"
+emit "probe build: $BUILD_NOTE"
 emit "probe: $PROBE ($PROBE_BIN)"
 emit "test mode: $TEST_MODE"
 emit "env file: $ENV_FILE"

@@ -803,6 +803,14 @@ impl GqaTpRank {
             rows * g.local_heads,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-qn", layer, &span.qn, 0, g.q_dim())?;
+        super::tp_trace::trace_row_last(
+            e,
+            "b.gqa-qn-last",
+            layer,
+            &span.qn,
+            rows,
+            g.q_dim(),
+        )?;
         e.rmsnorm_batch(
             &span.k,
             &self.knorm,
@@ -812,6 +820,14 @@ impl GqaTpRank {
             rows * g.local_kv_heads,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-kn", layer, &span.kn, 0, g.kv_dim())?;
+        super::tp_trace::trace_row_last(
+            e,
+            "b.gqa-kn-last",
+            layer,
+            &span.kn,
+            rows,
+            g.kv_dim(),
+        )?;
         e.mrope(
             &mut span.qn,
             &span.axes,
@@ -823,6 +839,11 @@ impl GqaTpRank {
             self.sections,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-rope-q", layer, &span.qn, 0, g.q_dim())?;
+        // [PADDOCK_TP_ABC_TRACE] last-row twin of the rope/attn stages: the
+        // final span row carries the highest text position, the only row
+        // where a four-axis staging bug actually diverges (row 0 sits at
+        // position 0, where all axes agree). Paired with c.gqa-*-last.
+        super::tp_trace::trace_row_last(e, "b.gqa-rope-q-last", layer, &span.qn, rows, g.q_dim())?;
         e.mrope(
             &mut span.kn,
             &span.axes,
@@ -834,6 +855,7 @@ impl GqaTpRank {
             self.sections,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
+        super::tp_trace::trace_row_last(e, "b.gqa-rope-k-last", layer, &span.kn, rows, g.kv_dim())?;
         let bt = self.block_tables.as_ref().expect("paged checked above");
         e.kv_append_batch_paged(
             &span.kn,
@@ -878,6 +900,7 @@ impl GqaTpRank {
             None,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
+        super::tp_trace::trace_row_last(e, "b.gqa-attn-last", layer, &span.attn, rows, g.q_dim())?;
         e.mul_sigmoid(&mut span.attn, &span.gate, rows * g.q_dim())?;
         super::tp_trace::trace_row(e, "b.gqa-out", layer, &span.attn, 0, g.q_dim())?;
         prefill_mm_any(

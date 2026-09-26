@@ -74,6 +74,31 @@ pub(crate) fn trace_row(
     Ok(())
 }
 
+/// Capture the LAST row of a row-batched plane (`rows` logical rows, `len`
+/// elements each) for `stage`/`layer`. The row-0 [`trace_row`] sites cannot
+/// see position-dependent stages: M-RoPE rotates row r with the row's own
+/// position, and row 0 sits at position 0 in every probe case, where all
+/// four axes agree regardless of staging. The paired `b.*-last` /
+/// `c.*-last` readbacks capture the final row of the pass (row 15 in the
+/// 16-row ABC case), which is where a text-position staging bug actually
+/// materializes. Same no-op/sync contract as `trace_row`; fails closed on
+/// a zero-row call.
+pub(crate) fn trace_row_last(
+    e: &GpuExecutor,
+    stage: &str,
+    layer: usize,
+    plane: &CudaSlice<f32>,
+    rows: usize,
+    len: usize,
+) -> Result<(), GpuError> {
+    if rows == 0 {
+        return Err(GpuError::Driver(format!(
+            "tp_trace {stage}[layer {layer}]: trace_row_last called with zero rows"
+        )));
+    }
+    trace_row(e, stage, layer, plane, (rows - 1) * len, len)
+}
+
 /// Drain the whole buffer in host-call order (each arm calls once, clearing
 /// it), so a probe can diff two arms stage by stage. Probe-surface only
 /// (used by the qwen35_tp_abc_probe example).

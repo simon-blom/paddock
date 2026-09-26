@@ -622,6 +622,14 @@ impl GpuQwen35 {
                         t_len * n_heads,
                     )?;
                     super::tp_trace::trace_row(&exec, "c.gqa-qn", li, &sc.d_qn, 0, q_dim)?;
+                    super::tp_trace::trace_row_last(
+                        &exec,
+                        "c.gqa-qn-last",
+                        li,
+                        &sc.d_qn,
+                        t_len,
+                        q_dim,
+                    )?;
                     exec.rmsnorm_batch(
                         &sc.d_k,
                         &w.k_norm.buf,
@@ -631,6 +639,14 @@ impl GpuQwen35 {
                         t_len * n_kv_heads,
                     )?;
                     super::tp_trace::trace_row(&exec, "c.gqa-kn", li, &sc.d_kn, 0, kv_dim)?;
+                    super::tp_trace::trace_row_last(
+                        &exec,
+                        "c.gqa-kn-last",
+                        li,
+                        &sc.d_kn,
+                        t_len,
+                        kv_dim,
+                    )?;
                     exec.mrope(
                         &mut sc.d_qn,
                         &ds.d_pf_mrope,
@@ -653,6 +669,27 @@ impl GpuQwen35 {
                         sections,
                     )?;
                     super::tp_trace::trace_row(&exec, "c.gqa-rope-k", li, &sc.d_kn, 0, kv_dim)?;
+                    // [PADDOCK_TP_ABC_TRACE] last-row twins of the rope/attn
+                    // stages (see gqa_tp.rs): the final prefill row carries
+                    // the highest text position, the only row where a
+                    // four-axis staging divergence materializes. Scratch
+                    // planes hold >= 64 rows, so row t_len-1 is in-bounds.
+                    super::tp_trace::trace_row_last(
+                        &exec,
+                        "c.gqa-rope-q-last",
+                        li,
+                        &sc.d_qn,
+                        t_len,
+                        q_dim,
+                    )?;
+                    super::tp_trace::trace_row_last(
+                        &exec,
+                        "c.gqa-rope-k-last",
+                        li,
+                        &sc.d_kn,
+                        t_len,
+                        kv_dim,
+                    )?;
                     exec.kv_append_batch(
                         &sc.d_kn,
                         ds.kv_k[li].as_mut().expect("full-attn layer KV"),
@@ -694,6 +731,14 @@ impl GpuQwen35 {
                         Some((&mut sc.d_attn_o, &mut sc.d_attn_ml)),
                     )?;
                     super::tp_trace::trace_row(&exec, "c.gqa-attn", li, &sc.d_attn, 0, q_dim)?;
+                    super::tp_trace::trace_row_last(
+                        &exec,
+                        "c.gqa-attn-last",
+                        li,
+                        &sc.d_attn,
+                        t_len,
+                        q_dim,
+                    )?;
                     exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, t_len * q_dim)?;
                     super::tp_trace::trace_row(&exec, "c.gqa-out", li, &sc.d_attn, 0, q_dim)?;
                     rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, t_len)?;
