@@ -170,6 +170,7 @@ impl FfnTpRank {
         rows: usize,
         span: &'a mut SpanFfn,
         q: &mut SpanGemmStaging,
+        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
@@ -210,6 +211,10 @@ impl FfnTpRank {
             &mut span.up,
             rows,
         )?;
+        // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the rank-local
+        // gate/up shards, compared through the rank map on the host.
+        super::tp_trace::trace_row(exec, "b.ffn-gate", layer, &span.gate, 0, self.local_ff)?;
+        super::tp_trace::trace_row(exec, "b.ffn-up", layer, &span.up, 0, self.local_ff)?;
         prefill_ffn_down_any(
             exec,
             &self.down,

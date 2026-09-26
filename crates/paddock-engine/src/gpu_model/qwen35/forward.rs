@@ -583,9 +583,22 @@ impl GpuQwen35 {
             )?;
             dbg_norm!(li, "x_embed", &sc.d_x, t_len * embd);
             dbg_norm!(li, "xn", &sc.d_xn, t_len * embd);
+            // [PADDOCK_TP_ABC_TRACE] probe-only stage readbacks mirroring the
+            // B-arm spans (see tp_trace.rs); no-ops without the env. The fused
+            // attn_norm quantize consumed the f32 rows, so the norm stage
+            // cannot be read back here - the projection trace below covers it.
+            super::tp_trace::trace_row(&exec, "c.layer-in", li, &sc.d_x, 0, embd)?;
             match &layer.mixer {
                 Mixer::Full(w) => {
                     pmm_pre!(&w.wq, &mut sc.d_qg);
+                    super::tp_trace::trace_row(
+                        &exec,
+                        "c.gqa-qg",
+                        li,
+                        &sc.d_qg,
+                        0,
+                        q_dim * 2,
+                    )?;
                     exec.split_qg(
                         &sc.d_qg,
                         &mut sc.d_q,
@@ -594,8 +607,12 @@ impl GpuQwen35 {
                         n_heads,
                         head_dim,
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-q", li, &sc.d_q, 0, q_dim)?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-gate", li, &sc.d_gate, 0, q_dim)?;
                     pmm_pre!(&w.wk, &mut sc.d_k);
                     pmm_pre!(&w.wv, &mut sc.d_v);
+                    super::tp_trace::trace_row(&exec, "c.gqa-k", li, &sc.d_k, 0, kv_dim)?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-v", li, &sc.d_v, 0, kv_dim)?;
                     exec.rmsnorm_batch(
                         &sc.d_q,
                         &w.q_norm.buf,
@@ -604,6 +621,7 @@ impl GpuQwen35 {
                         eps,
                         t_len * n_heads,
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-qn", li, &sc.d_qn, 0, q_dim)?;
                     exec.rmsnorm_batch(
                         &sc.d_k,
                         &w.k_norm.buf,
@@ -612,6 +630,7 @@ impl GpuQwen35 {
                         eps,
                         t_len * n_kv_heads,
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-kn", li, &sc.d_kn, 0, kv_dim)?;
                     exec.mrope(
                         &mut sc.d_qn,
                         &ds.d_pf_mrope,
@@ -622,6 +641,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-rope-q", li, &sc.d_qn, 0, q_dim)?;
                     exec.mrope(
                         &mut sc.d_kn,
                         &ds.d_pf_mrope,
@@ -632,6 +652,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-rope-k", li, &sc.d_kn, 0, kv_dim)?;
                     exec.kv_append_batch(
                         &sc.d_kn,
                         ds.kv_k[li].as_mut().expect("full-attn layer KV"),
@@ -672,14 +693,18 @@ impl GpuQwen35 {
                         None,
                         Some((&mut sc.d_attn_o, &mut sc.d_attn_ml)),
                     )?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-attn", li, &sc.d_attn, 0, q_dim)?;
                     exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, t_len * q_dim)?;
+                    super::tp_trace::trace_row(&exec, "c.gqa-out", li, &sc.d_attn, 0, q_dim)?;
                     rotate_opt(rot, &exec, &mut sc.d_attn, q_dim, t_len)?;
                     pmm!(&w.wo, &sc.d_attn, &mut sc.d_proj);
+                    super::tp_trace::trace_row(&exec, "c.mixer-out", li, &sc.d_proj, 0, embd)?;
                 }
                 Mixer::Linear(w) => {
                     // input quantized by the fused attn_norm above (P6k)
                     pmm_pre!(&w.in_qkv, &mut sc.d_mixed);
                     dbg_norm!(li, "mixed", &sc.d_mixed, t_len * conv_dim);
+                    super::tp_trace::trace_row(&exec, "c.dn-mixed", li, &sc.d_mixed, 0, conv_dim)?;
                     let vb16 = dn_vb16(&exec, t_len, state_size)
                         && paddock_models::dev_var_os!("PADDOCK_DBG_NORM").is_none();
                     if vb16 {
@@ -727,6 +752,10 @@ impl GpuQwen35 {
                             conv_k,
                         )?;
                         dbg_norm!(li, "conv", &sc.d_conv, t_len * conv_dim);
+                        // [PADDOCK_TP_ABC_TRACE] conv output on the unfused
+                        // two-kernel arm only (the fused conv_qkv kernels
+                        // never write this plane).
+                        super::tp_trace::trace_row(&exec, "c.dn-conv", li, &sc.d_conv, 0, conv_dim)?;
                     }
                     // Leave the conv window holding the last k-1 pre-conv inputs so
                     // incremental decode continues seamlessly. Window rows are
@@ -767,6 +796,16 @@ impl GpuQwen35 {
                             n_v_heads,
                             state_size,
                         )?;
+                    }
+                    // [PADDOCK_TP_ABC_TRACE] split+L2-norm q/k/v (row 0).
+                    // Both the fused conv_qkv arm (bit-exact composition) and
+                    // the two-kernel arm write the expanded f32 planes; the
+                    // compact-bf16 route has no comparable plane.
+                    let value_dim = n_v_heads * state_size;
+                    if !vb16 {
+                        super::tp_trace::trace_row(&exec, "c.dn-q", li, &sc.d_dq, 0, value_dim)?;
+                        super::tp_trace::trace_row(&exec, "c.dn-k", li, &sc.d_dk, 0, value_dim)?;
+                        super::tp_trace::trace_row(&exec, "c.dn-v", li, &sc.d_dv, 0, value_dim)?;
                     }
                     // Non-Q8 alpha/beta have no repacked pair - the ab plane is
                     // the only path (all spans); Q8 keeps its measured 1024 gate.
@@ -817,6 +856,8 @@ impl GpuQwen35 {
                     }
                     dbg_norm!(li, "g", &sc.d_g, t_len * n_v_heads);
                     dbg_norm!(li, "beta", &sc.d_beta, t_len * n_v_heads);
+                    super::tp_trace::trace_row(&exec, "c.dn-gate", li, &sc.d_g, 0, n_v_heads)?;
+                    super::tp_trace::trace_row(&exec, "c.dn-beta", li, &sc.d_beta, 0, n_v_heads)?;
                     prefill_delta_recurrent(
                         &exec,
                         sc,
@@ -828,9 +869,25 @@ impl GpuQwen35 {
                         vb16,
                     )?;
                     dbg_norm!(li, "dattn", &sc.d_dattn, t_len * n_v_heads * state_size);
+                    super::tp_trace::trace_row(
+                        &exec,
+                        "c.dn-rec",
+                        li,
+                        &sc.d_dattn,
+                        0,
+                        n_v_heads * state_size,
+                    )?;
                     // d_xn/d_yq untouched since in_qkv's prefill_quant: reuse
                     pmm_pre!(&w.gate_w, &mut sc.d_z);
                     dbg_norm!(li, "z", &sc.d_z, t_len * n_v_heads * state_size);
+                    super::tp_trace::trace_row(
+                        &exec,
+                        "c.dn-z",
+                        li,
+                        &sc.d_z,
+                        0,
+                        n_v_heads * state_size,
+                    )?;
                     exec.gated_rmsnorm(
                         &sc.d_dattn,
                         &sc.d_z,
@@ -841,6 +898,14 @@ impl GpuQwen35 {
                         eps,
                     )?;
                     dbg_norm!(li, "core", &sc.d_core, t_len * n_v_heads * state_size);
+                    super::tp_trace::trace_row(
+                        &exec,
+                        "c.dn-core",
+                        li,
+                        &sc.d_core,
+                        0,
+                        n_v_heads * state_size,
+                    )?;
                     if let Some(r) = rot {
                         // ssm_out reads the regrouped + rotated rows; d_dattn
                         // is free once the gated norm above has consumed it
@@ -851,6 +916,7 @@ impl GpuQwen35 {
                         pmm!(&w.out_w, &sc.d_core, &mut sc.d_proj);
                     }
                     dbg_norm!(li, "mix_proj", &sc.d_proj, t_len * embd);
+                    super::tp_trace::trace_row(&exec, "c.mixer-out", li, &sc.d_proj, 0, embd)?;
                 }
             }
             match &layer.ffn {
@@ -874,10 +940,17 @@ impl GpuQwen35 {
                         eps,
                         rot,
                     )?;
+                    // NOTE: no c.ffn-norm trace here - the fused add+norm+
+                    // quantize does not materialize the f32 rows on the
+                    // default (non-KQ_F32) path, so d_xn would read stale
+                    // mixer-block values. The ffn-gate/up traces below cover
+                    // this norm site's output instead.
                     pmm_pre!(gate, &mut sc.d_ffn_gate);
                     pmm_pre!(up, &mut sc.d_ffn_up);
                     dbg_norm!(li, "ffn_gate", &sc.d_ffn_gate, t_len * ff);
                     dbg_norm!(li, "ffn_up", &sc.d_ffn_up, t_len * ff);
+                    super::tp_trace::trace_row(&exec, "c.ffn-gate", li, &sc.d_ffn_gate, 0, ff)?;
+                    super::tp_trace::trace_row(&exec, "c.ffn-up", li, &sc.d_ffn_up, 0, ff)?;
                     match down {
                         QuantW::Kq(k) if kq_f32 => {
                             // exact-f32 fallback: swiglu explicitly, then the
@@ -911,6 +984,7 @@ impl GpuQwen35 {
                         )?,
                     }
                     dbg_norm!(li, "ffn_proj", &sc.d_proj, t_len * embd);
+                    super::tp_trace::trace_row(&exec, "c.ffn-out", li, &sc.d_proj, 0, embd)?;
                 }
                 Ffn::Nvf4Dense { gu, down } => {
                     // off the f32 xn - write_xn=true, the int8 staging
@@ -1026,6 +1100,7 @@ impl GpuQwen35 {
         // h_nextn rows (post-out_norm hidden at every position - the MTP head's h
         // inputs), then lm_head on the last row only.
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, t_len)?;
+        super::tp_trace::trace_row(&exec, "c.final-norm", 0, &sc.d_h, 0, embd)?;
         exec.copy_region(&sc.d_h, (t_len - 1) * embd, &mut sc.d_xn, 0, embd)?;
         rotate_opt(rot, &exec, &mut sc.d_xn, embd, 1)?;
         if let Some(p) = super::head_f8(self.out_f8.as_ref(), 1) {

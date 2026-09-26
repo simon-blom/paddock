@@ -1109,16 +1109,35 @@ impl Qwen35TpRank {
             rows,
             None,
         )?;
-        for layer in &mut self.layers {
+        for (layer, layer_data) in self.layers.iter_mut().enumerate() {
+            let layer_data = &mut *layer_data;
+            // [PADDOCK_TP_ABC_TRACE] probe-only stage readbacks (see
+            // tp_trace.rs); a no-op without the env, never a semantics change.
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.layer-in",
+                layer,
+                &planes.act.x,
+                0,
+                self.hidden,
+            )?;
             self.exec.rmsnorm_batch(
                 &planes.act.x,
-                &layer.attn_norm.buf,
+                &layer_data.attn_norm.buf,
                 &mut planes.act.xn,
                 self.hidden,
                 self.eps,
                 rows,
             )?;
-            let mixed_rows = match &mut layer.mixer {
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.post-norm",
+                layer,
+                &planes.act.xn,
+                0,
+                self.hidden,
+            )?;
+            let mixed_rows = match &mut layer_data.mixer {
                 TpMixer::Full(gqa) => {
                     let span = &mut planes.gqa;
                     let q = &mut planes.q;
@@ -1132,38 +1151,81 @@ impl Qwen35TpRank {
                         logical_kv,
                         span,
                         q,
+                        layer,
                     )?
                 }
-                TpMixer::Linear(delta) => delta.prefill_slot(
-                    &self.exec,
-                    group,
-                    &planes.act.xn,
-                    slot,
-                    rows,
-                )?,
+                TpMixer::Linear(delta) => {
+                    delta.prefill_slot(&self.exec, group, &planes.act.xn, slot, rows, layer)?
+                }
             };
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.mixer-out",
+                layer,
+                mixed_rows,
+                0,
+                self.hidden,
+            )?;
             // The reduced span planes carry live data in their first
             // rows*hidden elements, so a flat elementwise add covers the
             // batch (row-wise residual without a row-broadcast kernel).
             self.exec
                 .add(&mut planes.act.x, mixed_rows, rows * self.hidden)?;
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.post-mixer",
+                layer,
+                &planes.act.x,
+                0,
+                self.hidden,
+            )?;
             self.exec.rmsnorm_batch(
                 &planes.act.x,
-                &layer.post_norm.buf,
+                &layer_data.post_norm.buf,
                 &mut planes.act.xn,
                 self.hidden,
                 self.eps,
                 rows,
             )?;
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.ffn-norm",
+                layer,
+                &planes.act.xn,
+                0,
+                self.hidden,
+            )?;
             let ffn_rows = {
                 let span = &mut planes.ffn;
                 let q = &mut planes.q;
-                layer
-                    .ffn
-                    .forward_rows_capacity(&self.exec, group, &planes.act.xn, rows, span, q)?
+                layer_data.ffn.forward_rows_capacity(
+                    &self.exec,
+                    group,
+                    &planes.act.xn,
+                    rows,
+                    span,
+                    q,
+                    layer,
+                )?
             };
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.ffn-out",
+                layer,
+                ffn_rows,
+                0,
+                self.hidden,
+            )?;
             self.exec
                 .add(&mut planes.act.x, ffn_rows, rows * self.hidden)?;
+            super::tp_trace::trace_row(
+                &self.exec,
+                "b.layer-out",
+                layer,
+                &planes.act.x,
+                0,
+                self.hidden,
+            )?;
         }
         self.exec.rmsnorm_batch(
             &planes.act.x,
@@ -1172,6 +1234,14 @@ impl Qwen35TpRank {
             self.hidden,
             self.eps,
             rows,
+        )?;
+        super::tp_trace::trace_row(
+            &self.exec,
+            "b.final-norm",
+            0,
+            &planes.act.xn,
+            0,
+            self.hidden,
         )?;
         // Head GEMV on the LAST row only: copy the final normalized row into
         // the one-row staging plane (gemv_any takes a whole `&CudaSlice`, not

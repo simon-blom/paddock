@@ -522,7 +522,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, 1, slot, false).map(|_| ());
+        let result = self.forward(e, group, input, 1, slot, false, 0).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -565,7 +565,7 @@ impl DeltaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, 1, 0, false)
+        self.forward(e, group, input, 1, 0, false, 0)
     }
     pub fn prefill<'a, C: Communicator>(
         &'a mut self,
@@ -574,12 +574,13 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, rows, 0, true)
+        self.forward(e, group, input, rows, 0, true, 0)
     }
 
     /// Slot-addressed span prefill (prototype): identical math to `prefill`
     /// with the addressed slot's recurrent/conv pair swapped in for the span
-    /// and swapped back after it.
+    /// and swapped back after it. `layer` feeds the probe-only
+    /// `PADDOCK_TP_ABC_TRACE` substage readbacks.
     pub(crate) fn prefill_slot<'a, C: Communicator>(
         &'a mut self,
         e: &GpuExecutor,
@@ -587,9 +588,10 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         slot: usize,
         rows: usize,
+        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         if slot == 0 {
-            return self.forward(e, group, input, rows, slot, true);
+            return self.forward(e, group, input, rows, slot, true, layer);
         }
         let state = self
             .slot_states
@@ -597,7 +599,9 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, rows, slot, true).map(|_| ());
+        let result = self
+            .forward(e, group, input, rows, slot, true, layer)
+            .map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -612,6 +616,7 @@ impl DeltaTpRank {
         rows: usize,
         slot: usize,
         prefill: bool,
+        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let world = group.world_size();
         let rank = group.rank();
@@ -630,7 +635,7 @@ impl DeltaTpRank {
             if self.prefill_gemm.is_none() {
                 self.prefill_gemm = Some(PrefillGemm::new(e)?);
             }
-            self.prefill_run(e, input, rows)?;
+            self.prefill_run(e, input, rows, layer)?;
             self.finish_partial_prefill(e, rows)?;
         } else {
             self.decode_run(e, input, rows)?;
@@ -710,7 +715,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, false)
+        self.run(e, input, rows, false, 0)
     }
 
     fn prefill_run(
@@ -718,8 +723,9 @@ impl DeltaTpRank {
         e: &GpuExecutor,
         input: &CudaSlice<f32>,
         rows: usize,
+        layer: usize,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, true)
+        self.run(e, input, rows, true, layer)
     }
 
     fn run(
@@ -728,6 +734,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
         prefill: bool,
+        layer: usize,
     ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
@@ -735,6 +742,12 @@ impl DeltaTpRank {
             let mm = self.prefill_gemm.as_mut().expect("prefill scratch allocated");
             mm.project(e, &self.weights[0], input, &mut s.mixed, rows)?;
             mm.project(e, &self.weights[1], input, &mut s.z, rows)?;
+            // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the
+            // rank-local mixed shard and gate (z) shard, plus the whole-row
+            // mixer input, echoed under the c.* name for the host compare.
+            super::tp_trace::trace_row(e, "b.dn-in", layer, input, 0, WIDTH)?;
+            super::tp_trace::trace_row(e, "b.dn-mixed", layer, &s.mixed, 0, g.mixed())?;
+            super::tp_trace::trace_row(e, "b.dn-z", layer, &s.z, 0, g.value_dim())?;
         }
         // One row keeps the existing conv_step arithmetic in both modes.
         // Multi-row spans keep the existing causal-conv/state path.
@@ -782,6 +795,12 @@ impl DeltaTpRank {
                     gemv_any(e, &self.weights[1], &s.input, &mut s.core)?;
                     e.copy_region(&s.core, 0, &mut s.z, t * g.value_dim(), g.value_dim())?;
                 }
+                // [PADDOCK_TP_ABC_TRACE] the remaining PER-ROW fused
+                // alpha/beta gate work (deltanet_alpha_beta_gate): row 0 of
+                // the span only, so a probe sees exactly this site's values.
+                if t == 0 {
+                    super::tp_trace::trace_row(e, "b.dn-in", layer, &s.input, 0, WIDTH)?;
+                }
                 e.deltanet_alpha_beta_gate(
                     &self.alpha,
                     &self.beta_w,
@@ -792,6 +811,24 @@ impl DeltaTpRank {
                     &mut s.beta_one,
                     g.values(),
                 )?;
+                if t == 0 {
+                    super::tp_trace::trace_row(
+                        e,
+                        "b.dn-gate",
+                        layer,
+                        &s.gate_one,
+                        0,
+                        g.values(),
+                    )?;
+                    super::tp_trace::trace_row(
+                        e,
+                        "b.dn-beta",
+                        layer,
+                        &s.beta_one,
+                        0,
+                        g.values(),
+                    )?;
+                }
                 e.copy_region(&s.gate_one, 0, &mut s.gate, t * g.values(), g.values())?;
                 e.copy_region(&s.beta_one, 0, &mut s.beta, t * g.values(), g.values())?;
             }
@@ -829,6 +866,14 @@ impl DeltaTpRank {
                 g.values(),
                 S,
             )?;
+            if prefill {
+                // [PADDOCK_TP_ABC_TRACE] conv output, split+L2-norm q/k/v
+                // (row 0) on the batched span path.
+                super::tp_trace::trace_row(e, "b.dn-conv", layer, &s.convolved, 0, g.mixed())?;
+                super::tp_trace::trace_row(e, "b.dn-q", layer, &s.q, 0, g.value_dim())?;
+                super::tp_trace::trace_row(e, "b.dn-k", layer, &s.k, 0, g.value_dim())?;
+                super::tp_trace::trace_row(e, "b.dn-v", layer, &s.v, 0, g.value_dim())?;
+            }
         }
         e.gated_delta_recurrent_v2(
             &s.q,
@@ -846,6 +891,11 @@ impl DeltaTpRank {
             g.values(),
             S,
         )?;
+        if prefill {
+            // [PADDOCK_TP_ABC_TRACE] recurrence output (row 0) and the gated
+            // norm's `core` (row 0) - the out projection's input.
+            super::tp_trace::trace_row(e, "b.dn-rec", layer, &s.attn, 0, g.value_dim())?;
+        }
         e.gated_rmsnorm(
             &s.attn,
             &s.z,
@@ -855,6 +905,9 @@ impl DeltaTpRank {
             S,
             self.eps,
         )?;
+        if prefill {
+            super::tp_trace::trace_row(e, "b.dn-core", layer, &s.core, 0, g.value_dim())?;
+        }
         Ok(())
     }
 }

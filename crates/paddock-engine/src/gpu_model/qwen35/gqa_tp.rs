@@ -631,6 +631,7 @@ impl GqaTpRank {
         logical: &MirroredKv,
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
+        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if self.block_tables.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
@@ -684,7 +685,7 @@ impl GqaTpRank {
                 .memcpy_htod(&staged, &mut axes)
                 .map_err(GpuError::from)?;
         }
-        self.span_run(e, group, xn, rows, Some(position), logical, span, q)
+        self.span_run(e, group, xn, rows, Some(position), logical, span, q, layer)
     }
 
     /// The collective-free batched span run: QKV GEMMs, head split, per-head
@@ -692,6 +693,7 @@ impl GqaTpRank {
     /// sigmoid gate and the row-parallel down GEMM into the span's `partial`.
     /// `position` (when staged, the Some arm) only selects the block-table
     /// validation point; the appended rows carry their own positions.
+    /// `layer` feeds the probe-only `PADDOCK_TP_ABC_TRACE` stage readbacks.
     #[allow(clippy::too_many_arguments)]
     fn span_run<'a, C: Communicator>(
         &'a mut self,
@@ -703,6 +705,7 @@ impl GqaTpRank {
         logical: &MirroredKv,
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
+        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
@@ -767,6 +770,14 @@ impl GqaTpRank {
             g.local_heads,
             g.head_dim,
         )?;
+        // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the fused Q|gate
+        // shard plus the rank-local Q/K/V shards (compared through the rank
+        // map on the host; gqa-qg pairs odd Q/gate element runs).
+        super::tp_trace::trace_row(e, "b.gqa-qg", layer, &span.qg, 0, 2 * g.q_dim())?;
+        super::tp_trace::trace_row(e, "b.gqa-q", layer, &span.q, 0, g.q_dim())?;
+        super::tp_trace::trace_row(e, "b.gqa-k", layer, &span.k, 0, g.kv_dim())?;
+        super::tp_trace::trace_row(e, "b.gqa-v", layer, &span.v, 0, g.kv_dim())?;
+        super::tp_trace::trace_row(e, "b.gqa-gate", layer, &span.gate, 0, g.q_dim())?;
         e.rmsnorm_batch(
             &span.q,
             &self.qnorm,
@@ -775,6 +786,7 @@ impl GqaTpRank {
             self.eps,
             rows * g.local_heads,
         )?;
+        super::tp_trace::trace_row(e, "b.gqa-qn", layer, &span.qn, 0, g.q_dim())?;
         e.rmsnorm_batch(
             &span.k,
             &self.knorm,
@@ -783,6 +795,7 @@ impl GqaTpRank {
             self.eps,
             rows * g.local_kv_heads,
         )?;
+        super::tp_trace::trace_row(e, "b.gqa-kn", layer, &span.kn, 0, g.kv_dim())?;
         e.mrope(
             &mut span.qn,
             &span.axes,
@@ -793,6 +806,7 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
+        super::tp_trace::trace_row(e, "b.gqa-rope-q", layer, &span.qn, 0, g.q_dim())?;
         e.mrope(
             &mut span.kn,
             &span.axes,
@@ -803,6 +817,7 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
+        super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
         let bt = self.block_tables.as_ref().expect("paged checked above");
         e.kv_append_batch_paged(
             &span.kn,
@@ -846,7 +861,9 @@ impl GqaTpRank {
             Some((bt, self.blocks_per_slot)),
             None,
         )?;
+        super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
         e.mul_sigmoid(&mut span.attn, &span.gate, rows * g.q_dim())?;
+        super::tp_trace::trace_row(e, "b.gqa-out", layer, &span.attn, 0, g.q_dim())?;
         prefill_mm_any(
             e,
             &self.weights[3],
