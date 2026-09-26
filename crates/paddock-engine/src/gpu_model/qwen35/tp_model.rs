@@ -1000,12 +1000,15 @@ impl Qwen35TpRank {
         Ok(())
     }
 
-    /// Batched whole-model prefill span (prototype, not wired into serving):
+    /// Batched whole-model prefill span, STATE-ADVANCE half (production):
     /// `tokens` are ONE slot's prompt at contiguous positions
-    /// `position..position+len` — embedded as a batch, taken through all
+    /// `position..position+len` — embedded as a batch and taken through all
     /// layers in ONE traversal (batched GQA / DeltaNet / FFN per layer, two
-    /// span all-reduces per layer), final norm, and the head GEMV on the last
-    /// row only. Returns the final row's logits.
+    /// span all-reduces per layer). NO final norm, NO LM head, NO host
+    /// logits: GQA paged KV and DeltaNet recurrent/conv state advance
+    /// exactly once per row and nothing else happens. Pair with
+    /// [`Self::forward_span_head`] on the FINAL prompt span (which owns the
+    /// final norm + head + readback).
     ///
     /// Semantics are designed to match the serial one-row path exactly: KV
     /// rows append at their own logical positions, DeltaNet recurrent/conv
@@ -1014,14 +1017,14 @@ impl Qwen35TpRank {
     /// collectives pair across ranks (both ranks must call with identical
     /// slot/position/rows). Rows beyond `TP_SPAN_CAP` are NOT accepted — the
     /// caller slices longer prompts into spans.
-    pub fn forward_prefill_span<C: Communicator>(
+    pub fn forward_span_advance<C: Communicator>(
         &mut self,
         group: &C,
         logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
         slot: usize,
         tokens: &[u32],
         position: usize,
-    ) -> Result<Vec<f32>, Qwen35TpError> {
+    ) -> Result<(), Qwen35TpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
             || slot >= self.slots
@@ -1064,36 +1067,7 @@ impl Qwen35TpRank {
                 .map_err(|e| Qwen35TpError::Shape(e.into()))?;
         }
         // Allocate the span planes on first use only (bounded, explicit).
-        if self.span_planes.is_none() {
-            let g = self
-                .layers
-                .iter()
-                .find_map(|layer| match &layer.mixer {
-                    TpMixer::Full(gqa) => Some(gqa.geometry),
-                    TpMixer::Linear(_) => None,
-                })
-                .ok_or_else(|| {
-                    Qwen35TpError::Shape("model has no GQA layer for span scratch sizing".into())
-                })?;
-            let local_ff = self
-                .layers
-                .iter()
-                .map(|layer| layer.ffn.local_ff())
-                .max()
-                .ok_or_else(|| Qwen35TpError::Shape("model has no layers for span scratch sizing".into()))?;
-            let table_len = self
-                .max_ctx
-                .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
-                .checked_mul(self.slots)
-                .ok_or_else(|| Qwen35TpError::Shape("block table length overflow".into()))?;
-            self.span_planes = Some(super::tp_span::TpSpanPlanes::new(
-                &self.exec,
-                self.hidden,
-                &g,
-                local_ff,
-                table_len,
-            )?);
-        }
+        self.ensure_span_planes()?;
         let planes = self.span_planes.as_mut().expect("allocated above");
         // Batched embedding: all rows in one gather.
         self.exec
@@ -1109,6 +1083,86 @@ impl Qwen35TpRank {
             rows,
             None,
         )?;
+        self.span_layer_walk(group, logical_kv, slot, position, rows)?;
+        Ok(())
+    }
+
+    /// Head half of one batched span, ENQUEUE half (production): final norm
+    /// over the span's residual rows and the LM-head projection of the LAST
+    /// row into resident `logits`. No synchronization, no readback - the
+    /// caller samples resident logits (`sample_logits_slot`) or reads them
+    /// back later. Rank 0 calls this exactly once per prompt - on the final
+    /// span, immediately after that span's `forward_span_advance`. The head
+    /// enters no collective, so rank 1 never calls it; only the traversal
+    /// halves pair across ranks. `rows` must match the advance that just
+    /// ran (the head normalizes the residual plane the advance left behind).
+    pub fn forward_span_head_enqueue(&mut self, rows: usize) -> Result<(), Qwen35TpError> {
+        if rows == 0 || rows > super::tp_span::TP_SPAN_CAP {
+            return Err(Qwen35TpError::Shape(format!(
+                "span head rows {rows} outside the 1..={} cap",
+                super::tp_span::TP_SPAN_CAP
+            )));
+        }
+        let Some(planes) = self.span_planes.as_mut() else {
+            return Err(Qwen35TpError::Shape(
+                "span head before any span advance".into(),
+            ));
+        };
+        self.exec.rmsnorm_batch(
+            &planes.act.x,
+            &self.out_norm.buf,
+            &mut planes.act.xn,
+            self.hidden,
+            self.eps,
+            rows,
+        )?;
+        super::tp_trace::trace_row(
+            &self.exec,
+            "b.final-norm",
+            0,
+            &planes.act.xn,
+            0,
+            self.hidden,
+        )?;
+        // Head GEMV on the LAST row only: copy the final normalized row into
+        // the one-row staging plane (gemv_any takes a whole `&CudaSlice`, not
+        // an offset view) and project that.
+        self.exec.copy_region(
+            &planes.act.xn,
+            (rows - 1) * self.hidden,
+            &mut planes.act.x_last,
+            0,
+            self.hidden,
+        )?;
+        gemv_any(
+            &self.exec,
+            &self.output,
+            &planes.act.x_last,
+            &mut self.logits,
+        )?;
+        Ok(())
+    }
+
+    /// Blocking head half: enqueue (`forward_span_head_enqueue`) plus one
+    /// stream synchronization and the full-vocabulary copy to host - the
+    /// synchronous twin for callers that want the logits now.
+    pub fn forward_span_head(&mut self, rows: usize) -> Result<Vec<f32>, Qwen35TpError> {
+        self.forward_span_head_enqueue(rows)?;
+        self.exec.synchronize()?;
+        Ok(self.exec.to_host(&self.logits)?)
+    }
+
+    /// Shared layer walk of one span (both halves; the collectives and the
+    /// whole state advance live here so the two halves cannot drift).
+    fn span_layer_walk<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        position: usize,
+        rows: usize,
+    ) -> Result<(), Qwen35TpError> {
+        let planes = self.span_planes.as_mut().expect("ensure_span_planes ran");
         for (layer, layer_data) in self.layers.iter_mut().enumerate() {
             let layer_data = &mut *layer_data;
             // [PADDOCK_TP_ABC_TRACE] probe-only stage readbacks (see
@@ -1227,35 +1281,57 @@ impl Qwen35TpRank {
                 self.hidden,
             )?;
         }
-        self.exec.rmsnorm_batch(
-            &planes.act.x,
-            &self.out_norm.buf,
-            &mut planes.act.xn,
-            self.hidden,
-            self.eps,
-            rows,
-        )?;
-        super::tp_trace::trace_row(
+        Ok(())
+    }
+
+    fn ensure_span_planes(&mut self) -> Result<(), Qwen35TpError> {
+        if self.span_planes.is_some() {
+            return Ok(());
+        }
+        let g = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                TpMixer::Full(gqa) => Some(gqa.geometry),
+                TpMixer::Linear(_) => None,
+            })
+            .ok_or_else(|| {
+                Qwen35TpError::Shape("model has no GQA layer for span scratch sizing".into())
+            })?;
+        let local_ff = self
+            .layers
+            .iter()
+            .map(|layer| layer.ffn.local_ff())
+            .max()
+            .ok_or_else(|| Qwen35TpError::Shape("model has no layers for span scratch sizing".into()))?;
+        let table_len = self
+            .max_ctx
+            .div_ceil(crate::gpu_model::prefix_cache::BLOCK_TOKENS)
+            .checked_mul(self.slots)
+            .ok_or_else(|| Qwen35TpError::Shape("block table length overflow".into()))?;
+        self.span_planes = Some(super::tp_span::TpSpanPlanes::new(
             &self.exec,
-            "b.final-norm",
-            0,
-            &planes.act.xn,
-            0,
             self.hidden,
-        )?;
-        // Head GEMV on the LAST row only: copy the final normalized row into
-        // the one-row staging plane (gemv_any takes a whole `&CudaSlice`, not
-        // an offset view) and project that.
-        self.exec.copy_region(
-            &planes.act.xn,
-            (rows - 1) * self.hidden,
-            &mut planes.act.x_last,
-            0,
-            self.hidden,
-        )?;
-        gemv_any(&self.exec, &self.output, &planes.act.x_last, &mut self.logits)?;
-        self.exec.synchronize()?;
-        Ok(self.exec.to_host(&self.logits)?)
+            &g,
+            local_ff,
+            table_len,
+        )?);
+        Ok(())
+    }
+
+    /// The full prototype span (advance + head), unchanged semantics: the
+    /// probe's A-vs-B oracle. Production splits the halves so intermediate
+    /// spans skip the head and readback entirely.
+    pub fn forward_prefill_span<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        tokens: &[u32],
+        position: usize,
+    ) -> Result<Vec<f32>, Qwen35TpError> {
+        self.forward_span_advance(group, logical_kv, slot, tokens, position)?;
+        self.forward_span_head(tokens.len())
     }
 
     /// Build the second execution lane for overlapped prefill spans.
@@ -1447,6 +1523,100 @@ impl Qwen35TpRank {
             .forward_token_body(group, logical_kv, position, slot, false)
     }
 
+    /// Enqueue ONE batched span advance (up to `TP_SPAN_CAP` contiguous
+    /// rows of `slot` at `position..position+rows`) on the prefill lane:
+    /// the lane's whole-model traversal, no head, no readback, no host sync.
+    /// The caller must have validated the positions and mirrored the KV
+    /// events on BOTH ranks in the same order (the collectives pair across
+    /// ranks). `rows` re-derives from `tokens.len()` like every other entry.
+    pub fn prefill_lane_span_advance<C: Communicator>(
+        &mut self,
+        group: &C,
+        logical_kv: &crate::gpu_model::qwen35::tp_kv::MirroredKv,
+        slot: usize,
+        tokens: &[u32],
+        position: usize,
+    ) -> Result<(), Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        if slot >= self.slots || position >= self.max_ctx {
+            return Err(Qwen35TpError::Shape(
+                "prefill slot or position invalid".into(),
+            ));
+        }
+        Self::fence_lane_drained(lane)?;
+        lane.owner = Some(slot);
+        // The prefill lane is never captured: always eager.
+        lane.model
+            .forward_span_advance(group, logical_kv, slot, tokens, position)
+    }
+
+    /// Enqueue the FINAL span's head on the prefill lane WITHOUT blocking
+    /// the host: final norm + LM-head projection of the last row land in
+    /// the lane's resident logits. `plan` mirrors `prefill_lane_finisher`:
+    /// `Some(plan)` samples the logits on device (rank 0, sample-chain
+    /// fenced) and the caller reads the ID via
+    /// `prefill_lane_sampled_id_after`; `None` leaves the full logits for
+    /// `prefill_lane_logits_after`. Either way an event marking the lane's
+    /// completion is returned. Must immediately follow
+    /// `prefill_lane_span_advance` of the same span (the head normalizes
+    /// the residual plane that advance left behind).
+    pub fn prefill_lane_span_finish(
+        &mut self,
+        slot: usize,
+        rows: usize,
+        plan: Option<crate::sampler::DevicePlan>,
+    ) -> Result<CudaEvent, Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        Self::fence_lane_drained(lane)?;
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("finisher slot out of range".into()));
+        }
+        // The head is the ENQUEUE half (`forward_span_head_enqueue`): no
+        // sync, no readback - the caller reads event-ordered later, exactly
+        // like `prefill_lane_finisher`'s contract.
+        lane.model.forward_span_head_enqueue(rows)?;
+        let Some(plan) = plan else {
+            // Host-finisher path (rank 1, or planless): park a probe event
+            // so `prefill_lane_done` tracks this enqueue on every rank.
+            let probe = lane.model.exec.record_event()?;
+            let ev = lane.model.exec.record_event()?;
+            lane.event = probe;
+            return Ok(ev);
+        };
+        if self.rank != 0 || !self.exec.has_sample_rows() {
+            return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
+        }
+        let params = tp_sample_params(plan)?;
+        // Cross-lane sampler serialization (see `prefill_lane_finisher`).
+        if let Some(prev) = self.sample_chain.take() {
+            lane.model.exec.stream.wait(&prev).map_err(GpuError::from)?;
+        }
+        lane.model
+            .exec
+            .stream
+            .memcpy_htod(&params, &mut lane.model.sample_params)
+            .map_err(GpuError::from)?;
+        lane.model.exec.sample_rows(
+            &lane.model.logits,
+            &lane.model.sample_params,
+            &mut lane.model.feedback_ids[slot][0],
+            1,
+            self.vocab,
+        )?;
+        let chain = lane.model.exec.record_event()?;
+        let ev = lane.model.exec.record_event()?;
+        let probe = lane.model.exec.record_event()?;
+        lane.event = probe;
+        self.sample_chain = Some(chain);
+        Ok(ev)
+    }
+
     /// Enqueue the span finisher for `slot`'s final prefill row on the lane:
     /// `Some(plan)` samples the lane's resident logits on device (rank 0,
     /// fenced against every other lane's sampler via the process sample
@@ -1512,8 +1682,20 @@ impl Qwen35TpRank {
         Ok(ev)
     }
 
-    /// Non-blocking: has the lane's latest finisher (and everything enqueued
-    /// before it) completed? True when the lane has no finisher event yet.
+    /// Park a fresh completion probe after the latest prefill-lane work,
+    /// including launches that contain no finisher. An old finisher event
+    /// cannot establish that the current span has completed.
+    pub fn prefill_lane_track_latest(&mut self) -> Result<(), Qwen35TpError> {
+        let lane = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| Qwen35TpError::Shape("prefill lane not enabled".into()))?;
+        lane.event = lane.model.exec.record_event()?;
+        Ok(())
+    }
+
+    /// Non-blocking: has the latest lane enqueue (including non-finishing
+    /// prompt spans) completed? This polls a fresh event for each launch.
     pub fn prefill_lane_done(&self) -> bool {
         match self.prefill.as_ref() {
             Some(lane) => lane.exec.event_done(&lane.event),

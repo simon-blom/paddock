@@ -73,8 +73,8 @@ pub enum TpSpanFinisherPlan {
 pub enum ControlMessage {
     /// Rank 1 -> rank 0, first message after connect.
     Hello {
-        /// Protocol version, for future-gating. 2 = this wire format (v2:
-        /// end-of-tick KV snapshots, coordinator-resolved graph mode).
+        /// Protocol version, for future-gating. 3 adds explicit trailing
+        /// chunk-run geometry to TpMixed (v2 added batched KV snapshots).
         version: u32,
         /// The world size the worker was configured with. Must match the
         /// coordinator's or the handshake fails (mismatched world-size gate).
@@ -147,11 +147,17 @@ pub enum ControlMessage {
     /// the slot count (a prompt chunk advances multiple rows per tick alongside
     /// the decode rows). Same execution contract: the worker applies the
     /// ordered row operations and validates the end-of-tick snapshot, then
-    /// runs one eager forward per row in order (no logits, no sampling -
-    /// rank 0 owns both).
+    /// executes the rows in order - decode rows as one-token forwards, the
+    /// trailing chunk run (the last `chunk_rows` entries, which MUST be the
+    /// non-decode rows in wire order) as batched span prefill (no logits, no
+    /// sampling - rank 0 owns both).
     TpMixed {
         sequence: u64,
         rows: Vec<(usize, u32, usize)>,
+        /// Length of the trailing chunk run inside `rows` (wire order):
+        /// rows[..rows.len()-chunk_rows] are decode rows, the rest prompt
+        /// rows executed as one or more batched spans. v3.
+        chunk_rows: usize,
         kv_state: serde_json::Value,
     },
     /// Start an ordered device-feedback decode segment with host tokens.
@@ -301,4 +307,46 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 /// Version 2: mutating commands carry one end-of-tick KV mirror snapshot
 /// instead of one full-snapshot event per row (B2: bounded frames), and
 /// `TpInit` carries the coordinator-resolved CUDA-graph mode (I4).
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 3: `TpMixed` carries `chunk_rows` (the trailing prompt-run length
+/// the worker must execute as batched span prefill), keeping both ranks'
+/// span geometry host-derived from one wire value.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tp_mixed_chunk_rows_roundtrip_and_missing_field_fails_closed() {
+        let msg = ControlMessage::TpMixed {
+            sequence: 7,
+            rows: vec![(0, 11, 0), (0, 12, 1), (1, 22, 5)],
+            chunk_rows: 2,
+            kv_state: serde_json::json!({"tables": []}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlMessage::TpMixed {
+                sequence,
+                rows,
+                chunk_rows,
+                ..
+            } => {
+                assert_eq!(sequence, 7);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(chunk_rows, 2);
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+        let mut missing: serde_json::Value = serde_json::from_str(&json).unwrap();
+        missing.as_object_mut().unwrap().remove("chunk_rows");
+        assert!(serde_json::from_value::<ControlMessage>(missing).is_err());
+    }
+
+    #[test]
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+}
