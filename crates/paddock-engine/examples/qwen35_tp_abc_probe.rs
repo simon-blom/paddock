@@ -29,7 +29,8 @@
 //! changed, and the trace is compiled out of hardened builds. C's prefill
 //! is graph-captured by default and readbacks are capture-illegal, so the
 //! probe pins `PADDOCK_NO_PREFILL_GRAPH=1` itself; B's span path is always
-//! eager. B runs first, then C, so the trace buffers drain in arm order.
+//! eager. The arms' stages accumulate in ONE process-local trace buffer and
+//! are partitioned by the b./c. stage-name prefix at drain time.
 use paddock_dist::{
     config::{ParallelConfig, Resolved},
     protocol::{ControlMessage, receive_nccl_id, send_nccl_id},
@@ -424,24 +425,40 @@ fn compare_stage(
     Ok(Some((m, bd.len(), cd.len())))
 }
 
-/// Print the per-layer trace until the first material divergence.
+/// Print the per-layer trace until the first material divergence. Returns
+/// the number of stage pairs actually compared (both arms present) - the
+/// caller treats zero pairs as an infrastructure failure even when both
+/// buffers are nonempty.
 fn compare_arms(
     b: Vec<(String, usize, Vec<f32>)>,
     c: Vec<(String, usize, Vec<f32>)>,
     stop: f32,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<usize, Box<dyn Error>> {
+    if b.is_empty() {
+        return Err("B arm captured zero trace stages (PADDOCK_TP_ABC_TRACE \
+                    did not reach the span path?)"
+            .into());
+    }
+    if c.is_empty() {
+        return Err("C arm captured zero trace stages (PADDOCK_TP_ABC_TRACE \
+                    did not reach the trusted TP=1 prefill, or the single \
+                    trace buffer was drained once for both arms?)"
+            .into());
+    }
     let index = |v: Vec<(String, usize, Vec<f32>)>| -> HashMap<(String, usize), Vec<f32>> {
         v.into_iter().map(|(s, l, d)| ((s, l), d)).collect()
     };
     let bm = index(b);
     let cm = index(c);
     let layers = bm.keys().map(|(_, l)| *l).max().unwrap_or(0) + 1;
+    let mut compared = 0usize;
     for layer in 0..layers {
         // Mixer substages first (in traversal order), then the spine.
         for (key, cmp) in SUBSTAGES {
             if let Some((m, bl, cl)) =
                 compare_stage(&format!("b.{layer}-{key}"), &format!("c.{layer}-{key}"), layer, cmp, &bm, &cm)?
             {
+                compared += 1;
                 println!(
                     "layer {layer:>2} {key:<12} len {bl}/{cl} max_abs {m:.3e}"
                 );
@@ -449,7 +466,7 @@ fn compare_arms(
                     println!(
                         "first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}"
                     );
-                    return Ok(true);
+                    return Ok(compared);
                 }
             }
         }
@@ -462,26 +479,35 @@ fn compare_arms(
                 &bm,
                 &cm,
             )? {
+                compared += 1;
                 println!("layer {layer:>2} {key:<12} len {bl}/{cl} max_abs {m:.3e}");
                 if m > stop {
                     println!(
                         "first material divergence: layer {layer} {key} max_abs {m:.3e} > {stop:e}"
                     );
-                    return Ok(true);
+                    return Ok(compared);
                 }
             }
         }
     }
+    if compared == 0 {
+        return Err(
+            "no comparable stage pairs between the arms (stage-name mismatch; \
+             both buffers nonempty but every lookup missed)"
+                .into(),
+        );
+    }
     // Final norm (layer key 0 on both arms).
     if let Some((m, bl, cl)) = compare_stage("b.0-final-norm", "c.0-final-norm", 0, &Cmp::Full, &bm, &cm)? {
+        compared += 1;
         println!("final-norm          len {bl}/{cl} max_abs {m:.3e}");
         if m > stop {
             println!("first material divergence: final-norm max_abs {m:.3e} > {stop:e}");
-            return Ok(true);
+            return Ok(compared);
         }
     }
     println!("no stage exceeded the reporting threshold {stop:e}");
-    Ok(false)
+    Ok(compared)
 }
 
 fn run(
@@ -526,14 +552,28 @@ fn run(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1e-3);
-            let b = tp_trace::take();
-            let c = tp_trace::take();
+            // One drain for the whole case: BOTH arms' stages accumulate in
+            // the single process-local trace buffer, so the partition below
+            // - not two takes - is what separates the arms. (Two takes
+            // back-to-back would give one arm everything and the other
+            // nothing: exactly the c_stages=0 failure this fixes.)
+            let all = tp_trace::take();
+            let mut b = Vec::new();
+            let mut c = Vec::new();
+            for row in all {
+                if row.0.starts_with("b.") {
+                    b.push(row);
+                } else if row.0.starts_with("c.") {
+                    c.push(row);
+                }
+            }
             println!(
                 "abc_probe case={name} rows={ROWS} stop={stop:e} b_stages={} c_stages={}",
                 b.len(),
                 c.len()
             );
-            compare_arms(b, c, stop)?;
+            let compared = compare_arms(b, c, stop)?;
+            println!("compared_stage_pairs={compared}");
         }
     }
     group.stream().synchronize()?;

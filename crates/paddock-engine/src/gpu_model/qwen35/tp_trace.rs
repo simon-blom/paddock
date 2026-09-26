@@ -5,11 +5,13 @@
 //! behavior, kernel election, sequencing or numerics change in any way, and
 //! CUDA graph capture stays legal (no stream ops are issued). With the env
 //! set, each site reads back ONE row (row 0 unless a site says otherwise)
-//! of the named tensor into a process-local buffer that
-//! `Qwen35TpRank::take_tp_trace` / `GpuQwen35::take_tp_trace` drain in
-//! host-call order. The B-vs-C probe diffs the two engines' buffers stage
-//! by stage to localize the first material divergence; nothing here feeds
-//! back into execution, alters a dispatch, or weakens a guard. Readbacks
+//! of the named tensor into a process-local buffer that `tp_trace::take()`
+//! drains in host-call order (the B-vs-C probe partitions the drained rows
+//! by stage-name prefix - `b.` for the span arm, `c.` for the trusted TP=1
+//! prefill - because both arms append into the SAME buffer). The probe
+//! diffs the two partitions stage by stage to localize the first material
+//! divergence; nothing here feeds back into execution, alters a dispatch,
+//! or weakens a guard. Readbacks
 //! synchronize the stream, so a traced prefill must run eager (the probe
 //! pins `PADDOCK_NO_PREFILL_GRAPH=1`) and no graph capture may be active.
 use std::cell::RefCell;

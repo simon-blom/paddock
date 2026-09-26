@@ -252,18 +252,49 @@ RANK1_PID=""
 # --- summarize ---------------------------------------------------------------
 emit "rank0 exit: $RANK0_RC"
 emit "rank1 exit: $RANK1_RC"
-if [[ "$RANK0_RC" == 0 && "$RANK1_RC" == 0 ]]; then
+INFRA="PASS"
+[[ "$RANK0_RC" != 0 || "$RANK1_RC" != 0 ]] && INFRA="FAIL"
+emit "infrastructure: $INFRA (rank exit codes only - does not imply the comparison ran)"
+
+# Numerical-comparison verdict, parsed from the probe's own stdout rather
+# than inferred from process exits: a zero exit with an empty arm trace is
+# an infrastructure pass AND a comparison failure at once (the c_stages=0
+# run summarized as PASS on exits alone - the failure mode this fixes).
+COMPARISON="INVALID: no probe verdict found in rank0 log"
+if [[ "$PROBE" == "abc" ]]; then
+  if grep -qE "b_stages=0" "$R0_LOG"; then
+    COMPARISON="INVALID: B arm traced zero stages"
+  elif grep -qE "c_stages=0" "$R0_LOG"; then
+    COMPARISON="INVALID: C arm traced zero stages"
+  elif grep -q "first material divergence" "$R0_LOG"; then
+    COMPARISON="DIVERGENCE ($(grep -m1 'first material divergence' "$R0_LOG" | sed 's/^first material divergence: //'))"
+  elif grep -qE "compared_stage_pairs=0" "$R0_LOG"; then
+    COMPARISON="INVALID: zero comparable stage pairs"
+  elif grep -q "no stage exceeded" "$R0_LOG"; then
+    COMPARISON="MATCH (all compared stages within threshold)"
+  fi
+else
+  if grep -q "VIOLATION" "$R0_LOG"; then
+    COMPARISON="DIVERGENCE ($(grep -m1 'VIOLATION' "$R0_LOG" | sed 's/.*span_probe //'))"
+  elif grep -q "span_probe OK" "$R0_LOG"; then
+    COMPARISON="MATCH (all cases within tolerance)"
+  fi
+fi
+emit "comparison: $COMPARISON"
+if [[ "$INFRA" == "PASS" && "$COMPARISON" != INVALID* ]]; then
+  # A valid run: MATCH or a located DIVERGENCE both mean the diagnostic
+  # itself succeeded; the comparison line above carries the verdict.
   emit "result: PASS"
 else
   emit "result: FAIL"
 fi
 emit ""
 emit "--- probe result lines (rank0) ---"
-grep -E "span_probe|abc_probe|first material divergence|no stage exceeded|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
+grep -E "span_probe|abc_probe|compared_stage_pairs|first material divergence|no stage exceeded|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
 if [[ "$PROBE" == "abc" ]]; then
   emit ""
   emit "--- B-C per-layer trace (rank0) ---"
-  grep -E "^layer [0-9]+ |final-norm|first material divergence|no stage exceeded" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
+  grep -E "^layer [0-9]+ |final-norm|first material divergence|no stage exceeded|compared_stage_pairs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
 fi
 emit ""
 emit "--- WARN/ERROR/VIOLATION lines ---"
