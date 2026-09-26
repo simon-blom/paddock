@@ -678,14 +678,30 @@ impl GqaTpRank {
             .memcpy_htod(&vec![slot as u32; rows], &mut span.slots.slice_mut(0..rows))
             .map_err(GpuError::from)?;
         {
-            let mut staged = vec![0u32; 4 * rows];
-            staged[..rows].copy_from_slice(&pos_h);
-            let mut axes = span.axes.slice_mut(0..4 * rows);
+            // M-RoPE text staging matches the trusted text paths verbatim:
+            // record_prefill (forward.rs) fills all four axes with the row
+            // position ((0..4).flat_map(|_| 0..t_len)) and forward_paged
+            // above stages [pos; 4], so axis 0 alone here would rotate Q/K
+            // with zeroed time-height axes 1..3 and diverge from every
+            // trusted prefill (first materialized at the first GQA layer's
+            // RoPE checkpoint). Axis-major [4, rows] layout: the kernel
+            // reads mpos[row] for axis a at mpos[a*rows + row].
+            let axes_h = Self::mrope_text_axes(&pos_h);
             e.stream
-                .memcpy_htod(&staged, &mut axes)
+                .memcpy_htod(&axes_h, &mut span.axes.slice_mut(0..4 * rows))
                 .map_err(GpuError::from)?;
         }
         self.span_run(e, group, xn, rows, Some(position), logical, span, q, layer)
+    }
+
+    /// The [4, rows] axis-major M-RoPE plane for a text span: the row's
+    /// position on ALL FOUR axes, exactly the trusted text-prefill staging
+    /// (`record_prefill`'s `(0..4).flat_map(|_| 0..t_len)` and the one-row
+    /// path's `[pos; 4]`). Kept pure so the staging semantics stay
+    /// host-testable; a previous version filled only axis 0, leaving axes
+    /// 1..3 at zero and rotating Q/K differently from every trusted prefill.
+    fn mrope_text_axes(pos_h: &[u32]) -> Vec<u32> {
+        (0..4).flat_map(|_| pos_h.iter().copied()).collect()
     }
 
     /// The collective-free batched span run: QKV GEMMs, head split, per-head
@@ -933,5 +949,29 @@ mod tests {
         let f16 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp16).unwrap();
         let fp8 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp8E4m3).unwrap();
         assert_eq!(fp8 * 2, f16);
+    }
+
+    /// Regression: the TP span's M-RoPE text staging must fill ALL FOUR axes
+    /// with the row position, matching the trusted text paths — the one-row
+    /// `forward_paged` stages `[pos; 4]` and `record_prefill` builds
+    /// `(0..4).flat_map(|_| 0..t_len)`. The span once staged only axis 0
+    /// (zeros elsewhere), rotating Q/K with zeroed time-height axes and
+    /// diverging from trusted prefill at the first GQA layer's RoPE (~0.18
+    /// max-abs at layer 3 of the two-node ABC probe).
+    #[test]
+    fn span_mrope_text_axes_match_trusted_text_staging() {
+        let axes = GqaTpRank::mrope_text_axes(&[5, 6, 7]);
+        // [4, rows] axis-major: axis a's row r lives at a*rows + r.
+        assert_eq!(axes, vec![5, 6, 7, 5, 6, 7, 5, 6, 7, 5, 6, 7]);
+        // Axis 0 is NOT special-cased; a zero-only prefix never appears
+        // unless the position itself is zero.
+        assert_eq!(GqaTpRank::mrope_text_axes(&[0]), vec![0; 4]);
+        assert_eq!(GqaTpRank::mrope_text_axes(&[]), Vec::<u32>::new());
+        assert_eq!(GqaTpRank::mrope_text_axes(&[u32::MAX]), vec![u32::MAX; 4]);
+        // The trusted record_prefill literal for rows=3 at position 0.
+        assert_eq!(
+            GqaTpRank::mrope_text_axes(&(0..3).collect::<Vec<u32>>()),
+            (0..4).flat_map(|_| 0..3).collect::<Vec<u32>>()
+        );
     }
 }
