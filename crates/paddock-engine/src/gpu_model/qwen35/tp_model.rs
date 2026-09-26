@@ -1000,23 +1000,13 @@ impl Qwen35TpRank {
         Ok(())
     }
 
-    /// Batched whole-model prefill span, STATE-ADVANCE half (production):
-    /// `tokens` are ONE slot's prompt at contiguous positions
-    /// `position..position+len` — embedded as a batch and taken through all
-    /// layers in ONE traversal (batched GQA / DeltaNet / FFN per layer, two
-    /// span all-reduces per layer). NO final norm, NO LM head, NO host
-    /// logits: GQA paged KV and DeltaNet recurrent/conv state advance
-    /// exactly once per row and nothing else happens. Pair with
-    /// [`Self::forward_span_head`] on the FINAL prompt span (which owns the
-    /// final norm + head + readback).
-    ///
-    /// Semantics are designed to match the serial one-row path exactly: KV
-    /// rows append at their own logical positions, DeltaNet recurrent/conv
-    /// state advances over the span as one native prefill (the primitive the
-    /// parity work already validated), row order is preserved, and the
-    /// collectives pair across ranks (both ranks must call with identical
-    /// slot/position/rows). Rows beyond `TP_SPAN_CAP` are NOT accepted — the
-    /// caller slices longer prompts into spans.
+    /// Advance one slot's contiguous prompt rows through the batched
+    /// embedding and all model layers. Both ranks must call with matching
+    /// slot, positions and row count so their collectives pair; KV and
+    /// DeltaNet state advance once per row. This skips final norm, LM head
+    /// and logits readback. A finishing caller may then invoke
+    /// [`Self::forward_span_head`] for the final row. Runs must be bounded
+    /// by `TP_SPAN_CAP`.
     pub fn forward_span_advance<C: Communicator>(
         &mut self,
         group: &C,

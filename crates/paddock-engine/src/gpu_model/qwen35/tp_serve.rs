@@ -172,12 +172,9 @@ fn validate_multistep_positions(
 /// DeltaNet primitive capacity directly so neither rank can drift from it.
 const TP_SPAN_CAP: usize = super::tp_span::TP_SPAN_CAP;
 
-/// Sub-span boundaries for `len` contiguous prompt rows of one slot: a
-/// boundary list starting at 0 and ending at `len` where every window is
-/// 1..=`TP_SPAN_CAP` rows and the LAST window is the prompt's final span
-/// (the only one that may produce logits). Interior spans take exactly the
-/// cap; the final span takes the whole remainder. Pure so the coordinator
-/// and worker chunk identically from shared wire rows. Host-testable.
+/// Boundaries for one slot's contiguous prompt-row run. Each window has
+/// 1..=`TP_SPAN_CAP` rows; the last window may produce logits only when
+/// this run finishes the prompt. Both ranks use this chunker on wire rows.
 fn span_chunk_points(len: usize) -> Vec<usize> {
     let mut points = Vec::new();
     let mut at = 0usize;
@@ -695,11 +692,8 @@ impl TpCoordinator {
         Ok((sampled, host_logits))
     }
 
-    /// Serial prefill (slots=1 scheduler): the whole prompt as batched spans
-    /// of at most TP_SPAN_CAP rows through the same v3 `TpMixed` tick the
-    /// chunked path uses (zero decode rows), with a synthetic host-plan
-    /// finisher on the FINAL sub-chunk so the head + logits readback run
-    /// exactly once. Replaces the old one-forward-per-token loop.
+    /// The serial scheduler uses `TpMixed` with zero decode rows, one tick
+    /// per bounded prompt span. Only the final tick requests host logits.
     fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>, String> {
         if slot >= self.positions.len()
             || tokens.is_empty()
@@ -1074,21 +1068,14 @@ impl TpCoordinator {
         self.chunks.len() != before
     }
 
-    /// One mixed tick: decode rows + the next chunk budget's rows. The
-    /// decode rows run one-token forwards exactly as before; the chunk run
-    /// (ONE slot's contiguous prompt rows - chunk_take pops a single chunk)
-    /// executes as batched spans of at most TP_SPAN_CAP rows through the
-    /// same weight pass: interior spans advance state only, the final span
-    /// adds the head once. Wire order is decodes-then-chunks and the chunk
-    /// length rides the message, so rank 1 replays the identical span
-    /// geometry from the shared pure chunker. Plans are ROW-position-indexed
-    /// per service.rs:4606 and hole-free (dec is built compactly); a decode
-    /// row samples on device (its id lands in `step.ids[dec_row]`) or
-    /// returns host logits. A finishing chunk's LAST span is its finisher:
-    /// with a supported `Device` plan it samples the last row on device
-    /// (`FinishSample::Sampled`, no readback); otherwise the row's full
-    /// logits are returned (`FinishSample::Logits`, peeked uniforms stay
-    /// uncommitted per the scheduler's rule).
+    /// A mixed tick executes the scheduler's decode rows individually,
+    /// followed by one slot's contiguous prompt run as bounded batched spans.
+    /// `chunk_take` supplies at most one chunk per tick. The trailing run
+    /// length is sent to rank 1 so both ranks derive the same span geometry.
+    /// Only a finishing chunk produces last-row logits (or a sampled ID);
+    /// interior and non-finishing spans advance state without a head.
+    /// Decode plans index the compact decode rows, and host rows return in
+    /// that same order.
     #[allow(clippy::type_complexity)]
     fn forward_mixed(
         &mut self,
@@ -1112,9 +1099,8 @@ impl TpCoordinator {
         if plans.len() != dec_n {
             return Err("TP mixed plan width mismatch".into());
         }
-        // service builds dec slot-ascending; enforce it so the slot-sorted
-        // execution order matches the host_rows push order the scheduler
-        // pops in dec-iteration order.
+        // The scheduler supplies decode rows in slot order; retain that
+        // order for the host_rows consumer before appending prompt rows.
         if decodes.windows(2).any(|w| w[0].0 >= w[1].0) {
             return Err("TP mixed decode rows must be strictly ascending by slot".into());
         }
@@ -1371,13 +1357,12 @@ impl TpCoordinator {
         (rows, finishers)
     }
 
-    /// Authorize and enqueue one span: validate the whole row plan, mirror
-    /// each KV Ensure (ONE end-of-tick snapshot for the whole span), send
-    /// the launch with the finishers, wait for the worker's Prepared, then
-    /// enqueue the rows as batched sub-spans (<= TP_SPAN_CAP rows per span,
-    /// shared pure chunker) and each finishing chunk's lane head + finisher
-    /// in chunk order, all without host-synchronizing. The caller pumps
-    /// decode-pipe ticks while the lane's kernels run.
+    /// Launch a prefill-lane tick: validate and authorize the ordered KV
+    /// operations, send one end-of-tick KV snapshot, then enqueue each
+    /// contiguous slot run in bounded spans after the worker's Prepared.
+    /// The run loop can handle several slots; `chunk_take` currently emits
+    /// one chunk (one slot) per launch. Decode-pipe ticks may proceed while
+    /// the lane runs.
     fn span_begin(
         &mut self,
         rows: Vec<(usize, u32, usize)>,
@@ -1395,9 +1380,10 @@ impl TpCoordinator {
         if rows.is_empty() {
             return Err("TP span launch has no rows".into());
         }
-        // The lane has one resident logits plane. Its results are read only
-        // after the full launch joins, so two host finishers in one launch
-        // would overwrite the first. chunk_take currently emits at most one.
+        // The lane has one resident logits plane, read after the launch
+        // joins. Restrict the optional finisher to the final run: a second
+        // host finisher could overwrite the first result. `chunk_take`
+        // currently emits at most one finisher.
         if finishers.len() > 1 || finishers.iter().any(|f| rows.last().map(|r| r.0) != Some(f.slot)) {
             return Err("TP span launch supports only a final-run finisher".into());
         }
@@ -1427,11 +1413,8 @@ impl TpCoordinator {
             }
             cursor[s] += 1;
         }
-        // Authorize the whole span's KV mutation first: failed validation must
-        // not leave the ranks' logical tables diverged mid-span. The wire
-        // carries the ordered rows plus ONE end-of-tick snapshot (v2 protocol,
-        // B2) instead of one full-snapshot event per row, so long prefills
-        // stay far below the 1 MiB frame cap.
+        // Authorize the ordered Ensure operations; the wire carries rows
+        // and one end-of-tick KV snapshot, not a snapshot per prompt row.
         let ops: Vec<Operation> = rows
             .iter()
             .map(|&(slot, _, position)| Operation::Ensure { slot, position })
@@ -1448,15 +1431,9 @@ impl TpCoordinator {
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
         prepared(&mut self.stream, seq)?;
-        // Both ranks now hold the authorized plan. Enqueue the whole span on
-        // the prefill lane as batched sub-spans of at most TP_SPAN_CAP
-        // contiguous rows per slot run - interior spans advance state only;
-        // each finishing chunk's LAST sub-span adds the lane head (final
-        // norm + LM head) exactly once, then the finisher sampler. The
-        // chunker is the shared pure `span_chunk_points`, so rank 1 derives
-        // the identical geometry from the same wire rows.
-        // `positions` advance as each row is enqueued so a later tick sees
-        // the new state.
+        // Both ranks chunk each contiguous slot run from the same wire
+        // rows. Only the optional final-run finisher adds a rank-0 head
+        // (and device sampling when planned); other spans advance state.
         let mut events = VecDeque::with_capacity(finishers.len());
         let mut at = 0usize;
         while at < rows.len() {
@@ -1487,9 +1464,8 @@ impl TpCoordinator {
             at = end;
         }
         record_prefill_rows(&rows, &mut self.positions, &mut self.occupied);
-        // Every launch, including one with no finisher, must update the
-        // completion probe; otherwise an old finisher event can make the
-        // scheduler treat a live span as already drained.
+        // Track this launch's completion even without a finisher, so a
+        // prior lane event cannot report this span as drained.
         self.model
             .prefill_lane_track_latest()
             .map_err(|e| e.to_string())?;
@@ -2529,14 +2505,10 @@ pub fn run_worker(
                     kv_state,
                     ..
                 } => {
-                    // Mixed tick (decode + chunk rows in one pass): rows may
-                    // exceed the slot count - the trailing `chunk_rows` entries
-                    // are ONE slot's contiguous prompt run executed as batched
-                    // spans (wire order: decode rows first). Same authorization
-                    // contract as TpBatch: mirror KV, Prepared, then execute in
-                    // wire order (no logits, no sampling - rank 0 owns both).
-                    // The chunker is the shared pure `span_chunk_points`, so
-                    // this rank derives the identical span geometry rank 0 did.
+                    // Decode rows precede the optional single-slot chunk run.
+                    // Rank 1 mirrors the authorized KV snapshot before
+                    // Prepared, then replays the same bounded span geometry;
+                    // it neither samples nor reads logits back to the host.
                     if rows.is_empty() {
                         return Err("TP mixed tick membership invalid".into());
                     }
