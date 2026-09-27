@@ -45,6 +45,13 @@ pub enum Operation {
     CheckpointRecycle { index: u32 },
 }
 
+/// The prefix-probe result for a resume decision (see
+/// [`MirroredKv::match_prefix_probe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixProbe {
+    pub ckpt: Option<(usize, u32)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub tables: Vec<Vec<u32>>,
@@ -126,6 +133,66 @@ impl MirroredKv {
     /// The index reserved for `slot`'s checkpoint cut at `pos`, if any.
     pub fn slot_reserved_ckpt(&self, slot: usize, pos: usize) -> Option<u32> {
         self.radix.reserved_index(slot, pos)
+    }
+
+    /// The checkpoint index attached at `position` under `slot`'s admitted
+    /// tokens (the resume-time lookup; `None` when no checkpoint sits there).
+    pub fn slot_checkpoint_index(&self, slot: usize, position: usize) -> Option<u32> {
+        let tokens = self.tokens.get(slot)?;
+        if tokens.len() < position {
+            return None;
+        }
+        self.radix.ckpt_index_at(tokens, position)
+    }
+
+    /// Recycle every still-reserved checkpoint index owned by `slot`
+    /// (worker-side straggler cleanup after a publish tick).
+    pub fn drop_slot_reservations(&mut self, slot: usize) {
+        self.radix.drop_slot_reservations(slot);
+    }
+
+    /// Every reservation owned by `slot` as `(position, index)` (the publish
+    /// tick's recycle composition reads this on BOTH ranks; the lists are
+    /// mirror-deterministic so the composition cannot diverge).
+    pub fn slot_reserved_indices(&self, slot: usize) -> Vec<(usize, u32)> {
+        self.radix.slot_reservations(slot)
+    }
+
+    /// Read-only probe of the mirrored radix (the coordinator's decision
+    /// consult): the deepest checkpoint `(position, index)` under the
+    /// longest cached block prefix of `tokens`. Touches nothing - LRU and
+    /// the recurrence flag advance only inside the authoritative `Admit`,
+    /// so a probe can never diverge the two trees.
+    pub fn match_prefix_probe(&self, tokens: &[u32]) -> PrefixProbe {
+        PrefixProbe {
+            ckpt: self.radix.probe_ckpt(tokens),
+        }
+    }
+
+    /// Rank-0 coordinator helper: reserve checkpoint indices for `slot`'s
+    /// cuts (mirrored op `CheckpointReserve`), returning `(cut, index)`
+    /// pairs in cut order. Cuts already holding a reservation are skipped.
+    pub fn reserve_cuts_for_slot(
+        &mut self,
+        slot: usize,
+        cuts: &[usize],
+    ) -> Result<Vec<(usize, u32)>, &'static str> {
+        let mut out = Vec::with_capacity(cuts.len());
+        for &cut in cuts {
+            if self.slot_reserved_ckpt(slot, cut).is_some() {
+                continue;
+            }
+            let tokens = self.tokens.get(slot).ok_or("TP reserve: slot not admitted")?;
+            let tokens = tokens.clone();
+            self.apply(&Operation::CheckpointReserve {
+                tokens,
+                position: cut,
+            })?;
+            if let Some(idx) = self.slot_reserved_ckpt(slot, cut) {
+                out.push((cut, idx));
+            }
+        }
+        Ok(out)
     }
 
     /// The reuse position of the last applied `Admit`, consumed once
@@ -405,6 +472,36 @@ impl MirroredKv {
         }
         Ok(())
     }
+}
+
+/// The pure publish composition (host-testable): given a slot's checkpoint
+/// reservations `(position, index)` and the set that were actually
+/// snapshotted (`snapshotted` = positions whose GPU state landed), build the
+/// ordered `Checkpoint*` operation list for the publish tick: attach every
+/// snapshotted reservation (ascending position), recycle the rest. An
+/// attached index is consumed by the attach; an unsnapshotted one returns to
+/// the free list. Both ranks run the SAME composition over their
+/// mirror-identical reservation lists, so the publication cannot diverge.
+pub fn tp_publish_ops(
+    slot: usize,
+    reservations: &[(usize, u32)],
+    tokens: Vec<u32>,
+    snapshotted: &[usize],
+) -> Vec<Operation> {
+    let mut ops = Vec::with_capacity(reservations.len() + 1);
+    for &(pos, idx) in reservations {
+        if snapshotted.contains(&pos) {
+            ops.push(Operation::CheckpointAttach {
+                tokens: tokens.clone(),
+                position: pos,
+                index: idx,
+            });
+        } else {
+            ops.push(Operation::CheckpointRecycle { index: idx });
+        }
+    }
+    ops.push(Operation::Publish { slot, tokens });
+    ops
 }
 
 /// The pure resume decision (host-testable): given the deepest checkpoint

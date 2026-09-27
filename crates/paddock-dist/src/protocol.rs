@@ -74,8 +74,9 @@ pub enum TpSpanFinisherPlan {
 pub enum ControlMessage {
     /// Rank 1 -> rank 0, first message after connect.
     Hello {
-        /// Protocol version, for future-gating. 3 adds explicit trailing
-        /// chunk-run geometry to TpMixed (v2 added batched KV snapshots).
+        /// Protocol version, for future-gating. 4 adds prefix-cache resume
+        /// (TpPrefixAdmit/Publish, ckpt_slots in TpInit); 3 added the
+        /// explicit trailing chunk-run geometry to TpMixed.
         version: u32,
         /// The world size the worker was configured with. Must match the
         /// coordinator's or the handshake fails (mismatched world-size gate).
@@ -127,6 +128,11 @@ pub enum ControlMessage {
         /// hand-started remote worker cannot disagree with rank 0 about
         /// graphed/eager sequencing (a mispair hangs the collectives).
         use_graphs: bool,
+        /// DeltaNet checkpoint-pool slots per layer for the mirrored prefix
+        /// cache (v4). Rank 0 resolves the capacity (default 4; 0 disables
+        /// resume entirely) and both ranks size their state pools + radix
+        /// free-lists from THIS value, so the pools can never disagree.
+        ckpt_slots: u32,
     },
     /// Rank-0-authorized ordered active rows; holes are omitted.
     ///
@@ -208,6 +214,35 @@ pub enum ControlMessage {
     TpRelease {
         sequence: u64,
         slots: Vec<usize>,
+        kv_state: serde_json::Value,
+    },
+    /// Prefix-cache admission (v4): the coordinator's exact logical resume
+    /// decision for `slot`. `tokens` is the FULL prompt (sent once, at
+    /// admission only); `resume` is the block-aligned position to start
+    /// prefill at (0 = cold). The worker mirrors `Operation::Admit` - which
+    /// independently validates the cached chain AND its checkpoint at exactly
+    /// `resume` on the worker's own radix - BEFORE acknowledging Prepared, so
+    /// a rank that cannot satisfy the decision fails closed instead of
+    /// resuming alone. No physical page ids travel: each rank resolves the
+    /// logical prefix to its own (mirror-identical) physical blocks.
+    TpPrefixAdmit {
+        sequence: u64,
+        slot: usize,
+        tokens: Vec<u32>,
+        resume: usize,
+        kv_state: serde_json::Value,
+    },
+    /// Prefix-cache publication (v4): attach the checkpoint indices the
+    /// prefill snapshotted (in cut order), publish the prompt's full pages,
+    /// then recycle any reservation that was not attached. `kv_state` is the
+    /// end-of-tick mirror snapshot. Both ranks run the publication only
+    /// after their rank-local GPU snapshot succeeded, so an attached
+    /// checkpoint always has real state behind it on every rank.
+    TpPrefixPublish {
+        sequence: u64,
+        slot: usize,
+        /// `(cut position, checkpoint index)` in ascending cut order.
+        checkpoints: Vec<(usize, u32)>,
         kv_state: serde_json::Value,
     },
     /// Worker has mirrored and validated a tick's logical KV operations
@@ -312,7 +347,15 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 /// Version 3: `TpMixed` carries `chunk_rows` (the trailing prompt-run length
 /// the worker must execute as batched span prefill), keeping both ranks'
 /// span geometry host-derived from one wire value.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// Version 4: prefix-cache resume. `TpInit` carries the coordinator-resolved
+/// DeltaNet checkpoint-pool capacity (`ckpt_slots`); `TpPrefixAdmit` carries
+/// the full prompt tokens plus the coordinator's block-aligned resume
+/// decision (validated independently on both ranks inside `Operation::Admit`
+/// before either rank adopts); `TpPrefixPublish` attaches the post-prefill
+/// checkpoint indices and publishes the full pages. Logical identity only -
+/// no physical page ids ever travel.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -347,7 +390,50 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn tp_prefix_admit_and_publish_roundtrip() {
+        let admit = ControlMessage::TpPrefixAdmit {
+            sequence: 9,
+            slot: 1,
+            tokens: vec![5, 6, 7],
+            resume: 32,
+            kv_state: serde_json::json!({"tables": []}),
+        };
+        let json = serde_json::to_string(&admit).unwrap();
+        match serde_json::from_str(&json).unwrap() {
+            ControlMessage::TpPrefixAdmit {
+                sequence,
+                slot,
+                tokens,
+                resume,
+                ..
+            } => {
+                assert_eq!((sequence, slot, tokens, resume), (9, 1, vec![5, 6, 7], 32));
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
+        let publish = ControlMessage::TpPrefixPublish {
+            sequence: 10,
+            slot: 1,
+            checkpoints: vec![(512, 0), (1024, 1)],
+            kv_state: serde_json::json!({"tables": []}),
+        };
+        let json = serde_json::to_string(&publish).unwrap();
+        match serde_json::from_str(&json).unwrap() {
+            ControlMessage::TpPrefixPublish {
+                sequence,
+                slot,
+                checkpoints,
+                ..
+            } => {
+                assert_eq!((sequence, slot), (10, 1));
+                assert_eq!(checkpoints, vec![(512, 0), (1024, 1)]);
+            }
+            other => panic!("wrong message: {other:?}"),
+        }
     }
 }

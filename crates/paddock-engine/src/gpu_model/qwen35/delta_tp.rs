@@ -318,6 +318,11 @@ pub struct DeltaTpRank {
     conv: CudaSlice<f32>,
     /// Slot 0 lives in recurrent/conv; other slots swap into that pair for a step.
     slot_states: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
+    /// DeltaNet state-checkpoint pool (prefix-cache resume): `n` per-layer
+    /// (recurrent, conv) pairs addressed by the mirrored radix's state index.
+    /// Allocated at load when checkpointing is armed; never allocated on the
+    /// pages-only path.
+    ckpt_pool: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
     span: Span,
     prefill_gemm: Option<PrefillGemm>,
     eps: f32,
@@ -425,6 +430,7 @@ impl DeltaTpRank {
             recurrent: e.alloc(g.recurrent_elements())?,
             conv: e.alloc(g.conv_elements())?,
             slot_states: Vec::new(),
+            ckpt_pool: Vec::new(),
             conv_weight: f32_select(
                 e,
                 map,
@@ -568,6 +574,108 @@ impl DeltaTpRank {
     }
     pub fn local_state_bytes(&self) -> usize {
         (self.recurrent.len() + self.conv.len()) * 4
+    }
+    /// Exact per-slot recurrent-state bytes (one checkpoint slot's half).
+    pub fn recurrent_bytes(&self) -> usize {
+        self.recurrent.len() * 4
+    }
+    /// Exact per-slot conv-window bytes (one checkpoint slot's other half).
+    pub fn conv_bytes(&self) -> usize {
+        self.conv.len() * 4
+    }
+    /// The persistent state pair as raw device-slice views (the checkpoint
+    /// pool's snapshot/restore copy engine needs lengths + the slice handles;
+    /// slot 0's home pair and swapped slot pairs have identical geometry).
+    pub fn state_slices(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
+        (&self.recurrent, &self.conv)
+    }
+
+    /// Allocate and zero `n` checkpoint slots for this layer: each holds one
+    /// (recurrent, conv) pair exactly like a live slot's pair. `n == 0` skips
+    /// allocation entirely (pages-only cache). Idempotence is refused: the
+    /// pool is sized once at load from the coordinator-resolved capacity.
+    pub fn enable_ckpt_pool(&mut self, e: &GpuExecutor, n: usize) -> Result<(), DeltaTpError> {
+        if !self.ckpt_pool.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..n {
+            let mut recurrent = e.alloc(self.geometry.recurrent_elements())?;
+            let mut conv = e.alloc(self.geometry.conv_elements())?;
+            e.stream.memset_zeros(&mut recurrent).map_err(GpuError::from)?;
+            e.stream.memset_zeros(&mut conv).map_err(GpuError::from)?;
+            self.ckpt_pool.push((recurrent, conv));
+        }
+        Ok(())
+    }
+
+    /// The checkpoint pair at `index` (None when out of range / no pool).
+    pub fn ckpt_pair(&self, index: u32) -> Option<(&CudaSlice<f32>, &CudaSlice<f32>)> {
+        self.ckpt_pool
+            .get(index as usize)
+            .map(|(r, c)| (r, c))
+    }
+
+    /// Copy `slot`'s live (recurrent, conv) pair into checkpoint `index`.
+    /// Direct field borrows (live state and pool are disjoint fields), so no
+    /// method-shaped borrow conflict; the two memcpys are stream-ordered.
+    pub fn snapshot_slot_to_ckpt(
+        &mut self,
+        e: &GpuExecutor,
+        slot: usize,
+        index: u32,
+    ) -> Result<(), DeltaTpError> {
+        let (src_rec, src_conv): (&CudaSlice<f32>, &CudaSlice<f32>) = if slot == 0 {
+            (&self.recurrent, &self.conv)
+        } else {
+            let pair = self
+                .slot_states
+                .get(slot - 1)
+                .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+            (&pair.0, &pair.1)
+        };
+        let (dst_rec, dst_conv) = self
+            .ckpt_pool
+            .get_mut(index as usize)
+            .ok_or_else(|| DeltaTpError::Shape("checkpoint index outside the pool".into()))?;
+        if src_rec.len() != dst_rec.len() || src_conv.len() != dst_conv.len() {
+            return Err(DeltaTpError::Shape(
+                "snapshot state/checkpoint geometry differ".into(),
+            ));
+        }
+        e.stream.memcpy_dtod(src_rec, dst_rec).map_err(GpuError::from)?;
+        e.stream.memcpy_dtod(src_conv, dst_conv).map_err(GpuError::from)?;
+        Ok(())
+    }
+
+    /// Copy checkpoint `index` back into `slot`'s live pair (the resume's
+    /// DeltaNet half). Fails closed when anything is out of range.
+    pub fn restore_ckpt_to_slot(
+        &mut self,
+        e: &GpuExecutor,
+        slot: usize,
+        index: u32,
+    ) -> Result<(), DeltaTpError> {
+        let (dst_rec, dst_conv): (&mut CudaSlice<f32>, &mut CudaSlice<f32>) = if slot == 0 {
+            (&mut self.recurrent, &mut self.conv)
+        } else {
+            let pair = self
+                .slot_states
+                .get_mut(slot - 1)
+                .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
+            (&mut pair.0, &mut pair.1)
+        };
+        let (src_rec, src_conv) = self
+            .ckpt_pool
+            .get(index as usize)
+            .ok_or_else(|| DeltaTpError::Shape("checkpoint index outside the pool".into()))?;
+        if src_rec.len() != dst_rec.len() || src_conv.len() != dst_conv.len() {
+            return Err(DeltaTpError::Shape(
+                "restore state/checkpoint geometry differ".into(),
+            ));
+        }
+        e.stream.memcpy_dtod(src_rec, dst_rec).map_err(GpuError::from)?;
+        e.stream.memcpy_dtod(src_conv, dst_conv).map_err(GpuError::from)?;
+        Ok(())
     }
     pub fn decode<'a, C: Communicator>(
         &'a mut self,

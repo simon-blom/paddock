@@ -988,6 +988,74 @@ impl Qwen35TpRank {
         Ok(())
     }
 
+    /// Enable the DeltaNet checkpoint pool on every DeltaNet layer: `n`
+    /// snapshot slots per layer (the mirrored radix's state capacity). Both
+    /// ranks arm from the SAME coordinator-resolved count (`TpInit`), so
+    /// pool geometry can never diverge. Memory cost is exact and attributable:
+    /// n x per-layer (recurrent + conv) bytes per rank.
+    pub fn enable_prefix_checkpoints(
+        &mut self,
+        slots: usize,
+    ) -> Result<(), Qwen35TpError> {
+        for layer in &mut self.layers {
+            if let TpMixer::Linear(delta) = &mut layer.mixer {
+                delta
+                    .enable_ckpt_pool(&self.exec, slots)
+                    .map_err(Qwen35TpError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot `slot`'s DeltaNet state (recurrent + conv, every DeltaNet
+    /// layer) into checkpoint `index` - the rank-local device half of cache
+    /// publication. Enqueues on this rank's decode-executor stream; the
+    /// caller orders it against the prefill that produced the state.
+    pub fn snapshot_slot_ckpt(&mut self, slot: usize, index: u32) -> Result<(), Qwen35TpError> {
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("snapshot slot out of range".into()));
+        }
+        for layer in &mut self.layers {
+            if let TpMixer::Linear(delta) = &mut layer.mixer {
+                delta
+                    .snapshot_slot_to_ckpt(&self.exec, slot, index)
+                    .map_err(Qwen35TpError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore `slot`'s DeltaNet state from checkpoint `index` - the reverse
+    /// copy, rank-local. Fails closed when the index is outside the pool;
+    /// a failed restore is the resume decision's all-or-nothing gate.
+    pub fn restore_slot_ckpt(&mut self, slot: usize, index: u32) -> Result<(), Qwen35TpError> {
+        if slot >= self.slots {
+            return Err(Qwen35TpError::Shape("restore slot out of range".into()));
+        }
+        for layer in &mut self.layers {
+            if let TpMixer::Linear(delta) = &mut layer.mixer {
+                delta
+                    .restore_ckpt_to_slot(&self.exec, slot, index)
+                    .map_err(Qwen35TpError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One DeltaNet layer's per-slot checkpoint bytes (the load-time sizing
+    /// probe; every DeltaNet layer has identical geometry).
+    pub fn dn_layer_ckpt_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                TpMixer::Linear(delta) => Some(
+                    (delta.recurrent_bytes() + delta.conv_bytes()) as u64,
+                ),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     pub fn reset_slot(&mut self, slot: usize) -> Result<(), Qwen35TpError> {
         if slot >= self.slots {
             return Err(Qwen35TpError::Shape("slot out of range".into()));

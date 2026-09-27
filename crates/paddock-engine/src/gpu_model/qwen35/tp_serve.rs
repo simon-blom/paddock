@@ -22,7 +22,7 @@ use paddock_dist::{
 use paddock_models::mapped::MappedGguf;
 
 use super::{
-    tp_kv::{Event, MirroredKv, Operation, Snapshot},
+    tp_kv::{tp_publish_ops, tp_resume_decision, Event, MirroredKv, Operation, Snapshot},
     tp_model::Qwen35TpRank,
 };
 use crate::{
@@ -295,6 +295,42 @@ fn logical(max_ctx: usize, slots: usize) -> Result<MirroredKv, String> {
     MirroredKv::new(blocks, slots, max_ctx).map_err(str::to_owned)
 }
 
+/// The checkpoint-pool capacity rank 0 resolves for BOTH ranks (mirroring
+/// the kv_dtype/use_graphs rank-0-authoritative pattern): `PADDOCK_TP_CKPT_SLOTS`,
+/// default 4 (~4 x the DeltaNet state pair per layer per rank at the Qwen3.8
+/// geometry). 0 disables resume entirely (pages-only impossible too - no
+/// snapshots, cache empty). Pure function of the env for host tests.
+fn resolve_ckpt_slots(env: Option<&str>) -> u32 {
+    env.and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(64) as u32)
+        .unwrap_or(4)
+}
+
+/// The checkpoint cuts a prompt's prefill snapshots: the prompt's last two
+/// full page boundaries (the shared `ckpt_cuts` contract), filtered to cuts
+/// the prefill can actually reach (strictly after `start`, strictly before
+/// `t_len`). Boundaries are ascending.
+fn tp_prefill_cuts(t_len: usize, start: usize) -> Vec<usize> {
+    let [b1, b2] = crate::gpu_model::qwen35::tp_checkpoint_cuts(t_len);
+    [b1, b2]
+        .into_iter()
+        .filter(|&c| c > start && c < t_len)
+        .collect()
+}
+
+/// Which of `cuts` a span covering rows `[span_start, span_start + rows)`
+/// lands EXACTLY on (span end == cut): a checkpoint may be snapshotted only
+/// there, because the slot's live DeltaNet state is exactly the state after
+/// row `cut - 1` - the state matching KV pages `[0, cut)`. Pure, shared by
+/// both ranks' snapshot discipline.
+fn tp_cuts_crossed(cuts: &[(usize, u32)], span_start: usize, rows: usize) -> Vec<(usize, u32)> {
+    let span_end = span_start.saturating_add(rows);
+    cuts.iter()
+        .filter(|&&(cut, _)| cut == span_end)
+        .copied()
+        .collect()
+}
+
 struct PipeFlight {
     /// Member slots in WIRE order (TpPipeBegin/Next rows must ascend by
     /// slot; identity rows for plain pipes).
@@ -331,6 +367,10 @@ pub struct TpCoordinator {
     span_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     poisoned: Option<String>,
     shutdown_sent: bool,
+    /// Checkpoint cuts whose rank-0 GPU snapshot succeeded, per slot
+    /// `(slot, cut)`. Filled by `run_chunk_spans`; consumed by
+    /// `publish_slot_cache` at the prefill's successful finish.
+    snapshotted_cuts: Vec<(usize, usize)>,
 }
 
 /// One queued prompt chunk: the remaining ordered rows (slot, token,
@@ -342,6 +382,10 @@ struct PrefillChunk {
     fin_plan: Option<crate::sampler::DevicePlan>,
     /// Set when the first rows execute; persists over every partial tick.
     owner: Option<crate::generator::PrefillLane>,
+    /// Checkpoint reservations `(cut, index)` this prompt's prefill owns
+    /// (rank-0 order). Snapshot at a cut marks the entry; the finish tick
+    /// attaches the marked ones, publishes the pages, and recycles the rest.
+    ckpts: Vec<(usize, u32)>,
 }
 
 fn abort_queued_chunk(chunks: &mut VecDeque<PrefillChunk>, slot: usize) -> bool {
@@ -476,6 +520,7 @@ impl TpCoordinator {
         // that state, never the environment.
         let use_graphs = Qwen35TpRank::resolve_graph_mode_for_serve();
         let (checkpoint_sha256, pack_blake3) = hashes(model, pack)?;
+        let ckpt_slots = resolve_ckpt_slots(std::env::var("PADDOCK_TP_CKPT_SLOTS").ok().as_deref());
         ControlMessage::TpInit {
             checkpoint_sha256,
             pack_blake3,
@@ -483,6 +528,7 @@ impl TpCoordinator {
             slots,
             kv_dtype: kv_dtype_wire(kv_dtype).to_owned(),
             use_graphs,
+            ckpt_slots,
         }
         .to_stream(&mut stream)
         .map_err(|e| e.to_string())?;
@@ -510,6 +556,14 @@ impl TpCoordinator {
                 .enable_tp_graphs(&group)
                 .map_err(|e| e.to_string())?;
         }
+        // Prefix-cache arm: the coordinator-resolved capacity sizes BOTH the
+        // rank-local DeltaNet checkpoint pool and the mirrored radix's
+        // free-list. The worker arms from the SAME TpInit value.
+        model
+            .enable_prefix_checkpoints(ckpt_slots as usize)
+            .map_err(|e| e.to_string())?;
+        let mut kv = logical(max_ctx, slots)?;
+        kv.set_state_capacity(ckpt_slots);
         ready(&mut stream, 1)?;
         stream
             .set_read_timeout(Some(STEP_TIMEOUT))
@@ -518,7 +572,7 @@ impl TpCoordinator {
             stream,
             group,
             model,
-            logical: logical(max_ctx, slots)?,
+            logical: kv,
             positions: vec![0; slots],
             occupied: vec![false; slots],
             sequence: 1,
@@ -528,6 +582,7 @@ impl TpCoordinator {
             span_done: Some(span_done),
             poisoned: None,
             shutdown_sent: false,
+            snapshotted_cuts: Vec::new(),
         })
     }
 
@@ -729,6 +784,7 @@ impl TpCoordinator {
         slot: usize,
         run: &[(usize, u32, usize)],
         finisher: Option<SpanFinishKind>,
+        ckpts: &mut Vec<(usize, u32)>,
     ) -> Result<(Option<u32>, Option<Vec<f32>>), String> {
         let mut sampled = None;
         let mut host_logits = None;
@@ -740,6 +796,17 @@ impl TpCoordinator {
             self.model
                 .forward_span_advance(&self.group, &self.logical, slot, &tokens, position)
                 .map_err(|e| e.to_string())?;
+            // Checkpoint cuts this span ends exactly on: snapshot the slot's
+            // live DeltaNet state into the reserved pool index BEFORE any
+            // further rows advance it (rank-local; the worker snapshots its
+            // own state at the same span boundary).
+            for (cut, idx) in tp_cuts_crossed(ckpts, position, stop - start) {
+                self.model
+                    .snapshot_slot_ckpt(slot, idx)
+                    .map_err(|e| e.to_string())?;
+                self.snapshotted_cuts.push((slot, cut));
+                tracing::debug!(slot, cut, idx, "TP prefix ckpt snapshotted");
+            }
             if stop == run.len() && let Some(kind) = finisher {
                 match kind {
                     SpanFinishKind::Device(plan) => {
@@ -800,6 +867,7 @@ impl TpCoordinator {
                 slot,
                 &rows,
                 finishing.then_some(SpanFinishKind::HostLogits),
+                &mut Vec::new(),
             )?;
             self.sequence += 1;
             ready(&mut self.stream, self.sequence)?;
@@ -1281,7 +1349,13 @@ impl TpCoordinator {
             let kind = fin.as_ref().and_then(|(s, p)| {
                 (*s == slot).then(|| p.map_or(SpanFinishKind::HostLogits, SpanFinishKind::Device))
             });
-            let (sampled, logits) = self.run_chunk_spans(slot, &chunk_rows, kind)?;
+            let mut chunk_ckpts: Vec<(usize, u32)> = self
+                .chunks
+                .front()
+                .filter(|c| c.slot == slot)
+                .map(|c| c.ckpts.clone())
+                .unwrap_or_default();
+            let (sampled, logits) = self.run_chunk_spans(slot, &chunk_rows, kind, &mut chunk_ckpts)?;
             if let Some(id) = sampled {
                 fin_ids[0] = id;
             }
@@ -1302,7 +1376,76 @@ impl TpCoordinator {
             };
             results.push((fin.slot, sample, fin.fin_rows));
         }
+        // Cache publication: every finisher's prefill completed successfully.
+        // Attach the snapshotted checkpoints (only cuts this prefill actually
+        // crossed are attached; everything else recycles), publish the full
+        // pages, and mirror the tick to the worker. Runs AFTER the GPU work
+        // succeeded - a poisoned tick never publishes.
+        for fin in &finishers {
+            self.publish_slot_cache(fin.slot, &chunk_rows)?;
+        }
         Ok((step, results))
+    }
+
+    /// The publication tick for `slot`'s completed prefill: attach snapshotted
+    /// checkpoints, recycle unsnapshotted reservations, publish the prompt's
+    /// full pages, and send `TpPrefixPublish` with the end-of-tick snapshot.
+    /// `chunk_rows` is the final tick's rows (their positions bound what this
+    /// prefill actually crossed); snapshots live in the coordinator's
+    /// `snapshotted_cuts` set filled during `run_chunk_spans`.
+    fn publish_slot_cache(
+        &mut self,
+        slot: usize,
+        _chunk_rows: &[(usize, u32, usize)],
+    ) -> Result<(), String> {
+        let tokens = self
+            .logical
+            .slot_admitted_tokens(slot)
+            .to_vec();
+        if tokens.is_empty() {
+            return Ok(()); // nothing admitted (serial path) - nothing to publish
+        }
+        let reservations = self.logical.slot_reserved_indices(slot);
+        if reservations.is_empty() {
+            return Ok(());
+        }
+        let snapshotted: Vec<usize> = self
+            .snapshotted_cuts
+            .iter()
+            .filter(|(s, _)| *s == slot)
+            .map(|(_, c)| *c)
+            .collect();
+        // Attach + recycle + publish; the slot stays LIVE (its table refs
+        // drop at the scheduler's release tick, which mirrors the same
+        // logical Release on both ranks).
+        let ops = tp_publish_ops(slot, &reservations, tokens.clone(), &snapshotted);
+        let kv_state =
+            serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
+                .map_err(|e| e.to_string())?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPrefixPublish {
+            sequence: seq,
+            slot,
+            checkpoints: reservations
+                .iter()
+                .filter(|(pos, _)| snapshotted.contains(pos))
+                .cloned()
+                .collect(),
+            kv_state,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        self.sequence = seq;
+        self.snapshotted_cuts
+            .retain(|(s, _)| *s != slot);
+        tracing::info!(
+            slot,
+            attached = snapshotted.len(),
+            pages = tokens.len() / crate::kv_pool::BLOCK_TOKENS,
+            "TP prefix published"
+        );
+        Ok(())
     }
 
     /// Queue a prompt for chunked prefill (scheduler-side admission). No
@@ -1331,6 +1474,78 @@ impl TpCoordinator {
         if tokens.len() >= self.model.max_ctx() {
             return Err("TP prompt exceeds the context window".into());
         }
+        // ── Prefix-cache admission (milestone-1 text-only) ──
+        // Rank 0 probes the mirrored radix READ-ONLY (no LRU/recurrence
+        // mutation), makes the resume decision ONCE with the pure helper,
+        // then authorizes `Admit` - which performs the one MUTATING
+        // adoption on rank 0 and rides the wire so the worker's `Admit`
+        // re-walk validates the exact same checkpoint on its own tree
+        // BEFORE Prepared. A rank that cannot satisfy the decision fails
+        // closed; neither rank resumes alone.
+        let t_len = tokens.len();
+        let probe = self.logical.match_prefix_probe(&tokens);
+        let resume = tp_resume_decision(probe.ckpt, t_len, self.positions.len());
+        let ops = vec![Operation::Admit {
+            slot,
+            tokens: tokens.clone(),
+            resume,
+        }];
+        self.logical
+            .authorize_all(&ops)
+            .map_err(str::to_owned)?;
+        let reused = self.logical.take_admitted_reused();
+        tracing::info!(
+            slot,
+            resume,
+            reused,
+            tokens = t_len,
+            "TP prefix admit (cache {})",
+            if resume > 0 { "HIT" } else { "cold" }
+        );
+        // Resumed prompts are pinned to Mixed for the whole prefill
+        // (milestone-1 lane rule): a span-lane prompt's promotion would
+        // overwrite decode slabs with stale lane data for the adopted
+        // blocks. `owner = Some(Mixed)` before the first take does exactly
+        // what the existing first-chunk pin does, one tick earlier.
+        let pinned_owner = (resume > 0).then_some(crate::generator::PrefillLane::Mixed);
+        // Reserve the checkpoint indices this prefill will snapshot (both
+        // ranks run the mirrored Reserve, each allocates from its own
+        // free-list deterministically). Rank 0's indices are what the worker
+        // receives at publish time; the worker's own indices live in its
+        // mirror's reservation list.
+        let cuts = tp_prefill_cuts(t_len, resume);
+        let reserved = self
+            .logical
+            .reserve_cuts_for_slot(slot, &cuts)
+            .map_err(str::to_owned)?;
+        let kv_state =
+            serde_json::to_value(self.logical.authorize_all(&[]).map_err(str::to_owned)?)
+                .map_err(|e| e.to_string())?;
+        let seq = self.sequence + 1;
+        ControlMessage::TpPrefixAdmit {
+            sequence: seq,
+            slot,
+            tokens: tokens.clone(),
+            resume,
+            kv_state,
+        }
+        .to_stream(&mut self.stream)
+        .map_err(|e| e.to_string())?;
+        prepared(&mut self.stream, seq)?;
+        self.sequence = seq;
+        // Worker's DeltaNet restore rides the same TpReady as rank 0's: the
+        // worker restores AFTER mirroring Admit, before its Ready; rank 0
+        // restores here (its own device, its own checkpoint index).
+        if resume > 0 {
+            let idx = probe
+                .ckpt
+                .filter(|(pos, _)| *pos == resume)
+                .map(|(_, idx)| idx)
+                .ok_or("TP resume decision lost its checkpoint")?;
+            self.model
+                .restore_slot_ckpt(slot, idx)
+                .map_err(|e| e.to_string())?;
+        }
         self.chunks.push_back(PrefillChunk {
             slot,
             rows: tokens
@@ -1339,7 +1554,8 @@ impl TpCoordinator {
                 .map(|(pos, token)| (slot, token, pos))
                 .collect(),
             fin_plan: None,
-            owner: None,
+            owner: pinned_owner,
+            ckpts: reserved,
         });
         Ok(())
     }
@@ -2312,7 +2528,7 @@ pub fn run_worker(
         .set_write_timeout(Some(STEP_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let run = (|| -> Result<(), String> {
-        let (max_ctx, slots, kv_dtype, use_graphs) =
+        let (max_ctx, slots, kv_dtype, use_graphs, ckpt_slots) =
             match ControlMessage::from_stream(&mut stream).map_err(|e| e.to_string())? {
                 ControlMessage::TpInit {
                     checkpoint_sha256,
@@ -2321,6 +2537,7 @@ pub fn run_worker(
                     slots,
                     kv_dtype,
                     use_graphs,
+                    ckpt_slots,
                 } => {
                     let (own_checkpoint, own_pack) = hashes(model_path, pack)?;
                     // The dtype parses BEFORE the hash compare so an unknown
@@ -2336,7 +2553,7 @@ pub fn run_worker(
                             "rank-1 checkpoint, CUDA pack or context disagrees with rank 0".into(),
                         );
                     }
-                    (max_ctx, slots, kv_dtype, use_graphs)
+                    (max_ctx, slots, kv_dtype, use_graphs, ckpt_slots)
                 }
                 ControlMessage::Shutdown { graceful: true } => return Ok(()),
                 other => {
@@ -2371,7 +2588,13 @@ pub fn run_worker(
                 .enable_tp_graphs(&group)
                 .map_err(|e| e.to_string())?;
         }
+        // Prefix-cache arm from the TpInit value (rank-0-authoritative, same
+        // pattern as graphs/dtype): identical pool + free-list geometry.
+        model
+            .enable_prefix_checkpoints(ckpt_slots as usize)
+            .map_err(|e| e.to_string())?;
         let mut logical = logical(max_ctx, slots)?;
+        logical.set_state_capacity(ckpt_slots);
         let mut positions = vec![0; slots];
         let mut pipe_slots: Option<Vec<usize>> = None;
         let mut span_in_flight = false;
@@ -2398,6 +2621,8 @@ pub fn run_worker(
                 | ControlMessage::TpRelease { sequence, .. }
                 | ControlMessage::TpMixed { sequence, .. }
                 | ControlMessage::TpSpanLaunch { sequence, .. }
+                | ControlMessage::TpPrefixAdmit { sequence, .. }
+                | ControlMessage::TpPrefixPublish { sequence, .. }
                 | ControlMessage::TpSpanFinish { sequence } => *sequence,
                 ControlMessage::Shutdown { graceful: true }
                     if pipe_slots.is_none() && !span_in_flight =>
@@ -2579,6 +2804,79 @@ pub fn run_worker(
                         model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
                         positions[slot] = 0;
                     }
+                }
+                ControlMessage::TpPrefixAdmit {
+                    sequence: _,
+                    slot,
+                    tokens,
+                    resume,
+                    kv_state,
+                } => {
+                    if slot >= slots || tokens.is_empty() || tokens.len() >= max_ctx {
+                        return Err("TP prefix admit slot or prompt invalid".into());
+                    }
+                    if resume % crate::kv_pool::BLOCK_TOKENS != 0 || resume >= tokens.len() {
+                        return Err("TP prefix admit resume position invalid".into());
+                    }
+                    // Mirror the admission: the worker's own `Admit` apply
+                    // independently validates the cached chain AND its
+                    // checkpoint at EXACTLY the coordinator's resume position
+                    // on this rank's tree. Failing here fails the whole pair
+                    // before any state adoption - the rank-symmetry gate.
+                    let ops = vec![Operation::Admit {
+                        slot,
+                        tokens: tokens.clone(),
+                        resume,
+                    }];
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
+                    // Rank-local DeltaNet restore from THIS rank's pool at
+                    // the validated index, BEFORE the Ready: by the time the
+                    // coordinator proceeds, both ranks' slot state matches
+                    // the checkpoint's logical position.
+                    if resume > 0 {
+                        // The attached checkpoint at `resume` (the Admit
+                        // validated it exists on this rank's tree).
+                        let idx = logical
+                            .slot_checkpoint_index(slot, resume)
+                            .ok_or("TP worker resume checkpoint missing")?;
+                        model
+                            .restore_slot_ckpt(slot, idx)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    positions[slot] = resume;
+                }
+                ControlMessage::TpPrefixPublish {
+                    sequence: _,
+                    slot,
+                    checkpoints,
+                    kv_state,
+                } => {
+                    if slot >= slots {
+                        return Err("TP prefix publish slot invalid".into());
+                    }
+                    // The worker's snapshot discipline mirrors rank 0's: each
+                    // rank ran its own GPU snapshots at the shared cut
+                    // boundaries. The wire's (cut, rank-0 index) pairs drive
+                    // the mirrored Attach ops; the worker's own reservation
+                    // indices are what ITS attach consumes (mirror-deterministic
+                    // free-list pops made them identical).
+                    let snapshotted: Vec<usize> =
+                        checkpoints.iter().map(|&(pos, _)| pos).collect();
+                    let tokens = logical.slot_admitted_tokens(slot).to_vec();
+                    if tokens.is_empty() {
+                        return Err("TP prefix publish for unadmitted slot".into());
+                    }
+                    let reservations = logical.slot_reserved_indices(slot);
+                    let ops = tp_publish_ops(slot, &reservations, tokens, &snapshotted);
+                    logical
+                        .mirror_tick(&ops, &wire_kv_state(kv_state)?)
+                        .map_err(str::to_owned)?;
+                    // The worker's own unsnapshotted reservations were
+                    // recycled by the ops above; drop any stragglers its
+                    // snapshot discipline did not reach.
+                    logical.drop_slot_reservations(slot);
                 }
                 ControlMessage::TpBatch {
                     rows, kv_state, ..
@@ -2793,6 +3091,7 @@ mod tests {
             rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
             fin_plan: None,
             owner: None,
+            ckpts: Vec::new(),
         };
         let mut queue = VecDeque::from([prompt(1)]);
         let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 2, Mixed).unwrap();
@@ -2838,6 +3137,7 @@ mod tests {
             rows: vec![(1, 7, 0)],
             fin_plan: None,
             owner: None,
+            ckpts: Vec::new(),
         }]);
         assert!(abort_queued_chunk(&mut queue, 1));
         queue.push_back(PrefillChunk {
@@ -2845,6 +3145,7 @@ mod tests {
             rows: vec![(1, 8, 0)],
             fin_plan: None,
             owner: None,
+            ckpts: Vec::new(),
         });
         assert_eq!(queue.front().map(|chunk| chunk.slot), Some(1));
     }
@@ -2858,6 +3159,7 @@ mod tests {
             rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
             fin_plan: None,
             owner: None,
+            ckpts: Vec::new(),
         };
         let mut queue = VecDeque::from([prompt(0)]);
         let mut async_launches = 0usize;

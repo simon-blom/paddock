@@ -274,6 +274,25 @@ impl PagedRadix {
         }
     }
 
+    /// The checkpoint index attached at the cached node ending at boundary
+    /// `pos` of `tokens` (read-only; the resume-time exact lookup).
+    pub(crate) fn ckpt_index_at(&self, tokens: &[u32], pos: usize) -> Option<u32> {
+        if pos == 0 || !pos.is_multiple_of(BLOCK_TOKENS) || tokens.len() < pos {
+            return None;
+        }
+        let mut node = 0u32;
+        for bi in 0..pos / BLOCK_TOKENS {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let h = hash_block(chunk);
+            let child = *self.nodes[node as usize].children.get(&h)?;
+            if self.nodes[child as usize].tokens != chunk {
+                return None;
+            }
+            node = child;
+        }
+        self.nodes[node as usize].state_blk
+    }
+
     /// Read-only resume probe: the deepest DeltaNet checkpoint
     /// `(position, state index)` on the longest block-aligned cached prefix
     /// of `tokens`. Walks exactly like `match_full` but takes `&self` and
@@ -332,13 +351,6 @@ impl PagedRadix {
             node = child;
         }
         Some((blocks, self.nodes[node as usize].state_blk))
-    }
-
-    /// Free checkpoint-pool indices (the radix's state free-list length).
-    /// Snapshot-visible: both mirrored trees pop/push the same list through
-    /// the same operations, so the count is part of the end-state equality.
-    pub(crate) fn state_capacity_free(&self) -> usize {
-        self.state_free.len()
     }
 
     /// Reserve a checkpoint-pool index for a later snapshot at cut `pos` of
@@ -409,6 +421,15 @@ impl PagedRadix {
         self.state_reserved.remove(at);
         self.nodes[node as usize].state_blk = Some(want);
         true
+    }
+
+    /// Every reservation owned by `slot` as `(position, index)`.
+    pub(crate) fn slot_reservations(&self, slot: usize) -> Vec<(usize, u32)> {
+        self.state_reserved
+            .iter()
+            .filter(|(s, _, _)| *s == slot)
+            .map(|(_, p, i)| (*p, *i))
+            .collect()
     }
 
     /// Drop every reservation owned by `slot`, returning their indices to the

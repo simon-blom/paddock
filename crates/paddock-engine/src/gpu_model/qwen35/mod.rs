@@ -156,6 +156,14 @@ fn ckpt_cuts(t_len: usize, step: usize) -> [usize; 2] {
     [b1.saturating_sub(step), b1]
 }
 
+/// The TP prefill's checkpoint boundaries: the same last-two-full-page rule
+/// at the BLOCK_TOKENS granularity, exposed for the TP serve (which builds
+/// its mirrored radix cuts with the identical contract). [0, 0] when the
+/// prompt is too short to be worth a checkpoint.
+pub fn tp_checkpoint_cuts(t_len: usize) -> [usize; 2] {
+    ckpt_cuts(t_len, BLOCK_TOKENS)
+}
+
 // max chunked prefills in flight: crate::service::max_chunks_inflight()
 // (one shared value so `prefill_begin` never over-admits)
 
