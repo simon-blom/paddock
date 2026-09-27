@@ -103,8 +103,8 @@ impl SpanProfile {
         Ok(())
     }
 
-    /// Counts the actual capacity-sized f32 partial submitted to NCCL, not
-    /// the logical live prefix; the latter is recorded separately as rows.
+    /// Counts the f32 partial submitted to NCCL: the live rows*hidden view
+    /// on the span paths (the capacity plane on decode paths).
     pub(super) fn reduce<C: Communicator, S: DevicePtr<f32>, R: DevicePtrMut<f32>>(
         &mut self,
         compute: &CudaStream,

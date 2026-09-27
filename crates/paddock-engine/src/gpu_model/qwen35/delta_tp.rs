@@ -793,7 +793,30 @@ impl DeltaTpRank {
             self.decode_run(e, input, rows)?;
             self.finish_partial(e, rows)?;
         }
-        if let Some(p) = profile {
+        // Prefill reduces only the live rows*WIDTH prefix (both ranks derive
+        // identical `rows`); decode keeps the capacity-sized collective the
+        // captured graphs bake in.
+        let live = rows * WIDTH;
+        if prefill {
+            if let Some(p) = profile {
+                p.reduce(
+                    &e.stream,
+                    group,
+                    &self.span.partial.slice(0..live),
+                    &mut self.span.reduced.slice_mut(0..live),
+                    1,
+                    layer,
+                )
+                .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
+            } else {
+                group.after_compute(&e.stream)?;
+                group.all_reduce(
+                    &self.span.partial.slice(0..live),
+                    &mut self.span.reduced.slice_mut(0..live),
+                )?;
+                group.before_compute(&e.stream)?;
+            }
+        } else if let Some(p) = profile {
             p.reduce(&e.stream, group, &self.span.partial, &mut self.span.reduced, 1, layer)
                 .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
         } else {
@@ -833,10 +856,10 @@ impl DeltaTpRank {
     }
 
     fn finish_partial_prefill(&mut self, e: &GpuExecutor, rows: usize) -> Result<(), DeltaTpError> {
-        // NCCL reduces the entire capacity buffer, including the unused rows.
-        e.stream
-            .memset_zeros(&mut self.span.partial)
-            .map_err(GpuError::from)?;
+        // The out-projection writes exactly the live rows*WIDTH prefix; the
+        // stale capacity suffix is never reduced (the collective below sums
+        // the live view) and never consumed (the residual add reads only
+        // the live prefix).
         self.prefill_gemm
             .as_mut()
             .expect("prefill scratch allocated")

@@ -227,17 +227,27 @@ impl FfnTpRank {
             self.local_ff,
             rows,
         )?;
-        // Zero the capacity-sized partial's unused suffix so the whole-plane
-        // collective sums over live rows only (mirrors the GQA span path).
-        exec.stream
-            .memset_zeros(&mut span.partial.slice_mut(rows * self.hidden..))
-            .map_err(GpuError::from)?;
+        // The collectives sum only the LIVE prefix (rows * hidden): both
+        // ranks derive identical `rows` from the same wire rows, the views
+        // are contiguous slices (no copies), and the stale suffix of either
+        // plane is never reduced or consumed. Collective order unchanged.
+        let live = rows * self.hidden;
         if let Some(p) = profile {
-            p.reduce(&exec.stream, group, &span.partial, &mut span.reduced, 2, layer)
-                .map_err(|err| FfnTpError::Shape(err.to_string()))?;
+            p.reduce(
+                &exec.stream,
+                group,
+                &span.partial.slice(0..live),
+                &mut span.reduced.slice_mut(0..live),
+                2,
+                layer,
+            )
+            .map_err(|err| FfnTpError::Shape(err.to_string()))?;
         } else {
             group.after_compute(&exec.stream)?;
-            group.all_reduce(&span.partial, &mut span.reduced)?;
+            group.all_reduce(
+                &span.partial.slice(0..live),
+                &mut span.reduced.slice_mut(0..live),
+            )?;
             group.before_compute(&exec.stream)?;
         }
         Ok(&span.reduced)

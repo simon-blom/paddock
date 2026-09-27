@@ -941,19 +941,28 @@ impl GqaTpRank {
             &mut span.partial,
             rows,
         )?;
-        // The span's all-reduce pair is capacity-sized; the unused suffix must
-        // be zero so the whole-plane collective is a sum over live rows only.
-        // Zero it on the span path itself (cheap, once per layer, and keeps
-        // the invariant local to the plane's owner).
-        e.stream
-            .memset_zeros(&mut span.partial.slice_mut(rows * g.width..))
-            .map_err(GpuError::from)?;
+        // The collectives sum only the LIVE prefix (rows * width): both
+        // ranks derive identical `rows` from the same wire rows, the views
+        // are contiguous slices (no copies), and the stale suffix of either
+        // plane is never reduced or consumed (the residual add reads only
+        // the live prefix). Collective order is unchanged.
+        let live = rows * g.width;
         if let Some(p) = profile {
-            p.reduce(&e.stream, group, &span.partial, &mut span.reduced, 0, layer)
-                .map_err(|err| GqaTpError::Shape(err.to_string()))?;
+            p.reduce(
+                &e.stream,
+                group,
+                &span.partial.slice(0..live),
+                &mut span.reduced.slice_mut(0..live),
+                0,
+                layer,
+            )
+            .map_err(|err| GqaTpError::Shape(err.to_string()))?;
         } else {
             group.after_compute(&e.stream)?;
-            group.all_reduce(&span.partial, &mut span.reduced)?;
+            group.all_reduce(
+                &span.partial.slice(0..live),
+                &mut span.reduced.slice_mut(0..live),
+            )?;
             group.before_compute(&e.stream)?;
         }
         Ok(&span.reduced)
