@@ -649,6 +649,7 @@ impl GqaTpRank {
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
         layer: usize,
+        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if self.block_tables.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
@@ -708,7 +709,7 @@ impl GqaTpRank {
                 .memcpy_htod(&axes_h, &mut span.axes.slice_mut(0..4 * rows))
                 .map_err(GpuError::from)?;
         }
-        self.span_run(e, group, xn, rows, span, q, layer)
+        self.span_run(e, group, xn, rows, span, q, layer, profile)
     }
 
     /// The [4, rows] axis-major M-RoPE plane for a text span: the row's
@@ -736,12 +737,16 @@ impl GqaTpRank {
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
         layer: usize,
+        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
             || xn.context().cu_ctx() != e.stream.context().cu_ctx()
         {
             return Err(GqaTpError::Shape("rank or context changed".into()));
+        }
+        if let Some(p) = profile.as_mut() {
+            p.stage(&e.stream, "gqa-local", Some(layer))?;
         }
         let g = self.geometry;
         prefill_mm_any(
@@ -928,9 +933,14 @@ impl GqaTpRank {
         e.stream
             .memset_zeros(&mut span.partial.slice_mut(rows * g.width..))
             .map_err(GpuError::from)?;
-        group.after_compute(&e.stream)?;
-        group.all_reduce(&span.partial, &mut span.reduced)?;
-        group.before_compute(&e.stream)?;
+        if let Some(p) = profile {
+            p.reduce(&e.stream, group, &span.partial, &mut span.reduced, 0, layer)
+                .map_err(|err| GqaTpError::Shape(err.to_string()))?;
+        } else {
+            group.after_compute(&e.stream)?;
+            group.all_reduce(&span.partial, &mut span.reduced)?;
+            group.before_compute(&e.stream)?;
+        }
         Ok(&span.reduced)
     }
 }

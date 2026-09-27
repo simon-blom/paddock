@@ -184,6 +184,9 @@ remote_env=(
   "NCCL_NET=$NCCL_NET"
 )
 [[ -n "$LD_LIBRARY_PATH" ]] && remote_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+# Opt-in diagnostics must run on both ranks; their collectives and event
+# timings are measured independently on each node.
+[[ "${PADDOCK_TP_PREFILL_PROFILE:-0}" == 1 ]] && remote_env+=("PADDOCK_TP_PREFILL_PROFILE=1")
 for arg in env -u PADDOCK_TP_GRAPH -u PADDOCK_TP_NO_SPAWN "${remote_env[@]}" \
   "$REMOTE_RUNNER" --tp-worker \
   --model "$REMOTE_MODEL" --kernel-pack "$REMOTE_PACK" \

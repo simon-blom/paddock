@@ -711,9 +711,10 @@ impl DeltaTpRank {
         slot: usize,
         rows: usize,
         layer: usize,
+        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         if slot == 0 {
-            return self.forward(e, group, input, rows, slot, true, layer);
+            return self.forward_profiled(e, group, input, rows, slot, true, layer, profile);
         }
         let state = self
             .slot_states
@@ -722,7 +723,7 @@ impl DeltaTpRank {
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
         let result = self
-            .forward(e, group, input, rows, slot, true, layer)
+            .forward_profiled(e, group, input, rows, slot, true, layer, profile)
             .map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
@@ -739,6 +740,21 @@ impl DeltaTpRank {
         slot: usize,
         prefill: bool,
         layer: usize,
+    ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
+        self.forward_profiled(e, group, input, rows, slot, prefill, layer, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_profiled<'a, C: Communicator>(
+        &'a mut self,
+        e: &GpuExecutor,
+        group: &C,
+        input: &CudaSlice<f32>,
+        rows: usize,
+        slot: usize,
+        prefill: bool,
+        layer: usize,
+        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let world = group.world_size();
         let rank = group.rank();
@@ -764,9 +780,14 @@ impl DeltaTpRank {
             self.decode_run(e, input, rows)?;
             self.finish_partial(e, rows)?;
         }
-        group.after_compute(&e.stream)?;
-        group.all_reduce(&self.span.partial, &mut self.span.reduced)?;
-        group.before_compute(&e.stream)?;
+        if let Some(p) = profile {
+            p.reduce(&e.stream, group, &self.span.partial, &mut self.span.reduced, 1, layer)
+                .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
+        } else {
+            group.after_compute(&e.stream)?;
+            group.all_reduce(&self.span.partial, &mut self.span.reduced)?;
+            group.before_compute(&e.stream)?;
+        }
         Ok(&self.span.reduced)
     }
 

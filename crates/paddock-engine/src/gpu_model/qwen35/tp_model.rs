@@ -1127,6 +1127,15 @@ impl Qwen35TpRank {
         // Allocate the span planes on first use only (bounded, explicit).
         self.ensure_span_planes()?;
         let planes = self.span_planes.as_mut().expect("allocated above");
+        let mut profile = if super::tp_prefill_profile::enabled(
+            paddock_models::dev_var!("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
+        ) {
+            let mut p = super::tp_prefill_profile::SpanProfile::new(self.rank, rows);
+            p.begin_whole(&self.exec.stream)?;
+            Some(p)
+        } else {
+            None
+        };
         // Batched embedding: all rows in one gather.
         self.exec
             .stream
@@ -1141,7 +1150,10 @@ impl Qwen35TpRank {
             rows,
             None,
         )?;
-        self.span_layer_walk(group, logical_kv, slot, position, rows)?;
+        self.span_layer_walk(group, logical_kv, slot, position, rows, &mut profile)?;
+        if let Some(p) = profile {
+            p.finish(&self.exec.stream)?;
+        }
         Ok(())
     }
 
@@ -1219,6 +1231,7 @@ impl Qwen35TpRank {
         slot: usize,
         position: usize,
         rows: usize,
+        profile: &mut Option<super::tp_prefill_profile::SpanProfile>,
     ) -> Result<(), Qwen35TpError> {
         let planes = self.span_planes.as_mut().expect("ensure_span_planes ran");
         for (layer, layer_data) in self.layers.iter_mut().enumerate() {
@@ -1249,6 +1262,14 @@ impl Qwen35TpRank {
                 0,
                 self.hidden,
             )?;
+            if let Some(p) = profile.as_mut() {
+                let name = if matches!(&layer_data.mixer, TpMixer::Full(_)) {
+                    "gqa-metadata"
+                } else {
+                    "delta-local"
+                };
+                p.stage(&self.exec.stream, name, Some(layer))?;
+            }
             let mixed_rows = match &mut layer_data.mixer {
                 TpMixer::Full(gqa) => {
                     let span = &mut planes.gqa;
@@ -1264,10 +1285,13 @@ impl Qwen35TpRank {
                         span,
                         q,
                         layer,
+                        profile.as_mut(),
                     )?
                 }
                 TpMixer::Linear(delta) => {
-                    delta.prefill_slot(&self.exec, group, &planes.act.xn, slot, rows, layer)?
+                    delta.prefill_slot(
+                        &self.exec, group, &planes.act.xn, slot, rows, layer, profile.as_mut(),
+                    )?
                 }
             };
             super::tp_trace::trace_row(
@@ -1307,6 +1331,9 @@ impl Qwen35TpRank {
                 0,
                 self.hidden,
             )?;
+            if let Some(p) = profile.as_mut() {
+                p.stage(&self.exec.stream, "ffn-local", Some(layer))?;
+            }
             let ffn_rows = {
                 let span = &mut planes.ffn;
                 let q = &mut planes.q;
@@ -1318,6 +1345,7 @@ impl Qwen35TpRank {
                     span,
                     q,
                     layer,
+                    profile.as_mut(),
                 )?
             };
             super::tp_trace::trace_row(

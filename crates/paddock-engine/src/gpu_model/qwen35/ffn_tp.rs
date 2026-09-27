@@ -171,6 +171,7 @@ impl FfnTpRank {
         span: &'a mut SpanFfn,
         q: &mut SpanGemmStaging,
         layer: usize,
+        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
@@ -235,9 +236,14 @@ impl FfnTpRank {
         exec.stream
             .memset_zeros(&mut span.partial.slice_mut(rows * self.hidden..))
             .map_err(GpuError::from)?;
-        group.after_compute(&exec.stream)?;
-        group.all_reduce(&span.partial, &mut span.reduced)?;
-        group.before_compute(&exec.stream)?;
+        if let Some(p) = profile {
+            p.reduce(&exec.stream, group, &span.partial, &mut span.reduced, 2, layer)
+                .map_err(|err| FfnTpError::Shape(err.to_string()))?;
+        } else {
+            group.after_compute(&exec.stream)?;
+            group.all_reduce(&span.partial, &mut span.reduced)?;
+            group.before_compute(&exec.stream)?;
+        }
         Ok(&span.reduced)
     }
 }

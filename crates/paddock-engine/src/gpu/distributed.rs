@@ -79,6 +79,10 @@ pub fn create_unique_id() -> Result<[u8; NCCL_ID_BYTES], CollectiveError> {
 /// asynchronously on the communicator's dedicated stream. No socket or NCCL
 /// bootstrap detail leaks into model layers.
 pub trait Communicator {
+    /// Optional timing domain; normal collective callers never inspect it.
+    fn profiling_stream(&self) -> Option<&CudaStream> {
+        None
+    }
     fn rank(&self) -> usize;
     fn world_size(&self) -> usize;
     fn after_compute(&self, compute: &CudaStream) -> Result<(), CollectiveError>;
@@ -148,6 +152,9 @@ impl NcclCommunicator {
 }
 
 impl Communicator for NcclCommunicator {
+    fn profiling_stream(&self) -> Option<&CudaStream> {
+        Some(&self.stream)
+    }
     fn rank(&self) -> usize {
         self.comm.rank()
     }
