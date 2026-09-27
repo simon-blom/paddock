@@ -61,7 +61,7 @@ Effective throughput is `22,130 / cold wall`. Relative to historical cap 192, th
 
 All four new caps started successfully, returned HTTP 200, produced 22,130 prompt tokens and 64 completion tokens with `finish_reason=length`, and generated the same output hash. The output text was byte-identical across the four new caps. This is output evidence only, not a strict numerical-correctness oracle.
 
-The launcher was stopped after each completed request by signaling the exact runner child; its final process status was coordinator/worker `143` for the four headline runs because the benchmark harness terminated the server after collecting the response. The server logs show normal drain and device-memory release for each run. No request failed. Raw evidence:
+The launcher wrapper was stopped after each completed request by signaling the exact runner child; its wrapper status was `143` for the four headline runs because the benchmark harness terminated the server after collecting the response. The server logs show normal drain and device-memory release for each run. The remote worker status file recorded exit `0` on the final run; the wrapper's forced-stop path did not preserve a separate per-cap worker status line. No request failed. Raw evidence:
 
 `/home/sime/.hermes/cache/scratch/span-sweep-20260928-014349/`
 
