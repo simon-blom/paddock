@@ -537,36 +537,15 @@ pub fn tp_publish_ops(
 /// (`slots <= resume_live_max`) where short resumes are still net-positive.
 /// Rank 0 runs this ONCE; both ranks validate the exact selection in `Admit`.
 pub fn tp_resume_decision(ckpt: Option<(usize, u32)>, t_len: usize, slots: usize) -> usize {
-    let floor = if slots <= resume_live_max_tp() {
+    let floor = if slots <= super::resume_live_max() {
         2 * BLOCK_TOKENS
     } else {
-        min_cache_prefix_tp().max(2 * BLOCK_TOKENS)
+        super::min_cache_prefix().max(2 * BLOCK_TOKENS)
     };
     match ckpt {
         Some((pos, _)) if pos >= floor && pos >= 2 * BLOCK_TOKENS && pos < t_len => pos,
         _ => 0,
     }
-}
-
-/// Narrow-serve threshold for the TP resume gate (same seam as the non-TP
-/// `resume_live_max`): below this configured slot count a short-prefix
-/// resume still pays for itself. TP=2 serves are always narrow, so the
-/// default (12) admits every resume the cache can serve.
-fn resume_live_max_tp() -> usize {
-    12
-}
-
-/// Minimum prefix worth a TP restore (same default as the non-TP
-/// `min_cache_prefix`; a TP restore is two rank-local copies instead of page
-/// adoption only, but the per-request state restore is the same order of
-/// work). Env-overridable for sweeps.
-fn min_cache_prefix_tp() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var_os!("PADDOCK_MIN_CACHE_PREFIX")
-            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
-            .unwrap_or(512)
-    })
 }
 
 #[cfg(test)]

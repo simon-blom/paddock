@@ -165,6 +165,9 @@ pub enum ControlMessage {
         /// rows[..rows.len()-chunk_rows] are decode rows, the rest prompt
         /// rows executed as one or more batched spans. v3.
         chunk_rows: usize,
+        /// Checkpoint cuts claimed when a cold prompt first takes Mixed
+        /// ownership. Empty on later ticks and every Async-owned prompt.
+        reserve_cuts: Vec<usize>,
         /// Prefix-cache checkpoint cuts the chunk run's spans end exactly on,
         /// `(cut position, rank-0 pool index)` in cut order (v4). The worker
         /// snapshots its own DeltaNet state at those span boundaries into its
@@ -368,7 +371,10 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 /// before either rank adopts); `TpPrefixPublish` attaches the post-prefill
 /// checkpoint indices and publishes the full pages. Logical identity only -
 /// no physical page ids ever travel.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// Version 5: `TpMixed.reserve_cuts` claims cold-prompt checkpoints only on
+/// first Mixed ownership, before that tick's KV Ensure operations.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +386,7 @@ mod tests {
             sequence: 7,
             rows: vec![(0, 11, 0), (0, 12, 1), (1, 22, 5)],
             chunk_rows: 2,
+            reserve_cuts: vec![64],
             ckpts: vec![(64, 0)],
             kv_state: serde_json::json!({"tables": []}),
         };
@@ -401,11 +408,14 @@ mod tests {
         let mut missing: serde_json::Value = serde_json::from_str(&json).unwrap();
         missing.as_object_mut().unwrap().remove("chunk_rows");
         assert!(serde_json::from_value::<ControlMessage>(missing).is_err());
+        let mut missing: serde_json::Value = serde_json::from_str(&json).unwrap();
+        missing.as_object_mut().unwrap().remove("reserve_cuts");
+        assert!(serde_json::from_value::<ControlMessage>(missing).is_err());
     }
 
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

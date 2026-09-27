@@ -342,6 +342,31 @@ fn tp_prefill_cuts(t_len: usize, start: usize) -> Vec<usize> {
         .collect()
 }
 
+fn reserve_cold_mixed_cuts(
+    logical: &mut MirroredKv,
+    pending: &mut std::collections::HashMap<usize, Vec<(usize, u32)>>,
+    slot: usize,
+    start: usize,
+) -> Result<Vec<usize>, String> {
+    if pending.contains_key(&slot) {
+        return Ok(Vec::new()); // resumed or already committed to Mixed
+    }
+    if start != 0 {
+        return Err("TP cold Mixed checkpoint reservation after first row".into());
+    }
+    let len = logical.slot_admitted_tokens(slot).len();
+    if len == 0 {
+        return Err("TP Mixed checkpoint reservation without admission".into());
+    }
+    let reserved = logical
+        .reserve_cuts_for_slot(slot, &tp_prefill_cuts(len, 0))
+        .map_err(str::to_owned)?;
+    let cuts = reserved.iter().map(|&(cut, _)| cut).collect();
+    // Insert even when capacity is zero: later Mixed ticks must not retry.
+    pending.insert(slot, reserved);
+    Ok(cuts)
+}
+
 /// Which of `cuts` a span covering rows `[span_start, span_start + rows)`
 /// lands EXACTLY on (span end == cut): a checkpoint may be snapshotted only
 /// there, because the slot's live DeltaNet state is exactly the state after
@@ -900,6 +925,7 @@ impl TpCoordinator {
                 chunk_rows: rows.len(),
                 // The serial one-slot path stays cold in milestone 1 (the
                 // chunked admission is the production TP path).
+                reserve_cuts: Vec::new(),
                 ckpts: Vec::new(),
                 kv_state,
             }
@@ -1342,6 +1368,13 @@ impl TpCoordinator {
             .iter()
             .map(|&(slot, _, position)| Operation::Ensure { slot, position })
             .collect();
+        let reserve_cuts = if let Some(&(slot, _, start)) = chunk_rows.first() {
+            reserve_cold_mixed_cuts(&mut self.logical, &mut self.pending_ckpts, slot, start)?
+        } else {
+            Vec::new()
+        };
+        // Reservation ops were authorized before Ensures; the worker replays
+        // the same ordered prefix before validating this tick's snapshot.
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
         // The chunk run's checkpoint cuts: which of the slot's reservations
@@ -1365,6 +1398,7 @@ impl TpCoordinator {
             sequence: self.sequence + 1,
             rows: rows.clone(),
             chunk_rows: chunk_rows.len(),
+            reserve_cuts,
             ckpts: wire_ckpts.clone(),
             kv_state,
         }
@@ -1581,19 +1615,18 @@ impl TpCoordinator {
         // blocks. `owner = Some(Mixed)` before the first take does exactly
         // what the existing first-chunk pin does, one tick earlier.
         let pinned_owner = (resume > 0).then_some(crate::generator::PrefillLane::Mixed);
-        // Reserve the checkpoint indices this prefill will snapshot (both
-        // ranks run the mirrored Reserve, each allocates from its own
-        // free-list deterministically). Rank 0's indices are what the worker
-        // receives at publish time; the worker's own indices live in its
-        // mirror's reservation list.
-        let cuts = tp_prefill_cuts(t_len, resume);
-        let reserved = self
-            .logical
-            .reserve_cuts_for_slot(slot, &cuts)
-            .map_err(str::to_owned)?;
-        let kv_state =
-            serde_json::to_value(self.logical.authorize_all(&[]).map_err(str::to_owned)?)
-                .map_err(|e| e.to_string())?;
+        // A cold admission only claims pages. Async can publish pages but
+        // cannot snapshot DeltaNet; reserve only after Mixed takes ownership.
+        // Resumed prompts are Mixed-pinned and reserve during admission.
+        let reserved = if resume > 0 {
+            self.logical
+                .reserve_cuts_for_slot(slot, &tp_prefill_cuts(t_len, resume))
+                .map_err(str::to_owned)?
+        } else {
+            Vec::new()
+        };
+        let kv_state = serde_json::to_value(self.logical.snapshot())
+            .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
         ControlMessage::TpPrefixAdmit {
             sequence: seq,
@@ -1627,7 +1660,9 @@ impl TpCoordinator {
         // Admission owns reservations and possibly adopted pages even before
         // the first GPU row. Release must see this slot after a queued abort.
         self.occupied[slot] = true;
-        self.pending_ckpts.insert(slot, reserved.clone());
+        if resume > 0 {
+            self.pending_ckpts.insert(slot, reserved.clone());
+        }
         self.chunks.push_back(PrefillChunk {
             slot,
             rows: tp_suffix_rows(slot, tokens, resume),
@@ -3076,6 +3111,7 @@ pub fn run_worker(
                 ControlMessage::TpMixed {
                     rows,
                     chunk_rows,
+                    reserve_cuts,
                     ckpts,
                     kv_state,
                     ..
@@ -3086,25 +3122,37 @@ pub fn run_worker(
                     // it neither samples nor reads logits back to the host.
                     let split = validate_mixed_worker_rows(&rows, chunk_rows, &positions, max_ctx)?;
                     let chunk = &rows[split..];
-                    if chunk.is_empty() && !ckpts.is_empty() {
+                    if chunk.is_empty() && (!ckpts.is_empty() || !reserve_cuts.is_empty()) {
                         return Err("TP mixed cuts without prompt rows".into());
                     }
-                    if !chunk.is_empty() {
+                    if !chunk.is_empty() && !reserve_cuts.is_empty() {
                         let slot = chunk[0].0;
-                        let reserved = logical.slot_reserved_indices(slot);
-                        let expected = tp_cuts_in_run(&reserved, chunk[0].2, chunk.len());
-                        if ckpts != expected {
-                            return Err("TP mixed cut list disagrees with reservations".into());
+                        if chunk[0].2 != 0
+                            || !logical.slot_reserved_indices(slot).is_empty()
+                            || reserve_cuts.windows(2).any(|w| w[0] >= w[1])
+                            || reserve_cuts.iter().any(|cut| {
+                                !tp_prefill_cuts(logical.slot_admitted_tokens(slot).len(), 0).contains(cut)
+                            })
+                        {
+                            return Err("TP mixed cold reservation invalid".into());
                         }
-                        span_checkpoint_points(chunk[0].2, chunk.len(), &ckpts)?;
                     }
-                    let ops: Vec<Operation> = rows
-                        .iter()
-                        .map(|&(slot, _, position)| Operation::Ensure { slot, position })
-                        .collect();
+                    let mut ops: Vec<Operation> = if let Some(&(slot, _, _)) = chunk.first() {
+                        reserve_cuts.iter().map(|&position| Operation::CheckpointReserve { slot, position }).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    ops.extend(rows.iter().map(|&(slot, _, position)| Operation::Ensure { slot, position }));
                     logical
                         .mirror_tick(&ops, &wire_kv_state(kv_state)?)
                         .map_err(str::to_owned)?;
+                    if let Some(&(slot, _, start)) = chunk.first() {
+                        let expected = tp_cuts_in_run(&logical.slot_reserved_indices(slot), start, chunk.len());
+                        if ckpts != expected {
+                            return Err("TP mixed cut list disagrees with reservations".into());
+                        }
+                        span_checkpoint_points(start, chunk.len(), &ckpts)?;
+                    }
                     ControlMessage::TpPrepared { sequence: got }
                         .to_stream(&mut stream)
                         .map_err(|e| e.to_string())?;
@@ -3444,6 +3492,82 @@ mod tests {
         assert_eq!(taken.last().unwrap().2, t_len - 1);
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].fin_rows, t_len);
+    }
+
+    #[test]
+    fn cold_async_never_reserves_or_steals_a_checkpoint() {
+        let mut head = MirroredKv::new(32, 2, 128).unwrap();
+        let mut worker = head.clone();
+        head.set_state_capacity(1);
+        worker.set_state_capacity(1);
+        let cached: Vec<u32> = (0..65).collect();
+        let admit = [Operation::Admit { slot: 0, tokens: cached.clone(), resume: 0 }];
+        let end = head.authorize_all(&admit).unwrap();
+        worker.mirror_tick(&admit, &end).unwrap();
+        let reserve = [Operation::CheckpointReserve { slot: 0, position: 48 }];
+        let end = head.authorize_all(&reserve).unwrap();
+        worker.mirror_tick(&reserve, &end).unwrap();
+        let ensure = [Operation::Ensure { slot: 0, position: 64 }];
+        let end = head.authorize_all(&ensure).unwrap();
+        worker.mirror_tick(&ensure, &end).unwrap();
+        let publish = tp_publish_ops(0, &head.slot_reserved_indices(0), cached.clone(), &[48]);
+        let end = head.authorize_all(&publish).unwrap();
+        worker.mirror_tick(&publish, &end).unwrap();
+        let release = [Operation::Release { slot: 0 }];
+        let end = head.authorize_all(&release).unwrap();
+        worker.mirror_tick(&release, &end).unwrap();
+        let before = head.match_prefix_probe(&cached).ckpt;
+        assert!(before.is_some());
+
+        let async_tokens = vec![900; 65];
+        let admit = [Operation::Admit { slot: 1, tokens: async_tokens.clone(), resume: 0 }];
+        let end = head.authorize_all(&admit).unwrap();
+        worker.mirror_tick(&admit, &end).unwrap();
+        // Async uses Ensure + pages-only publish. It never calls the Mixed
+        // ownership seam, even if the prompt has checkpoint-eligible cuts.
+        let ensure = [Operation::Ensure { slot: 1, position: 64 }];
+        let end = head.authorize_all(&ensure).unwrap();
+        worker.mirror_tick(&ensure, &end).unwrap();
+        let publish = tp_publish_ops(1, &head.slot_reserved_indices(1), async_tokens, &[]);
+        let end = head.authorize_all(&publish).unwrap();
+        worker.mirror_tick(&publish, &end).unwrap();
+        assert!(head.slot_reserved_indices(1).is_empty());
+        assert_eq!(head.match_prefix_probe(&cached).ckpt, before);
+        assert_eq!(head.snapshot(), worker.snapshot());
+    }
+
+    #[test]
+    fn cold_mixed_reserves_once_and_mirrors_before_ensure() {
+        let mut head = MirroredKv::new(32, 2, 128).unwrap();
+        let mut worker = head.clone();
+        head.set_state_capacity(2);
+        worker.set_state_capacity(2);
+        let admit = [Operation::Admit { slot: 0, tokens: vec![7; 65], resume: 0 }];
+        let end = head.authorize_all(&admit).unwrap();
+        worker.mirror_tick(&admit, &end).unwrap();
+        assert!(head.snapshot().checkpoint_reserved.is_empty());
+        let mut pending = std::collections::HashMap::new();
+        let cuts = reserve_cold_mixed_cuts(&mut head, &mut pending, 0, 0).unwrap();
+        assert_eq!(cuts, vec![48, 64]);
+        let ensure = [Operation::Ensure { slot: 0, position: 0 }];
+        let end = head.authorize_all(&ensure).unwrap();
+        let mut ops: Vec<_> = cuts.iter().map(|&position| Operation::CheckpointReserve { slot: 0, position }).collect();
+        ops.extend(ensure);
+        worker.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(head.snapshot(), worker.snapshot());
+        assert!(reserve_cold_mixed_cuts(&mut head, &mut pending, 0, 1).unwrap().is_empty());
+        assert_eq!(head.snapshot(), worker.snapshot());
+        assert_eq!(tp_cuts_in_run(pending.get(&0).unwrap(), 0, 64), vec![(48, 0), (64, 1)]);
+    }
+
+    #[test]
+    fn cold_mixed_zero_capacity_is_not_retried() {
+        let mut logical = MirroredKv::new(8, 1, 128).unwrap();
+        logical.authorize_all(&[Operation::Admit { slot: 0, tokens: vec![7; 65], resume: 0 }]).unwrap();
+        let mut pending = std::collections::HashMap::new();
+        assert!(reserve_cold_mixed_cuts(&mut logical, &mut pending, 0, 0).unwrap().is_empty());
+        assert!(reserve_cold_mixed_cuts(&mut logical, &mut pending, 0, 16).unwrap().is_empty());
+        assert_eq!(pending.get(&0), Some(&Vec::new()));
     }
 
     #[test]
