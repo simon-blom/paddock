@@ -13,18 +13,18 @@
 //! unsupported values fail closed with a clear error instead of truncating.
 //!
 //! 64 remains the default. The supported experimental widths are 128, 192,
-//! 384, 512, 1024, and 2048; all are parameterized through the span-sized
-//! allocations and remain unvalidated until the sweep below.
+//! 384, 512, 1024, 2048, 4096, and 8192; all are parameterized through the
+//! span-sized allocations and remain unvalidated until the sweep below.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The production default: the only GPU-validated span width.
 pub const DEFAULT_TP_SPAN_CAP: usize = 64;
 
 /// Largest width the staging and DeltaNet geometry are sized for.
-pub const MAX_TP_SPAN_CAP: usize = 2048;
+pub const MAX_TP_SPAN_CAP: usize = 8192;
 
 /// Supported experimental widths for the two-node sweep.
-pub const SWEEP_CAPS: [usize; 7] = [64, 128, 192, 384, 512, 1024, 2048];
+pub const SWEEP_CAPS: [usize; 9] = [64, 128, 192, 384, 512, 1024, 2048, 4096, 8192];
 
 static RESOLVED: AtomicUsize = AtomicUsize::new(DEFAULT_TP_SPAN_CAP);
 
@@ -33,7 +33,7 @@ static RESOLVED: AtomicUsize = AtomicUsize::new(DEFAULT_TP_SPAN_CAP);
 #[error("PADDOCK_TP_SPAN_CAP={value} unsupported: use one of {allowed:?} (default {default})")]
 pub struct SpanCapError {
     pub value: String,
-    pub allowed: [usize; 7],
+    pub allowed: [usize; 9],
     pub default: usize,
 }
 
@@ -104,7 +104,10 @@ mod tests {
         assert_eq!(parse_span_cap(Some("  ")).unwrap(), 64);
         let err = parse_span_cap(Some("abc")).unwrap_err();
         assert_eq!(err.value, "abc");
-        assert_eq!(err.allowed, [64, 128, 192, 384, 512, 1024, 2048]);
+        assert_eq!(
+            err.allowed,
+            [64, 128, 192, 384, 512, 1024, 2048, 4096, 8192]
+        );
     }
 
     #[test]
