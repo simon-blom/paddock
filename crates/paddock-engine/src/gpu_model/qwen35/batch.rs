@@ -6134,6 +6134,16 @@ impl GpuQwen35 {
         }
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
+        // TP1 uses the unified span lane rather than the serial prefill path.
+        // Reuse the same opt-in CUDA-event semantics; whole timing stops before
+        // final norm/head/sampling, matching the TP2 span profiler boundary.
+        let mut profile = super::tp_prefill_profile::enabled(
+            std::env::var("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
+        )
+        .then(|| super::tp_prefill_profile::SerialProfile::new(r));
+        if let Some(p) = profile.as_mut() {
+            p.begin_whole(&exec.stream)?;
+        }
 
         // device inputs (eager buffers; the fused shape is variable -> no graph)
         let mut d_tokens = exec.alloc_u32(r)?;
@@ -6204,6 +6214,14 @@ impl GpuQwen35 {
                 .all(|(si, &v)| !v || shares[si].2 == 0);
 
         for (li, layer) in layers.iter().enumerate() {
+            if let Some(p) = profile.as_mut() {
+                let stage = if matches!(&layer.mixer, Mixer::Full(_)) {
+                    "gqa-local"
+                } else {
+                    "deltanet-local"
+                };
+                p.stage(&exec.stream, stage)?;
+            }
             if let Some(df) = dtap.as_mut()
                 && let Some(band) = df.target_layers.iter().position(|&t| t == li)
             {
@@ -7556,6 +7574,9 @@ impl GpuQwen35 {
                     }
                 }
             }
+            if let Some(p) = profile.as_mut() {
+                p.stage(&exec.stream, "ffn-local")?;
+            }
             let mut proj_is_b16 = false;
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
@@ -8022,6 +8043,11 @@ impl GpuQwen35 {
             Some(true) => exec.add_b16(&mut sc.d_x, &sc.d_proj, r * embd)?,
             Some(false) => exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?,
             None => {}
+        }
+        // Match TP2's whole-advance boundary: exclude final norm, lm-head,
+        // and sampling from the profiled whole-prefill measurement.
+        if let Some(p) = profile {
+            p.finish(&exec.stream)?;
         }
         exec.rmsnorm_batch(&sc.d_x, &out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         // rotated-basis model: the head is a rotated weight like the rest. On

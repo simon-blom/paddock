@@ -39,6 +39,84 @@ struct Aggregate {
 
 thread_local! {
     static AGGREGATE: RefCell<Aggregate> = RefCell::new(Aggregate::default());
+    static SERIAL_AGGREGATE: RefCell<Aggregate> = RefCell::new(Aggregate::default());
+}
+
+/// Opt-in event profile for the single-rank batched prefill path. It shares
+/// the same CUDA-event and stage-boundary semantics as `SpanProfile`, but has
+/// no collective intervals and reports a separate TP1 line.
+pub(crate) struct SerialProfile {
+    rows: usize,
+    intervals: Vec<Interval>,
+    pending: Option<(&'static str, CudaEvent)>,
+    whole_start: Option<CudaEvent>,
+}
+
+impl SerialProfile {
+    pub(super) fn new(rows: usize) -> Self {
+        Self { rows, intervals: Vec::new(), pending: None, whole_start: None }
+    }
+
+    pub(super) fn begin_whole(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.whole_start = Some(SpanProfile::event(stream)?);
+        Ok(())
+    }
+
+    pub(super) fn stage(
+        &mut self,
+        stream: &CudaStream,
+        name: &'static str,
+    ) -> Result<(), GpuError> {
+        if let Some((stage, start)) = self.pending.take() {
+            self.intervals.push(Interval {
+                stage,
+                layer: None,
+                start,
+                end: SpanProfile::event(stream)?,
+            });
+        }
+        self.pending = Some((name, SpanProfile::event(stream)?));
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if let Some((stage, start)) = self.pending.take() {
+            self.intervals.push(Interval {
+                stage,
+                layer: None,
+                start,
+                end: SpanProfile::event(stream)?,
+            });
+        }
+        if let Some(start) = self.whole_start.take() {
+            self.intervals.push(Interval {
+                stage: "whole-prefill",
+                layer: None,
+                start,
+                end: SpanProfile::event(stream)?,
+            });
+        }
+        let terminal = SpanProfile::event(stream)?;
+        terminal.synchronize().map_err(GpuError::from)?;
+        let mut stage_ms = BTreeMap::<&'static str, f64>::new();
+        for interval in &self.intervals {
+            let ms = interval.start.elapsed_ms(&interval.end).map_err(GpuError::from)? as f64;
+            *stage_ms.entry(interval.stage).or_default() += ms;
+        }
+        SERIAL_AGGREGATE.with(|state| {
+            let mut total = state.borrow_mut();
+            total.spans += 1;
+            total.rows += self.rows;
+            for (stage, ms) in &stage_ms {
+                *total.stage_ms.entry(stage).or_default() += ms;
+            }
+            eprintln!(
+                "[TP1-PREFILL-PROFILE] rows={} stage_ms={stage_ms:?} total_chunks={} total_rows={} total_stage_ms={:?}",
+                self.rows, total.spans, total.rows, total.stage_ms
+            );
+        });
+        Ok(())
+    }
 }
 
 pub(crate) struct SpanProfile {

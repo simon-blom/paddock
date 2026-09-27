@@ -793,6 +793,7 @@ impl GpuQwen35 {
         let bs_w8_all = &self.bs_w8;
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
+        let profile: Option<super::tp_prefill_profile::SerialProfile> = None;
 
         // The window-extended conv stages [window | span] through the shared
         // ext buffers, which are sized for a typical resumed tail. A wider one
@@ -1747,6 +1748,9 @@ impl GpuQwen35 {
             }
         }
 
+        if let Some(p) = profile {
+            p.finish(&exec.stream)?;
+        }
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
         // rotated-basis model: the head reads the rotated row; d_h stays in
@@ -1856,6 +1860,16 @@ impl GpuQwen35 {
         let nv4_min = proj_nv4_min_batch();
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
+        let mut profile = if super::tp_prefill_profile::enabled(
+            paddock_models::dev_var!("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
+        ) {
+            let mut p = super::tp_prefill_profile::SerialProfile::new(r);
+            p.begin_whole(&exec.stream)?;
+            p.stage(&exec.stream, "other")?;
+            Some(p)
+        } else {
+            None
+        };
 
         embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
 
@@ -1885,6 +1899,16 @@ impl GpuQwen35 {
             // xn below - same seam as the FFN post-norm cut. xn still
             // written (alpha/beta + reuse comments hold).
             let entry_fused = lnv4.is_none() && lw8.is_some() && exec.has_add_rmsnorm_e4m3_xn();
+            if let Some(p) = profile.as_mut() {
+                p.stage(
+                    &exec.stream,
+                    if matches!(&layer.mixer, Mixer::Full(_)) {
+                        "gqa-local"
+                    } else {
+                        "delta-local"
+                    },
+                )?;
+            }
             if entry_fused {
                 exec.add_rmsnorm_e4m3_xn(
                     &mut sc.d_x,
@@ -2519,6 +2543,9 @@ impl GpuQwen35 {
                     }
                 }
             }
+            if let Some(p) = profile.as_mut() {
+                p.stage(&exec.stream, "ffn-local")?;
+            }
             // residual add + post_norm + gate/up quantize in one pass (P6k);
             // xn skipped - the ffn quantize is its only consumer here
             let mut proj_is_b16 = false;
@@ -2891,6 +2918,9 @@ impl GpuQwen35 {
             }
         }
 
+        if let Some(p) = profile {
+            p.finish(&exec.stream)?;
+        }
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
         // rotated-basis model: the head reads the rotated row; d_h stays in
