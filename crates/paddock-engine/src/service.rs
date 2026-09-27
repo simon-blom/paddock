@@ -6925,6 +6925,7 @@ fn run_batched(
                         // mixed flow), and the pass must not realloc scratch
                         // (a realloc would drop graphs with queued replays).
                         if !host_row
+                            && generator.decode_pipe_context_limit().is_none()
                             && generator.supports_overlap()
                             && admit_req.as_ref().is_some_and(|r| {
                                 r.mm_chunks.is_none()
@@ -7037,6 +7038,16 @@ fn run_batched(
                             if req.mm_chunks.is_some() && !mm_slots {
                                 mm_pending = Some(req);
                             } else {
+                                // A TP pipe can finish its last live member
+                                // during this drain. Reclaim its rank-local KV
+                                // and recurrent state before admitting a new
+                                // request into the now-free scheduler slot;
+                                // the next outer-loop release would see only
+                                // the new occupant and miss the old owner.
+                                if generator.decode_pipe_context_limit().is_some() {
+                                    let live: Vec<bool> = slots.iter().map(Option::is_some).collect();
+                                    generator.release_inactive_slots(&live);
+                                }
                                 debit_pool_budget(&mut admit_budget, &req);
                                 admit(&mut slots, req, generator.max_context(), metrics);
                                 {
