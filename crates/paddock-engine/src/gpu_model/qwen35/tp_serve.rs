@@ -212,6 +212,30 @@ fn span_chunk_points(len: usize) -> Vec<usize> {
     points
 }
 
+/// Split at both the GPU row cap and each reserved logical checkpoint cut.
+/// A cut N is the state after rows [0,N), before any row N changes DeltaNet.
+fn span_checkpoint_points(start: usize, len: usize, cuts: &[(usize, u32)]) -> Result<Vec<usize>, String> {
+    let end = start.checked_add(len).ok_or("TP span range overflow")?;
+    if cuts.windows(2).any(|w| w[0].0 >= w[1].0)
+        || cuts.iter().any(|&(cut, _)| cut <= start || cut > end || !cut.is_multiple_of(crate::kv_pool::BLOCK_TOKENS))
+    {
+        return Err("TP span checkpoint cuts invalid".into());
+    }
+    let mut points = vec![0];
+    let mut at = 0;
+    while at < len {
+        let next_cut = cuts.iter().find(|&&(cut, _)| cut > start + at).map_or(end, |&(cut, _)| cut);
+        at += TP_SPAN_CAP.min(len - at).min(next_cut - start - at);
+        points.push(at);
+    }
+    Ok(points)
+}
+
+fn tp_suffix_rows(slot: usize, tokens: Vec<u32>, resume: usize) -> Vec<(usize, u32, usize)> {
+    tokens.into_iter().enumerate().skip(resume)
+        .map(|(pos, token)| (slot, token, pos)).collect()
+}
+
 /// Record rows already validated, authorized and enqueued. A prompt-only
 /// span must mark its slot occupied even before the first decode: release
 /// uses this bit to reclaim its pages on cancellation.
@@ -323,6 +347,11 @@ fn tp_prefill_cuts(t_len: usize, start: usize) -> Vec<usize> {
 /// there, because the slot's live DeltaNet state is exactly the state after
 /// row `cut - 1` - the state matching KV pages `[0, cut)`. Pure, shared by
 /// both ranks' snapshot discipline.
+fn tp_cuts_in_run(cuts: &[(usize, u32)], span_start: usize, rows: usize) -> Vec<(usize, u32)> {
+    let end = span_start.saturating_add(rows);
+    cuts.iter().filter(|&&(cut, _)| cut > span_start && cut <= end).copied().collect()
+}
+
 fn tp_cuts_crossed(cuts: &[(usize, u32)], span_start: usize, rows: usize) -> Vec<(usize, u32)> {
     let span_end = span_start.saturating_add(rows);
     cuts.iter()
@@ -390,10 +419,6 @@ struct PrefillChunk {
     fin_plan: Option<crate::sampler::DevicePlan>,
     /// Set when the first rows execute; persists over every partial tick.
     owner: Option<crate::generator::PrefillLane>,
-    /// Checkpoint reservations `(cut, index)` this prompt's prefill owns
-    /// (rank-0 order). Snapshot at a cut marks the entry; the finish tick
-    /// attaches the marked ones, publishes the pages, and recycles the rest.
-    ckpts: Vec<(usize, u32)>,
 }
 
 fn abort_queued_chunk(chunks: &mut VecDeque<PrefillChunk>, slot: usize) -> bool {
@@ -803,7 +828,7 @@ impl TpCoordinator {
     ) -> Result<(Option<u32>, Option<Vec<f32>>), String> {
         let mut sampled = None;
         let mut host_logits = None;
-        let points = span_chunk_points(run.len());
+        let points = span_checkpoint_points(run[0].2, run.len(), ckpts)?;
         for w in points.windows(2) {
             let (start, stop) = (w[0], w[1]);
             let tokens: Vec<u32> = run[start..stop].iter().map(|&(_, t, _)| t).collect();
@@ -1204,10 +1229,9 @@ impl TpCoordinator {
         }
         let removed = abort_queued_chunk(&mut self.chunks, slot);
         if removed {
-            // An aborted prompt's snapshots never attach: drop its cut
-            // records AND its reservations (the Release tick would recycle
-            // them, but a same-slot re-admit before that tick must not see
-            // stale entries).
+            // The subsequent mirrored Release recycles reservations and
+            // adopted refs. Keep the slot occupied until that release; an
+            // intervening same-slot Admit is rejected by MirroredKv.
             self.snapshotted_cuts.retain(|(s, _)| *s != slot);
             self.pending_ckpts.remove(&slot);
         }
@@ -1335,7 +1359,7 @@ impl TpCoordinator {
                 .get(&slot)
                 .cloned()
                 .unwrap_or_default();
-            tp_cuts_crossed(&pending, span_start, span_len)
+            tp_cuts_in_run(&pending, span_start, span_len)
         };
         ControlMessage::TpMixed {
             sequence: self.sequence + 1,
@@ -1394,12 +1418,7 @@ impl TpCoordinator {
             let kind = fin.as_ref().and_then(|(s, p)| {
                 (*s == slot).then(|| p.map_or(SpanFinishKind::HostLogits, SpanFinishKind::Device))
             });
-            let chunk_ckpts: Vec<(usize, u32)> = self
-                .chunks
-                .front()
-                .filter(|c| c.slot == slot)
-                .map(|c| c.ckpts.clone())
-                .unwrap_or_default();
+            let chunk_ckpts = wire_ckpts.clone();
             let (sampled, logits) = self.run_chunk_spans(slot, &chunk_rows, kind, &chunk_ckpts)?;
             if let Some(id) = sampled {
                 fin_ids[0] = id;
@@ -1420,6 +1439,11 @@ impl TpCoordinator {
                 ),
             };
             results.push((fin.slot, sample, fin.fin_rows));
+        }
+        // Verify rank-0 device work, including checkpoint copies, before any
+        // radix entry becomes visible to later admissions.
+        if !finishers.is_empty() {
+            self.model.synchronize().map_err(|e| e.to_string())?;
         }
         // Cache publication: every finisher's prefill completed successfully.
         // Attach the snapshotted checkpoints (only cuts this prefill actually
@@ -1451,17 +1475,15 @@ impl TpCoordinator {
             return Ok(()); // nothing admitted (serial path) - nothing to publish
         }
         let reservations = self.logical.slot_reserved_indices(slot);
-        if reservations.is_empty() {
-            return Ok(());
-        }
         let snapshotted: Vec<usize> = self
             .snapshotted_cuts
             .iter()
-            .filter(|(s, _)| *s == slot)
+            .filter(|(s, cut)| *s == slot && self.logical.slot_checkpoint_index(slot, *cut).is_none())
             .map(|(_, c)| *c)
             .collect();
-        // Attach + recycle + publish; the slot stays LIVE (its table refs
-        // drop at the scheduler's release tick, which mirrors the same
+        // Publish pages, attach snapshotted cuts, recycle the rest. The slot
+        // stays LIVE; its table refs drop at the scheduler's release tick,
+        // which mirrors the same
         // logical Release on both ranks).
         let ops = tp_publish_ops(slot, &reservations, tokens.clone(), &snapshotted);
         let kv_state =
@@ -1480,7 +1502,7 @@ impl TpCoordinator {
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
+        ready(&mut self.stream, seq)?;
         self.sequence = seq;
         self.snapshotted_cuts
             .retain(|(s, _)| *s != slot);
@@ -1578,11 +1600,12 @@ impl TpCoordinator {
             slot,
             tokens: tokens.clone(),
             resume,
+            cuts: reserved.iter().map(|&(cut, _)| cut).collect(),
             kv_state,
         }
         .to_stream(&mut self.stream)
         .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
+        ready(&mut self.stream, seq)?;
         self.sequence = seq;
         // Worker's DeltaNet restore rides the same TpReady as rank 0's: the
         // worker restores AFTER mirroring Admit, before its Ready; rank 0
@@ -1601,17 +1624,15 @@ impl TpCoordinator {
         // carry [resume..t_len), so mixed-tick validation must see the cursor
         // there (the worker sets its own cursor in TpPrefixAdmit).
         self.positions[slot] = resume;
+        // Admission owns reservations and possibly adopted pages even before
+        // the first GPU row. Release must see this slot after a queued abort.
+        self.occupied[slot] = true;
         self.pending_ckpts.insert(slot, reserved.clone());
         self.chunks.push_back(PrefillChunk {
             slot,
-            rows: tokens
-                .into_iter()
-                .enumerate()
-                .map(|(pos, token)| (slot, token, pos))
-                .collect(),
+            rows: tp_suffix_rows(slot, tokens, resume),
             fin_plan: None,
             owner: pinned_owner,
-            ckpts: reserved,
         });
         Ok(())
     }
@@ -1751,16 +1772,9 @@ impl TpCoordinator {
             .collect();
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
-        // Cold prompts only reach the lane (resumed ones are pinned Mixed),
-        // so a launch's cut list is empty in milestone 1 - but derive it
-        // honestly in case a cold prompt reserved cuts.
-        let wire_ckpts: Vec<(usize, u32)> = {
-            let slot = rows[0].0;
-            let span_start = rows[0].2;
-            let pending = self.pending_ckpts.get(&slot).cloned().unwrap_or_default();
-            let total = rows.len();
-            tp_cuts_crossed(&pending, span_start, total)
-        };
+        // Milestone 1 publishes pages from cold Async prompts but never
+        // checkpoints their separate lane-local recurrent state.
+        let wire_ckpts: Vec<(usize, u32)> = Vec::new();
         let seq = self.sequence + 1;
         ControlMessage::TpSpanLaunch {
             sequence: seq,
@@ -1935,6 +1949,14 @@ impl TpCoordinator {
                     ));
                 }
             }
+        }
+        if !results.is_empty() {
+            self.model.synchronize().map_err(|e| e.to_string())?;
+        }
+        for &(slot, _, _) in &results {
+            // Both ranks joined/promoted. Async stores pages only; its
+            // reservations were never snapshotted and are recycled here.
+            self.publish_slot_cache(slot, &[])?;
         }
         Ok(results)
     }
@@ -2509,13 +2531,14 @@ impl Generator for TpGenerator {
         // scheduler-side non-TP feature); the return is the admission's
         // resume position - the usage-report `cached` count. The admission
         // inside ChunkBegin writes slot_reused[slot] BEFORE the reply.
+        self.prefill_begin(slot, tokens)?;
         let reused = self
             .slot_reused
             .lock()
-            .ok()
-            .and_then(|g| g.get(slot).copied())
-            .unwrap_or(0);
-        self.prefill_begin(slot, tokens)?;
+            .map_err(|_| GenError::Backend("TP prefix accounting lock poisoned".into()))?
+            .get(slot)
+            .copied()
+            .ok_or_else(|| GenError::Backend("TP prefix accounting slot invalid".into()))?;
         Ok(reused)
     }
     fn take_prefill_reused(&mut self, slot: usize) -> usize {
@@ -2711,6 +2734,7 @@ pub fn run_worker(
         let mut logical = logical(max_ctx, slots)?;
         logical.set_state_capacity(ckpt_slots);
         let mut positions = vec![0; slots];
+        let mut worker_snapshotted: Vec<(usize, usize)> = Vec::new();
         let mut pipe_slots: Option<Vec<usize>> = None;
         let mut span_in_flight = false;
         // Finishing chunks of the in-flight span (wire shape, chunk order):
@@ -2918,6 +2942,7 @@ pub fn run_worker(
                         model.reset_slot(slot).map_err(|e| e.to_string())?;
                         model.reset_lane_slot(slot).map_err(|e| e.to_string())?;
                         positions[slot] = 0;
+                        worker_snapshotted.retain(|&(s, _)| s != slot);
                     }
                 }
                 ControlMessage::TpPrefixAdmit {
@@ -2925,6 +2950,7 @@ pub fn run_worker(
                     slot,
                     tokens,
                     resume,
+                    cuts,
                     kv_state,
                 } => {
                     if slot >= slots || tokens.is_empty() || tokens.len() >= max_ctx {
@@ -2938,11 +2964,21 @@ pub fn run_worker(
                     // checkpoint at EXACTLY the coordinator's resume position
                     // on this rank's tree. Failing here fails the whole pair
                     // before any state adoption - the rank-symmetry gate.
-                    let ops = vec![Operation::Admit {
+                    if cuts.windows(2).any(|w| w[0] >= w[1])
+                        || cuts.iter().any(|cut| !tp_prefill_cuts(tokens.len(), resume).contains(cut))
+                    {
+                        return Err("TP prefix admit cuts invalid".into());
+                    }
+                    let resume_idx = (resume > 0).then(|| logical.match_prefix_probe(&tokens).ckpt)
+                        .flatten()
+                        .filter(|&(position, _)| position == resume)
+                        .map(|(_, idx)| idx);
+                    let mut ops = vec![Operation::Admit {
                         slot,
                         tokens: tokens.clone(),
                         resume,
                     }];
+                    ops.extend(cuts.iter().map(|&position| Operation::CheckpointReserve { slot, position }));
                     logical
                         .mirror_tick(&ops, &wire_kv_state(kv_state)?)
                         .map_err(str::to_owned)?;
@@ -2951,11 +2987,10 @@ pub fn run_worker(
                     // coordinator proceeds, both ranks' slot state matches
                     // the checkpoint's logical position.
                     if resume > 0 {
-                        // The attached checkpoint at `resume` (the Admit
-                        // validated it exists on this rank's tree).
-                        let idx = logical
-                            .slot_checkpoint_index(slot, resume)
-                            .ok_or("TP worker resume checkpoint missing")?;
+                        // A reservation in this same admission may steal the
+                        // old radix attachment, but cannot overwrite its GPU
+                        // blob before this stream-ordered restore.
+                        let idx = resume_idx.ok_or("TP worker resume checkpoint missing")?;
                         model
                             .restore_slot_ckpt(slot, idx)
                             .map_err(|e| e.to_string())?;
@@ -2984,6 +3019,12 @@ pub fn run_worker(
                         return Err("TP prefix publish for unadmitted slot".into());
                     }
                     let reservations = logical.slot_reserved_indices(slot);
+                    if checkpoints.windows(2).any(|w| w[0].0 >= w[1].0)
+                        || snapshotted.iter().any(|&cut| !worker_snapshotted.contains(&(slot, cut)))
+                        || checkpoints.iter().any(|&(cut, idx)| logical.slot_reserved_ckpt(slot, cut) != Some(idx))
+                    {
+                        return Err("TP prefix publish cuts or snapshots mismatch".into());
+                    }
                     // Rank-symmetry gate: every cut the coordinator attached
                     // must have a reservation here. A missing one means the
                     // two ranks' snapshot disciplines diverged - fail closed
@@ -2999,6 +3040,7 @@ pub fn run_worker(
                     logical
                         .mirror_tick(&ops, &wire_kv_state(kv_state)?)
                         .map_err(str::to_owned)?;
+                    worker_snapshotted.retain(|&(s, _)| s != slot);
                 }
                 ControlMessage::TpBatch {
                     rows, kv_state, ..
@@ -3044,6 +3086,18 @@ pub fn run_worker(
                     // it neither samples nor reads logits back to the host.
                     let split = validate_mixed_worker_rows(&rows, chunk_rows, &positions, max_ctx)?;
                     let chunk = &rows[split..];
+                    if chunk.is_empty() && !ckpts.is_empty() {
+                        return Err("TP mixed cuts without prompt rows".into());
+                    }
+                    if !chunk.is_empty() {
+                        let slot = chunk[0].0;
+                        let reserved = logical.slot_reserved_indices(slot);
+                        let expected = tp_cuts_in_run(&reserved, chunk[0].2, chunk.len());
+                        if ckpts != expected {
+                            return Err("TP mixed cut list disagrees with reservations".into());
+                        }
+                        span_checkpoint_points(chunk[0].2, chunk.len(), &ckpts)?;
+                    }
                     let ops: Vec<Operation> = rows
                         .iter()
                         .map(|&(slot, _, position)| Operation::Ensure { slot, position })
@@ -3062,7 +3116,7 @@ pub fn run_worker(
                     }
                     if !chunk.is_empty() {
                         let slot = chunk[0].0;
-                        let points = span_chunk_points(chunk.len());
+                        let points = span_checkpoint_points(chunk[0].2, chunk.len(), &ckpts)?;
                         for w in points.windows(2) {
                             let (start, stop) = (w[0], w[1]);
                             let tokens: Vec<u32> =
@@ -3071,21 +3125,23 @@ pub fn run_worker(
                             model
                                 .forward_span_advance(&group, &logical, slot, &tokens, position)
                                 .map_err(|e| e.to_string())?;
-                            // Rank-local snapshot at exact cut ends (the wire
-                            // cut list was derived from the SAME rows both
-                            // ranks validate; indices are validation-only -
-                            // the worker attaches its own mirror-identical
-                            // reservation at publish).
-                            for (cut, _) in tp_cuts_crossed(&ckpts, position, stop - start) {
-                                if let Some(idx) = logical.slot_reserved_ckpt(slot, cut) {
-                                    model
-                                        .snapshot_slot_ckpt(slot, idx)
-                                        .map_err(|e| e.to_string())?;
+                            for (cut, wire_idx) in tp_cuts_crossed(&ckpts, position, stop - start) {
+                                let idx = logical.slot_reserved_ckpt(slot, cut)
+                                    .ok_or("TP worker snapshot reservation missing")?;
+                                if idx != wire_idx {
+                                    return Err("TP worker snapshot index mismatch".into());
                                 }
+                                model.snapshot_slot_ckpt(slot, idx).map_err(|e| e.to_string())?;
+                                worker_snapshotted.push((slot, cut));
                             }
                         }
                         for &(s, _, _) in chunk {
                             positions[s] += 1;
+                        }
+                        if !ckpts.is_empty() || positions[slot] == logical.slot_admitted_tokens(slot).len() {
+                            // Ready must certify completed GPU snapshots and
+                            // full pages before rank 0 publishes the prefix.
+                            model.synchronize().map_err(|e| e.to_string())?;
                         }
                     }
                 }
@@ -3105,8 +3161,8 @@ pub fn run_worker(
                     // both have no collectives and run only on rank 0; the
                     // finisher list exists so this rank promotes the same
                     // slots at the span finish.
-                    if rows.is_empty() {
-                        return Err("TP span launch membership invalid".into());
+                    if rows.is_empty() || !ckpts.is_empty() {
+                        return Err("TP span launch membership or checkpoint cuts invalid".into());
                     }
                     if finishers.len() > 1
                         || finishers.iter().any(|f| rows.last().map(|r| r.0) != Some(f.0))
@@ -3143,15 +3199,8 @@ pub fn run_worker(
                                     &group, &logical, slot, &tokens, position,
                                 )
                                 .map_err(|e| e.to_string())?;
-                            // Rank-local snapshot at exact cut ends (the lane
-                            // owns this slot's live DeltaNet state mid-prefill).
-                            for (cut, _) in tp_cuts_crossed(&ckpts, position, stop - start) {
-                                if let Some(idx) = logical.slot_reserved_ckpt(slot, cut) {
-                                    model
-                                        .snapshot_slot_ckpt(slot, idx)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                            }
+                            // Cold Async has no rank-local checkpoints in
+                            // milestone 1; publication recycles reservations.
                         }
                         for &(s, _, _) in run {
                             positions[s] += 1;
@@ -3197,6 +3246,7 @@ pub fn run_worker(
                             .promote_lane_slot(&mark, *slot, &live)
                             .map_err(|e| e.to_string())?;
                     }
+                    model.synchronize().map_err(|e| e.to_string())?;
                     span_in_flight = false;
                     span_finishers.clear();
                 }
@@ -3236,7 +3286,6 @@ mod tests {
             rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
             fin_plan: None,
             owner: None,
-            ckpts: Vec::new(),
         };
         let mut queue = VecDeque::from([prompt(1)]);
         let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 2, Mixed).unwrap();
@@ -3282,7 +3331,6 @@ mod tests {
             rows: vec![(1, 7, 0)],
             fin_plan: None,
             owner: None,
-            ckpts: Vec::new(),
         }]);
         assert!(abort_queued_chunk(&mut queue, 1));
         queue.push_back(PrefillChunk {
@@ -3290,7 +3338,6 @@ mod tests {
             rows: vec![(1, 8, 0)],
             fin_plan: None,
             owner: None,
-            ckpts: Vec::new(),
         });
         assert_eq!(queue.front().map(|chunk| chunk.slot), Some(1));
     }
@@ -3304,7 +3351,6 @@ mod tests {
             rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
             fin_plan: None,
             owner: None,
-            ckpts: Vec::new(),
         };
         let mut queue = VecDeque::from([prompt(0)]);
         let mut async_launches = 0usize;
@@ -3358,21 +3404,18 @@ mod tests {
             rows: vec![(0, 9, 64), (0, 9, 65)],
             fin_plan: None,
             owner: Some(crate::generator::PrefillLane::Mixed),
-            ckpts: Vec::new(),
         };
         let cold = PrefillChunk {
             slot: 0,
             rows: vec![(0, 9, 0), (0, 9, 1)],
             fin_plan: None,
             owner: Some(crate::generator::PrefillLane::Mixed),
-            ckpts: Vec::new(),
         };
         let unpinned = PrefillChunk {
             slot: 0,
             rows: vec![(0, 9, 64), (0, 9, 65)],
             fin_plan: None,
             owner: None,
-            ckpts: Vec::new(),
         };
         let is_resumed = |c: &PrefillChunk| c.owner == Some(crate::generator::PrefillLane::Mixed) && !c.rows.is_empty() && c.rows[0].2 > 0;
         assert!(is_resumed(&resumed), "resumed chunk must be detected");
@@ -3386,24 +3429,45 @@ mod tests {
     fn chunk_take_starts_at_the_resume_position() {
         let resume = 64usize;
         let t_len = 100usize;
-        let rows: Vec<(usize, u32, usize)> = (resume..t_len)
-            .map(|pos| (0usize, 7u32, pos))
-            .collect();
+        let rows = tp_suffix_rows(0, vec![7; t_len], resume);
         let mut queue = VecDeque::from([PrefillChunk {
             slot: 0,
-            rows: rows.clone(),
+            rows,
             fin_plan: None,
             owner: Some(crate::generator::PrefillLane::Mixed),
-            ckpts: Vec::new(),
         }]);
         let (taken, finished) =
-            TpCoordinator::chunk_take(&mut queue, rows.len(), crate::generator::PrefillLane::Mixed)
+            TpCoordinator::chunk_take(&mut queue, t_len - resume, crate::generator::PrefillLane::Mixed)
                 .unwrap();
         assert_eq!(taken.len(), t_len - resume);
         assert_eq!(taken.first().unwrap().2, resume, "first row is the resume position");
         assert_eq!(taken.last().unwrap().2, t_len - 1);
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].fin_rows, t_len);
+    }
+
+    #[test]
+    fn checkpoint_spans_split_at_each_logical_cut_and_reject_bad_wire() {
+        for (len, cuts) in [
+            (15, vec![]), (16, vec![]), (17, vec![(16, 0)]),
+            (31, vec![(16, 0)]), (32, vec![(16, 0)]),
+            (33, vec![(16, 0), (32, 1)]),
+            (63, vec![(48, 0)]), (64, vec![(48, 0)]),
+            (65, vec![(48, 0), (64, 1)]),
+            (100, vec![(80, 0), (96, 1)]),
+        ] {
+            let points = span_checkpoint_points(0, len, &cuts).unwrap();
+            assert_eq!(points.first(), Some(&0));
+            assert_eq!(points.last(), Some(&len));
+            assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= TP_SPAN_CAP));
+            assert!(cuts.iter().all(|(cut, _)| points.contains(cut)), "len={len}");
+        }
+        let shifted = span_checkpoint_points(64, 36, &[(80, 0), (96, 1)]).unwrap();
+        assert!(shifted.contains(&16) && shifted.contains(&32));
+        for bad in [vec![(96, 0), (80, 1)], vec![(80, 0), (80, 1)],
+                    vec![(81, 0)], vec![(112, 0)]] {
+            assert!(span_checkpoint_points(64, 36, &bad).is_err());
+        }
     }
 
     #[test]

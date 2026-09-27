@@ -575,6 +575,10 @@ impl DeltaTpRank {
     pub fn local_state_bytes(&self) -> usize {
         (self.recurrent.len() + self.conv.len()) * 4
     }
+    /// Device bytes actually allocated to this layer's checkpoint pool.
+    pub fn checkpoint_pool_bytes(&self) -> usize {
+        self.ckpt_pool.iter().map(|(r, c)| (r.len() + c.len()) * 4).sum()
+    }
     /// Exact per-slot recurrent-state bytes (one checkpoint slot's half).
     pub fn recurrent_bytes(&self) -> usize {
         self.recurrent.len() * 4

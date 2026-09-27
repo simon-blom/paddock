@@ -429,7 +429,7 @@ impl Qwen35TpRank {
     }
     /// This rank's context-state bytes, exactly (Phase 12 rank-local memory
     /// accounting): each full-attn layer's rank-local K/V slab pair plus each
-    /// DeltaNet layer's rank-local recurrent/conv slot state. Identical on
+    /// DeltaNet layer's rank-local recurrent/conv state and checkpoint pool. Identical on
     /// both ranks by construction (the shard geometry is symmetric), so the
     /// service's memory-breakdown API can report "per rank" honestly without
     /// any cross-rank query.
@@ -438,7 +438,7 @@ impl Qwen35TpRank {
             .iter()
             .map(|layer| match &layer.mixer {
                 TpMixer::Full(gqa) => gqa.local_kv_bytes() as u64,
-                TpMixer::Linear(delta) => delta.local_state_bytes() as u64,
+                TpMixer::Linear(delta) => (delta.local_state_bytes() + delta.checkpoint_pool_bytes()) as u64,
             })
             .sum()
     }

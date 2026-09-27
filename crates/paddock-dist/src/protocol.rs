@@ -240,6 +240,9 @@ pub enum ControlMessage {
         slot: usize,
         tokens: Vec<u32>,
         resume: usize,
+        /// Ordered cuts reserved by rank 0; rank 1 reserves the same cuts
+        /// before comparing the mirrored logical state.
+        cuts: Vec<usize>,
         kv_state: serde_json::Value,
     },
     /// Prefix-cache publication (v4): attach the checkpoint indices the
@@ -412,6 +415,7 @@ mod tests {
             slot: 1,
             tokens: vec![5, 6, 7],
             resume: 32,
+            cuts: vec![],
             kv_state: serde_json::json!({"tables": []}),
         };
         let json = serde_json::to_string(&admit).unwrap();

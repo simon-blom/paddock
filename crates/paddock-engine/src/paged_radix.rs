@@ -119,8 +119,8 @@ pub struct PagedRadix {
     /// `(slot, cut position, pool index)`. The blob is written only after the
     /// GPU snapshot succeeds; `attach_reserved_at` then consumes the
     /// reservation, and slot release/flush recycles unconsumed ones. Deliberate
-    /// replay state (same class as the LRU clock): both mirrored ranks run the
-    /// same Reserve/Attach/Release sequence, so the lists cannot diverge.
+    /// replay state: both ranks run the same Reserve/Attach/Release sequence,
+    /// and the TP snapshot compares these lists and the radix digest.
     state_reserved: Vec<(usize, usize, u32)>,
     /// Admission control on the state pool: once a checkpoint belongs to a
     /// prefix that has recurred, stop stealing it - let the pool fill and hold.
@@ -364,8 +364,8 @@ impl PagedRadix {
     /// it is held in `state_reserved` until `attach_reserved_at` consumes it
     /// (after the rank-local GPU snapshot succeeded) or the owning slot
     /// releases. Deterministic replay state: both ranks run the same
-    /// Reserve/Attach sequence, so the lists cannot diverge; deliberately not
-    /// part of `Snapshot` (same class as the LRU clock).
+    /// Reserve/Attach sequence; the TP mirror digest and explicit reservation
+    /// snapshot also compare this state across ranks.
     pub(crate) fn reserve_state_for(&mut self, slot: usize, pos: usize) -> Option<u32> {
         if pos == 0 || !pos.is_multiple_of(BLOCK_TOKENS) {
             return None;
@@ -420,7 +420,9 @@ impl PagedRadix {
             }
             node = child;
         }
-        if node == 0 || self.nodes[node as usize].state_blk.is_some() {
+        if node == 0 || self.nodes[node as usize].state_blk.is_some()
+            || self.state_reserved[at].2 != want
+        {
             return false;
         }
         self.state_reserved.remove(at);
@@ -435,6 +437,69 @@ impl PagedRadix {
             .filter(|(s, _, _)| *s == slot)
             .map(|(_, p, i)| (*p, *i))
             .collect()
+    }
+
+    /// Deterministic digest of cache decisions, including exact token keys,
+    /// insertion/free-list order, LRU, checkpoint attachments and reservations.
+    /// HashMap iteration order is sorted before hashing. TP has no tier keys.
+    pub(crate) fn mirror_digest(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&(self.nodes.len() as u64).to_le_bytes());
+        for node in &self.nodes {
+            h.update(&node.parent.to_le_bytes());
+            h.update(&node.block.to_le_bytes());
+            h.update(&node.key.to_le_bytes());
+            h.update(&node.last_used.to_le_bytes());
+            h.update(&[u8::from(node.alive), u8::from(node.recurred)]);
+            h.update(&node.state_blk.unwrap_or(u32::MAX).to_le_bytes());
+            h.update(&(node.tokens.len() as u64).to_le_bytes());
+            for token in &node.tokens { h.update(&token.to_le_bytes()); }
+            let mut children: Vec<_> = node.children.iter().collect();
+            children.sort_unstable_by_key(|&(key, _)| *key);
+            h.update(&(children.len() as u64).to_le_bytes());
+            for (key, child) in children {
+                h.update(&key.to_le_bytes());
+                h.update(&child.to_le_bytes());
+            }
+        }
+        h.update(&(self.free_nodes.len() as u64).to_le_bytes());
+        for index in &self.free_nodes { h.update(&index.to_le_bytes()); }
+        h.update(&self.clock.to_le_bytes());
+        h.update(&[u8::from(self.protect_proven)]);
+        h.update(&(self.state_free.len() as u64).to_le_bytes());
+        for index in &self.state_free { h.update(&index.to_le_bytes()); }
+        h.update(&(self.state_reserved.len() as u64).to_le_bytes());
+        for &(slot, cut, index) in &self.state_reserved {
+            h.update(&(slot as u64).to_le_bytes());
+            h.update(&(cut as u64).to_le_bytes());
+            h.update(&index.to_le_bytes());
+        }
+        *h.finalize().as_bytes()
+    }
+
+    /// Consume one reservation exactly once; an attached or already recycled
+    /// index is never returned to the free list a second time.
+    pub(crate) fn recycle_reserved(&mut self, slot: usize, pos: usize, idx: u32) -> bool {
+        let Some(at) = self.state_reserved.iter().position(|&(s, p, i)|
+            s == slot && p == pos && i == idx
+        ) else {
+            return false;
+        };
+        self.state_reserved.remove(at);
+        self.state_free.push(idx);
+        true
+    }
+
+    pub(crate) fn free_state_slots(&self) -> usize {
+        self.state_free.len() + self.nodes.iter().filter(|n| n.alive && n.state_blk.is_some()).count()
+    }
+
+    pub(crate) fn reserved_state(&self) -> &[(usize, usize, u32)] {
+        &self.state_reserved
+    }
+
+    pub(crate) fn free_state_indices(&self) -> &[u32] {
+        &self.state_free
     }
 
     /// Drop every reservation owned by `slot`, returning their indices to the

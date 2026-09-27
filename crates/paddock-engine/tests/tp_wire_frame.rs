@@ -285,6 +285,7 @@ fn tp_prefix_admit_and_publish_stay_inside_the_frame_cap() {
         slot: 1,
         tokens: tokens.clone(),
         resume: 20_480.min((tokens.len() - 1) / 16 * 16), // deepest block-aligned
+        cuts: vec![],
         kv_state: serde_json::to_value(coord.snapshot()).expect("snapshot"),
     };
     let frame = admit.to_frame().expect("encode admit");

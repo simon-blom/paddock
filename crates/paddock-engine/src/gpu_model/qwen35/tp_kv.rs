@@ -29,20 +29,21 @@ pub enum Operation {
         resume: usize,
     },
     /// Claim a checkpoint pool index for the upcoming snapshot at cut
-    /// `position` of `tokens` (which must be a cached node boundary). The
+    /// `position` of the admitted slot tokens (a future cached node boundary). The
     /// index is reserved (not yet attached) so publication can happen after
     /// the GPU work succeeds; undo with `CheckpointRecycle`.
-    CheckpointReserve { tokens: Vec<u32>, position: usize },
+    CheckpointReserve { slot: usize, position: usize },
     /// Attach a previously reserved index at `position` of `tokens` (after
     /// the rank-local snapshot succeeded). Fails when nothing is reserved
     /// there.
     CheckpointAttach {
+        slot: usize,
         tokens: Vec<u32>,
         position: usize,
         index: u32,
     },
     /// Return a reserved-but-unattached index to the free list.
-    CheckpointRecycle { index: u32 },
+    CheckpointRecycle { slot: usize, position: usize, index: u32 },
 }
 
 /// The prefix-probe result for a resume decision (see
@@ -57,6 +58,10 @@ pub struct Snapshot {
     pub tables: Vec<Vec<u32>>,
     pub refcounts: Vec<u32>,
     pub free: usize,
+    pub checkpoint_free: Vec<u32>,
+    pub checkpoint_reserved: Vec<(usize, usize, u32)>,
+    pub token_digests: Vec<(usize, [u8; 32])>,
+    pub radix_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -178,16 +183,22 @@ impl MirroredKv {
         cuts: &[usize],
     ) -> Result<Vec<(usize, u32)>, &'static str> {
         let mut out = Vec::with_capacity(cuts.len());
+        let len = self.tokens.get(slot).ok_or("TP reserve: slot not admitted")?.len();
         for &cut in cuts {
+            if cut == 0 || cut >= len || !cut.is_multiple_of(BLOCK_TOKENS) {
+                return Err("TP checkpoint cut invalid");
+            }
             if self.slot_reserved_ckpt(slot, cut).is_some() {
                 continue;
             }
-            let tokens = self.tokens.get(slot).ok_or("TP reserve: slot not admitted")?;
-            let tokens = tokens.clone();
-            self.apply(&Operation::CheckpointReserve {
-                tokens,
-                position: cut,
-            })?;
+            // Exhaustion is an optional-cache miss, not a request failure.
+            if self.radix.free_state_slots() == 0 {
+                break;
+            }
+            let op = Operation::CheckpointReserve { slot, position: cut };
+            if self.authorize_all(&[op]).is_err() {
+                break; // e.g. protected checkpoints may not be stolen
+            }
             if let Some(idx) = self.slot_reserved_ckpt(slot, cut) {
                 out.push((cut, idx));
             }
@@ -208,6 +219,14 @@ impl MirroredKv {
                 .map(|b| self.pool.refcount(b))
                 .collect(),
             free: self.pool.free_blocks(),
+            checkpoint_free: self.radix.free_state_indices().to_vec(),
+            checkpoint_reserved: self.radix.reserved_state().to_vec(),
+            radix_digest: self.radix.mirror_digest(),
+            token_digests: self.tokens.iter().map(|t| {
+                let mut hasher = blake3::Hasher::new();
+                for token in t { hasher.update(&token.to_le_bytes()); }
+                (t.len(), *hasher.finalize().as_bytes())
+            }).collect(),
         }
     }
 
@@ -338,8 +357,12 @@ impl MirroredKv {
                 }
                 let t = self.tables.get_mut(*slot).ok_or("KV slot out of range")?;
                 let needed = *position / BLOCK_TOKENS + 1;
-                if needed.saturating_sub(t.blocks().len()) > self.pool.free_blocks() {
-                    return Err("KV pool exhausted");
+                while needed.saturating_sub(t.blocks().len()) > self.pool.free_blocks() {
+                    // A shared page may lose its radix ref without becoming
+                    // free. Keep evicting until enough actual capacity exists.
+                    if self.radix.evict_lru(&mut self.pool).is_none() {
+                        return Err("KV pool exhausted");
+                    }
                 }
                 t.ensure(*position, &mut self.pool)
                     .map_err(|_| "KV pool exhausted")?;
@@ -402,6 +425,11 @@ impl MirroredKv {
                 if *slot >= self.tables.len() || tokens.len() > self.max_ctx || tokens.is_empty() {
                     return Err("TP admit slot or prompt out of range");
                 }
+                if !self.tokens[*slot].is_empty() || !self.tables[*slot].blocks().is_empty()
+                    || !self.radix.slot_reservations(*slot).is_empty()
+                {
+                    return Err("TP admit requires a released slot");
+                }
                 let reused = if *resume > 0 {
                     // One authoritative adoption walk: both ranks require the
                     // cached chain AND its checkpoint at exactly the
@@ -434,40 +462,34 @@ impl MirroredKv {
                 self.tokens[*slot] = tokens.clone();
                 self.admitted_reused = Some(reused);
             }
-            Operation::CheckpointReserve { tokens, position } => {
-                if tokens.len() > self.max_ctx {
-                    return Err("TP checkpoint reserve tokens out of range");
+            Operation::CheckpointReserve { slot, position } => {
+                let tokens = self.tokens.get(*slot).ok_or("TP checkpoint reserve slot invalid")?;
+                if tokens.is_empty() || *position == 0 || *position >= tokens.len()
+                    || !position.is_multiple_of(BLOCK_TOKENS)
+                    || self.radix.reserved_index(*slot, *position).is_some()
+                {
+                    return Err("TP checkpoint reservation invalid");
                 }
-                let slot = self
-                    .tokens
-                    .iter()
-                    .position(|t| t.as_slice() == tokens.as_slice())
-                    .ok_or("TP checkpoint reserve for unadmitted prompt")?;
                 self.radix
-                    .reserve_state_for(slot, *position)
+                    .reserve_state_for(*slot, *position)
                     .ok_or("TP checkpoint reserve exhausted")?;
             }
             Operation::CheckpointAttach {
+                slot,
                 tokens,
                 position,
                 index,
             } => {
-                let slot = self
-                    .tokens
-                    .iter()
-                    .position(|t| t.as_slice() == tokens.as_slice())
-                    .ok_or("TP checkpoint attach for unadmitted prompt")?;
-                if !self
-                    .radix
-                    .attach_reserved_at(slot, tokens, *position, *index)
+                if self.tokens.get(*slot).map(Vec::as_slice) != Some(tokens.as_slice())
+                    || !self.radix.attach_reserved_at(*slot, tokens, *position, *index)
                 {
-                    return Err("TP checkpoint attach has no reservation");
+                    return Err("TP checkpoint attach has no matching reservation");
                 }
             }
-            Operation::CheckpointRecycle { index } => {
-                // Reserved-only index: putting it straight back on the free
-                // list is the exact inverse of alloc_state's pop.
-                self.radix.recycle_state(*index);
+            Operation::CheckpointRecycle { slot, position, index } => {
+                if !self.radix.recycle_reserved(*slot, *position, *index) {
+                    return Err("TP checkpoint reservation already consumed or mismatched");
+                }
             }
         }
         Ok(())
@@ -489,18 +511,21 @@ pub fn tp_publish_ops(
     snapshotted: &[usize],
 ) -> Vec<Operation> {
     let mut ops = Vec::with_capacity(reservations.len() + 1);
+    // The new radix nodes must exist before an attached cut can be found.
+    // authorize_all stages this entire sequence atomically.
+    ops.push(Operation::Publish { slot, tokens: tokens.clone() });
     for &(pos, idx) in reservations {
         if snapshotted.contains(&pos) {
             ops.push(Operation::CheckpointAttach {
+                slot,
                 tokens: tokens.clone(),
                 position: pos,
                 index: idx,
             });
         } else {
-            ops.push(Operation::CheckpointRecycle { index: idx });
+            ops.push(Operation::CheckpointRecycle { slot, position: pos, index: idx });
         }
     }
-    ops.push(Operation::Publish { slot, tokens });
     ops
 }
 
@@ -796,7 +821,7 @@ mod tests {
         cut: usize,
     ) -> (u32, u32) {
         let ops = vec![Operation::CheckpointReserve {
-            tokens: tokens.to_vec(),
+            slot,
             position: cut,
         }];
         let end = head.authorize_all(&ops).unwrap();
@@ -804,6 +829,7 @@ mod tests {
         let idx_head = head.slot_reserved_ckpt(slot, cut).unwrap();
         let idx_worker = worker.slot_reserved_ckpt(slot, cut).unwrap();
         let ops2 = vec![Operation::CheckpointAttach {
+            slot,
             tokens: tokens.to_vec(),
             position: cut,
             index: idx_head,
@@ -1053,22 +1079,149 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                Operation::CheckpointRecycle { index: 3 },
+                Operation::Publish { slot: 1, tokens: tokens.clone() },
+                Operation::CheckpointRecycle { slot: 1, position: 64, index: 3 },
                 Operation::CheckpointAttach {
+                    slot: 1,
                     tokens: tokens.clone(),
                     position: 80,
                     index: 5,
-                },
-                Operation::Publish {
-                    slot: 1,
-                    tokens,
                 },
             ]
         );
         // everything snapshotted: no recycles
         let ops2 = tp_publish_ops(0, &[(64, 3)], vec![2u32; 32], &[64]);
-        assert!(matches!(ops2[0], Operation::CheckpointAttach { position: 64, index: 3, .. }));
-        assert!(matches!(ops2[1], Operation::Publish { slot: 0, .. }));
+        assert!(matches!(ops2[0], Operation::Publish { slot: 0, .. }));
+        assert!(matches!(ops2[1], Operation::CheckpointAttach { position: 64, index: 3, .. }));
+    }
+
+    #[test]
+    fn abort_before_first_chunk_releases_admission_reservations() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        head.set_state_capacity(1);
+        worker.set_state_capacity(1);
+        let tokens = vec![7; 97];
+        let admit = [Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 },
+            Operation::CheckpointReserve { slot: 0, position: 80 }];
+        let end = head.authorize_all(&admit).unwrap();
+        worker.mirror_tick(&admit, &end).unwrap();
+        assert!(head.authorize_all(&[Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 }]).is_err());
+        let release = [Operation::Release { slot: 0 }];
+        let end = head.authorize_all(&release).unwrap();
+        worker.mirror_tick(&release, &end).unwrap();
+        assert!(head.snapshot().checkpoint_reserved.is_empty());
+        assert_eq!(head.snapshot().checkpoint_free, vec![0]);
+        let end = head.authorize_all(&[Operation::Admit { slot: 0, tokens, resume: 0 }]).unwrap();
+        worker.mirror_tick(&[Operation::Admit { slot: 0, tokens: vec![7; 97], resume: 0 }], &end).unwrap();
+    }
+
+    #[test]
+    fn cached_pages_evict_to_satisfy_new_ensure() {
+        let mut kv = MirroredKv::new(3, 1, 64).unwrap();
+        let tokens: Vec<u32> = (0..33).collect();
+        kv.authorize_all(&[Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 },
+            Operation::Ensure { slot: 0, position: 31 },
+            Operation::Publish { slot: 0, tokens }]).unwrap();
+        kv.authorize_all(&[Operation::Release { slot: 0 }]).unwrap();
+        assert_eq!(kv.snapshot().free, 1);
+        kv.authorize_all(&[Operation::Admit { slot: 0, tokens: vec![99; 33], resume: 0 },
+            Operation::Ensure { slot: 0, position: 31 }]).unwrap();
+        assert_eq!(kv.snapshot().free, 0);
+        assert_eq!(kv.tables[0].blocks().len(), 2);
+    }
+
+    #[test]
+    fn overlapping_identical_slots_reserve_distinct_indices() {
+        let mut kv = mk(128, 2);
+        kv.set_state_capacity(2);
+        let tokens = vec![5; 97];
+        kv.authorize_all(&[Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 },
+            Operation::Admit { slot: 1, tokens, resume: 0 }]).unwrap();
+        assert_eq!(kv.reserve_cuts_for_slot(0, &[80]).unwrap(), vec![(80, 0)]);
+        assert_eq!(kv.reserve_cuts_for_slot(1, &[80]).unwrap(), vec![(80, 1)]);
+        assert_eq!(kv.slot_reserved_ckpt(0, 80), Some(0));
+        assert_eq!(kv.slot_reserved_ckpt(1, 80), Some(1));
+    }
+
+    #[test]
+    fn cold_publish_release_and_identical_or_divergent_resume_mirror() {
+        let mut head = mk(256, 2);
+        let mut worker = mk(256, 2);
+        head.set_state_capacity(4);
+        worker.set_state_capacity(4);
+        let tokens: Vec<u32> = (0..97).collect();
+        let admit = vec![Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 },
+            Operation::CheckpointReserve { slot: 0, position: 80 },
+            Operation::CheckpointReserve { slot: 0, position: 96 }];
+        let end = head.authorize_all(&admit).unwrap();
+        worker.mirror_tick(&admit, &end).unwrap();
+        let reservations = head.slot_reserved_indices(0);
+        assert_eq!(reservations, worker.slot_reserved_indices(0));
+        let ensure = vec![Operation::Ensure { slot: 0, position: 96 }];
+        let end = head.authorize_all(&ensure).unwrap();
+        worker.mirror_tick(&ensure, &end).unwrap();
+        // Production ordering: new nodes and both checkpoint attachments in
+        // ONE staged publish, not the earlier seed-then-attach test sequence.
+        let publish = tp_publish_ops(0, &reservations, tokens.clone(), &[80, 96]);
+        let end = head.authorize_all(&publish).unwrap();
+        worker.mirror_tick(&publish, &end).unwrap();
+        assert_eq!(head.match_prefix_probe(&tokens).ckpt.map(|(p, _)| p), Some(96));
+        let release = vec![Operation::Release { slot: 0 }];
+        let end = head.authorize_all(&release).unwrap();
+        worker.mirror_tick(&release, &end).unwrap();
+        assert_eq!(head.snapshot().checkpoint_reserved, Vec::new());
+        for (prompt, expected) in [(tokens.clone(), 96), {
+            let mut divergent = tokens[..80].to_vec();
+            divergent.extend(1000..1033);
+            (divergent, 80)
+        }] {
+            let probe = head.match_prefix_probe(&prompt);
+            assert_eq!(probe.ckpt.map(|(p, _)| p), Some(expected));
+            let resume = tp_resume_decision(probe.ckpt, prompt.len(), 2);
+            let op = vec![Operation::Admit { slot: 1, tokens: prompt, resume }];
+            let end = head.authorize_all(&op).unwrap();
+            worker.mirror_tick(&op, &end).unwrap();
+            assert_eq!(head.tables[1].blocks().len(), expected / BLOCK_TOKENS);
+            let done = vec![Operation::Release { slot: 1 }];
+            let end = head.authorize_all(&done).unwrap();
+            worker.mirror_tick(&done, &end).unwrap();
+        }
+    }
+
+    #[test]
+    fn reservation_recycles_once_and_zero_capacity_serves_pages_only() {
+        let mut kv = mk(128, 2);
+        kv.set_state_capacity(0);
+        let tokens: Vec<u32> = (0..65).collect();
+        kv.authorize_all(&[Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 }]).unwrap();
+        assert!(kv.reserve_cuts_for_slot(0, &[48, 64]).unwrap().is_empty());
+        kv.authorize_all(&[Operation::Ensure { slot: 0, position: 64 }]).unwrap();
+        kv.authorize_all(&tp_publish_ops(0, &[], tokens.clone(), &[])).unwrap();
+        kv.authorize_all(&[Operation::Release { slot: 0 }]).unwrap();
+        assert!(kv.match_prefix_probe(&tokens).ckpt.is_none());
+        kv.set_state_capacity(1);
+        kv.authorize_all(&[Operation::Admit { slot: 0, tokens: tokens.clone(), resume: 0 }]).unwrap();
+        let reserved = kv.reserve_cuts_for_slot(0, &[48, 64]).unwrap();
+        assert_eq!(reserved.len(), 1);
+        let (position, index) = reserved[0];
+        let recycle = Operation::CheckpointRecycle { slot: 0, position, index };
+        kv.authorize_all(std::slice::from_ref(&recycle)).unwrap();
+        assert!(kv.authorize_all(&[recycle]).is_err());
+        assert_eq!(kv.snapshot().checkpoint_free, vec![index]);
+    }
+
+    #[test]
+    fn mirror_refuses_unmirrored_reservation_even_when_pages_match() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        head.set_state_capacity(1);
+        worker.set_state_capacity(1);
+        let tokens: Vec<u32> = (0..65).collect();
+        let admit = Operation::Admit { slot: 0, tokens, resume: 0 };
+        let end = head.authorize_all(&[admit.clone(), Operation::CheckpointReserve { slot: 0, position: 48 }]).unwrap();
+        assert!(worker.mirror_tick(&[admit], &end).is_err());
+        assert!(worker.slot_admitted_tokens(0).is_empty());
     }
 
     #[test]
