@@ -1,11 +1,12 @@
 # Qwen3.8 TP=2 wider span-cap sweep
 
 Date: 2026-09-28
-Tested HEAD: `a882ab99f5903d83ca742bd66cd4bd173325e3b2` (`tp: batch DeltaNet alpha beta preparation on prefill spans`)
+Starting HEAD: `a9172c1dde9efb5d5aa8ca280a0e174dba488f11`
+Allowlist commit: `28938243ab3744e141867939f8e1fc70441f7b4f` (`tp: permit wider experimental span caps`)
 
 ## Scope and setup
 
-This was intended as an unprofiled cold-chat sweep of `PADDOCK_TP_SPAN_CAP` at 384, 512, 1024, and 2048. The production default was not changed and `PADDOCK_TP_PREFILL_PROFILE` was unset for every attempt.
+This was an unprofiled fresh-server cold-chat sweep of `PADDOCK_TP_SPAN_CAP` at 384, 512, 1024, and 2048. `PADDOCK_TP_PREFILL_PROFILE` was unset for every headline run. The production default remains 64.
 
 The launcher used the existing two-node TP=2 configuration with:
 
@@ -16,58 +17,84 @@ The launcher used the existing two-node TP=2 configuration with:
 - `enable_thinking=false`, temperature 0, seed 1, max output 64
 - expected prompt size: 22,130 tokens
 
-The existing launcher performed its normal rank-0/rank-1 bootstrap. Before the second attempt, the exact current runner and CUDA pack were staged to the configured worker paths because the pre-existing remote runner hash was stale. The resulting runner hash was `08a8f015b2b9e4236000ba3687fee3a65e66d8baaa20e51dfe7fd0bf311cd89b` on both nodes; the pack hash was `c58133072ed1f339201168b5f5eb7ecf0056ad7edb251e8f1224554d0e9b321e` on both nodes.
+The exact release runner and CUDA pack were staged to the configured worker path before the sweep. Runner SHA-256 was `54864930e28cca4b859efe35b898f395d5d8b0f6cc1bb960e26ba5576f215207` on both nodes. CUDA pack SHA-256 was `c58133072ed1f339201168b5f5eb7ecf0056ad7edb251e8f1224554d0e9b321e` on both nodes.
 
-## Results
+## Phase 1: guard inspection and minimal change
 
-The requested wider values are rejected during engine startup by the existing explicit span-cap gate. No HTTP server became ready, so there are no cold-chat wall times, prompt/completion token counts, prompt throughput values, generated outputs, or output hashes for these four caps.
+The previous failure was an explicit validation gate, not a discovered CUDA or kernel limit. `tp_span_cap.rs` resolved the coordinator environment value and the rank-1 wire value through `SWEEP_CAPS`; the old array was `[64, 128, 192]`. Span-sized GPU allocations already derived their dimensions from the resolved runtime cap, including the TP span planes, DeltaNet prefill scratch, quantization staging, and chunked-scan scratch. Relevant allocations use expressions such as `cap * width` and `(cap.div_ceil(64) + 32) * ...`; no separate 192-row static buffer or kernel guard was found.
 
-| Span cap | Cold wall | Prompt tok/s | vs 192 | Output | Startup / errors / notes |
-|---:|---:|---:|---:|---|---|
-| 64 | 102.973 s historical | 214.9 effective historical | 0.339x | historical | Existing optimized result; production default remains 64 |
-| 192 | 34.823 s historical | 635.5 effective historical | baseline | historical | Existing optimized result; fastest previously measured lane |
-| 384 | N/A | N/A | N/A | N/A | Startup failed: `PADDOCK_TP_SPAN_CAP=384 unsupported: use one of [64, 128, 192] (default 64)`; coordinator 1, worker 1 |
-| 512 | N/A | N/A | N/A | N/A | Startup failed: `PADDOCK_TP_SPAN_CAP=512 unsupported: use one of [64, 128, 192] (default 64)`; coordinator 1, worker 1 |
-| 1024 | N/A | N/A | N/A | N/A | Startup failed: `PADDOCK_TP_SPAN_CAP=1024 unsupported: use one of [64, 128, 192] (default 64)`; coordinator 1, worker 1 |
-| 2048 | N/A | N/A | N/A | N/A | Startup failed: `PADDOCK_TP_SPAN_CAP=2048 unsupported: use one of [64, 128, 192] (default 64)`; coordinator 1, worker 1 |
+The smallest experimental change was therefore limited to `tp_span_cap.rs`:
 
-The historical cap-192 result is 2.957x faster than the historical cap-64 result, or 65.9% lower wall time. Effective prompt throughput from the 22,130-token workload is approximately 214.9 tok/s at cap 64 and 635.5 tok/s at cap 192. These calculations are historical context, not new measurements from this sweep.
+- `DEFAULT_TP_SPAN_CAP` remains 64.
+- `SWEEP_CAPS` is now exactly `[64, 128, 192, 384, 512, 1024, 2048]`.
+- `MAX_TP_SPAN_CAP` is updated from 192 to 2048 as the documented largest experimental geometry.
+- `SpanCapError.allowed` and the parser unit expectation were widened to seven entries.
+- Arbitrary values remain rejected by the same allowlist and wire validation.
 
-## Failure classification and logs
+No kernel, scheduler, protocol, or allocation implementation was redesigned. Host validation passed:
 
-Each cap was attempted with a fresh launcher/server lifecycle. Rank 0 reached TP bootstrap, connected rank 1, and began model loading. Engine startup then rejected the value before HTTP readiness. This is an explicit configured-size allowlist restriction, not an allocation/OOM, CUDA launch, NCCL, protocol, checkpoint/cache, or generated-output failure.
+- `cargo test -p paddock-engine tp_span_cap --lib`: 3 passed
+- `cargo test -p paddock-engine span_cap_geometry_boundaries_at_every_sweep_width --lib`: 1 passed
+- `cargo test -p paddock-engine span_cap_wire_install_fails_closed_and_keeps_last_good --lib`: 1 passed
+- `cargo build --release -p paddock-runner --bin paddock-runner`: passed
+- `git diff --check`: passed
 
-Observed per-cap process status:
+## Benchmark results
 
-- 384: coordinator exit 1, worker exit 1
-- 512: coordinator exit 1, worker exit 1
-- 1024: coordinator exit 1, worker exit 1
-- 2048: coordinator exit 1, worker exit 1
+Historical 64 and 192 values are from the optimized-TP report and are not new runs in this sweep. New timings are client wall time for the complete cold chat request, including 64 generated tokens.
 
-No CUDA errors, NCCL errors, cache/checkpoint errors, protocol errors, OOM/allocation failures, or unusual runtime warnings appeared in the captured launcher logs. No span/checkpoint cuts were reached because model engine startup rejected each value before serving a request. Peak memory was not available because no benchmark request ran.
+| Cap | Cold wall | Effective prompt tok/s | Speedup vs 192 | Speedup vs 64 | Output | Notes |
+|---:|---:|---:|---:|---:|---|---|
+| 64 | 102.973 s historical | 214.9 historical | 0.338x | baseline | historical | Production default |
+| 192 | 34.823 s historical | 635.5 historical | baseline | 2.957x | historical | Historical optimized result |
+| 384 | 32.767 s new | 675.4 | 1.063x | 3.143x | `4156a7f2716cbaf9d1734bbebfe8757841d200f0af4d9f6b5ef91d562f715f84` | HTTP 200; prompt 22,130; completion 64 |
+| 512 | 33.264 s new | 665.3 | 1.047x | 3.096x | `4156a7f2716cbaf9d1734bbebfe8757841d200f0af4d9f6b5ef91d562f715f84` | HTTP 200; prompt 22,130; completion 64 |
+| 1024 | 36.291 s new | 609.8 | 0.960x | 2.837x | `4156a7f2716cbaf9d1734bbebfe8757841d200f0af4d9f6b5ef91d562f715f84` | HTTP 200; prompt 22,130; completion 64; regression vs 192 |
+| 2048 | 41.760 s new | 529.9 | 0.834x | 2.466x | `4156a7f2716cbaf9d1734bbebfe8757841d200f0af4d9f6b5ef91d562f715f84` | HTTP 200; prompt 22,130; completion 64; regression vs 192 |
 
-The source of the restriction is `crates/paddock-engine/src/gpu_model/qwen35/tp_span_cap.rs`: `SWEEP_CAPS` is `[64, 128, 192]`, `MAX_TP_SPAN_CAP` is 192, and both environment and wire resolution fail closed outside that set. No production code was changed to bypass this restriction; doing so would be outside this mechanical measurement pass and would require revalidating the larger-cap geometry and allocations.
+Effective throughput is `22,130 / cold wall`. Relative to historical cap 192, the new caps changed wall time by:
 
-Per-cap raw evidence is under:
+- 384: 2.056 s lower, 5.9% reduction
+- 512: 1.559 s lower, 4.5% reduction
+- 1024: 1.468 s higher, 4.2% regression
+- 2048: 6.937 s higher, 19.9% regression
 
-`/home/sime/.hermes/cache/scratch/span-sweep-20260928-012910/`
+All four new caps started successfully, returned HTTP 200, produced 22,130 prompt tokens and 64 completion tokens with `finish_reason=length`, and generated the same output hash. The output text was byte-identical across the four new caps. This is output evidence only, not a strict numerical-correctness oracle.
 
-The earlier pre-staging attempts are preserved under:
+The launcher was stopped after each completed request by signaling the exact runner child; its final process status was coordinator/worker `143` for the four headline runs because the benchmark harness terminated the server after collecting the response. The server logs show normal drain and device-memory release for each run. No request failed. Raw evidence:
 
-`/home/sime/.hermes/cache/scratch/span-sweep-20260928-012835/`
+`/home/sime/.hermes/cache/scratch/span-sweep-20260928-014349/`
 
-## Output comparison
+Visible production route behavior included 8,192-row scheduler chunks for the long prompt, followed by a 5,746-row finishing chunk, checkpoint cuts at 22,112 and 22,128, and normal decode-pipe drain. No span-specific runtime error occurred.
 
-No new 64-token outputs were generated because none of the requested caps reached HTTP serving. Therefore byte-identical/tail-different/materially-different comparison is not applicable. The optimization report records that the historical cap-64 and cap-192 outputs differed across caps on both binaries; generated-text equality is not treated as a strict numerical correctness oracle.
+No peak memory metric was available from existing instrumentation, so no peak-memory number is claimed. The allocations are cap-sized by construction; the 2048 run reached HTTP 200 and completed without OOM/allocation failure.
 
-## Multi-request smoke test
+## Errors and warnings
 
-Not run. There was no successful cap in the requested 384/512/1024/2048 sweep at which to run the requested two-simultaneous-request smoke test. No claim is made about multi-request behavior at the rejected values. The prior report's separate cap-192 two-slot smoke result remains historical evidence only.
+No CUDA errors, NCCL errors, protocol errors, state/poison errors, checkpoint/cache errors, OOMs, allocation failures, or kernel launch failures were observed in the four new benchmark logs. The only warnings were the existing tick-stall warnings during long mixed/prefill work; they occurred for all caps and are not failure indicators. Coordinator and worker bootstrap completed for every run.
 
-## Measurement-supported conclusion
+## Multi-request smoke at fastest new cap
 
-- The requested wider values cannot currently be benchmarked on this branch: all four fail the explicit `[64, 128, 192]` span-cap gate during startup.
-- No conclusion about performance improving, flattening, or regressing above 192 is supported by this run.
-- No requested size produced a measured failure from allocation, CUDA, NCCL, protocol, or runtime execution; all four failed earlier as explicit unsupported configuration values.
-- The fastest successful cap with existing measured evidence remains historical cap 192 at 34.823 s, not a new result from this sweep.
-- The production default remains 64. This report does not recommend changing it.
+The fastest new cap was 384 at 32.767 s. A two-simultaneous-request smoke test was run at `PADDOCK_TP_SPAN_CAP=384` using the established decode-rider plus long asynchronous prompt style:
+
+- decode-rider: HTTP 200, prompt 71 tokens, completion 128 tokens, `finish=length`
+- async-long-2200: HTTP 200, prompt 5,552 tokens, completion 8 tokens, `finish=length`
+- both slots were exercised: logs show slot 0 Mixed and slot 1 Async ownership
+- both requests completed decode after prefill; slot 1 logged prefill-span launch, finish, promotion to decode, and subsequent decode-pipe activity
+- coordinator exit 0, worker exit 0
+- no CUDA, NCCL, protocol, state, checkpoint, or cache errors
+
+Smoke evidence:
+
+`/home/sime/.hermes/cache/scratch/span-smoke-cap384-20260928-014952/`
+
+## Conclusions supported by this sweep
+
+- The allowlist was the only blocker to measuring the wider values; all four larger caps run successfully without changing kernels.
+- Performance improves modestly from 192 to 384, with 512 slightly slower than 384 but still faster than 192.
+- Improvement flattens at 384–512 and reverses at 1024.
+- 1024 and 2048 are successful runtime measurements, not memory/kernel cliffs, but both regress against cap 192; 2048 is 19.9% slower than 192.
+- The fastest newly measured cap is 384 at 32.767 s.
+- The fastest successful cap in the combined historical/new table is 384, but this does not justify changing the production default. Resumed-prefix/state correctness qualification remains outstanding.
+
+No recommendation to change the production default is made.
