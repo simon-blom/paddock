@@ -394,3 +394,46 @@ first-token equality and API cached/usage accounting under a real request.
 Host tests cannot prove device-content fidelity or the two-ended wire/ACK
 sequence without model initialization. **Approved for two-node GPU
 validation only**, not production deployment; stop on any mismatch.
+
+## Two-node GPU validation
+
+Validation was run from starting local HEAD `56149da4ee328e62ea01cd951aec28fb6a745a76` on `review/qwen38-tp2-final`; remote HEAD was `0f73352bab63ebb41e54d1c1b54cbf855c88bd85`, and local history descended normally from remote. The worktree was clean before validation. No code fix was required and no push was made.
+
+Identity and configuration preflight:
+
+- Rank-0 runner: `fb99067f00c6a83e4e0989363a56b89a5ee062588d76dfe5f0e9da7513bc0b11`.
+- Staged rank-1 runner: `/home/sime/.cache/paddock-tp/paddock-runner-56149d`, SHA-256 `fb99067f00c6a83e4e0989363a56b89a5ee062588d76dfe5f0e9da7513bc0b11`.
+- CUDA pack on both ranks: `c58133072ed1f339201168b5f5eb7ecf0056ad7edb251e8f1224554d0e9b321e`.
+- Model on both ranks: `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`.
+- `TP=2`, `MAX_CTX=65536`, `SPEC=off`, `TP_GRAPH=0`, `PADDOCK_UNIFIED=1`, `KV_DTYPE=f16`, `MAX_BATCH=2`, `PADDOCK_TP_CKPT_SLOTS=4` for the normal run. NCCL/RoCE used `NCCL_SOCKET_IFNAME=enp1s0f0np0`, `NCCL_IB_HCA=rocep1s0f0`, `NCCL_IB_DISABLE=0`, `NCCL_NET=IB`.
+- Dry run passed: protocol v4 startup, TP worker connectivity, runner/pack/model identity, and no stale worker pidfile/server conflict were verified. Checkpoint capacity initialized successfully.
+
+Cold prompt and identical hit:
+
+- The exact local 22,130-token Hermes-style fixture was available at `/home/sime/.hermes/cache/scratch/qwen38-hermes-20k-prompt.txt` and was used unchanged. Cold HTTP 200: prompt tokens `22130`, resume `0`, cached `0`, wall `115.481 s`, completion `64`, finish `length`. Rank 0 reserved/snapshotted cuts `22112` and `22128` and published `2` checkpoints with `1383` pages.
+- Cold first generated text: `Scheduler pins lane ownership; \`chunk_abort\` defers until \`span_finish\` clears \`SpanFlight\`. Decode-pipe pumps synchronously; context lookahead drains before illegal \`pipe_next\`. Slot reuse requires lane join, NCCL sync, and mirrored release. Host tests verify geometry; live GPU parity, pending-CUDA cancellation`.
+- Identical request without restart: HTTP 200, prompt tokens `22130`, resume `22128`, cached `22128`, computed Mixed rows `2`, wall `10.301 s`, finish `length`. The complete generated text matched the cold response exactly, including the first generated text. Wall speedup was `11.21x` (`91.08%` lower); actual prefill-row reduction was `99.991%` (`22130` to `2`).
+- The hit log shows `TP prefix admit (cache HIT) ... resume=22128 reused=22128`, Mixed ownership, and suffix-only `rows=2`; no rows before `resume` were recomputed. The API reported unchanged full prompt length and cached-token accounting exactly equal to resume.
+
+Shared-prefix divergent tail:
+
+- P1 reused the base prefix and added a large shared history plus message A; it served HTTP 200 with prompt `23994`, cached `22112`, and published checkpoints at `23968`/`23984`.
+- P2 used the same shared history and message B. Its first attempt correctly resumed only at `22112` because the divergence preceded P1's deepest published checkpoint; this was the documented milestone limitation, not a cache error. The adjusted fixture placed divergence after a published checkpoint: P3 served with prompt `25510`, resume/cached `23984`, and `1526` computed rows; P4's divergent tail served with prompt `25511`, resume/cached `25488`, and `23` computed rows. P4 therefore resumed within the common history and did not adopt divergent content. Both outputs were coherent and HTTP 200.
+
+Release/reuse and payload behavior:
+
+- A concurrent decoder admitted a long Async prefill; the client disconnected after a confirmed span launch. The post-drain path logged `TP prefill span finished`, `client gone mid-prefill - aborted slot 1`, then reused slot 1 successfully with HTTP 200 (`8` prompt tokens, `12` completion tokens). Earlier and subsequent cache-hit requests also reused slot 0 repeatedly. No stale owner/cursor, duplicate publish, page error, or KV error appeared.
+- The live logs showed rank-local snapshot cuts before publication and successful Mixed resume from attached cuts. Rank 1's worker log is intentionally control-plane-only (bootstrap/dial/calibration; it emits no per-request prefix decision lines), so physical payload addresses and worker-side textual resume lines are unavailable. The wire protocol completed symmetrically for every request, rank 1 joined all paired operations, and no rank-1 error/NCCL/protocol failure occurred. This is protocol/rank-symmetry evidence, not a direct rank-1 log equality dump.
+
+Zero checkpoint capacity:
+
+- The server was restarted with `PADDOCK_TP_CKPT_SLOTS=0` and the same prompt was sent twice. Both requests returned HTTP 200 with prompt `22130`, resume `0`, cached `0`, and `64` completion tokens. Logs show pages-only publication (`attached=0`) and both admissions remained cold; no invalid checkpoint index, KV-only resume, coordinator poison, rank mismatch, or error occurred.
+- Normal capacity `PADDOCK_TP_CKPT_SLOTS=4` was restored and the two-node server started and stopped cleanly.
+
+Full log scan covered coordinator and rank-1 logs for NCCL/collective mismatch, protocol v4/Prepared/Ready sequencing, cache decision or reservation mismatch, checkpoint attach/recycle failure, invalid checkpoint index, page-table errors, `KV position has no live pages`, position/cursor mismatch, DeltaNet/GQA errors, duplicate publish, refcount underflow, coordinator poison, CUDA errors, panic, and generic errors. No new-cache-path failure was found. The only matching strings were benign `model ready`/`PDF processing ready` INFO lines.
+
+Static validation relevant to this validation session: release runner build passed before launch; dry-run and all live HTTP gates passed. The implementation had already passed the documented focused TP KV/serve/wire tests, full engine library suite (`507`), dist tests (`5` unit + `22` integration), clippy with pre-existing warnings, and `git diff --check`; no code changes were made during this GPU campaign.
+
+**TP PREFIX CACHE GPU VALIDATION: PASS**
+
+This is milestone validation, not production approval. Remaining limitations are the deliberate milestone scope: text-only TP=2, in-GPU-memory cache, prompt-prefill checkpoints only, Mixed resume pinning, no reply checkpoints, Async-lane resume, serial TP cache resume, multimodal cache, or NVMe/RAM tiering. The branch is ready for final Sol review and an explicit push decision; it was not pushed during validation.
