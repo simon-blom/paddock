@@ -11,7 +11,7 @@ use paddock_models::gguf::Value;
 use paddock_models::mapped::MappedGguf;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest, gguf_shard};
 
-use super::ops::{gemv_any, prefill_mm_any};
+use super::ops::{gemv_any, prefill_mm_any, prefill_mm_pre_any, prefill_quant};
 use super::tp_span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
@@ -22,14 +22,13 @@ const S: usize = 128;
 const NK: usize = 16;
 const NV: usize = 48;
 const CONV_K: usize = 4;
-/// Span row cap of the DeltaNet batched prefill primitive: the resolved
-/// rank-0-authoritative value (the whole-model traversal reuses
-/// `DeltaTpRank::prefill(rows)` with the SAME resolved cap; both consumers
-/// call `tp_span_cap::span_cap()`, so no magic value can drift). DeltaNet's
-/// own kernels carry no 64-row limit: the recurrence loops per-token inside
-/// one block for any `n_tokens` and the conv/gate/norm kernels are
-/// n_tokens-parameterized.
-
+// Span row cap of the DeltaNet batched prefill primitive: the resolved
+// rank-0-authoritative value (the whole-model traversal reuses
+// `DeltaTpRank::prefill(rows)` with the SAME resolved cap; both consumers
+// call `tp_span_cap::span_cap()`, so no magic value can drift). DeltaNet's
+// own kernels carry no 64-row limit: the recurrence loops per-token inside
+// one block for any `n_tokens` and the conv/gate/norm kernels are
+// n_tokens-parameterized.
 
 fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
     let Some(expected) = rows.checked_mul(WIDTH) else {
@@ -898,8 +897,27 @@ impl DeltaTpRank {
         let s = &mut self.span;
         if prefill {
             let mm = self.prefill_gemm.as_mut().expect("prefill scratch allocated");
-            mm.project(e, &self.weights[0], input, &mut s.mixed, rows)?;
-            mm.project(e, &self.weights[1], input, &mut s.z, rows)?;
+            // One activation quantization for both projections off the same
+            // mirrored input (in_qkv + gate share it at in_dim = WIDTH);
+            // same layouts and scales as two separate `prefill_mm_any` calls.
+            prefill_quant(e, &mut mm.xq, &mut mm.xs, &mut mm.yq, input, WIDTH, rows)?;
+            for (w, out) in [
+                (&self.weights[0], &mut s.mixed as &mut CudaSlice<f32>),
+                (&self.weights[1], &mut s.z as &mut CudaSlice<f32>),
+            ] {
+                prefill_mm_pre_any(
+                    e,
+                    w,
+                    &mm.xq,
+                    &mm.xs,
+                    &mm.yq,
+                    &mut mm.xsums,
+                    &mut mm.ssums,
+                    &mut mm.skfix,
+                    out,
+                    rows,
+                )?;
+            }
             // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the
             // rank-local mixed shard and gate (z) shard, plus the whole-row
             // mixer input, echoed under the c.* name for the host compare.

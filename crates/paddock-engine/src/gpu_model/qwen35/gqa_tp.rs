@@ -9,7 +9,7 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{gemv_any, prefill_attn, prefill_mm_any, read_sections};
+use super::ops::{gemv_any, prefill_attn, prefill_mm_any, prefill_mm_pre_any, prefill_quant, read_sections};
 use super::tp_kv::MirroredKv;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
@@ -749,45 +749,29 @@ impl GqaTpRank {
             p.stage(&e.stream, "gqa-local", Some(layer))?;
         }
         let g = self.geometry;
-        prefill_mm_any(
-            e,
-            &self.weights[0],
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            xn,
-            &mut span.qg,
-            rows,
-        )?;
-        prefill_mm_any(
-            e,
-            &self.weights[1],
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            xn,
-            &mut span.k,
-            rows,
-        )?;
-        prefill_mm_any(
-            e,
-            &self.weights[2],
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            xn,
-            &mut span.v,
-            rows,
-        )?;
+        // One activation quantization for all three projections off the same
+        // normalized input: Q/K/V share `xn` (in_dim = width), so quantize
+        // once and run the GEMM half per weight. Same layouts and scales as
+        // three `prefill_mm_any` calls (bit-identical staging bytes).
+        prefill_quant(e, &mut q.xq, &mut q.xs, &mut q.yq, xn, g.width, rows)?;
+        for (w, out) in [
+            (&self.weights[0], &mut span.qg as &mut CudaSlice<f32>),
+            (&self.weights[1], &mut span.k as &mut CudaSlice<f32>),
+            (&self.weights[2], &mut span.v as &mut CudaSlice<f32>),
+        ] {
+            prefill_mm_pre_any(
+                e,
+                w,
+                &q.xq,
+                &q.xs,
+                &q.yq,
+                &mut q.xsums,
+                &mut q.ssums,
+                &mut q.skfix,
+                out,
+                rows,
+            )?;
+        }
         e.split_qg(
             &span.qg,
             &mut span.q,

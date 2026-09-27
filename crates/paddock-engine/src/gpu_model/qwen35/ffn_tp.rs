@@ -16,7 +16,7 @@ use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 
-use super::ops::{gemv_any, prefill_ffn_down_any, prefill_mm_any};
+use super::ops::{gemv_any, prefill_ffn_down_any, prefill_mm_pre_any, prefill_quant};
 use super::tp_span::{SpanFfn, SpanGemmStaging};
 
 #[derive(Debug, thiserror::Error)]
@@ -186,32 +186,28 @@ impl FfnTpRank {
                 xn.len(), xn.context().cu_ctx() == exec.stream.context().cu_ctx()
             )));
         }
-        prefill_mm_any(
-            exec,
-            &self.gate,
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            xn,
-            &mut span.gate,
-            rows,
-        )?;
-        prefill_mm_any(
-            exec,
-            &self.up,
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            xn,
-            &mut span.up,
-            rows,
-        )?;
+        // One activation quantization for both gate/up projections off the
+        // same normalized input (in_dim = hidden); the GEMM half runs per
+        // weight off the shared staging. Same layouts and scales as two
+        // `prefill_mm_any` calls (bit-identical staging bytes).
+        prefill_quant(exec, &mut q.xq, &mut q.xs, &mut q.yq, xn, self.hidden, rows)?;
+        for (w, out) in [
+            (&self.gate, &mut span.gate as &mut CudaSlice<f32>),
+            (&self.up, &mut span.up as &mut CudaSlice<f32>),
+        ] {
+            prefill_mm_pre_any(
+                exec,
+                w,
+                &q.xq,
+                &q.xs,
+                &q.yq,
+                &mut q.xsums,
+                &mut q.ssums,
+                &mut q.skfix,
+                out,
+                rows,
+            )?;
+        }
         // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the rank-local
         // gate/up shards, compared through the rank map on the host.
         super::tp_trace::trace_row(exec, "b.ffn-gate", layer, &span.gate, 0, self.local_ff)?;
