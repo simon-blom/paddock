@@ -4486,7 +4486,19 @@ fn run_batched(
                 .filter(|&k| slots[k].as_ref().is_some_and(|s| s.events.is_closed()))
                 .collect();
             for k in dead {
-                if generator.prefill_abort(k) {
+                // This is deliberately sampled immediately before the abort
+                // request: for the TP overlap backend it is the shared CUDA
+                // completion probe, so `false` proves the cancellation was
+                // observed while the launched span still had pending work.
+                let span_done = generator.unified_span_done();
+                let aborted = generator.prefill_abort(k);
+                tracing::info!(
+                    slot = k,
+                    span_done,
+                    aborted,
+                    "serve: prefill cancellation probe"
+                );
+                if aborted {
                     chunking.remove(&k);
                     slots[k] = None;
                     tracing::info!("serve: client gone mid-prefill - aborted slot {k}");
