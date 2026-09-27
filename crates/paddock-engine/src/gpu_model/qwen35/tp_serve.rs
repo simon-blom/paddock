@@ -1378,12 +1378,12 @@ impl TpCoordinator {
             if !go {
                 break;
             }
-            let (slot, take, finishing, plan) = {
+            let (slot, take, finishing, plan, first) = {
                 let chunk = chunks
                     .front()
                     .expect("chunk front is Some: the go guard just matched it");
                 let take = chunk.rows.len().min(budget - rows.len());
-                (chunk.slot, take, chunk.rows.len() == take, chunk.fin_plan)
+                (chunk.slot, take, chunk.rows.len() == take, chunk.fin_plan, chunk.owner.is_none())
             };
             let drained: Vec<_> = {
                 let chunk = chunks
@@ -1396,6 +1396,7 @@ impl TpCoordinator {
             // tick's piece - the scheduler sets slot.pos=rows.
             let fin_rows = drained.last().map_or(0, |&(_, _, position)| position + 1);
             rows.extend(drained);
+            tracing::info!(slot, ?owner, first, rows = take, finishing, "TP prompt prefill owner");
             if finishing {
                 chunks.pop_front();
                 finishers.push(SpanFinisher {
@@ -1603,6 +1604,7 @@ impl TpCoordinator {
             self.model
                 .promote_lane_slot(&mark, fin.slot, &live)
                 .map_err(|e| e.to_string())?;
+            tracing::info!(slot = fin.slot, "TP prefill lane promoted to decode");
         }
         let mut results = Vec::with_capacity(flight.finishing.len());
         for (fin, ev) in flight.finishing.into_iter().zip(flight.events) {
