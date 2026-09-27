@@ -61,7 +61,7 @@ No direct TP=1 numerical/logit oracle or independently measured simultaneous GPU
 
 **Readiness: not yet ready for the ~20k Hermes acceptance.** The context-limit overlap branch needs an executable target-device boundary harness (or an API admission geometry that reaches it), and direct parity/stronger cancellation evidence remain open. Do not run the full acceptance or push this local follow-up as an accepted production milestone on the strength of this smoke. The remote branch was read with `git ls-remote` and still pointed to the starting `096838db6751c26ad0536da1797d26184b46899f`; no push was made.
 
-The original starting-HEAD readiness assessment above is superseded by this follow-up. The numerical-class differences remain unchanged; no tolerances were altered.
+The original starting-HEAD readiness assessment above is superseded by this final reachability review. The numerical-class differences remain unchanged; no tolerances were altered.
 
 ## Final targeted-gate follow-up (starting `cf9debb4488d843a7350abb68fbaaa93ad79d644`)
 
@@ -118,4 +118,54 @@ The live Async traces did not show a Mixed -> Async eligibility flip; the focuse
 Static validation after the instrumentation passed: focused serial-pipe tests (8), TP serve tests (23), `cargo test -p paddock-engine --lib` (488), `cargo test -p paddock-engine --all-targets`, `cargo test -p paddock-dist` (4 unit + 22 bootstrap), `cargo clippy -p paddock-engine -p paddock-dist --all-targets` (existing warnings only), `git diff --check`, and `cargo build --release -p paddock-runner --bin paddock-runner`. The cancellation probe is the only code change; this documentation update is the only additional tracked change.
 
 Final decision: both required target-device gates remain open. Do not push and do not run the ~20k Hermes acceptance. The next valid step is a dedicated real coordinator harness or scheduler yield/control seam that can send the existing `PrefillAbort` command while `unified_span_done()` is false, plus a target-device context-boundary harness that reaches the overlap lookahead branch without relying on the public completion cap.
+## Final reachability and readiness decision (starting local `8ad7adef1f4906199962c032f6f6a3346e9c3ebe`, remote `096838db6751c26ad0536da1797d26184b46899f`)
+
+### Async cancellation control-flow proof
+
+The production invariant holds: a TP Async span cannot be aborted, released, reset, or reused by the scheduler while its CUDA work is pending. The relevant control flow is one scheduler-thread tick, not independently scheduled callback work:
+
+1. The scheduler checks `prefill_front_owner`, computes `overlap_eligible`, and selects Async only for an unowned queue head or a queue head already pinned Async (`service.rs:4600-4623`). A prompt is pinned by the first executed `chunk_take`; a later eligibility change cannot switch it (`tp_serve.rs:1360-1401`).
+2. `unified_span_launch` is a synchronous proxy request. The scheduler then synchronously begins/pumps the decode pipe, checking `unified_span_done`, headroom, dead rows, host-plan eligibility, and context lookahead at each loop iteration (`service.rs:4651-4764`). Each pipe begin/next/drain call waits for its command-thread response; there is no scheduler yield to the disconnect sweep inside a call.
+3. The pump drains the pipe before `unified_span_finish`; `span_finish` is the only production path that joins the lane, reads finisher events, promotes lane KV/DeltaNet state to decode, and clears the coordinator span (`service.rs:4792-4827`; `tp_serve.rs:1570-1640`).
+4. The disconnect sweep runs once at the scheduler tick boundary (`service.rs:4477-4505`). It calls `prefill_abort`, but the TP command thread handles that command serially. While `coordinator.span` exists, `chunk_abort` returns false for every slot whose rows were popped into that span (`tp_serve.rs:1103-1116`), so the scheduler leaves the request in `chunking` and retries on a later tick.
+5. The command-thread guard permits only pipe commands, `SpanFinish`, and queued-chunk `PrefillAbort` while a span exists; release/reset and all unrelated forward commands are rejected (`tp_serve.rs:1884-1914`). Even after the event reports done, `span_finish` is the operation that performs the ownership transition; `release` independently fails closed if `pipe` or `span` is present or the lane event is not done (`tp_serve.rs:569-610`).
+6. `release_inactive_slots` is called after scheduler slot reconciliation, but it is still a synchronous command on the same owning coordinator thread (`service.rs:3757-3765`; `tp_serve.rs:2057-2063`). Slot reset/reuse therefore follows lane join, NCCL/device synchronization, mirrored logical `Release`, `reset_slot`, `reset_lane_slot`, and cursor clearing.
+
+The only cross-thread state is the release/acquire `span_done` atomic polled by the scheduler's nonblocking probe; it reports completion and does not mutate coordinator ownership. The send-only proxy has no callback that can execute `release`, reset, or `chunk_abort` concurrently with the command thread. There is no production callback/thread that mutates `TpCoordinator`; the GPU/NCCL state remains owned by `qwen35-tp-rank0`.
+
+The focused regression `abort_during_span_is_deferred_until_span_ownership_clears` now exercises the production `queued_chunk_abort_allowed` decision seam: an in-flight span refuses reclamation for an owned slot, an unrelated slot remains eligible, and after span ownership clears the queued entry can be removed and the same slot queued again. The existing `prompt_owner_pins_partial_ticks_and_clears_on_finish_abort_and_reuse` and `mirrored_two_slot_release_and_reuse_keeps_survivor` tests cover pin clearing, logical mirror release, and same-slot reuse.
+
+Therefore the previously requested state “disconnect observed while `unified_span_done() == false` and the same span is reclaimed” is unreachable by normal production scheduler construction. The live probe's `span_done=true` result was the expected consequence of this synchronous control flow, not missing timing coverage. No artificial runtime hook was added.
+
+### Context-boundary proof and off-by-one semantics
+
+The production admission invariant also holds for public HTTP requests. `admit` rejects prompts longer than `max_ctx`, rejects a prompt that exactly fills the window, and clamps `req.max_tokens` to `max_ctx - prompt.len()` (`service.rs:3060-3115`). The serial path applies the same budget before prefill (`service.rs:2101-2124`), and `finish_prefill` re-clamps against actual landed rows, including multimodal image rows (`service.rs:2812-2821`). Each generated token is emitted and counted; `Length` removes the slot immediately when the requested budget is reached (`service.rs:2051-2069`). At the actual context edge, the last legal forward leaves a pending sampled token at position `max_ctx`; the overlap path retires that member before the next scheduler tick (`service.rs:4814-4824`).
+
+The pipe's cursor is zero-based: position `p` is legal when `p < max_ctx`, while a forward at `p` advances the cursor to `p + 1`. The lookahead tests the next enqueue, `position + pipe_next_calls + 1 >= limit`, and therefore drains before attempting the first illegal position. For example, with limit 48, position 46 can issue one next tick at position 47; after that pending token advances the cursor to 48 and no further `pipe_next` is legal. Dummy rows are included in the same test because they still consume a pipe tick until drain. The coordinator's `pipe_next` independently rejects any row at `position >= max_ctx` (`tp_serve.rs:996-1011`).
+
+The explicit overlap lookahead is consequently a defensive fail-safe for internal, malformed, multimodal, or edge state. It is covered by the real helper/decision tests `overlap_context_drain_at_final_legal_position` and `fixed_context_pipe_drains_before_lookahead_even_for_dummy_slots`, plus the pipe length/finish tests. Under normal public request admission and generation-budget semantics, the API completion/Length retirement removes the decoder before a subsequent illegal overlap `pipe_next`; the exact target-device marker is not a normally reachable HTTP branch and no GPU harness was manufactured to force it.
+
+### Post-drain cancellation/reuse invariant
+
+A cancellation visible during an in-flight scheduler span cannot reclaim GPU state early: scheduler slot removal is deferred until `prefill_abort` returns true, and the TP abort seam returns false for rows owned by `SpanFlight`. Completion then drains the pipe, joins the lane, promotes only completed finishers, and clears the span. Release requires no pipe/span, joins and synchronizes both lanes, mirrors logical KV release to rank 1, resets GQA KV and DeltaNet lane state, clears positions/occupancy, and only then permits same-slot admission. Aborted requests do not enter finisher promotion; completed finishers promote exactly once from the finisher list. The existing live post-drain cancellation/reuse trace and the host mirror/reuse tests support this invariant; no duplicate-promotion or stale-state path remains reachable in the inspected control flow.
+
+### Mixed -> Async pinning
+
+The host regression `gpu_model::qwen35::tp_serve::tests::eligibility_change_does_not_relaunch_a_running_mixed_prompt_on_async_lane` invokes the real `select_prefill_lane` plus `TpCoordinator::chunk_take` seam. It executes two Mixed-owned partial rows, flips eligibility to Async while the prompt remains incomplete, verifies the same queue entry continues Mixed with zero Async launches, completes it, and confirms a fresh prompt can select Async. It is therefore sufficient behavioral coverage of the lane-pinning invariant; a live Mixed -> Async trace is not required.
+
+### Final gate classification
+
+- Async pending-cancellation: unreachable by production scheduler invariant, with supporting control-flow proof and focused deferred-abort regression. The live `span_done=false` timing state is not a production gate.
+- Post-drain cancellation/reuse: reachable as a normal disconnect outcome, tested and live-observed after drain; release/reset/reuse is fail-closed until all GPU state is drained.
+- Overlap context lookahead: defensive branch only under normal public API budgeting, covered by focused decision/helper regressions; no live target-device branch claim is made.
+- Mixed -> Async pinning: invariant tested at the production owner-selection/queue seam; fresh post-completion Async selection is covered.
+- Remaining reachable correctness risks: none found in the requested scheduler/control-flow scope. Numerical parity, throughput, and rank-exit evidence remain separate previously documented gates; this review does not relabel them.
+
+### Changes and validation
+
+Added the production abort-decision seam and regression `abort_during_span_is_deferred_until_span_ownership_clears` in `crates/paddock-engine/src/gpu_model/qwen35/tp_serve.rs`. Retained the existing context lookahead and Mixed -> Async decision tests; no artificial runtime hooks or GPU harnesses were added.
+
+Focused tests passed: all 24 `gpu_model::qwen35::tp_serve::tests` and `service::serial_pipe_tests::overlap_context_drain_at_final_legal_position`. Full required validation after the change: `cargo test -p paddock-engine --lib`, `cargo test -p paddock-engine --all-targets`, `cargo test -p paddock-dist`, `cargo clippy -p paddock-engine -p paddock-dist --all-targets`, `git diff --check`, and `cargo build --release -p paddock-runner --bin paddock-runner`. No ~20k Hermes acceptance was run.
+
+Readiness recommendation: READY for the ~20k Hermes acceptance. This recommendation is limited to the two former “live gates” being structurally unreachable/defensive as proven above; the acceptance itself remains the next step and was intentionally not run in this session.
 

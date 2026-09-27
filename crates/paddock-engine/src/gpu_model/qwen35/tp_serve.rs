@@ -350,6 +350,14 @@ fn abort_queued_chunk(chunks: &mut VecDeque<PrefillChunk>, slot: usize) -> bool 
     chunks.len() != before
 }
 
+/// A queued chunk may be reclaimed only while no launched span owns its rows.
+/// This is the production abort decision seam: the scheduler can observe a
+/// disconnect between ticks, but an in-flight span remains owned until the
+/// command thread has drained it and cleared `self.span`.
+fn queued_chunk_abort_allowed(span: Option<&SpanFlight>, slot: usize) -> bool {
+    !span.is_some_and(|flight| flight.slots.contains(&slot))
+}
+
 /// A finishing chunk's summary, kept from launch until the span drains so
 /// `span_finish` can read each finisher's result in chunk order.
 struct SpanFinisher {
@@ -1105,11 +1113,7 @@ impl TpCoordinator {
     /// chunk is already popped for launch (in flight by definition); the
     /// scheduler retries next tick and drops the chunk at finish.
     fn chunk_abort(&mut self, slot: usize) -> bool {
-        if self
-            .span
-            .as_ref()
-            .is_some_and(|span| span.slots.contains(&slot))
-        {
+        if !queued_chunk_abort_allowed(self.span.as_ref(), slot) {
             return false;
         }
         abort_queued_chunk(&mut self.chunks, slot)
@@ -2813,6 +2817,36 @@ mod tests {
         assert_eq!(queue.front().unwrap().owner, None);
         TpCoordinator::chunk_take(&mut queue, 5, Mixed).unwrap();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn abort_during_span_is_deferred_until_span_ownership_clears() {
+        let in_flight = SpanFlight {
+            finishing: Vec::new(),
+            events: VecDeque::new(),
+            slots: vec![1],
+        };
+        // The scheduler may observe the disconnect, but the real abort seam
+        // refuses to reclaim a slot whose rows were popped into this span.
+        assert!(!queued_chunk_abort_allowed(Some(&in_flight), 1));
+        assert!(queued_chunk_abort_allowed(Some(&in_flight), 0));
+        // After the span-finish path clears coordinator.span, queued ownership
+        // can be removed and the same slot can be admitted again safely.
+        assert!(queued_chunk_abort_allowed(None, 1));
+        let mut queue = VecDeque::from([PrefillChunk {
+            slot: 1,
+            rows: vec![(1, 7, 0)],
+            fin_plan: None,
+            owner: None,
+        }]);
+        assert!(abort_queued_chunk(&mut queue, 1));
+        queue.push_back(PrefillChunk {
+            slot: 1,
+            rows: vec![(1, 8, 0)],
+            fin_plan: None,
+            owner: None,
+        });
+        assert_eq!(queue.front().map(|chunk| chunk.slot), Some(1));
     }
 
     #[test]
