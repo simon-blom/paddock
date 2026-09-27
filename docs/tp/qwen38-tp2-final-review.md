@@ -65,7 +65,7 @@ The original starting-HEAD readiness assessment above is superseded by this foll
 
 ## Final targeted-gate follow-up (starting `cf9debb4488d843a7350abb68fbaaa93ad79d644`)
 
-The starting local HEAD was `cf9debb4488d843a7350abb68fbaaa93ad79d644`; the starting remote `origin/review/qwen38-tp2-final` was `096838db6751c26ad0536da1797d26184b46899f`. Two narrow commits were added without rewriting the four readiness commits: `dc8d5b9` (join the TP coordinator thread and send an explicit rank-0 graceful shutdown frame before process exit) and `d1eb7a8` (stage the exact worker runner, capture the worker sidecar status, and report both ranks from the launcher). Final local HEAD is recorded after this section is committed.
+The starting local HEAD was `cf9debb4488d843a7350abb68fbaaa93ad79d644`; the starting remote `origin/review/qwen38-tp2-final` was `096838db6751c26ad0536da1797d26184b46899f`. Two narrow commits were added without rewriting the four readiness commits: `dc8d5b9` (join the TP coordinator thread and send an explicit rank-0 graceful shutdown frame before process exit) and `d1eb7a8` (stage the exact worker runner, capture the worker sidecar status, and report both ranks from the launcher). The implementation final before this documentation commit is `ab85f89`; this documentation commit is the final report commit on top of it.
 
 ### Production-context rerun
 
