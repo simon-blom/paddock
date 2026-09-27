@@ -17,6 +17,32 @@ pub enum Operation {
     Reuse { slot: usize, tokens: Vec<u32> },
     Reset,
     Flush,
+    /// Prefix-cache admission (TP resume): store `slot`'s full prompt tokens,
+    /// release the slot's previous table, and on `resume > 0` adopt the cached
+    /// prefix pages by refcount. Fails unless the radix holds a DeltaNet
+    /// checkpoint at exactly `resume` under `tokens` - the coordinator's
+    /// selection is validated independently on each rank, never trusted.
+    /// `resume == 0` is a cold admission.
+    Admit {
+        slot: usize,
+        tokens: Vec<u32>,
+        resume: usize,
+    },
+    /// Claim a checkpoint pool index for the upcoming snapshot at cut
+    /// `position` of `tokens` (which must be a cached node boundary). The
+    /// index is reserved (not yet attached) so publication can happen after
+    /// the GPU work succeeds; undo with `CheckpointRecycle`.
+    CheckpointReserve { tokens: Vec<u32>, position: usize },
+    /// Attach a previously reserved index at `position` of `tokens` (after
+    /// the rank-local snapshot succeeded). Fails when nothing is reserved
+    /// there.
+    CheckpointAttach {
+        tokens: Vec<u32>,
+        position: usize,
+        index: u32,
+    },
+    /// Return a reserved-but-unattached index to the free list.
+    CheckpointRecycle { index: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -40,6 +66,21 @@ pub struct MirroredKv {
     radix: PagedRadix,
     sequence: u64,
     max_ctx: usize,
+    /// Each slot's full prompt tokens as admitted (`Admit`), so checkpoint
+    /// reservations/publishes can name cuts by position without re-sending
+    /// the prompt on every op. Release/reset clears the entry.
+    tokens: Vec<Vec<u32>>,
+    /// Checkpoint-pool capacity in indices (`set_state_capacity`); 0 = the
+    /// cache runs pages-only (never resumes). Part of identity so a mirror
+    /// with a different pool size fails closed at setup, not mid-tick.
+    state_capacity: u32,
+    /// The reuse position of the MOST RECENT apply of an `Admit`
+    /// operation (0 = cold). Deliberately NOT mirrored state: it is the
+    /// coordinator's accounting seam for the tick in flight, read
+    /// immediately after `authorize`, exactly like the non-TP backend's
+    /// `last_reused[slot]`. The worker never reads it, so no divergence is
+    /// possible.
+    admitted_reused: Option<usize>,
 }
 
 impl MirroredKv {
@@ -59,7 +100,38 @@ impl MirroredKv {
             radix: PagedRadix::new(),
             sequence: 0,
             max_ctx,
+            tokens: vec![Vec::new(); slots],
+            state_capacity: 0,
+            admitted_reused: None,
         })
+    }
+
+    /// Enable DeltaNet checkpointing: `n` pool indices. Call on both ranks
+    /// with the SAME coordinator-resolved value (`TpInit` carries it) before
+    /// any `CheckpointReserve`. Idempotent-ish: arms the radix free-list;
+    /// a zero value keeps the cache pages-only.
+    pub fn set_state_capacity(&mut self, n: u32) {
+        self.state_capacity = n;
+        self.radix.set_state_capacity(n);
+    }
+
+    /// The tokens `slot` was admitted with (empty = no live admission).
+    pub fn slot_admitted_tokens(&self, slot: usize) -> &[u32] {
+        self.tokens
+            .get(slot)
+            .map(|t| t.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The index reserved for `slot`'s checkpoint cut at `pos`, if any.
+    pub fn slot_reserved_ckpt(&self, slot: usize, pos: usize) -> Option<u32> {
+        self.radix.reserved_index(slot, pos)
+    }
+
+    /// The reuse position of the last applied `Admit`, consumed once
+    /// (the accounting seam for the tick in flight).
+    pub fn take_admitted_reused(&mut self) -> usize {
+        self.admitted_reused.take().unwrap_or(0)
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -210,6 +282,12 @@ impl MirroredKv {
                     .get_mut(*slot)
                     .ok_or("KV slot out of range")?
                     .clear(&mut self.pool);
+                // Reserved-but-unattached checkpoint indices die with the
+                // admission that owned them; attached ones stay in the radix.
+                self.radix.drop_slot_reservations(*slot);
+                if let Some(toks) = self.tokens.get_mut(*slot) {
+                    toks.clear();
+                }
             }
             Operation::Publish { slot, tokens } => {
                 if tokens.len() > self.max_ctx {
@@ -233,17 +311,140 @@ impl MirroredKv {
                 for t in &mut self.tables {
                     t.clear(&mut self.pool);
                 }
+                for t in &mut self.tokens {
+                    t.clear();
+                }
+                self.radix.recycle_all_reserved();
                 // Cache retains published blocks; reset releases slots, not the cache.
             }
             Operation::Flush => {
                 for t in &mut self.tables {
                     t.clear(&mut self.pool);
                 }
+                for t in &mut self.tokens {
+                    t.clear();
+                }
+                self.radix.recycle_all_reserved();
                 while self.radix.evict_lru(&mut self.pool).is_some() {}
+            }
+            Operation::Admit {
+                slot,
+                tokens,
+                resume,
+            } => {
+                if *slot >= self.tables.len() || tokens.len() > self.max_ctx || tokens.is_empty() {
+                    return Err("TP admit slot or prompt out of range");
+                }
+                let reused = if *resume > 0 {
+                    // One authoritative adoption walk: both ranks require the
+                    // cached chain AND its checkpoint at exactly the
+                    // coordinator-chosen position. A rank that cannot satisfy
+                    // it fails closed instead of resuming alone.
+                    let depth = *resume / BLOCK_TOKENS;
+                    let (blocks, ckpt) = self
+                        .radix
+                        .match_full_upto(tokens, depth)
+                        .ok_or("TP admit resume chain not cached")?;
+                    if ckpt.is_none() || resume % BLOCK_TOKENS != 0 {
+                        return Err("TP admit resume checkpoint missing");
+                    }
+                    {
+                        let t = self
+                            .tables
+                            .get_mut(*slot)
+                            .ok_or("KV slot out of range")?;
+                        t.clear(&mut self.pool);
+                        t.share_prefix(&blocks, &mut self.pool);
+                    }
+                    *resume
+                } else {
+                    self.tables
+                        .get_mut(*slot)
+                        .ok_or("KV slot out of range")?
+                        .clear(&mut self.pool);
+                    0
+                };
+                self.tokens[*slot] = tokens.clone();
+                self.admitted_reused = Some(reused);
+            }
+            Operation::CheckpointReserve { tokens, position } => {
+                if tokens.len() > self.max_ctx {
+                    return Err("TP checkpoint reserve tokens out of range");
+                }
+                let slot = self
+                    .tokens
+                    .iter()
+                    .position(|t| t.as_slice() == tokens.as_slice())
+                    .ok_or("TP checkpoint reserve for unadmitted prompt")?;
+                self.radix
+                    .reserve_state_for(slot, *position)
+                    .ok_or("TP checkpoint reserve exhausted")?;
+            }
+            Operation::CheckpointAttach {
+                tokens,
+                position,
+                index,
+            } => {
+                let slot = self
+                    .tokens
+                    .iter()
+                    .position(|t| t.as_slice() == tokens.as_slice())
+                    .ok_or("TP checkpoint attach for unadmitted prompt")?;
+                if !self
+                    .radix
+                    .attach_reserved_at(slot, tokens, *position, *index)
+                {
+                    return Err("TP checkpoint attach has no reservation");
+                }
+            }
+            Operation::CheckpointRecycle { index } => {
+                // Reserved-only index: putting it straight back on the free
+                // list is the exact inverse of alloc_state's pop.
+                self.radix.recycle_state(*index);
             }
         }
         Ok(())
     }
+}
+
+/// The pure resume decision (host-testable): given the deepest checkpoint
+/// probe under the prompt and the prompt length, pick the resume position.
+/// Mirrors the non-TP gate: block-aligned (the probe position always is),
+/// at least two blocks deep, strictly inside the prompt, and either deep
+/// enough to be worth the restore (`min_cache_prefix`) or on a narrow serve
+/// (`slots <= resume_live_max`) where short resumes are still net-positive.
+/// Rank 0 runs this ONCE; both ranks validate the exact selection in `Admit`.
+pub fn tp_resume_decision(ckpt: Option<(usize, u32)>, t_len: usize, slots: usize) -> usize {
+    let floor = if slots <= resume_live_max_tp() {
+        2 * BLOCK_TOKENS
+    } else {
+        min_cache_prefix_tp().max(2 * BLOCK_TOKENS)
+    };
+    match ckpt {
+        Some((pos, _)) if pos >= floor && pos >= 2 * BLOCK_TOKENS && pos < t_len => pos,
+        _ => 0,
+    }
+}
+
+/// Narrow-serve threshold for the TP resume gate (same seam as the non-TP
+/// `resume_live_max`): below this configured slot count a short-prefix
+/// resume still pays for itself. TP=2 serves are always narrow, so the
+/// default (12) admits every resume the cache can serve.
+fn resume_live_max_tp() -> usize {
+    12
+}
+
+/// Minimum prefix worth a TP restore (same default as the non-TP
+/// `min_cache_prefix`; a TP restore is two rank-local copies instead of page
+/// adoption only, but the per-request state restore is the same order of
+/// work). Env-overridable for sweeps.
+fn min_cache_prefix_tp() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var_os!("PADDOCK_MIN_CACHE_PREFIX")
+            .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(512)
+    })
 }
 
 #[cfg(test)]

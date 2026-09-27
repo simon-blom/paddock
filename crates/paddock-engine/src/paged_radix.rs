@@ -115,6 +115,13 @@ pub struct PagedRadix {
     /// state pool). Empty until `set_state_capacity` - text-only / non-hybrid
     /// models never checkpoint state.
     state_free: Vec<u32>,
+    /// Checkpoint indices RESERVED for a prefill still crossing a cut
+    /// `(slot, cut position, pool index)`. The blob is written only after the
+    /// GPU snapshot succeeds; `attach_reserved_at` then consumes the
+    /// reservation, and slot release/flush recycles unconsumed ones. Deliberate
+    /// replay state (same class as the LRU clock): both mirrored ranks run the
+    /// same Reserve/Attach/Release sequence, so the lists cannot diverge.
+    state_reserved: Vec<(usize, usize, u32)>,
     /// Admission control on the state pool: once a checkpoint belongs to a
     /// prefix that has recurred, stop stealing it - let the pool fill and hold.
     ///
@@ -173,6 +180,7 @@ impl PagedRadix {
             free_nodes: Vec::new(),
             clock: 0,
             state_free: Vec::new(),
+            state_reserved: Vec::new(),
             protect_proven: false,
             st_writes: 0,
             st_steals: 0,
@@ -264,6 +272,171 @@ impl PagedRadix {
             ckpt,
             tail: node,
         }
+    }
+
+    /// Read-only resume probe: the deepest DeltaNet checkpoint
+    /// `(position, state index)` on the longest block-aligned cached prefix
+    /// of `tokens`. Walks exactly like `match_full` but takes `&self` and
+    /// touches nothing - no LRU bump, no recurrence marking - so a rank-0
+    /// DECISION consult can never diverge the two mirrored trees. The
+    /// authoritative (mutating) adoption runs inside the `Admit` operation,
+    /// which re-walks and validates the selected checkpoint on every rank.
+    pub(crate) fn probe_ckpt(&self, tokens: &[u32]) -> Option<(usize, u32)> {
+        let full = tokens.len().saturating_sub(1) / BLOCK_TOKENS;
+        let mut node = 0u32;
+        let mut ckpt = None;
+        for bi in 0..full {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let h = hash_block(chunk);
+            let child = *self.nodes[node as usize].children.get(&h)?;
+            if self.nodes[child as usize].tokens != chunk {
+                break; // hash collision - treat as a miss
+            }
+            if let Some(sb) = self.nodes[child as usize].state_blk {
+                ckpt = Some(((bi + 1) * BLOCK_TOKENS, sb));
+            }
+            node = child;
+        }
+        ckpt
+    }
+
+    /// The authoritative adoption walk behind `Operation::Admit`: walk the
+    /// cached chain of `tokens` up to exactly `depth` full blocks, requiring
+    /// EVERY block through `depth` to be cached. Bumps LRU and marks
+    /// recurrence on the walked path (this is a real reuse). Returns the
+    /// adopted block ids plus the checkpoint index attached at the depth
+    /// node (`None` when that boundary holds no checkpoint). `None` when the
+    /// chain stops short of `depth` - miss or collision anywhere along it.
+    pub(crate) fn match_full_upto(
+        &mut self,
+        tokens: &[u32],
+        depth: usize,
+    ) -> Option<(Vec<BlockId>, Option<u32>)> {
+        let full = tokens.len().saturating_sub(1) / BLOCK_TOKENS;
+        if depth == 0 || depth > full {
+            return None;
+        }
+        let mut node = 0u32;
+        let mut blocks = Vec::with_capacity(depth);
+        for bi in 0..depth {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let h = hash_block(chunk);
+            let child = *self.nodes[node as usize].children.get(&h)?;
+            if self.nodes[child as usize].tokens != chunk {
+                return None;
+            }
+            blocks.push(self.nodes[child as usize].block);
+            self.nodes[child as usize].recurred = true;
+            let t = self.tick();
+            self.nodes[child as usize].last_used = t;
+            node = child;
+        }
+        Some((blocks, self.nodes[node as usize].state_blk))
+    }
+
+    /// Free checkpoint-pool indices (the radix's state free-list length).
+    /// Snapshot-visible: both mirrored trees pop/push the same list through
+    /// the same operations, so the count is part of the end-state equality.
+    pub(crate) fn state_capacity_free(&self) -> usize {
+        self.state_free.len()
+    }
+
+    /// Reserve a checkpoint-pool index for a later snapshot at cut `pos` of
+    /// `slot`'s stored tokens. Unlike [`Self::attach_state`] the index is NOT
+    /// attached to a node - the KV chain for `pos` may not be published yet -
+    /// it is held in `state_reserved` until `attach_reserved_at` consumes it
+    /// (after the rank-local GPU snapshot succeeded) or the owning slot
+    /// releases. Deterministic replay state: both ranks run the same
+    /// Reserve/Attach sequence, so the lists cannot diverge; deliberately not
+    /// part of `Snapshot` (same class as the LRU clock).
+    pub(crate) fn reserve_state_for(&mut self, slot: usize, pos: usize) -> Option<u32> {
+        if pos == 0 || !pos.is_multiple_of(BLOCK_TOKENS) {
+            return None;
+        }
+        let idx = self.alloc_state()?;
+        self.state_reserved.push((slot, pos, idx));
+        Some(idx)
+    }
+
+    /// The index reserved for `slot`'s cut at `pos`, if any.
+    pub(crate) fn reserved_index(&self, slot: usize, pos: usize) -> Option<u32> {
+        self.state_reserved
+            .iter()
+            .find(|(s, p, _)| *s == slot && *p == pos)
+            .map(|(_, _, i)| *i)
+    }
+
+    /// Consume `slot`'s reservation at `pos` and attach `want` at the cached
+    /// node ending there. `Publish` must have created the node already (the
+    /// attach op follows its publish in the same authorized tick). The
+    /// reservation is consumed only when the node is walkable and
+    /// unattached, so a failed attach never leaks the index.
+    pub(crate) fn attach_reserved_at(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        pos: usize,
+        want: u32,
+    ) -> bool {
+        let at = match self
+            .state_reserved
+            .iter()
+            .position(|(s, p, _)| *s == slot && *p == pos)
+        {
+            Some(at) => at,
+            None => return false,
+        };
+        if !pos.is_multiple_of(BLOCK_TOKENS) || pos == 0 || tokens.len() < pos {
+            return false;
+        }
+        // walk to the node at depth pos / BLOCK_TOKENS
+        let mut node = 0u32;
+        for bi in 0..pos / BLOCK_TOKENS {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let h = hash_block(chunk);
+            let child = match self.nodes[node as usize].children.get(&h) {
+                Some(&c) => c,
+                None => return false,
+            };
+            if self.nodes[child as usize].tokens != chunk {
+                return false;
+            }
+            node = child;
+        }
+        if node == 0 || self.nodes[node as usize].state_blk.is_some() {
+            return false;
+        }
+        self.state_reserved.remove(at);
+        self.nodes[node as usize].state_blk = Some(want);
+        true
+    }
+
+    /// Drop every reservation owned by `slot`, returning their indices to the
+    /// free list (slot release/abort: the snapshots were taken but never
+    /// attached, or the crossing tick never ran). Returns the recycled count.
+    pub(crate) fn drop_slot_reservations(&mut self, slot: usize) -> usize {
+        let mut kept = Vec::new();
+        let mut recycled = 0;
+        for (s, p, i) in self.state_reserved.drain(..) {
+            if s == slot {
+                self.state_free.push(i);
+                recycled += 1;
+            } else {
+                kept.push((s, p, i));
+            }
+        }
+        self.state_reserved = kept;
+        recycled
+    }
+
+    /// Drop every reservation (full flush): all indices return to the free
+    /// list. Returns the recycled count.
+    pub(crate) fn recycle_all_reserved(&mut self) -> usize {
+        let n = self.state_reserved.len();
+        for (_, _, i) in self.state_reserved.drain(..) {
+            self.state_free.push(i);
+        }
+        n
     }
 
     /// Claim a free state-pool index without attaching it - the tier's aux
