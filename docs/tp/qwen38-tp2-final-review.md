@@ -62,3 +62,38 @@ No direct TP=1 numerical/logit oracle or independently measured simultaneous GPU
 **Readiness: not yet ready for the ~20k Hermes acceptance.** The context-limit overlap branch needs an executable target-device boundary harness (or an API admission geometry that reaches it), and direct parity/stronger cancellation evidence remain open. Do not run the full acceptance or push this local follow-up as an accepted production milestone on the strength of this smoke. The remote branch was read with `git ls-remote` and still pointed to the starting `096838db6751c26ad0536da1797d26184b46899f`; no push was made.
 
 The original starting-HEAD readiness assessment above is superseded by this follow-up. The numerical-class differences remain unchanged; no tolerances were altered.
+
+## Final targeted-gate follow-up (starting `cf9debb4488d843a7350abb68fbaaa93ad79d644`)
+
+The starting local HEAD was `cf9debb4488d843a7350abb68fbaaa93ad79d644`; the starting remote `origin/review/qwen38-tp2-final` was `096838db6751c26ad0536da1797d26184b46899f`. Two narrow commits were added without rewriting the four readiness commits: `dc8d5b9` (join the TP coordinator thread and send an explicit rank-0 graceful shutdown frame before process exit) and `d1eb7a8` (stage the exact worker runner, capture the worker sidecar status, and report both ranks from the launcher). Final local HEAD is recorded after this section is committed.
+
+### Production-context rerun
+
+The two-node run used the actual production context `MAX_CTX=65536`, `SPEC=off`, `TP_GRAPH=0`, `PADDOCK_UNIFIED=1`, `PADDOCK_PIPE_MIN_LIVE=0`, and `PADDOCK_PREFILL_TICK_ROWS=128`. The exact coordinator and staged worker runner hashes matched (`d0d12fde...` for the first 64K smoke; the later status-fix rebuild was staged under the same dedicated cache path with its exact local/worker hash match), and the CUDA pack hash matched on both ranks. The 64K smoke completed a 33,001-token multi-span request (HTTP 200, one completion token), then a 48,001-token async candidate alongside a 14-token concurrent decoder (HTTP 200, 32 and 64 completion tokens). Logs showed repeated Mixed ownership, Async launch, span finish, one lane promotion and decode-pipe drain; no page, KV, NCCL, panic or coordinator-poison error appeared. This gate passes for the exercised requests, not as a claim about untested 64K shapes.
+
+### Mixed -> Async eligibility-change pinning
+
+A new focused regression `gpu_model::qwen35::tp_serve::tests::eligibility_change_does_not_relaunch_a_running_mixed_prompt_on_async_lane` passed in the full 488-test engine library run. It starts a prompt with `Mixed` eligibility, executes a partial `chunk_take`, flips the eligibility input to Async while the prompt remains incomplete, verifies the same queue entry continues on Mixed with zero async launches, then verifies completion and a fresh prompt can select Async. This exercises the shared lane-selection and queue-take seam and proves no `TpSpanLaunch` is selected for the pinned prompt. It is still a host behavioral test rather than a live scheduler trace with a changing decoder cohort; that live evidence remains open.
+
+### Cancellation while CUDA span work is pending
+
+The existing 64K live smoke still proves deferred cancellation only after the prior request's abort was observed after span drain. A new raw-socket harness was attempted with a concurrent decoder, but it did not obtain a new Async `TpSpanLaunch` before timeout (the request remained on the Mixed path), so it does not prove cancellation while `prefill_lane_done()` is false. The slot-reuse request itself completed, but this gate remains open and is not claimed as passed.
+
+### Context-lookahead branch
+
+The focused real helper tests `overlap_context_drain_at_final_legal_position` and `fixed_context_pipe_drains_before_lookahead_even_for_dummy_slots` pass in the 488-test engine library run and cover positions 46/47 with limit 48, including dummy-slot accounting. The 64K live run did not emit the exact overlap context-boundary marker because the public API completion cap drained before an illegal `pipe_next`. Therefore the helper/decision arithmetic is tested, but the target-device coordinator branch is not live-proven; this gate remains open.
+
+### Rank exit status
+
+The launcher now stages the worker at `/home/sime/.cache/paddock-tp/paddock-runner-cf9debb`, preserves the configured worker binary, keeps exact runner/pack hash preflight, records a numeric sidecar status, and prints both statuses. A clean SIGTERM shutdown through the runner's normal graceful path produced `coordinator exit: 0` and `worker exit: 0`; the worker sidecar also contained `0`. The admin `/v1/shutdown` path bypasses the normal signal cleanup and still produces worker `1`/EOF, so status evidence must use the normal signal path. The required normal-shutdown gate passes; the admin-path discrepancy is a remaining operational caveat.
+
+### TP=1 parity sanity
+
+Using the same Qwen3.8 checkpoint, pack, and `MAX_CTX=65536`, deterministic greedy requests were run at TP=1 and TP=2 for a 5-token short prompt and a 192-token prompt (>64). Both paths returned first token text `" Paris"` and `" A"`, respectively. Legacy API logprobs differed as expected: TP=1 `-0.4762611` / `-0.0793877`, TP=2 `-0.4674339` / `-0.0724716`. The endpoint exposes decoded token strings rather than numeric IDs, so this is a first-token decoded parity check, not a direct ID-array oracle; no obvious state divergence was found.
+
+### Final status
+
+Static validation after the code changes passed: `cargo test -p paddock-engine --lib` (488 passed), `cargo test -p paddock-engine --all-targets` (pass; model-dependent tests self-skipped where fixtures were absent), `cargo test -p paddock-dist` (4 unit + 22 bootstrap), `cargo clippy -p paddock-engine -p paddock-dist --all-targets` (pass with existing warnings), `git diff --check`, and `cargo build --release -p paddock-runner --bin paddock-runner`. `cargo fmt --all -- --check` remains nonzero on pre-existing unrelated formatting across other engine examples/modules; it was not used as an acceptance gate. No ~20k Hermes acceptance was run.
+
+Readiness remains **not ready** for the ~20k Hermes acceptance. The 64K production smoke, normal numeric rank-exit reporting, focused pinning regression, and lightweight TP=1 parity passed, but the required live Mixed -> Async eligibility transition, true pending-CUDA cancellation/reuse proof, and target-device context-lookahead branch proof remain incomplete. No push was made.
+
