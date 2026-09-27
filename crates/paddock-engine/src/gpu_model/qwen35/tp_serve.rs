@@ -330,6 +330,7 @@ pub struct TpCoordinator {
     /// (`&self`, no request round-trip). Published after every command.
     span_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     poisoned: Option<String>,
+    shutdown_sent: bool,
 }
 
 /// One queued prompt chunk: the remaining ordered rows (slot, token,
@@ -518,6 +519,7 @@ impl TpCoordinator {
             span: None,
             span_done: Some(span_done),
             poisoned: None,
+            shutdown_sent: false,
         })
     }
 
@@ -1751,6 +1753,9 @@ impl TpCoordinator {
 }
 
 enum Command {
+    /// Ask the owning CUDA thread to send the rank-0 shutdown frame before it
+    /// is joined during generator teardown.
+    Shutdown,
     Reset,
     Step(u32),
     Prefill(usize, Vec<u32>),
@@ -1814,6 +1819,11 @@ pub struct TpGenerator {
     /// flight (published after every command). `unified_span_done` polls it.
     span_done: Arc<std::sync::atomic::AtomicBool>,
     poisoned: Option<String>,
+    /// The command thread owns the CUDA/NCCL stream and coordinator. Joining
+    /// it on drop guarantees its `TpCoordinator` sends the graceful Shutdown
+    /// frame before the runner exits; a detached thread could be killed after
+    /// the engine's ready waiter fired, making rank 1 report a false EOF.
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TpGenerator {
@@ -1835,7 +1845,7 @@ impl TpGenerator {
         let pack = pack.to_owned();
         let span_done = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let lane_flag = Arc::clone(&span_done);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("qwen35-tp-rank0".into())
             .spawn(move || {
                 let mut coordinator = match TpCoordinator::load(
@@ -1872,7 +1882,13 @@ impl TpGenerator {
                     return;
                 }
                 for (cmd, reply) in rx {
-                    let result = if coordinator.pipe.is_some()
+                    let shutdown = matches!(cmd, Command::Shutdown);
+                    let result = if shutdown {
+                        coordinator.shutdown_sent = true;
+                        shutdown_worker(&mut coordinator.stream, coordinator.poisoned.is_none())
+                            .map(|_| Response::Logits(Vec::new()))
+                            .map_err(|e| e.to_string())
+                    } else if coordinator.pipe.is_some()
                         && !matches!(cmd, Command::PipeNext(_) | Command::PipeDrain)
                     {
                         Err("TP pipe must drain before another command".into())
@@ -1897,6 +1913,7 @@ impl TpGenerator {
                         Err("TP span in flight; only pipe ticks or the span finish may run".into())
                     } else {
                         match cmd {
+                            Command::Shutdown => unreachable!("shutdown handled before command dispatch"),
                             Command::Reset => coordinator
                                 .reset_both()
                                 .map(|_| Response::Logits(Vec::new())),
@@ -1953,7 +1970,7 @@ impl TpGenerator {
                     coordinator.publish_span_done();
                     let failed = result.is_err();
                     let _ = reply.send(result);
-                    if failed {
+                    if failed || shutdown {
                         break;
                     }
                 }
@@ -1973,6 +1990,7 @@ impl TpGenerator {
             process_bytes,
             span_done,
             poisoned: None,
+            worker: Some(worker),
         })
     }
 
@@ -1997,6 +2015,29 @@ impl TpGenerator {
         match self.request(command)? {
             Response::Logits(logits) => Ok(logits),
             _ => Err("TP reply kind mismatch".into()),
+        }
+    }
+}
+
+impl Drop for TpGenerator {
+    fn drop(&mut self) {
+        // Ask the owning CUDA thread to send the frame while its stream is
+        // still live. The queue close below is the fallback for an already
+        // failed command thread.
+        if self.worker.is_some() {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            if self.commands.send((Command::Shutdown, reply_tx)).is_ok() {
+                let _ = reply_rx.recv();
+            }
+        }
+        // Close the command queue before joining so the coordinator thread can
+        // leave its loop if the explicit shutdown could not be queued.
+        let (replacement, _receiver) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.commands, replacement));
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("TP coordinator thread panicked during shutdown");
         }
     }
 }
@@ -2240,7 +2281,9 @@ impl Generator for TpGenerator {
 
 impl Drop for TpCoordinator {
     fn drop(&mut self) {
-        let _ = shutdown_worker(&mut self.stream, self.poisoned.is_none());
+        if !self.shutdown_sent {
+            let _ = shutdown_worker(&mut self.stream, self.poisoned.is_none());
+        }
     }
 }
 
@@ -2772,6 +2815,59 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    #[test]
+    fn eligibility_change_does_not_relaunch_a_running_mixed_prompt_on_async_lane() {
+        use crate::generator::PrefillLane::{Async, Mixed};
+
+        let prompt = |slot| PrefillChunk {
+            slot,
+            rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
+            fin_plan: None,
+            owner: None,
+        };
+        let mut queue = VecDeque::from([prompt(0)]);
+        let mut async_launches = 0usize;
+
+        // P starts while no decoder makes overlap eligible: its first rows
+        // execute on Mixed and pin the queue entry through the real chunk_take
+        // path, not by inspecting an owner field in isolation.
+        let owner = queue.front().and_then(|c| c.owner);
+        let lane = if crate::service::select_prefill_lane(owner, false) {
+            async_launches += 1;
+            Async
+        } else {
+            Mixed
+        };
+        let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 2, lane).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(finished.is_empty());
+        assert_eq!(queue.front().and_then(|c| c.owner), Some(Mixed));
+        assert_eq!(async_launches, 0, "P must not launch TpSpanLaunch yet");
+
+        // The scheduler becomes async-eligible before P completes. The same
+        // queue entry must continue on Mixed, and the attempted async route
+        // must not consume rows or launch a span.
+        let owner = queue.front().and_then(|c| c.owner);
+        assert!(!crate::service::select_prefill_lane(owner, true));
+        let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 3, Mixed).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(finished.len(), 1);
+        assert!(queue.is_empty(), "P completed on its pinned lane");
+        assert_eq!(async_launches, 0);
+
+        // Completion clears the pin. A fresh prompt may legitimately select
+        // Async under the same eligibility conditions and then finish for its
+        // first decode token.
+        queue.push_back(prompt(0));
+        let owner = queue.front().and_then(|c| c.owner);
+        assert!(crate::service::select_prefill_lane(owner, true));
+        async_launches += 1;
+        let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 5, Async).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(finished.len(), 1);
+        assert!(queue.is_empty());
+        assert_eq!(async_launches, 1);
+    }
     #[test]
     fn finisher_wire_plan_rejects_invalid_sampler_parameters_before_authorization() {
         use crate::sampler::DevicePlan;

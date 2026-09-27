@@ -3197,7 +3197,7 @@ mod cohort_grace_tests {
     }
 }
 
-fn select_prefill_lane(owner: Option<PrefillLane>, overlap_eligible: bool) -> bool {
+pub(crate) fn select_prefill_lane(owner: Option<PrefillLane>, overlap_eligible: bool) -> bool {
     match owner {
         Some(PrefillLane::Mixed) => false,
         Some(PrefillLane::Async) => true,
