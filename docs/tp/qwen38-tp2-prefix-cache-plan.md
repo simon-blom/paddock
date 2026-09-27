@@ -171,3 +171,121 @@ New: `Admit`/`CheckpointReserve`/`CheckpointAttach`/extended `Publish` ops in
 wire messages (protocol v4); admission/publish hooks + Mixed pin in
 `tp_serve.rs`; `take_prefill_reused`/`prefill_begin_hinted` on
 `TpGenerator`.
+
+
+## Milestone-1 implementation record
+
+Commits on `review/qwen38-tp2-final`, starting HEAD `0f73352`:
+
+1. `229be9f` - this design note (Phase 1/2);
+2. `06d24e0` - cache metadata: `Admit`/`CheckpointReserve`/`CheckpointAttach`/
+   `CheckpointRecycle` in `MirroredKv`, `probe_ckpt`/`match_full_upto`/
+   reservations in `PagedRadix`, the pure `tp_resume_decision` +
+   `tp_publish_ops`;
+3. `f4ef4eb` - protocol v4 (`ckpt_slots` in `TpInit`, `TpPrefixAdmit`,
+   `TpPrefixPublish`), coordinator admission/publish hooks, the rank-local
+   DeltaNet checkpoint pool (`enable_prefix_checkpoints`,
+   `snapshot_slot_ckpt`, `restore_slot_ckpt`);
+4. `190681c` - resumed-prompt Mixed pin, wire cut lists (`TpMixed.ckpts`,
+   `TpSpanLaunch.ckpts`), worker rank-local snapshots at cut boundaries,
+   fail-closed publish, admission-cursor integration;
+5. `92590cc` - wire-frame cap/roundtrip tests for the new messages.
+
+Validation: `cargo test -p paddock-engine --lib` 500 passed (12 new
+`tp_kv` + 2 new `tp_serve` tests); `cargo test -p paddock-dist` 5 + 22
+passed (2 new protocol tests); `--test tp_wire_frame` 6 passed (1 new);
+`cargo clippy -p paddock-engine -p paddock-dist --all-targets` clean apart
+from the pre-existing `cuda.rs`/example warnings; `git diff --check` clean;
+`cargo build --release -p paddock-runner --bin paddock-runner` passed. The
+GPU-touching `--all-targets` binaries were NOT run in this session (the host
+GPU is occupied by the serving model); they belong to the validation session
+below.
+
+### How the invariants are met
+
+- **Rank symmetry.** Rank 0 probes read-only, decides once with
+  `tp_resume_decision`, and authorizes `Admit`; each rank's `Admit` apply
+  re-walks its own tree and requires the checkpoint at EXACTLY the chosen
+  position (`match_full_upto` + attached-checkpoint check) before adopting.
+  A rank that cannot satisfy it fails the tick - recompute, never a
+  one-sided resume. The worker additionally fail-closes a publish whose cuts
+  have no local reservation.
+- **No physical page ids on the wire.** Resume carries tokens + position;
+  publish carries `(cut, rank-0 index)` pairs where the index is
+  validation-only (each rank attaches its own mirror-deterministic
+  reservation).
+- **GQA restore.** `Admit` clears the slot's table and `share_prefix`es the
+  matched blocks (zero-copy refcount adoption) - the same mechanism the
+  non-TP path uses; both ranks' tables are snapshot-validated.
+- **DeltaNet restore.** Both ranks `restore_slot_ckpt(slot, idx)` from their
+  own pool at the validated index BEFORE the admission Ready; the recurrent
+  state and conv window are restored together (one per-layer pair copy),
+  matching the logical position of the adopted pages exactly (enforced by
+  the attach-at-exact-position rule).
+- **Publication.** Mid-prefill, a span ending exactly on a reserved cut
+  snapshots the live DeltaNet state (rank-local) BEFORE further rows
+  advance it; at successful finish the publish tick attaches the
+  snapshotted reservations, publishes all full pages, and recycles the
+  rest - only after the GPU work succeeded on both ranks.
+- **Refs/releases.** Insert retains (tree ref); adoption retains (slot ref);
+  `Release`/`Reset`/`Flush` drop slot refs, recycle that slot's
+  unattached reservations, and keep radix-owned pages until LRU eviction
+  (tested: release frees exactly the un-published partial-tail page).
+- **Scheduler integration.** `chunk_enqueue` sets `positions[slot] = resume`
+  and queues rows `[resume..t_len)`; `chunk_take` therefore starts at
+  `resume` (tested); `finish_prefill` reports `cached = resume` through
+  `prefill_begin_hinted`/`take_prefill_reused`.
+- **Mixed pin.** A resumed prompt's queue entry is pinned
+  `owner = Some(Mixed)` before the first take, `span_take` refuses it
+  (returns false, no error), and `prefill_front_owner` reports the pin -
+  the scheduler can never select Async for a restored prompt in milestone 1.
+
+### Known limitations (deliberate, milestone 1)
+
+- Resume depth is bounded by prompt-prefill checkpoints (the last two page
+  boundaries): agentic depth comes from stage-F reply checkpoints, which are
+  out of scope here. Identical prompts resume at the second-to-last
+  boundary and recompute the trailing partial page; scenario B resumes only
+  when the divergent tail starts at/after a published checkpoint.
+- The serial one-slot `Prefill` path stays cold (chunked admission is the
+  production TP path).
+- Multimodal prompts are not covered (keys are raw token ids; the scheduler
+  routes mm prompts elsewhere).
+- The checkpoint pool is modest (default 4 slots/layer/rank,
+  `PADDOCK_TP_CKPT_SLOTS` to change); exhaustion steals the LRU checkpoint
+  deterministically on both ranks.
+
+### GPU validation plan (next hosted-model session)
+
+Run from a clean server (fresh coordinator + worker; `SPEC=off`,
+`TP_GRAPH=0`, `PADDOCK_UNIFIED=1`, production `MAX_CTX=65536`); the exact
+~20k Hermes request from the accepted run, deterministic sampling
+(temperature 0, seed 1). Rank-0 and rank-1 logs both carry
+`TP prefix admit`/`TP prefix published` lines - record BOTH ranks' resume
+positions and prove equality (gate D).
+
+- **A. Cold then identical.** Send P (~20k text tokens); record cold prefill
+  duration. Send P again; verify `TP prefix admit (cache HIT)` with
+  `resume` = the second-to-last page boundary of P, `Prefilled { cached:
+  resume }` in usage, only the trailing partial page + 1 token computed
+  (mixed-tick row counts), and a dramatic latency reduction. First
+  generated token must match the cold run under the deterministic plan.
+- **B. Shared prefix, divergent tail.** P1 = long history + user message A;
+  P2 = same history + user message B. Verify P2's `resume` lands inside the
+  shared history (>= the deepest checkpoint P1 published), only the
+  divergent suffix appears in mixed-tick rows, and the decode is coherent.
+  NOTE: the tail must start at/after a published checkpoint - if A's text
+  begins inside P1's trailing partial page, extend the shared history by a
+  full page before the divergence.
+- **C. Release/reuse.** Complete/cache one request; reuse the same slot with
+  a resumed prompt; cancel a queued/active request (post-drain per the
+  existing invariant); reuse again. No stale KV/DeltaNet/page errors, no
+  `KV position has no live pages`, no duplicate publish.
+- **D. Rank symmetry.** Both ranks' logs show the same `resume` for every
+  admitted prompt; no NCCL mismatch, no coordinator poison. A worker-side
+  checkpoint mismatch fails the pair BEFORE GPU work (by construction);
+  exercise the failure by staging a corrupted cache state only if a safe
+  harness exists - otherwise rely on the host test covering the refusal.
+- **Failure drill (optional but valuable).** With `PADDOCK_TP_CKPT_SLOTS=0`,
+  every request must serve cold with no cache logging and no errors -
+  proving the pages-only degrade path.
