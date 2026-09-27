@@ -289,3 +289,108 @@ positions and prove equality (gate D).
 - **Failure drill (optional but valuable).** With `PADDOCK_TP_CKPT_SLOTS=0`,
   every request must serve cold with no cache logging and no errors -
   proving the pages-only degrade path.
+
+## Sol correctness review
+
+Review base `0f73352bab63ebb41e54d1c1b54cbf855c88bd85` through
+`825c5e471f6f97e682999c0adaa394cd72442f2b`. This section supersedes
+incorrect implementation claims above without removing the original design
+history. The following are pre-GPU findings; none was discovered by running
+GPU inference.
+
+### Findings and narrow fixes
+
+- **BLOCKER — admission/publish ACK mismatch:** the worker replied `TpReady`,
+  while rank 0 waited for `TpPrepared`; the first admitted request timed out.
+  Both metadata exchanges now await the worker's actual Ready after mirror
+  validation (and, on resume, its DeltaNet restore). Existing tests never
+  exercised the two-ended command exchange.
+- **BLOCKER — non-mirrored reservation and incomplete comparison:** rank 0
+  reserved cuts but `TpPrefixAdmit` carried only `Admit`; rank 1 could not
+  snapshot or attach. The wire now carries rank-0-selected ordered cuts and
+  rank 1 replays the same reservation operations. The snapshot compares
+  reservations, free indices, per-slot token digests, and a deterministic
+  digest of the radix's exact token keys, page bindings, LRU, recurrence,
+  checkpoint attachments and free-list order. The worker validates exact
+  cut/index correspondence before snapshot and refuses publication of any
+  cut it did not snapshot. Prior tests seeded reservations independently.
+- **BLOCKER — resumed cursor mismatch:** rank 0 set position `R` but queued
+  prompt rows from zero. Admission now queues precisely `tokens[R..T]` with
+  absolute positions; the queue regression uses the same row constructor.
+- **BLOCKER — publish ordering:** `CheckpointAttach` ran before the radix
+  `Publish` created its nodes. Publication now stages `Publish`, attachments,
+  then recycles atomically; a new mirrored cold→publish→release→identical or
+  divergent resume regression exercises the actual operation sequence.
+- **HIGH — skipped checkpoint cuts:** fixed-cap spans crossed 16-token cut
+  boundaries without landing on them (e.g. cuts 80/96 in a 100-row prompt).
+  Both ranks now split Mixed subspans at every reserved cut and snapshot
+  immediately after row `N-1` and before row `N`; exact cut lists and indices
+  are validated on receipt. Both ranks fence completed GPU work before
+  publication (and rank 1 fences at every snapshotted cut). Boundary tests
+  cover 15/16/17, 31/32/33, 63/64/65 and non-cap-aligned 80/96. GPU
+  content fidelity is still untested.
+- **HIGH — reservation double recycle / concurrent identical prompts:**
+  recycle now consumes the exact `(slot, cut, index)` reservation once, and
+  reserve/attach names the slot explicitly rather than choosing the first
+  identical token vector. Concurrent identical slots retain distinct pool
+  indices. An already-attached cached cut is not reattached by a later
+  identical prompt: its extra snapshot reservation is recycled instead.
+- **HIGH — exhausted capacity and page-only publication:** zero or occupied
+  checkpoint capacity now skips new reservations rather than rejecting cold
+  service. Successful prompts publish their complete GQA pages even without
+  snapshots. Cold Async also publishes pages after both ranks join, and
+  explicitly carries no checkpoint cuts; a pages-only match never resumes
+  without a DeltaNet checkpoint.
+- **HIGH — reclaimable cache exhausted the KV pool:** `Ensure` now evicts LRU
+  radix leaves until enough *actual* free pages exist, then allocates in the
+  staged mirrored transaction. A focused host test fills the pool with
+  cache-held pages and verifies new prefill can reclaim them.
+- **HIGH — abort before first chunk:** admission may retain pages and reserve
+  checkpoint indices before any GPU row marks a slot occupied. Successful
+  admission now marks it occupied immediately so the normal mirrored Release
+  reclaims all slot refs and reservations after queued cancellation. A
+  second Admit into an unreleased slot fails closed; no partial state can be
+  reused. Command errors poison and tear down the pair, rather than letting
+  another request consume a partially adopted slot.
+- **MEDIUM — memory accounting:** `context_mem_bytes` now includes actual
+  allocated checkpoint-pool pairs in every linear layer. A pool slot's bytes
+  are `sum_layers((recurrent_elements + conv_elements) * sizeof(f32))`
+  per rank; default capacity allocates four such slots on each rank, capacity
+  zero allocates none. The earlier ~57 MB/rank-per-slot estimate remains a
+  model-geometry estimate, not a measurement from this CPU-only review;
+  allocation failure at startup returns an error rather than reducing capacity.
+
+### Corrected invariants and remaining risk
+
+Rank 0 is the sole resume-depth chooser. Rank 1 only verifies the exact
+checkpoint during `Admit`, adopts its own GQA pages, and restores its own
+recurrent and conv state. A reservation may detach an LRU checkpoint after
+admission; both ranks capture the chosen rank-local checkpoint index *before*
+reservation replay and enqueue restore before any later snapshot can reuse
+that device buffer. The radix mirror digest detects future-decision drift;
+`probe_ckpt` and exact `match_full_upto` compare the same 16-token blocks
+including exact collision checks. Refcounted slot pages are released once;
+radix-owned pages survive until eviction; trailing partial pages never enter
+the cache. Successful Async paths publish GQA pages only, and Mixed owns all
+resumed work across ticks. The scheduler's semantic prompt length remains
+`T`; cached rows are `R` and computed rows are `T-R`.
+
+Static checks: focused `tp_kv` (20) and `tp_serve` (27) host tests passed;
+`cargo test -p paddock-engine --lib` (507 passed), `cargo test -p
+paddock-dist` (5 unit + 22 integration passed), focused TP wire-frame tests,
+`cargo clippy -p paddock-engine -p paddock-dist --all-targets` (passed with
+pre-existing warnings in `cuda.rs` and two examples), `git diff --check`, and
+`cargo build --release -p paddock-runner --bin paddock-runner` passed. A
+stricter `-D warnings` clippy invocation stopped on the pre-existing
+`cuda.rs` unnecessary cast; it is not a correctness gate and was not changed.
+`cargo test -p paddock-engine --all-targets` was deliberately skipped:
+GPU binaries initialize CUDA on the host serving a local model and can OOM
+that backend. No two-node GPU run was made.
+
+Remaining risks requiring the planned isolated GPU campaign: verify actual
+recurrent/conv checkpoint bytes and the two ranks' content after a cut,
+stream ordering under Mixed and Async completion, GQA payload equality,
+first-token equality and API cached/usage accounting under a real request.
+Host tests cannot prove device-content fidelity or the two-ended wire/ACK
+sequence without model initialization. **Approved for two-node GPU
+validation only**, not production deployment; stop on any mismatch.
