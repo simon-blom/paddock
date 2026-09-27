@@ -10,7 +10,7 @@ CONFIG_KEYS=(
   RUNNER REMOTE_RUNNER MODEL REMOTE_MODEL PACK REMOTE_PACK
   WORKER_HOST MASTER_ADDR MASTER_PORT HTTP_HOST HTTP_PORT MAX_CTX MAX_BATCH
   KV_DTYPE SPEC TP_GRAPH SSH_OPTS NCCL_SOCKET_IFNAME NCCL_IB_HCA
-  NCCL_IB_DISABLE NCCL_NET REMOTE_PIDFILE REMOTE_LOG LD_LIBRARY_PATH
+  NCCL_IB_DISABLE NCCL_NET REMOTE_PIDFILE REMOTE_LOG REMOTE_STATUSFILE LD_LIBRARY_PATH
 )
 
 # Read simple KEY=VALUE dotenv files without executing them. Caller-provided
@@ -69,6 +69,7 @@ load_env_file "$ENV_FILE"
 : "${LD_LIBRARY_PATH:=}"
 : "${REMOTE_PIDFILE:=/tmp/paddock-qwen38-tp2-worker-${MASTER_PORT}.pid}"
 : "${REMOTE_LOG:=/tmp/paddock-qwen38-tp2-worker-${MASTER_PORT}.log}"
+: "${REMOTE_STATUSFILE:=/tmp/paddock-qwen38-tp2-worker-${MASTER_PORT}.status}"
 : "${TP_DRY_RUN:=0}"
 
 require_nonempty() {
@@ -88,6 +89,60 @@ fi
 
 read -r -a SSH_ARGS <<< "$SSH_OPTS"
 remote_pid=""
+remote_status=""
+
+remote_cleanup() {
+  local pidfile="$REMOTE_PIDFILE" statusfile="$REMOTE_STATUSFILE" result
+  set +e
+  [[ -n "$remote_pid" ]] || return 0
+  result="$(ssh "${SSH_ARGS[@]}" "$WORKER_HOST" bash -s -- "$pidfile" "$statusfile" <<'REMOTE_CLEANUP'
+set -e
+pidfile="$1"
+statusfile="$2"
+if [[ -r "$statusfile" ]]; then
+  cat "$statusfile"
+  rm -f "$pidfile"
+  exit 0
+fi
+pid=""
+if [[ -r "$pidfile" ]]; then
+  pid="$(<"$pidfile")"
+fi
+# A normal coordinator shutdown sends the worker a protocol Shutdown. Give
+# that path time to write its numeric status before escalating.
+for _ in {1..30}; do
+  if [[ -r "$statusfile" ]]; then
+    cat "$statusfile"
+    exit 0
+  fi
+  [[ "$pid" =~ ^[0-9]+$ ]] || break
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 1
+done
+if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]]; then
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  if [[ "$cmdline" == *"--tp-worker"* && "$cmdline" == *"paddock-runner"* ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      [[ -r "$statusfile" ]] && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+fi
+if [[ -r "$statusfile" ]]; then
+  cat "$statusfile"
+else
+  printf 'unknown\n'
+fi
+rm -f "$pidfile"
+REMOTE_CLEANUP
+)"
+  remote_status="$(printf '%s\n' "$result" | awk '/^[0-9]+$/{line=$0} END{print line}')"
+  [[ -n "$remote_status" ]] || remote_status="unknown"
+  remote_pid=""
+}
 
 if [[ "$TP_DRY_RUN" != 1 ]]; then
   # Refuse an older remote runner before either rank loads the model or joins
@@ -115,31 +170,6 @@ fi
 
 quote_remote() {
   printf '%q' "$1"
-}
-
-remote_cleanup() {
-  local pidfile="$REMOTE_PIDFILE" pid cmdline
-  set +e
-  [[ -n "$remote_pid" ]] || return 0
-  ssh "${SSH_ARGS[@]}" "$WORKER_HOST" bash -s -- "$pidfile" <<'REMOTE_CLEANUP' >/dev/null 2>&1
-set -e
-pidfile="$1"
-if [[ -r "$pidfile" ]]; then
-  pid="$(<"$pidfile")"
-  if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]]; then
-    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
-    if [[ "$cmdline" == *"--tp-worker"* && "$cmdline" == *"paddock-runner"* ]]; then
-      kill -TERM "$pid" 2>/dev/null || true
-      for _ in {1..20}; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 1
-      done
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  fi
-  rm -f "$pidfile"
-fi
-REMOTE_CLEANUP
 }
 
 trap remote_cleanup EXIT
@@ -174,12 +204,14 @@ fi
 
 # Refuse an existing live worker with the same exact pidfile instead of
 # attaching to or killing an unrelated Paddock process.
-ssh "${SSH_ARGS[@]}" "$WORKER_HOST" bash -s -- "$REMOTE_PIDFILE" "$REMOTE_LOG" "$remote_worker_cmd" <<'REMOTE_START'
+ssh "${SSH_ARGS[@]}" "$WORKER_HOST" bash -s -- "$REMOTE_PIDFILE" "$REMOTE_LOG" "$REMOTE_STATUSFILE" "$remote_worker_cmd" <<'REMOTE_START'
 set -euo pipefail
 pidfile="$1"
 logfile="$2"
-shift 2
+statusfile="$3"
+shift 3
 command="$*"
+status_q="$(printf '%q' "$statusfile")"
 if [[ -r "$pidfile" ]]; then
   old="$(<"$pidfile")"
   if [[ "$old" =~ ^[0-9]+$ && -r "/proc/$old/cmdline" ]]; then
@@ -191,7 +223,11 @@ if [[ -r "$pidfile" ]]; then
   fi
   rm -f "$pidfile"
 fi
-nohup bash -lc "$command" >"$logfile" 2>&1 < /dev/null &
+rm -f "$statusfile"
+# Keep the worker's real numeric exit code in a sidecar. The launcher reads it
+# after the coordinator's protocol shutdown, before escalating cleanup.
+wrapped="$command; rc=\$?; printf '%s\\n' \"\$rc\" > $status_q; exit \"\$rc\""
+nohup bash -lc "$wrapped" >"$logfile" 2>&1 < /dev/null &
 pid=$!
 printf '%s\n' "$pid" > "$pidfile"
 for _ in {1..10}; do
@@ -225,4 +261,11 @@ coordinator_env=(
   "NCCL_NET=$NCCL_NET"
 )
 [[ -n "$LD_LIBRARY_PATH" ]] && coordinator_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+set +e
 env "${coordinator_env[@]}" "${coordinator[@]}"
+coordinator_rc=$?
+set -e
+remote_cleanup
+printf 'coordinator exit: %s\n' "$coordinator_rc"
+printf 'worker exit: %s\n' "$remote_status"
+exit "$coordinator_rc"
