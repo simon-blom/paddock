@@ -292,6 +292,8 @@ struct Span {
     v: CudaSlice<f32>,
     gate: CudaSlice<f32>,
     beta: CudaSlice<f32>,
+    alpha_proj: CudaSlice<f32>,
+    beta_proj: CudaSlice<f32>,
     gate_one: CudaSlice<f32>,
     beta_one: CudaSlice<f32>,
     attn: CudaSlice<f32>,
@@ -314,6 +316,8 @@ impl Span {
             v: e.alloc(n * value)?,
             gate: e.alloc(n * heads)?,
             beta: e.alloc(n * heads)?,
+            alpha_proj: e.alloc(n * heads)?,
+            beta_proj: e.alloc(n * heads)?,
             gate_one: e.alloc(heads)?,
             beta_one: e.alloc(heads)?,
             attn: e.alloc(n * value)?,
@@ -1009,50 +1013,82 @@ impl DeltaTpRank {
                 gemv_any(e, &self.weights[1], input, &mut s.z)?;
             }
         } else {
-            for t in 0..rows {
-                e.copy_region(input, t * WIDTH, &mut s.input, 0, WIDTH)?;
-                if !prefill {
+            if prefill {
+                profile_stage(&mut profile, e, "delta-alpha-beta-batched", layer)?;
+                // Use the existing f32 repacked Q8 pair projection and gate math
+                // on all live rows. Decode keeps the fused one-row kernel.
+                if e.has_q8_0_gemm_repacked_x2() {
+                    e.q8_0_gemm_repacked_x2(
+                        &self.alpha,
+                        &self.beta_w,
+                        input,
+                        &mut s.alpha_proj,
+                        &mut s.beta_proj,
+                        rows,
+                    )?;
+                } else {
+                    e.q8_0_gemm_repacked(&self.alpha, None, input, &mut s.alpha_proj, rows)?;
+                    e.q8_0_gemm_repacked(&self.beta_w, None, input, &mut s.beta_proj, rows)?;
+                }
+                e.delta_gate(
+                    &s.alpha_proj,
+                    &s.beta_proj,
+                    &self.a,
+                    &self.dt,
+                    &mut s.gate,
+                    &mut s.beta,
+                    rows,
+                    g.values(),
+                )?;
+                super::tp_trace::trace_row(e, "b.dn-gate", layer, &s.gate, 0, g.values())?;
+                super::tp_trace::trace_row(e, "b.dn-beta", layer, &s.beta, 0, g.values())?;
+            } else {
+                for t in 0..rows {
+                    e.copy_region(input, t * WIDTH, &mut s.input, 0, WIDTH)?;
                     gemv_any(e, &self.weights[0], &s.input, &mut s.convolved)?;
                     e.copy_region(&s.convolved, 0, &mut s.mixed, t * g.mixed(), g.mixed())?;
                     gemv_any(e, &self.weights[1], &s.input, &mut s.core)?;
                     e.copy_region(&s.core, 0, &mut s.z, t * g.value_dim(), g.value_dim())?;
-                }
-                // [PADDOCK_TP_ABC_TRACE] the remaining PER-ROW fused
-                // alpha/beta gate work (deltanet_alpha_beta_gate): row 0 of
-                // the span only, so a probe sees exactly this site's values.
-                if t == 0 {
-                    super::tp_trace::trace_row(e, "b.dn-in", layer, &s.input, 0, WIDTH)?;
-                }
-                e.deltanet_alpha_beta_gate(
-                    &self.alpha,
-                    &self.beta_w,
-                    &s.input,
-                    &self.a,
-                    &self.dt,
-                    &mut s.gate_one,
-                    &mut s.beta_one,
-                    g.values(),
-                )?;
-                if t == 0 {
-                    super::tp_trace::trace_row(
-                        e,
-                        "b.dn-gate",
-                        layer,
-                        &s.gate_one,
-                        0,
+                    // [PADDOCK_TP_ABC_TRACE] the remaining PER-ROW fused
+                    // alpha/beta gate work (deltanet_alpha_beta_gate): row 0 of
+                    // the span only, so a probe sees exactly this site's values.
+                    if t == 0 {
+                        super::tp_trace::trace_row(e, "b.dn-in", layer, &s.input, 0, WIDTH)?;
+                    }
+                    e.deltanet_alpha_beta_gate(
+                        &self.alpha,
+                        &self.beta_w,
+                        &s.input,
+                        &self.a,
+                        &self.dt,
+                        &mut s.gate_one,
+                        &mut s.beta_one,
                         g.values(),
                     )?;
-                    super::tp_trace::trace_row(
-                        e,
-                        "b.dn-beta",
-                        layer,
-                        &s.beta_one,
-                        0,
-                        g.values(),
-                    )?;
+                    if t == 0 {
+                        super::tp_trace::trace_row(
+                            e,
+                            "b.dn-gate",
+                            layer,
+                            &s.gate_one,
+                            0,
+                            g.values(),
+                        )?;
+                        super::tp_trace::trace_row(
+                            e,
+                            "b.dn-beta",
+                            layer,
+                            &s.beta_one,
+                            0,
+                            g.values(),
+                        )?;
+                    }
+                    e.copy_region(&s.gate_one, 0, &mut s.gate, t * g.values(), g.values())?;
+                    e.copy_region(&s.beta_one, 0, &mut s.beta, t * g.values(), g.values())?;
                 }
-                e.copy_region(&s.gate_one, 0, &mut s.gate, t * g.values(), g.values())?;
-                e.copy_region(&s.beta_one, 0, &mut s.beta, t * g.values(), g.values())?;
+            }
+            if prefill {
+                profile_stage(&mut profile, e, "delta-conv-split-prep", layer)?;
             }
             e.copy_region(&self.conv, 0, &mut s.ext, 0, g.conv_elements())?;
             e.copy_region(&s.mixed, 0, &mut s.ext, g.conv_elements(), rows * g.mixed())?;
