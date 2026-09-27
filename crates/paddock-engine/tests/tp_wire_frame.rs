@@ -263,3 +263,77 @@ fn b2_new_design_worker_mirror_accepts_then_fails_closed() {
         other => panic!("unexpected message: {other:?}"),
     }
 }
+
+
+/// Protocol v4 prefix-resume messages stay inside the frame cap at realistic
+/// serving geometry: `TpPrefixAdmit` carries the FULL prompt ONCE (a 20k-token
+/// prompt is ~80 KB of JSON - the dominant wire cost of the whole feature),
+/// and `TpPrefixPublish` carries only the cut/index pairs. Both round-trip
+/// through the real `to_frame()`/`from_stream()` codec.
+#[test]
+fn tp_prefix_admit_and_publish_stay_inside_the_frame_cap() {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    // A 20k-token prompt of increasing ids: realistic Hermes-scale body.
+    let tokens: Vec<u32> = (0..20_000).map(|i| (i % 100_000) as u32).collect();
+    let mut coord = MirroredKv::new(BLOCKS, SLOTS, MAX_CTX).expect("geometry");
+    coord.set_state_capacity(4);
+
+    let admit = ControlMessage::TpPrefixAdmit {
+        sequence: 42,
+        slot: 1,
+        tokens: tokens.clone(),
+        resume: 20_480.min((tokens.len() - 1) / 16 * 16), // deepest block-aligned
+        kv_state: serde_json::to_value(coord.snapshot()).expect("snapshot"),
+    };
+    let frame = admit.to_frame().expect("encode admit");
+    assert!(
+        frame.len() <= MAX_FRAME as usize,
+        "TpPrefixAdmit frame {} exceeds the {}-byte cap",
+        frame.len(),
+        MAX_FRAME
+    );
+    // round-trip through a real socket
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut head, mut worker) = {
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (s, _) = listener.accept().unwrap();
+        (s, client)
+    };
+    head.write_all(&frame).unwrap();
+    match ControlMessage::from_stream(&mut worker).expect("decode admit") {
+        ControlMessage::TpPrefixAdmit {
+            sequence, slot, tokens: got, resume, ..
+        } => {
+            assert_eq!((sequence, slot, resume), (42, 1, admit_resume(&tokens)));
+            assert_eq!(got.len(), tokens.len());
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let publish = ControlMessage::TpPrefixPublish {
+        sequence: 43,
+        slot: 1,
+        checkpoints: vec![(512, 0), (1024, 1), (20_352, 2)],
+        kv_state: serde_json::to_value(coord.snapshot()).expect("snapshot"),
+    };
+    let frame = publish.to_frame().expect("encode publish");
+    assert!(frame.len() <= MAX_FRAME as usize);
+    head.write_all(&frame).unwrap();
+    match ControlMessage::from_stream(&mut worker).expect("decode publish") {
+        ControlMessage::TpPrefixPublish {
+            sequence, checkpoints, ..
+        } => {
+            assert_eq!((sequence, checkpoints.len()), (43, 3));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// The deepest block-aligned resume a cold decision could pick for `tokens`
+/// (mirrors the pure helper's strictly-inside rule).
+fn admit_resume(tokens: &[u32]) -> usize {
+    (tokens.len() - 1) / 16 * 16
+}
