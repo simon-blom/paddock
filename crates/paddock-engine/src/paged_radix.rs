@@ -307,7 +307,12 @@ impl PagedRadix {
         for bi in 0..full {
             let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
             let h = hash_block(chunk);
-            let child = *self.nodes[node as usize].children.get(&h)?;
+            // A miss anywhere ENDS the walk (deepest match so far wins) - it
+            // must NOT discard the checkpoint already found under the shared
+            // prefix.
+            let Some(&child) = self.nodes[node as usize].children.get(&h) else {
+                break;
+            };
             if self.nodes[child as usize].tokens != chunk {
                 break; // hash collision - treat as a miss
             }

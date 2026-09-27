@@ -165,6 +165,13 @@ pub enum ControlMessage {
         /// rows[..rows.len()-chunk_rows] are decode rows, the rest prompt
         /// rows executed as one or more batched spans. v3.
         chunk_rows: usize,
+        /// Prefix-cache checkpoint cuts the chunk run's spans end exactly on,
+        /// `(cut position, rank-0 pool index)` in cut order (v4). The worker
+        /// snapshots its own DeltaNet state at those span boundaries into its
+        /// own mirror-deterministic pool index; the wire indices are for
+        /// validation only (the worker attaches ITS index at publish).
+        /// Empty on every non-prefill tick.
+        ckpts: Vec<(usize, u32)>,
         kv_state: serde_json::Value,
     },
     /// Start an ordered device-feedback decode segment with host tokens.
@@ -200,6 +207,9 @@ pub enum ControlMessage {
         /// chunk reads full logits for the host sampler. Rank 1 promotes
         /// exactly these slots' lane-local state at the span finish.
         finishers: Vec<(usize, Option<TpSpanFinisherPlan>)>,
+        /// Prefix-cache checkpoint cuts this launch's spans end exactly on,
+        /// `(cut position, rank-0 pool index)` (v4). See TpMixed.ckpts.
+        ckpts: Vec<(usize, u32)>,
         kv_state: serde_json::Value,
     },
     /// Fence the in-flight span: join both lanes, promote each finished
@@ -367,6 +377,7 @@ mod tests {
             sequence: 7,
             rows: vec![(0, 11, 0), (0, 12, 1), (1, 22, 5)],
             chunk_rows: 2,
+            ckpts: vec![(64, 0)],
             kv_state: serde_json::json!({"tables": []}),
         };
         let json = serde_json::to_string(&msg).unwrap();

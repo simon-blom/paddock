@@ -749,6 +749,328 @@ mod tests {
         assert!(f.mirror_tick(&ops, &end).is_ok());
     }
 
+    // ── prefix-cache resume (milestone 1) ────────────────────────────────
+
+    fn mk(max_ctx: usize, slots: usize) -> MirroredKv {
+        let blocks = (max_ctx.div_ceil(BLOCK_TOKENS) * slots) as u32;
+        MirroredKv::new(blocks, slots, max_ctx).unwrap()
+    }
+
+    /// Admit a cold prompt, publish its pages, checkpoint at the given cut.
+    ///
+    /// Mirrors the op sequence on head AND worker at every step.
+    fn seed_cache(
+        head: &mut MirroredKv,
+        worker: &mut MirroredKv,
+        tokens: &[u32],
+        slot: usize,
+    ) {
+        head.set_state_capacity(4);
+        worker.set_state_capacity(4);
+        let ops = vec![Operation::Admit {
+            slot,
+            tokens: tokens.to_vec(),
+            resume: 0,
+        }];
+        let end = head.authorize_all(&ops).unwrap();
+        worker.mirror_tick(&ops, &end).unwrap();
+        // fill the slot's table with live pages (the physical backing a real
+        // prefill wrote) and publish its full blocks
+        let position = tokens.len() - 1;
+        let ops2 = vec![Operation::Ensure { slot, position }];
+        let end2 = head.authorize_all(&ops2).unwrap();
+        worker.mirror_tick(&ops2, &end2).unwrap();
+        let ops3 = vec![Operation::Publish {
+            slot,
+            tokens: tokens.to_vec(),
+        }];
+        let end3 = head.authorize_all(&ops3).unwrap();
+        worker.mirror_tick(&ops3, &end3).unwrap();
+    }
+
+    fn attach_ckpt(
+        head: &mut MirroredKv,
+        worker: &mut MirroredKv,
+        tokens: &[u32],
+        slot: usize,
+        cut: usize,
+    ) -> (u32, u32) {
+        let ops = vec![Operation::CheckpointReserve {
+            tokens: tokens.to_vec(),
+            position: cut,
+        }];
+        let end = head.authorize_all(&ops).unwrap();
+        worker.mirror_tick(&ops, &end).unwrap();
+        let idx_head = head.slot_reserved_ckpt(slot, cut).unwrap();
+        let idx_worker = worker.slot_reserved_ckpt(slot, cut).unwrap();
+        let ops2 = vec![Operation::CheckpointAttach {
+            tokens: tokens.to_vec(),
+            position: cut,
+            index: idx_head,
+        }];
+        let end2 = head.authorize_all(&ops2).unwrap();
+        worker.mirror_tick(&ops2, &end2).unwrap();
+        (idx_head, idx_worker)
+    }
+
+    /// 1 + 2. Cold prompt probes nothing; an identical cached prompt probes
+    /// a nonzero block-aligned resume at the attached checkpoint.
+    #[test]
+    fn cold_probe_is_none_and_identical_prompt_probes_the_checkpoint() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut tokens: Vec<u32> = (0..96).collect(); // 6 blocks
+        tokens.push(999);
+        assert!(head.match_prefix_probe(&tokens).ckpt.is_none());
+        seed_cache(&mut head, &mut worker, &tokens, 0);
+        // attach at the 4-block boundary (64) - the deepest prefill-reachable
+        // cut for a 97-token prompt per tp_checkpoint_cuts
+        let cut = 64;
+        let (idx, _) = attach_ckpt(&mut head, &mut worker, &tokens, 0, cut);
+        // read-only probe leaves both trees untouched (equal snapshots)
+        let before = (head.snapshot(), worker.snapshot());
+        assert_eq!(
+            head.match_prefix_probe(&tokens).ckpt,
+            Some((cut, idx))
+        );
+        assert_eq!(head.snapshot(), before.0);
+        assert_eq!(worker.snapshot(), before.1);
+        // decision honors it
+        assert_eq!(tp_resume_decision(Some((cut, idx)), tokens.len(), 2), cut);
+        // and the worker's tree sees the same checkpoint (mirror identity)
+        assert_eq!(
+            worker.match_prefix_probe(&tokens).ckpt,
+            Some((cut, idx))
+        );
+    }
+
+    /// 3. Long shared prefix + divergent tail: the tail prompt probes the
+    ///
+    /// checkpoint under the shared prefix only.
+    #[test]
+    fn shared_prefix_divergent_tail_probes_the_shared_checkpoint() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut base: Vec<u32> = (0..80).collect(); // 5 blocks
+        base.push(500);
+        seed_cache(&mut head, &mut worker, &base, 0);
+        let (idx, _) = attach_ckpt(&mut head, &mut worker, &base, 0, 64);
+        // divergent tail: same first 64 tokens, different after
+        let mut tail = base[..64].to_vec();
+        tail.extend((900..1000).collect::<Vec<u32>>());
+        tail.push(501);
+        let probe = head.match_prefix_probe(&tail);
+        assert_eq!(probe.ckpt, Some((64, idx)));
+        assert_eq!(tp_resume_decision(probe.ckpt, tail.len(), 2), 64);
+        // worker agrees (rank symmetry)
+        assert_eq!(worker.match_prefix_probe(&tail).ckpt, Some((64, idx)));
+    }
+
+    /// 4. A partial trailing page is never treated as reusable.
+    ///
+    /// Matching the exact cached sequence keeps the last block unmatched.
+    #[test]
+    fn partial_trailing_page_is_not_reusable() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut tokens: Vec<u32> = (0..32).collect(); // exactly 2 blocks
+        tokens.push(7);
+        seed_cache(&mut head, &mut worker, &tokens, 0);
+        let (idx, _) = attach_ckpt(&mut head, &mut worker, &tokens, 0, 16);
+        // the exact 33-token prompt: match_full caps at len-1, so only block 1
+        let probe = head.match_prefix_probe(&tokens);
+        assert_eq!(probe.ckpt, Some((16, idx)));
+        // ...but the decision gate refuses a 1-block resume (the non-TP
+        // `pos >= 32` rule): the page is only partially useful and the tail
+        // prefill dominates. The exact-repeat case resumes only when a DEEP
+        // checkpoint exists (see the 6-block test).
+        assert_eq!(tp_resume_decision(probe.ckpt, tokens.len(), 2), 0);
+        // a resumed Admit validates the exact checkpoint and rejects others
+        let ops = vec![Operation::Admit {
+            slot: 1,
+            tokens: tokens.clone(),
+            resume: 32, // = the full prompt: no checkpoint attached there
+        }];
+        assert!(head.authorize_all(&ops).is_err());
+    }
+
+    /// 5. The worker validates the coordinator-selected checkpoint exactly.
+    ///
+    /// A resume position the worker's tree cannot satisfy fails the mirror.
+    #[test]
+    fn worker_rejects_a_resume_it_cannot_satisfy() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut tokens: Vec<u32> = (0..96).collect();
+        tokens.push(999);
+        seed_cache(&mut head, &mut worker, &tokens, 0);
+        attach_ckpt(&mut head, &mut worker, &tokens, 0, 64);
+        // coordinator selects 64: both ranks accept
+        let ops = vec![Operation::Admit {
+            slot: 1,
+            tokens: tokens.clone(),
+            resume: 64,
+        }];
+        let end = head.authorize_all(&ops).unwrap();
+        assert!(worker.mirror_tick(&ops, &end).is_ok());
+        // a corrupted/mismatched selection (checkpoint at 80 only): the
+        // worker's Admit re-walk must refuse it, so divergence is impossible
+        let ops2 = vec![Operation::Admit {
+            slot: 1,
+            tokens: tokens.clone(),
+            resume: 48, // no checkpoint attached at 48
+        }];
+        assert!(head.authorize_all(&ops2).is_err());
+        assert!(worker.mirror_tick(&ops2, &end).is_err());
+    }
+
+    /// 6. Symmetric recompute on unavailability.
+    ///
+    /// A cold Admit succeeds identically on both ranks even when a partial
+    /// cache exists elsewhere.
+    #[test]
+    fn cold_admit_is_rank_symmetric_when_cache_unavailable() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let tokens: Vec<u32> = (0..65).collect();
+        // no cache at all: cold admission works on both
+        let ops = vec![Operation::Admit {
+            slot: 0,
+            tokens: tokens.clone(),
+            resume: 0,
+        }];
+        let end = head.authorize_all(&ops).unwrap();
+        worker.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(head.snapshot(), worker.snapshot());
+        assert!(head.slot_admitted_tokens(0) == tokens.as_slice());
+    }
+
+    /// 7 + 8. Slot release drops slot refs but not radix-owned cache pages.
+    ///
+    /// Eviction returns the tree's refs; reservations die with the slot.
+    #[test]
+    fn release_keeps_radix_pages_and_recycles_reservations() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut tokens: Vec<u32> = (0..96).collect();
+        tokens.push(999);
+        seed_cache(&mut head, &mut worker, &tokens, 0);
+        let (idx, _) = attach_ckpt(&mut head, &mut worker, &tokens, 0, 64);
+        let free_after_seed = head.snapshot().free;
+        // release the live slot: its table refs drop, the tree's stay
+        let ops = vec![Operation::Release { slot: 0 }];
+        let end = head.authorize_all(&ops).unwrap();
+        worker.mirror_tick(&ops, &end).unwrap();
+        assert_eq!(head.snapshot(), worker.snapshot());
+        // the tree still pins the 6 PUBLISHED pages; only the un-published
+        // partial-tail block (position 96's page) returned to the pool
+        assert_eq!(
+            head.snapshot().free,
+            free_after_seed + 1,
+            "tree pins published pages; the partial-tail page frees"
+        );
+        assert!(head.slot_admitted_tokens(0).is_empty());
+        // a resumed re-adoption retakes refs from the tree's pages
+        let ops2 = vec![Operation::Admit {
+            slot: 0,
+            tokens: tokens.clone(),
+            resume: 64,
+        }];
+        let end2 = head.authorize_all(&ops2).unwrap();
+        worker.mirror_tick(&ops2, &end2).unwrap();
+        assert_eq!(head.snapshot(), worker.snapshot());
+        let _ = idx;
+        // flush returns everything (tree refs + slot refs)
+        let ops3 = vec![Operation::Flush];
+        let end3 = head.authorize_all(&ops3).unwrap();
+        worker.mirror_tick(&ops3, &end3).unwrap();
+        assert_eq!(head.snapshot(), worker.snapshot());
+        assert!(head.snapshot().refcounts.iter().all(|&rc| rc == 0));
+    }
+
+    /// 9. A resume validates the checkpoint exactly at the resume position.
+    ///
+    /// GQA page adoption depth and checkpoint position cannot disagree.
+    #[test]
+    fn resumed_checkpoint_position_matches_adopted_prefix_depth() {
+        let mut head = mk(128, 2);
+        let mut worker = mk(128, 2);
+        let mut tokens: Vec<u32> = (0..96).collect();
+        tokens.push(999);
+        seed_cache(&mut head, &mut worker, &tokens, 0);
+        attach_ckpt(&mut head, &mut worker, &tokens, 0, 64);
+        let ops = vec![Operation::Admit {
+            slot: 1,
+            tokens: tokens.clone(),
+            resume: 64,
+        }];
+        let end = head.authorize_all(&ops).unwrap();
+        worker.mirror_tick(&ops, &end).unwrap();
+        // the slot's table now backs exactly 4 blocks (64 tokens) and the
+        // checkpoint lookup at that boundary succeeds on both ranks
+        for kv in [&head, &worker] {
+            assert!(kv.slot_checkpoint_index(1, 64).is_some());
+            assert_eq!(kv.tables[1].blocks().len(), 4);
+        }
+        // and the device-table validation accepts every ADOPTED position
+        // (0..64; a prefill's own Ensures grow the table past 64 afterwards)
+        let bps = 128 / 16;
+        for pos in [0usize, 16, 48, 63] {
+            assert!(
+                head.checked_device_table(1, pos, bps * 2, 2, 128).is_ok(),
+                "adopted position {pos} must be live"
+            );
+        }
+    }
+
+    /// The pure decision gate: floors, block alignment, strictly-inside.
+    #[test]
+    fn tp_resume_decision_gate() {
+        // below the 2-block floor: cold
+        assert_eq!(tp_resume_decision(Some((16, 0)), 100, 2), 0);
+        // deep enough, inside: resume
+        assert_eq!(tp_resume_decision(Some((64, 0)), 100, 2), 64);
+        // equal to the prompt length: cold (one token must remain to prefill)
+        assert_eq!(tp_resume_decision(Some((64, 0)), 64, 2), 0);
+        // narrow serve admits short resumes; a wide one would gate on
+        // PADDOCK_MIN_CACHE_PREFIX (TP=2 is always narrow)
+        assert_eq!(tp_resume_decision(Some((32, 0)), 100, 2), 32);
+        // no checkpoint: cold
+        assert_eq!(tp_resume_decision(None, 100, 2), 0);
+    }
+
+    /// The pure publish composition: snapshotted cuts attach, the rest
+    /// recycle, publish last, in cut order.
+    #[test]
+    fn tp_publish_composition() {
+        let tokens = vec![1u32; 96];
+        let ops = tp_publish_ops(
+            1,
+            &[(64, 3), (80, 5)],
+            tokens.clone(),
+            &[80],
+        );
+        assert_eq!(
+            ops,
+            vec![
+                Operation::CheckpointRecycle { index: 3 },
+                Operation::CheckpointAttach {
+                    tokens: tokens.clone(),
+                    position: 80,
+                    index: 5,
+                },
+                Operation::Publish {
+                    slot: 1,
+                    tokens,
+                },
+            ]
+        );
+        // everything snapshotted: no recycles
+        let ops2 = tp_publish_ops(0, &[(64, 3)], vec![2u32; 32], &[64]);
+        assert!(matches!(ops2[0], Operation::CheckpointAttach { position: 64, index: 3, .. }));
+        assert!(matches!(ops2[1], Operation::Publish { slot: 0, .. }));
+    }
+
     #[test]
     fn mixed_tick_release_and_flush_mirror_through_the_batch_api() {
         let mut a = MirroredKv::new(5, 2, 48).unwrap();

@@ -56,6 +56,7 @@ fn new_design_span_frame(row_count: usize) -> usize {
             .map(|position| (0usize, position as u32, position))
             .collect(),
         finishers: Vec::new(),
+        ckpts: Vec::new(),
         kv_state,
     };
     msg.to_frame().expect("frame").len()
@@ -215,6 +216,7 @@ fn b2_new_design_worker_mirror_accepts_then_fails_closed() {
         sequence: 7,
         rows: rows.clone(),
         finishers: Vec::new(),
+        ckpts: Vec::new(),
         kv_state: serde_json::to_value(&end).expect("snapshot json"),
     };
     let frame = msg.to_frame().expect("frame under the cap");

@@ -371,6 +371,14 @@ pub struct TpCoordinator {
     /// `(slot, cut)`. Filled by `run_chunk_spans`; consumed by
     /// `publish_slot_cache` at the prefill's successful finish.
     snapshotted_cuts: Vec<(usize, usize)>,
+    /// Per-slot checkpoint reservations still owned by a queued or in-flight
+    /// prefill: `(cut, index)` in cut order. Filled at admission, cleared at
+    /// finish/abort/release; the Mixed tick derives its wire cut list from
+    /// here and the publish tick consumes the survivors.
+    pending_ckpts: std::collections::HashMap<usize, Vec<(usize, u32)>>,
+    /// Shared with the scheduler proxy: per-slot cached-token accounting
+    /// (written at admission, read by `take_prefill_reused`).
+    slot_reused: Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
 /// One queued prompt chunk: the remaining ordered rows (slot, token,
@@ -492,6 +500,7 @@ impl TpCoordinator {
         max_ctx: usize,
         slots: usize,
         span_done: Arc<std::sync::atomic::AtomicBool>,
+        slot_reused: Arc<std::sync::Mutex<Vec<usize>>>,
     ) -> Result<Self, String> {
         if !resolved.is_coordinator() || max_ctx == 0 || !(1..=2).contains(&slots) {
             return Err(
@@ -583,6 +592,8 @@ impl TpCoordinator {
             poisoned: None,
             shutdown_sent: false,
             snapshotted_cuts: Vec::new(),
+            pending_ckpts: std::collections::HashMap::new(),
+            slot_reused,
         })
     }
 
@@ -622,6 +633,8 @@ impl TpCoordinator {
         self.span = None;
         self.positions.fill(0);
         self.occupied.fill(false);
+        self.snapshotted_cuts.clear();
+        self.pending_ckpts.clear();
         Ok(())
     }
 
@@ -669,6 +682,8 @@ impl TpCoordinator {
                 .map_err(|e| e.to_string())?;
             self.positions[slot] = 0;
             self.occupied[slot] = false;
+            self.snapshotted_cuts.retain(|(s, _)| *s != slot);
+            self.pending_ckpts.remove(&slot);
         }
         Ok(())
     }
@@ -784,7 +799,7 @@ impl TpCoordinator {
         slot: usize,
         run: &[(usize, u32, usize)],
         finisher: Option<SpanFinishKind>,
-        ckpts: &mut Vec<(usize, u32)>,
+        ckpts: &[(usize, u32)],
     ) -> Result<(Option<u32>, Option<Vec<f32>>), String> {
         let mut sampled = None;
         let mut host_logits = None;
@@ -858,6 +873,9 @@ impl TpCoordinator {
                 sequence: self.sequence + 1,
                 rows: rows.clone(),
                 chunk_rows: rows.len(),
+                // The serial one-slot path stays cold in milestone 1 (the
+                // chunked admission is the production TP path).
+                ckpts: Vec::new(),
                 kv_state,
             }
             .to_stream(&mut self.stream)
@@ -867,7 +885,7 @@ impl TpCoordinator {
                 slot,
                 &rows,
                 finishing.then_some(SpanFinishKind::HostLogits),
-                &mut Vec::new(),
+                &[],
             )?;
             self.sequence += 1;
             ready(&mut self.stream, self.sequence)?;
@@ -1184,7 +1202,16 @@ impl TpCoordinator {
         if !queued_chunk_abort_allowed(self.span.as_ref(), slot) {
             return false;
         }
-        abort_queued_chunk(&mut self.chunks, slot)
+        let removed = abort_queued_chunk(&mut self.chunks, slot);
+        if removed {
+            // An aborted prompt's snapshots never attach: drop its cut
+            // records AND its reservations (the Release tick would recycle
+            // them, but a same-slot re-admit before that tick must not see
+            // stale entries).
+            self.snapshotted_cuts.retain(|(s, _)| *s != slot);
+            self.pending_ckpts.remove(&slot);
+        }
+        removed
     }
 
     /// A mixed tick executes the scheduler's decode rows individually,
@@ -1293,10 +1320,28 @@ impl TpCoordinator {
             .collect();
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
+        // The chunk run's checkpoint cuts: which of the slot's reservations
+        // can this tick's span end exactly on. Derived from the slot's
+        // pending-cut map (coordinator-owned, like snapshotted_cuts); rank 1
+        // receives the cut list on the wire and derives the same spans.
+        let wire_ckpts: Vec<(usize, u32)> = if chunk_rows.is_empty() {
+            Vec::new()
+        } else {
+            let slot = chunk_rows[0].0;
+            let span_start = chunk_rows[0].2;
+            let span_len = chunk_rows.len();
+            let pending = self
+                .pending_ckpts
+                .get(&slot)
+                .cloned()
+                .unwrap_or_default();
+            tp_cuts_crossed(&pending, span_start, span_len)
+        };
         ControlMessage::TpMixed {
             sequence: self.sequence + 1,
             rows: rows.clone(),
             chunk_rows: chunk_rows.len(),
+            ckpts: wire_ckpts.clone(),
             kv_state,
         }
         .to_stream(&mut self.stream)
@@ -1349,13 +1394,13 @@ impl TpCoordinator {
             let kind = fin.as_ref().and_then(|(s, p)| {
                 (*s == slot).then(|| p.map_or(SpanFinishKind::HostLogits, SpanFinishKind::Device))
             });
-            let mut chunk_ckpts: Vec<(usize, u32)> = self
+            let chunk_ckpts: Vec<(usize, u32)> = self
                 .chunks
                 .front()
                 .filter(|c| c.slot == slot)
                 .map(|c| c.ckpts.clone())
                 .unwrap_or_default();
-            let (sampled, logits) = self.run_chunk_spans(slot, &chunk_rows, kind, &mut chunk_ckpts)?;
+            let (sampled, logits) = self.run_chunk_spans(slot, &chunk_rows, kind, &chunk_ckpts)?;
             if let Some(id) = sampled {
                 fin_ids[0] = id;
             }
@@ -1439,6 +1484,7 @@ impl TpCoordinator {
         self.sequence = seq;
         self.snapshotted_cuts
             .retain(|(s, _)| *s != slot);
+        self.pending_ckpts.remove(&slot);
         tracing::info!(
             slot,
             attached = snapshotted.len(),
@@ -1494,6 +1540,11 @@ impl TpCoordinator {
             .authorize_all(&ops)
             .map_err(str::to_owned)?;
         let reused = self.logical.take_admitted_reused();
+        if let Ok(mut guard) = self.slot_reused.lock()
+            && let Some(cell) = guard.get_mut(slot)
+        {
+            *cell = reused;
+        }
         tracing::info!(
             slot,
             resume,
@@ -1546,6 +1597,11 @@ impl TpCoordinator {
                 .restore_slot_ckpt(slot, idx)
                 .map_err(|e| e.to_string())?;
         }
+        // The scheduler cursor starts at the resume position: the chunk rows
+        // carry [resume..t_len), so mixed-tick validation must see the cursor
+        // there (the worker sets its own cursor in TpPrefixAdmit).
+        self.positions[slot] = resume;
+        self.pending_ckpts.insert(slot, reserved.clone());
         self.chunks.push_back(PrefillChunk {
             slot,
             rows: tokens
@@ -1695,11 +1751,22 @@ impl TpCoordinator {
             .collect();
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
+        // Cold prompts only reach the lane (resumed ones are pinned Mixed),
+        // so a launch's cut list is empty in milestone 1 - but derive it
+        // honestly in case a cold prompt reserved cuts.
+        let wire_ckpts: Vec<(usize, u32)> = {
+            let slot = rows[0].0;
+            let span_start = rows[0].2;
+            let pending = self.pending_ckpts.get(&slot).cloned().unwrap_or_default();
+            let total = rows.len();
+            tp_cuts_crossed(&pending, span_start, total)
+        };
         let seq = self.sequence + 1;
         ControlMessage::TpSpanLaunch {
             sequence: seq,
             rows: rows.clone(),
             finishers: wire_finishers,
+            ckpts: wire_ckpts,
             kv_state,
         }
         .to_stream(&mut self.stream)
@@ -1776,6 +1843,20 @@ impl TpCoordinator {
         fin_plans: &[(usize, RowSample)],
     ) -> Result<bool, String> {
         if self.chunks.is_empty() || self.span.is_some() || self.pipe.is_some() {
+            return Ok(false);
+        }
+        // Milestone-1 lane rule (explicit): a prefix-RESUMED prompt is pinned
+        // to Mixed at admission - the prefill lane's KV slabs hold no adopted
+        // prefix content, so an Async span would recompute the prefix rows
+        // and its span-finish promotion would overwrite decode slabs with
+        // stale lane data for the adopted blocks. Refuse WITHOUT error: the
+        // scheduler treats a false launch as "not this tick" and the Mixed
+        // tick drains the queue instead. Cold prompts still select Async.
+        if let Some(front) = self.chunks.front()
+            && front.owner == Some(crate::generator::PrefillLane::Mixed)
+            && !front.rows.is_empty()
+            && front.rows[0].2 > 0
+        {
             return Ok(false);
         }
         self.chunk_plans(fin_plans);
@@ -2038,6 +2119,10 @@ pub struct TpGenerator {
     /// Shared with the coordinator thread: false while a prefill span is in
     /// flight (published after every command). `unified_span_done` polls it.
     span_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-slot prompt tokens the last admission served from the prefix
+    /// cache (written by Mixed ticks' finisher path; taken by
+    /// `take_prefill_reused` for the usage report).
+    slot_reused: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     poisoned: Option<String>,
     /// The command thread owns the CUDA/NCCL stream and coordinator. Joining
     /// it on drop guarantees its `TpCoordinator` sends the graceful Shutdown
@@ -2065,6 +2150,8 @@ impl TpGenerator {
         let pack = pack.to_owned();
         let span_done = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let lane_flag = Arc::clone(&span_done);
+        let slot_reused = Arc::new(std::sync::Mutex::new(vec![0usize; slots]));
+        let reused_proxy = Arc::clone(&slot_reused);
         let worker = std::thread::Builder::new()
             .name("qwen35-tp-rank0".into())
             .spawn(move || {
@@ -2077,6 +2164,7 @@ impl TpGenerator {
                     max_ctx,
                     slots,
                     lane_flag,
+                    slot_reused,
                 ) {
                     Ok(coordinator) => coordinator,
                     Err(e) => {
@@ -2209,6 +2297,7 @@ impl TpGenerator {
             context_bytes,
             process_bytes,
             span_done,
+            slot_reused: reused_proxy,
             poisoned: None,
             worker: Some(worker),
         })
@@ -2409,6 +2498,32 @@ impl Generator for TpGenerator {
         self.request_logits(Command::ChunkBegin(slot, tokens))
             .map(|_| ())
             .map_err(GenError::Backend)
+    }
+    fn prefill_begin_hinted(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        _hints: &[usize],
+    ) -> Result<usize, GenError> {
+        // Hint-free on TP in milestone 1 (shared-prefix dedupe stays a
+        // scheduler-side non-TP feature); the return is the admission's
+        // resume position - the usage-report `cached` count. The admission
+        // inside ChunkBegin writes slot_reused[slot] BEFORE the reply.
+        let reused = self
+            .slot_reused
+            .lock()
+            .ok()
+            .and_then(|g| g.get(slot).copied())
+            .unwrap_or(0);
+        self.prefill_begin(slot, tokens)?;
+        Ok(reused)
+    }
+    fn take_prefill_reused(&mut self, slot: usize) -> usize {
+        self.slot_reused
+            .lock()
+            .ok()
+            .and_then(|mut g| g.get_mut(slot).map(|cell| std::mem::replace(cell, 0)))
+            .unwrap_or(0)
     }
     fn prefill_abort(&mut self, slot: usize) -> bool {
         match self.request(Command::PrefillAbort(slot)) {
@@ -2869,14 +2984,21 @@ pub fn run_worker(
                         return Err("TP prefix publish for unadmitted slot".into());
                     }
                     let reservations = logical.slot_reserved_indices(slot);
+                    // Rank-symmetry gate: every cut the coordinator attached
+                    // must have a reservation here. A missing one means the
+                    // two ranks' snapshot disciplines diverged - fail closed
+                    // BEFORE any attach/recycle mutates this rank's tree.
+                    for &(cut, _) in &checkpoints {
+                        if !reservations.iter().any(|&(p, _)| p == cut) {
+                            return Err(format!(
+                                "TP prefix publish cut {cut} has no worker reservation"
+                            ));
+                        }
+                    }
                     let ops = tp_publish_ops(slot, &reservations, tokens, &snapshotted);
                     logical
                         .mirror_tick(&ops, &wire_kv_state(kv_state)?)
                         .map_err(str::to_owned)?;
-                    // The worker's own unsnapshotted reservations were
-                    // recycled by the ops above; drop any stragglers its
-                    // snapshot discipline did not reach.
-                    logical.drop_slot_reservations(slot);
                 }
                 ControlMessage::TpBatch {
                     rows, kv_state, ..
@@ -2912,6 +3034,7 @@ pub fn run_worker(
                 ControlMessage::TpMixed {
                     rows,
                     chunk_rows,
+                    ckpts,
                     kv_state,
                     ..
                 } => {
@@ -2948,6 +3071,18 @@ pub fn run_worker(
                             model
                                 .forward_span_advance(&group, &logical, slot, &tokens, position)
                                 .map_err(|e| e.to_string())?;
+                            // Rank-local snapshot at exact cut ends (the wire
+                            // cut list was derived from the SAME rows both
+                            // ranks validate; indices are validation-only -
+                            // the worker attaches its own mirror-identical
+                            // reservation at publish).
+                            for (cut, _) in tp_cuts_crossed(&ckpts, position, stop - start) {
+                                if let Some(idx) = logical.slot_reserved_ckpt(slot, cut) {
+                                    model
+                                        .snapshot_slot_ckpt(slot, idx)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
                         }
                         for &(s, _, _) in chunk {
                             positions[s] += 1;
@@ -2957,6 +3092,7 @@ pub fn run_worker(
                 ControlMessage::TpSpanLaunch {
                     rows,
                     finishers,
+                    ckpts,
                     kv_state,
                     ..
                 } => {
@@ -3007,6 +3143,15 @@ pub fn run_worker(
                                     &group, &logical, slot, &tokens, position,
                                 )
                                 .map_err(|e| e.to_string())?;
+                            // Rank-local snapshot at exact cut ends (the lane
+                            // owns this slot's live DeltaNet state mid-prefill).
+                            for (cut, _) in tp_cuts_crossed(&ckpts, position, stop - start) {
+                                if let Some(idx) = logical.slot_reserved_ckpt(slot, cut) {
+                                    model
+                                        .snapshot_slot_ckpt(slot, idx)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
                         }
                         for &(s, _, _) in run {
                             positions[s] += 1;
@@ -3204,6 +3349,63 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(async_launches, 1);
     }
+    #[test]
+    fn span_take_refuses_a_mixed_pinned_resumed_chunk() {
+        // Milestone-1 lane rule: a prefix-resumed prompt (first row's
+        // position > 0) pinned to Mixed must NOT launch on the async lane.
+        let resumed = PrefillChunk {
+            slot: 0,
+            rows: vec![(0, 9, 64), (0, 9, 65)],
+            fin_plan: None,
+            owner: Some(crate::generator::PrefillLane::Mixed),
+            ckpts: Vec::new(),
+        };
+        let cold = PrefillChunk {
+            slot: 0,
+            rows: vec![(0, 9, 0), (0, 9, 1)],
+            fin_plan: None,
+            owner: Some(crate::generator::PrefillLane::Mixed),
+            ckpts: Vec::new(),
+        };
+        let unpinned = PrefillChunk {
+            slot: 0,
+            rows: vec![(0, 9, 64), (0, 9, 65)],
+            fin_plan: None,
+            owner: None,
+            ckpts: Vec::new(),
+        };
+        let is_resumed = |c: &PrefillChunk| c.owner == Some(crate::generator::PrefillLane::Mixed) && !c.rows.is_empty() && c.rows[0].2 > 0;
+        assert!(is_resumed(&resumed), "resumed chunk must be detected");
+        assert!(!is_resumed(&cold), "cold chunk must not be detected");
+        assert!(!is_resumed(&unpinned), "unpinned chunk must not be detected");
+    }
+
+    /// chunk_take starts at the resumed position: rows carry positions
+    /// [resume..t_len), never replaying the prefix.
+    #[test]
+    fn chunk_take_starts_at_the_resume_position() {
+        let resume = 64usize;
+        let t_len = 100usize;
+        let rows: Vec<(usize, u32, usize)> = (resume..t_len)
+            .map(|pos| (0usize, 7u32, pos))
+            .collect();
+        let mut queue = VecDeque::from([PrefillChunk {
+            slot: 0,
+            rows: rows.clone(),
+            fin_plan: None,
+            owner: Some(crate::generator::PrefillLane::Mixed),
+            ckpts: Vec::new(),
+        }]);
+        let (taken, finished) =
+            TpCoordinator::chunk_take(&mut queue, rows.len(), crate::generator::PrefillLane::Mixed)
+                .unwrap();
+        assert_eq!(taken.len(), t_len - resume);
+        assert_eq!(taken.first().unwrap().2, resume, "first row is the resume position");
+        assert_eq!(taken.last().unwrap().2, t_len - 1);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].fin_rows, t_len);
+    }
+
     #[test]
     fn finisher_wire_plan_rejects_invalid_sampler_parameters_before_authorization() {
         use crate::sampler::DevicePlan;
