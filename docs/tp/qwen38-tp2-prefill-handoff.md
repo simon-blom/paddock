@@ -1,6 +1,6 @@
 # TP=2 cold-prefill performance handoff
 
-Branch: `review/qwen38-tp2-final`. Session start: `579b8fda88e41cdabbae91536742520d81346102` (clean). Prior session code HEAD: `bddbe88e1cb70f111f8c467398ad8edf67bb8356` (commits `b9628e5` cold checkpoint ownership/policy, `bddbe88` opt-in device-event profiler). This session's code HEAD: `069356c6b0b40efbead153552425a5f999af4923` plus the pending documentation commit; full commit list below. Pushed: NO.
+Branch: `review/qwen38-tp2-final`. Session start: `579b8fda88e41cdabbae91536742520d81346102` (clean). Prior session code HEAD: `bddbe88e1cb70f111f8c467398ad8edf67bb8356` (commits `b9628e5` cold checkpoint ownership/policy, `bddbe88` opt-in device-event profiler). This session's final HEAD: `783bafcfa95e2c52a52472dc84dbcaa7177e341f` (see `git log`); the implementation commits are `2deef1b`, `8ac7731`, `23e8086`, `076792b`, `069356c` plus two docs commits (`4dfe975`, `783bafc`). Pushed: NO.
 
 ## Completed changes
 

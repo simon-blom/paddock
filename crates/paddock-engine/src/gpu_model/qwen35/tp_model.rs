@@ -103,7 +103,7 @@ pub struct Qwen35TpRank {
     prefill: Option<Box<PreFillLane>>,
     /// Batched prefill-span planes (prototype, `forward_prefill_span`):
     /// allocated lazily on the first span forward, never on decode paths.
-    /// The whole-model traversal processes up to `TP_SPAN_CAP` rows per pass
+    /// The whole-model traversal processes up to `tp_span_cap::span_cap()` rows per pass
     /// through one shared plane set.
     span_planes: Option<super::tp_span::TpSpanPlanes>,
 }
@@ -1074,7 +1074,7 @@ impl Qwen35TpRank {
     /// DeltaNet state advance once per row. This skips final norm, LM head
     /// and logits readback. A finishing caller may then invoke
     /// [`Self::forward_span_head`] for the final row. Runs must be bounded
-    /// by `TP_SPAN_CAP`.
+    /// by `tp_span_cap::span_cap()`.
     pub fn forward_span_advance<C: Communicator>(
         &mut self,
         group: &C,
@@ -1609,7 +1609,7 @@ impl Qwen35TpRank {
             .forward_token_body(group, logical_kv, position, slot, false)
     }
 
-    /// Enqueue ONE batched span advance (up to `TP_SPAN_CAP` contiguous
+    /// Enqueue ONE batched span advance (up to `tp_span_cap::span_cap()` contiguous
     /// rows of `slot` at `position..position+rows`) on the prefill lane:
     /// the lane's whole-model traversal, no head, no readback, no host sync.
     /// The caller must have validated the positions and mirrored the KV
