@@ -1266,7 +1266,7 @@ impl Qwen35TpRank {
                 let name = if matches!(&layer_data.mixer, TpMixer::Full(_)) {
                     "gqa-metadata"
                 } else {
-                    "delta-local"
+                    "delta-prelude"
                 };
                 p.stage(&self.exec.stream, name, Some(layer))?;
             }

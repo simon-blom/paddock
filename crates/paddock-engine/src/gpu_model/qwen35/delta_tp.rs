@@ -41,6 +41,18 @@ fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
     }
 }
 
+fn profile_stage(
+    profile: &mut Option<&mut super::tp_prefill_profile::SpanProfile>,
+    e: &GpuExecutor,
+    name: &'static str,
+    layer: usize,
+) -> Result<(), DeltaTpError> {
+    if let Some(p) = profile.as_deref_mut() {
+        p.stage(&e.stream, name, Some(layer))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeltaTpError {
     #[error(transparent)]
@@ -766,7 +778,7 @@ impl DeltaTpRank {
         slot: usize,
         prefill: bool,
         layer: usize,
-        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
+        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let world = group.world_size();
         let rank = group.rank();
@@ -787,7 +799,8 @@ impl DeltaTpRank {
             if self.prefill_gemm.is_none() {
                 self.prefill_gemm = Some(PrefillGemm::new(e)?);
             }
-            self.prefill_run(e, input, rows, layer)?;
+            self.prefill_run(e, input, rows, layer, profile.as_deref_mut())?;
+            profile_stage(&mut profile, e, "delta-output-projection", layer)?;
             self.finish_partial_prefill(e, rows)?;
         } else {
             self.decode_run(e, input, rows)?;
@@ -895,7 +908,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, false, 0)
+        self.run(e, input, rows, false, 0, None)
     }
 
     fn prefill_run(
@@ -904,8 +917,9 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
         layer: usize,
+        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, true, layer)
+        self.run(e, input, rows, true, layer, profile)
     }
 
     fn run(
@@ -915,32 +929,40 @@ impl DeltaTpRank {
         rows: usize,
         prefill: bool,
         layer: usize,
+        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
         if prefill {
             let mm = self.prefill_gemm.as_mut().expect("prefill scratch allocated");
-            // One activation quantization for both projections off the same
-            // mirrored input (in_qkv + gate share it at in_dim = WIDTH);
-            // same layouts and scales as two separate `prefill_mm_any` calls.
+            profile_stage(&mut profile, e, "delta-input-quant", layer)?;
             prefill_quant(e, &mut mm.xq, &mut mm.xs, &mut mm.yq, input, WIDTH, rows)?;
-            for (w, out) in [
-                (&self.weights[0], &mut s.mixed as &mut CudaSlice<f32>),
-                (&self.weights[1], &mut s.z as &mut CudaSlice<f32>),
-            ] {
-                prefill_mm_pre_any(
-                    e,
-                    w,
-                    &mm.xq,
-                    &mm.xs,
-                    &mm.yq,
-                    &mut mm.xsums,
-                    &mut mm.ssums,
-                    &mut mm.skfix,
-                    out,
-                    rows,
-                )?;
-            }
+            profile_stage(&mut profile, e, "delta-input-qkv-projection", layer)?;
+            prefill_mm_pre_any(
+                e,
+                &self.weights[0],
+                &mm.xq,
+                &mm.xs,
+                &mm.yq,
+                &mut mm.xsums,
+                &mut mm.ssums,
+                &mut mm.skfix,
+                &mut s.mixed,
+                rows,
+            )?;
+            profile_stage(&mut profile, e, "delta-gate-projection", layer)?;
+            prefill_mm_pre_any(
+                e,
+                &self.weights[1],
+                &mm.xq,
+                &mm.xs,
+                &mm.yq,
+                &mut mm.xsums,
+                &mut mm.ssums,
+                &mut mm.skfix,
+                &mut s.z,
+                rows,
+            )?;
             // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the
             // rank-local mixed shard and gate (z) shard, plus the whole-row
             // mixer input, echoed under the c.* name for the host compare.
@@ -948,6 +970,7 @@ impl DeltaTpRank {
             super::tp_trace::trace_row(e, "b.dn-mixed", layer, &s.mixed, 0, g.mixed())?;
             super::tp_trace::trace_row(e, "b.dn-z", layer, &s.z, 0, g.value_dim())?;
         }
+        profile_stage(&mut profile, e, "delta-conv-split-gate-prep", layer)?;
         // One row keeps the existing conv_step arithmetic in both modes.
         // Multi-row spans keep the existing causal-conv/state path.
         if rows == 1 {
@@ -1074,6 +1097,7 @@ impl DeltaTpRank {
                 super::tp_trace::trace_row(e, "b.dn-v", layer, &s.v, 0, g.value_dim())?;
             }
         }
+        profile_stage(&mut profile, e, "delta-recurrent", layer)?;
         e.gated_delta_recurrent_v2(
             &s.q,
             &s.k,
@@ -1095,6 +1119,7 @@ impl DeltaTpRank {
             // norm's `core` (row 0) - the out projection's input.
             super::tp_trace::trace_row(e, "b.dn-rec", layer, &s.attn, 0, g.value_dim())?;
         }
+        profile_stage(&mut profile, e, "delta-norm-gate", layer)?;
         e.gated_rmsnorm(
             &s.attn,
             &s.z,

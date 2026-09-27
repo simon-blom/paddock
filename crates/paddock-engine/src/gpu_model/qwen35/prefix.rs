@@ -1905,7 +1905,7 @@ impl GpuQwen35 {
                     if matches!(&layer.mixer, Mixer::Full(_)) {
                         "gqa-local"
                     } else {
-                        "delta-local"
+                        "delta-prelude"
                     },
                 )?;
             }
@@ -2227,6 +2227,9 @@ impl GpuQwen35 {
                     }
                 }
                 Mixer::Linear(w) => {
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-input-norm-quant")?;
+                    }
                     // input quantized by the fused attn_norm above (P6k)
                     if let Some(l4) = lnv4 {
                         // nvf4-quant the normed hidden once; it feeds in_qkv AND
@@ -2258,6 +2261,9 @@ impl GpuQwen35 {
                             r,
                         )?;
                     } else {
+                        if let Some(p) = profile.as_mut() {
+                            p.stage(&exec.stream, "delta-input-qkv-projection")?;
+                        }
                         prefill_mm_pre_any(
                             &exec,
                             &w.in_qkv,
@@ -2270,6 +2276,9 @@ impl GpuQwen35 {
                             &mut sc.d_mixed,
                             r,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-conv-split-prep")?;
                     }
                     // window-extended conv (the spec-path pattern): rows =
                     // [slot's window | this chunk], conv over km1+r, keep the
@@ -2387,6 +2396,9 @@ impl GpuQwen35 {
                             n_v_heads,
                         )?;
                     }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-recurrent")?;
+                    }
                     prefill_delta_recurrent(
                         &exec,
                         sc,
@@ -2397,6 +2409,9 @@ impl GpuQwen35 {
                         state_size,
                         false,
                     )?;
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-gate-projection")?;
+                    }
                     // d_xn/d_pxq/d_exs (or d_yq on the Q8 path) untouched since
                     // in_qkv's quant: reuse the same e4m3 activations for gate_w.
                     if let Some(l4) = lnv4 {
@@ -2435,6 +2450,9 @@ impl GpuQwen35 {
                             r,
                         )?;
                     }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-norm-gate")?;
+                    }
                     // DN out_proj glue: gated norm + e4m3 quant in one pass
                     // on the w8 arm (scale math bit-matches the standalone
                     // quantize; f32 core still written for fallbacks).
@@ -2461,6 +2479,9 @@ impl GpuQwen35 {
                             state_size,
                             eps,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-output-projection")?;
                     }
                     if let Some(l4) = lnv4 {
                         exec.quantize_nvf4(

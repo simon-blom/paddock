@@ -6831,6 +6831,10 @@ impl GpuQwen35 {
                     }
                 }
                 Mixer::Linear(w) => {
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-input-norm-quant")?;
+                        p.stage(&exec.stream, "delta-input-qkv-projection")?;
+                    }
                     // one two-buffer GEMM over the fused plane when
                     // the split route covers it (see the mixed-tick site);
                     // d_z stays untouched until gated_rmsnorm below.
@@ -6948,6 +6952,9 @@ impl GpuQwen35 {
                             &mut sc.d_mixed,
                             r,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-conv-split-prep")?;
                     }
                     // conv SPLITS: decode rows advance their per-slot windows
                     // (1-step); each prefill span runs a window-extended causal
@@ -7139,6 +7146,9 @@ impl GpuQwen35 {
                             state_size,
                         )?;
                     }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-conv-split-gate-prep")?;
+                    }
                     // alpha/beta on the exact f32 repacked path (P6b decay rule)
                     if dn_ab_done {
                         // alpha/beta already landed by the fused f8t in-proj
@@ -7210,6 +7220,9 @@ impl GpuQwen35 {
                             r,
                             n_v_heads,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-recurrent")?;
                     }
                     // recurrence SPLITS: decode = multi-slot 1-step in place;
                     // each prefill span = a scan into its slot's state (base 0
@@ -7411,8 +7424,10 @@ impl GpuQwen35 {
                             state_size,
                         )?;
                     }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-gate-projection")?;
+                    }
                     if let Some(l8) = lw8 {
-                        // d_pxq still holds the e4m3 xn quant from in_qkv
                         // (alpha/beta read f32 xn directly, nothing clobbers it)
                         if !dn_fused {
                             exec.f8_gemm_w8(
@@ -7439,6 +7454,9 @@ impl GpuQwen35 {
                             &mut sc.d_z,
                             r,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-norm-gate")?;
                     }
                     // DN out_proj glue (GDN formulation band):
                     // fused gated-rmsnorm + e4m3 quant on the w8 arm, with
@@ -7476,6 +7494,9 @@ impl GpuQwen35 {
                             state_size,
                             eps,
                         )?;
+                    }
+                    if let Some(p) = profile.as_mut() {
+                        p.stage(&exec.stream, "delta-output-projection")?;
                     }
                     if let Some(ow_t) = f8t_ow_u {
                         // gr_fused is lw8-gated, so d_core holds the gated
