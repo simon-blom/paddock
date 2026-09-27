@@ -194,27 +194,31 @@ fn validate_mixed_worker_rows(
     Ok(split)
 }
 
-/// Row cap of the production batched prefill span. Use the model plane and
-/// DeltaNet primitive capacity directly so neither rank can drift from it.
-const TP_SPAN_CAP: usize = super::tp_span::TP_SPAN_CAP;
+/// Row cap of the production batched prefill span. Resolved once per process
+/// from the rank-0-authoritative `TpInit` value so neither rank can drift.
+fn tp_span_cap() -> usize {
+    super::tp_span_cap::span_cap()
+}
 
-/// Boundaries for one slot's contiguous prompt-row run. Each window has
-/// 1..=`TP_SPAN_CAP` rows; the last window may produce logits only when
-/// this run finishes the prompt. Both ranks use this chunker on wire rows.
-fn span_chunk_points(len: usize) -> Vec<usize> {
+/// Boundaries for one slot's contiguous prompt-row run at an explicit cap.
+/// Each window has 1..=`cap` rows; the last window may produce logits only
+/// when this run finishes the prompt. Pure so the geometry stays testable
+/// at every sweep width without racing the process-global resolution.
+fn span_chunk_points_at(len: usize, cap: usize) -> Vec<usize> {
     let mut points = Vec::new();
     let mut at = 0usize;
     while at < len {
         points.push(at);
-        at += TP_SPAN_CAP.min(len - at);
+        at += cap.min(len - at);
     }
     points.push(len);
     points
 }
 
-/// Split at both the GPU row cap and each reserved logical checkpoint cut.
-/// A cut N is the state after rows [0,N), before any row N changes DeltaNet.
-fn span_checkpoint_points(start: usize, len: usize, cuts: &[(usize, u32)]) -> Result<Vec<usize>, String> {
+/// Split at both the GPU row cap and each reserved logical checkpoint cut,
+/// at an explicit cap. A cut N is the state after rows [0,N), before any row
+/// N changes DeltaNet.
+fn span_checkpoint_points_at(start: usize, len: usize, cuts: &[(usize, u32)], cap: usize) -> Result<Vec<usize>, String> {
     let end = start.checked_add(len).ok_or("TP span range overflow")?;
     if cuts.windows(2).any(|w| w[0].0 >= w[1].0)
         || cuts.iter().any(|&(cut, _)| cut <= start || cut > end || !cut.is_multiple_of(crate::kv_pool::BLOCK_TOKENS))
@@ -225,10 +229,20 @@ fn span_checkpoint_points(start: usize, len: usize, cuts: &[(usize, u32)]) -> Re
     let mut at = 0;
     while at < len {
         let next_cut = cuts.iter().find(|&&(cut, _)| cut > start + at).map_or(end, |&(cut, _)| cut);
-        at += TP_SPAN_CAP.min(len - at).min(next_cut - start - at);
+        at += cap.min(len - at).min(next_cut - start - at);
         points.push(at);
     }
     Ok(points)
+}
+
+/// Production chunkers read the resolved rank-symmetric cap. Both ranks
+/// derive identical geometry from the identical resolution.
+fn span_chunk_points(len: usize) -> Vec<usize> {
+    span_chunk_points_at(len, tp_span_cap())
+}
+
+fn span_checkpoint_points(start: usize, len: usize, cuts: &[(usize, u32)]) -> Result<Vec<usize>, String> {
+    span_checkpoint_points_at(start, len, cuts, tp_span_cap())
 }
 
 fn tp_suffix_rows(slot: usize, tokens: Vec<u32>, resume: usize) -> Vec<(usize, u32, usize)> {
@@ -580,6 +594,13 @@ impl TpCoordinator {
         let use_graphs = Qwen35TpRank::resolve_graph_mode_for_serve();
         let (checkpoint_sha256, pack_blake3) = hashes(model, pack)?;
         let ckpt_slots = resolve_ckpt_slots(std::env::var("PADDOCK_TP_CKPT_SLOTS").ok().as_deref());
+        // The span cap is rank-0-authoritative too: resolve once here, ship
+        // it in TpInit, and install it before the worker can execute any
+        // span. An unsupported value fails this rank (and the pair) closed.
+        let span_cap = super::tp_span_cap::resolve_from_env(
+            std::env::var("PADDOCK_TP_SPAN_CAP").ok().as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         ControlMessage::TpInit {
             checkpoint_sha256,
             pack_blake3,
@@ -588,6 +609,7 @@ impl TpCoordinator {
             kv_dtype: kv_dtype_wire(kv_dtype).to_owned(),
             use_graphs,
             ckpt_slots,
+            span_cap,
         }
         .to_stream(&mut stream)
         .map_err(|e| e.to_string())?;
@@ -838,7 +860,7 @@ impl TpCoordinator {
     }
 
     /// Execute ONE slot's contiguous chunk run on the DECODE lane as batched
-    /// spans of at most TP_SPAN_CAP rows. Interior spans advance state only
+    /// spans of at most tp_span_cap() rows. Interior spans advance state only
     /// (no head, no readback); when `finisher` is Some the FINAL span adds
     /// the head exactly once - device-sampled or read back per the kind.
     /// The caller has already authorized KV, sent `TpMixed` and consumed
@@ -1432,7 +1454,7 @@ impl TpCoordinator {
             }
         }
         // Chunk run: contiguous same-slot prompt rows executed as batched
-        // spans of at most TP_SPAN_CAP rows. Interior spans advance state
+        // spans of at most tp_span_cap() rows. Interior spans advance state
         // only; the FINAL span (the finishing chunk's last span) adds the
         // head once - final norm + LM head on the run's last row - and
         // either samples it on device or reads the logits back. The head
@@ -2711,12 +2733,18 @@ pub fn run_worker(
                     kv_dtype,
                     use_graphs,
                     ckpt_slots,
+                    span_cap,
                 } => {
                     let (own_checkpoint, own_pack) = hashes(model_path, pack)?;
                     // The dtype parses BEFORE the hash compare so an unknown
                     // wire value reads as what it is - a protocol mismatch -
                     // not as an identity failure.
                     let kv_dtype = kv_dtype_parse(&kv_dtype)?;
+                    // The span cap installs BEFORE any span can run and
+                    // fails closed on an unsupported wire value: rank 1
+                    // never reads the coordinator's env (same contract as
+                    // graphs/dtype/ckpt_slots).
+                    super::tp_span_cap::wire_span_cap(span_cap).map_err(|e| e.to_string())?;
                     if own_checkpoint != checkpoint_sha256
                         || own_pack != pack_blake3
                         || max_ctx == 0
@@ -3201,7 +3229,7 @@ pub fn run_worker(
                     ..
                 } => {
                     // The whole prompt span enqueues on rank 1's prefill lane
-                    // as batched sub-spans of at most TP_SPAN_CAP contiguous
+                    // as batched sub-spans of at most tp_span_cap() contiguous
                     // rows per slot run (the shared pure `span_chunk_points`
                     // over the same wire rows rank 0 chunked from). The lane
                     // steps enter the same collectives in the same order as
@@ -3583,7 +3611,7 @@ mod tests {
             let points = span_checkpoint_points(0, len, &cuts).unwrap();
             assert_eq!(points.first(), Some(&0));
             assert_eq!(points.last(), Some(&len));
-            assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= TP_SPAN_CAP));
+            assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= tp_span_cap()));
             assert!(cuts.iter().all(|(cut, _)| points.contains(cut)), "len={len}");
         }
         let shifted = span_checkpoint_points(64, 36, &[(80, 0), (96, 1)]).unwrap();
@@ -3864,7 +3892,7 @@ mod tests {
             for w in points.windows(2) {
                 let rows = w[1] - w[0];
                 assert!(
-                    (1..=TP_SPAN_CAP).contains(&rows),
+                    (1..=tp_span_cap()).contains(&rows),
                     "len {len}: window {w:?} has {rows} rows"
                 );
             }
@@ -3884,6 +3912,89 @@ mod tests {
             let rank1 = span_chunk_points(len);
             assert_eq!(rank0, rank1);
         }
+    }
+
+    #[test]
+    fn span_cap_geometry_boundaries_at_every_sweep_width() {
+        // The chunkers must tile correctly at each supported cap with the
+        // boundary lengths 63/64/65, 127/128/129 and 191/192/193 relative to
+        // that cap. The `_at` variants are pure, so no process-global state
+        // is touched and parallel tests stay deterministic.
+        for &cap in super::super::tp_span_cap::SWEEP_CAPS.iter() {
+            for len in [cap - 1, cap, cap + 1, 2 * cap - 1, 2 * cap, 2 * cap + 1] {
+                let points = span_chunk_points_at(len, cap);
+                assert_eq!(points.first(), Some(&0), "cap {cap} len {len}");
+                assert_eq!(points.last(), Some(&len));
+                for w in points.windows(2) {
+                    let rows = w[1] - w[0];
+                    assert!(
+                        (1..=cap).contains(&rows),
+                        "cap {cap} len {len}: window {w:?} has {rows} rows"
+                    );
+                }
+                let total: usize = points.windows(2).map(|w| w[1] - w[0]).sum();
+                assert_eq!(total, len, "cap {cap} len {len}");
+            }
+            // Exact expected tilings at the first boundary past the cap.
+            assert_eq!(
+                span_chunk_points_at(cap + 1, cap),
+                vec![0, cap, cap + 1],
+                "cap {cap}"
+            );
+            assert_eq!(
+                span_chunk_points_at(2 * cap + 1, cap),
+                vec![0, cap, 2 * cap, 2 * cap + 1],
+                "cap {cap}"
+            );
+            // Checkpoint cuts at the cap boundary still land exactly on a
+            // span end; a non-page-aligned cut is refused regardless of cap.
+            let cut = cap;
+            let points = span_checkpoint_points_at(0, cap + 1, &[(cut, 0)], cap).unwrap();
+            assert!(
+                points.contains(&cut),
+                "cap {cap}: cut {cut} must split the span exactly"
+            );
+            let before = span_checkpoint_points_at(0, cap + 1, &[(cut - 1, 0)], cap);
+            assert!(before.is_err(), "cuts must be page-aligned (16)");
+        }
+    }
+
+    #[test]
+    fn span_checkpoint_cuts_inside_one_wide_span_split_exactly() {
+        // With cap 128, cuts at 48 and 96 inside one 130-row run force
+        // spans ending exactly at each cut; the remainder takes one span
+        // (34 rows, under the cap), and multiple cuts inside what would be
+        // one wide span never merge.
+        let points = span_checkpoint_points_at(0, 130, &[(48, 0), (96, 1)], 128).unwrap();
+        assert_eq!(points, vec![0, 48, 96, 130]);
+        assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= 128));
+        // A cut exactly at the cap boundary ends the span there.
+        let at_cap = span_checkpoint_points_at(0, 128, &[(128, 0)], 128).unwrap();
+        assert_eq!(at_cap, vec![0, 128]);
+        // A cut one row past the cap boundary forces the narrower split.
+        let past = span_checkpoint_points_at(0, 129, &[(128, 0)], 128).unwrap();
+        assert_eq!(past, vec![0, 128, 129]);
+    }
+
+    #[test]
+    fn span_cap_wire_install_fails_closed_and_keeps_last_good() {
+        // The wire installer must refuse unsupported values WITHOUT
+        // half-installing: a refused value leaves the prior resolution in
+        // force, so a mismatched pair can never serve. The final install
+        // restores the production default for any later reader.
+        use super::super::tp_span_cap;
+        tp_span_cap::wire_span_cap(64).unwrap();
+        assert_eq!(tp_span_cap(), 64);
+        for bad in [0usize, 63, 65, 1000] {
+            assert!(tp_span_cap::wire_span_cap(bad).is_err(), "{bad}");
+            assert_eq!(tp_span_cap(), 64);
+        }
+        tp_span_cap::wire_span_cap(192).unwrap();
+        assert_eq!(tp_span_cap(), 192);
+        assert!(tp_span_cap::wire_span_cap(65).is_err());
+        assert_eq!(tp_span_cap(), 192);
+        tp_span_cap::wire_span_cap(64).unwrap();
+        assert_eq!(tp_span_cap(), 64);
     }
 
     #[test]

@@ -1091,10 +1091,10 @@ impl Qwen35TpRank {
             return Err(Qwen35TpError::Shape("rank, slot or position changed".into()));
         }
         let rows = tokens.len();
-        if rows == 0 || rows > super::tp_span::TP_SPAN_CAP {
+        if rows == 0 || rows > super::tp_span_cap::span_cap() {
             return Err(Qwen35TpError::Shape(format!(
                 "span rows {rows} outside the 1..={} prototype cap",
-                super::tp_span::TP_SPAN_CAP
+                super::tp_span_cap::span_cap()
             )));
         }
         if position.checked_add(rows).is_none_or(|end| end > self.max_ctx) {
@@ -1167,10 +1167,10 @@ impl Qwen35TpRank {
     /// halves pair across ranks. `rows` must match the advance that just
     /// ran (the head normalizes the residual plane the advance left behind).
     pub fn forward_span_head_enqueue(&mut self, rows: usize) -> Result<(), Qwen35TpError> {
-        if rows == 0 || rows > super::tp_span::TP_SPAN_CAP {
+        if rows == 0 || rows > super::tp_span_cap::span_cap() {
             return Err(Qwen35TpError::Shape(format!(
                 "span head rows {rows} outside the 1..={} cap",
-                super::tp_span::TP_SPAN_CAP
+                super::tp_span_cap::span_cap()
             )));
         }
         let Some(planes) = self.span_planes.as_mut() else {

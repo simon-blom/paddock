@@ -4,26 +4,22 @@
 //! advance/head path and the `forward_prefill_span` probe wrapper:
 //! whole-model activation planes, the row-batched GQA/FFN mixer planes,
 //! and one shared quantized-GEMM staging set. Capacity is fixed at
-//! [`TP_SPAN_CAP`] rows so memory use is bounded and explicit (~16 MB at
-//! the Qwen3.8 geometry). Nothing here exists until the
-//! first span forward, so the one-token decode paths never pay for it.
+//! [`tp_span_cap::span_cap()`] rows so memory use is bounded and explicit
+//! (~16 MB at cap 64, ~25 MB at cap 192 at the Qwen3.8 geometry). Nothing
+//! here exists until the first span forward, so the one-token decode paths
+//! never pay for it.
 //!
-//! The staging set rides the rows<=64 strided quantize band exclusively
-//! (`quantize_q8` + the mma/dp4a GEMM rungs); the flat-mmq producers (`yq`,
-//! `xsums`) and the stream-K fold scratch (`skfix`) only engage above 64 rows,
-//! so those planes are one-element stand-ins while the cap holds.
+//! The staging set carries BOTH quantize layouts: the rows<=64 strided
+//! band (`quantize_q8` + the dp4a/mma GEMM rungs) and the rows>64 flat
+//! mmq band (`yq`/`xsums` + the W4A8-tile/mmq rungs) plus the Q8_0
+//! stream-K fold scratch (`skfix`). Every plane is sized at allocation
+//! from the resolved cap, and every consumer asserts `rows` against it —
+//! there are no one-element placeholder planes left to read stale bytes.
 use cudarc::driver::CudaSlice;
 
 use super::gqa_tp::GqaGeometry;
+use super::tp_span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
-
-/// Row cap of the batched prefill span. It must not exceed the
-/// DeltaNet primitive's own cap: the whole-model traversal reuses
-/// `DeltaTpRank::prefill(rows)` and a wider cap would fail mid-span.
-/// Guarded by a compile-time assertion.
-pub(super) const TP_SPAN_CAP: usize = 64;
-// The whole-model traversal passes this count directly to DeltaNet prefill.
-const _: () = assert!(TP_SPAN_CAP <= super::delta_tp::SPAN_CAP);
 
 /// Whole-model activation planes for one span: residual stream, normalized
 /// rows, and the span's token ids.
@@ -70,8 +66,10 @@ pub(crate) struct SpanFfn {
 }
 
 /// Quantized-GEMM staging shared by every projection of one span pass (GQA
-/// Q/K/V/output and FFN gate/up/down): the strided int8 activation pair plus
-/// the per-16 k-quant sums plane.
+/// Q/K/V/output and FFN gate/up/down): the strided int8 activation pair for
+/// the rows<=64 band, the flat mmq activation + per-32-block sums planes for
+/// the rows>64 band, the strided per-16 sums for the dp4a k-quant ladder,
+/// and the Q8_0 stream-K fold scratch.
 pub(crate) struct SpanGemmStaging {
     pub(crate) xq: CudaSlice<i8>,
     pub(crate) xs: CudaSlice<f32>,
@@ -79,6 +77,17 @@ pub(crate) struct SpanGemmStaging {
     pub(crate) xsums: CudaSlice<f32>,
     pub(crate) ssums: CudaSlice<f32>,
     pub(crate) skfix: CudaSlice<f32>,
+}
+
+/// Flat mmq activation-layout sizing, shared by every staging site (the
+/// producer `quantize_q8_mmq` and consumer `mmq_sums` pad `batch` to 128 and
+/// `in_dim` to 128 the same way; a producer/consumer disagreement here is
+/// silent activation garbage). `bytes` for the activation plane, `sums` for
+/// the per-32-block f32 sums.
+pub(crate) fn mmq_layout(in_dim: usize, rows: usize) -> (usize, usize) {
+    let cols = in_dim.div_ceil(128);
+    let rows_pad = rows.next_multiple_of(128).max(128);
+    (cols * rows_pad * 144, cols * rows_pad * 4)
 }
 
 /// The complete span plane set owned by each `Qwen35TpRank`, including
@@ -91,9 +100,11 @@ pub(super) struct TpSpanPlanes {
 }
 
 impl TpSpanPlanes {
-    /// Allocate every span plane at the fixed cap. `hidden` is the backbone
-    /// width, `g` the (uniform) GQA geometry, `local_ff` the FFN shard width,
-    /// and `table_len` the full mirrored block-table length (bps * slots).
+    /// Allocate every span plane at the resolved cap. `hidden` is the
+    /// backbone width, `g` the (uniform) GQA geometry, `local_ff` the FFN
+    /// shard width, and `table_len` the full mirrored block-table length
+    /// (bps * slots). `rows` beyond `cap` are refused by every consumer
+    /// (model, mixers, chunkers); nothing truncates.
     pub(super) fn new(
         e: &GpuExecutor,
         hidden: usize,
@@ -101,7 +112,7 @@ impl TpSpanPlanes {
         local_ff: usize,
         table_len: usize,
     ) -> Result<Self, GpuError> {
-        let cap = TP_SPAN_CAP;
+        let cap = span_cap();
         let q_dim = g.q_dim();
         let kv_dim = g.kv_dim();
         let width = g.width;
@@ -109,6 +120,9 @@ impl TpSpanPlanes {
         // GQA and FFN planes: hidden for Q/K/V and gate/up, the local Q width
         // for the attention output projection, the local FF width for down.
         let max_in = width.max(q_dim).max(local_ff);
+        // The flat mmq band rides the widest input at the FULL cap (the
+        // whole span is quantized in one pass per input).
+        let (yq_elems, xsums_elems) = mmq_layout(max_in, cap);
         Ok(Self {
             act: SpanAct {
                 x: e.alloc(cap * hidden)?,
@@ -143,12 +157,12 @@ impl TpSpanPlanes {
             q: SpanGemmStaging {
                 xq: e.alloc_i8(cap * max_in)?,
                 xs: e.alloc(cap * max_in / 32)?,
-                // Only the > 64-row rungs touch these three; the cap is pinned
-                // to the DeltaNet primitive's 64 (see TP_SPAN_CAP).
-                yq: e.alloc_u8(1)?,
-                xsums: e.alloc(1)?,
+                yq: e.alloc_u8(yq_elems)?,
+                xsums: e.alloc(xsums_elems)?,
                 ssums: e.alloc(cap * max_in / 16)?,
-                skfix: e.alloc(1)?,
+                // The Q8_0 mmq ladder's stream-K fixup contract (256 SMs x
+                // 128x128 tiles + fold flags); ignored by the k-quant rungs.
+                skfix: e.alloc(256 * 128 * 128 + 256)?,
             },
         })
     }

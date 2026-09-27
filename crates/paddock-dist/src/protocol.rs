@@ -133,6 +133,13 @@ pub enum ControlMessage {
         /// resume entirely) and both ranks size their state pools + radix
         /// free-lists from THIS value, so the pools can never disagree.
         ckpt_slots: u32,
+        /// The coordinator-resolved TP prefill span row cap (v6): the
+        /// maximum contiguous prompt rows one whole-model span advance
+        /// processes. Both ranks chunk every run from THIS value (the
+        /// worker never reads `PADDOCK_TP_SPAN_CAP` itself), so a
+        /// hand-started remote worker cannot pair a different span geometry
+        /// and desynchronize the collectives.
+        span_cap: usize,
     },
     /// Rank-0-authorized ordered active rows; holes are omitted.
     ///
@@ -374,7 +381,13 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 ///
 /// Version 5: `TpMixed.reserve_cuts` claims cold-prompt checkpoints only on
 /// first Mixed ownership, before that tick's KV Ensure operations.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// Version 6: `TpInit` carries the coordinator-resolved TP prefill span row
+/// cap (`span_cap`). Both ranks chunk every prompt run with the SAME cap, so
+/// a hand-started worker can never pair a different span geometry and
+/// desynchronize the collectives. Values outside the supported sweep set
+/// fail both ranks closed at init.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -414,8 +427,32 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn tp_init_carries_the_span_cap_roundtrip() {
+        let msg = ControlMessage::TpInit {
+            checkpoint_sha256: "a".repeat(64),
+            pack_blake3: "b".repeat(64),
+            max_ctx: 65536,
+            slots: 2,
+            kv_dtype: "fp16".to_owned(),
+            use_graphs: false,
+            ckpt_slots: 4,
+            span_cap: 128,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        match serde_json::from_str(&json).unwrap() {
+            ControlMessage::TpInit { span_cap, .. } => assert_eq!(span_cap, 128),
+            other => panic!("wrong message: {other:?}"),
+        }
+        // The field is mandatory: dropping it must fail closed (a v5 frame
+        // must never silently default the cap on one rank only).
+        let mut missing = serde_json::to_value(&msg).unwrap();
+        missing.as_object_mut().unwrap().remove("span_cap");
+        assert!(serde_json::from_value::<ControlMessage>(missing).is_err());
     }
 
     #[test]

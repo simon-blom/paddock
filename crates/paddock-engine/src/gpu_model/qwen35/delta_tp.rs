@@ -12,6 +12,7 @@ use paddock_models::mapped::MappedGguf;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest, gguf_shard};
 
 use super::ops::{gemv_any, prefill_mm_any};
+use super::tp_span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
@@ -21,9 +22,14 @@ const S: usize = 128;
 const NK: usize = 16;
 const NV: usize = 48;
 const CONV_K: usize = 4;
-/// Span row cap of the DeltaNet batched prefill primitive. The whole-model
-/// TP prefill span's cap (tp_span.rs `TP_SPAN_CAP`) is checked against it.
-pub(super) const SPAN_CAP: usize = 64;
+/// Span row cap of the DeltaNet batched prefill primitive: the resolved
+/// rank-0-authoritative value (the whole-model traversal reuses
+/// `DeltaTpRank::prefill(rows)` with the SAME resolved cap; both consumers
+/// call `tp_span_cap::span_cap()`, so no magic value can drift). DeltaNet's
+/// own kernels carry no 64-row limit: the recurrence loops per-token inside
+/// one block for any `n_tokens` and the conv/gate/norm kernels are
+/// n_tokens-parameterized.
+
 
 fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
     let Some(expected) = rows.checked_mul(WIDTH) else {
@@ -221,13 +227,20 @@ struct PrefillGemm {
 impl PrefillGemm {
     fn new(e: &GpuExecutor) -> Result<Self, DeltaTpError> {
         // All three rank-local projections have input width <= WIDTH. The
-        // span cap is <=64, so prefill_mm_any uses strided int8 + dp4a/mma.
+        // staging carries BOTH quantize bands: the strided int8 pair for
+        // rows <= 64 (dp4a/mma rungs) and the flat mmq activation + per-32
+        // sums planes for rows > 64 (the W4A8-tile rung requires the flat
+        // layout; a 1-element stub here fed stale bytes above the old cap).
+        // skfix stays a 1-element stub: every DeltaNet projection is forced
+        // k-quant at load and the k-quant rungs never read stream-K scratch.
+        let cap = span_cap();
+        let (yq_elems, xsums_elems) = super::tp_span::mmq_layout(WIDTH, cap);
         Ok(Self {
-            xq: e.alloc_i8(SPAN_CAP * WIDTH)?,
-            xs: e.alloc(SPAN_CAP * WIDTH / 32)?,
-            yq: e.alloc_u8(1)?,
-            xsums: e.alloc(1)?,
-            ssums: e.alloc(SPAN_CAP * WIDTH / 16)?,
+            xq: e.alloc_i8(cap * WIDTH)?,
+            xs: e.alloc(cap * WIDTH / 32)?,
+            yq: e.alloc_u8(yq_elems)?,
+            xsums: e.alloc(xsums_elems)?,
+            ssums: e.alloc(cap * WIDTH / 16)?,
             skfix: e.alloc(1)?,
         })
     }
@@ -278,7 +291,7 @@ struct Span {
 }
 impl Span {
     fn new(e: &GpuExecutor, g: &DeltaGeometry) -> Result<Self, DeltaTpError> {
-        let (n, mixed, value, heads) = (SPAN_CAP, g.mixed(), g.value_dim(), g.values());
+        let (n, mixed, value, heads) = (span_cap(), g.mixed(), g.value_dim(), g.values());
         Ok(Self {
             input: e.alloc(WIDTH)?,
             mixed: e.alloc(n * mixed)?,
@@ -760,13 +773,14 @@ impl DeltaTpRank {
         let rank = group.rank();
         let input_len = input.len();
         let context_match = input.context().cu_ctx() == e.stream.context().cu_ctx();
-        if world != 2 || rank != self.rank || rows == 0 || rows > SPAN_CAP
+        let cap = span_cap();
+        if world != 2 || rank != self.rank || rows == 0 || rows > cap
             || !input_len_matches(input_len, rows, prefill)
             || !context_match
         {
             return Err(DeltaTpError::Shape(format!(
                 "rank/input/span mismatch: expected world=2 rank={} input_len=rows*{} span_len=1..{} state_pair={}; actual world={} rank={} rows={} input_len={} span_len={} context_match={}",
-                self.rank, WIDTH, SPAN_CAP, if slot == 0 { "home" } else { "slot" },
+                self.rank, WIDTH, cap, if slot == 0 { "home" } else { "slot" },
                 world, rank, rows, input_len, rows, context_match
             )));
         }
