@@ -97,3 +97,25 @@ Static validation after the code changes passed: `cargo test -p paddock-engine -
 
 Readiness remains **not ready** for the ~20k Hermes acceptance. The 64K production smoke, normal numeric rank-exit reporting, focused pinning regression, and lightweight TP=1 parity passed, but the required live Mixed -> Async eligibility transition, true pending-CUDA cancellation/reuse proof, and target-device context-lookahead branch proof remain incomplete. No push was made.
 
+## Target-device gate attempt (starting `cc8eb0fe186c3ba5572f853694ff4668e8eed8e`)
+
+Starting local HEAD was `cc8eb0fe186c3ba5572f853694ff4668e8eed8e`; starting remote HEAD was `096838db6751c26ad0536da1797d26184b46899f`. The remote was behind all local readiness commits and did not move during this run. No ~20k Hermes acceptance was run and no push was made.
+
+A narrow cancellation probe was added in `crates/paddock-engine/src/service.rs`: immediately before `prefill_abort`, it records `generator.unified_span_done()` and the abort result in `serve: prefill cancellation probe`. This does not add a production API. The target-device launcher used the real TP=2 coordinator and worker, `PADDOCK_UNIFIED=1`, `PADDOCK_PIPE_MIN_LIVE=0`, `PADDOCK_PREFILL_TICK_ROWS=128`, `SPEC=off`, `TP_GRAPH=0`, and the exact runner staged to both Sparks with SHA-256 `1dcf79f2ef720f37708f7d2e60d0f444f48eeea4462c224563d38ce62d425c14`.
+
+### Pending-CUDA cancellation result: NOT PASSED
+
+The live request was owned `Async` and launched: `TP prompt prefill owner slot=1 owner=Async first=true rows=127 finishing=false`, followed by `TP prefill span launched sequence=29 rows=127 finishers=0`. The client disconnect was observed only after the synchronous scheduler tick had already drained and finished the span: `TP decode pipe drained sequence=31`, `TP prefill span finished sequence=32 finishers=0`, then `serve: prefill cancellation probe slot=1 span_done=true aborted=true`. The subsequent `client gone mid-prefill - aborted slot 1` proves safe post-drain abort/reuse, but explicitly does not prove `prefill_lane_done() == false` at cancellation.
+
+This is a structural limitation of the current scheduler/control arrangement, not a reason to fake the gate: `unified_span_launch`, pipe pumping/drain, and `unified_span_finish` run synchronously in one scheduler tick; the disconnect sweep cannot call `prefill_abort` between the launch and the event fence. The existing command thread accepts `PrefillAbort` while a span exists, but the scheduler thread does not regain control to send that command until the span-finish path returns. The narrow probe therefore captured the truthful result (`span_done=true`). The request's slot was aborted after drain and reused without a page/KV/NCCL/panic/coordinator-poison error, but the required in-flight cancellation proof remains open.
+
+### Target-device context-lookahead result: NOT PASSED
+
+A real TP=2 target run with `MAX_CTX=256`, `PADDOCK_UNIFIED=1`, `PADDOCK_PIPE_MIN_LIVE=0`, `PADDOCK_PREFILL_TICK_ROWS=32`, and concurrent requests exercised Async launch, slot-mapped decode-pipe begin/drain, span finish/promotion, and cancellation. It did not emit the required `serve: overlap decode pipe context boundary; draining before next tick` marker. The public request admission/length clamping retired the decoder before an illegal lookahead could be attempted, matching the previously recorded failure mode. The helper tests passed, but the real coordinator branch was not live-proven; no target-device context gate is claimed.
+
+The live Async traces did not show a Mixed -> Async eligibility flip; the focused host regression remains the only evidence for that transition. Normal shutdown of the launcher after the live runs reported coordinator exit `0` and worker exit `0` (worker sidecar `0`).
+
+Static validation after the instrumentation passed: focused serial-pipe tests (8), TP serve tests (23), `cargo test -p paddock-engine --lib` (488), `cargo test -p paddock-engine --all-targets`, `cargo test -p paddock-dist` (4 unit + 22 bootstrap), `cargo clippy -p paddock-engine -p paddock-dist --all-targets` (existing warnings only), `git diff --check`, and `cargo build --release -p paddock-runner --bin paddock-runner`. The cancellation probe is the only code change; this documentation update is the only additional tracked change.
+
+Final decision: both required target-device gates remain open. Do not push and do not run the ~20k Hermes acceptance. The next valid step is a dedicated real coordinator harness or scheduler yield/control seam that can send the existing `PrefillAbort` command while `unified_span_done()` is false, plus a target-device context-boundary harness that reaches the overlap lookahead branch without relying on the public completion cap.
+
