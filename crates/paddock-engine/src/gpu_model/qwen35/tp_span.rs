@@ -39,6 +39,12 @@ pub(crate) struct SpanAct {
 /// the whole row batch).
 pub(crate) struct SpanGqa {
     pub(crate) cap: usize,
+    /// The (slot, position, rows) whose metadata is currently resident in
+    /// the device planes below. None until the first stage of a span; a
+    /// change re-stages. GQA-layer-local buffers (projections, norms,
+    /// attention) are NOT covered by this key - only the span-global
+    /// metadata planes shared by every GQA layer of one traversal.
+    pub(crate) staged: Option<(usize, usize, usize)>,
     pub(crate) qg: CudaSlice<f32>,
     pub(crate) q: CudaSlice<f32>,
     pub(crate) gate: CudaSlice<f32>,
@@ -132,6 +138,7 @@ impl TpSpanPlanes {
             },
             gqa: SpanGqa {
                 cap,
+                staged: None,
                 qg: e.alloc(cap * 2 * q_dim)?,
                 q: e.alloc(cap * q_dim)?,
                 gate: e.alloc(cap * q_dim)?,

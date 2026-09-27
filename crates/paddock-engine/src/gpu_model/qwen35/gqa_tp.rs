@@ -651,6 +651,32 @@ impl GqaTpRank {
         layer: usize,
         profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
+        // The span-global metadata (block table, positions, slots, M-RoPE
+        // axes) is identical for every GQA layer of one whole-model span:
+        // the first layer stages it and later layers reuse the device
+        // planes. `span.staged` records exactly what is resident, so a new
+        // span (or changed slot/position/rows) always re-stages - no stale
+        // layer-local state is ever cached.
+        self.stage_span_metadata(e, slot, position, rows, logical, span)?;
+        self.span_run(e, group, xn, rows, span, q, layer, profile)
+    }
+
+    /// Validate and upload the span-global metadata ONCE per span: the
+    /// validated mirrored block table, per-row positions, slot ids and the
+    /// [4, rows] axis-major M-RoPE plane. `checked_device_table` semantics
+    /// and the table-length check are unchanged from the per-layer form.
+    /// Rank symmetry: every GQA layer's first call on each rank performs the
+    /// identical validation, so a rank that cannot validate fails before any
+    /// collective it would join.
+    fn stage_span_metadata(
+        &mut self,
+        e: &GpuExecutor,
+        slot: usize,
+        position: usize,
+        rows: usize,
+        logical: &MirroredKv,
+        span: &mut SpanGqa,
+    ) -> Result<(), GqaTpError> {
         if self.block_tables.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
@@ -661,6 +687,10 @@ impl GqaTpRank {
                 .is_none_or(|end| end > self.max_ctx)
         {
             return Err(GqaTpError::Shape("span geometry out of range".into()));
+        }
+        let key = (slot, position, rows);
+        if span.staged == Some(key) {
+            return Ok(());
         }
         let g = self.geometry;
         // One shared block-table upload covers the whole span (the host table
@@ -709,7 +739,8 @@ impl GqaTpRank {
                 .memcpy_htod(&axes_h, &mut span.axes.slice_mut(0..4 * rows))
                 .map_err(GpuError::from)?;
         }
-        self.span_run(e, group, xn, rows, span, q, layer, profile)
+        span.staged = Some(key);
+        Ok(())
     }
 
     /// The [4, rows] axis-major M-RoPE plane for a text span: the row's
