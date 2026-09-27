@@ -239,3 +239,46 @@ between caps — the cap is fixed at init):
 Log evidence to keep: both ranks' full logs per cap, per-request JSON
 results, the profile summaries, and the hash quadruple (runner, pack, model,
 per-rank).
+
+## Wider-span TP=2 validation (HEAD `519e0085a36fa8805ca5c8a968a95412e5828898`)
+
+The recorded handoff HEAD was `783bafcfa95e2c52a52472dc84dbcaa7177e341f`; the
+actual clean HEAD was `519e0085a36fa8805ca5c8a968a95412e5828898`, which adds only
+the documentation comment/reference update in `519e008` on top of that recorded
+final commit. The documented dry run passed. The runner was rebuilt from this
+HEAD and staged at `/home/sime/ffn-tp/acceptance-qwen38-tp2-519e008/paddock-runner`
+without overwriting the configured worker binary. Hashes matched on both nodes:
+
+- runner: `1e867a35adee3e3d2e3b6df4af7f3237df75313bb3e496a9efe8a48fe69adebb`
+- CUDA pack `pd-cuda-sm120.so`: `c58133072ed1f339201168b5f5eb7ecf0056ad7edb251e8f1224554d0e9b321e`
+- Qwen checkpoint: `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`
+
+Production configuration was `MAX_CTX=65536`, `SPEC=off`, `TP_GRAPH=0`,
+`PADDOCK_UNIFIED=1`, `KV_DTYPE=f16`, `MAX_BATCH=2`, `PADDOCK_TP_CKPT_SLOTS=4`
+(as set by the production env), and the exact unchanged 22,130-token Hermes
+fixture. Each cap used a fresh server, a profiled diagnostic cold request, a
+same-request cache-hit regression, and a fresh-server unprofiled cold request.
+All cold and hit requests returned HTTP 200, 64 tokens, `finish=length`, and
+coherent deterministic text; first generated token text matched cap 64. Cuts
+`22112` and `22128` were logged for every cap, both rank status files recorded
+exit `0`, and no CUDA/NCCL/KV/page/protocol/checkpoint/poison errors were found.
+
+| cap | correctness | actual spans / rows | rung | profiler whole-advance | FFN local+NCCL | DeltaNet local+NCCL | GQA local+NCCL | unprofiled wall | prompt tok/s | cache regression |
+|---:|:---:|---:|:---|---:|---:|---:|---:|---:|---:|:---|
+| 64 | PASS | 348 / 22,130 | kq-dp4a at <=64 | 105.252 s | 53.919 + 5.024 s | 30.210 + 4.016 s | 9.625 + 1.241 s | 116.641 s | 189.7 | PASS, 22,128 cached, 10.310 s |
+| 128 | PASS | 173 / 22,130 | kq-tile at 96; kq-dp4a only <=40 | 40.188 s | 9.474 + 3.994 s | 17.624 + 2.893 s | 4.353 + 0.938 s | 52.101 s | 424.8 | PASS, 22,128 cached, 10.726 s |
+| 192 | PASS | 116 / 22,130 | kq-tile at 128/160; kq-dp4a only <=40 | 37.155 s | 9.290 + 2.488 s | 17.999 + 2.377 s | 3.410 + 0.671 s | 48.441 s | 456.8 | PASS, 22,128 cached, 10.660 s |
+
+Profiler whole/component values for cap 64 are the accepted cap-64 diagnostic
+baseline in this handoff; cap 128/192 values are the cold-request cumulative
+profile delta after subtracting the server warm wave. The dispatch witness was
+present on rank 0; rank 1's forwarded profile summaries matched the span/row
+geometry. The current launcher forwards `PADDOCK_TP_PREFILL_PROFILE` but not the
+kernel-trace variable to the worker, so rank-1 kernel marker lines are absent;
+this is an evidence limitation of the existing launcher, not a cap failure.
+The exact rank logs and request JSON are preserved under
+`/home/sime/.hermes/cache/scratch/tp-prefill-cap{64,128,192}/`.
+
+All three caps passed the requested correctness gates. The fastest valid tested
+cap is 192 (48.441 s wall, 456.8 prompt tok/s); the production default remains
+64 and was not changed. No optimization work was started and nothing was pushed.
