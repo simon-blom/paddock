@@ -214,6 +214,12 @@ pub trait Generator: Send {
         Err(GenError::Backend("pipelined decode not supported".into()))
     }
 
+    /// Owner of the next queued prompt after its first prefill rows have run.
+    /// None means unowned (or a backend without separate prefill lanes).
+    fn prefill_front_owner(&mut self) -> Option<PrefillLane> {
+        None
+    }
+
     /// True when the backend can OVERLAP a prefill span with decode ticks on
     /// a second execution lane (route B): decode lane forked +
     /// unified spans + slot-mapped pipes available. Gates the overlapped
@@ -1290,6 +1296,14 @@ pub struct SpecRsDraw {
     pub inv_t: f32,
     /// per-chain-step draft-draw uniforms (length >= the round's k_use)
     pub u: Vec<f32>,
+}
+
+/// Stateful prompt prefill execution lane. The owner is fixed at the first
+/// executed prompt row and is cleared when the prompt finishes or is aborted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillLane {
+    Mixed,
+    Async,
 }
 
 /// Per-row instruction for a device-sampled decode step.

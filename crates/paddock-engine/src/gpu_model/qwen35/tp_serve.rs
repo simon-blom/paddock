@@ -168,6 +168,32 @@ fn validate_multistep_positions(
     Ok(())
 }
 
+/// Mirror coordinator decode-prefix ordering before the worker mirrors KV or
+/// acknowledges Prepared. The chunk tail may repeat one different slot.
+fn validate_mixed_worker_rows(
+    rows: &[(usize, u32, usize)],
+    chunk_rows: usize,
+    positions: &[usize],
+    max_ctx: usize,
+) -> Result<usize, String> {
+    if rows.is_empty() || chunk_rows > rows.len() {
+        return Err("TP mixed tick membership invalid".into());
+    }
+    let split = rows.len() - chunk_rows;
+    if rows[..split].windows(2).any(|w| w[0].0 >= w[1].0) {
+        return Err("TP mixed decode rows must be strictly ascending by slot".into());
+    }
+    let chunk = &rows[split..];
+    if !chunk.is_empty()
+        && (chunk.iter().any(|&(s, _, _)| s != chunk[0].0)
+            || rows[..split].iter().any(|r| r.0 == chunk[0].0))
+    {
+        return Err("TP mixed tick chunk run must be one disjoint slot".into());
+    }
+    validate_multistep_positions(rows, positions, max_ctx)?;
+    Ok(split)
+}
+
 /// Row cap of the production batched prefill span. Use the model plane and
 /// DeltaNet primitive capacity directly so neither rank can drift from it.
 const TP_SPAN_CAP: usize = super::tp_span::TP_SPAN_CAP;
@@ -313,6 +339,14 @@ struct PrefillChunk {
     slot: usize,
     rows: Vec<(usize, u32, usize)>,
     fin_plan: Option<crate::sampler::DevicePlan>,
+    /// Set when the first rows execute; persists over every partial tick.
+    owner: Option<crate::generator::PrefillLane>,
+}
+
+fn abort_queued_chunk(chunks: &mut VecDeque<PrefillChunk>, slot: usize) -> bool {
+    let before = chunks.len();
+    chunks.retain(|chunk| chunk.slot != slot);
+    chunks.len() != before
 }
 
 /// A finishing chunk's summary, kept from launch until the span drains so
@@ -361,6 +395,9 @@ fn wire_kv_state(value: serde_json::Value) -> Result<Snapshot, String> {
 fn wire_finisher_plan(
     plan: crate::sampler::DevicePlan,
 ) -> Result<TpSpanFinisherPlan, String> {
+    // The GPU finisher sampler checks these same parameters; reject invalid
+    // categorical values before either rank authorizes KV for the span.
+    super::tp_model::tp_sample_params(plan).map_err(|e| e.to_string())?;
     match plan {
         crate::sampler::DevicePlan::Greedy => Ok(TpSpanFinisherPlan::Greedy),
         crate::sampler::DevicePlan::Categorical { inv_t, u } => {
@@ -368,6 +405,28 @@ fn wire_finisher_plan(
         }
         other => Err(format!("TP span finisher plan unsupported: {other:?}")),
     }
+}
+
+/// Map scheduler-row plans to wire order, validating width before indexing.
+fn mapped_pipe_plans(
+    row_of: &[usize],
+    width: usize,
+    plans: &[RowSample],
+) -> Result<Vec<crate::sampler::DevicePlan>, String> {
+    if plans.len() != width || row_of.len() != width || row_of.iter().any(|&row| row >= width) {
+        return Err("TP slot-mapped pipe plan width mismatch".into());
+    }
+    row_of
+        .iter()
+        .map(|&row| match plans[row] {
+            RowSample::Device(plan) => {
+                super::tp_model::tp_sample_params(plan).map_err(|e| e.to_string())?;
+                Ok(plan)
+            }
+            RowSample::Hole => Ok(crate::sampler::DevicePlan::Greedy),
+            RowSample::Host => Err("TP pipe cannot read host logits".to_string()),
+        })
+        .collect()
 }
 
 impl TpCoordinator {
@@ -935,21 +994,9 @@ impl TpCoordinator {
     fn pipe_next(&mut self, plans: &[RowSample]) -> Result<Vec<u32>, String> {
         let flight = self.pipe.as_ref().ok_or("TP pipe next without begin")?;
         let devices = if flight.mapped {
-            // Slot-mapped rows: plan per SCHEDULER row, executed per WIRE row
-            // via row_of; dead members ride as greedy dummies (their ids are
-            // discarded by the scheduler).
-            flight
-                .row_of
-                .iter()
-                .map(|&row| match plans[row] {
-                    RowSample::Device(plan) => {
-                        super::tp_model::tp_sample_params(plan).map_err(|e| e.to_string())?;
-                        Ok(plan)
-                    }
-                    RowSample::Hole => Ok(crate::sampler::DevicePlan::Greedy),
-                    RowSample::Host => Err("TP pipe cannot read host logits".to_string()),
-                })
-                .collect::<Result<Vec<_>, String>>()?
+            // Slot-mapped plans index SCHEDULER rows, executed in WIRE order;
+            // dead members ride as greedy dummies.
+            mapped_pipe_plans(&flight.row_of, flight.width, plans)?
         } else {
             Self::pipe_plans(&flight.slots, flight.width, plans)?
         };
@@ -1063,9 +1110,7 @@ impl TpCoordinator {
         {
             return false;
         }
-        let before = self.chunks.len();
-        self.chunks.retain(|chunk| chunk.slot != slot);
-        self.chunks.len() != before
+        abort_queued_chunk(&mut self.chunks, slot)
     }
 
     /// A mixed tick executes the scheduler's decode rows individually,
@@ -1094,7 +1139,7 @@ impl TpCoordinator {
             return Err("TP span in flight; finish or drain it first".into());
         }
         self.chunk_plans(fin_plans);
-        let (chunk_rows, mut finishers) = self.chunk_take(budget);
+        let (chunk_rows, mut finishers) = Self::chunk_take(&mut self.chunks, budget, crate::generator::PrefillLane::Mixed)?;
         let dec_n = decodes.len();
         if plans.len() != dec_n {
             return Err("TP mixed plan width mismatch".into());
@@ -1288,6 +1333,7 @@ impl TpCoordinator {
                 .map(|(pos, token)| (slot, token, pos))
                 .collect(),
             fin_plan: None,
+            owner: None,
         });
         Ok(())
     }
@@ -1310,14 +1356,20 @@ impl TpCoordinator {
     /// finishing chunk (its plan if any; `None` = host-logit readback). A
     /// chunk finishes when its last row is popped.
     fn chunk_take(
-        &mut self,
+        chunks: &mut VecDeque<PrefillChunk>,
         budget: usize,
-    ) -> (Vec<(usize, u32, usize)>, Vec<SpanFinisher>) {
+        owner: crate::generator::PrefillLane,
+    ) -> Result<(Vec<(usize, u32, usize)>, Vec<SpanFinisher>), String> {
+        if let Some(pinned) = chunks.front().and_then(|c| c.owner)
+            && pinned != owner
+        {
+            return Err(format!("TP prompt prefill lane changed from {pinned:?} to {owner:?}"));
+        }
         let mut rows = Vec::new();
         let mut finishers = Vec::new();
         while rows.len() < budget {
             // Continue only within the chunk already open this tick.
-            let go = match self.chunks.front() {
+            let go = match chunks.front() {
                 Some(chunk) => {
                     rows.is_empty() || rows.last().is_some_and(|&(s, _, _)| s == chunk.slot)
                 }
@@ -1327,18 +1379,17 @@ impl TpCoordinator {
                 break;
             }
             let (slot, take, finishing, plan) = {
-                let chunk = self
-                    .chunks
+                let chunk = chunks
                     .front()
                     .expect("chunk front is Some: the go guard just matched it");
                 let take = chunk.rows.len().min(budget - rows.len());
                 (chunk.slot, take, chunk.rows.len() == take, chunk.fin_plan)
             };
             let drained: Vec<_> = {
-                let chunk = self
-                    .chunks
+                let chunk = chunks
                     .front_mut()
                     .expect("chunk front is Some: the go guard just matched it");
+                chunk.owner = Some(owner);
                 chunk.rows.drain(..take).collect()
             };
             // Full prompt rows (last row's position + 1), not the final
@@ -1346,7 +1397,7 @@ impl TpCoordinator {
             let fin_rows = drained.last().map_or(0, |&(_, _, position)| position + 1);
             rows.extend(drained);
             if finishing {
-                self.chunks.pop_front();
+                chunks.pop_front();
                 finishers.push(SpanFinisher {
                     slot,
                     plan,
@@ -1354,7 +1405,7 @@ impl TpCoordinator {
                 });
             }
         }
-        (rows, finishers)
+        Ok((rows, finishers))
     }
 
     /// Launch a prefill-lane tick: validate and authorize the ordered KV
@@ -1505,7 +1556,7 @@ impl TpCoordinator {
             return Ok(false);
         }
         self.chunk_plans(fin_plans);
-        let (rows, finishers) = self.chunk_take(budget);
+        let (rows, finishers) = Self::chunk_take(&mut self.chunks, budget, crate::generator::PrefillLane::Async)?;
         if rows.is_empty() {
             return Ok(false);
         }
@@ -1713,6 +1764,8 @@ enum Command {
     ChunkBegin(usize, Vec<u32>),
     /// Abandon a slot's queued chunked prefill (client hangup).
     PrefillAbort(usize),
+    /// Read the next queued prompt's lane pin without advancing it.
+    PrefillFrontOwner,
     /// Mixed tick: decode rows + chunked-prefill budget.
     Mixed(
         Vec<(usize, u32, u32)>,
@@ -1733,6 +1786,7 @@ enum Response {
     Ids(Vec<u32>),
     Launched(bool),
     Aborted(bool),
+    PrefillOwner(Option<crate::generator::PrefillLane>),
     Mixed(
         SampledStep,
         Vec<(usize, crate::generator::FinishSample, usize)>,
@@ -1877,6 +1931,9 @@ impl TpGenerator {
                             Command::PrefillAbort(slot) => {
                                 Ok(Response::Aborted(coordinator.chunk_abort(slot)))
                             }
+                            Command::PrefillFrontOwner => Ok(Response::PrefillOwner(
+                                coordinator.chunks.front().and_then(|c| c.owner),
+                            )),
                             Command::Mixed(decodes, budget, plans, fin_plans) => coordinator
                                 .forward_mixed(&decodes, budget, &plans, &fin_plans)
                                 .map(|(step, finished)| Response::Mixed(step, finished)),
@@ -2029,6 +2086,12 @@ impl Generator for TpGenerator {
         {
             Response::Ids(ids) => Ok(ids),
             _ => Err(GenError::Backend("TP pipe reply kind mismatch".into())),
+        }
+    }
+    fn prefill_front_owner(&mut self) -> Option<crate::generator::PrefillLane> {
+        match self.request(Command::PrefillFrontOwner) {
+            Ok(Response::PrefillOwner(owner)) => owner,
+            _ => Some(crate::generator::PrefillLane::Mixed), // fail closed; next command reports poison
         }
     }
     fn supports_overlap(&self) -> bool {
@@ -2509,21 +2572,8 @@ pub fn run_worker(
                     // Rank 1 mirrors the authorized KV snapshot before
                     // Prepared, then replays the same bounded span geometry;
                     // it neither samples nor reads logits back to the host.
-                    if rows.is_empty() {
-                        return Err("TP mixed tick membership invalid".into());
-                    }
-                    if chunk_rows > rows.len() {
-                        return Err("TP mixed tick chunk run exceeds its rows".into());
-                    }
-                    let split = rows.len() - chunk_rows;
+                    let split = validate_mixed_worker_rows(&rows, chunk_rows, &positions, max_ctx)?;
                     let chunk = &rows[split..];
-                    if !chunk.is_empty()
-                        && (chunk.iter().any(|&(s, _, _)| s != chunk[0].0)
-                            || rows[..split].iter().any(|r| r.0 == chunk[0].0))
-                    {
-                        return Err("TP mixed tick chunk run must be one disjoint slot".into());
-                    }
-                    validate_multistep_positions(&rows, &positions, max_ctx)?;
                     let ops: Vec<Operation> = rows
                         .iter()
                         .map(|&(slot, _, position)| Operation::Ensure { slot, position })
@@ -2684,6 +2734,96 @@ mod tests {
         let worker = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (head, _) = listener.accept().unwrap();
         (head, worker)
+    }
+
+    #[test]
+    fn prompt_owner_pins_partial_ticks_and_clears_on_finish_abort_and_reuse() {
+        use crate::generator::PrefillLane::{Async, Mixed};
+        let prompt = |slot| PrefillChunk {
+            slot,
+            rows: (0..5).map(|p| (slot, p as u32, p)).collect(),
+            fin_plan: None,
+            owner: None,
+        };
+        let mut queue = VecDeque::from([prompt(1)]);
+        let (rows, finished) = TpCoordinator::chunk_take(&mut queue, 2, Mixed).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(finished.is_empty());
+        assert_eq!(queue.front().unwrap().owner, Some(Mixed));
+        assert!(TpCoordinator::chunk_take(&mut queue, 2, Async).is_err());
+        assert_eq!(queue.front().unwrap().rows.len(), 3); // rejected before mutation
+        let (_, finished) = TpCoordinator::chunk_take(&mut queue, 3, Mixed).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert!(queue.is_empty()); // completion discards the pin
+
+        queue.push_back(prompt(1)); // same slot, fresh request
+        TpCoordinator::chunk_take(&mut queue, 2, Async).unwrap();
+        assert_eq!(queue.front().unwrap().owner, Some(Async));
+        assert!(TpCoordinator::chunk_take(&mut queue, 1, Mixed).is_err());
+        TpCoordinator::chunk_take(&mut queue, 2, Async).unwrap();
+        assert_eq!(queue.front().unwrap().owner, Some(Async));
+        assert!(abort_queued_chunk(&mut queue, 1));
+        assert!(queue.is_empty());
+        queue.push_back(prompt(1)); // cancellation/release and slot reuse
+        assert_eq!(queue.front().unwrap().owner, None);
+        TpCoordinator::chunk_take(&mut queue, 5, Mixed).unwrap();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn finisher_wire_plan_rejects_invalid_sampler_parameters_before_authorization() {
+        use crate::sampler::DevicePlan;
+        assert!(matches!(wire_finisher_plan(DevicePlan::Greedy), Ok(TpSpanFinisherPlan::Greedy)));
+        assert!(matches!(
+            wire_finisher_plan(DevicePlan::Categorical { inv_t: 2.0, u: 0.25 }),
+            Ok(TpSpanFinisherPlan::Categorical { .. })
+        ));
+        for (inv_t, u) in [
+            (0.0, 0.5),
+            (-1.0, 0.5),
+            (f32::NAN, 0.5),
+            (f32::INFINITY, 0.5),
+            (1.0, f32::NAN),
+            (1.0, f32::INFINITY),
+            (1.0, -0.1),
+            (1.0, 1.0),
+        ] {
+            assert!(wire_finisher_plan(DevicePlan::Categorical { inv_t, u }).is_err());
+        }
+    }
+
+    #[test]
+    fn mapped_pipe_plans_reject_bad_width_before_indexing_and_preserve_wire_order() {
+        use crate::sampler::DevicePlan;
+        let plans = [RowSample::Hole, RowSample::Device(DevicePlan::Categorical { inv_t: 2.0, u: 0.5 })];
+        let selected = mapped_pipe_plans(&[1, 0], 2, &plans).unwrap();
+        assert!(matches!(selected[0], DevicePlan::Categorical { .. }));
+        assert!(matches!(selected[1], DevicePlan::Greedy));
+        assert!(mapped_pipe_plans(&[1, 0], 2, &plans[..1]).is_err());
+        assert!(mapped_pipe_plans(&[1, 0], 2, &[plans[0], plans[1], RowSample::Hole]).is_err());
+        assert!(mapped_pipe_plans(&[2, 0], 2, &plans).is_err());
+        assert!(mapped_pipe_plans(&[0], 2, &plans).is_err());
+        assert!(mapped_pipe_plans(&[0, 1], 2, &[RowSample::Host, plans[1]]).is_err());
+        assert!(mapped_pipe_plans(
+            &[0, 1],
+            2,
+            &[RowSample::Hole, RowSample::Device(DevicePlan::Categorical { inv_t: 0.0, u: 0.5 })]
+        ).is_err());
+    }
+
+    #[test]
+    fn worker_mixed_decode_prefix_must_ascend_before_mirror() {
+        let pos = [3, 7, 11];
+        assert_eq!(
+            validate_mixed_worker_rows(&[(0, 4, 3), (1, 5, 7), (2, 6, 11), (2, 7, 12)], 2, &pos, 16),
+            Ok(2)
+        );
+        assert!(validate_mixed_worker_rows(&[(1, 5, 7), (0, 4, 3), (2, 6, 11)], 1, &pos, 16)
+            .unwrap_err().contains("ascending"));
+        assert!(validate_mixed_worker_rows(&[(0, 4, 3), (0, 5, 3)], 0, &pos, 16)
+            .unwrap_err().contains("ascending"));
+        assert!(validate_mixed_worker_rows(&[(0, 4, 3), (0, 5, 4)], 1, &pos, 16).is_err());
+        assert!(validate_mixed_worker_rows(&[(0, 4, 3), (1, 5, 8)], 1, &pos, 16).is_err());
     }
 
     #[test]

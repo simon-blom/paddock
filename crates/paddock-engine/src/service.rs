@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, RowSample};
+use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, PrefillLane, RowSample};
 use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
 use crate::sampler::{Sampler, SamplingParams, TokenConstraint};
 use crate::spec::NgramDraft;
@@ -3197,6 +3197,14 @@ mod cohort_grace_tests {
     }
 }
 
+fn select_prefill_lane(owner: Option<PrefillLane>, overlap_eligible: bool) -> bool {
+    match owner {
+        Some(PrefillLane::Mixed) => false,
+        Some(PrefillLane::Async) => true,
+        None => overlap_eligible,
+    }
+}
+
 // The TP pipe has fixed KV capacity, including its dead-but-still-running
 // dummy members. A lookahead tick at the limit must drain before enqueuing.
 fn pipe_lookahead_exhausted(positions: &[u32], next_calls: usize, limit: usize) -> bool {
@@ -4579,7 +4587,12 @@ fn run_batched(
                 });
             // requests in flight (chunking + decoding) - the pipe_min_live floor
             let live_slots = slots.iter().filter(|s| s.is_some()).count();
-            let overlap_ok = unified_ok
+            // The backend queue head is the next prompt to advance. Once its
+            // first rows execute, its KV and recurrent state belong to that
+            // lane until completion. Dynamic eligibility only chooses an
+            // owner for a prompt which has not advanced yet.
+            let prefill_owner = generator.prefill_front_owner();
+            let overlap_eligible = unified_ok
                 && !spec_mixed_first
                 && generator.supports_overlap()
                 && !dec.is_empty()
@@ -4594,6 +4607,7 @@ fn run_batched(
                 && generator
                     .pool_free_blocks()
                     .is_none_or(|f| f > max_batch + POOL_WATERMARK_BLOCKS);
+            let overlap_ok = select_prefill_lane(prefill_owner, overlap_eligible);
             if overlap_ok {
                 // finisher plans: same peek rules as the fused tick below
                 // (finishers sample in the span's own buffers - TruncCat is
@@ -4669,7 +4683,9 @@ fn run_batched(
                             }
                         })
                         .collect();
-                    let mut pipe_alive =
+                    let mut pipe_alive = if dec.is_empty() {
+                        false // lane-owned prompt may outlive every decoder
+                    } else {
                         match generator.decode_pipe_begin_slots(&slots_v, &toks, &pos, &plans0) {
                             Ok(()) => true,
                             Err(e) => {
@@ -4681,9 +4697,11 @@ fn run_batched(
                             });
                                 false
                             }
-                        };
+                        }
+                    };
                     if pipe_alive {
                         let mut prev_plans = plans0;
+                        let mut pipe_next_calls = 0usize;
                         loop {
                             // stop pumping when the span completes, the pool
                             // runs low, a row needs host sampling, or every
@@ -4692,7 +4710,12 @@ fn run_batched(
                             let low_headroom = !generator
                                 .pool_free_blocks()
                                 .is_none_or(|f| f > max_batch + POOL_WATERMARK_BLOCKS);
-                            if generator.unified_span_done() || low_headroom || all_dead {
+                            let context_limit = generator.decode_pipe_context_limit()
+                                .is_some_and(|limit| pipe_lookahead_exhausted(&pos, pipe_next_calls, limit));
+                            if generator.unified_span_done() || low_headroom || all_dead || context_limit {
+                                if context_limit {
+                                    tracing::info!("serve: overlap decode pipe context boundary; draining before next tick");
+                                }
                                 break;
                             }
                             let mut host_row = false;
@@ -4728,6 +4751,7 @@ fn run_batched(
                             }
                             match generator.decode_pipe_next(&next_plans) {
                                 Ok(ids) => {
+                                    pipe_next_calls += 1;
                                     st_ovl += 1;
                                     for (i, &(k, _, _)) in dec.iter().enumerate() {
                                         if matches!(prev_plans[i], RowSample::Device(_)) {
@@ -4772,6 +4796,18 @@ fn run_batched(
                                         }
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // The last legal forward may leave a pending token at
+                    // position max_ctx. It has already been emitted; retire
+                    // that member before the next mixed tick can feed it.
+                    if let Some(limit) = generator.decode_pipe_context_limit() {
+                        for &(k, _, _) in &dec {
+                            if slots[k].as_ref().is_some_and(|s| s.pos as usize >= limit)
+                                && let Some(s) = slots[k].take()
+                            {
+                                let _ = s.events.send(TokenEvent::Done(FinishReason::Length, s.run_stats()));
                             }
                         }
                     }
@@ -7926,6 +7962,27 @@ mod serial_pipe_tests {
         after_drain.commit_device_plan(&next);
         let _ = eager.device_plan();
         assert_eq!(after_drain.device_plan(), eager.device_plan());
+    }
+
+    #[test]
+    fn pinned_prompt_ignores_eligibility_changes_between_ticks() {
+        use crate::generator::PrefillLane::{Async, Mixed};
+        assert!(!super::select_prefill_lane(None, false));
+        assert!(super::select_prefill_lane(None, true));
+        assert!(!super::select_prefill_lane(Some(Mixed), true));
+        assert!(super::select_prefill_lane(Some(Async), false));
+    }
+
+    #[test]
+    fn overlap_context_drain_at_final_legal_position() {
+        let limit = 48;
+        let positions = [46, 3];
+        assert!(!super::pipe_lookahead_exhausted(&positions, 0, limit));
+        // Begin at 46; next enqueues the final legal position 47.
+        assert!(super::pipe_lookahead_exhausted(&positions, 1, limit));
+        // Drain, including the concurrent prefill span, rather than trying
+        // to enqueue position 48 (or discarding the in-flight final token).
+        assert!(super::pipe_lookahead_exhausted(&[47, 3], 0, limit));
     }
 
     #[test]
