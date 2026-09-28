@@ -16,7 +16,8 @@ use crate::gpu::{GpuError, GpuExecutor, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
 use crate::gpu_model::tp::attention::{
-    AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition, reduce_output,
+    AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition, PagedAttentionTable,
+    reduce_output,
 };
 use crate::gpu_model::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
@@ -140,13 +141,7 @@ pub struct GqaTpRank {
     positions: CudaSlice<u32>,
     slots: CudaSlice<u32>,
     axes: CudaSlice<u32>,
-    block_tables: Option<CudaSlice<u32>>,
-    // Per-slot generation of the physical page mapping already resident in
-    // block_tables. Position changes do not touch this; page allocation,
-    // release or reuse does.
-    staged_slot_versions: Vec<u64>,
-    blocks_per_slot: usize,
-    slots_count: usize,
+    block_table: Option<PagedAttentionTable>,
     pos: usize,
     max_ctx: usize,
     dtype: KvDtype,
@@ -278,10 +273,7 @@ impl GqaTpRank {
             positions: e.alloc_u32(1)?,
             slots: e.alloc_u32(1)?,
             axes: e.alloc_u32(4)?,
-            block_tables: None,
-            staged_slot_versions: Vec::new(),
-            blocks_per_slot: 0,
-            slots_count: 1,
+            block_table: None,
             pos: 0,
             max_ctx,
             dtype,
@@ -324,10 +316,7 @@ impl GqaTpRank {
             .ok_or_else(|| GqaTpError::Shape("paged KV size overflow".into()))?;
         rank.kc = e.alloc_u8(bytes)?;
         rank.vc = e.alloc_u8(bytes)?;
-        rank.block_tables = Some(e.alloc_u32(bps * slots)?);
-        rank.staged_slot_versions = vec![u64::MAX; slots];
-        rank.blocks_per_slot = bps;
-        rank.slots_count = slots;
+        rank.block_table = Some(PagedAttentionTable::new(e, slots, max_ctx)?);
         Ok(rank)
     }
     /// Bytes charged to each rank for one physical block across this GQA layer.
@@ -366,7 +355,7 @@ impl GqaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
-        if self.block_tables.is_some() {
+        if self.block_table.is_some() {
             return Err(GqaTpError::Shape("use forward_paged for paged KV".into()));
         }
         self.forward_at(e, group, input, 0, self.pos, None)
@@ -383,7 +372,7 @@ impl GqaTpRank {
         position: usize,
         logical: &MirroredKv,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
-        if self.block_tables.is_none() {
+        if self.block_table.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
         self.stage_slot_block_table(e, slot, position, logical)?;
@@ -497,14 +486,16 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
-        if let Some(bt) = self.block_tables.as_ref() {
+        if let Some(table) = self.block_table.as_ref() {
+            let bt = table.device();
+            let blocks_per_slot = table.blocks_per_slot();
             e.kv_append_batch_paged(
                 &self.kn,
                 &mut self.kc,
                 &self.positions,
                 Some(&self.slots),
                 bt,
-                self.blocks_per_slot,
+                blocks_per_slot,
                 g.kv_dim(),
                 1,
                 self.dtype,
@@ -515,7 +506,7 @@ impl GqaTpRank {
                 &self.positions,
                 Some(&self.slots),
                 bt,
-                self.blocks_per_slot,
+                blocks_per_slot,
                 g.kv_dim(),
                 1,
                 self.dtype,
@@ -539,7 +530,7 @@ impl GqaTpRank {
                 1,
                 1.0 / (g.head_dim as f32).sqrt(),
                 self.dtype,
-                Some((bt, self.blocks_per_slot)),
+                Some((bt, blocks_per_slot)),
             )?;
         } else {
             e.kv_append_batch(
@@ -602,10 +593,8 @@ impl GqaTpRank {
         Ok(&self.reduced)
     }
 
-    /// Stage only the live block ids for one slot, and only when that slot's
-    /// physical mapping changed. MirroredKv exposes a per-slot mapping version
-    /// which advances only when the BlockTable contents change, so the hot path
-    /// is O(1) in context length.
+    /// Stage only changed live block mappings; validation still runs on every
+    /// decode, including graph replays that only re-stage inputs.
     fn stage_slot_block_table(
         &mut self,
         e: &GpuExecutor,
@@ -613,45 +602,12 @@ impl GqaTpRank {
         position: usize,
         logical: &MirroredKv,
     ) -> Result<(), GqaTpError> {
-        let cached_version = *self
-            .staged_slot_versions
-            .get(slot)
-            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
-        let version = logical
-            .validate_device_table_versioned(
-                slot,
-                position,
-                u32::try_from(self.kc.len() / self.block_stride())
-                    .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?,
-                self.slots_count,
-                self.max_ctx,
-                Some(cached_version),
-            )
-            .map_err(|err| GqaTpError::Shape(err.into()))?;
-        if version == cached_version {
-            return Ok(());
-        }
-        let live = logical
-            .slot_blocks(slot)
-            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
-        if live.len() > self.blocks_per_slot {
-            return Err(GqaTpError::Shape("block table exceeds slot capacity".into()));
-        }
-        let start = slot * self.blocks_per_slot;
-        let stop = start + live.len();
-        if start != stop {
-            e.stream
-                .memcpy_htod(
-                    live,
-                    &mut self
-                        .block_tables
-                        .as_mut()
-                        .expect("paged checked")
-                        .slice_mut(start..stop),
-                )
-                .map_err(GpuError::from)?;
-        }
-        self.staged_slot_versions[slot] = version;
+        let pool_blocks = u32::try_from(self.kc.len() / self.block_stride())
+            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
+        self.block_table
+            .as_mut()
+            .ok_or_else(|| GqaTpError::Shape("not a paged GQA rank".into()))?
+            .stage_slot(e, logical, slot, position, pool_blocks)?;
         Ok(())
     }
 
@@ -668,7 +624,7 @@ impl GqaTpRank {
         position: usize,
         logical: &MirroredKv,
     ) -> Result<(), GqaTpError> {
-        if self.block_tables.is_none() {
+        if self.block_table.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
         self.stage_slot_block_table(e, slot, position, logical)?;
@@ -690,7 +646,7 @@ impl GqaTpRank {
     /// mirrored-KV serving geometry). Phase 11 graph capture is offered in
     /// this mode only.
     pub(crate) fn is_paged(&self) -> bool {
-        self.block_tables.is_some()
+        self.block_table.is_some()
     }
 
     /// Batched paged prefill span (prototype): `rows` prompt rows of ONE slot
@@ -747,7 +703,7 @@ impl GqaTpRank {
         logical: &MirroredKv,
         span: &mut SpanGqa,
     ) -> Result<(), GqaTpError> {
-        if self.block_tables.is_none() {
+        if self.block_table.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
         if rows == 0
@@ -774,7 +730,7 @@ impl GqaTpRank {
                 slot,
                 position + rows - 1,
                 blocks,
-                self.slots_count,
+                self.block_table.as_ref().expect("paged checked").slots(),
                 self.max_ctx,
             )
             .map_err(|err| GqaTpError::Shape(err.into()))?;
@@ -939,6 +895,11 @@ impl GqaTpRank {
         )?;
         super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
         super::tp_trace::trace_row_last(e, "b.gqa-rope-k-last", layer, &span.kn, rows, g.kv_dim())?;
+        let blocks_per_slot = self
+            .block_table
+            .as_ref()
+            .expect("paged checked")
+            .blocks_per_slot();
         let bt = span_paged_table_refs(&span.block_table);
         e.kv_append_batch_paged(
             &span.kn,
@@ -946,7 +907,7 @@ impl GqaTpRank {
             &span.positions,
             Some(&span.slots),
             bt.k_append,
-            self.blocks_per_slot,
+            blocks_per_slot,
             g.kv_dim(),
             rows,
             self.dtype,
@@ -957,7 +918,7 @@ impl GqaTpRank {
             &span.positions,
             Some(&span.slots),
             bt.v_append,
-            self.blocks_per_slot,
+            blocks_per_slot,
             g.kv_dim(),
             rows,
             self.dtype,
@@ -979,7 +940,7 @@ impl GqaTpRank {
             rows,
             1.0 / (g.head_dim as f32).sqrt(),
             self.dtype,
-            Some((bt.attention, self.blocks_per_slot)),
+            Some((bt.attention, blocks_per_slot)),
             None,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
