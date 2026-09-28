@@ -1842,7 +1842,7 @@ impl Qwen35TpRank {
     }
 
     /// Promote one finished prefill slot's lane-local state onto the decode
-    /// executor (rank 0, after the span join; all ranks in identical order
+    /// executor (after the span join; all ranks in identical order
     /// on their own executors).
     ///
     /// The lane's KV slab and DeltaNet slot state are private allocations

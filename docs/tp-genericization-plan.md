@@ -169,3 +169,70 @@ At every meaningful commit:
 - generic code contains no Qwen tensor names or architecture constants.
 - an optimized override can replace a component without replacing the whole TP
   runtime.
+
+
+## Implementation status
+
+Implemented on `review/tp-generic-core`:
+
+- Generic `TpTopology` and world-size-neutral row/column sharding.
+- Tensor slicing and NCCL communicator construction no longer assume TP=2.
+- Generic dense SwiGLU TP FFN for decode and row-batched prefill.
+- Generic GQA head/KV-head partitioning.
+- Generic Q/K/V column-parallel + output row-parallel attention weight loading.
+- Generic attention output reduction.
+- Generic projection-prefill scratch ownership.
+- A projection-prefill backend seam: generic TP owns orchestration/scratch while
+  a model may retain optimized dispatch policy.
+- Qwen FFN and GQA prefill no longer know quantization scratch plane layout.
+- Qwen DeltaNet sharding derives from `world_size`; unsupported worlds fail on
+  group divisibility rather than a hard-coded TP=2 check.
+- `Qwen35TpRank` stores topology rather than a bare rank and treats all
+  nonzero ranks as equivalent model workers.
+- Mirrored paged-KV/checkpoint lifecycle moved into generic
+  `gpu_model::tp::cache`; Qwen retains only its measured resume-profitability
+  thresholds.
+
+The current Qwen3.8 geometry naturally supports TP=2 and TP=4 for both its four
+KV heads and its DeltaNet key-group count. TP=3 is rejected by geometry, not by
+a separate model implementation.
+
+### Transport and placement boundary
+
+Model TP topology is deliberately independent of placement and transport:
+
+- model topology: rank, world size, shard geometry;
+- collectives: `Communicator` / NCCL;
+- process placement: same host or multiple hosts;
+- transport selected below NCCL: NVLink/NVSwitch, PCIe/P2P/shared memory,
+  InfiniBand/RoCE, etc.
+
+No model adapter should contain a RoCE or multi-node assumption.
+
+### Remaining major work
+
+1. Build/static-test the current checkpoint.
+2. Decide the default generic attention execution surface. Qwen's gated
+   Q+gate/M-RoPE path should be an override, not the shape of the generic API.
+3. Generalize serving/control fan-out from one worker to `world_size - 1`
+   workers. This should not require another Qwen algorithm change.
+4. Move generic profiling/span lifecycle out of the Qwen namespace where
+   useful.
+5. Prove the abstraction with a second conventional model.
+6. Run TP=2 regression benchmarks and eventually TP=4 runtime validation.
+
+### Current architectural test
+
+A future conventional model should be able to reuse:
+
+- `TpTopology`;
+- tensor sharding;
+- `SwiGluTpRank`;
+- projection-prefill staging/backend contract;
+- GQA partitioning and attention projection sharding;
+- generic output reduction;
+- mirrored TP cache lifecycle.
+
+If it needs another complete `ffn_tp.rs`, cache protocol, or rank-specific
+model traversal solely because of tensor parallelism, the abstraction is still
+too narrow.
