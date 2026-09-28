@@ -57,12 +57,30 @@ pub(crate) fn span_accumulate(
 /// The head half of a span: final normalization of all `rows` residual rows
 /// into `xn`, then the LAST row's LM-head projection into `logits`.
 ///
+/// `rows == 0` is refused: a zero-row span has no last row to project, and
+/// `(rows - 1)` would underflow the copy offset. `forward_span_advance`
+/// already refuses empty spans before the walk; this guard keeps the
+/// primitive safe standalone.
+///
 /// `x_last` is the caller's one-row staging plane (`gemv_quant` takes a whole
 /// slice, not an offset view); the copy is one hidden-width D2D per span.
 /// The head enters no collective — only the traversal halves pair across
 /// ranks, exactly as before the extraction. The projection's error type is
 /// the model-layer one (`gemv_quant`'s); `rmsnorm`/copy keep `GpuError`,
 /// converted at the boundary here.
+
+/// The head's row guard, pure so the host test exercises the real decision:
+/// a zero-row span has no last row to project and `(rows - 1)` would
+/// underflow the copy offset.
+fn check_head_rows(rows: usize) -> Result<(), GpuModelError> {
+    if rows == 0 {
+        return Err(GpuModelError::Unsupported(
+            "span head requires at least one row".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn span_head_normalize_project(
     exec: &GpuExecutor,
@@ -76,6 +94,7 @@ pub(crate) fn span_head_normalize_project(
     eps: f32,
     rows: usize,
 ) -> Result<(), GpuModelError> {
+    check_head_rows(rows)?;
     exec.rmsnorm_batch(x, out_norm, xn, hidden, eps, rows)
         .map_err(GpuModelError::from)?;
     exec.copy_region(xn, (rows - 1) * hidden, x_last, 0, hidden)
@@ -100,5 +119,22 @@ mod tests {
         // rows == 0 must never reach the head (forward_span_advance refuses
         // empty spans before the walk).
         assert_eq!(0 * hidden, 0);
+    }
+
+    /// `span_head_normalize_project` refuses a zero-row span before any GPU
+    /// work: there is no last row to project and `(rows - 1)` would underflow
+    /// the copy offset. The guard is pure, so the real decision is exercised
+    /// here without a `GpuExecutor`.
+    #[test]
+    fn span_head_refuses_zero_rows() {
+        assert!(matches!(
+            check_head_rows(0),
+            Err(GpuModelError::Unsupported(_))
+        ));
+        // Any positive row count passes; the offsets stay in range for those
+        // (pinned by head_offsets_stay_inside_live_prefix above).
+        for rows in [1usize, 2, 64, 192] {
+            assert!(check_head_rows(rows).is_ok());
+        }
     }
 }
