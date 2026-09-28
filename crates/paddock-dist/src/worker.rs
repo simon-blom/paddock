@@ -1,14 +1,14 @@
 //! Process bootstrap: the coordinator listens, spawns (or waits for) the
-//! rank-1 worker, and both sides run the bootstrap handshake.
+//! worker ranks, and all sides run the bootstrap handshake.
 //!
 //! Phase 2 shape: the worker process is a full runner binary started with
-//! rank-1 env. It performs the handshake, then idles on a control loop with
+//! rank-specific env. It performs the handshake, then idles on a control loop with
 //! only Shutdown in its vocabulary - the execution vocabulary (Prefill,
 //! Decode, ...) arrives with the distributed executor in a later phase. The
 //! worker NEVER binds an HTTP port; the coordinator's API is the only API.
 
 use crate::config::{RankRole, Resolved};
-use crate::protocol::{ControlMessage, PROTOCOL_VERSION, ProtocolError, handshake};
+use crate::protocol::{ControlMessage, PROTOCOL_VERSION, ProtocolError, handshake_rank};
 use std::net::TcpListener;
 use std::process::Command;
 use std::time::Duration;
@@ -28,7 +28,7 @@ pub enum BootstrapError {
     Connect(std::io::Error),
     #[error("handshake: {0}")]
     Handshake(#[from] ProtocolError),
-    #[error("spawn rank-1 worker: {0}")]
+    #[error("spawn TP worker: {0}")]
     Spawn(std::io::Error),
     #[error("coordinator requested a non-graceful shutdown")]
     Aborted,
@@ -36,12 +36,16 @@ pub enum BootstrapError {
 
 fn spawn_worker_local_with_paths(
     resolved: &Resolved,
+    rank: usize,
     model: Option<&std::path::Path>,
     pack: Option<&std::path::Path>,
 ) -> Result<std::process::Child, BootstrapError> {
     let exe = std::env::current_exe().map_err(BootstrapError::Spawn)?;
     let mut cmd = Command::new(exe);
-    for (k, v) in resolved.worker_env() {
+    for (k, v) in resolved
+        .worker_env_for(rank)
+        .map_err(|e| BootstrapError::Handshake(ProtocolError::Rejected(e.to_string())))?
+    {
         cmd.env(k, v);
     }
     if let Some(model) = model {
@@ -59,25 +63,46 @@ fn spawn_worker_local_with_paths(
     cmd.spawn().map_err(BootstrapError::Spawn)
 }
 
-/// Run the rank-0 coordinator side of bootstrap: bind the control plane,
-/// accept exactly one worker, exchange the handshake, return the connection.
-///
-/// `spawn_worker` decides whether the coordinator launches the worker itself
-/// (local two-process bring-up and tests) or waits for an operator- or
-/// SSH-started one (the real two-node case).
+/// One joined worker control connection, identified by TP rank.
+pub struct WorkerControl {
+    pub rank: usize,
+    pub stream: std::net::TcpStream,
+}
+
+/// Backward-compatible TP=2 coordinator helper.
 pub fn coordinate(
     resolved: &Resolved,
     spawn_worker: bool,
 ) -> Result<(std::net::TcpStream, u64), BootstrapError> {
-    coordinate_with_paths(resolved, spawn_worker, None, None)
+    let (mut workers, session) =
+        coordinate_workers_with_paths(resolved, spawn_worker, None, None)?;
+    if workers.len() != 1 || workers[0].rank != 1 {
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(
+            "coordinate() is the TP=2 compatibility helper; use coordinate_workers()".into(),
+        )));
+    }
+    Ok((workers.remove(0).stream, session))
 }
 
-fn coordinate_with_paths(
+/// Join all nonzero ranks in one TP world. Returned controls are rank-sorted.
+pub fn coordinate_workers(
     resolved: &Resolved,
-    spawn_worker: bool,
+    spawn_workers: bool,
+) -> Result<(Vec<WorkerControl>, u64), BootstrapError> {
+    coordinate_workers_with_paths(resolved, spawn_workers, None, None)
+}
+
+fn coordinate_workers_with_paths(
+    resolved: &Resolved,
+    spawn_workers: bool,
     model: Option<&std::path::Path>,
     pack: Option<&std::path::Path>,
-) -> Result<(std::net::TcpStream, u64), BootstrapError> {
+) -> Result<(Vec<WorkerControl>, u64), BootstrapError> {
+    if !resolved.is_coordinator() || resolved.tp_size < 2 {
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(
+            "TP coordinator requires rank 0 and tp_size >= 2".into(),
+        )));
+    }
     let listener = TcpListener::bind((resolved.master_addr.as_str(), resolved.master_port))
         .map_err(|source| BootstrapError::Bind {
             addr: resolved.master_addr.clone(),
@@ -91,47 +116,68 @@ fn coordinate_with_paths(
         resolved.tp_size
     );
 
-    if spawn_worker {
-        match spawn_worker_local_with_paths(resolved, model, pack) {
-            Ok(child) => tracing::info!("spawned rank-1 worker child (pid {})", child.id()),
-            Err(e) => tracing::warn!(
-                "could not spawn worker locally ({e}); waiting for a manual or SSH start"
-            ),
+    if spawn_workers {
+        for rank in 1..resolved.tp_size {
+            match spawn_worker_local_with_paths(resolved, rank, model, pack) {
+                Ok(child) => tracing::info!(
+                    rank,
+                    pid = child.id(),
+                    "spawned TP worker child"
+                ),
+                Err(e) => tracing::warn!(
+                    rank,
+                    "could not spawn worker locally ({e}); waiting for a manual or SSH start"
+                ),
+            }
         }
     }
 
-    // Exactly one worker for TP=2. Wrong-world-size dials are rejected and
-    // the accept loop keeps waiting for the real worker.
-    loop {
+    let session = next_session();
+    let mut joined: Vec<Option<std::net::TcpStream>> =
+        (0..resolved.tp_size).map(|_| None).collect();
+    let mut remaining = resolved.tp_size - 1;
+    while remaining > 0 {
         let (mut stream, peer) = listener.accept()?;
         tracing::info!("control-plane connection from {peer}");
-        let session = next_session();
-        match greet(&mut stream, resolved, session) {
-            Ok(()) => return Ok((stream, session)),
+        match greet(&mut stream, resolved, session, &joined) {
+            Ok(rank) => {
+                joined[rank] = Some(stream);
+                remaining -= 1;
+            }
             Err(BootstrapError::Handshake(ProtocolError::Rejected(reason))) => {
                 tracing::warn!("rejected a control-plane connection: {reason}");
                 if let Err(e) = (ControlMessage::Reject { reason }).to_stream(&mut stream) {
                     tracing::debug!("reject delivery failed: {e}");
                 }
-                continue;
             }
             Err(e) => return Err(e),
         }
     }
+
+    let workers = (1..resolved.tp_size)
+        .map(|rank| WorkerControl {
+            rank,
+            stream: joined[rank]
+                .take()
+                .expect("all worker ranks joined before bootstrap completed"),
+        })
+        .collect();
+    Ok((workers, session))
 }
 
-/// Server side of the handshake: read Hello, enforce version + world size,
-/// send Welcome/Reject. Mismatches are reported as `Rejected` so the accept
-/// loop can continue; the Reject frame is sent here before returning.
+/// Server side of one worker handshake. Rank identity is validated before
+/// Welcome so duplicate/out-of-range sockets never enter the TP world.
 fn greet(
     stream: &mut std::net::TcpStream,
     resolved: &Resolved,
     session: u64,
-) -> Result<(), BootstrapError> {
+    joined: &[Option<std::net::TcpStream>],
+) -> Result<usize, BootstrapError> {
     let msg = ControlMessage::from_stream(stream)?;
     let ControlMessage::Hello {
         version,
         tp_size,
+        rank,
         who,
     } = msg
     else {
@@ -140,34 +186,38 @@ fn greet(
         ))));
     };
     if version != PROTOCOL_VERSION {
-        let reason = format!("protocol version {version}, coordinator speaks {PROTOCOL_VERSION}");
-        ControlMessage::Reject {
-            reason: reason.clone(),
-        }
-        .to_stream(stream)?;
-        return Err(BootstrapError::Handshake(ProtocolError::Rejected(reason)));
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
+            "protocol version {version}, coordinator speaks {PROTOCOL_VERSION}"
+        ))));
     }
     if tp_size != resolved.tp_size {
-        let reason = format!(
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
             "worker configured tp_size={tp_size}, coordinator is tp_size={}",
             resolved.tp_size
-        );
-        ControlMessage::Reject {
-            reason: reason.clone(),
-        }
-        .to_stream(stream)?;
-        return Err(BootstrapError::Handshake(ProtocolError::Rejected(reason)));
+        ))));
     }
-    tracing::info!("worker '{who}' joined as rank 1 (session {session})");
+    if rank == 0 || rank >= resolved.tp_size {
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
+            "worker rank {rank} is outside 1..{}",
+            resolved.tp_size
+        ))));
+    }
+    if joined.get(rank).is_some_and(Option::is_some) {
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(format!(
+            "worker rank {rank} already joined"
+        ))));
+    }
+    tracing::info!("worker '{who}' joined as rank {rank} (session {session})");
     ControlMessage::Welcome {
         tp_size: resolved.tp_size,
+        rank,
         session,
     }
     .to_stream(stream)?;
-    Ok(())
+    Ok(rank)
 }
 
-/// Run the rank-1 worker side: dial the coordinator, handshake, then serve
+/// Run one nonzero worker-rank side: dial the coordinator, handshake, then serve
 /// the control loop until Shutdown (graceful -> Ok, non-graceful ->
 /// [`BootstrapError::Aborted`]).
 ///
@@ -199,20 +249,20 @@ pub fn work(resolved: &Resolved) -> Result<(), BootstrapError> {
     }
 }
 
-/// Join as rank 1 and return the bootstrap control connection after Hello /
-/// Welcome. Standalone parity probes exchange the NCCL ID on it; the Phase 9
+/// Join as this configured worker rank and return the bootstrap connection after Hello / Welcome. Standalone parity probes exchange the NCCL ID on it; the Phase 9
 /// worker hands it to the ordered model execution loop.
 pub fn connect_worker(resolved: &Resolved) -> Result<(std::net::TcpStream, u64), BootstrapError> {
     let addr = (resolved.master_addr.as_str(), resolved.master_port);
     let who = std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".to_string());
     tracing::info!(
-        "rank 1 dialing coordinator at {}:{} (tp_size={})",
+        "rank {} dialing coordinator at {}:{} (tp_size={})",
+        resolved.rank,
         resolved.master_addr,
         resolved.master_port,
         resolved.tp_size
     );
     let mut stream = connect_with_retry(addr, Duration::from_secs(30))?;
-    let session = handshake(&mut stream, resolved.tp_size, &who)?;
+    let session = handshake_rank(&mut stream, resolved.tp_size, resolved.rank, &who)?;
     Ok((stream, session))
 }
 
@@ -255,23 +305,23 @@ pub fn shutdown_worker(
     Ok(())
 }
 
-/// The coordinator's held control channel, stored at bootstrap so the
-/// runner's shutdown path can release the worker without threading the
-/// stream through every layer.
-static COORDINATOR_CONTROL: std::sync::OnceLock<std::sync::Mutex<Option<std::net::TcpStream>>> =
-    std::sync::OnceLock::new();
+/// Coordinator-held worker controls, stored at bootstrap so shutdown and
+/// model handoff operate on the complete TP world.
+static COORDINATOR_CONTROLS: std::sync::OnceLock<
+    std::sync::Mutex<Option<Vec<WorkerControl>>>,
+> = std::sync::OnceLock::new();
 
-/// Run [`coordinate`] and store the connection for later
-/// [`broadcast_shutdown`]. Called once by the runner startup on rank 0.
+/// Join the complete worker world and store its controls for model handoff.
 pub fn coordinate_and_store(
     resolved: &Resolved,
-    spawn_worker: bool,
+    spawn_workers: bool,
     model: Option<&std::path::Path>,
     pack: Option<&std::path::Path>,
 ) -> Result<u64, BootstrapError> {
-    let (stream, session) = coordinate_with_paths(resolved, spawn_worker, model, pack)?;
-    COORDINATOR_CONTROL
-        .set(std::sync::Mutex::new(Some(stream)))
+    let (workers, session) =
+        coordinate_workers_with_paths(resolved, spawn_workers, model, pack)?;
+    COORDINATOR_CONTROLS
+        .set(std::sync::Mutex::new(Some(workers)))
         .map_err(|_| {
             BootstrapError::Handshake(ProtocolError::Rejected(
                 "coordinator already running".into(),
@@ -280,33 +330,63 @@ pub fn coordinate_and_store(
     Ok(session)
 }
 
-/// Hand ownership of the bootstrap channel to the Phase 9 model. The generic
-/// runner shutdown path must not send Shutdown while the model is executing.
-pub fn take_control() -> Result<std::net::TcpStream, BootstrapError> {
-    COORDINATOR_CONTROL
+/// Hand ownership of every worker channel to the distributed model.
+pub fn take_controls() -> Result<Vec<WorkerControl>, BootstrapError> {
+    COORDINATOR_CONTROLS
         .get()
         .and_then(|m| m.lock().ok())
         .and_then(|mut slot| slot.take())
         .ok_or_else(|| {
             BootstrapError::Handshake(ProtocolError::Rejected(
-                "no coordinator channel to take".into(),
+                "no coordinator channels to take".into(),
             ))
         })
 }
 
-/// Send Shutdown to the joined worker, if one is. Returns whether a worker
-/// was connected and acknowledged the send (best effort - the worker may
-/// already be gone; that is not an error for the coordinator's exit).
+/// TP=2 compatibility helper used by the current serving implementation.
+/// On a larger world it fails without consuming the stored controls.
+pub fn take_control() -> Result<std::net::TcpStream, BootstrapError> {
+    let mutex = COORDINATOR_CONTROLS.get().ok_or_else(|| {
+        BootstrapError::Handshake(ProtocolError::Rejected(
+            "no coordinator channels to take".into(),
+        ))
+    })?;
+    let mut guard = mutex.lock().map_err(|_| {
+        BootstrapError::Handshake(ProtocolError::Rejected(
+            "coordinator channel lock poisoned".into(),
+        ))
+    })?;
+    let workers = guard.as_ref().ok_or_else(|| {
+        BootstrapError::Handshake(ProtocolError::Rejected(
+            "no coordinator channels to take".into(),
+        ))
+    })?;
+    if workers.len() != 1 || workers[0].rank != 1 {
+        return Err(BootstrapError::Handshake(ProtocolError::Rejected(
+            "take_control() requires exactly rank 1; use take_controls()".into(),
+        )));
+    }
+    let mut workers = guard.take().expect("checked above");
+    Ok(workers.remove(0).stream)
+}
+
+/// Best-effort Shutdown fan-out to every joined worker.
 pub fn broadcast_shutdown(graceful: bool) -> bool {
-    match COORDINATOR_CONTROL.get() {
+    match COORDINATOR_CONTROLS.get() {
         Some(mutex) => {
-            let Ok(mut stream) = mutex.lock() else {
+            let Ok(mut guard) = mutex.lock() else {
                 return false;
             };
-            matches!(
-                stream.as_mut().map(|s| shutdown_worker(s, graceful)),
-                Some(Ok(()))
-            )
+            let Some(workers) = guard.as_mut() else {
+                return false;
+            };
+            let mut any = false;
+            let mut all_ok = true;
+            for worker in workers {
+                any = true;
+                all_ok &= shutdown_worker(&mut worker.stream, graceful).is_ok();
+            }
+            any && all_ok
         }
         None => false,
     }

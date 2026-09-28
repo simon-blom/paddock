@@ -1,4 +1,4 @@
-//! The rank0<->rank1 control protocol: length-prefixed JSON over TCP.
+//! The rank-0 <-> worker control protocol: length-prefixed JSON over TCP.
 //!
 //! Bootstrap, model identity and TP serving execution share this channel.
 //! Tensor payloads and collectives stay on the GPU.
@@ -72,23 +72,24 @@ pub enum TpSpanFinisherPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
-    /// Rank 1 -> rank 0, first message after connect.
+    /// Worker -> rank 0, first message after connect.
     Hello {
-        /// Protocol version, for future-gating. 4 adds prefix-cache resume
-        /// (TpPrefixAdmit/Publish, ckpt_slots in TpInit); 3 added the
-        /// explicit trailing chunk-run geometry to TpMixed.
+        /// Protocol version.
         version: u32,
-        /// The world size the worker was configured with. Must match the
-        /// coordinator's or the handshake fails (mismatched world-size gate).
+        /// The world size the worker was configured with.
         tp_size: usize,
-        /// Worker identity: hostname, for logs. Not used for routing.
+        /// The worker's configured rank. Must be in 1..tp_size.
+        rank: usize,
+        /// Worker identity: hostname, for logs only.
         who: String,
     },
-    /// Rank 0 -> rank 1, reply to Hello. Accepts the worker into the group.
+    /// Rank 0 -> worker, reply to Hello. Accepts this rank into the group.
     Welcome {
-        /// Echoed so the worker can verify it joined the world it configured.
+        /// Echoed so the worker can verify the world it joined.
         tp_size: usize,
-        /// Coordinator-assigned group/session id, for log correlation.
+        /// Echoed worker rank; protects against cross-wired worker sockets.
+        rank: usize,
+        /// Coordinator-assigned group/session id, shared by the TP world.
         session: u64,
     },
     /// Rank 0 -> rank 1, reply to Hello. Refuses the connection.
@@ -335,21 +336,37 @@ impl ControlMessage {
 
 /// One handshake exchange: worker sends Hello, reads the verdict. Returns
 /// the session id on acceptance, or the rejection reason as an error.
-pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u64, ProtocolError> {
+pub fn handshake(
+    stream: &mut TcpStream,
+    tp_size: usize,
+    who: &str,
+) -> Result<u64, ProtocolError> {
+    handshake_rank(stream, tp_size, 1, who)
+}
+
+/// Rank-aware handshake for worlds larger than two.
+pub fn handshake_rank(
+    stream: &mut TcpStream,
+    tp_size: usize,
+    rank: usize,
+    who: &str,
+) -> Result<u64, ProtocolError> {
     ControlMessage::Hello {
         version: PROTOCOL_VERSION,
         tp_size,
+        rank,
         who: who.to_string(),
     }
     .to_stream(stream)?;
     match ControlMessage::from_stream(stream)? {
         ControlMessage::Welcome {
             tp_size: echoed,
+            rank: echoed_rank,
             session,
         } => {
-            if echoed != tp_size {
+            if echoed != tp_size || echoed_rank != rank {
                 return Err(ProtocolError::Rejected(format!(
-                    "coordinator runs tp_size={echoed}, we configured {tp_size}"
+                    "coordinator welcomed tp_size={echoed} rank={echoed_rank}, we configured tp_size={tp_size} rank={rank}"
                 )));
             }
             Ok(session)
@@ -383,11 +400,11 @@ pub fn handshake(stream: &mut TcpStream, tp_size: usize, who: &str) -> Result<u6
 /// first Mixed ownership, before that tick's KV Ensure operations.
 ///
 /// Version 6: `TpInit` carries the coordinator-resolved TP prefill span row
-/// cap (`span_cap`). Both ranks chunk every prompt run with the SAME cap, so
-/// a hand-started worker can never pair a different span geometry and
-/// desynchronize the collectives. Values outside the supported sweep set
-/// fail both ranks closed at init.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// cap (`span_cap`).
+///
+/// Version 7: Hello/Welcome carry the worker rank so one coordinator can
+/// identify and validate every rank in worlds larger than two.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[cfg(test)]
 mod tests {

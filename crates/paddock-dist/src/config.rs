@@ -1,8 +1,8 @@
 //! Rank/world configuration for tensor-parallel serving.
 //!
-//! Phase 2 keeps this deliberately strict: TP=1 or TP=2, one GPU per node,
-//! rank 0 is the coordinator and rank 1 is the worker. Broader topologies are
-//! a non-goal for the first implementation (plan §Non-goals).
+//! TP=1 is the historical single-process path. TP>=2 uses rank 0 as the
+//! coordinator and ranks 1..world_size-1 as workers. Placement/transport are
+//! separate concerns: workers may be local processes or remote nodes.
 //!
 //! Layering follows the runner convention: CLI flag > `PADDOCK_TP_*` env >
 //! `paddock.toml` `[parallel]` table > defaults. Every env name read here is
@@ -18,27 +18,27 @@ pub enum ParallelConfigError {
     BadInt { field: &'static str, value: String },
     #[error("{field} must be 1..=65535, got {value}")]
     BadPort { field: &'static str, value: i64 },
-    #[error("tp_size must be 1 or 2 (broader topologies are not supported), got {0}")]
+    #[error("tp_size must be >= 1, got {0}")]
     UnsupportedTpSize(usize),
     #[error("rank must be < tp_size (tp_size={tp}), got rank {rank}")]
     RankOutOfRange { tp: usize, rank: usize },
-    #[error("rank 1 needs the coordinator's address: set master_addr (or PADDOCK_TP_MASTER_ADDR)")]
+    #[error("worker rank needs the coordinator's address: set master_addr (or PADDOCK_TP_MASTER_ADDR)")]
     EmptyMasterAddr,
     #[error(
-        "rank 1 must not be started in serving mode; it is a worker (start it via the rank-0 coordinator, or set rank 0)"
+        "worker ranks must not be started in serving mode; start rank 0 as the coordinator"
     )]
     WorkerMustNotServe,
     #[error("[parallel] has no key {0:?}")]
     UnknownParallelKey(String),
 }
 
-/// Which process role this runner instance takes in the TP pair.
+/// Which process role this runner instance takes in the TP world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankRole {
     /// Rank 0: exposes the API, owns scheduling, coordinates the worker.
     Coordinator,
-    /// Rank 1: worker. Loads its shard later; never serves requests.
+    /// Any nonzero rank: worker. Loads its shard later; never serves requests.
     Worker,
 }
 
@@ -51,12 +51,12 @@ pub enum RankRole {
 #[serde(deny_unknown_fields)]
 pub struct ParallelConfig {
     /// Tensor-parallel world size. 1 = the historical single-process path;
-    /// 2 = one coordinator + one worker across two nodes.
+    /// >=2 = one coordinator plus `tp_size - 1` workers.
     pub tp_size: Option<usize>,
-    /// This process's rank: 0 = coordinator, 1 = worker. Must be < tp_size.
+    /// This process's rank: 0 = coordinator, nonzero = worker. Must be < tp_size.
     pub rank: Option<usize>,
     /// Address of the rank-0 control-plane listener. Rank 0 binds it
-    /// (default "0.0.0.0" - the worker is on the other node); rank 1 dials it.
+    /// (default "0.0.0.0"); worker ranks dial it.
     pub master_addr: Option<String>,
     /// TCP port of the rank-0 control-plane listener.
     pub master_port: Option<u16>,
@@ -141,32 +141,26 @@ impl ParallelConfig {
     pub fn resolved(&self, serving_mode: bool) -> Result<Option<Resolved>, ParallelConfigError> {
         match (self.tp_size, self.rank) {
             (None, None) => Ok(None),
-            // A rank with no world size is a config error, not a silent TP=1.
             (None, Some(rank)) => Err(ParallelConfigError::RankOutOfRange { tp: 1, rank }),
+            (Some(0), _) => Err(ParallelConfigError::UnsupportedTpSize(0)),
             (Some(1), None | Some(0)) => Ok(None),
             (Some(1), Some(rank)) => Err(ParallelConfigError::RankOutOfRange { tp: 1, rank }),
-            (Some(2), Some(rank)) if rank >= 2 => {
-                Err(ParallelConfigError::RankOutOfRange { tp: 2, rank })
+            (Some(tp), Some(rank)) if rank >= tp => {
+                Err(ParallelConfigError::RankOutOfRange { tp, rank })
             }
-            (Some(2), Some(rank)) => self.resolved_tp2(rank, serving_mode),
-            // World size without a rank defaults to rank 0 (coordinator) -
-            // "start the pair from this box". A rank-1 start is always
-            // explicit: the spawned child's env, or a hand-set rank for a
-            // manually/SSH-started worker. Both nodes defaulting to rank 0
-            // is visible (both wait for a worker) and never half-serves.
-            (Some(2), None) => self.resolved_tp2(0, serving_mode),
-            (Some(tp), _) => Err(ParallelConfigError::UnsupportedTpSize(tp)),
+            (Some(tp), Some(rank)) => self.resolved_tp(tp, rank, serving_mode),
+            // World size without a rank always means the coordinator.
+            (Some(tp), None) => self.resolved_tp(tp, 0, serving_mode),
         }
     }
 
-    /// The TP=2 branch shared by the explicit-rank and default-rank arms.
-    fn resolved_tp2(
+    fn resolved_tp(
         &self,
+        tp_size: usize,
         rank: usize,
         serving_mode: bool,
     ) -> Result<Option<Resolved>, ParallelConfigError> {
-        // A rank-1 worker never serves an API, no matter how it was started.
-        if rank == 1 && serving_mode {
+        if rank != 0 && serving_mode {
             return Err(ParallelConfigError::WorkerMustNotServe);
         }
         let master_addr = match self.master_addr.as_deref().map(str::trim) {
@@ -181,7 +175,7 @@ impl ParallelConfig {
         };
         let master_port = self.master_port.unwrap_or(DEFAULT_MASTER_PORT);
         Ok(Some(Resolved {
-            tp_size: 2,
+            tp_size,
             rank,
             role: if rank == 0 {
                 RankRole::Coordinator
@@ -193,7 +187,7 @@ impl ParallelConfig {
         }))
     }
 
-    /// True when this process was spawned as a rank-1 worker child by a
+    /// True when this process was spawned as a worker child by a
     /// coordinator (the marker is set by [`Resolved::worker_env`], never by
     /// users).
     pub fn is_worker_child() -> bool {
@@ -211,7 +205,7 @@ pub struct Resolved {
     pub tp_size: usize,
     pub rank: usize,
     pub role: RankRole,
-    /// Bind address for rank 0 ("0.0.0.0" default), dial target for rank 1.
+    /// Bind address for rank 0 ("0.0.0.0" default), dial target for workers.
     pub master_addr: String,
     pub master_port: u16,
 }
@@ -221,13 +215,26 @@ impl Resolved {
         self.role == RankRole::Coordinator
     }
 
-    /// The exact env a coordinator sets when re-executing the rank-1 worker
-    /// child. Registered in the runner's `ENV_SURFACE` - same file, edit
-    /// together (see the hardened-seal note in paddock-runner/src/config.rs).
+    /// Backward-compatible TP=2 helper: env for worker rank 1.
     pub fn worker_env(&self) -> Vec<(&'static str, String)> {
+        self.worker_env_for(1)
+            .expect("rank 1 exists for every resolved TP coordinator")
+    }
+
+    /// Exact env for one worker rank.
+    pub fn worker_env_for(
+        &self,
+        rank: usize,
+    ) -> Result<Vec<(&'static str, String)>, ParallelConfigError> {
+        if rank == 0 || rank >= self.tp_size {
+            return Err(ParallelConfigError::RankOutOfRange {
+                tp: self.tp_size,
+                rank,
+            });
+        }
         let mut env = vec![
             ("PADDOCK_TP_SIZE", self.tp_size.to_string()),
-            ("PADDOCK_TP_RANK", "1".to_string()),
+            ("PADDOCK_TP_RANK", rank.to_string()),
             ("PADDOCK_TP_WORKER_CHILD", "1".to_string()),
             ("PADDOCK_TP_MASTER_PORT", self.master_port.to_string()),
         ];
@@ -241,7 +248,7 @@ impl Resolved {
             a => a.to_string(),
         };
         env.push(("PADDOCK_TP_MASTER_ADDR", dial));
-        env
+        Ok(env)
     }
 }
 

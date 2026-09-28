@@ -4,20 +4,24 @@
 
 use paddock_dist::config::{DEFAULT_MASTER_PORT, ParallelConfig, ParallelConfigError, RankRole};
 use paddock_dist::protocol::{
-    ControlMessage, PROTOCOL_VERSION, ProtocolError, receive_nccl_id, send_nccl_id,
+    ControlMessage, PROTOCOL_VERSION, ProtocolError, handshake_rank, receive_nccl_id, send_nccl_id,
 };
-use paddock_dist::worker::{coordinate, shutdown_worker};
+use paddock_dist::worker::{coordinate, coordinate_workers, shutdown_worker};
 use std::io::Write as _;
 use std::time::Duration;
 
-fn resolved(rank: usize, port: u16) -> paddock_dist::config::Resolved {
+fn resolved_world(tp_size: usize, rank: usize, port: u16) -> paddock_dist::config::Resolved {
     let cfg = ParallelConfig {
-        tp_size: Some(2),
+        tp_size: Some(tp_size),
         rank: Some(rank),
         master_addr: Some("127.0.0.1".into()),
         master_port: Some(port),
     };
-    cfg.resolved(false).expect("valid").expect("tp2")
+    cfg.resolved(false).expect("valid").expect("tensor parallel")
+}
+
+fn resolved(rank: usize, port: u16) -> paddock_dist::config::Resolved {
+    resolved_world(2, rank, port)
 }
 
 fn free_port() -> u16 {
@@ -69,17 +73,30 @@ fn rank_without_tp_size_is_an_error() {
 }
 
 #[test]
-fn tp3_is_rejected_not_downgraded() {
-    let cfg = ParallelConfig {
+fn tp3_config_is_valid_and_keeps_rank_roles_generic() {
+    let coordinator = ParallelConfig {
         tp_size: Some(3),
         rank: Some(0),
         master_addr: None,
         master_port: None,
-    };
-    assert!(matches!(
-        cfg.resolved(true),
-        Err(ParallelConfigError::UnsupportedTpSize(3))
-    ));
+    }
+    .resolved(true)
+    .unwrap()
+    .unwrap();
+    assert_eq!(coordinator.tp_size, 3);
+    assert_eq!(coordinator.role, RankRole::Coordinator);
+
+    let worker = ParallelConfig {
+        tp_size: Some(3),
+        rank: Some(2),
+        master_addr: Some("10.0.0.5".into()),
+        master_port: None,
+    }
+    .resolved(false)
+    .unwrap()
+    .unwrap();
+    assert_eq!(worker.role, RankRole::Worker);
+    assert_eq!(worker.rank, 2);
 }
 
 #[test]
@@ -144,16 +161,17 @@ fn rank0_defaults_bind_wildcard_and_default_port() {
 }
 
 #[test]
-fn worker_env_marks_the_child_and_sets_rank1() {
+fn worker_env_marks_the_child_and_sets_requested_rank() {
     let cfg = ParallelConfig {
-        tp_size: Some(2),
+        tp_size: Some(4),
         rank: Some(0),
         master_addr: Some("192.168.100.10".into()),
         master_port: Some(12345),
     };
     let resolved = cfg.resolved(true).unwrap().unwrap();
     let env: Vec<(String, String)> = resolved
-        .worker_env()
+        .worker_env_for(3)
+        .unwrap()
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
@@ -163,8 +181,8 @@ fn worker_env_marks_the_child_and_sets_rank1() {
             .map(|(_, v)| v.clone())
             .unwrap()
     };
-    assert_eq!(get("PADDOCK_TP_SIZE"), "2");
-    assert_eq!(get("PADDOCK_TP_RANK"), "1");
+    assert_eq!(get("PADDOCK_TP_SIZE"), "4");
+    assert_eq!(get("PADDOCK_TP_RANK"), "3");
     assert_eq!(get("PADDOCK_TP_MASTER_ADDR"), "192.168.100.10");
     assert_eq!(get("PADDOCK_TP_MASTER_PORT"), "12345");
     assert_eq!(get("PADDOCK_TP_WORKER_CHILD"), "1");
@@ -188,6 +206,7 @@ fn frame_roundtrip_over_tcp() {
     let msg = ControlMessage::Hello {
         version: 1,
         tp_size: 2,
+        rank: 1,
         who: "test".into(),
     };
     let frame = msg.to_frame().unwrap();
@@ -257,6 +276,7 @@ fn mismatched_world_size_is_rejected_and_coordinator_keeps_waiting() {
     ControlMessage::Hello {
         version: 1,
         tp_size: 8,
+        rank: 1,
         who: "impostor".into(),
     }
     .to_stream(&mut c)
@@ -294,6 +314,7 @@ fn protocol_version_mismatch_is_rejected() {
     ControlMessage::Hello {
         version: PROTOCOL_VERSION - 1,
         tp_size: 2,
+        rank: 1,
         who: "v1-worker".into(),
     }
     .to_stream(&mut c)
@@ -306,6 +327,7 @@ fn protocol_version_mismatch_is_rejected() {
     ControlMessage::Hello {
         version: 999,
         tp_size: 2,
+        rank: 1,
         who: "time-traveler".into(),
     }
     .to_stream(&mut c)
@@ -354,6 +376,55 @@ fn unexpected_message_shape_is_rejected() {
     };
     assert_eq!(s2, session);
     shutdown_worker(&mut stream, true).unwrap();
+}
+
+#[test]
+fn tp4_joins_all_worker_ranks_out_of_order_and_rejects_duplicate_rank() {
+    let port = free_port();
+    let coord = resolved_world(4, 0, port);
+    let t = std::thread::spawn(move || coordinate_workers(&coord, false));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Rank 2 joins first.
+    let w2 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 2, "rank2").unwrap()
+    });
+    let session = w2.join().unwrap();
+
+    // A second rank 2 is refused while the world remains incomplete.
+    let mut duplicate = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ControlMessage::Hello {
+        version: PROTOCOL_VERSION,
+        tp_size: 4,
+        rank: 2,
+        who: "duplicate-rank2".into(),
+    }
+    .to_stream(&mut duplicate)
+    .unwrap();
+    assert!(matches!(
+        ControlMessage::from_stream(&mut duplicate).unwrap(),
+        ControlMessage::Reject { .. }
+    ));
+    drop(duplicate);
+
+    let w3 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 3, "rank3").unwrap()
+    });
+    let w1 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 1, "rank1").unwrap()
+    });
+
+    assert_eq!(w3.join().unwrap(), session);
+    assert_eq!(w1.join().unwrap(), session);
+    let (workers, coordinator_session) = t.join().unwrap().unwrap();
+    assert_eq!(coordinator_session, session);
+    assert_eq!(
+        workers.iter().map(|worker| worker.rank).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 // --- explicit --tp-worker dial-target precedence (CLI > env) ------------
