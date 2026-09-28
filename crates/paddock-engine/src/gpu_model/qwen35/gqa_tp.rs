@@ -9,7 +9,7 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, read_sections};
-use super::tp_kv::MirroredKv;
+use crate::gpu_model::tp::cache::MirroredKv;
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype};
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn span_validation_uses_nonzero_slot_and_last_row_position() {
-        use super::super::tp_kv::Operation;
+        use crate::gpu_model::tp::cache::Operation;
 
         let mut kv = MirroredKv::new(4, 2, 48).unwrap();
         kv.authorize(Operation::Ensure {

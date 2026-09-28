@@ -19,9 +19,9 @@ use paddock_dist::{
 };
 use paddock_models::mapped::MappedGguf;
 
-use super::{
-    tp_kv::{tp_publish_ops, tp_resume_decision, Event, MirroredKv, Operation, Snapshot},
-    tp_model::Qwen35TpRank,
+use super::{tp_kv::tp_resume_decision, tp_model::Qwen35TpRank};
+use crate::gpu_model::tp::cache::{
+    Event, MirroredKv, Operation, Snapshot, tp_publish_ops,
 };
 use crate::gpu_model::tp::control::WorkerSet;
 use crate::{
