@@ -495,6 +495,26 @@ impl ConventionalGqaRank {
         self.geometry
     }
 
+    /// The rank-local KV pool's token capacity (max_ctx this rank serves).
+    /// Pending seam: exercised by model #2's `ServeModel` impl.
+    #[allow(dead_code)]
+    pub(crate) fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    /// The rank-local KV payload bytes (K + V slabs). Pending seam: same.
+    #[allow(dead_code)]
+    pub(crate) fn local_kv_bytes(&self) -> usize {
+        self.kc.len() + self.vc.len()
+    }
+
+    /// Clear the decode bookkeeping. Paged KV is masked by position and the
+    /// block table is re-validated against the mirrored pool on every decode,
+    /// so there is no host counter to reset (the mirror's Release/Ensure
+    /// sequence regenerates the table versions). Pending seam: same.
+    #[allow(dead_code)]
+    pub(crate) fn reset(&mut self) {}
+
     /// Bytes charged to each rank for one physical block across this layer.
     pub fn local_block_bytes(&self) -> Option<usize> {
         self.geometry
