@@ -40,11 +40,7 @@ pub(crate) fn gemv_any(
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
 ) -> Result<(), GpuModelError> {
-    match w {
-        QuantW::Q8(q) => exec.q8_0_gemv_repacked(q, None, x, y)?,
-        QuantW::Kq(k) => exec.kquant_gemv(k, x, y)?,
-    }
-    Ok(())
+    crate::gpu_model::projection::gemv_quant(exec, w, x, y)
 }
 
 /// NVFP4 checkpoint-plane matmul election (the qwen3.8 lane).

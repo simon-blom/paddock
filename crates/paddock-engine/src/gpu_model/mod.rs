@@ -14,6 +14,7 @@ pub mod nemotron;
 pub mod paddleocr_vl;
 pub mod pillow;
 pub mod prefix_cache;
+pub(crate) mod projection;
 pub mod qwen3;
 pub mod qwen35;
 pub mod qwen3_asr;
