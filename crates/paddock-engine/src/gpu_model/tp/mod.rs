@@ -5,6 +5,7 @@
 //! schedules layers or which architecture-specific fast path it may override.
 
 pub(crate) mod attention;
+pub mod cache;
 pub(crate) mod ffn;
 pub(crate) mod prefill;
 
