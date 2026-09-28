@@ -17,7 +17,7 @@
 //! there are no one-element placeholder planes left to read stale bytes.
 use cudarc::driver::CudaSlice;
 
-use super::gqa_tp::GqaGeometry;
+use super::tp_gqa::GqaGeometry;
 use super::tp_span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
 use crate::tp::prefill::ProjectionStaging;

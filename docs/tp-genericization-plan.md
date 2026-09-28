@@ -67,9 +67,9 @@ Qwen should eventually supply mostly:
 
 ### Accidental duplication / coupling
 
-- `ffn_tp.rs` hard-codes TP=2 even though its shard loader and collective
+- `tp_ffn.rs` hard-codes TP=2 even though its shard loader and collective
   pattern are generic.
-- `gqa_tp.rs` hard-codes TP=2/local head division despite shared normal-path
+- `tp_gqa.rs` hard-codes TP=2/local head division despite shared normal-path
   attention/GEMM primitives.
 - `tp_span.rs` owns detailed quantization scratch knowledge that should track
   shared prefill primitives rather than duplicate their assumptions.
@@ -237,6 +237,6 @@ A future conventional model should be able to reuse:
 - generic output reduction;
 - mirrored TP cache lifecycle.
 
-If it needs another complete `ffn_tp.rs`, cache protocol, or rank-specific
+If it needs another complete `tp_ffn.rs`, cache protocol, or rank-specific
 model traversal solely because of tensor parallelism, the abstraction is still
 too narrow.

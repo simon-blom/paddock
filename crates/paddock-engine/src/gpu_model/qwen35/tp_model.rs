@@ -10,9 +10,9 @@ use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::{TokEmbd, embed_any, gemv_any};
 use super::{
-    delta_tp::{DeltaTpError, DeltaTpRank},
-    ffn_tp::{FfnTpError, FfnTpRank},
-    gqa_tp::{GqaTpError, GqaTpRank},
+    tp_delta::{DeltaTpError, DeltaTpRank},
+    tp_ffn::{FfnTpError, FfnTpRank},
+    tp_gqa::{GqaTpError, GqaTpRank},
     tp_graph::{TpGraphs, TpRunKey},
 };
 use crate::{
