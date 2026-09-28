@@ -16,6 +16,7 @@ use super::tp_span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::gpu_model::tp::TpTopology;
 
 const WIDTH: usize = 5120;
 const S: usize = 128;
@@ -75,11 +76,17 @@ pub struct DeltaGeometry {
     pub channels: Vec<usize>,
 }
 impl DeltaGeometry {
-    pub fn new(rank: usize) -> Result<Self, DeltaTpError> {
-        if rank >= 2 {
-            return Err(DeltaTpError::Shape("expected TP=2 rank 0 or 1".into()));
+    pub fn new(topology: TpTopology) -> Result<Self, DeltaTpError> {
+        let world = topology.world_size();
+        if world < 2 || !NK.is_multiple_of(world) {
+            return Err(DeltaTpError::Shape(format!(
+                "DeltaNet key groups {NK} cannot split evenly over TP={world}"
+            )));
         }
-        let key_heads: Vec<usize> = (rank * (NK / 2)..(rank + 1) * (NK / 2)).collect();
+        let local_keys = NK / world;
+        let rank = topology.rank();
+        let key_heads: Vec<usize> =
+            (rank * local_keys..(rank + 1) * local_keys).collect();
         let value_heads: Vec<usize> = (0..NV / NK)
             .flat_map(|band| key_heads.iter().map(move |&h| band * NK + h))
             .collect();
@@ -354,7 +361,7 @@ pub struct DeltaTpRank {
     span: Span,
     prefill_gemm: Option<PrefillGemm>,
     eps: f32,
-    rank: usize,
+    topology: TpTopology,
 }
 impl DeltaTpRank {
     pub fn load<C: Communicator>(
@@ -363,10 +370,14 @@ impl DeltaTpRank {
         layer: usize,
         group: &C,
     ) -> Result<Self, DeltaTpError> {
-        if group.world_size() != 2 {
-            return Err(DeltaTpError::Shape("expected TP=2".into()));
+        let topology = TpTopology::from_group(group)
+            .map_err(|e| DeltaTpError::Shape(e.to_string()))?;
+        if topology.world_size() < 2 {
+            return Err(DeltaTpError::Shape(
+                "DeltaNet TP requires world size >= 2".into(),
+            ));
         }
-        let g = DeltaGeometry::new(group.rank())?;
+        let g = DeltaGeometry::new(topology)?;
         if GpuExecutor::dn_state_esz() != 4 {
             return Err(DeltaTpError::Shape(
                 "F32 recurrent state required for oracle parity".into(),
@@ -482,7 +493,7 @@ impl DeltaTpRank {
             beta_w: ab.remove(0),
             geometry: g,
             eps,
-            rank: group.rank(),
+            topology,
         };
         r.reset(e)?;
         Ok(r)
@@ -789,14 +800,25 @@ impl DeltaTpRank {
         let input_len = input.len();
         let context_match = input.context().cu_ctx() == e.stream.context().cu_ctx();
         let cap = span_cap();
-        if world != 2 || rank != self.rank || rows == 0 || rows > cap
+        if TpTopology::from_group(group).ok() != Some(self.topology)
+            || rows == 0
+            || rows > cap
             || !input_len_matches(input_len, rows, prefill)
             || !context_match
         {
             return Err(DeltaTpError::Shape(format!(
-                "rank/input/span mismatch: expected world=2 rank={} input_len=rows*{} span_len=1..{} state_pair={}; actual world={} rank={} rows={} input_len={} span_len={} context_match={}",
-                self.rank, WIDTH, cap, if slot == 0 { "home" } else { "slot" },
-                world, rank, rows, input_len, rows, context_match
+                "rank/input/span mismatch: expected world={} rank={} input_len=rows*{} span_len=1..{} state_pair={}; actual world={} rank={} rows={} input_len={} span_len={} context_match={}",
+                self.topology.world_size(),
+                self.topology.rank(),
+                WIDTH,
+                cap,
+                if slot == 0 { "home" } else { "slot" },
+                world,
+                rank,
+                rows,
+                input_len,
+                rows,
+                context_match
             )));
         }
         if prefill {
@@ -1187,8 +1209,8 @@ mod tests {
     use super::*;
     #[test]
     fn head_groups_and_state_are_rank_local() {
-        let a = DeltaGeometry::new(0).unwrap();
-        let b = DeltaGeometry::new(1).unwrap();
+        let a = DeltaGeometry::new(TpTopology::new(0, 2).unwrap()).unwrap();
+        let b = DeltaGeometry::new(TpTopology::new(1, 2).unwrap()).unwrap();
         assert_eq!(
             (
                 a.keys(),
@@ -1199,7 +1221,7 @@ mod tests {
             ),
             (8, 24, 5120, 24 * 128 * 128, 3 * 5120)
         );
-        assert!(DeltaGeometry::new(2).is_err());
+        assert!(TpTopology::new(2, 2).is_err());
         let mut heads = a.value_heads.clone();
         heads.extend(b.value_heads.iter().copied());
         heads.sort_unstable();
@@ -1216,6 +1238,24 @@ mod tests {
         channels.extend(b.channels.iter().copied());
         channels.sort_unstable();
         assert_eq!(channels, (0..10240).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn deltanet_geometry_scales_to_tp4() {
+        let mut all_keys = Vec::new();
+        let mut all_values = Vec::new();
+        for rank in 0..4 {
+            let g = DeltaGeometry::new(TpTopology::new(rank, 4).unwrap()).unwrap();
+            assert_eq!(g.keys(), NK / 4);
+            assert_eq!(g.values(), NV / 4);
+            all_keys.extend(g.key_heads.iter().copied());
+            all_values.extend(g.value_heads.iter().copied());
+        }
+        all_keys.sort_unstable();
+        all_values.sort_unstable();
+        assert_eq!(all_keys, (0..NK).collect::<Vec<_>>());
+        assert_eq!(all_values, (0..NV).collect::<Vec<_>>());
+        assert!(DeltaGeometry::new(TpTopology::new(0, 3).unwrap()).is_err());
     }
 
     #[test]
@@ -1237,8 +1277,8 @@ mod tests {
         // state footprint is the Phase 12 accounting input for DeltaNet
         // layers - local_state_bytes must equal both slots' live state, so
         // context_mem_bytes stays exact regardless of slot count.
-        let a = DeltaGeometry::new(0).unwrap();
-        let b = DeltaGeometry::new(1).unwrap();
+        let a = DeltaGeometry::new(TpTopology::new(0, 2).unwrap()).unwrap();
+        let b = DeltaGeometry::new(TpTopology::new(1, 2).unwrap()).unwrap();
         assert!(!a.value_heads.iter().any(|h| b.value_heads.contains(h)));
         // Conv window is (conv_k - 1) * mixed width per slot; recurrent is
         // value_heads * S * S. Both derive from the same geometry, so the
