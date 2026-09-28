@@ -6,6 +6,7 @@
 
 pub(crate) mod attention;
 pub(crate) mod ffn;
+pub(crate) mod prefill;
 
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 

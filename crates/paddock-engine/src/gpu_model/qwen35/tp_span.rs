@@ -20,6 +20,8 @@ use cudarc::driver::CudaSlice;
 use super::gqa_tp::GqaGeometry;
 use super::tp_span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
+use crate::gpu_model::tp::prefill::ProjectionStaging;
+pub(crate) use crate::gpu_model::tp::prefill::ProjectionStaging as SpanGemmStaging;
 
 /// Whole-model activation planes for one span: residual stream, normalized
 /// rows, and the span's token ids.
@@ -71,38 +73,13 @@ pub(crate) struct SpanFfn {
     pub(crate) reduced: CudaSlice<f32>,
 }
 
-/// Quantized-GEMM staging shared by every projection of one span pass (GQA
-/// Q/K/V/output and FFN gate/up/down): the strided int8 activation pair for
-/// the rows<=64 band, the flat mmq activation + per-32-block sums planes for
-/// the rows>64 band, the strided per-16 sums for the dp4a k-quant ladder,
-/// and the Q8_0 stream-K fold scratch.
-pub(crate) struct SpanGemmStaging {
-    pub(crate) xq: CudaSlice<i8>,
-    pub(crate) xs: CudaSlice<f32>,
-    pub(crate) yq: CudaSlice<u8>,
-    pub(crate) xsums: CudaSlice<f32>,
-    pub(crate) ssums: CudaSlice<f32>,
-    pub(crate) skfix: CudaSlice<f32>,
-}
-
-/// Flat mmq activation-layout sizing, shared by every staging site (the
-/// producer `quantize_q8_mmq` and consumer `mmq_sums` pad `batch` to 128 and
-/// `in_dim` to 128 the same way; a producer/consumer disagreement here is
-/// silent activation garbage). `bytes` for the activation plane, `sums` for
-/// the per-32-block f32 sums.
-pub(crate) fn mmq_layout(in_dim: usize, rows: usize) -> (usize, usize) {
-    let cols = in_dim.div_ceil(128);
-    let rows_pad = rows.next_multiple_of(128).max(128);
-    (cols * rows_pad * 144, cols * rows_pad * 4)
-}
-
 /// The complete span plane set owned by each `Qwen35TpRank`, including
 /// the dedicated prefill-lane rank.
 pub(super) struct TpSpanPlanes {
     pub(super) act: SpanAct,
     pub(super) gqa: SpanGqa,
     pub(super) ffn: SpanFfn,
-    pub(crate) q: SpanGemmStaging,
+    pub(crate) q: ProjectionStaging,
 }
 
 impl TpSpanPlanes {
@@ -126,9 +103,6 @@ impl TpSpanPlanes {
         // GQA and FFN planes: hidden for Q/K/V and gate/up, the local Q width
         // for the attention output projection, the local FF width for down.
         let max_in = width.max(q_dim).max(local_ff);
-        // The flat mmq band rides the widest input at the FULL cap (the
-        // whole span is quantized in one pass per input).
-        let (yq_elems, xsums_elems) = mmq_layout(max_in, cap);
         Ok(Self {
             act: SpanAct {
                 x: e.alloc(cap * hidden)?,
@@ -161,16 +135,7 @@ impl TpSpanPlanes {
                 partial: e.alloc(cap * hidden)?,
                 reduced: e.alloc(cap * hidden)?,
             },
-            q: SpanGemmStaging {
-                xq: e.alloc_i8(cap * max_in)?,
-                xs: e.alloc(cap * max_in / 32)?,
-                yq: e.alloc_u8(yq_elems)?,
-                xsums: e.alloc(xsums_elems)?,
-                ssums: e.alloc(cap * max_in / 16)?,
-                // The Q8_0 mmq ladder's stream-K fixup contract (256 SMs x
-                // 128x128 tiles + fold flags); ignored by the k-quant rungs.
-                skfix: e.alloc(256 * 128 * 128 + 256)?,
-            },
+            q: ProjectionStaging::new(e, max_in, cap)?,
         })
     }
 }
