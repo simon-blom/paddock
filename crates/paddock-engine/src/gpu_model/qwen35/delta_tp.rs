@@ -16,7 +16,7 @@ use super::tp_span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::tp::TpTopology;
+use crate::gpu_model::tp::{prefill::mmq_layout, TpTopology};
 
 const WIDTH: usize = 5120;
 const S: usize = 128;
@@ -252,7 +252,7 @@ impl PrefillGemm {
         // skfix stays a 1-element stub: every DeltaNet projection is forced
         // k-quant at load and the k-quant rungs never read stream-K scratch.
         let cap = span_cap();
-        let (yq_elems, xsums_elems) = super::tp_span::mmq_layout(WIDTH, cap);
+        let (yq_elems, xsums_elems) = mmq_layout(WIDTH, cap);
         Ok(Self {
             xq: e.alloc_i8(cap * WIDTH)?,
             xs: e.alloc(cap * WIDTH / 32)?,
