@@ -863,10 +863,14 @@ impl ConventionalGqaRank {
             self.dtype,
             self.prefill_policy,
         )?;
-        backend.project_prepared(
+        // Q/K/V share staging prepared from the layer input above, but the
+        // row-parallel output projection consumes the post-attention
+        // activation. Re-prepare staging from attention before projecting O.
+        backend.project(
             exec,
             staging,
             self.weights.output(),
+            &scratch.attn,
             &mut scratch.partial,
             rows,
         )?;
@@ -957,5 +961,24 @@ mod tests {
         // single-pass, so the split scratch would never be used.
         assert!(DecodeSplitPolicy::Splits(1).resolve().is_err());
         assert!(DecodeSplitPolicy::Splits(0).resolve().is_err());
+    }
+
+    /// Until a production model exercises ConventionalGqaRank on GPU, keep a
+    /// structural regression guard on the prefill O projection: it must
+    /// re-prepare staging from the attention activation instead of reusing the
+    /// hidden-state staging left by Q/K/V.
+    #[test]
+    fn prefill_output_projection_reprepares_from_attention() {
+        let source = include_str!("conventional.rs");
+        let start = source
+            .find("row-parallel output projection consumes the post-attention")
+            .expect("output projection marker");
+        let tail = &source[start..];
+        let end = tail.find("Ok(())").expect("end of prefill_local");
+        let block = &tail[..end];
+
+        assert!(block.contains("backend.project("));
+        assert!(block.contains("&scratch.attn"));
+        assert!(!block.contains("backend.project_prepared("));
     }
 }
