@@ -2207,24 +2207,37 @@ fn build_engine(
         let tp = tp.clone();
         Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
             if let Some(resolved) = tp {
-                if arch != "qwen35"
-                    || device != "cuda"
+                if device != "cuda"
                     || !(1..=2).contains(&max_batch)
                     || mmproj.is_some()
                     || mtp.is_some()
                     || fp8_native.is_some()
                     || vram_budget.is_some()
                 {
-                    return Err("TP requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
+                    return Err("TP requires CUDA with at most two text slots and no companions/offload".into());
                 }
                 let pack = pack
                     .as_deref()
                     .ok_or("TP serving requires an explicit CUDA pack (--kernel-pack)")?;
                 let workers = paddock_dist::worker::take_controls().map_err(|e| e.to_string())?;
-                let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
-                    workers, resolved, &path, pack, gpu, max_ctx, max_batch,
-                )?;
-                return Ok(Box::new(generator) as Box<dyn Generator>);
+                // Two TP models today: the proven Qwen3.8 lane and the
+                // MiniCPM5-2B plain-llama proof (model #2, review/tp-model2-proof).
+                let generator: Box<dyn Generator> = if arch == "qwen35" {
+                    Box::new(paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
+                        workers, resolved, &path, pack, gpu, max_ctx, max_batch,
+                    )?)
+                } else if arch == "llama" {
+                    Box::new(
+                        paddock_engine::gpu_model::minicpm::tp_shim::TpGenerator::load(
+                            workers, resolved, &path, pack, gpu, max_ctx, max_batch,
+                        )?,
+                    )
+                } else {
+                    return Err(format!(
+                        "TP serving supports qwen35 and llama (MiniCPM5-2B) on CUDA, got {arch}"
+                    ));
+                };
+                return Ok(generator);
             }
             build_generator(
                 &arch,

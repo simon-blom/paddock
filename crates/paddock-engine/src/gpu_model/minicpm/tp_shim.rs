@@ -673,6 +673,10 @@ impl MiniCpmTpRank {
 }
 
 
+/// The runner-facing MiniCPM5-2B TP generator: the generic serve's
+/// `TpGenerator` bound to `MiniCpmTpRank`.
+pub type TpGenerator = crate::tp::serve::TpGenerator<MiniCpmTpRank>;
+
 /// Host check entry: read the spec from a checkpoint without a device.
 pub fn load_spec_for_host_check(map_path: &Path) -> Result<MiniCpmTpSpec, String> {
     let map = MappedGguf::open(map_path).map_err(|e| e.to_string())?;
