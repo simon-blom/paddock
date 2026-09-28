@@ -17,7 +17,7 @@ use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
 use crate::gpu_model::tp::attention::{
     decode_paged, AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition,
-    PagedAttentionTable, reduce_output,
+    PagedAttentionTable, PagedKvBatch, reduce_output,
 };
 use crate::gpu_model::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
@@ -93,23 +93,6 @@ impl GqaGeometry {
         max_ctx
             .checked_mul(self.kv_dim())?
             .checked_mul(dtype.bytes())
-    }
-}
-
-/// The span path has one freshly staged table for all paged consumers. Keep
-/// the three uses named so they cannot silently drift to separate sources.
-#[derive(Clone, Copy)]
-struct SpanPagedTableRefs<'a, T> {
-    k_append: &'a T,
-    v_append: &'a T,
-    attention: &'a T,
-}
-
-fn span_paged_table_refs<'a, T>(table: &'a T) -> SpanPagedTableRefs<'a, T> {
-    SpanPagedTableRefs {
-        k_append: table,
-        v_append: table,
-        attention: table,
     }
 }
 
@@ -487,30 +470,17 @@ impl GqaTpRank {
             self.sections,
         )?;
         if let Some(table) = self.block_table.as_ref() {
-            let bt = table.device();
-            let blocks_per_slot = table.blocks_per_slot();
-            e.kv_append_batch_paged(
-                &self.kn,
-                &mut self.kc,
+            let kv = PagedKvBatch::new(
                 &self.positions,
-                Some(&self.slots),
-                bt,
-                blocks_per_slot,
+                &self.slots,
+                table.device(),
+                table.blocks_per_slot(),
                 g.kv_dim(),
                 1,
                 self.dtype,
             )?;
-            e.kv_append_batch_paged(
-                &self.v,
-                &mut self.vc,
-                &self.positions,
-                Some(&self.slots),
-                bt,
-                blocks_per_slot,
-                g.kv_dim(),
-                1,
-                self.dtype,
-            )?;
+            kv.append(e, &self.kn, &self.v, &mut self.kc, &mut self.vc)?;
+            let (bt, blocks_per_slot) = kv.table();
             // TP's one-row path cannot reach Qwen's eight-row TC5 override.
             // Keep Qwen's measured split policy; generic TP owns the paged
             // partial/combine and single-pass kernel execution.
@@ -904,29 +874,17 @@ impl GqaTpRank {
             .as_ref()
             .expect("paged checked")
             .blocks_per_slot();
-        let bt = span_paged_table_refs(&span.block_table);
-        e.kv_append_batch_paged(
-            &span.kn,
-            &mut self.kc,
+        let kv = PagedKvBatch::new(
             &span.positions,
-            Some(&span.slots),
-            bt.k_append,
+            &span.slots,
+            &span.block_table,
             blocks_per_slot,
             g.kv_dim(),
             rows,
             self.dtype,
         )?;
-        e.kv_append_batch_paged(
-            &span.v,
-            &mut self.vc,
-            &span.positions,
-            Some(&span.slots),
-            bt.v_append,
-            blocks_per_slot,
-            g.kv_dim(),
-            rows,
-            self.dtype,
-        )?;
+        kv.append(e, &span.kn, &span.v, &mut self.kc, &mut self.vc)?;
+        let (bt, blocks_per_slot) = kv.table();
         prefill_attn(
             e,
             &span.qn,
@@ -944,7 +902,7 @@ impl GqaTpRank {
             rows,
             1.0 / (g.head_dim as f32).sqrt(),
             self.dtype,
-            Some((bt.attention, blocks_per_slot)),
+            Some((bt, blocks_per_slot)),
             None,
         )?;
         super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
@@ -1060,15 +1018,6 @@ mod tests {
         // slot 1; the old hard-coded slot 0 validation would reject it.
         assert!(kv.checked_device_table(1, 31, 4, 2, 48).is_ok());
         assert!(kv.checked_device_table(0, 31, 4, 2, 48).is_err());
-    }
-
-    #[test]
-    fn span_paged_table_refs_share_one_staged_table() {
-        let staged = vec![11_u32, 22, 33];
-        let refs = span_paged_table_refs(&staged);
-        assert!(std::ptr::eq(refs.k_append, &staged));
-        assert!(std::ptr::eq(refs.v_append, &staged));
-        assert!(std::ptr::eq(refs.attention, &staged));
     }
 
     /// Regression: the TP span's M-RoPE text staging must fill ALL FOUR axes

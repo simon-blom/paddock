@@ -208,6 +208,140 @@ fn paged_slot_upload(
     Ok(Some((live, version)))
 }
 
+/// Shared paged KV append inputs. Both payload planes use the same metadata;
+/// the attention kernel can then reuse this exact table and slot stride.
+pub struct PagedKvBatch<'a> {
+    positions: &'a CudaSlice<u32>,
+    slots: &'a CudaSlice<u32>,
+    table: &'a CudaSlice<u32>,
+    blocks_per_slot: usize,
+    kv_dim: usize,
+    rows: usize,
+    dtype: KvDtype,
+}
+
+impl<'a> PagedKvBatch<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        positions: &'a CudaSlice<u32>,
+        slots: &'a CudaSlice<u32>,
+        table: &'a CudaSlice<u32>,
+        blocks_per_slot: usize,
+        kv_dim: usize,
+        rows: usize,
+        dtype: KvDtype,
+    ) -> Result<Self, AttentionTpError> {
+        validate_paged_kv_metadata(
+            positions.len(),
+            slots.len(),
+            table.len(),
+            blocks_per_slot,
+            kv_dim,
+            rows,
+        )?;
+        Ok(Self {
+            positions,
+            slots,
+            table,
+            blocks_per_slot,
+            kv_dim,
+            rows,
+            dtype,
+        })
+    }
+
+    pub fn append(
+        &self,
+        exec: &GpuExecutor,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        kc: &mut CudaSlice<u8>,
+        vc: &mut CudaSlice<u8>,
+    ) -> Result<(), AttentionTpError> {
+        let input_len = self.rows * self.kv_dim; // checked in the constructor
+        let block_bytes = BLOCK_TOKENS
+            .checked_mul(self.kv_dim)
+            .and_then(|n| n.checked_mul(self.dtype.bytes()))
+            .ok_or_else(|| AttentionTpError::Shape("KV block size overflow".into()))?;
+        validate_paged_kv_payload(k.len(), v.len(), kc.len(), vc.len(), input_len, block_bytes)?;
+        self.append_one(exec, k, kc)?;
+        self.append_one(exec, v, vc)?;
+        Ok(())
+    }
+
+    fn append_one(
+        &self,
+        exec: &GpuExecutor,
+        input: &CudaSlice<f32>,
+        cache: &mut CudaSlice<u8>,
+    ) -> Result<(), GpuError> {
+        exec.kv_append_batch_paged(
+            input,
+            cache,
+            self.positions,
+            Some(self.slots),
+            self.table,
+            self.blocks_per_slot,
+            self.kv_dim,
+            self.rows,
+            self.dtype,
+        )
+    }
+
+    pub fn table(&self) -> (&'a CudaSlice<u32>, usize) {
+        (self.table, self.blocks_per_slot)
+    }
+}
+
+fn validate_paged_kv_metadata(
+    positions: usize,
+    slots: usize,
+    table: usize,
+    blocks_per_slot: usize,
+    kv_dim: usize,
+    rows: usize,
+) -> Result<(), AttentionTpError> {
+    if rows == 0
+        || rows > u32::MAX as usize
+        || kv_dim == 0
+        || kv_dim > u32::MAX as usize
+        || blocks_per_slot == 0
+        || blocks_per_slot > u32::MAX as usize
+        || rows.checked_mul(kv_dim).is_none()
+        || positions < rows
+        || slots < rows
+        || table == 0
+        || !table.is_multiple_of(blocks_per_slot)
+    {
+        return Err(AttentionTpError::Shape(
+            "invalid paged KV append metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_paged_kv_payload(
+    k_len: usize,
+    v_len: usize,
+    kc_len: usize,
+    vc_len: usize,
+    input_len: usize,
+    block_bytes: usize,
+) -> Result<(), AttentionTpError> {
+    if k_len < input_len
+        || v_len < input_len
+        || kc_len == 0
+        || kc_len != vc_len
+        || block_bytes == 0
+        || !kc_len.is_multiple_of(block_bytes)
+    {
+        return Err(AttentionTpError::Shape(
+            "paged K/V payload geometry mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Default paged GQA decode: split partial+combine when the model's policy
 /// requests multiple fixed splits, otherwise use the single-pass kernel.
 /// Models own split-count policy and may override this dispatch entirely.
@@ -403,6 +537,35 @@ impl GqaPartition {
 mod tests {
     use super::*;
     use crate::gpu_model::tp::cache::Operation;
+
+    #[test]
+    fn paged_kv_pair_preflights_both_planes_before_append() {
+        assert!(validate_paged_kv_metadata(4, 4, 12, 6, 64, 4).is_ok());
+        for (positions, slots, table, stride, kv_dim, rows) in [
+            (3, 4, 12, 6, 64, 4),
+            (4, 3, 12, 6, 64, 4),
+            (4, 4, 11, 6, 64, 4),
+            (4, 4, 12, 0, 64, 4),
+            (4, 4, 12, 6, 0, 4),
+            (4, 4, 12, 6, 64, 0),
+            (4, 4, 12, 6, usize::MAX, 4),
+        ] {
+            assert!(
+                validate_paged_kv_metadata(positions, slots, table, stride, kv_dim, rows).is_err()
+            );
+        }
+        assert!(validate_paged_kv_payload(256, 256, 2048, 2048, 256, 1024).is_ok());
+        for (k, v, kc, vc, input, block) in [
+            (255, 256, 2048, 2048, 256, 1024),
+            (256, 255, 2048, 2048, 256, 1024),
+            (256, 256, 2048, 1024, 256, 1024),
+            (256, 256, 2049, 2049, 256, 1024),
+            (256, 256, 0, 0, 256, 1024),
+            (256, 256, 2048, 2048, 256, 0),
+        ] {
+            assert!(validate_paged_kv_payload(k, v, kc, vc, input, block).is_err());
+        }
+    }
 
     #[test]
     fn decode_split_scratch_covers_local_heads_and_batch() {
