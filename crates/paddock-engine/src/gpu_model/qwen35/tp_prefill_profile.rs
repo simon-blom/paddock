@@ -182,7 +182,7 @@ impl SpanProfile {
     }
 
     /// Counts the f32 partial submitted to NCCL: the live rows*hidden view
-    /// on the span paths (the capacity plane on decode paths).
+    /// for prefill and eager/graph DeltaNet decode.
     pub(super) fn reduce<C: Communicator, S: DevicePtr<f32>, R: DevicePtrMut<f32>>(
         &mut self,
         compute: &CudaStream,
