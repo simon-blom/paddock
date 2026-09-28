@@ -8,6 +8,7 @@ pub(crate) mod attention;
 pub(crate) mod conventional;
 pub(crate) mod control;
 pub mod cache;
+pub mod serve;
 pub(crate) mod ffn;
 pub(crate) mod prefill;
 pub(crate) mod state;
