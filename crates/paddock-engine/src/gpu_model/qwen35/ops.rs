@@ -986,6 +986,40 @@ pub(crate) fn attn_decode_dispatch(
     // needs a paged partial kernel, P3b). `None` = the dense `slot*max_ctx` path.
     paged: Option<(&CudaSlice<u32>, usize)>,
 ) -> Result<(), GpuModelError> {
+    attn_decode_dispatch_c(
+        exec, q, kc, vc, sinks, attn_o, attn_ml, out, positions, slots, n_heads, n_kv_heads,
+        head_dim, max_ctx, kv_dim, batch, scale, kv_dtype, paged, false,
+    )
+}
+
+/// [`attn_decode_dispatch`] with `width_invariant`: a row's attention takes the
+/// same kernel and the same key partition at every tick width - the fixed
+/// split count wherever the partial scratch holds it (no collapse to the
+/// serial walk at the walk-length boundary, no tcgen05 arm from 8 rows), so a
+/// decode row scores the same alone or sharing its tick (the ternary class).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_decode_dispatch_c(
+    exec: &GpuExecutor,
+    q: &CudaSlice<f32>,
+    kc: &CudaSlice<u8>,
+    vc: &CudaSlice<u8>,
+    sinks: &CudaSlice<f32>,
+    attn_o: &mut CudaSlice<f32>,
+    attn_ml: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    positions: &CudaSlice<u32>,
+    slots: Option<&CudaSlice<u32>>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_ctx: usize,
+    kv_dim: usize,
+    batch: usize,
+    scale: f32,
+    kv_dtype: KvDtype,
+    paged: Option<(&CudaSlice<u32>, usize)>,
+    width_invariant: bool,
+) -> Result<(), GpuModelError> {
     // tcgen05/TMEM decode attention. A kernel census put this band at
     // 2117 us/tick (114.7 us/launch on a dim3(n_kv_heads, rows, n_splits) =
     // 2048-CTA grid, 98 MB of KV read at 0.86 TB/s), against ~151 us/tick for
@@ -1012,6 +1046,7 @@ pub(crate) fn attn_decode_dispatch(
         let tc5_on =
             *TC5_ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_Q35_TC5ATTN").is_none());
         if tc5_on
+            && !width_invariant
             && batch >= 8
             && head_dim == 256
             && n_kv_heads > 0
@@ -1042,7 +1077,11 @@ pub(crate) fn attn_decode_dispatch(
             return Ok(());
         }
     }
-    let n_splits = attn_splits(n_heads, batch, exec.sm_count());
+    let n_splits = if width_invariant {
+        super::attn_splits_wi(n_heads, batch, exec.sm_count())
+    } else {
+        attn_splits(n_heads, batch, exec.sm_count())
+    };
     if n_splits > 1 {
         // Only reachable on a ≥128-SM die (attn_splits engages). P3b: the paged
         // FlashDecoding partial reads the block pool; the combine is unchanged
@@ -2030,6 +2069,29 @@ pub(crate) fn prefill_quant(
     in_dim: usize,
     batch: usize,
 ) -> Result<(), GpuModelError> {
+    prefill_quant_c(exec, xq, xs, yq, x, in_dim, batch, false)
+}
+
+/// [`prefill_quant`] for consumers of a known activation class: `act128`
+/// (RepackedKQ::act128, or the model's rotation) stages the ternary class.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_quant_c(
+    exec: &GpuExecutor,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<f32>,
+    yq: &mut CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    in_dim: usize,
+    batch: usize,
+    act128: bool,
+) -> Result<(), GpuModelError> {
+    // the consumers are the ternary class (RepackedKQ::act128): up to 64
+    // rows they ride the NB lane off per-128 int8 staging (kq_mm_pre); a
+    // wider span keeps the tile layout below
+    if act128 && batch <= 64 {
+        exec.quantize_q8_b128(x, xq, xs, batch * in_dim)?;
+        return Ok(());
+    }
     if batch > 64 {
         exec.quantize_q8_mmq(x, yq, in_dim, batch)?;
         // A pack without the i-quant tile rung (slot 585) keeps a dense
@@ -2287,6 +2349,14 @@ pub(crate) fn kq_mm_pre(
     y: &mut CudaSlice<f32>,
     batch: usize,
 ) -> Result<(), GpuModelError> {
+    // the ternary class up to 64 rows: the NB lane, one weight read for the
+    // span (prefill_quant staged xq / xs per 128 for it). The generic lanes
+    // below re-read the plane per row at these widths - a 60-token prompt
+    // prefilled in ~860 ms on Bonsai 27B.
+    if k.act128 && batch <= 64 {
+        exec.ternary_gemm_nb(&mut [(k, y)], xq, xs, batch)?;
+        return Ok(());
+    }
     let needs = crate::gpu::kq_needs_sums(k.ty);
     // An i-quant plane rides the tile rung only when the pack's pipe2 builds
     // its tile through the i-quant window unpack (slot 585); a pack without
@@ -2374,7 +2444,7 @@ pub(crate) fn prefill_mm_any(
     match w {
         QuantW::Q8(q) => prefill_mm(exec, q, xq, xs, yq, skfix, x, y, batch),
         QuantW::Kq(k) => {
-            prefill_quant(exec, xq, xs, yq, x, k.dims[0], batch)?;
+            prefill_quant_c(exec, xq, xs, yq, x, k.dims[0], batch, k.act128)?;
             kq_mm_pre(exec, k, xq, xs, yq, xsums, ssums, y, batch)
         }
     }
@@ -2410,7 +2480,7 @@ pub(crate) fn prefill_ffn_down_any(
                 exec.quantize_q8_mmq_swiglu(gate, up, yq, k.dims[0], batch)?;
             } else {
                 exec.swiglu(gate, up, batch * ff)?;
-                prefill_quant(exec, xq, xs, yq, gate, k.dims[0], batch)?;
+                prefill_quant_c(exec, xq, xs, yq, gate, k.dims[0], batch, k.act128)?;
             }
             kq_mm_pre(exec, k, xq, xs, yq, xsums, ssums, y, batch)
         }
@@ -2597,7 +2667,7 @@ pub(crate) fn prefill_add_norm_quant_rot(
     }
     exec.rmsnorm_batch(x, w, xn, n, eps, batch)?;
     r.rotate(exec, xn, n, batch)?;
-    prefill_quant(exec, xq, xs, yq, xn, n, batch)
+    prefill_quant_c(exec, xq, xs, yq, xn, n, batch, r.act128)
 }
 
 /// [`prefill_ffn_down_any`] for a model that may be rotated-basis: the down
@@ -2627,7 +2697,7 @@ pub(crate) fn prefill_ffn_down_rot(
     };
     exec.swiglu(gate, up, batch * ff)?;
     r.rotate(exec, gate, ff, batch)?;
-    prefill_quant(exec, xq, xs, yq, gate, ff, batch)?;
+    prefill_quant_c(exec, xq, xs, yq, gate, ff, batch, r.act128)?;
     prefill_mm_pre_any(exec, w, xq, xs, yq, xsums, ssums, skfix, y, batch)
 }
 

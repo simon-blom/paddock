@@ -12,7 +12,7 @@
 //!   batch=32 serving decode.
 //!
 //! Usage: QWEN35_GGUF=... PADDOCK_PACK=... PPL_CORPUS=corpus.txt \
-//!        [PPL_OUT=perpos.csv] [PPL_MAX_TOK=1024] [PPL_PREFIX=1] qwen35_ppl
+//!        [PPL_OUT=perpos.csv] [PPL_MAX_TOK=1024] [PPL_PREFIX=1] [PPL_CTX=8192] qwen35_ppl
 //! Prints: token count, mean NLL (nats), perplexity. Optional CSV: pos,true_id,nll,argmax_id.
 //!
 //! PPL_PREFIX (default 1) is the fp8-per-32 PREFILL gate mode: prefill the
@@ -90,7 +90,13 @@ fn main() {
     if let Some(d) = &fp8_native {
         eprintln!("fp8-native dir: {}", d.display());
     }
-    let mut m = GpuQwen35::load_with(exec, &map, 8192, fp8_native.as_deref()).expect("load qwen35");
+    // PPL_CTX (default 8192): the context the model is loaded for - a deep
+    // PPL_PREFIX (an agent's 100K-token turn) needs room for prefix + scored tail
+    let ctx: usize = std::env::var("PPL_CTX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+    let mut m = GpuQwen35::load_with(exec, &map, ctx, fp8_native.as_deref()).expect("load qwen35");
     // PADDOCK_KV_FP8: score in the kv8 serving class (fp8-e4m3 KV) so the
     // prefill leg exercises the fp8 attention tiles (pf7/v4-PIPE) exactly as
     // the serve does - the same opt-in the batch_bench example carries.
@@ -98,6 +104,13 @@ fn main() {
         use paddock_engine::gpu::KvDtype;
         m.set_kv_dtype(KvDtype::Fp8E4m3);
         eprintln!("KV dtype: fp8 e4m3 (kv8 serving class)");
+    }
+    // PADDOCK_KV_F16: the f16 leg of a model whose own default is fp8 (the
+    // rotated-basis line) - its comparand must ask for f16 explicitly
+    if std::env::var_os("PADDOCK_KV_F16").is_some() {
+        use paddock_engine::gpu::KvDtype;
+        m.set_kv_dtype(KvDtype::Fp16);
+        eprintln!("KV dtype: f16");
     }
 
     let mut out = std::env::var_os("PPL_OUT").map(|p| {
@@ -120,8 +133,20 @@ fn main() {
     let slot_mode = std::env::var_os("PPL_SLOT").is_some();
     let mut logits = if slot_mode {
         m.enable_batch(1).expect("enable_batch");
-        m.forward_prefill_slot(0, &ids[0..prefix])
-            .expect("slot prefill")
+        // a deep prefix goes in 4096-token steps: each call resumes at the
+        // previous one's prefix-cache checkpoint (the multi-turn resume the
+        // serve takes), since one slot prefill of a whole 16K+ prompt
+        // outgrows its conv staging - the serve chunks those too
+        let mut end = prefix.min(4096);
+        loop {
+            let lg = m
+                .forward_prefill_slot(0, &ids[0..end])
+                .expect("slot prefill");
+            if end == prefix {
+                break lg;
+            }
+            end = (end + 4096).min(prefix);
+        }
     } else {
         m.reset();
         m.prefill(&ids[0..prefix]).expect("prefill") // predicts ids[prefix]

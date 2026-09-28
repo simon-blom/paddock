@@ -218,6 +218,7 @@ impl GpuExecutor {
                 scales,
                 dims,
                 ty: p.ty,
+                act128: false,
             });
         }
         let n_waves = n_expert.div_ceil(slots);

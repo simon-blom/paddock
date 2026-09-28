@@ -302,14 +302,14 @@ struct NativeReadsView: View {
       }
       DisclosureGroup("API request") {
         let request =
-          (try? model.draft.orderedJSON(model: model.current?.model ?? "", includeImageData: false))
+          (try? model.draft.orderedJSON(model: model.requestModel, includeImageData: false))
           ?? ""
         Text("POST /v1/systemone\n\n" + request).font(.system(size: 11, design: .monospaced))
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
         Button("Copy request") {
           let draft = model.draft
-          let name = model.current?.model ?? ""
+          let name = model.requestModel
           Task {
             if let full = await Task.detached(
               priority: .userInitiated, operation: { try? draft.orderedJSON(model: name) }
@@ -336,6 +336,14 @@ struct NativeReadsView: View {
         }
       }
       HStack(spacing: 16) {
+        if model.current?.backend == "laya" || model.draft.checkpoint != nil {
+          Dropdown(title: "Checkpoint", value: model.draft.checkpoint ?? "Automatic language") {
+            Button("Automatic language") { model.draft.checkpoint = nil }
+            ForEach(model.current?.checkpoints ?? [], id: \.self) { checkpoint in
+              Button(checkpoint) { model.draft.checkpoint = checkpoint }
+            }
+          }.accessibilityIdentifier("reads-checkpoint")
+        }
         if let max = model.current?.maxSteps, max > 1 {
           Text("Steps").font(.system(size: 12)).foregroundStyle(.secondary)
           Dropdown(title: "Steps", value: "\(model.draft.steps)") {
@@ -372,20 +380,24 @@ struct NativeReadsView: View {
       .accessibilityIdentifier("reads-editor-tabs")
   }
 
-  private var samplePicker: some View {
-    HStack(spacing: 8) {
-      Text("Reads per question").font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
-      Dropdown(
-        title: "Reads per question",
-        value: model.draft.samples == 0 ? "Auto" : "\(model.draft.samples)"
-      ) {
-        Button("Auto") { model.draft.samples = 0 }
-        ForEach([1, 2, 4, 8, 16, 32].filter { $0 <= model.current?.maxSamples ?? 32 }, id: \.self) {
-          count in
-          Button("\(count)") { model.draft.samples = count }
-        }
-      }.fixedSize()
-    }.fixedSize(horizontal: true, vertical: false)
+  @ViewBuilder private var samplePicker: some View {
+    if model.current?.maxSamples != 1 || model.draft.samples > 1 {
+      HStack(spacing: 8) {
+        Text("Reads per question").font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
+        Dropdown(
+          title: "Reads per question",
+          value: model.draft.samples == 0 ? "Auto" : "\(model.draft.samples)"
+        ) {
+          Button("Auto") { model.draft.samples = 0 }
+          ForEach(
+            [1, 2, 4, 8, 16, 32].filter { $0 <= model.current?.maxSamples ?? 32 }, id: \.self
+          ) {
+            count in
+            Button("\(count)") { model.draft.samples = count }
+          }
+        }.fixedSize()
+      }.fixedSize(horizontal: true, vertical: false)
+    }
   }
 
   private var answers: some View {

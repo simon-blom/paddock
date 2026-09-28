@@ -164,6 +164,7 @@ impl GpuExecutor {
             scales,
             dims,
             ty,
+            act128,
         } = dev;
         let mut data_m = HostMirror::new(self.stream.clone(), data.len(), name)?;
         {
@@ -182,6 +183,7 @@ impl GpuExecutor {
             scales: ManuallyDrop::into_inner(scales_m.device_view()),
             dims,
             ty,
+            act128,
         };
         Ok(Some(HostMappedKq {
             plane: ManuallyDrop::new(plane),

@@ -42,6 +42,13 @@ pub struct KvPool {
     /// and makes deferred-reclamation (hand a finished seq's blocks to the next
     /// arrival) a natural fast path.
     free: Vec<BlockId>,
+    /// allocation generation per block, bumped by every `alloc` (0 = never
+    /// allocated). A side store addressed by block id - rows a drafter keeps
+    /// beside the pool's own - stamps the generation it wrote under, and a
+    /// page whose generation moved since has had another tenant: freed and
+    /// handed out again, whether to a sequence or to a tier restore that
+    /// refills only the pool's own planes.
+    tenant: Vec<u32>,
 }
 
 impl KvPool {
@@ -52,6 +59,7 @@ impl KvPool {
             // free-list high-id-first so `alloc` hands out 0,1,2,... in order (nicer
             // for tests + locality); order is otherwise immaterial.
             free: (0..n_blocks).rev().collect(),
+            tenant: vec![0; n_blocks as usize],
         }
     }
 
@@ -87,7 +95,15 @@ impl KvPool {
             "free block had nonzero refcount"
         );
         self.refcount[b as usize] = 1;
+        let g = &mut self.tenant[b as usize];
+        // wraps past 0 so a stamp of 0 always reads as "never written"
+        *g = g.wrapping_add(1).max(1);
         Ok(b)
+    }
+
+    /// The block's allocation generation (see `tenant`).
+    pub fn generation(&self, b: BlockId) -> u32 {
+        self.tenant[b as usize]
     }
 
     /// Add a reference to an already-allocated block (refcount++). Used when a new
@@ -285,6 +301,20 @@ mod tests {
         pool.release(b);
         assert_eq!(pool.free_blocks(), 1);
         assert_eq!(pool.alloc().unwrap(), b); // recycled
+    }
+
+    #[test]
+    fn generation_moves_with_every_tenant() {
+        let mut pool = KvPool::with_blocks(2);
+        let a = pool.alloc().unwrap();
+        let g = pool.generation(a);
+        assert!(g > 0, "an allocated block has a nonzero generation");
+        pool.retain(a);
+        pool.release(a);
+        assert_eq!(pool.generation(a), g, "sharing is the same tenant");
+        pool.release(a);
+        assert_eq!(pool.alloc().unwrap(), a);
+        assert_ne!(pool.generation(a), g, "a re-issued block is a new tenant");
     }
 
     #[test]

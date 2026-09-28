@@ -61,7 +61,10 @@ struct NativeReadDiagnostics: View {
       DisclosureGroup("Diagnostics") {
         VStack(alignment: .leading, spacing: 12) {
           Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
-            metric("Canvas", "\(response.diagnostics.canvas) positions")
+            if let canvas = response.diagnostics.canvas { metric("Canvas", "\(canvas) positions") }
+            if let checkpoint = response.diagnostics.checkpoint { metric("Checkpoint", checkpoint) }
+            if let tokens = response.diagnostics.stateTokens { metric("State tokens", "\(tokens)") }
+            if let routing = response.routing { metric("Routing", routing.reason) }
             metric("Reads", "\(response.diagnostics.reads)")
             if let input = response.usage?.inputTokens { metric("Prompt tokens", "\(input)") }
             if let output = response.usage?.outputTokens { metric("Output tokens", "\(output)") }
@@ -75,9 +78,27 @@ struct NativeReadDiagnostics: View {
               Text(row.id).font(.caption.weight(.medium)).textSelection(.enabled)
               HStack {
                 if let position = row.position { Text("Position \(position)") }
-                Text("Label mass \(row.labelMass, specifier: "%.3f")")
+                if let mass = row.labelMass { Text("Label mass \(mass, specifier: "%.3f")") }
                 Text("Entropy \(row.entropy, specifier: "%.3f")")
               }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
+              if let temperature = row.temperature {
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                  metric("Temperature", String(format: "%.2f", temperature))
+                  if let count = row.options { metric("Options", "\(count)") }
+                  if let tokens = row.tokens {
+                    metric("Tokens", tokens.map(String.init).joined(separator: ", "))
+                  }
+                  if let confidence = row.entropyConfidence {
+                    metric("Entropy confidence", String(format: "%.3f", confidence))
+                  }
+                  if let window = row.window {
+                    metric(
+                      "Window",
+                      "\(window.index + 1) of \(window.count) · tokens \(window.tokenStart)-\(window.tokenEnd)"
+                    )
+                  }
+                }.font(.caption).textSelection(.enabled)
+              }
               if let reads = row.reads, reads.count > 1 {
                 // Native, wrapping heatmap: every cell remains keyboard/VoiceOver
                 // readable; no clipped labels or horizontal page overflow.
@@ -110,7 +131,7 @@ struct NativeReadDiagnostics: View {
     }
   }
   private var legend: some View {
-    ForEach(Array(["under 0.5", "0.5–0.7", "0.7–0.9", "0.9 and over"].enumerated()), id: \.offset) {
+    ForEach(Array(["under 0.5", "0.5-0.7", "0.7-0.9", "0.9 and over"].enumerated()), id: \.offset) {
       index, label in
       HStack(spacing: 4) {
         ReadConfidenceSwatch(value: [0.0, 0.5, 0.7, 0.9][index])

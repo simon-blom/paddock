@@ -13,9 +13,9 @@
 pub mod align;
 pub mod audio;
 pub mod backend;
+pub mod ckpt_pages;
 #[cfg(feature = "cuda")]
 pub mod cuda;
-#[cfg(feature = "cuda")]
 pub mod decision;
 pub mod encoder;
 pub mod envset;

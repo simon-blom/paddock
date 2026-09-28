@@ -35,7 +35,7 @@ use std::time::Instant;
 use cudarc::driver::CudaEvent;
 
 use super::pool_tier::{AuxHit, PoolTier, TicketId, TierHit, XferSink};
-use crate::kv_pool::BLOCK_TOKENS;
+use crate::kv_pool::{BLOCK_TOKENS, KvPool};
 use crate::paged_radix::PagedRadix;
 
 /// How long a parked request waits before abandoning the restore and
@@ -54,7 +54,9 @@ const ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The hybrid round-two plan: which blob to restore and where checkpoint
 /// slots live on the device (base + idx*stride), captured at flow start.
-/// The device allocation outlives the flow - both live for the batch.
+/// The device allocation outlives the flow - both live for the batch. A
+/// family whose checkpoints live in pool pages leaves base and stride at 0:
+/// the radix names each reserved checkpoint's pages instead.
 pub struct AuxPlan {
     pub hit: AuxHit,
     pub state_base: u64,
@@ -194,6 +196,7 @@ impl RestoreFlow {
         &mut self,
         tier: &mut PoolTier<T>,
         pr: &mut PagedRadix,
+        pool: Option<&mut KvPool>,
         after: &mut dyn FnMut() -> Option<CudaEvent>,
     ) {
         match self.state {
@@ -218,13 +221,25 @@ impl RestoreFlow {
                     let Some(plan) = self.aux.as_ref() else {
                         unreachable!("aux checked above");
                     };
-                    let Some(cidx) = pr.reserve_state_slot() else {
+                    // paged checkpoints draw their pages here; a flat pool
+                    // (or a paged one pumped without its pool) takes a slot
+                    let reserved = match pool {
+                        Some(pool) if pr.state_is_paged() => pr.reserve_state_slot_with_pool(pool),
+                        _ => pr.reserve_state_slot(),
+                    };
+                    let Some(cidx) = reserved else {
                         self.finish(tier, false);
                         return;
                     };
-                    let dst = plan.state_base + cidx as u64 * plan.state_stride;
                     let aux_est = plan.hit.bytes as f64 / 16_000.0 + 100.0;
-                    match tier.begin_restore_aux(&plan.hit, dst, after()) {
+                    let started = if pr.state_is_paged() {
+                        let pages = pr.state_pages(cidx).to_vec();
+                        tier.begin_restore_aux_paged(&plan.hit, &pages, after())
+                    } else {
+                        let dst = plan.state_base + cidx as u64 * plan.state_stride;
+                        tier.begin_restore_aux(&plan.hit, dst, after())
+                    };
+                    match started {
                         Some(tk) => {
                             self.state = FlowState::Aux {
                                 ticket: tk,
@@ -358,12 +373,33 @@ impl<T: XferSink> PoolTier<T> {
         pr: &mut PagedRadix,
         after: &mut dyn FnMut() -> Option<CudaEvent>,
     ) {
+        self.pump_flows_in(pr, None, after);
+    }
+
+    /// [`Self::pump_flows`] for a family whose checkpoints live in pool pages
+    /// (issue #33): an aux round reserves its checkpoint's pages from `pool`
+    /// before the blob lands in them.
+    pub fn pump_flows_with_pool(
+        &mut self,
+        pr: &mut PagedRadix,
+        pool: &mut KvPool,
+        after: &mut dyn FnMut() -> Option<CudaEvent>,
+    ) {
+        self.pump_flows_in(pr, Some(pool), after);
+    }
+
+    fn pump_flows_in(
+        &mut self,
+        pr: &mut PagedRadix,
+        mut pool: Option<&mut KvPool>,
+        after: &mut dyn FnMut() -> Option<CudaEvent>,
+    ) {
         let mut park = std::mem::take(&mut self.flows);
         for f in park.active.values_mut() {
-            f.pump(self, pr, after);
+            f.pump(self, pr, pool.as_deref_mut(), after);
         }
         for f in park.zombies.iter_mut() {
-            f.pump(self, pr, after);
+            f.pump(self, pr, pool.as_deref_mut(), after);
         }
         park.zombies
             .retain(|f| !matches!(f.state, FlowState::Done { .. }));

@@ -14,6 +14,7 @@ pub mod chat;
 pub use paddock_mcp::clock;
 mod asr_residency;
 pub mod chat_template;
+mod companions;
 pub mod completions;
 pub mod config;
 pub mod constrained;
@@ -79,8 +80,7 @@ fn resolve_local_model(cfg: &mut Config) -> Result<(), String> {
         // so `--model <dir>/X.gguf` silently served an mm model without its
         // sibling `X-mmproj.gguf` (caught live on PaddleOCR-VL) -
         // the two entry forms must behave identically.
-        discover_companions(cfg, &model);
-        return Ok(());
+        return companions::resolve(cfg, &model);
     }
     // Not a path on disk - treat it as an installed-model id and scan.
     let name = model.to_string_lossy().to_string();
@@ -99,59 +99,9 @@ fn resolve_local_model(cfg: &mut Config) -> Result<(), String> {
         ));
     };
     tracing::info!(name = %name, weights = %found.path.display(), "resolved installed model by name");
-    discover_companions(cfg, &found.path);
+    companions::resolve(cfg, &found.path)?;
     cfg.model = Some(found.path);
     Ok(())
-}
-
-/// Fill unset companion paths (mmproj / MTP drafter) from the weights'
-/// directory - the layout catalog pulls produce. Explicit `--mmproj`/`--mtp`
-/// always win; a multi-model directory yields the first match in readdir
-/// order, so mixed layouts should keep one model per directory.
-fn discover_companions(cfg: &mut Config, weights: &std::path::Path) {
-    if cfg.mmproj.is_some() && cfg.mtp.is_some() {
-        return;
-    }
-    // A checkpoint DIRECTORY (safetensors-primary lane) carries everything
-    // inside itself; scanning its PARENT would treat unrelated sibling
-    // models' companions as this model's.
-    if weights.is_dir() {
-        return;
-    }
-    let Some(dir) = weights.parent() else { return };
-    let weights_name = weights.file_name().map(|n| n.to_os_string());
-    let mut mmproj = None;
-    let mut mtp = None;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            // never resolve the weights file itself as its own companion
-            // (e.g. a main GGUF whose NAME contains "mmproj")
-            if Some(e.file_name()) == weights_name {
-                continue;
-            }
-            let fname = e.file_name().to_string_lossy().to_lowercase();
-            if !fname.ends_with(".gguf") {
-                continue;
-            }
-            if fname.contains("mmproj") {
-                mmproj.get_or_insert(e.path());
-            } else if fname.starts_with("mtp") || fname.contains("-mtp.") {
-                mtp.get_or_insert(e.path());
-            }
-        }
-    }
-    if cfg.mmproj.is_none()
-        && let Some(p) = mmproj
-    {
-        tracing::info!(mmproj = %p.display(), "companion mmproj discovered beside the weights");
-        cfg.mmproj = Some(p);
-    }
-    if cfg.mtp.is_none()
-        && let Some(p) = mtp
-    {
-        tracing::info!(mtp = %p.display(), "companion MTP drafter discovered beside the weights");
-        cfg.mtp = Some(p);
-    }
 }
 
 /// Bind and serve until the process is stopped. Caller sets up tracing.
@@ -159,6 +109,7 @@ pub async fn run(
     mut cfg: Config,
     mut banner: startup::Banner,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    cfg.check_vram_budget()?;
     resolve_local_model(&mut cfg)?;
 
     if cfg.device == "metal" {
@@ -837,6 +788,7 @@ pub async fn run(
         .map(|s| s.engine.metrics())
         .or_else(|| embedder.as_ref().map(|e| Arc::clone(&e.metrics)))
         .or_else(|| asr.as_ref().map(|a| Arc::clone(&a.metrics)))
+        .or_else(|| laya.as_ref().map(|m| m.decider.metrics()))
         .or_else(|| image.as_ref().map(|m| Arc::clone(&m.metrics)));
     let stats = crate::stats::start(engine_metrics.clone());
     // Held for the graceful-shutdown path below: on SIGINT/SIGTERM the engine

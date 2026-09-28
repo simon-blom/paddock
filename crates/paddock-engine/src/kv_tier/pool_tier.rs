@@ -314,6 +314,18 @@ pub struct AuxTaken {
     pub state_idx: u32,
 }
 
+/// Where an aux blob's bytes sit on device (issue #33).
+///
+/// `Flat` is one contiguous span - a fixed checkpoint pool at `base + idx *
+/// stride`. `Pages` is a checkpoint that lives in pool pages
+/// ([`PagedRadix::set_state_paged`]): those hold the blob in the KV planes'
+/// own record layout, so it ships as page runs over the tier's planes exactly
+/// like a KV run, and its RAM bytes are the flat blob's plus tail padding.
+enum AuxSpan {
+    Flat { base: u64, bytes: u64 },
+    Pages(Vec<u32>),
+}
+
 /// A restorable aux boundary found by [`PoolTier::probe_aux`].
 #[derive(Debug, Clone, Copy)]
 pub struct AuxHit {
@@ -641,6 +653,69 @@ impl<T: XferSink> PoolTier<T> {
         }
     }
 
+    // -- aux spans (see AuxSpan) --------------------------------------------
+
+    /// Whole pages per aux shard: as close to `AUX_SHARD` as pages allow.
+    fn pages_per_shard(&self) -> usize {
+        (Self::AUX_SHARD / self.record_stride.max(1)).max(1) as usize
+    }
+
+    fn aux_bytes(&self, s: &AuxSpan) -> u64 {
+        match s {
+            AuxSpan::Flat { bytes, .. } => *bytes,
+            AuxSpan::Pages(p) => p.len() as u64 * self.record_stride,
+        }
+    }
+
+    fn aux_shards(&self, s: &AuxSpan) -> usize {
+        match s {
+            AuxSpan::Flat { bytes, .. } => bytes.div_ceil(Self::AUX_SHARD) as usize,
+            AuxSpan::Pages(p) => p.len().div_ceil(self.pages_per_shard()),
+        }
+    }
+
+    /// Shard `i`'s pages (empty for a flat span).
+    fn aux_shard_pages<'a>(&self, s: &'a AuxSpan, i: usize) -> &'a [u32] {
+        match s {
+            AuxSpan::Flat { .. } => &[],
+            AuxSpan::Pages(p) => {
+                let pps = self.pages_per_shard();
+                &p[i * pps..((i + 1) * pps).min(p.len())]
+            }
+        }
+    }
+
+    fn aux_shard_len(&self, s: &AuxSpan, i: usize) -> u64 {
+        match s {
+            AuxSpan::Flat { bytes, .. } => Self::AUX_SHARD.min(bytes - i as u64 * Self::AUX_SHARD),
+            AuxSpan::Pages(_) => self.aux_shard_pages(s, i).len() as u64 * self.record_stride,
+        }
+    }
+
+    fn aux_shard_spec(&self, s: &AuxSpan, i: usize, after: Option<CudaEvent>) -> XferSpec {
+        match s {
+            AuxSpan::Flat { base, .. } => XferSpec {
+                planes: vec![PlaneDesc {
+                    base: base + i as u64 * Self::AUX_SHARD,
+                    stride: 16,
+                    bytes: self.aux_shard_len(s, i),
+                }],
+                block_ids: vec![0],
+                after,
+            },
+            AuxSpan::Pages(_) => self.spec(self.aux_shard_pages(s, i).to_vec(), after),
+        }
+    }
+
+    fn aux_span_ok(&self, s: &AuxSpan) -> bool {
+        match s {
+            AuxSpan::Flat { base, bytes } => {
+                *bytes > 0 && bytes.is_multiple_of(16) && base.is_multiple_of(16)
+            }
+            AuxSpan::Pages(p) => !p.is_empty(),
+        }
+    }
+
     fn run_bytes(&self) -> u64 {
         self.record_stride * self.run_blocks as u64
     }
@@ -803,17 +878,99 @@ impl<T: XferSink> PoolTier<T> {
         state: Option<(u64, u64)>,
         after: &mut dyn FnMut() -> Option<CudaEvent>,
     ) {
+        if radix.state_is_paged() {
+            self.press_paged_state(radix, pool, target, after);
+        }
         let (_e, taken) = self.pressure_demote(radix, pool, target, after());
         let r = self.run_blocks;
         for a in taken {
-            match state {
-                Some((base, stride)) if a.end_block % r == 0 => {
-                    let blob = base + a.state_idx as u64 * stride;
-                    self.demote_aux(radix, a, blob, stride, after());
-                }
-                _ => radix.recycle_state(a.state_idx),
+            if a.end_block % r != 0 {
+                radix.recycle_state(a.state_idx);
+            } else if radix.state_is_paged() {
+                self.demote_aux_paged(radix, pool, a, after());
+            } else if let Some((base, stride)) = state {
+                let blob = base + a.state_idx as u64 * stride;
+                self.demote_aux(radix, a, blob, stride, after());
+            } else {
+                radix.recycle_state(a.state_idx);
             }
         }
+    }
+
+    /// The paged backing's pressure order, run before the LRU-path demotion
+    /// (issue #33). Checkpoints hold pool pages there, and on a single
+    /// conversation the LRU leaf path IS the live one: demoting it would
+    /// ship the newest checkpoint along with the stale ones. So first dead
+    /// KV goes (below the deepest checkpoint a hybrid recomputes anyway),
+    /// then the stalest checkpoint by its own recency - and only what that
+    /// cannot free falls through to the path walk.
+    ///
+    /// A checkpoint is only restorable from RAM together with the KV it
+    /// resumes over (the restore flow's blocks round comes first), so its
+    /// path's runs are written through beside the blob. They stay on the
+    /// device - the path may still be serving - and so do not count as
+    /// freed; once no checkpoint covers them they trim as dead KV, already
+    /// safe in T1.
+    fn press_paged_state(
+        &mut self,
+        radix: &mut PagedRadix,
+        pool: &mut KvPool,
+        target: usize,
+        after: &mut dyn FnMut() -> Option<CudaEvent>,
+    ) {
+        let r = self.run_blocks;
+        radix.reclaim(pool);
+        loop {
+            let pending = self.pending_evict_blocks();
+            if pool.free_blocks() + pending >= target {
+                return;
+            }
+            if radix.evict_dead_leaves(pool, target.saturating_sub(pending), 0) > 0 {
+                continue;
+            }
+            let Some(e) = radix.stalest_state() else {
+                return;
+            };
+            let Some(idx) = radix.take_state(e.node) else {
+                return;
+            };
+            match e.tkey {
+                Some(key) if e.depth % r == 0 && !self.aux_meta.contains_key(&key) => {
+                    // the KV first: root-first, like pressure_demote, so a
+                    // probe can walk the chain from its head
+                    let path = radix.path_entries(e.node);
+                    for lo in (0..(path.len() / r) * r).step_by(r) {
+                        let run = &path[lo..lo + r];
+                        if let Some(rk) = run[r - 1].tkey
+                            && run.iter().all(|x| x.tkey.is_some())
+                        {
+                            let mut ev = after();
+                            self.demote_run(rk, run, pool, &mut ev, false);
+                        }
+                    }
+                    let t = AuxTaken {
+                        key,
+                        end_block: e.depth,
+                        state_idx: idx,
+                    };
+                    self.demote_aux_paged(radix, pool, t, after());
+                }
+                // off a run boundary, unkeyed, or already in T1: drop it
+                _ => radix.recycle_state(idx),
+            }
+            // a refused or dropped blob parked its pages; count them now
+            radix.reclaim(pool);
+        }
+    }
+
+    /// Blocks an evicting store will free when it lands - demote pins defer
+    /// their frees to completion, so pressure passes count them as freed.
+    fn pending_evict_blocks(&self) -> usize {
+        self.deferred
+            .values()
+            .filter(|d| d.evicting)
+            .map(|d| d.blocks.len())
+            .sum()
     }
 
     /// 2.3 background write-through: pre-store LRU-retained chains during
@@ -847,7 +1004,20 @@ impl<T: XferSink> PoolTier<T> {
         // blob half for the entire busy phase (both found live on the
         // gemma4 pooled smoke). A hybrid's blocks are worthless without
         // their blob; the blob is the priority artifact.
-        if let Some((base, stride)) = state {
+        if radix.state_is_paged() {
+            for (depth, key, idx) in radix.state_attachments() {
+                if depth % r == 0
+                    && let Some(key) = key
+                    && !self.aux_meta.contains_key(&key)
+                {
+                    let span = AuxSpan::Pages(radix.state_pages(idx).to_vec());
+                    let ev = after.take();
+                    if self.mirror_aux_span(key, depth, span, Some(pool), ev) {
+                        break;
+                    }
+                }
+            }
+        } else if let Some((base, stride)) = state {
             for (depth, key, idx) in radix.state_attachments() {
                 if depth % r == 0
                     && let Some(key) = key
@@ -960,22 +1130,49 @@ impl<T: XferSink> PoolTier<T> {
         t: AuxTaken,
         base: u64,
         bytes: u64,
+        after: Option<CudaEvent>,
+    ) {
+        self.demote_aux_span(radix, None, t, AuxSpan::Flat { base, bytes }, after);
+    }
+
+    /// [`Self::demote_aux`] for a checkpoint that lives in pool pages: the
+    /// pages ship as runs over the KV planes and stay pinned until their
+    /// shard lands, so they count toward a pressure pass's target like a
+    /// demoted KV run's blocks do.
+    pub fn demote_aux_paged(
+        &mut self,
+        radix: &mut PagedRadix,
+        pool: &mut KvPool,
+        t: AuxTaken,
+        after: Option<CudaEvent>,
+    ) {
+        let pages = radix.state_pages(t.state_idx).to_vec();
+        self.demote_aux_span(radix, Some(pool), t, AuxSpan::Pages(pages), after);
+    }
+
+    fn demote_aux_span(
+        &mut self,
+        radix: &mut PagedRadix,
+        mut pool: Option<&mut KvPool>,
+        t: AuxTaken,
+        span: AuxSpan,
         mut after: Option<CudaEvent>,
     ) {
-        if bytes == 0 || !bytes.is_multiple_of(16) || !base.is_multiple_of(16) {
+        if !self.aux_span_ok(&span) {
             tracing::warn!(
-                bytes,
+                bytes = self.aux_bytes(&span),
                 "tier aux demote: blob not 16-aligned - recycled unstored"
             );
             radix.recycle_state(t.state_idx);
             return;
         }
-        let shards = bytes.div_ceil(Self::AUX_SHARD) as usize;
+        let bytes = self.aux_bytes(&span);
+        let shards = self.aux_shards(&span);
         // all-or-nothing admission: reserve every shard first
         let mut reserved = 0usize;
         for i in 0..shards {
             let skey = t.key.child_bytes("aux", &(i as u32).to_le_bytes());
-            let slen = Self::AUX_SHARD.min(bytes - i as u64 * Self::AUX_SHARD);
+            let slen = self.aux_shard_len(&span, i);
             match self.catalog.reserve(skey, Tier::Ram, slen) {
                 Ok(()) => reserved += 1,
                 Err(ReserveError::AlreadyPresent) => {
@@ -1004,17 +1201,8 @@ impl<T: XferSink> PoolTier<T> {
         let mut submitted = 0usize;
         for i in 0..shards {
             let skey = t.key.child_bytes("aux", &(i as u32).to_le_bytes());
-            let off = i as u64 * Self::AUX_SHARD;
-            let slen = Self::AUX_SHARD.min(bytes - off);
-            let spec = XferSpec {
-                planes: vec![PlaneDesc {
-                    base: base + off,
-                    stride: 16,
-                    bytes: slen,
-                }],
-                block_ids: vec![0],
-                after: after.take(),
-            };
+            let slen = self.aux_shard_len(&span, i);
+            let spec = self.aux_shard_spec(&span, i, after.take());
             let ok = self.transport.expect_store(skey, spec).is_ok();
             let started = if ok {
                 self.catalog.begin_store_adopt(skey, Tier::Ram, slen).ok()
@@ -1024,13 +1212,26 @@ impl<T: XferSink> PoolTier<T> {
             match started {
                 Some((op, job)) => {
                     if self.transport.submit(job).is_ok() {
+                        // a paged blob's pages stay pinned until this shard
+                        // lands (a flat blob's slot is simply not recycled
+                        // until then)
+                        // (only pins actually taken are recorded: completion
+                        // releases exactly `blocks`)
+                        let pins = match pool.as_deref_mut() {
+                            Some(pool) => {
+                                let pins = self.aux_shard_pages(&span, i).to_vec();
+                                for &b in &pins {
+                                    pool.retain(b);
+                                }
+                                pins
+                            }
+                            None => Vec::new(),
+                        };
                         self.deferred.insert(
                             op,
                             DeferredStore {
                                 key: skey,
-                                blocks: Vec::new(),
-                                // blob stores carry no block pins; the flag
-                                // is moot but they are eviction-driven
+                                blocks: pins,
                                 aux_recycle: Some(t.state_idx),
                                 evicting: true,
                             },
@@ -1081,16 +1282,28 @@ impl<T: XferSink> PoolTier<T> {
         end_block: usize,
         base: u64,
         bytes: u64,
+        after: Option<CudaEvent>,
+    ) -> bool {
+        self.mirror_aux_span(key, end_block, AuxSpan::Flat { base, bytes }, None, after)
+    }
+
+    fn mirror_aux_span(
+        &mut self,
+        key: LogicalKey,
+        end_block: usize,
+        span: AuxSpan,
+        mut pool: Option<&mut KvPool>,
         mut after: Option<CudaEvent>,
     ) -> bool {
-        if self.tripped || bytes == 0 || !bytes.is_multiple_of(16) || !base.is_multiple_of(16) {
+        if self.tripped || !self.aux_span_ok(&span) {
             return false;
         }
-        let shards = bytes.div_ceil(Self::AUX_SHARD) as usize;
+        let bytes = self.aux_bytes(&span);
+        let shards = self.aux_shards(&span);
         let mut reserved = 0usize;
         for i in 0..shards {
             let skey = key.child_bytes("aux", &(i as u32).to_le_bytes());
-            let slen = Self::AUX_SHARD.min(bytes - i as u64 * Self::AUX_SHARD);
+            let slen = self.aux_shard_len(&span, i);
             match self.catalog.reserve(skey, Tier::Ram, slen) {
                 Ok(()) => reserved += 1,
                 Err(ReserveError::Insufficient { .. })
@@ -1115,17 +1328,8 @@ impl<T: XferSink> PoolTier<T> {
         let mut submitted = 0usize;
         for i in 0..shards {
             let skey = key.child_bytes("aux", &(i as u32).to_le_bytes());
-            let off = i as u64 * Self::AUX_SHARD;
-            let slen = Self::AUX_SHARD.min(bytes - off);
-            let spec = XferSpec {
-                planes: vec![PlaneDesc {
-                    base: base + off,
-                    stride: 16,
-                    bytes: slen,
-                }],
-                block_ids: vec![0],
-                after: after.take(),
-            };
+            let slen = self.aux_shard_len(&span, i);
+            let spec = self.aux_shard_spec(&span, i, after.take());
             let ok = self.transport.expect_store(skey, spec).is_ok();
             let started = if ok {
                 self.catalog.begin_store_adopt(skey, Tier::Ram, slen).ok()
@@ -1135,11 +1339,27 @@ impl<T: XferSink> PoolTier<T> {
             match started {
                 Some((op, job)) => {
                     if self.transport.submit(job).is_ok() {
+                        // The checkpoint stays attached, so it can be
+                        // evicted or stolen while this shard is still being
+                        // read: a paged blob's pages are pinned so they
+                        // cannot return to the pool mid-store. (A flat slot
+                        // has no such guard - it can be refilled under a
+                        // mirror in flight - one more reason to page them.)
+                        let pins = match pool.as_deref_mut() {
+                            Some(pool) => {
+                                let pins = self.aux_shard_pages(&span, i).to_vec();
+                                for &b in &pins {
+                                    pool.retain(b);
+                                }
+                                pins
+                            }
+                            None => Vec::new(),
+                        };
                         self.deferred.insert(
                             op,
                             DeferredStore {
                                 key: skey,
-                                blocks: Vec::new(),
+                                blocks: pins,
                                 aux_recycle: None, // the slot stays attached
                                 evicting: false,
                             },
@@ -1403,29 +1623,53 @@ impl<T: XferSink> PoolTier<T> {
         &mut self,
         hit: &AuxHit,
         dst_base: u64,
+        after: Option<CudaEvent>,
+    ) -> Option<TicketId> {
+        let span = AuxSpan::Flat {
+            base: dst_base,
+            bytes: hit.bytes,
+        };
+        self.begin_restore_aux_span(hit, span, after)
+    }
+
+    /// [`Self::begin_restore_aux`] into a reserved checkpoint's pool pages.
+    /// `None` - and the caller recycles the reservation - when the pages
+    /// cannot hold what was stored (a blob stored under another geometry).
+    pub fn begin_restore_aux_paged(
+        &mut self,
+        hit: &AuxHit,
+        pages: &[u32],
+        after: Option<CudaEvent>,
+    ) -> Option<TicketId> {
+        let span = AuxSpan::Pages(pages.to_vec());
+        if self.aux_bytes(&span) != hit.bytes || self.aux_shards(&span) != hit.shards {
+            tracing::debug!(
+                stored = hit.bytes,
+                pages = pages.len(),
+                "tier aux restore: stored blob does not match the checkpoint's pages"
+            );
+            return None;
+        }
+        self.begin_restore_aux_span(hit, span, after)
+    }
+
+    fn begin_restore_aux_span(
+        &mut self,
+        hit: &AuxHit,
+        span: AuxSpan,
         mut after: Option<CudaEvent>,
     ) -> Option<TicketId> {
         let ticket = self.next_ticket;
         let mut runs: Vec<TicketRun> = Vec::with_capacity(hit.shards);
         for i in 0..hit.shards {
             let skey = hit.key.child_bytes("aux", &(i as u32).to_le_bytes());
-            let off = i as u64 * Self::AUX_SHARD;
-            let slen = Self::AUX_SHARD.min(hit.bytes - off);
             let src = self.ready_on(&skey).map(|(t, _)| t).unwrap_or(Tier::Ram);
             match self
                 .catalog
                 .begin_load(skey, src, LoadDst::Gpu, WaiterId(ticket))
             {
                 Ok(LoadStart::Started { op, job }) => {
-                    let spec = XferSpec {
-                        planes: vec![PlaneDesc {
-                            base: dst_base + off,
-                            stride: 16,
-                            bytes: slen,
-                        }],
-                        block_ids: vec![0],
-                        after: after.take(),
-                    };
+                    let spec = self.aux_shard_spec(&span, i, after.take());
                     if self.transport.expect_load(skey, spec).is_err()
                         || self.transport.submit(job).is_err()
                     {
@@ -1755,6 +1999,9 @@ impl<T: XferSink> PoolTier<T> {
                 self.resolved.insert(tid, w);
             }
         }
+        // a paged checkpoint recycled above parked its pages; this is the
+        // first moment with a pool at hand to give them back
+        radix.reclaim(pool);
     }
 
     /// Claim a resolved ticket's wake (see `pump_completions`).
@@ -1970,6 +2217,85 @@ mod tests {
         let mut r = PagedRadix::new();
         r.set_tier_root(t.tier_root());
         r
+    }
+
+    // -- paged checkpoints (issue #33) ---------------------------------------
+
+    /// A checkpoint that lives in pool pages goes to T1 as page runs, with
+    /// the KV it resumes over; its pages stay pinned until the store lands,
+    /// come back to the pool after, and restore into a fresh reservation.
+    #[test]
+    fn a_paged_checkpoint_ships_with_its_kv_and_restores_into_fresh_pages() {
+        let mut t = tier(256 << 20);
+        let mut pool = KvPool::with_blocks(64);
+        let mut radix = armed_radix(&t);
+        // 6 pages x 4 MiB records = 24 MiB: shards of 4 pages, so 2 (4 + 2)
+        radix.set_state_paged(4, 6);
+        let tokens = cached_chain(&mut radix, &mut pool, 1, 4);
+        let s0 = radix
+            .attach_state_with_pool(&tokens, 4 * BLOCK_TOKENS, &mut pool)
+            .expect("checkpoint");
+        let pages = radix.state_pages(s0).to_vec();
+        assert_eq!(pages.len(), 6);
+        t.press(&mut radix, &mut pool, 64, None, &mut || None);
+        for &p in &pages {
+            assert_eq!(pool.refcount(p), 2, "owned by the index and pinned");
+        }
+        t.transport.deliver_all();
+        t.pump_completions(&mut radix, &mut pool);
+        assert_eq!(
+            pool.free_blocks(),
+            64,
+            "the pages and the chain all came back"
+        );
+        let hit = t.probe(&tokens, 0).expect("the KV went to T1 with it");
+        assert_eq!(hit.end_block, 4);
+        let aux = t.probe_aux(&tokens, 4).expect("blob resident");
+        assert_eq!((aux.end_block, aux.shards, aux.bytes), (4, 2, 24 << 20));
+        // round two into a fresh reservation's pages
+        let c = radix
+            .reserve_state_slot_with_pool(&mut pool)
+            .expect("reserve");
+        let fresh = radix.state_pages(c).to_vec();
+        assert!(
+            t.begin_restore_aux_paged(&aux, &fresh[..5], None).is_none(),
+            "a checkpoint of another size never loads"
+        );
+        let ticket = t
+            .begin_restore_aux_paged(&aux, &fresh, None)
+            .expect("aux ticket");
+        t.transport.deliver_all();
+        t.pump_completions(&mut radix, &mut pool);
+        assert_eq!(t.take_wake(ticket).map(|w| w.ok), Some(true));
+        t.catalog.check_invariants();
+    }
+
+    /// The write-through mirror copies a checkpoint that stays attached, so it
+    /// can be evicted mid-store: its pages must not reach the free list until
+    /// the store has read them.
+    #[test]
+    fn a_mirrored_paged_checkpoint_keeps_its_pages_until_the_store_lands() {
+        let mut t = tier(256 << 20);
+        let mut pool = KvPool::with_blocks(64);
+        let mut radix = armed_radix(&t);
+        radix.set_state_paged(4, 3);
+        let tokens = cached_chain(&mut radix, &mut pool, 1, 4);
+        let s0 = radix
+            .attach_state_with_pool(&tokens, 4 * BLOCK_TOKENS, &mut pool)
+            .expect("checkpoint");
+        let pages = radix.state_pages(s0).to_vec();
+        t.mirror_slack(&radix, &mut pool, None, 0, None);
+        // the checkpoint is evicted with its chain while the store is open
+        while radix.evict_lru(&mut pool).is_some() {}
+        for &p in &pages {
+            assert_eq!(pool.refcount(p), 1, "the mirror's pin holds it");
+        }
+        t.transport.deliver_all();
+        t.pump_completions(&mut radix, &mut pool);
+        for &p in &pages {
+            assert_eq!(pool.refcount(p), 0, "free once the store read it");
+        }
+        assert!(t.probe_aux(&tokens, 4).is_some(), "and the copy is whole");
     }
 
     #[test]

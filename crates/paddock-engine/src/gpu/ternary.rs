@@ -1,6 +1,8 @@
-//! The batch-1 decode lane of PrismML's dense ternary packing (PTQ1_0) and
-//! the per-128 int8 activation quantizer it eats: pack slots 627 / 628. See
-//! `packs/cuda/src/quant/ternary.cuh` for why the lane exists and what the
+//! The decode lanes of PrismML's dense ternary packing (PTQ1_0) and the
+//! per-128 int8 activation quantizer they eat: pack slots 627 / 628 / 630
+//! (one row) and 686 (NB rows on the int8 tensor cores). Every lane is the
+//! same numeric class - per row the same bits at any row count. See
+//! `packs/cuda/src/quant/ternary.cuh` for why the lanes exist and what the
 //! coarser activation scale costs.
 
 use super::error::*;
@@ -66,15 +68,13 @@ impl GpuExecutor {
     }
 
     /// Planes that may share one [`Self::ternary_gemv_b128_multi`] launch:
-    /// all on the lane, one input width, row counts in multiples of 8.
+    /// all on the lane, one input width.
     pub fn ternary_multi_fits(&self, planes: &[&RepackedKQ]) -> bool {
         self.has_ternary_gemv_b128_multi()
             && (1..=3).contains(&planes.len())
-            && planes.iter().all(|w| {
-                self.ternary_gemv_b128_fits(w)
-                    && w.dims[0] == planes[0].dims[0]
-                    && w.dims[1].is_multiple_of(8)
-            })
+            && planes
+                .iter()
+                .all(|w| self.ternary_gemv_b128_fits(w) && w.dims[0] == planes[0].dims[0])
     }
 
     /// `y_i = W_i xq` for up to three planes reading the same staged row, in
@@ -237,6 +237,155 @@ impl GpuExecutor {
                 in_dim as u32,
                 out_dim as u32,
                 raw_id | ((column_major as u32) << 20),
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// The pack carries the NB-row ternary lane (slot 686).
+    pub fn has_ternary_gemm_nb(&self) -> bool {
+        self.kernels.ternary_gemm_nb.is_some() && self.kernels.quantize_q8_b128.is_some()
+    }
+
+    /// Planes that may share one [`Self::ternary_gemm_nb`] launch at `rows`
+    /// activation rows: PTQ1_0 on the batch-1 lane (the class the NB lane
+    /// reproduces), one input width, row counts in multiples of 16, and the
+    /// staging of min(rows, 8) columns within a block's shared memory
+    /// (mirrors `pd_trn_nb_smem`).
+    pub fn ternary_nb_fits(&self, planes: &[&RepackedKQ], rows: usize) -> bool {
+        if !self.has_ternary_gemm_nb() || !(1..=3).contains(&planes.len()) || rows == 0 {
+            return false;
+        }
+        let in_dim = planes[0].dims[0];
+        let (ns, nc) = (in_dim / 256, rows.min(8));
+        let sbs = ns.min(32);
+        let smem = 1024 + nc * (sbs * 64 + 4) * 4 + nc * 2 * sbs * 4 + 8 * 16 * 8 * 4;
+        smem <= 99 * 1024
+            && planes.iter().all(|w| {
+                self.ternary_gemv_b128_fits(w)
+                    && w.dims[0] == in_dim
+                    && w.dims[1].is_multiple_of(16)
+            })
+    }
+
+    /// `y_i = W_i xq` for `rows` activation rows against up to three planes
+    /// reading the same staged input, one weight read (slot 686). `xq` holds
+    /// `rows * in_dim` int8, `xs` `rows * in_dim / 128` scales, `y_i`
+    /// `rows * out_i` row-major. Per row bit-identical to
+    /// [`Self::ternary_gemv_b128`] / [`Self::ternary_gemv_b128_multi`].
+    pub fn ternary_gemm_nb(
+        &self,
+        planes: &mut [(&RepackedKQ, &mut CudaSlice<f32>)],
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .ternary_gemm_nb
+            .ok_or(GpuError::MissingOp("ternary_gemm_nb"))?;
+        let n = planes.len();
+        if !(1..=3).contains(&n) {
+            return Err(GpuError::Unsupported(format!(
+                "{n} planes in one ternary launch"
+            )));
+        }
+        let in_dim = planes[0].0.dims[0];
+        debug_assert!(xq.len() >= rows * in_dim && xs.len() >= rows * in_dim / 128);
+        let (xqp, _gx) = xq.device_ptr(&self.stream);
+        let (xsp, _gs) = xs.device_ptr(&self.stream);
+        let mut dp = [std::ptr::null::<core::ffi::c_void>(); 3];
+        let mut rp = [std::ptr::null::<core::ffi::c_void>(); 3];
+        let mut yp = [std::ptr::null_mut::<core::ffi::c_void>(); 3];
+        let mut outs = [0u32; 3];
+        let mut guards = Vec::with_capacity(9);
+        for (i, (w, y)) in planes.iter_mut().enumerate() {
+            debug_assert!(w.dims[0] == in_dim && y.len() >= rows * w.dims[1]);
+            let (d, g1) = w.data.device_ptr(&self.stream);
+            let (r, g2) = w.scales.device_ptr(&self.stream);
+            let (yy, g3) = y.device_ptr_mut(&self.stream);
+            dp[i] = d as *const _;
+            rp[i] = r as *const _;
+            yp[i] = yy as *mut _;
+            outs[i] = w.dims[1] as u32;
+            guards.push(g1);
+            guards.push(g2);
+            guards.push(g3);
+        }
+        // SAFETY: pack ABI v1 contract; pointers + stream live across the
+        // call (the guards above outlive it); unused planes pass null
+        check(unsafe {
+            f(
+                dp[0],
+                rp[0],
+                dp[1],
+                rp[1],
+                dp[2],
+                rp[2],
+                xqp as *const _,
+                xsp as *const _,
+                yp[0],
+                yp[1],
+                yp[2],
+                in_dim as u32,
+                outs[0],
+                outs[1],
+                outs[2],
+                n as u32,
+                0,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// `y = silu(gate xq) * (up xq)` for `rows` activation rows in one launch
+    /// (slot 686). Per row bit-identical to [`Self::ternary_glu_b128`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn ternary_glu_nb(
+        &self,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .ternary_gemm_nb
+            .ok_or(GpuError::MissingOp("ternary_gemm_nb"))?;
+        let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
+        debug_assert!(up.dims[0] == in_dim && up.dims[1] == ff && y.len() >= rows * ff);
+        debug_assert!(xq.len() >= rows * in_dim && xs.len() >= rows * in_dim / 128);
+        let (gd, _g1) = gate.data.device_ptr(&self.stream);
+        let (gr, _g2) = gate.scales.device_ptr(&self.stream);
+        let (ud, _g3) = up.data.device_ptr(&self.stream);
+        let (ur, _g4) = up.scales.device_ptr(&self.stream);
+        let (xqp, _g5) = xq.device_ptr(&self.stream);
+        let (xsp, _g6) = xs.device_ptr(&self.stream);
+        let (yp, _g7) = y.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract; pointers + stream live across the call
+        check(unsafe {
+            f(
+                gd as *const _,
+                gr as *const _,
+                ud as *const _,
+                ur as *const _,
+                std::ptr::null(),
+                std::ptr::null(),
+                xqp as *const _,
+                xsp as *const _,
+                yp as *mut _,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                in_dim as u32,
+                ff as u32,
+                ff as u32,
+                0,
+                2,
+                1,
+                rows as u32,
                 self.stream_ptr(),
             )
         })

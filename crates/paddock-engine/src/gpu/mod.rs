@@ -18,6 +18,7 @@ mod arch;
 /// kernel, so both halves have to name the same constants.
 pub mod asr;
 mod attention;
+mod attn_paged;
 mod basic_ops;
 mod batch_ops;
 mod bf16;
@@ -58,6 +59,7 @@ mod transfer;
 mod unified_mem;
 mod upload;
 mod vae;
+mod w16;
 
 pub use error::GpuError;
 use error::drv;

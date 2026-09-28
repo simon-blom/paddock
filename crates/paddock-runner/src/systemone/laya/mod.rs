@@ -462,9 +462,18 @@ pub async fn decide(
             })
             .await
             .map_err(|e| {
+                let busy = e.starts_with("decision queue is full");
                 Box::new(super::err(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
+                    if busy {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    },
+                    if busy {
+                        "overloaded_error"
+                    } else {
+                        "server_error"
+                    },
                     format!("the decision pass failed: {e}"),
                 ))
             })?;

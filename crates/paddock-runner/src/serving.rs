@@ -444,7 +444,7 @@ const LAYA_PASS_TOKENS: usize = 16_384;
 const LAYA_PASS_SEQUENCES: usize = 512;
 
 /// Load a Laya bundle: every checkpoint it holds on one engine thread, one
-/// shared workspace, a tokenizer per checkpoint. CUDA only.
+/// shared workspace, a tokenizer per checkpoint. Native CUDA or Metal.
 pub fn load_laya(
     id: String,
     dir: &Path,
@@ -455,9 +455,9 @@ pub fn load_laya(
 ) -> Result<crate::systemone::laya::LayaModel, ServeError> {
     use crate::systemone::laya::{LayaModel, sequence::LayaTok};
     use paddock_engine::gpu_model::laya::{GpuLaya, LayaWorkspace};
-    if device != "cuda" {
+    if !matches!(device, "cuda" | "metal") {
         return Err(ServeError::Engine(format!(
-            "decision models need cuda (got {device:?})"
+            "decision models need cuda or metal (got {device:?})"
         )));
     }
     let bundle = paddock_models::laya::LayaBundle::read(dir)
@@ -475,6 +475,19 @@ pub fn load_laya(
             );
         }
         toks.push((*c, Arc::new(t)));
+    }
+    if device == "metal" {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let path = dir.to_path_buf();
+            let decider = paddock_engine::decision::Decider::spawn_backend(move || {
+                paddock_metal::Laya::load(&path, vram_budget).map_err(|e| e.to_string())
+            })
+            .map_err(ServeError::Engine)?;
+            return Ok(LayaModel::new(id, decider, toks));
+        }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        return Err(ServeError::Engine("this build has no Metal backend".into()));
     }
     let pack = pack.map(Path::to_path_buf);
     let decider = paddock_engine::decision::Decider::spawn(move || {
@@ -1605,7 +1618,11 @@ pub(crate) fn load_with_residency(
             max_ctx,
             max_batch,
             vram_budget,
-            if device == "metal" { mtp } else { None },
+            // CUDA's directory lane takes a sideloaded drafter too: nemotron's
+            // official DFlash drafter is a safetensors dir (this used to pass
+            // None off Metal, so `mtp` never reached attach_dflash and the NVFP4
+            // lane served spec = "on" at the no-spec rate)
+            mtp,
             residency,
         );
     }
@@ -2549,6 +2566,14 @@ fn build_generator(
             return Err(format!("{arch} needs cuda (got {device:?})"));
         }
         let exec = make_exec(pack)?;
+        // Only nemotron consumes a sideloaded drafter in this lane; granite
+        // has none and qwen4exp's head ships in its own shards. Refuse one
+        // rather than serve as if it were attached.
+        if mtp.is_some() && arch != "nemotron" {
+            return Err(format!(
+                "{arch}: the safetensors lane takes no sideloaded drafter (--mtp / `mtp`)"
+            ));
+        }
         return match arch {
             "nemotron" => {
                 let mut model =

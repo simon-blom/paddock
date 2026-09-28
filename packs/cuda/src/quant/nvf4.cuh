@@ -434,12 +434,17 @@ int pd_quantize_nvf4(const void* x, void* q, void* scale, uint32_t n, void* stre
 //
 // BIT-EXACT to that chain by construction, and the construction is the whole
 // point:
-//   - section 1 is pd_rmsnorm_batch_kernel's vectorized branch verbatim over
-//     the SUMMED values (f64 acc, float4 index stride nth, same shfl tree,
-//     same `1.0f / sqrtf((float)(sum / (double)n) + eps)` -- not rsqrtf), so
-//     the launcher must pass the same nth pd_rmsnorm_batch would have picked;
-//     regrouping the reduction is the sanctioned near-tie class, not a free
-//     choice.
+//   - section 1 is pd_rmsnorm_batch_kernel_t's vectorized branch verbatim
+//     over the SUMMED values, in EVERY accumulator mode (ACC is
+//     pd_norm_acc_mode()'s election, float4 index stride nth, same shfl tree
+//     and in-order warp combine, same `1.0f / sqrtf((float)(total /
+//     (double)n) + eps)` -- not rsqrtf), so the launcher must pass the same
+//     nth pd_rmsnorm_batch would have picked; regrouping the reduction is the
+//     sanctioned near-tie class, not a free choice. This kernel first shipped
+//     with the f64 accumulate hard-coded, which stopped matching the chain
+//     when df became the default: a row alone (the plain chain) and the same
+//     row in a batch (this kernel) then took different 1-ulp norm scales on
+//     about one MoE prologue in twenty (Nemotron 3.5 on GB10, 2026-09-26).
 //   - `out` keeps the exact expression `v * inv * w`, so the f32 normed row
 //     the router still reads is unchanged element for element. Only which
 //     THREAD computes a given element moves, which cannot move a value.
@@ -451,11 +456,13 @@ int pd_quantize_nvf4(const void* x, void* q, void* scale, uint32_t n, void* stre
 // Sections 2+3 share one 8-element walk: fusing them drops a second read of
 // the row and lets the quantize consume `r` straight out of registers rather
 // than re-reading what section 2 just stored.
+template <int ACC>
 __global__ void pd_add_rmsnorm_quant_nvf4_batch_kernel(
     float* __restrict__ x, const float* __restrict__ proj,
     const float* __restrict__ w, float* __restrict__ out,
     unsigned char* __restrict__ q, unsigned char* __restrict__ scale,
     uint32_t n, float eps) {
+    using A = typename pd_acc_of<ACC>::type;
     PD_PDL_ARM();
     const uint32_t b = blockIdx.x;
     float* xb = x + (size_t)b * n;
@@ -465,39 +472,60 @@ __global__ void pd_add_rmsnorm_quant_nvf4_batch_kernel(
     unsigned char* sb = scale + (size_t)b * (n >> 4);
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const uint32_t warp = tid >> 5, lane = tid & 31u;
-    __shared__ double wsum[32];
+    __shared__ A wsum[32];
     __shared__ float s_inv;
 
     // section 1: x += proj (skipped when proj==null: the attn-input norm has
-    // no residual), write back, sum squares of the SUMMED values
+    // no residual), write back, sum squares of the SUMMED values - products
+    // f32 in every mode, only the accumulate differs (the chain's contract)
     const uint32_t n4 = n >> 2;
-    double acc = 0.0;
+    A acc;
+    if constexpr (ACC == PD_ACC_DF) { acc.hi = 0.0f; acc.lo = 0.0f; } else { acc = (A)0; }
     {
         float4* x4 = reinterpret_cast<float4*>(xb);
-        if (proj) {
-            const float4* p4 = reinterpret_cast<const float4*>(pb);
-            for (uint32_t i = tid; i < n4; i += nth) {
-                float4 v = x4[i];
+        const float4* p4 = proj ? reinterpret_cast<const float4*>(pb) : nullptr;
+        for (uint32_t i = tid; i < n4; i += nth) {
+            float4 v = x4[i];
+            if (p4) {
                 const float4 pv = p4[i];
                 v.x += pv.x; v.y += pv.y; v.z += pv.z; v.w += pv.w;
                 x4[i] = v;
-                acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
             }
-        } else {
-            for (uint32_t i = tid; i < n4; i += nth) {
-                const float4 v = x4[i];
+            if constexpr (ACC == PD_ACC_DF) {
+                pd_df_add(acc, v.x * v.x);
+                pd_df_add(acc, v.y * v.y);
+                pd_df_add(acc, v.z * v.z);
+                pd_df_add(acc, v.w * v.w);
+            } else {
                 acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
             }
         }
     }
-    for (uint32_t s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
+    for (uint32_t s = 16; s > 0; s >>= 1) {
+        if constexpr (ACC == PD_ACC_DF) {
+            pd_df o;
+            o.hi = __shfl_down_sync(0xffffffffu, acc.hi, s);
+            o.lo = __shfl_down_sync(0xffffffffu, acc.lo, s);
+            acc = pd_df_merge(acc, o);
+        } else {
+            acc += __shfl_down_sync(0xffffffffu, acc, s);
+        }
+    }
     if (lane == 0) wsum[warp] = acc;
     __syncthreads();
     if (tid == 0) {
-        double sum = 0.0;
         const uint32_t nwarps = (nth + 31u) >> 5;
-        for (uint32_t wi = 0; wi < nwarps; ++wi) sum += wsum[wi];
-        s_inv = 1.0f / sqrtf((float)(sum / (double)n) + eps);
+        double total;
+        if constexpr (ACC == PD_ACC_DF) {
+            pd_df sum; sum.hi = 0.0f; sum.lo = 0.0f;
+            for (uint32_t wi = 0; wi < nwarps; ++wi) sum = pd_df_merge(sum, wsum[wi]);
+            total = (double)sum.hi + (double)sum.lo;
+        } else {
+            A sum = (A)0;
+            for (uint32_t wi = 0; wi < nwarps; ++wi) sum += wsum[wi];
+            total = (double)sum;
+        }
+        s_inv = 1.0f / sqrtf((float)(total / (double)n) + eps);
     }
     __syncthreads();   // also publishes section 1's x writes to the whole CTA
     const float inv = s_inv;
@@ -528,10 +556,23 @@ int pd_add_rmsnorm_quant_nvf4_batch(void* x, const void* proj, const void* w,
     // nth pick must match pd_rmsnorm_batch or the reduction regroups.
     if ((n & 31u) != 0) return cudaErrorInvalidValue;
     const uint32_t nth = batch >= 64u ? pd_norm_wide_nth_ws(batch) : pd_norm_decode_nth();
-    pd_pdl_go(pd_add_rmsnorm_quant_nvf4_batch_kernel, batch, nth, 0u,
-              (cudaStream_t)stream, (float*)x, (const float*)proj,
-              (const float*)w, (float*)out, (unsigned char*)q,
-              (unsigned char*)scale, n, eps);
+    const int accm = pd_norm_acc_mode();
+    if (accm == PD_ACC_DF) {
+        pd_pdl_go(pd_add_rmsnorm_quant_nvf4_batch_kernel<PD_ACC_DF>, batch, nth, 0u,
+                  (cudaStream_t)stream, (float*)x, (const float*)proj,
+                  (const float*)w, (float*)out, (unsigned char*)q,
+                  (unsigned char*)scale, n, eps);
+    } else if (accm == PD_ACC_F64) {
+        pd_pdl_go(pd_add_rmsnorm_quant_nvf4_batch_kernel<PD_ACC_F64>, batch, nth, 0u,
+                  (cudaStream_t)stream, (float*)x, (const float*)proj,
+                  (const float*)w, (float*)out, (unsigned char*)q,
+                  (unsigned char*)scale, n, eps);
+    } else {
+        pd_pdl_go(pd_add_rmsnorm_quant_nvf4_batch_kernel<PD_ACC_F32>, batch, nth, 0u,
+                  (cudaStream_t)stream, (float*)x, (const float*)proj,
+                  (const float*)w, (float*)out, (unsigned char*)q,
+                  (unsigned char*)scale, n, eps);
+    }
     return pd_launch_status();
 }
 

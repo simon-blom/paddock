@@ -379,23 +379,28 @@ impl Qwen4ExpGpu {
             for c in super::super::prefix::ckpt_cuts(len) {
                 if c > s.from
                     && c < len
-                    && let Some(idx) = pc.reserve_ckpt()
+                    && let Some(idx) = pc.reserve_ckpt(&mut self.pages)
                 {
                     reserved.push((c, idx));
                 }
             }
         }
-        self.walk_cuts = reserved.iter().map(|&(c, idx)| (c - s.from, idx)).collect();
+        // each cut into its staging blob, committed into its checkpoint's
+        // pages right after the walk
+        self.walk_cuts = reserved
+            .iter()
+            .enumerate()
+            .map(|(blob, &(c, _))| (c - s.from, blob as u32))
+            .collect();
+        self.walk_ckpts = reserved.iter().map(|&(_, idx)| idx).collect();
         let ids = std::mem::take(&mut self.chunked[qi].tokens);
         let walked = self.walk_span_dev(s.slot, &ids, s.from, s.to);
         self.chunked[qi].tokens = ids;
         self.walk_cuts.clear();
+        let walked = walked.and_then(|()| self.commit_walk_cuts());
         if let Err(e) = walked {
-            if let Some(pc) = self.prefix.as_mut() {
-                for &(_, idx) in &reserved {
-                    pc.recycle_ckpt(idx);
-                }
-            }
+            self.walk_ckpts.clear();
+            self.recycle_reserved(&reserved);
             return Err(e);
         }
         Ok(MixedWalk {
@@ -426,7 +431,7 @@ impl Qwen4ExpGpu {
                 self.pos[s.slot] = s.to;
                 if s.finishes {
                     self.prefix_publish(s.slot, &ids, s.to, false)?;
-                    self.attach_cuts(s.slot, &ids, &w.reserved)?;
+                    self.attach_cuts(&ids, &w.reserved);
                     self.reply_track_admit(s.slot);
                 } else if s.at_cut {
                     self.prefix_cut(s.slot, &ids, s.to)?;

@@ -25,7 +25,7 @@ impl FlashNext {
         self.healthy()?;
         let n = rows.len();
         if n == 0
-            || n > self.chunk
+            || n > self.capacity
             || outputs.len() > self.slots.len()
             || outputs.iter().any(|&i| i >= n)
         {
@@ -43,11 +43,11 @@ impl FlashNext {
                 .map(|r| (r.0, r.2 as usize, r.1))
                 .collect::<Vec<_>>(),
             &lengths,
-            self.chunk,
+            self.capacity,
             self.context,
         )?;
-        let dp = deltanet::Plan::new(&positions, &lengths, self.chunk, self.context)?;
-        let qp = qsa::Plan::new(&positions, &lengths, self.chunk, self.context)?;
+        let dp = deltanet::Plan::new(&positions, &lengths, self.capacity, self.context)?;
+        let qp = qsa::Plan::new(&positions, &lengths, self.capacity, self.context)?;
         let mut projection_rows = Vec::new();
         if self.is_mlx() {
             for (i, row) in rows.iter().enumerate() {
@@ -74,6 +74,19 @@ impl FlashNext {
                 }
             }
         }
+        // Fenced compressed-row reads precede GPU mutation. Failed I/O is
+        // not a cache miss or a reason to consume stale staging bytes.
+        #[cfg(test)]
+        let ple_started = std::time::Instant::now();
+        self.ple_table.stage(&pp, &self.scratch.ple)?;
+        #[cfg(test)]
+        if n > 8 && std::env::var_os("PADDOCK_FLASH_NEXT_PLE_TIMING").is_some() {
+            eprintln!(
+                "FLASH_PLE_STAGE rows={n} position={} host_ms={:.3}",
+                rows[0].2,
+                ple_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut next = lengths.clone();
         for r in rows {
             next[r.0] += 1;
@@ -87,7 +100,7 @@ impl FlashNext {
                     .saturating_sub(s.table.blocks().len())
             })
             .sum::<usize>();
-        if needed > self.pool.free_blocks() {
+        if !self.reclaim_prefix_pages(needed) {
             return Err(MetalError::Memory(
                 "Flash Next paged KV exhausted before submission".into(),
             ));
@@ -176,8 +189,8 @@ impl FlashNext {
             // GGUF blk.1 is the PLE site. It adds to all four residual streams
             // before the attention HC mixer, not after attention or the FFN.
             if li == 1 {
-                s.ple
-                    .encode(&cmd, &self.ple_weights, &self.ple_table, &pp, &s.h);
+                self.ple_table
+                    .encode(&s.ple, &cmd, &self.ple_weights, &pp, &s.h);
             }
             layer.hc.encode(&cmd, &s.h, &s.hc, n);
             trace!(li, "hc_norm", &s.hc.norm, WIDE);

@@ -81,7 +81,6 @@ const QSA_DENSE_EXACT: usize = 512 * 4 + 3;
 /// QSA_BLOCK + the deepest verify chunk, rounded up to whole blocks (the
 /// shape vLLM sizes its ring by). 16 covers chunks up to 12 rows.
 const QSA_RING: usize = 16;
-use super::prefix::ResRole;
 use crate::gpu::qsa::{QSA_BLOCK, QsaRoute};
 
 /// Which attention a walk takes. `Auto` is the serving rule: QSA sparse
@@ -133,16 +132,6 @@ fn qsa_routes(e: &GpuExecutor, c: &Qwen4ExpConfig) -> (QsaRoute, QsaRoute) {
                 && QsaRoute::attn_fits(c.n_heads, c.n_kv_heads, c.head_dim, QSA_BLOCK),
         ),
     )
-}
-
-/// A prompt checkpoint cut's same-slot role: the prompt's upper cut or its
-/// lower one (`prefix::ckpt_cuts`).
-fn cut_role(n: usize, c: usize) -> ResRole {
-    if super::prefix::ckpt_cuts(n)[1] == c {
-        ResRole::CutHi
-    } else {
-        ResRole::CutLo
-    }
 }
 
 /// Bytes of the per-walk QSA score scratch: rows are scored and selected in
@@ -476,17 +465,21 @@ pub struct Qwen4ExpGpu {
     sc: Scratch,
     /// per-layer GDN recurrent state `[v_heads][k_dim][v_dim]`, None on attn layers
     recur: Vec<Option<CudaSlice<f32>>>,
-    /// per-layer KV caches `[max_tokens, kv_dim]`, None on GDN layers
+    /// per attention layer, the K and V pool planes `[pool blocks, 16,
+    /// kv_dim]` (`pages` addresses them), None on GDN layers
     kv_k: Vec<Option<CudaSlice<u8>>>,
     kv_v: Vec<Option<CudaSlice<u8>>>,
-    /// per attention layer, the QSA indexer's compressed key cache
-    /// `[slots, max_tokens/4, 128]` bf16 - one normed, rotated key per
-    /// 4-token block, written as each block completes (attn/qsa.cuh). None on
-    /// GDN layers and on a pack without the indexer.
+    /// per attention layer, the QSA indexer's compressed key plane
+    /// `[pool blocks, 4, 128]` bf16 on the same block ids - one normed,
+    /// rotated key per 4-token block, written as each block completes
+    /// (attn/qsa.cuh). None on GDN layers and on a pack without the indexer.
     idx_cache: Vec<Option<CudaSlice<half::bf16>>>,
     /// per attention layer, the raw indexer keys the next pool may still need
     /// `[slots, QSA_RING, 128]` f32 (a ring by position)
     idx_ring: Vec<Option<CudaSlice<f32>>>,
+    /// the KV pool's bookkeeping, the slots' block tables and the device
+    /// table every trunk attention launch reads (pages.rs)
+    pages: super::pages::KvPages,
     /// per-GDN-layer conv window: the last `k-1` PRE-conv rows, oldest first
     /// (`conv_step`'s contract - it shifts the window itself)
     gdn_win: Vec<Option<CudaSlice<f32>>>,
@@ -555,9 +548,13 @@ pub struct Qwen4ExpGpu {
     /// (`resume_gdn_conv` / `resume_ple_conv`); 0 = a fresh sequence.
     walk_row0: usize,
     /// in-walk prefix-cache checkpoints for the span `device_walk` runs next:
-    /// (row within the span, reserved pool index), ascending - the GDN and
-    /// PLE passes write each one's carried state as it stands at that row
+    /// (row within the span, staging blob), ascending - the GDN and PLE
+    /// passes write each one's carried state as it stands at that row into
+    /// the prefix cache's staging blob
     walk_cuts: Vec<(usize, u32)>,
+    /// the reserved checkpoint index each staging blob of the walk just run
+    /// commits into (`commit_walk_cuts`), blob order
+    walk_ckpts: Vec<u32>,
     /// Stage F, the reply checkpoint (`reply_snapshot`): per slot the cut
     /// and pool index of its live in-reply checkpoint, and whether the
     /// slot's reply is tracked at all (a prompt admitted through the cache,
@@ -609,12 +606,6 @@ fn sk_split() -> u32 {
 }
 
 struct Scratch {
-    /// Identity block table for the tcgen05 decode arm (slot 431). The dense
-    /// slot-major KV cache is a degenerate paged pool: rows are contiguous, so
-    /// block `i` of slot `s` sits at pool block `s*(max_ctx/16)+i`, and the
-    /// table is literally `0..slots*(max_ctx/16)`. Built once at load; the
-    /// kernel's TMA fetch does `y = table[..]*16` into the flat row pool.
-    d_blk_tab: CudaSlice<u32>,
     d_tok: CudaSlice<u32>,
     d_pos: CudaSlice<u32>,
     d_mrope: CudaSlice<u32>,
@@ -1135,7 +1126,17 @@ impl Qwen4ExpGpu {
         max_tokens: usize,
         slots: usize,
     ) -> Result<Self, GpuModelError> {
-        let (recur, kv_k, kv_v) = alloc_state(exec, &cfg, max_tokens, slots)?;
+        // the walks read every KV and index plane through the pool's table
+        if !exec.has_attn_paged_modes()
+            || !exec.has_attn_prefill_paged()
+            || (exec.has_qsa_indexer() && !exec.has_qsa_paged())
+        {
+            return Err(GpuModelError::Unsupported(
+                "qwen4exp needs the paged attention modes (pack slots 688-696) - rebuild packs/cuda"
+                    .into(),
+            ));
+        }
+        let recur = alloc_recur(exec, &cfg, slots)?;
         // QSA indexer state beside every attention layer's KV (tiny: 64 B a
         // token a layer, plus a 16-deep raw ring per slot). Written on every
         // walk, dense or not, so a sequence crossing the dense-exact window
@@ -1150,18 +1151,9 @@ impl Qwen4ExpGpu {
                  attend to every token, the model to its indexer's selection)"
             );
         }
-        let (mut idx_cache, mut idx_ring) = (Vec::new(), Vec::new());
+        let mut idx_ring = Vec::new();
         for b in &cfg.blocks {
             let attn = qsa && matches!(b, Qwen4ExpBlock::Attention);
-            idx_cache.push(if attn {
-                Some(
-                    exec.stream_alloc_bf16(
-                        slots * max_tokens.div_ceil(QSA_BLOCK) * cfg.idx_head_dim,
-                    )?,
-                )
-            } else {
-                None
-            });
             idx_ring.push(if attn {
                 Some(exec.alloc(slots * QSA_RING * cfg.idx_head_dim)?)
             } else {
@@ -1266,7 +1258,42 @@ impl Qwen4ExpGpu {
             lowm_ok: false,
             f16_max: usize::MAX,
         };
-        let mut me = Self {
+        // The KV pool, planned last against what is left: weights, per-slot
+        // state and the walk scratch are in the ledger by now, so the grant
+        // is exactly what the pool may take (pages.rs) - its pages hold the
+        // live KV, the prefix cache's retained pages and its checkpoints.
+        let kv_row_bytes = cfg.n_kv_heads * cfg.head_dim * KV().bytes();
+        let idx_row_bytes = if qsa { cfg.idx_head_dim * 2 } else { 0 };
+        let n_attn = cfg
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Qwen4ExpBlock::Attention))
+            .count();
+        let geo = (slots >= 1 && !super::prefix::prefix_disabled())
+            .then(|| super::prefix::CkptGeometry::of(&cfg));
+        let plan = super::pages::plan_pool(
+            exec,
+            max_tokens,
+            slots,
+            n_attn,
+            kv_row_bytes,
+            idx_row_bytes,
+            geo.map(|g| g.bytes()),
+        )?;
+        let (kv_k, kv_v, idx_cache) =
+            alloc_pool_planes(exec, &cfg, plan.blocks, kv_row_bytes, qsa)?;
+        let pages = super::pages::KvPages::new(exec, slots, max_tokens, &plan)?;
+        let prefix = match (geo, plan.ckpt) {
+            (Some(geo), Some((n_ckpt, _))) => {
+                let layout =
+                    checkpoint_layout(exec, &kv_k, &kv_v, &idx_cache, kv_row_bytes, idx_row_bytes);
+                Some(super::prefix::PrefixCache::new(
+                    exec, geo, layout, slots, n_ckpt,
+                )?)
+            }
+            _ => None,
+        };
+        let me = Self {
             exec: exec.clone(),
             cfg,
             weights_bytes,
@@ -1283,6 +1310,7 @@ impl Qwen4ExpGpu {
             kv_v,
             idx_cache,
             idx_ring,
+            pages,
             gdn_win,
             ple_win,
             slots,
@@ -1298,9 +1326,10 @@ impl Qwen4ExpGpu {
             stage,
             decode_graph: [None, None],
             graph_capture: capture_wanted(),
-            prefix: None,
+            prefix,
             walk_row0: 0,
             walk_cuts: Vec::new(),
+            walk_ckpts: Vec::new(),
             reply_ckpt: vec![None; slots],
             reply_pinned: vec![None; slots],
             reply_track: vec![false; slots],
@@ -1310,17 +1339,6 @@ impl Qwen4ExpGpu {
             chunked: Vec::new(),
             spec_rs_draws: None,
         };
-        if slots >= 1 && !super::prefix::prefix_disabled() {
-            let x_row_bytes = if qsa { me.cfg.idx_head_dim * 2 } else { 0 };
-            me.prefix = super::prefix::PrefixCache::new(
-                exec,
-                &me.cfg,
-                slots,
-                max_tokens,
-                KV().bytes(),
-                x_row_bytes,
-            )?;
-        }
         Ok(me)
     }
 
@@ -1401,6 +1419,10 @@ impl Qwen4ExpGpu {
         self.reply_track[slot] = false;
         self.reply_ckpt[slot] = None;
         self.reply_pinned[slot] = None;
+        // a fresh sequence writes its own pages: the old ones may be the
+        // radix's too (a publish retains a slot's pages), and a page it
+        // shares must never be written
+        self.pages.release(slot);
         let st = self.cfg.gdn_v_heads * self.cfg.gdn_k_dim * self.cfg.gdn_v_dim;
         for r in self.recur.iter_mut().flatten() {
             self.exec.zero_region(r, slot * st, st)?;
@@ -1446,6 +1468,7 @@ impl Qwen4ExpGpu {
         to: usize,
     ) -> Result<(), GpuModelError> {
         let n = to - from;
+        self.back_rows([(slot, to)])?;
         let pos: Vec<u32> = (from as u32..to as u32).collect();
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
         let slots: Vec<u32> = vec![slot as u32; n];
@@ -1483,90 +1506,66 @@ impl Qwen4ExpGpu {
         walked
     }
 
-    /// The prefix-cache consult for `slot`: the resume point with the slot's
-    /// carried state restored to it, or 0 (nothing touched). The deeper of
-    /// the slot's own checkpoints - its strips still hold the rows under
-    /// them, so that resume is a state copy at any depth - and the side
-    /// store, which copies pages in and only holds what its budget does.
-    /// Either way the slot's checkpoints past the resume point are
-    /// forgotten: the walk from there rewrites their rows.
+    /// The prefix-cache consult for `slot`: the resume point - the slot's
+    /// table pointed at the cached pages under it, its carried state restored
+    /// from the checkpoint's pages - or 0 (nothing touched). A continued
+    /// conversation resumes the same way wherever its last turn ran: the
+    /// radix holds that turn's pages and its reply checkpoint.
     fn prefix_resume(&mut self, slot: usize, ids: &[u32]) -> Result<usize, GpuModelError> {
         let Some(pc) = self.prefix.as_mut() else {
             return Ok(0);
         };
-        // must run before the prompt replaces the slot's stream
-        let held = self.pos[slot].min(self.stream[slot].len().saturating_sub(2));
-        // a slot that never held a sequence has no stream at all
-        let own = pc.res_best(slot, ids, self.stream[slot].get(2..2 + held).unwrap_or(&[]));
-        // the side store only where it goes deeper (another slot published a
-        // longer shared prefix); at equal depth the state copy alone wins
-        let mut at = pc.resume(
+        pc.resume(
             &self.exec,
             slot,
             ids,
-            own.map_or(0, |(_, p)| p),
-            self.max_tokens,
-            &mut self.kv_k,
-            &mut self.kv_v,
-            &mut self.idx_cache,
-            &mut self.recur,
-            &mut self.gdn_win,
-            self.ple_win.as_mut(),
-        )?;
-        if at == 0
-            && let Some((role, pos)) = own
-        {
-            pc.res_restore(
-                &self.exec,
-                slot,
-                role,
-                pos,
-                &mut self.recur,
-                &mut self.gdn_win,
-                self.ple_win.as_mut(),
-            )?;
-            at = pos;
-        }
-        pc.res_keep_upto(slot, at);
-        Ok(at)
+            &mut self.pages,
+            super::prefix::SlotState {
+                recur: &mut self.recur,
+                gdn_win: &mut self.gdn_win,
+                ple_win: self.ple_win.as_mut(),
+            },
+        )
     }
 
     /// File checkpoint cut `c` of `ids` in `slot`, whose carried state is the
-    /// state after `c` right now: under the radix, and as the slot's own
-    /// same-slot checkpoint for that cut.
+    /// state after `c` right now, under the radix.
     fn prefix_cut(&mut self, slot: usize, ids: &[u32], c: usize) -> Result<(), GpuModelError> {
         self.prefix_publish(slot, ids, c, true)?;
-        if let Some(pc) = self.prefix.as_mut() {
-            pc.res_store(
-                &self.exec,
-                slot,
-                cut_role(ids.len(), c),
-                c,
-                &mut self.recur,
-                &mut self.gdn_win,
-                self.ple_win.as_mut(),
-            )?;
-        }
         Ok(())
     }
 
     /// Attach the in-walk checkpoints a walk of `ids` wrote (`reserved`: cut,
-    /// radix index), each first copied into `slot`'s same-slot checkpoint for
-    /// its cut - the attach may give the index back to the pool.
-    fn attach_cuts(
-        &mut self,
-        slot: usize,
-        ids: &[u32],
-        reserved: &[(usize, u32)],
-    ) -> Result<(), GpuModelError> {
-        let Some(pc) = self.prefix.as_mut() else {
-            return Ok(());
-        };
-        for &(c, idx) in reserved {
-            pc.res_from_ckpt(&self.exec, slot, cut_role(ids.len(), c), c, ids, idx)?;
-            pc.attach_reserved(ids, c, idx);
+    /// checkpoint index - their staging blobs already committed into the
+    /// checkpoints' pages); a miss gives the index and its pages back.
+    fn attach_cuts(&mut self, ids: &[u32], reserved: &[(usize, u32)]) {
+        if let Some(pc) = self.prefix.as_mut() {
+            for &(c, idx) in reserved {
+                pc.attach_reserved(ids, c, idx, &mut self.pages);
+            }
+        }
+    }
+
+    /// Commit the in-walk checkpoints the walk just run wrote (`walk_ckpts`,
+    /// staging blob order) into their checkpoints' pages - before the next
+    /// walk reuses the staging blobs.
+    fn commit_walk_cuts(&mut self) -> Result<(), GpuModelError> {
+        let ck = std::mem::take(&mut self.walk_ckpts);
+        if let Some(pc) = self.prefix.as_mut() {
+            for (blob, &idx) in ck.iter().enumerate() {
+                pc.commit_staged(&self.exec, &self.pages, blob, idx)?;
+            }
         }
         Ok(())
+    }
+
+    /// Give back reserved checkpoints a failed walk never filed.
+    fn recycle_reserved(&mut self, reserved: &[(usize, u32)]) {
+        if let Some(pc) = self.prefix.as_mut() {
+            for &(_, idx) in reserved {
+                pc.recycle_ckpt(idx, &mut self.pages);
+            }
+        }
     }
 
     fn prefix_publish(
@@ -1585,13 +1584,12 @@ impl Qwen4ExpGpu {
             ids,
             upto,
             snapshot,
-            self.max_tokens,
-            &mut self.kv_k,
-            &mut self.kv_v,
-            &mut self.idx_cache,
-            &mut self.recur,
-            &mut self.gdn_win,
-            self.ple_win.as_mut(),
+            &mut self.pages,
+            super::prefix::SlotState {
+                recur: &mut self.recur,
+                gdn_win: &mut self.gdn_win,
+                ple_win: self.ple_win.as_mut(),
+            },
         )
     }
 
@@ -1601,7 +1599,7 @@ impl Qwen4ExpGpu {
     // next turn - the same history plus this reply plus a new message -
     // resumes at the prompt's last cut and re-walks the whole reply. So a
     // tracked slot checkpoints its reply too: every time a decode tick
-    // closes a 16-token page, the page is filed under the radix (the strip
+    // closes a 16-token page, the page is filed under the radix (the slot's page
     // already holds its rows) and the carried state is snapshotted there,
     // replacing the slot's previous reply checkpoint. One rolling
     // checkpoint per reply; the next turn prefills <= 15 reply tokens plus
@@ -1663,9 +1661,6 @@ impl Qwen4ExpGpu {
         self.qsa_dense_guard(slot);
         self.reply_ckpt[slot] = None;
         self.reply_pinned[slot] = None;
-        if let Some(pc) = self.prefix.as_mut() {
-            pc.res_drop_reply(slot);
-        }
         self.reply_track[slot] = self.prefix.is_some()
             && !crate::gpu_model::prefix_cache::reply_ckpt_disabled()
             && self.pos[slot] >= super::prefix::MIN_SNAPSHOT_LEN;
@@ -1696,19 +1691,6 @@ impl Qwen4ExpGpu {
             self.reply_track[slot] = false;
             return Ok(());
         }
-        // the slot's own rolling checkpoint first: it holds wherever the
-        // side store has no room for the reply's pages
-        if let Some(pc) = self.prefix.as_mut() {
-            pc.res_store(
-                &self.exec,
-                slot,
-                ResRole::Rolling,
-                cut,
-                &mut self.recur,
-                &mut self.gdn_win,
-                self.ple_win.as_mut(),
-            )?;
-        }
         let tokens: Vec<u32> = self.stream[slot][2..].iter().map(|&t| t as u32).collect();
         let Some(idx) = self.prefix_publish(slot, &tokens, cut, true)? else {
             return Ok(());
@@ -1716,7 +1698,7 @@ impl Qwen4ExpGpu {
         if let Some((old_cut, old_idx)) = self.reply_ckpt[slot].replace((cut, idx))
             && let Some(pc) = self.prefix.as_mut()
         {
-            pc.drop_ckpt(&tokens, old_cut, old_idx);
+            pc.drop_ckpt(&tokens, old_cut, old_idx, &mut self.pages);
         }
         if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
             tracing::info!("qwen4exp-reply-ckpt: slot {slot} cut {cut} idx {idx}");
@@ -1733,8 +1715,30 @@ impl Qwen4ExpGpu {
             return;
         }
         self.reply_pinned[slot] = self.reply_ckpt[slot].take();
-        if let Some(pc) = self.prefix.as_mut() {
-            pc.res_pin(slot);
+    }
+
+    /// Idle slots give their pages back to the pool - the radix keeps what
+    /// it filed (the prompt's pages, the reply's closed pages and their
+    /// checkpoints), so the conversation resumes from there wherever it
+    /// lands next. The slot's cursor and stream go too: nothing may address
+    /// its empty table before the next admission resumes or resets it. A
+    /// slot with a prompt still queued for chunked prefill is not idle.
+    pub fn release_inactive_slots(&mut self, occupied: &[bool]) {
+        for slot in 0..self.slots {
+            // every scheduler pass calls this: the cheap checks first
+            if occupied.get(slot).copied() == Some(true)
+                || self.pages.blocks(slot).is_empty()
+                || self.prefill_queue_impl().iter().any(|q| q.0 == slot)
+            {
+                continue;
+            }
+            self.reply_track[slot] = false;
+            self.reply_ckpt[slot] = None;
+            self.reply_pinned[slot] = None;
+            self.pages.release(slot);
+            self.pos[slot] = 0;
+            self.stream[slot].clear();
+            self.mtp_clear(slot);
         }
     }
 
@@ -1759,18 +1763,33 @@ impl Qwen4ExpGpu {
         let mut a = from;
         loop {
             let b = to.min((a / w + 1) * w);
-            self.walk_cuts = cuts
+            let inside: Vec<(usize, u32)> = cuts
                 .iter()
                 .filter(|&&(c, _)| c > a && c < b)
-                .map(|&(c, idx)| (c - a, idx))
+                .copied()
                 .collect();
+            self.walk_cuts = inside
+                .iter()
+                .enumerate()
+                .map(|(blob, &(c, _))| (c - a, blob as u32))
+                .collect();
+            self.walk_ckpts = inside.iter().map(|&(_, idx)| idx).collect();
             let walked = if b == to {
                 self.walk_span(slot, ids, a, b).map(Some)
             } else {
                 self.walk_span_dev(slot, ids, a, b).map(|()| None)
             };
             self.walk_cuts.clear();
-            let logits = walked?;
+            let logits = match walked {
+                Ok(l) => {
+                    self.commit_walk_cuts()?;
+                    l
+                }
+                Err(e) => {
+                    self.walk_ckpts.clear();
+                    return Err(e);
+                }
+            };
             self.mtp_seed(slot, 0, a, b, ids)?;
             self.pos[slot] = b;
             if b == to {
@@ -1778,9 +1797,7 @@ impl Qwen4ExpGpu {
             }
             if let Some(i) = cuts.iter().position(|&(c, _)| c == b) {
                 let (_, idx) = cuts.remove(i);
-                if let Some(pc) = self.prefix.as_mut() {
-                    pc.recycle_ckpt(idx);
-                }
+                self.recycle_reserved(&[(b, idx)]);
                 self.prefix_cut(slot, ids, b)?;
             }
             a = b;
@@ -1825,7 +1842,7 @@ impl Qwen4ExpGpu {
                 for c in cuts {
                     if c > pos
                         && c < n
-                        && let Some(idx) = pc.reserve_ckpt()
+                        && let Some(idx) = pc.reserve_ckpt(&mut self.pages)
                     {
                         reserved.push((c, idx));
                     }
@@ -1835,17 +1852,13 @@ impl Qwen4ExpGpu {
             let logits = match walked {
                 Ok(l) => l,
                 Err(err) => {
-                    if let Some(pc) = self.prefix.as_mut() {
-                        for &(_, idx) in &reserved {
-                            pc.recycle_ckpt(idx);
-                        }
-                    }
+                    self.recycle_reserved(&reserved);
                     return Err(err);
                 }
             };
             self.pos[slot] = n;
             self.prefix_publish(slot, ids, n, false)?;
-            self.attach_cuts(slot, ids, &reserved)?;
+            self.attach_cuts(ids, &reserved);
             self.reply_track_admit(slot);
             return Ok(logits);
         }
@@ -2211,9 +2224,52 @@ impl Qwen4ExpGpu {
             .map_err(crate::gpu::from_driver)?)
     }
 
+    /// Back the pool pages a walk's rows reach - `(slot, positions up to)` -
+    /// and upload the table if it grew. Every walk stages through one of the
+    /// `stage_inputs*` entries or `walk_span_dev`, which call this before
+    /// the walk (or the captured replay) reads the table; a verify span is
+    /// backed whole, so a draft row past a page boundary never lands on
+    /// another slot's page.
+    fn back_rows(
+        &mut self,
+        reach: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<(), GpuModelError> {
+        // With checkpoints in the pool a freed page may still hold a
+        // checkpoint's f32 record, whose halves read as f16 include Inf / NaN;
+        // P6i stages whole 64-key tiles and weighs the keys past a row's by
+        // 0, and 0 x NaN poisons it. The only unwritten rows a tile can reach
+        // are the tail of the page holding a walk's last row: the walk writes
+        // every row of the other pages it takes (a slot's rows below a walk
+        // are always written, adopted pages are whole, and past the table
+        // the entries name the zeroed spare). So that one page is zeroed as
+        // the table takes it - zeroing every page taken cost ~1% of a 16.5K
+        // prefill, mostly its descriptor upload stalling the host behind the
+        // previous walk. Interim: the SOTA fix is in the kernel - P6i
+        // zero-filling the V rows past the walk's last written key as it
+        // stages them (FlashAttention's out-of-bounds clear), after which a
+        // stale page is harmless and this copy goes.
+        let mut tails: Vec<crate::kv_pool::BlockId> = Vec::new();
+        for (slot, upto) in reach {
+            let had = self.pages.blocks(slot).len();
+            self.pages.back(slot, upto)?;
+            let now = self.pages.blocks(slot).len();
+            if now > had && !upto.is_multiple_of(BLOCK_TOKENS) {
+                tails.push(self.pages.blocks(slot)[now - 1]);
+            }
+        }
+        if let Some(pc) = self.prefix.as_mut()
+            && !tails.is_empty()
+        {
+            pc.zero_pages(&self.exec, &tails)?;
+        }
+        self.pages.sync(&self.exec)
+    }
+
     /// Stage one token per row, each against its own slot and position.
     fn stage_inputs_rows(&mut self, rows: &[(usize, u32)]) -> Result<(), GpuModelError> {
         let n = rows.len();
+        let reach: Vec<(usize, usize)> = rows.iter().map(|&(s, _)| (s, self.pos[s] + 1)).collect();
+        self.back_rows(reach)?;
         let ids: Vec<u32> = rows.iter().map(|&(_, t)| t).collect();
         let slots: Vec<u32> = rows.iter().map(|&(s, _)| s as u32).collect();
         let pos: Vec<u32> = rows.iter().map(|&(s, _)| self.pos[s] as u32).collect();
@@ -2454,6 +2510,7 @@ impl Qwen4ExpGpu {
         lead: usize,
     ) -> Result<(), GpuModelError> {
         let n: usize = runs.iter().map(|r| r.len).sum();
+        self.back_rows(runs.iter().map(|r| (r.slot, r.row0 + r.len)))?;
         let mut pos = Vec::with_capacity(n);
         let mut slots = Vec::with_capacity(n);
         for r in runs {
@@ -2682,14 +2739,22 @@ impl Qwen4ExpGpu {
                 self.slots
             )));
         }
+        // block b of the slot is row table[b / 4] * 4 + b % 4 of the plane
+        let pages = self.pages.blocks(slot);
+        if b1.div_ceil(super::pages::IDX_ROWS_PER_PAGE) > pages.len() {
+            return Err(GpuModelError::Unsupported(format!(
+                "qsa_index_keys: slot {slot} backs {} blocks, asked for {b1}",
+                pages.len() * super::pages::IDX_ROWS_PER_PAGE
+            )));
+        }
         let all = self.exec.to_host_bf16(cache)?;
-        let base = slot * cap * hd;
-        Ok(Some(
-            all[base + b0 * hd..base + b1 * hd]
-                .iter()
-                .map(|v| v.to_f32())
-                .collect(),
-        ))
+        let rpp = super::pages::IDX_ROWS_PER_PAGE;
+        let mut out = Vec::with_capacity((b1 - b0) * hd);
+        for b in b0..b1 {
+            let row = pages[b / rpp] as usize * rpp + b % rpp;
+            out.extend(all[row * hd..(row + 1) * hd].iter().map(|v| v.to_f32()));
+        }
+        Ok(Some(out))
     }
 
     /// How many sequences this instance is sized for.
@@ -2700,6 +2765,10 @@ impl Qwen4ExpGpu {
     /// Drop every per-sequence state. The allocations stay - a later capture
     /// rung bakes these addresses.
     fn reset(&mut self) -> Result<(), GpuModelError> {
+        // fresh sequences write their own pages (see `reset_slot`)
+        for slot in 0..self.slots {
+            self.pages.release(slot);
+        }
         let state_len = self.slots * self.cfg.gdn_v_heads * self.cfg.gdn_k_dim * self.cfg.gdn_v_dim;
         for r in self.recur.iter_mut().flatten() {
             self.exec.zero_region(r, 0, state_len)?;
@@ -2747,6 +2816,7 @@ impl Qwen4ExpGpu {
     fn stage_inputs(&mut self, ids: &[u32]) -> Result<(), GpuModelError> {
         let n = ids.len();
         let base = self.pos[0];
+        self.back_rows([(0, base + n)])?;
         let pos: Vec<u32> = (0..n).map(|i| (base + i) as u32).collect();
         let mrope: Vec<u32> = (0..4).flat_map(|_| pos.iter().copied()).collect();
         self.exec.upload_u32(ids, &mut self.sc.d_tok)?;
@@ -2808,6 +2878,7 @@ impl Qwen4ExpGpu {
             walk_cuts,
             prefix,
             verify,
+            pages,
             ..
         } = self;
         let row0 = *walk_row0;
@@ -3070,6 +3141,8 @@ impl Qwen4ExpGpu {
                         idx_cache[li].as_mut().zip(idx_ring[li].as_mut()),
                         *walk_qsa,
                         *max_tokens,
+                        &pages.d_tab,
+                        pages.bps,
                         n,
                         attn_phase,
                         seq_runs,
@@ -5057,6 +5130,8 @@ fn qsa_attend(
     kc: &CudaSlice<u8>,
     vc: &CudaSlice<u8>,
     max_ctx: usize,
+    tab: &CudaSlice<u32>,
+    bps: usize,
     n: usize,
     scale: f32,
 ) -> Result<(), GpuModelError> {
@@ -5068,12 +5143,14 @@ fn qsa_attend(
     let mut row0 = 0;
     while row0 < n {
         let rows = sc.qsa_rb.min(n - row0);
-        e.q4x_qsa_logits(
+        e.q4x_qsa_logits_paged(
             score_route,
             &sc.d_idx_q,
             cache,
             &sc.d_pos,
             &sc.d_slots,
+            tab,
+            bps,
             &mut sc.d_qsa_scores,
             row0,
             rows,
@@ -5107,13 +5184,15 @@ fn qsa_attend(
             .clamp(1, 16)
             .min(sc.d_qsa_cnt.len() / n.max(1))
     };
-    e.q4x_qsa_attn(
+    e.q4x_qsa_attn_paged(
         attn_route,
         &sc.d_qn,
         kc,
         vc,
         &sc.d_pos,
         &sc.d_slots,
+        tab,
+        bps,
         &sc.d_qsa_sel,
         &sc.d_qsa_cnt,
         &mut sc.d_qsa_po,
@@ -5122,7 +5201,6 @@ fn qsa_attend(
         nh,
         nkv,
         hd,
-        max_ctx,
         k,
         QSA_BLOCK,
         splits,
@@ -5157,7 +5235,8 @@ fn qsa_index(
     stage: &mut DenseStage,
     cache: &mut CudaSlice<half::bf16>,
     ring: &mut CudaSlice<f32>,
-    max_ctx: usize,
+    tab: &CudaSlice<u32>,
+    bps: usize,
     n: usize,
 ) -> Result<(), GpuModelError> {
     let (ih, ihd) = (c.idx_heads, c.idx_head_dim);
@@ -5211,20 +5290,21 @@ fn qsa_index(
         yarn,
         MROPE_SECTIONS,
     )?;
-    e.q4x_idx_store(
+    e.q4x_idx_store_paged(
         &sc.d_idx_qk,
         &sc.d_idx_stage,
         &sc.d_pos,
         &sc.d_slots,
         cache,
         ring,
+        tab,
+        bps,
         n,
         ihd,
         ld,
         koff,
         QSA_RING,
         QSA_BLOCK,
-        max_ctx.div_ceil(QSA_BLOCK),
     )?;
     Ok(())
 }
@@ -5246,6 +5326,10 @@ fn attn_pass(
     // this walk attends through QSA (needs `idx`); else the dense kernels
     qsa: bool,
     max_ctx: usize,
+    // the block table `kc` / `vc` / the index are read through, and its
+    // stride: the pool's (the trunk) or an identity table (the MTP head)
+    tab: &CudaSlice<u32>,
+    bps: usize,
     n: usize,
     phase: Phase,
     runs: &[Run],
@@ -5303,23 +5387,25 @@ fn attn_pass(
             yarn,
             MROPE_SECTIONS,
         )?;
-        e.kv_append_batch(
+        e.kv_append_batch_paged(
             &sc.d_kn,
             kc,
             &sc.d_pos,
             Some(&sc.d_slots),
+            tab,
+            bps,
             kv_dim,
-            max_ctx,
             n,
             KV(),
         )?;
-        e.kv_append_batch(
+        e.kv_append_batch_paged(
             &sc.d_v,
             vc,
             &sc.d_pos,
             Some(&sc.d_slots),
+            tab,
+            bps,
             kv_dim,
-            max_ctx,
             n,
             KV(),
         )?;
@@ -5390,23 +5476,25 @@ fn attn_pass(
             yarn,
             MROPE_SECTIONS,
         )?;
-        e.kv_append_batch(
+        e.kv_append_batch_paged(
             &sc.d_kn,
             kc,
             &sc.d_pos,
             Some(&sc.d_slots),
+            tab,
+            bps,
             kv_dim,
-            max_ctx,
             n,
             KV(),
         )?;
-        e.kv_append_batch(
+        e.kv_append_batch_paged(
             &sc.d_v,
             vc,
             &sc.d_pos,
             Some(&sc.d_slots),
+            tab,
+            bps,
             kv_dim,
-            max_ctx,
             n,
             KV(),
         )?;
@@ -5415,10 +5503,10 @@ fn attn_pass(
     let scale = 1.0 / (hd as f32).sqrt();
     let sparse = match idx {
         Some((cache, ring)) => {
-            qsa_index(e, c, w, sc, stage, cache, ring, max_ctx, n)?;
+            qsa_index(e, c, w, sc, stage, cache, ring, tab, bps, n)?;
             pm_lap(e, "attn-qsa-index");
             if qsa {
-                qsa_attend(e, c, sc, cache, kc, vc, max_ctx, n, scale)?;
+                qsa_attend(e, c, sc, cache, kc, vc, max_ctx, tab, bps, n, scale)?;
                 pm_lap(e, "attn-qsa");
             }
             qsa
@@ -5441,16 +5529,18 @@ fn attn_pass(
             kc,
             vc,
             max_ctx,
+            tab,
+            bps,
             lead,
             Phase::DecodeBatch,
             &[],
             scale,
         )?;
         if !runs.is_empty() {
-            attn_core(e, c, sc, kc, vc, max_ctx, n, phase, runs, scale)?;
+            attn_core(e, c, sc, kc, vc, max_ctx, tab, bps, n, phase, runs, scale)?;
         }
     } else {
-        attn_core(e, c, sc, kc, vc, max_ctx, n, phase, runs, scale)?;
+        attn_core(e, c, sc, kc, vc, max_ctx, tab, bps, n, phase, runs, scale)?;
     }
     pm_lap(e, "attn-core");
     e.mul_sigmoid(&mut sc.d_attn, &sc.d_agate, n * q_dim)?;
@@ -5468,7 +5558,11 @@ fn attn_pass(
 /// The attention core of `attn_pass`: rows [0, n) against the carried KV,
 /// dispatched by `phase` (decode kernels read one query row per slot, the
 /// prefill tile walks the run table staged for `runs`). K/V for every row
-/// is appended before this runs. Output rows land in `d_attn`.
+/// is appended before this runs. Output rows land in `d_attn`. Every arm is
+/// a paged kernel reading `kc` / `vc` through `tab` - the pool's table, or
+/// the MTP head's identity table over its own dense planes - each the
+/// bit-identical twin of the dense-strip kernel this lane took before its KV
+/// was paged (gate: tests/gpu_paged_attn_modes.rs).
 #[allow(clippy::too_many_arguments)]
 fn attn_core(
     e: &GpuExecutor,
@@ -5477,6 +5571,8 @@ fn attn_core(
     kc: &CudaSlice<u8>,
     vc: &CudaSlice<u8>,
     max_ctx: usize,
+    tab: &CudaSlice<u32>,
+    bps: usize,
     n: usize,
     phase: Phase,
     runs: &[Run],
@@ -5486,9 +5582,9 @@ fn attn_core(
     let kv_dim = nkv * hd;
     // tcgen05 decode attention (pack slot 431, the <256,6> instantiation built
     // for qwen3.8's 24q/4kv/hd256 - the same geometry). Needs e4m3 pools
-    // (PADDOCK_Q38FN_KV8=1): its TMA maps assume 1-byte elements. The dense
-    // slot-major cache rides as a degenerate paged pool through the identity
-    // block table (see `d_blk_tab`). The effective window is the CONSTANT
+    // (PADDOCK_Q38FN_KV8=1): its TMA maps assume 1-byte elements. It reads
+    // the table only for the pages under each row's keys (the window below
+    // bounds its tick table, not its reach). The effective window is the CONSTANT
     // max_ctx+16, never a live band - this walk is graph-captured, and a
     // window derived from live positions would bake into a replay (qwen35
     // precedent, including the +16 exact-multiple corner). Sinks here are
@@ -5526,8 +5622,8 @@ fn attn_core(
                 &mut sc.d_attn,
                 &sc.d_pos,
                 Some(&sc.d_slots),
-                &sc.d_blk_tab,
-                max_ctx / 16,
+                tab,
+                bps,
                 nh,
                 nkv_virt,
                 hd,
@@ -5555,7 +5651,7 @@ fn attn_core(
                 // a tile that spills past its run's end is masked row by row
                 // (`slots[b] == slot`), and the spilled rows are covered by their
                 // own run's tiles - the kernel writes nothing for a foreign row
-                e.attn_prefill_batch(
+                e.attn_prefill_batch_paged(
                     &sc.d_qn,
                     kc,
                     vc,
@@ -5563,13 +5659,14 @@ fn attn_core(
                     &mut sc.d_attn,
                     &sc.d_pos,
                     &sc.d_slots,
+                    tab,
+                    bps,
                     &sc.d_tile_row0,
                     &sc.d_tile_slot,
                     n_qtiles(runs),
                     nh,
                     nkv,
                     hd,
-                    max_ctx,
                     kv_dim,
                     0,
                     n,
@@ -5590,11 +5687,13 @@ fn attn_core(
             Phase::Prefill
                 if hd == 256
                     && KV() == KvDtype::Fp16
+                    // P6i stages whole 64-key tiles: every table entry up to
+                    // the tile boundary is inside the slot's row
                     && max_ctx.is_multiple_of(64)
                     && super::attn_pf16_enabled()
-                    && e.has_attn_prefill_f16() =>
+                    && e.has_attn_prefill_f16_paged() =>
             {
-                e.attn_prefill_f16(
+                e.attn_prefill_f16_paged(
                     &sc.d_qn,
                     kc,
                     vc,
@@ -5602,10 +5701,11 @@ fn attn_core(
                     &mut sc.d_attn,
                     &sc.d_pos,
                     &sc.d_slots,
+                    tab,
+                    bps,
                     nh,
                     nkv,
                     hd,
-                    max_ctx,
                     kv_dim,
                     0,
                     n,
@@ -5613,7 +5713,7 @@ fn attn_core(
                     KV(),
                 )?
             }
-            Phase::Prefill => e.attn_prefill(
+            Phase::Prefill => e.attn_prefill_paged(
                 &sc.d_qn,
                 kc,
                 vc,
@@ -5621,10 +5721,11 @@ fn attn_core(
                 &mut sc.d_attn,
                 &sc.d_pos,
                 &sc.d_slots,
+                tab,
+                bps,
                 nh,
                 nkv,
                 hd,
-                max_ctx,
                 kv_dim,
                 0,
                 n,
@@ -5642,13 +5743,13 @@ fn attn_core(
             // vs the rival's 9.1). Own numeric class; `PADDOCK_Q38FN_FMHA_SP=S`
             // arms it, battery judges.
             Phase::Decode | Phase::DecodeBatch
-                if e.has_attn_decode_fmha_sp()
+                if e.has_attn_paged_modes()
                     && super::attn_fmha_sp() >= 2
                     && super::attn_fmha_enabled()
                     && n <= 64
                     && (hd == 128 || hd == 256) =>
             {
-                e.attn_decode_fmha_sp(
+                e.attn_decode_fmha_sp_paged(
                     &sc.d_qn,
                     kc,
                     vc,
@@ -5657,10 +5758,11 @@ fn attn_core(
                     &mut sc.d_fmha_part,
                     &sc.d_pos,
                     Some(&sc.d_slots),
+                    tab,
+                    bps,
                     nh,
                     nkv,
                     hd,
-                    max_ctx,
                     kv_dim,
                     0,
                     n,
@@ -5676,11 +5778,11 @@ fn attn_core(
             // layout needs (head_dim/32) % 4 == 0.
             // `PADDOCK_Q38FN_ATTN_FMHA=0` falls back to the walk below.
             Phase::Decode | Phase::DecodeBatch
-                if e.has_attn_decode_fmha()
+                if e.has_attn_paged_modes()
                     && super::attn_fmha_enabled()
                     && (hd == 128 || hd == 256) =>
             {
-                e.attn_decode_fmha(
+                e.attn_decode_fmha_paged(
                     &sc.d_qn,
                     kc,
                     vc,
@@ -5688,10 +5790,11 @@ fn attn_core(
                     &mut sc.d_attn,
                     &sc.d_pos,
                     Some(&sc.d_slots),
+                    tab,
+                    bps,
                     nh,
                     nkv,
                     hd,
-                    max_ctx,
                     kv_dim,
                     0,
                     n,
@@ -5700,9 +5803,9 @@ fn attn_core(
                 )?
             }
             Phase::Decode | Phase::DecodeBatch
-                if e.has_attn_decode_batch_ps() && super::attn_ps_enabled() =>
+                if e.has_attn_paged_modes() && super::attn_ps_enabled() =>
             {
-                e.attn_decode_batch_ps(
+                e.attn_decode_batch_ps_paged(
                     &sc.d_qn,
                     kc,
                     vc,
@@ -5710,10 +5813,11 @@ fn attn_core(
                     &mut sc.d_attn,
                     &sc.d_pos,
                     Some(&sc.d_slots),
+                    tab,
+                    bps,
                     nh,
                     nkv,
                     hd,
-                    max_ctx,
                     kv_dim,
                     0,
                     n,
@@ -5721,7 +5825,7 @@ fn attn_core(
                     KV(),
                 )?
             }
-            Phase::Decode | Phase::DecodeBatch => e.attn_decode_batch(
+            Phase::Decode | Phase::DecodeBatch => e.attn_decode_batch_paged(
                 &sc.d_qn,
                 kc,
                 vc,
@@ -5729,10 +5833,11 @@ fn attn_core(
                 &mut sc.d_attn,
                 &sc.d_pos,
                 Some(&sc.d_slots),
+                tab,
+                bps,
                 nh,
                 nkv,
                 hd,
-                max_ctx,
                 kv_dim,
                 0,
                 n,
@@ -6921,38 +7026,94 @@ fn bf16_plane(
     })
 }
 
-#[allow(clippy::type_complexity)]
-fn alloc_state(
+/// Per-GDN-layer recurrent state, `[slots][v_heads][k_dim][v_dim]` f32.
+fn alloc_recur(
     e: &Arc<GpuExecutor>,
     c: &Qwen4ExpConfig,
-    max_tokens: usize,
     slots: usize,
+) -> Result<Vec<Option<CudaSlice<f32>>>, GpuModelError> {
+    let state_len = slots * c.gdn_v_heads * c.gdn_k_dim * c.gdn_v_dim;
+    let mut recur = Vec::with_capacity(c.n_layer);
+    for li in 0..c.n_layer {
+        recur.push(match c.blocks[li] {
+            Qwen4ExpBlock::Gdn => Some(e.alloc(state_len)?),
+            Qwen4ExpBlock::Attention => None,
+        });
+    }
+    Ok(recur)
+}
+
+/// Every attention layer's pool planes on `pool_blocks` block ids: K and V
+/// `[blocks, 16, kv_dim]` (zeroed, so the spare block and every unwritten row
+/// are finite) and, with the indexer, the compressed keys `[blocks, 4, 128]`.
+#[allow(clippy::type_complexity)]
+fn alloc_pool_planes(
+    e: &Arc<GpuExecutor>,
+    c: &Qwen4ExpConfig,
+    pool_blocks: usize,
+    kv_row_bytes: usize,
+    qsa: bool,
 ) -> Result<
     (
-        Vec<Option<CudaSlice<f32>>>,
         Vec<Option<CudaSlice<u8>>>,
         Vec<Option<CudaSlice<u8>>>,
+        Vec<Option<CudaSlice<half::bf16>>>,
     ),
     GpuModelError,
 > {
-    let kv_bytes = slots * max_tokens * c.n_kv_heads * c.head_dim * KV().bytes();
-    let state_len = slots * c.gdn_v_heads * c.gdn_k_dim * c.gdn_v_dim;
-    let (mut recur, mut kk, mut kv) = (Vec::new(), Vec::new(), Vec::new());
+    let kv_bytes = pool_blocks * crate::kv_pool::BLOCK_TOKENS * kv_row_bytes;
+    let idx_len = pool_blocks * super::pages::IDX_ROWS_PER_PAGE * c.idx_head_dim;
+    let (mut kk, mut kv, mut ix) = (Vec::new(), Vec::new(), Vec::new());
     for li in 0..c.n_layer {
         match c.blocks[li] {
             Qwen4ExpBlock::Gdn => {
-                recur.push(Some(e.alloc(state_len)?));
                 kk.push(None);
                 kv.push(None);
+                ix.push(None);
             }
             Qwen4ExpBlock::Attention => {
-                recur.push(None);
                 kk.push(Some(e.alloc_u8(kv_bytes)?));
                 kv.push(Some(e.alloc_u8(kv_bytes)?));
+                ix.push(if qsa {
+                    Some(e.stream_alloc_bf16(idx_len)?)
+                } else {
+                    None
+                });
             }
         }
     }
-    Ok((recur, kk, kv))
+    Ok((kk, kv, ix))
+}
+
+/// A checkpoint page's record over the pool planes, in layer order: each
+/// attention layer's K page, V page and index rows (the planes one block id
+/// addresses - every byte of a page a checkpoint draws).
+fn checkpoint_layout(
+    e: &Arc<GpuExecutor>,
+    kv_k: &[Option<CudaSlice<u8>>],
+    kv_v: &[Option<CudaSlice<u8>>],
+    idx_cache: &[Option<CudaSlice<half::bf16>>],
+    kv_row_bytes: usize,
+    idx_row_bytes: usize,
+) -> crate::ckpt_pages::PageLayout {
+    use cudarc::driver::DevicePtr;
+    let page = (crate::kv_pool::BLOCK_TOKENS * kv_row_bytes) as u64;
+    let idx_page = (super::pages::IDX_ROWS_PER_PAGE * idx_row_bytes) as u64;
+    let mut planes = Vec::new();
+    for li in 0..kv_k.len() {
+        let (Some(k), Some(v)) = (kv_k[li].as_ref(), kv_v[li].as_ref()) else {
+            continue;
+        };
+        let (kp, _g1) = k.device_ptr(&e.stream);
+        let (vp, _g2) = v.device_ptr(&e.stream);
+        planes.push((kp, page));
+        planes.push((vp, page));
+        if let Some(x) = idx_cache[li].as_ref() {
+            let (xp, _g3) = x.device_ptr(&e.stream);
+            planes.push((xp, idx_page));
+        }
+    }
+    crate::ckpt_pages::PageLayout::new(planes)
 }
 
 impl Scratch {
@@ -7024,8 +7185,6 @@ impl Scratch {
             yd
         };
         Ok(Self {
-            d_blk_tab: e
-                .to_device_u32(&(0..(slots * (ctx / 16)).max(1) as u32).collect::<Vec<u32>>())?,
             d_tok: e.alloc_u32(t)?,
             d_pos: e.alloc_u32(t)?,
             d_mrope: e.alloc_u32(4 * t)?,
@@ -7272,6 +7431,10 @@ impl crate::generator::Generator for Qwen4ExpGpu {
 
     fn reply_pin(&mut self, slot: usize) {
         Qwen4ExpGpu::reply_pin(self, slot);
+    }
+
+    fn release_inactive_slots(&mut self, occupied: &[bool]) {
+        Qwen4ExpGpu::release_inactive_slots(self, occupied);
     }
 
     fn reset(&mut self) {

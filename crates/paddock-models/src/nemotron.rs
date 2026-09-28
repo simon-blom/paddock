@@ -412,11 +412,213 @@ mod tests {
         assert!((c.routed_scale - 2.5).abs() < 1e-6);
         assert_eq!((c.n_groups, c.d_state, c.chunk), (8, 128, 128));
     }
+
+    /// The two official drafters' configs as NVIDIA ships them (quantization
+    /// block elided): DFlash = full, non-causal, yarn; DSpark = causal,
+    /// sliding window 1024 with sinks, plain rope, the rank-512 Markov head.
+    #[test]
+    fn drafter_configs_parse_both_official_checkpoints() {
+        let parse = |json: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("config.json"), json).expect("write");
+            NemotronDflashConfig::read(dir.path())
+        };
+        let df = parse(DFLASH_CONFIG).expect("dflash");
+        assert!(!df.causal && df.window == 0 && !df.sinks && df.markov_rank.is_none());
+        assert_eq!(
+            (df.rope_theta, df.rope_factor, df.rope_orig),
+            (10000.0, 128.0, 8192)
+        );
+        let ds = parse(DSPARK_CONFIG).expect("dspark");
+        assert!(ds.causal && ds.sinks);
+        assert_eq!(
+            (ds.window, ds.markov_rank, ds.block_size),
+            (1024, Some(512), Some(8))
+        );
+        assert_eq!((ds.rope_theta, ds.rope_factor), (10000.0, 1.0));
+        for c in [&df, &ds] {
+            assert_eq!(c.target_layers, vec![1, 5, 19, 29, 41, 51]);
+            assert_eq!(
+                (c.n_layers, c.hidden, c.n_heads, c.n_kv_heads),
+                (6, 2688, 32, 2)
+            );
+            assert_eq!(c.mask_token, 990);
+        }
+        // the anchor-as-first layout is another model
+        let anchor = DSPARK_CONFIG.replace(
+            "\"sample_from_anchor\": false",
+            "\"sample_from_anchor\": true",
+        );
+        assert!(parse(&anchor).is_err());
+    }
+
+    const DFLASH_CONFIG: &str = r#"{
+ "architectures": [
+  "DFlashDraftModel"
+ ],
+ "attention_bias": false,
+ "attention_sink_bias": false,
+ "dflash_config": {
+  "attention_sink_bias": false,
+  "causal": false,
+  "mask_token_id": 990,
+  "target_layer_ids": [
+   1,
+   5,
+   19,
+   29,
+   41,
+   51
+  ],
+  "use_swa": false,
+  "sample_from_anchor": false
+ },
+ "dflash_query_causal": false,
+ "draft_vocab_size": null,
+ "dspark_fixup_head_type": null,
+ "dspark_markov_rank": null,
+ "dtype": "bfloat16",
+ "eagle_aux_hidden_state_layer_ids": [
+  2,
+  6,
+  20,
+  30,
+  42,
+  52
+ ],
+ "has_embed_tokens": true,
+ "has_lm_head": false,
+ "head_dim": 128,
+ "hidden_act": "silu",
+ "hidden_size": 2688,
+ "intermediate_size": 6144,
+ "layer_types": [
+  "full_attention",
+  "full_attention",
+  "full_attention",
+  "full_attention",
+  "full_attention",
+  "full_attention"
+ ],
+ "mask_token_id": 990,
+ "max_position_embeddings": 1048576,
+ "model_type": "qwen3",
+ "num_attention_heads": 32,
+ "num_aux_layers": 6,
+ "num_hidden_layers": 6,
+ "num_key_value_heads": 2,
+ "pard_token": 990,
+ "rms_norm_eps": 1e-06,
+ "rope_parameters": {
+  "factor": 128.0,
+  "original_max_position_embeddings": 8192,
+  "rope_theta": 10000,
+  "rope_type": "yarn"
+ },
+ "rope_theta": 10000,
+ "sliding_window": null,
+ "target_layer_ids": [
+  1,
+  5,
+  19,
+  29,
+  41,
+  51
+ ],
+ "train_embed_tokens": false,
+ "transformers_version": "5.5.3",
+ "use_cache": false,
+ "vocab_size": 131072,
+ "sample_from_anchor": false
+}"#;
+    const DSPARK_CONFIG: &str = r#"{
+ "architectures": [
+  "Qwen3DSparkModel"
+ ],
+ "attention_bias": false,
+ "attention_sink_bias": true,
+ "block_size": 8,
+ "dflash_config": {
+  "attention_sink_bias": true,
+  "causal": true,
+  "mask_token_id": 990,
+  "swa_window_size": 1024,
+  "target_layer_ids": [
+   1,
+   5,
+   19,
+   29,
+   41,
+   51
+  ],
+  "use_swa": true,
+  "sample_from_anchor": false
+ },
+ "dflash_query_causal": true,
+ "draft_vocab_size": null,
+ "dspark_bonus_anchor": true,
+ "dspark_fixup_head_type": "markov",
+ "dspark_markov_rank": 512,
+ "dtype": "bfloat16",
+ "eagle_aux_hidden_state_layer_ids": [
+  2,
+  6,
+  20,
+  30,
+  42,
+  52
+ ],
+ "has_embed_tokens": true,
+ "has_lm_head": false,
+ "head_dim": 128,
+ "hidden_act": "silu",
+ "hidden_size": 2688,
+ "intermediate_size": 6144,
+ "layer_types": [
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention",
+  "sliding_attention"
+ ],
+ "markov_head_type": "vanilla",
+ "markov_rank": 512,
+ "mask_token_id": 990,
+ "max_position_embeddings": 1048576,
+ "model_type": "qwen3",
+ "num_attention_heads": 32,
+ "num_aux_layers": 6,
+ "num_hidden_layers": 6,
+ "num_key_value_heads": 2,
+ "pard_token": 990,
+ "rms_norm_eps": 1e-06,
+ "rope_parameters": null,
+ "rope_theta": 10000,
+ "sliding_window": 1024,
+ "target_layer_ids": [
+  1,
+  5,
+  19,
+  29,
+  41,
+  51
+ ],
+ "train_embed_tokens": false,
+ "transformers_version": "5.5.3",
+ "use_cache": false,
+ "vocab_size": 131072,
+ "sample_from_anchor": false
+}"#;
 }
 
-/// The official DFlash drafter checkpoint's config (C2):
-/// `nvidia/...-NVFP4-DFlash` - a 6-layer qwen3-class dense GQA drafter with
-/// yarn rope and NVFP4 MLPs. Every consumed key is validated present.
+/// The official block drafters' config (C2): `nvidia/...-NVFP4-DFlash` - a
+/// 6-layer qwen3-class dense GQA drafter with yarn rope and NVFP4 MLPs - and
+/// its DSpark sibling `...-NVFP4-DSpark` (`Qwen3DSparkModel`): the same
+/// backbone and taps with a CAUSAL block, sliding-window attention with
+/// per-head sinks, plain rope, and a low-rank Markov head that biases each
+/// draft by the token drafted before it. Every consumed key is validated
+/// present.
 #[derive(Debug, Clone)]
 pub struct NemotronDflashConfig {
     pub n_layers: usize,
@@ -428,10 +630,22 @@ pub struct NemotronDflashConfig {
     pub eps: f32,
     pub mask_token: u32,
     pub target_layers: Vec<usize>,
-    /// yarn: (theta, factor, original_max_position_embeddings)
+    /// yarn: (theta, factor, original_max_position_embeddings); plain rope
+    /// reads as factor 1 (yarn's interpolation and mscale are then identity)
     pub rope_theta: f32,
     pub rope_factor: f32,
     pub rope_orig: usize,
+    /// the query block attends causally (DSpark) or as a whole (DFlash)
+    pub causal: bool,
+    /// sliding-window width of every layer's attention, 0 = full
+    pub window: usize,
+    /// per-head attention sink logits ship with each layer
+    pub sinks: bool,
+    /// the Markov fixup head's rank (DSpark), None = drafts are the base
+    /// logits' argmaxes
+    pub markov_rank: Option<usize>,
+    /// the trained block (anchor + masks), when the config states it
+    pub block_size: Option<usize>,
 }
 
 impl NemotronDflashConfig {
@@ -445,19 +659,91 @@ impl NemotronDflashConfig {
                 .map(|x| x as usize)
                 .ok_or_else(|| miss(k))
         };
-        if v["architectures"][0].as_str() != Some("DFlashDraftModel") {
-            return Err(StError::Header(format!(
-                "not a DFlashDraftModel checkpoint (architectures {:?})",
-                v.get("architectures")
-            )));
+        let arch = v["architectures"][0].as_str();
+        let dspark = match arch {
+            Some("DFlashDraftModel") => false,
+            Some("Qwen3DSparkModel") => true,
+            _ => {
+                return Err(StError::Header(format!(
+                    "not a DFlash/DSpark drafter checkpoint (architectures {:?})",
+                    v.get("architectures")
+                )));
+            }
+        };
+        let dc = &v["dflash_config"];
+        // the bonus-anchor layout: row 0 is the committed token, mask row j
+        // predicts the token AT its own position. The paper's anchor-as-first
+        // layout (row j-1 predicts position j) is another model.
+        if dc["sample_from_anchor"].as_bool().unwrap_or(false)
+            || v["sample_from_anchor"].as_bool().unwrap_or(false)
+        {
+            return Err(StError::Header(
+                "drafter samples from its anchor row - only the bonus-anchor layout is served"
+                    .into(),
+            ));
         }
         let rp = &v["rope_parameters"];
-        if rp["rope_type"].as_str() != Some("yarn") {
-            return Err(StError::Header(format!(
-                "dflash rope_type {:?} unsupported (expected yarn)",
-                rp.get("rope_type")
-            )));
-        }
+        let (rope_theta, rope_factor, rope_orig) = if rp.is_null() {
+            // plain rope (DSpark ships rope_parameters null + rope_theta)
+            let theta = v["rope_theta"].as_f64().ok_or_else(|| miss("rope_theta"))? as f32;
+            (theta, 1.0, u("max_position_embeddings")?)
+        } else {
+            match rp["rope_type"].as_str() {
+                Some("yarn") => (
+                    rp["rope_theta"]
+                        .as_f64()
+                        .ok_or_else(|| miss("rope_theta"))? as f32,
+                    rp["factor"].as_f64().ok_or_else(|| miss("rope factor"))? as f32,
+                    rp["original_max_position_embeddings"]
+                        .as_u64()
+                        .ok_or_else(|| miss("rope original_max_position_embeddings"))?
+                        as usize,
+                ),
+                Some("default") => (
+                    rp["rope_theta"]
+                        .as_f64()
+                        .ok_or_else(|| miss("rope_theta"))? as f32,
+                    1.0,
+                    u("max_position_embeddings")?,
+                ),
+                t => {
+                    return Err(StError::Header(format!(
+                        "drafter rope_type {t:?} unsupported (expected yarn or default)"
+                    )));
+                }
+            }
+        };
+        let causal = dc["causal"].as_bool().unwrap_or(false);
+        let window = if dc["use_swa"].as_bool().unwrap_or(false) {
+            dc["swa_window_size"]
+                .as_u64()
+                .or_else(|| v["sliding_window"].as_u64())
+                .ok_or_else(|| miss("dflash_config.swa_window_size"))? as usize
+        } else {
+            0
+        };
+        let sinks = dc["attention_sink_bias"].as_bool().unwrap_or(false);
+        let markov_rank = if dspark {
+            if v["dspark_fixup_head_type"].as_str() != Some("markov")
+                || v["markov_head_type"]
+                    .as_str()
+                    .is_some_and(|t| t != "vanilla")
+            {
+                return Err(StError::Header(format!(
+                    "dspark fixup head {:?}/{:?} unsupported (expected the vanilla markov head)",
+                    v.get("dspark_fixup_head_type"),
+                    v.get("markov_head_type")
+                )));
+            }
+            Some(
+                v["dspark_markov_rank"]
+                    .as_u64()
+                    .or_else(|| v["markov_rank"].as_u64())
+                    .ok_or_else(|| miss("dspark_markov_rank"))? as usize,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             n_layers: u("num_hidden_layers")?,
             hidden: u("hidden_size")?,
@@ -482,14 +768,14 @@ impl NemotronDflashConfig {
                         .ok_or_else(|| miss("target_layer_ids entry"))
                 })
                 .collect::<Result<_, _>>()?,
-            rope_theta: rp["rope_theta"]
-                .as_f64()
-                .ok_or_else(|| miss("rope_theta"))? as f32,
-            rope_factor: rp["factor"].as_f64().ok_or_else(|| miss("rope factor"))? as f32,
-            rope_orig: rp["original_max_position_embeddings"]
-                .as_u64()
-                .ok_or_else(|| miss("rope original_max_position_embeddings"))?
-                as usize,
+            rope_theta,
+            rope_factor,
+            rope_orig,
+            causal,
+            window,
+            sinks,
+            markov_rank,
+            block_size: v["block_size"].as_u64().map(|b| b as usize),
         })
     }
 }

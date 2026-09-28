@@ -62,6 +62,16 @@ impl GpuExecutor {
         self.kernels.q4x_qsa_logits.is_some() && self.kernels.q4x_qsa_topk.is_some()
     }
 
+    /// True when the pack carries every paged twin of the QSA cache and
+    /// attention ops (slots 692-696).
+    pub fn has_qsa_paged(&self) -> bool {
+        self.kernels.q4x_idx_store_paged.is_some()
+            && self.kernels.q4x_qsa_logits_paged.is_some()
+            && self.kernels.q4x_qsa_logits_mma_paged.is_some()
+            && self.kernels.q4x_qsa_attn_paged.is_some()
+            && self.kernels.q4x_qsa_attn_mma_paged.is_some()
+    }
+
     /// True when the pack carries the QSA indexer ops (slots 661-663).
     pub fn has_qsa_indexer(&self) -> bool {
         self.kernels.q4x_idx_q.is_some()
@@ -428,6 +438,197 @@ impl GpuExecutor {
                 nkv as u32,
                 hd as u32,
                 splits as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Paged twin of [`Self::q4x_idx_store`] (slot 692): the compressed
+    /// cache rides the KV pool's block ids - a 16-token page holds `16/cr`
+    /// rows, so block `b` of slot `s` is row
+    /// `block_tables[s*bps + b/(16/cr)]*(16/cr) + b%(16/cr)` of `cache`
+    /// ([n_blocks*16/cr, hd] bf16). The ring stays per slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_idx_store_paged(
+        &self,
+        raw: &CudaSlice<f32>,
+        stage: &CudaSlice<f32>,
+        pos: &CudaSlice<u32>,
+        slots: &CudaSlice<u32>,
+        cache: &mut CudaSlice<half::bf16>,
+        ring: &mut CudaSlice<f32>,
+        block_tables: &CudaSlice<u32>,
+        blocks_per_slot: usize,
+        rows: usize,
+        hd: usize,
+        ld: usize,
+        koff: usize,
+        ring_len: usize,
+        cr: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_idx_store_paged
+            .ok_or(GpuError::MissingOp("q4x_idx_store_paged"))?;
+        let (rp, _g1) = raw.device_ptr(&self.stream);
+        let (sp, _g2) = stage.device_ptr(&self.stream);
+        let (pp, _g3) = pos.device_ptr(&self.stream);
+        let (lp, _g4) = slots.device_ptr(&self.stream);
+        let (cp, _g5) = cache.device_ptr_mut(&self.stream);
+        let (gp, _g6) = ring.device_ptr_mut(&self.stream);
+        let (bp, _g7) = block_tables.device_ptr(&self.stream);
+        // SAFETY: ABI contract (slot 692); shapes are the caller's
+        check(unsafe {
+            f(
+                rp as *const _,
+                sp as *const _,
+                pp as *const _,
+                lp as *const _,
+                cp as *mut _,
+                gp as *mut _,
+                bp as *const _,
+                blocks_per_slot as u32,
+                rows as u32,
+                hd as u32,
+                ld as u32,
+                koff as u32,
+                ring_len as u32,
+                cr as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Paged twin of [`Self::q4x_qsa_logits`] (slots 693 / 694 by `route`):
+    /// keys from the paged compressed cache; `cap` stays the scores' row
+    /// stride and the grid's block extent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_qsa_logits_paged(
+        &self,
+        route: QsaRoute,
+        q: &CudaSlice<f32>,
+        cache: &CudaSlice<half::bf16>,
+        pos: &CudaSlice<u32>,
+        slots: &CudaSlice<u32>,
+        block_tables: &CudaSlice<u32>,
+        blocks_per_slot: usize,
+        scores: &mut CudaSlice<f32>,
+        row0: usize,
+        rows: usize,
+        heads: usize,
+        hd: usize,
+        cap: usize,
+        cr: usize,
+        k: usize,
+    ) -> Result<(), GpuError> {
+        let f = match route {
+            QsaRoute::Simt => self
+                .kernels
+                .q4x_qsa_logits_paged
+                .ok_or(GpuError::MissingOp("q4x_qsa_logits_paged"))?,
+            QsaRoute::Mma => self
+                .kernels
+                .q4x_qsa_logits_mma_paged
+                .ok_or(GpuError::MissingOp("q4x_qsa_logits_mma_paged"))?,
+        };
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (cp, _g2) = cache.device_ptr(&self.stream);
+        let (pp, _g3) = pos.device_ptr(&self.stream);
+        let (lp, _g4) = slots.device_ptr(&self.stream);
+        let (bp, _g5) = block_tables.device_ptr(&self.stream);
+        let (sp, _g6) = scores.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slots 693 / 694); shapes are the caller's
+        check(unsafe {
+            f(
+                qp as *const _,
+                cp as *const _,
+                pp as *const _,
+                lp as *const _,
+                bp as *const _,
+                blocks_per_slot as u32,
+                sp as *mut _,
+                row0 as u32,
+                rows as u32,
+                heads as u32,
+                hd as u32,
+                cap as u32,
+                cr as u32,
+                k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Paged twin of [`Self::q4x_qsa_attn`] (slots 695 / 696 by `route`):
+    /// `pool_k` / `pool_v` are the block pool [n_blocks, 16, nkv*hd].
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_qsa_attn_paged(
+        &self,
+        route: QsaRoute,
+        q: &CudaSlice<f32>,
+        pool_k: &CudaSlice<u8>,
+        pool_v: &CudaSlice<u8>,
+        pos: &CudaSlice<u32>,
+        slots: &CudaSlice<u32>,
+        block_tables: &CudaSlice<u32>,
+        blocks_per_slot: usize,
+        sel: &CudaSlice<u32>,
+        cnt: &CudaSlice<u32>,
+        part_o: &mut CudaSlice<f32>,
+        part_ml: &mut CudaSlice<f32>,
+        rows: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        k: usize,
+        cr: usize,
+        splits: usize,
+        scale: f32,
+        kv_dtype: KvDtype,
+    ) -> Result<(), GpuError> {
+        let f = match route {
+            QsaRoute::Simt => self
+                .kernels
+                .q4x_qsa_attn_paged
+                .ok_or(GpuError::MissingOp("q4x_qsa_attn_paged"))?,
+            QsaRoute::Mma => self
+                .kernels
+                .q4x_qsa_attn_mma_paged
+                .ok_or(GpuError::MissingOp("q4x_qsa_attn_mma_paged"))?,
+        };
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = pool_k.device_ptr(&self.stream);
+        let (vp, _g3) = pool_v.device_ptr(&self.stream);
+        let (pp, _g4) = pos.device_ptr(&self.stream);
+        let (lp, _g5) = slots.device_ptr(&self.stream);
+        let (bp, _g6) = block_tables.device_ptr(&self.stream);
+        let (sp, _g7) = sel.device_ptr(&self.stream);
+        let (np, _g8) = cnt.device_ptr(&self.stream);
+        let (op, _g9) = part_o.device_ptr_mut(&self.stream);
+        let (mp, _g10) = part_ml.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slots 695 / 696); shapes are the caller's
+        check(unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                pp as *const _,
+                lp as *const _,
+                bp as *const _,
+                blocks_per_slot as u32,
+                sp as *const _,
+                np as *const _,
+                op as *mut _,
+                mp as *mut _,
+                rows as u32,
+                nh as u32,
+                nkv as u32,
+                hd as u32,
+                k as u32,
+                cr as u32,
+                splits as u32,
+                scale,
+                kv_dtype as u32,
                 self.stream_ptr(),
             )
         })

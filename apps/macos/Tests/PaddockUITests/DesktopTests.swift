@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import PaddockClient
+import PaddockConversationCore
 import PaddockStudio
 import Testing
 
@@ -8,6 +9,31 @@ import Testing
 
 @Suite("OS integration policy", .serialized, .timeLimit(.minutes(2))) @MainActor
 struct DesktopTests {
+  @Test func readerEndpointOpensReadsAndPreservesBothDrafts() async throws {
+    let model = WorkspaceModel(client: DesktopReaderCore())
+    model.draft.message = "Keep the chat draft"
+    model.reads.api = { path, _, _, _ in
+      let json: String
+      if path == "api/runners" {
+        json = #"[{"port":12345,"reader":"laya"}]"#
+      } else if path.hasSuffix("/server") {
+        json =
+          #"{"structured_read":{"backend":"laya","max_samples":1,"checkpoints":[{"name":"english"}]}}"#
+      } else {
+        json = "[]"
+      }
+      return try JSONDecoder().decode(ConversationValue.self, from: Data(json.utf8))
+    }
+    await model.refresh()
+    await model.handleDesktopRequest(.init(.chat(port: 12345)))
+    #expect(model.navigation.studio == .reads && model.reads.port == 12345)
+    #expect(model.desktopError == nil && model.draft.message == "Keep the chat draft")
+    model.reads.draft.state = "Keep the read draft"
+    model.reads.port = 12346
+    await model.handleDesktopRequest(.init(.chat(port: 12345)))
+    #expect(model.reads.port == 12346 && model.reads.draft.state == "Keep the read draft")
+    #expect(model.desktopError?.contains("Nothing was discarded") == true)
+  }
   @Test func inventoryRestorationAndNormalPollingAreSilent() throws {
     var tracker = DesktopEventTracker()
     let snapshot = try endpointFixture()
@@ -205,6 +231,19 @@ struct DesktopTests {
 private struct DesktopNoCore: ManagerLoading {
   func snapshot() async throws -> ManagerSnapshot {
     throw ManagerError.core("Synthetic unavailable core")
+  }
+}
+private struct DesktopReaderCore: ManagerLoading {
+  func snapshot() async throws -> ManagerSnapshot {
+    let base = try endpointFixture()
+    return try ManagerSnapshot(
+      identity: base.identity, readiness: base.readiness, catalog: base.catalog,
+      runners: ManagerWire.decode(
+        [RunnerInfo].self,
+        from: Data(
+          #"[{"port":12345,"pid":42,"status":"ok","reader":"laya","endpoint":"http://127.0.0.1:12345"}]"#
+            .utf8)),
+      servers: [])
   }
 }
 private actor QuitFixture: ManagerLoading {

@@ -83,7 +83,7 @@ fn flash_next_mlx_teacher_forced_margins() {
     // Both the retained 128-row gate and the wide-prefill candidate can be
     // checked against their actual same-checkpoint upstream chunk contract.
     let chunk = reference["chunk"].as_u64().unwrap() as usize;
-    assert!([CHUNK, 512, MLX_CHUNK].contains(&chunk));
+    assert!([CHUNK, 256, 512, MLX_CHUNK].contains(&chunk));
     let mut m = FlashNext::load(Path::new(&path), 2048, 4, None).unwrap();
     m.chunk = chunk;
     for case in reference["cases"].as_array().unwrap() {
@@ -464,7 +464,7 @@ fn checked_full_model_memory_bounds() {
         assert!(FlashNext::memory(ctx, batch).is_err());
         assert!(FlashNext::memory_rows(ctx, batch, MLX_CHUNK).is_err());
     }
-    for rows in [0, MLX_CHUNK + 1, usize::MAX] {
+    for rows in [0, super::super::affine::MAX_ROWS + 1, usize::MAX] {
         assert!(FlashNext::memory_rows(4096, 4, rows).is_err());
     }
     for (ctx, batch) in [(1, 1), (4096, 4), (262144, 64)] {
@@ -481,23 +481,1492 @@ fn checked_full_model_memory_bounds() {
 }
 
 #[test]
+#[ignore = "read-only capacity diagnostic; requires the elected MLX checkpoint headers"]
+fn mlx_agent_context_capacity_plan() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").expect("MLX model directory");
+    let plan = super::super::mlx::FlashNextMlxPlan::inspect(Path::new(&path)).unwrap();
+    for batch in [1, 4] {
+        for context in [4096, 8192, 12288, 16384, 24576, 32768] {
+            for rows in [MLX_CHUNK, 512, 256, CHUNK] {
+                let (cache, scratch) = FlashNext::mlx_memory_rows(context, batch, rows).unwrap();
+                let scratch = scratch + super::super::affine::workspace_bytes(rows) as u64;
+                for entries in [2 * batch, batch, 0] {
+                    let prefix_bytes = prefix::PrefixCache::bytes(context, entries);
+                    let required = plan.resident_weight_bytes + cache + scratch + prefix_bytes;
+                    eprintln!(
+                        "FLASH_AGENT_PLAN context={context} batch={batch} rows={rows} entries={entries} weights={} cache={cache} prefix={prefix_bytes} scratch={scratch} required={required}",
+                        plan.resident_weight_bytes
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "112 GB complete-state prefix replay; external memory watchdog required"]
+fn flash_next_mlx_prefix_reuse_preserves_complete_state() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("positive budget bytes"));
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, budget).unwrap();
+    eprintln!(
+        "FLASH_PREFIX_CAPACITY rows={} allocated={}",
+        m.chunk,
+        m.device.allocated_bytes()
+    );
+    let allocated = m.device.allocated_bytes();
+    let prompt = |branch: u32, n: usize| {
+        (0..n)
+            .map(|i| {
+                if i % 257 == 0 {
+                    248044
+                } else {
+                    100 + (i as u32 * 7 + branch * 113) % 16000
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    // Cross-slot restores on both sides of logical and sparse-index boundaries.
+    // Full-vocabulary F32 equality, plus teacher-forced decode, validates every
+    // carried state rather than accepting merely the same first greedy token.
+    for n in [m.chunk + 1, m.chunk + 17, 2307] {
+        let tokens = prompt(1, n);
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        // Disable capture as well as lookup for the cold reference, retaining
+        // the same allocated capacity and arithmetic shape. This also tests
+        // whether introducing the backup-page cut changes cold computation.
+        let prefix = std::mem::take(&mut m.prefix);
+        let start = std::time::Instant::now();
+        let mut cold = vec![m.prefill(0, &tokens).unwrap()];
+        let cold_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(m.take_prefill_reused(0), 0);
+        for t in [321, 248044, 753, 902] {
+            cold.push(m.forward(t).unwrap());
+        }
+        m.prefix = prefix;
+        m.reset();
+        assert_eq!(
+            m.prefill(0, &tokens).unwrap(),
+            cold[0],
+            "capture changed cold logits"
+        );
+        m.reset();
+        let reused = prefix::cuts(tokens.len(), m.chunk)[1];
+        let start = std::time::Instant::now();
+        let warm = m.prefill(2, &tokens).unwrap();
+        let warm_ms = start.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(m.take_prefill_reused(2), reused);
+        assert_eq!(m.take_prefill_reused(2), 0);
+        assert_eq!(warm, cold[0], "prefix changed complete logits at {n}");
+        for (i, t) in [321, 248044, 753, 902].into_iter().enumerate() {
+            let pos = m.slots[2].length as u32;
+            assert_eq!(m.execute(&[(2, t, pos)], &[0]).unwrap(), cold[i + 1]);
+        }
+        if n == 2307 {
+            let mut edited = tokens.clone();
+            edited[reused - 1] = 1337;
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            let expected = m.prefill(0, &edited).unwrap();
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            m.prefill(0, &tokens).unwrap();
+            m.reset();
+            assert_eq!(m.prefill(3, &edited).unwrap(), expected);
+            assert_eq!(
+                m.take_prefill_reused(3),
+                prefix::cuts(tokens.len(), m.chunk)[0]
+            );
+            // Re-establish the original branch for the cancellation gate.
+            m.prefill(0, &tokens).unwrap();
+        }
+        // Cancellation must not lose validated snapshots, and scheduler slicing
+        // a restored suffix must keep the cold prompt's original shape contract.
+        m.prefill_begin(3, tokens.clone()).unwrap();
+        assert_eq!(m.take_prefill_reused(3), reused);
+        assert!(m.prefill_abort(3));
+        m.prefill_begin(1, tokens.clone()).unwrap();
+        assert_eq!(m.take_prefill_reused(1), reused);
+        let mut ticks = 0;
+        loop {
+            let (_, completed) = m.forward_mixed(&[], [1, 13, 32, 63][ticks % 4]).unwrap();
+            ticks += 1;
+            assert!(ticks < 128);
+            if let Some((_, logits, used)) = completed.into_iter().find(|v| v.0 == 1) {
+                assert_eq!(used, n);
+                assert_eq!(
+                    logits, cold[0],
+                    "sliced prefix suffix changed logits at {n}"
+                );
+                break;
+            }
+        }
+        assert_eq!(m.device.allocated_bytes(), allocated);
+        eprintln!(
+            "FLASH_PREFIX_EXACT prompt={n} reused={reused} cold_ms={cold_ms:.3} warm_ms={warm_ms:.3} vocabulary={VOCAB} decode_steps=4"
+        );
+    }
+    // Distinct conversations fill the pool; one advancing agent must not
+    // displace the other waiting conversations' latest checkpoints.
+    m.reset();
+    m.prefix.clear(&mut m.pool);
+    let mut prompts = (0..4).map(|i| prompt(i, m.chunk + 17)).collect::<Vec<_>>();
+    let mut references = Vec::new();
+    for (i, tokens) in prompts.iter().enumerate() {
+        references.push(m.prefill(i, tokens).unwrap());
+    }
+    for _ in 0..3 {
+        prompts[0].extend([33; 512]);
+        m.prefill(0, &prompts[0]).unwrap();
+    }
+    m.reset();
+    for i in 1..4 {
+        assert_eq!(m.prefill(i, &prompts[i]).unwrap(), references[i]);
+        assert!(m.take_prefill_reused(i) > 0, "fast branch evicted peer {i}");
+    }
+    assert_eq!(allocated, m.device.allocated_bytes());
+    m.reset();
+    m.prefix.clear(&mut m.pool);
+    assert_eq!(m.pool.free_blocks(), m.pool.capacity() as usize);
+    m.poisoned = true;
+    assert!(
+        m.prepare(0, &prompts[0]).is_err(),
+        "poison is not a cache miss"
+    );
+}
+
+#[test]
+#[ignore = "112 GB natural-generation cache gate; elected model, prefix fixtures and watchdog required"]
+fn flash_next_mlx_prefix_natural_generations_and_arrivals() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let prompts = fixtures["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            v["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 4);
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("positive budget bytes"));
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, budget).unwrap();
+    eprintln!(
+        "FLASH_PREFIX_CAPACITY rows={} allocated={}",
+        m.chunk,
+        m.device.allocated_bytes()
+    );
+    let allocated = m.device.allocated_bytes();
+    let argmax = |logits: &[f32]| {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
+            .unwrap()
+            .0 as u32
+    };
+    let ended = |t: u32| [248044, 248046].contains(&t);
+    let mut reference = Vec::new();
+    for prompt in &prompts {
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let prefix = std::mem::take(&mut m.prefix);
+        let mut logits = m.prefill(0, prompt).unwrap();
+        assert_eq!(
+            m.take_prefill_reused(0),
+            0,
+            "fixture prefixes must be distinct"
+        );
+        let mut tokens = Vec::new();
+        for _ in 0..64 {
+            let t = argmax(&logits);
+            tokens.push(t);
+            if ended(t) {
+                break;
+            }
+            logits = m.forward(t).unwrap();
+        }
+        assert!(
+            ended(*tokens.last().unwrap()),
+            "a capped generation is not a natural-EOS gate"
+        );
+        reference.push(tokens);
+        m.prefix = prefix;
+    }
+    for warm in [false, true] {
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        if warm {
+            for (slot, prompt) in prompts.iter().enumerate() {
+                let logits = m.prefill(slot, prompt).unwrap();
+                assert_eq!(
+                    argmax(&logits),
+                    reference[slot][0],
+                    "capture changed first token"
+                );
+            }
+        }
+        m.reset();
+        let mut actual = vec![Vec::new(); 4];
+        let mut ready = [false; 4];
+        // The fourth client arrives late, after the first cohort starts processing.
+        for (slot, prompt) in prompts.iter().enumerate().take(3) {
+            m.prefill_begin(slot, prompt.clone()).unwrap();
+            assert_eq!(
+                m.take_prefill_reused(slot),
+                if warm {
+                    prefix::cuts(prompt.len(), m.chunk)[1]
+                } else {
+                    0
+                }
+            );
+        }
+        for tick in 0..512 {
+            if tick == 2 {
+                m.prefill_begin(3, prompts[3].clone()).unwrap();
+                assert_eq!(m.take_prefill_reused(3) > 0, warm);
+                assert!(m.prefill_abort(3));
+                m.prefill_begin(3, prompts[3].clone()).unwrap();
+                assert_eq!(m.take_prefill_reused(3) > 0, warm);
+            }
+            let decodes = (0..4)
+                .filter_map(|slot| {
+                    let &token = actual[slot].last()?;
+                    (ready[slot] && !ended(token)).then_some((
+                        slot,
+                        token,
+                        m.slots[slot].length as u32,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let budget = if warm {
+                [13, 128, 512]
+            } else {
+                [m.capacity, 511, 33]
+            };
+            let (logits, complete) = m.forward_mixed(&decodes, budget[tick % 3]).unwrap();
+            for (i, &(slot, _, _)) in decodes.iter().enumerate() {
+                actual[slot].push(argmax(&logits[i * VOCAB..(i + 1) * VOCAB]));
+            }
+            for (slot, logits, rows) in complete {
+                assert_eq!(rows, prompts[slot].len());
+                actual[slot].push(argmax(&logits));
+                ready[slot] = true;
+            }
+            assert!(actual.iter().all(|v| v.len() <= 64));
+            assert_eq!(allocated, m.device.allocated_bytes());
+            if actual.iter().all(|v| v.last().is_some_and(|&t| ended(t))) {
+                break;
+            }
+        }
+        assert_eq!(
+            actual, reference,
+            "restores/late arrivals changed complete generations"
+        );
+        eprintln!(
+            "FLASH_PREFIX_NATURAL warm={warm} exact=4/4 natural_eos=true late_arrival=true cancellation=true"
+        );
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; exact full logits and alternating execution cost, not serving throughput"]
+fn flash_next_mlx_coalesced_packed_execution() {
+    use super::super::{affine, deltanet, moe};
+    let controls = |route| {
+        affine::SEPARATE_SPANS_FOR_TEST.with(|v| v.set(route == 0));
+        deltanet::BASELINE_RECURRENT_FOR_TEST.with(|v| v.set(route < 2));
+        moe::BASELINE_EXPERT_TAIL_FOR_TEST.with(|v| v.set(route < 3));
+        affine::INLINE_INPUT_FOR_TEST.with(|v| v.set(route < 4));
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            affine::SEPARATE_SPANS_FOR_TEST.with(|v| v.set(false));
+            deltanet::BASELINE_RECURRENT_FOR_TEST.with(|v| v.set(false));
+            moe::BASELINE_EXPERT_TAIL_FOR_TEST.with(|v| v.set(false));
+            affine::INLINE_INPUT_FOR_TEST.with(|v| v.set(false));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    assert_eq!(m.chunk, 1024);
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut expected = None;
+        let mut times = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for round in 0..3 {
+            for i in 0..5 {
+                let route = (i + round) % 5;
+                controls(route);
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                let mut gpu = 0.;
+                let mut logits = Vec::new();
+                let step = 1024 / slots;
+                for offset in (0..2048).step_by(step) {
+                    let rows = (0..slots)
+                        .flat_map(|slot| {
+                            (offset..offset + step)
+                                .map(move |p| (slot, 1000 + p as u32 + slot as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    let output = if offset + step == 2048 {
+                        (0..slots).map(|s| (s + 1) * step - 1).collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    };
+                    let result = m
+                        .execute_contracts(&rows, &output, Some(&vec![1024; slots]))
+                        .unwrap();
+                    gpu += m.last_gpu_seconds;
+                    logits.extend(result.into_iter().map(f32::to_bits));
+                }
+                times[route].push(gpu);
+                for pos in 2048..2051 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 23 + s as u32, pos))
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                }
+                if let Some(reference) = &expected {
+                    assert!(
+                        &logits == reference,
+                        "changed full-vocabulary prefill/continuation: c={slots} round={round} route={route}"
+                    );
+                } else {
+                    expected = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_COALESCED_PACKED_SAMPLE c={slots} round={round} route={route} gpu_s={gpu}"
+                );
+            }
+        }
+        eprintln!(
+            "FLASH_COALESCED_PACKED {}",
+            serde_json::json!({"slots":slots,"gpu_seconds":times,"full_logits_exact":true})
+        );
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; physical 1024/2048 rows, unchanged logical arithmetic, full logits and cost"]
+fn flash_next_mlx_wide_batch_execution_cost() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            mlx_load::WIDE_BATCH_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    mlx_load::WIDE_BATCH_FOR_TEST.with(|v| v.set(true));
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let prompts = fixtures["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(s, p)| {
+            p["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cycle()
+                .take(4096 + s * 17)
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut m = FlashNext::load(Path::new(&path), 8192, 4, Some(budget)).unwrap();
+    assert_eq!((m.capacity, m.chunk), (2048, 1024));
+    let allocated = m.device.allocated_bytes();
+    let _prefix = std::mem::take(&mut m.prefix);
+    m.prefill(0, &prompts[0]).unwrap();
+    let mut reference = None;
+    for round in 0..3 {
+        for index in 0..2 {
+            let capacity = if (round + index) % 2 == 0 { 1024 } else { 2048 };
+            m.capacity = capacity;
+            m.reset();
+            for (slot, prompt) in prompts.iter().enumerate() {
+                m.prefill_begin(slot, prompt.clone()).unwrap();
+            }
+            let started = std::time::Instant::now();
+            let mut gpu = 0.;
+            let mut ticks = 0;
+            let mut first = [0.; 4];
+            let mut last = [0.; 4];
+            let mut gaps = Vec::new();
+            let mut steps = [0; 4];
+            let mut logits = vec![Vec::new(); 4];
+            for _ in 0..512 {
+                let decodes = (0..4)
+                    .filter(|&s| (1..=16).contains(&steps[s]))
+                    .map(|s| (s, 100 + s as u32 * 17 + steps[s], m.slots[s].length as u32))
+                    .collect::<Vec<_>>();
+                let (out, complete) = m.forward_mixed(&decodes, capacity).unwrap();
+                gpu += m.last_gpu_seconds;
+                ticks += 1;
+                let elapsed = started.elapsed().as_secs_f64();
+                for (i, &(s, _, _)) in decodes.iter().enumerate() {
+                    logits[s].extend(out[i * VOCAB..(i + 1) * VOCAB].iter().map(|v| v.to_bits()));
+                    gaps.push(elapsed - last[s]);
+                    last[s] = elapsed;
+                    steps[s] += 1;
+                }
+                for (s, out, _) in complete {
+                    logits[s].extend(out.into_iter().map(f32::to_bits));
+                    first[s] = elapsed;
+                    last[s] = elapsed;
+                    steps[s] = 1;
+                }
+                if steps.iter().all(|&v| v == 17) {
+                    break;
+                }
+            }
+            assert_eq!(steps, [17; 4]);
+            if let Some(expected) = &reference {
+                assert!(
+                    &logits == expected,
+                    "wide physical pass changed full logits"
+                );
+            } else {
+                reference = Some(logits);
+            }
+            assert_eq!(allocated, m.device.allocated_bytes());
+            gaps.sort_by(f64::total_cmp);
+            eprintln!(
+                "FLASH_WIDE_PHYSICAL {}",
+                serde_json::json!({"round":round,"capacity":capacity,
+                "gpu_seconds":gpu,"seconds":started.elapsed().as_secs_f64(),"first_seconds":first,
+                "max_gap_s":gaps.last(),"ticks":ticks,"allocated_bytes":allocated,"full_logits_exact":true})
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; natural complete generations, restores, late arrivals and cancellation at 2048 physical rows"]
+fn flash_next_mlx_wide_batch_generation_and_cache_parity() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            mlx_load::WIDE_BATCH_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    mlx_load::WIDE_BATCH_FOR_TEST.with(|v| v.set(true));
+    flash_next_mlx_prefix_natural_generations_and_arrivals();
+    flash_next_mlx_prefix_reuse_preserves_complete_state();
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; on-chip decode attention cost and exact full-vocabulary continuations"]
+fn flash_next_mlx_local_attention_execution_cost() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            qsa::LOCAL_ATTENTION_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let prompts = fixtures["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            p["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut m = FlashNext::load(Path::new(&path), 8192, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for batch in [1, 4] {
+        let mut reference: Option<Vec<Vec<u32>>> = None;
+        for round in 0..3 {
+            for turn in 0..2 {
+                let local = (round + turn) % 2 == 1;
+                qsa::LOCAL_ATTENTION_FOR_TEST.with(|v| v.set(local));
+                m.reset();
+                let mut logits = Vec::new();
+                for (slot, prompt) in prompts.iter().enumerate().take(batch) {
+                    logits.push(
+                        m.prefill(slot, prompt)
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                let started = std::time::Instant::now();
+                let mut gpu = Vec::new();
+                for step in 0..32 {
+                    let rows = (0..batch)
+                        .map(|slot| {
+                            (
+                                slot,
+                                100 + slot as u32 * 17 + step,
+                                m.slots[slot].length as u32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let out = m.execute(&rows, &(0..batch).collect::<Vec<_>>()).unwrap();
+                    gpu.push(m.last_gpu_seconds);
+                    logits.push(out.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+                }
+                let wall = started.elapsed().as_secs_f64();
+                if let Some(expected) = &reference {
+                    assert!(
+                        expected == &logits,
+                        "local attention changed full logits: c={batch} local={local}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(m.device.allocated_bytes(), allocated);
+                eprintln!(
+                    "FLASH_LOCAL_ATTENTION {}",
+                    serde_json::json!({"batch":batch,"round":round,"local":local,
+                    "wall_seconds":wall,"gpu_seconds":gpu,"allocated_bytes":allocated,"full_logits_exact":true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint, prefix fixtures and watchdog; fixed-work admission cost with exact vocabulary checks"]
+fn flash_next_mlx_admission_execution_cost() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            serving::POLICY_FOR_TEST.with(|v| v.set(0));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let prompts = fixtures["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(slot, p)| {
+            p["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cycle()
+                .take(4096 + slot * 17)
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 4);
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 8192, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    m.prefix.clear(&mut m.pool);
+    let _prefix = std::mem::take(&mut m.prefix);
+    let mut reference = None;
+    for round in 0..2 {
+        for index in 0..3 {
+            let policy = (index + round) % 3;
+            serving::POLICY_FOR_TEST.with(|v| v.set(policy));
+            m.reset();
+            for (slot, prompt) in prompts.iter().enumerate() {
+                m.prefill_begin(slot, prompt.clone()).unwrap();
+            }
+            let started = std::time::Instant::now();
+            let mut gpu = 0.;
+            let mut first = [0.; 4];
+            let mut last = [0.; 4];
+            let mut gaps = Vec::new();
+            let mut logits = vec![Vec::new(); 4];
+            let mut steps = [0; 4];
+            for _ in 0..512 {
+                let decodes = (0..4)
+                    .filter(|&s| (1..=16).contains(&steps[s]))
+                    .map(|s| (s, 100 + s as u32 * 17 + steps[s], m.slots[s].length as u32))
+                    .collect::<Vec<_>>();
+                let (out, complete) = m.forward_mixed(&decodes, m.chunk).unwrap();
+                gpu += m.last_gpu_seconds;
+                let elapsed = started.elapsed().as_secs_f64();
+                for (i, &(s, _, _)) in decodes.iter().enumerate() {
+                    logits[s].extend(out[i * VOCAB..(i + 1) * VOCAB].iter().map(|v| v.to_bits()));
+                    gaps.push(elapsed - last[s]);
+                    last[s] = elapsed;
+                    steps[s] += 1;
+                }
+                for (s, out, _) in complete {
+                    logits[s].extend(out.into_iter().map(f32::to_bits));
+                    first[s] = elapsed;
+                    last[s] = elapsed;
+                    steps[s] = 1;
+                }
+                if steps.iter().all(|&n| n == 17) {
+                    break;
+                }
+            }
+            assert_eq!(steps, [17; 4]);
+            if let Some(reference) = &reference {
+                assert!(
+                    &logits == reference,
+                    "admission changed full-vocabulary state: policy={policy} round={round}"
+                );
+            } else {
+                reference = Some(logits);
+            }
+            assert_eq!(allocated, m.device.allocated_bytes());
+            gaps.sort_by(f64::total_cmp);
+            eprintln!(
+                "FLASH_ADMISSION {}",
+                serde_json::json!({"round":round,"policy":policy,
+                "seconds":started.elapsed().as_secs_f64(),"gpu_seconds":gpu,"first_seconds":first,
+                "max_gap_s":gaps.last(),"p99_gap_s":gaps[gaps.len()*99/100],"full_logits_exact":true})
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; fixed ragged projection cost and exact full-vocabulary continuations"]
+fn flash_next_mlx_compatible_spans_execution_cost() {
+    use super::super::affine;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            affine::SHAPE_ONLY_SPANS_FOR_TEST.with(|v| v.set(false));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 2048, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    let mut reference = None;
+    for round in 0..3 {
+        for i in 0..2 {
+            let route = (i + round) % 2;
+            affine::SHAPE_ONLY_SPANS_FOR_TEST.with(|v| v.set(route == 0));
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            let started = std::time::Instant::now();
+            let mut gpu = 0.;
+            let mut logits = Vec::new();
+            for offset in (0..512).step_by(32) {
+                let rows = (0..4)
+                    .flat_map(|s| {
+                        (offset..offset + 32)
+                            .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                    })
+                    .collect::<Vec<_>>();
+                let outputs = if offset == 480 {
+                    vec![31, 63, 95, 127]
+                } else {
+                    vec![]
+                };
+                logits.extend(
+                    m.execute_contracts(&rows, &outputs, Some(&[700, 750, 800, 1024]))
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits),
+                );
+                gpu += m.last_gpu_seconds;
+            }
+            for pos in 512..516 {
+                let rows = (0..4).map(|s| (s, 23 + s as u32, pos)).collect::<Vec<_>>();
+                logits.extend(
+                    m.execute_contracts(&rows, &[0, 1, 2, 3], Some(&[1; 4]))
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits),
+                );
+                gpu += m.last_gpu_seconds;
+            }
+            if let Some(reference) = &reference {
+                assert!(
+                    &logits == reference,
+                    "compatible span merge changed logits: round={round} route={route}"
+                );
+            } else {
+                reference = Some(logits);
+            }
+            assert_eq!(allocated, m.device.allocated_bytes());
+            eprintln!(
+                "FLASH_COMPATIBLE_SPANS {}",
+                serde_json::json!({"round":round,"route":route,
+                "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),"full_logits_exact":true})
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; fused expert gate/up complete vocabulary and GPU execution A/B"]
+fn flash_next_mlx_fused_gate_up_execution_cost() {
+    use super::super::moe;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            moe::FUSED_GATE_UP_FOR_TEST.with(|v| v.set(0));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut reference = None;
+        for round in 0..3 {
+            for index in 0..3 {
+                let fused = (round + index) % 3;
+                moe::FUSED_GATE_UP_FOR_TEST.with(|v| v.set(fused));
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                let started = std::time::Instant::now();
+                let mut gpu = 0.;
+                let mut logits = Vec::new();
+                let step = 1024 / slots;
+                for offset in (0..2048).step_by(step) {
+                    let rows = (0..slots)
+                        .flat_map(|s| {
+                            (offset..offset + step)
+                                .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    let outputs = if offset + step == 2048 {
+                        (0..slots).map(|s| (s + 1) * step - 1).collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    };
+                    logits.extend(
+                        m.execute_contracts(&rows, &outputs, Some(&vec![1024; slots]))
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                for pos in 2048..2052 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 23 + s as u32, pos))
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                if let Some(expected) = &reference {
+                    assert!(
+                        &logits == expected,
+                        "fused={fused} slots={slots} round={round}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_FUSED_GATE_UP {}",
+                    serde_json::json!({"slots":slots,"round":round,"fused":fused,
+                    "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),"full_logits_exact":true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; alternating whole-model loader costs and exact full logits"]
+fn flash_next_mlx_projection_loader_execution_cost() {
+    use super::super::{affine, moe};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            moe::EXPERT_LOADER_FOR_TEST.with(|v| v.set(2));
+            affine::PLAIN_DENSE_FOR_TEST.with(|v| v.set(false));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut reference = None;
+        for round in 0..3 {
+            for index in 0..3 {
+                let route = (index + round) % 3;
+                moe::EXPERT_LOADER_FOR_TEST.with(|v| v.set(if route == 0 { 0 } else { 2 }));
+                affine::PLAIN_DENSE_FOR_TEST.with(|v| v.set(route < 2));
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                let started = std::time::Instant::now();
+                let mut gpu = 0.;
+                let mut logits = Vec::new();
+                let step = 1024 / slots;
+                for offset in (0..2048).step_by(step) {
+                    let rows = (0..slots)
+                        .flat_map(|s| {
+                            (offset..offset + step)
+                                .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    let outputs = if offset + step == 2048 {
+                        (0..slots).map(|s| (s + 1) * step - 1).collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    };
+                    logits.extend(
+                        m.execute_contracts(&rows, &outputs, Some(&vec![1024; slots]))
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                for pos in 2048..2052 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 23 + s as u32, pos))
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                if let Some(expected) = &reference {
+                    assert!(
+                        &logits == expected,
+                        "projection loader changed logits: c={slots} round={round} route={route}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_PROJECTION_LOADER {}",
+                    serde_json::json!({"slots":slots,
+                    "round":round, "route":route, "gpu_seconds":gpu,
+                    "wall_seconds":started.elapsed().as_secs_f64(), "full_logits_exact":true})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; staged projections/padded attention full-logit parity and rotated costs"]
+fn flash_next_mlx_prefill_optimization_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::Staging, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; gathered attention full-logit parity and rotated costs"]
+fn flash_next_mlx_attention_gather_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::AttentionGather, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long prefill gathered attention exact logits and rotated costs"]
+fn flash_next_mlx_attention_gather_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::AttentionGather, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; padded projections exact long-prefill logits and rotated costs"]
+fn flash_next_mlx_projection_padding_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::ProjectionPadding, true);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrefillOptimization {
+    Staging,
+    AttentionGather,
+    ProjectionPadding,
+}
+
+fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bool) {
+    use super::super::{affine, qsa};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(false));
+            qsa::PADDED_ATTENTION_FOR_TEST.with(|v| v.set(true));
+            qsa::GATHER_ATTENTION_FOR_TEST.with(|v| v.set(true));
+            affine::PADDED_TILES_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let context = if long { 12288 } else { 4096 };
+    let full_tokens = if long { 8192 } else { 2048 };
+    let mut m = FlashNext::load(Path::new(&path), context, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut reference = None;
+        let gather = matches!(comparison, PrefillOptimization::AttentionGather);
+        let projection = matches!(comparison, PrefillOptimization::ProjectionPadding);
+        let routes = if gather || projection { 2 } else { 3 };
+        for round in 0..3 {
+            for index in 0..routes {
+                let route = (index + round) % routes;
+                affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(!gather && !projection && route == 0));
+                affine::PADDED_TILES_FOR_TEST.with(|v| v.set(projection && route == 1));
+                qsa::PADDED_ATTENTION_FOR_TEST.with(|v| v.set(gather || projection || route == 2));
+                qsa::GATHER_ATTENTION_FOR_TEST
+                    .with(|v| v.set(projection || (gather && route == 1)));
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                let started = std::time::Instant::now();
+                let mut gpu = 0.;
+                let mut logits = Vec::new();
+                // First full logical chunks, then a split-K 512-row tail.
+                // Four slots share the full 2048-row physical arena.
+                let step = if slots == 1 { 1024 } else { 512 };
+                for (offset, count, logical) in (0..full_tokens)
+                    .step_by(step)
+                    .map(|offset| (offset, step, 1024))
+                    .chain([(full_tokens, 512, 512)])
+                {
+                    let rows = (0..slots)
+                        .flat_map(|s| {
+                            (offset..offset + count)
+                                .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    let outputs = (0..slots).map(|s| (s + 1) * count - 1).collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute_contracts(&rows, &outputs, Some(&vec![logical; slots]))
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                let prefill_gpu = gpu;
+                for pos in full_tokens as u32 + 512..full_tokens as u32 + 544 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 23 + s as u32, pos))
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                    gpu += m.last_gpu_seconds;
+                }
+                if let Some(expected) = &reference {
+                    assert!(
+                        &logits == expected,
+                        "{comparison:?} changed full logits c={slots} round={round} route={route}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_SPLIT_MODEL {}",
+                    serde_json::json!({"slots":slots,
+                    "round":round,"route":route,"prefill_gpu_seconds":prefill_gpu,
+                    "gather_comparison":gather,"prompt_tokens":full_tokens+512,
+                    "comparison":format!("{comparison:?}"),
+                    "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),
+                    "full_logits_exact":true,"allocated":allocated})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint, watchdog and PADDOCK_METAL_PROFILE; instrumented stage attribution, not serving timing"]
+fn flash_next_mlx_prefill_stage_attribution() {
+    assert!(std::env::var_os("PADDOCK_METAL_PROFILE").is_some());
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    for slots in [1, 4] {
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let step = if slots == 1 { 1024 } else { 512 };
+        for (offset, count, logical) in (0..2048)
+            .step_by(step)
+            .map(|offset| (offset, step, 1024))
+            .chain([(2048, 512, 512)])
+        {
+            let rows = (0..slots)
+                .flat_map(|s| {
+                    (offset..offset + count)
+                        .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "FLASH_STAGE slots={slots} position={offset} rows={} logical={logical}",
+                rows.len()
+            );
+            m.execute_contracts(&rows, &[], Some(&vec![logical; slots]))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; changed logical tail lengths must preserve cold full-vocabulary outputs"]
+fn flash_next_mlx_tail_classes_preserve_cold_logits() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    assert_eq!(m.chunk, 1024);
+    let allocated = m.device.allocated_bytes();
+    for (source_len, target_len, reuse_tail) in [
+        (1700, 1800, true),
+        (1700, 2020, false),
+        (2020, 2200, true),
+        (1800, 1700, true),
+        (1510, 1530, true),
+        (1290, 1510, false),
+        (751, 800, true),
+        (751, 900, false),
+    ] {
+        let prompt = |n: usize| (0..n).map(|i| 1000 + i as u32 % 3000).collect::<Vec<_>>();
+        let source = prompt(source_len);
+        let target = prompt(target_len);
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let prefix = std::mem::take(&mut m.prefix);
+        let mut reference = vec![m.prefill(0, &target).unwrap()];
+        for t in [23, 248044, 42] {
+            reference.push(m.forward(t).unwrap());
+        }
+        m.prefix = prefix;
+        m.reset();
+        m.prefill(0, &source).unwrap();
+        m.reset();
+        let got = m.prefill(3, &target).unwrap();
+        let reused = m.take_prefill_reused(3);
+        let cuts = prefix::cuts(source.len(), m.chunk);
+        // A shorter prompt cannot restore state beyond its own history.
+        let expected = if reuse_tail && cuts[1] < target_len {
+            cuts[1]
+        } else {
+            cuts[0]
+        };
+        assert_eq!(reused, expected, "source={source_len} target={target_len}");
+        assert!(
+            got == reference[0],
+            "tail restore changed cold logits: {source_len}->{target_len}"
+        );
+        for (i, t) in [23, 248044, 42].into_iter().enumerate() {
+            let pos = m.slots[3].length as u32;
+            assert!(
+                m.execute(&[(3, t, pos)], &[0]).unwrap() == reference[i + 1],
+                "tail restore changed continuation {i}: {source_len}->{target_len}"
+            );
+        }
+        assert_eq!(allocated, m.device.allocated_bytes());
+        eprintln!(
+            "FLASH_TAIL_CLASS source={source_len} target={target_len} reused={reused} full_logits_exact=true"
+        );
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; fixed-contract accuracy, complete generations and cross-length cache experiment"]
+fn flash_next_mlx_canonical_prefill_diagnostic() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            serving::CANONICAL_PREFILL_FOR_TEST.with(|v| v.set(false));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    let argmax = |logits: &[f32]| {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
+            .unwrap()
+            .0 as u32
+    };
+    for fixture in fixtures["prompts"].as_array().unwrap() {
+        let tokens = fixture["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        let mut reference: Option<(Vec<f32>, Vec<u32>)> = None;
+        for canonical in [false, true] {
+            serving::CANONICAL_PREFILL_FOR_TEST.with(|v| v.set(canonical));
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            let prefix = std::mem::take(&mut m.prefix);
+            let started = std::time::Instant::now();
+            let mut logits = m.prefill(0, &tokens).unwrap();
+            let prefill_seconds = started.elapsed().as_secs_f64();
+            assert!(logits.iter().all(|v| v.is_finite()));
+            let first = logits.clone();
+            let mut output = Vec::new();
+            for _ in 0..128 {
+                let t = argmax(&logits);
+                output.push(t);
+                if [248044, 248046].contains(&t) {
+                    break;
+                }
+                logits = m.forward(t).unwrap();
+            }
+            m.prefix = prefix;
+            assert!(
+                [248044, 248046].contains(output.last().unwrap()),
+                "natural EOS required"
+            );
+            let (relative_l2, max_abs, first_equal, generation_equal) =
+                if let Some((a, b)) = &reference {
+                    let error = a
+                        .iter()
+                        .zip(&first)
+                        .map(|(&a, &b)| f64::from(a - b).powi(2))
+                        .sum::<f64>();
+                    let norm = a.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
+                    (
+                        error.sqrt() / norm.sqrt(),
+                        a.iter()
+                            .zip(&first)
+                            .map(|(&a, &b)| (a - b).abs())
+                            .fold(0f32, f32::max),
+                        argmax(a) == argmax(&first),
+                        b == &output,
+                    )
+                } else {
+                    (0., 0., true, true)
+                };
+            eprintln!(
+                "FLASH_CANONICAL_ACCURACY {}",
+                serde_json::json!({
+                    "prompt_tokens":tokens.len(), "canonical":canonical, "prefill_seconds":prefill_seconds,
+                    "relative_l2":relative_l2, "max_abs":max_abs, "first_equal":first_equal,
+                    "generation_equal":generation_equal, "output_tokens":output
+                })
+            );
+            if !canonical {
+                reference = Some((first, output));
+            }
+        }
+    }
+    // These exact-prefix extensions crossed contraction classes in the
+    // observed SDK workload. A candidate must preserve its OWN cold graph's
+    // complete vocabulary and subsequent recurrence, not only its argmax.
+    for (source_len, target_len) in [(751, 900), (1700, 2020), (1290, 1510)] {
+        let source = (0..source_len)
+            .map(|i| 1000 + i as u32 % 3000)
+            .collect::<Vec<_>>();
+        let target = (0..target_len)
+            .map(|i| 1000 + i as u32 % 3000)
+            .collect::<Vec<_>>();
+        for canonical in [false, true] {
+            serving::CANONICAL_PREFILL_FOR_TEST.with(|v| v.set(canonical));
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            let prefix = std::mem::take(&mut m.prefix);
+            let mut reference = vec![m.prefill(0, &target).unwrap()];
+            for t in [23, 248044, 42] {
+                reference.push(m.forward(t).unwrap());
+            }
+            m.prefix = prefix;
+            m.reset();
+            m.prefill(0, &source).unwrap();
+            m.reset();
+            let started = std::time::Instant::now();
+            let got = m.prefill(3, &target).unwrap();
+            let seconds = started.elapsed().as_secs_f64();
+            let reused = m.take_prefill_reused(3);
+            assert!(
+                got == reference[0],
+                "cold/warm mismatch canonical={canonical} {source_len}->{target_len}"
+            );
+            for (i, t) in [23, 248044, 42].into_iter().enumerate() {
+                let pos = m.slots[3].length as u32;
+                assert!(m.execute(&[(3, t, pos)], &[0]).unwrap() == reference[i + 1]);
+            }
+            if canonical {
+                assert_eq!(reused, prefix::cuts(source_len, m.chunk)[1]);
+            }
+            assert_eq!(allocated, m.device.allocated_bytes());
+            eprintln!(
+                "FLASH_CANONICAL_RESTORE {}",
+                serde_json::json!({
+                    "canonical":canonical, "source_tokens":source_len, "target_tokens":target_len,
+                    "reused":reused, "seconds":seconds, "full_logits_exact":true
+                })
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "112 GB wide-prefix generation gate; elected model, fixtures and watchdog required"]
+fn flash_next_mlx_prefix_wide_serial_generations() {
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("positive budget bytes"));
+    let mut m = FlashNext::load(Path::new(&path), 4096, 1, budget).unwrap();
+    assert!(
+        m.chunk >= 256,
+        "this gate must exercise grouped matrix arithmetic"
+    );
+    let allocated = m.device.allocated_bytes();
+    eprintln!("FLASH_PREFIX_WIDE rows={} allocated={allocated}", m.chunk);
+    let generate = |m: &mut FlashNext, mut logits: Vec<f32>| {
+        let mut tokens = Vec::new();
+        for _ in 0..64 {
+            let t = logits
+                .iter()
+                .enumerate()
+                .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
+                .unwrap()
+                .0 as u32;
+            tokens.push(t);
+            if [248044, 248046].contains(&t) {
+                return tokens;
+            }
+            logits = m.forward(t).unwrap();
+        }
+        panic!("a capped generation is not a natural-EOS gate");
+    };
+    let prompts = fixtures["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 4);
+    for fixture in prompts {
+        let prompt = fixture["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let prefix = std::mem::take(&mut m.prefix);
+        let cold = m.prefill(0, &prompt).unwrap();
+        let reference = generate(&mut m, cold.clone());
+        m.prefix = prefix;
+        m.reset();
+        assert_eq!(
+            m.prefill(0, &prompt).unwrap(),
+            cold,
+            "wide capture changed logits"
+        );
+        // Overwrite live recurrence and PLE history before restoring. The saved
+        // GPU state must be independent, not an alias of the original slot.
+        m.reset();
+        m.prefill(0, &[17, 42, 248044]).unwrap();
+        m.reset();
+        let warm = m.prefill(0, &prompt).unwrap();
+        let reused = m.take_prefill_reused(0);
+        assert_eq!(reused, prefix::cuts(prompt.len(), m.chunk)[1]);
+        assert_eq!(warm, cold, "wide restore changed full-vocabulary logits");
+        assert_eq!(
+            generate(&mut m, warm),
+            reference,
+            "wide complete generation changed"
+        );
+        assert_eq!(m.device.allocated_bytes(), allocated);
+        eprintln!(
+            "FLASH_PREFIX_WIDE_EXACT prompt={} reused={reused} natural_eos=true",
+            prompt.len()
+        );
+    }
+}
+
+#[test]
 fn mlx_prefill_capacity_preserves_explicit_cache_budget() {
     let weight_bytes = 1 << 20;
-    for expected in [CHUNK, 512, MLX_CHUNK] {
-        let (cache, scratch) = FlashNext::memory_rows(256, 4, expected).unwrap();
-        let scratch = scratch + super::super::affine::WORKSPACE_BYTES as u64;
+    for expected in [CHUNK, 256, 512, MLX_CHUNK] {
+        let (cache, scratch) = FlashNext::mlx_memory_rows(256, 4, expected).unwrap();
+        let scratch = scratch + super::super::affine::workspace_bytes(expected) as u64;
         let budget = weight_bytes + cache + scratch;
-        let (device, chunk, actual_cache, actual_scratch) =
-            FlashNext::mlx_device(256, 4, weight_bytes, Some(budget)).unwrap();
+        let (device, chunk, actual_cache, actual_scratch, entries, paged) =
+            FlashNext::mlx_device(256, 4, weight_bytes, 0, Some(budget)).unwrap();
+        assert!(!paged);
+        let (base_cache, base_scratch) = FlashNext::mlx_memory_rows(256, 4, chunk).unwrap();
         assert_eq!(
-            (chunk, actual_cache, actual_scratch),
-            (expected, cache, scratch)
+            actual_cache,
+            base_cache + prefix::PrefixCache::bytes(256, entries)
         );
+        assert_eq!(
+            actual_scratch,
+            base_scratch + super::super::affine::workspace_bytes(chunk) as u64
+        );
+        assert!(chunk <= expected);
+        assert!(weight_bytes + actual_cache + actual_scratch <= budget);
         assert_eq!(device.budget_bytes(), budget);
         assert_eq!(device.allocated_bytes(), 0);
+        if entries == 0 {
+            assert_eq!(
+                chunk, expected,
+                "a cache miss must preserve legacy capacity"
+            );
+        }
     }
-    assert!(FlashNext::mlx_device(256, 4, weight_bytes, Some(1)).is_err());
-    assert!(FlashNext::mlx_device(256, 4, u64::MAX, None).is_err());
+    assert!(FlashNext::mlx_device(256, 4, weight_bytes, 0, Some(1)).is_err());
+    assert!(FlashNext::mlx_device(256, 4, u64::MAX, 0, None).is_err());
+}
+
+#[test]
+fn mlx_wide_upgrade_preserves_residency_retention_and_grant() {
+    let (context, batch, weights, ple) = (256, 4, 1u64 << 30, 1u64 << 29);
+    let (cache, scratch) = FlashNext::mlx_memory_rows(context, batch, MLX_CHUNK).unwrap();
+    let entries = batch * 2;
+    let cache = cache + prefix::PrefixCache::bytes(context, entries);
+    let scratch = scratch + super::super::affine::workspace_bytes(MLX_CHUNK) as u64;
+    let (wc, ws) =
+        FlashNext::mlx_memory_rows(context, batch, super::super::affine::MAX_ROWS).unwrap();
+    assert_eq!(wc + prefix::PrefixCache::bytes(context, entries), cache);
+    let wide_scratch =
+        ws + super::super::affine::workspace_bytes(super::super::affine::MAX_ROWS) as u64;
+    for (space, expected) in [
+        (scratch, MLX_CHUNK),
+        (wide_scratch, super::super::affine::MAX_ROWS),
+    ] {
+        let budget = weights + cache + space;
+        let (d, rows, actual_cache, actual_scratch, actual_entries, paged) =
+            FlashNext::mlx_device(context, batch, weights, ple, Some(budget)).unwrap();
+        assert!(
+            !paged,
+            "wider rows must never force resident weights onto disk"
+        );
+        assert_eq!(actual_entries, entries);
+        assert_eq!(actual_cache, cache);
+        assert_eq!(
+            rows,
+            if d.tensor_accelerated() {
+                expected
+            } else {
+                MLX_CHUNK
+            }
+        );
+        assert_eq!(d.budget_bytes(), budget);
+        assert!(weights + actual_cache + actual_scratch <= budget);
+        assert_eq!(d.allocated_bytes(), 0);
+    }
+}
+
+#[test]
+fn mlx_file_backed_ple_preserves_grant_and_wide_prefill() {
+    let weights = 110_626_145_280;
+    let ple = 32_000_153_600;
+    let budget = 106334 * 1024 * 1024;
+    for batch in [1, 4] {
+        let (d, rows, cache, scratch, entries, paged) =
+            FlashNext::mlx_device(8192, batch, weights, ple, Some(budget)).unwrap();
+        assert!(paged);
+        assert_eq!(
+            rows,
+            if batch > 1 && d.tensor_accelerated() {
+                super::super::affine::MAX_ROWS
+            } else {
+                MLX_CHUNK
+            }
+        );
+        assert_eq!(entries, batch * 2);
+        assert_eq!(d.budget_bytes(), budget);
+        assert_eq!(d.allocated_bytes(), 0);
+        assert!(weights - ple + cache + scratch <= budget);
+    }
+    assert!(FlashNext::mlx_device(8192, 1, weights, ple, Some(weights - ple)).is_err());
+    assert!(FlashNext::mlx_device(8192, 1, 1, ple, Some(budget)).is_err());
 }
 
 #[test]

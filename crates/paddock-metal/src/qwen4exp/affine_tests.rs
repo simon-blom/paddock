@@ -9,6 +9,774 @@ fn poison_output(y: &crate::device::Buffer, count: usize) {
     unsafe { y.write_u32(&vec![f32::NAN.to_bits(); count + 32]) };
 }
 
+#[test]
+fn group32_expert_loaders_preserve_mixed_rows_and_output_guards() {
+    let d = MetalDevice::new(Some(96 << 20)).unwrap();
+    if !d.tensor_accelerated() {
+        return;
+    }
+    let (k, n) = (64usize, 64usize);
+    let mut raw = (0..512 * k * n / 2)
+        .map(|i| (i * 37 + 19) as u8)
+        .collect::<Vec<_>>();
+    for value in [0.003f32, -0.04] {
+        raw.extend(
+            (0..512 * k * n / 32).flat_map(|_| ((value.to_bits() >> 16) as u16).to_le_bytes()),
+        );
+    }
+    let w = d.upload(&raw).unwrap();
+    for rows in [1usize, 9, 33, 129, 2048] {
+        let entries = rows * 10;
+        let ids = (0..entries)
+            .map(|i| {
+                if i / 10 % 7 == 0 {
+                    (i % 10) as u32
+                } else {
+                    ((i / 10 * 37 + i % 10 * 17) % 512) as u32
+                }
+            })
+            .collect::<Vec<_>>();
+        let ids = d
+            .upload(&ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+            .unwrap();
+        let lists = d.alloc(512 * entries * 4).unwrap();
+        let counts = d.alloc(512 * 4).unwrap();
+        let tiles = d.alloc((1 + 2 * (entries.div_ceil(32) + 512)) * 4).unwrap();
+        let y = d.alloc((entries * n + 32) * 4).unwrap();
+        let cmd = d.begin().unwrap();
+        cmd.dispatch(
+            "moe_align",
+            &[&ids, &lists, &counts],
+            &[entries as u32],
+            [512, 1, 1],
+            256,
+        );
+        cmd.dispatch("iq_tiles512", &[&counts, &tiles], &[512], [1, 1, 1], 512);
+        cmd.finish().unwrap();
+        for per_entry in [false, true] {
+            let input_rows = if per_entry { entries } else { rows };
+            let x = d
+                .upload(
+                    &(0..input_rows * k)
+                        .flat_map(|i| (((i * 29 % 137) as f32 - 68.) / 97.).to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let staged = d.alloc(input_rows.next_multiple_of(32) * k * 2).unwrap();
+            let mut p = vec![
+                k as u32,
+                n as u32,
+                entries as u32,
+                u32::from(per_entry),
+                512,
+            ];
+            p.extend([u32::MAX; affine::MAX_ROWS.div_ceil(32)]);
+            for row in (0..rows).step_by(7) {
+                p[5 + row / 32] &= !(1 << (row % 32));
+            }
+            let mut expected = None;
+            for kernel in [
+                "q4a_expert_mm_tail",
+                "q4a_expert_mm_group32",
+                "q4a_expert_mm_group32_pad",
+                "q4a_expert_mm_group32_packed",
+            ] {
+                poison_output(&y, entries * n);
+                let cmd = d.begin().unwrap();
+                let input = if kernel.ends_with("_packed") {
+                    cmd.dispatch(
+                        "q4a_input",
+                        &[&x, &staged],
+                        &[k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
+                        [(input_rows.next_multiple_of(32) * k).div_ceil(256), 1, 1],
+                        256,
+                    );
+                    &staged
+                } else {
+                    &x
+                };
+                cmd.dispatch(
+                    kernel,
+                    &[&w, input, &lists, &counts, &tiles, &y],
+                    &p,
+                    [n.div_ceil(64), entries.div_ceil(32) + 512, 1],
+                    128,
+                );
+                cmd.dispatch(
+                    "q4a_expert_vector_masked",
+                    &[&w, &x, &ids, &y],
+                    &p,
+                    [n.div_ceil(16), entries, 1],
+                    128,
+                );
+                cmd.finish().unwrap();
+                let got = unsafe { y.read_f32(0, entries * n + 32) };
+                assert!(got[..entries * n].iter().all(|v| v.is_finite()));
+                assert!(got[entries * n..].iter().all(|v| v.is_nan()));
+                if let Some(expected) = &expected {
+                    assert!(
+                        &got[..entries * n] == expected,
+                        "{kernel} rows={rows} per_entry={per_entry}"
+                    );
+                } else {
+                    expected = Some(got[..entries * n].to_vec());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_expert_gate_up_preserves_bf16_boundaries_masks_and_guards() {
+    let d = MetalDevice::new(Some(128 << 20)).unwrap();
+    if !d.tensor_accelerated() {
+        return;
+    }
+    let (k, n) = (128usize, 80usize);
+    let weight = |seed: usize| {
+        let mut raw = (0..512 * k * n / 2)
+            .map(|i| (i.wrapping_mul(37 + seed) ^ (i >> 5) ^ seed) as u8)
+            .collect::<Vec<_>>();
+        for value in [0.013f32, -0.08] {
+            raw.extend((0..512 * k * n / 32).flat_map(|i| {
+                ((value
+                    .mul_add(1. + (i % 7) as f32 / 8., seed as f32 / 1000.)
+                    .to_bits()
+                    >> 16) as u16)
+                    .to_le_bytes()
+            }));
+        }
+        d.upload(&raw).unwrap()
+    };
+    let gate = weight(1);
+    let up = weight(3);
+    for rows in [1usize, 9, 33, 129, 1024, 2048] {
+        let entries = rows * 10;
+        let ids = d
+            .upload(
+                &(0..entries)
+                    .flat_map(|i| {
+                        (if i / 10 % 7 == 0 {
+                            i % 10
+                        } else {
+                            (i / 10 * 37 + i % 10 * 17) % 512
+                        } as u32)
+                            .to_le_bytes()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let x = d
+            .upload(
+                &(0..rows * k)
+                    .flat_map(|i| (((i * 29 % 137) as f32 - 68.) / 97.).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let packed = d.alloc(rows.next_multiple_of(32) * k * 2).unwrap();
+        let lists = d.alloc(512 * entries * 4).unwrap();
+        let counts = d.alloc(512 * 4).unwrap();
+        let tiles = d.alloc((1 + 2 * (entries.div_ceil(32) + 512)) * 4).unwrap();
+        let y = d.alloc((entries * n + 32) * 4).unwrap();
+        let u = d.alloc((entries * n + 32) * 4).unwrap();
+        let cmd = d.begin().unwrap();
+        cmd.dispatch(
+            "moe_align",
+            &[&ids, &lists, &counts],
+            &[entries as u32],
+            [512, 1, 1],
+            256,
+        );
+        cmd.dispatch("iq_tiles512", &[&counts, &tiles], &[512], [1, 1, 1], 512);
+        cmd.dispatch(
+            "q4a_input",
+            &[&x, &packed],
+            &[k as u32, n as u32, rows as u32, 0, 0, 0, 0],
+            [(rows.next_multiple_of(32) * k).div_ceil(256), 1, 1],
+            256,
+        );
+        cmd.finish().unwrap();
+        for mixed in [false, true] {
+            let mut p = vec![k as u32, n as u32, entries as u32, 0, 512];
+            p.extend([u32::MAX; affine::MAX_ROWS.div_ceil(32)]);
+            if mixed {
+                for row in (0..rows).step_by(7) {
+                    p[5 + row / 32] &= !(1 << (row % 32));
+                }
+            }
+            let mut expected = None;
+            for fused in [0, 1, 2] {
+                poison_output(&y, entries * n);
+                poison_output(&u, entries * n);
+                let cmd = d.begin().unwrap();
+                if fused == 1 {
+                    cmd.dispatch(
+                        "q4a_expert_gate_up_packed",
+                        &[&gate, &up, &packed, &lists, &counts, &tiles, &y],
+                        &p,
+                        [n.div_ceil(64), entries.div_ceil(32) + 512, 1],
+                        128,
+                    );
+                } else if fused == 2 {
+                    cmd.dispatch(
+                        "q4a_expert_gate_up_dispatch",
+                        &[&gate, &up, &packed, &lists, &counts, &tiles, &y, &u],
+                        &p,
+                        [n.div_ceil(64), entries.div_ceil(32) + 512, 2],
+                        128,
+                    );
+                } else {
+                    for (w, out) in [(&gate, &y), (&up, &u)] {
+                        cmd.dispatch(
+                            "q4a_expert_mm_group32_packed",
+                            &[w, &packed, &lists, &counts, &tiles, out],
+                            &p,
+                            [n.div_ceil(64), entries.div_ceil(32) + 512, 1],
+                            128,
+                        );
+                    }
+                }
+                if mixed {
+                    for (w, out) in [(&gate, &y), (&up, &u)] {
+                        cmd.dispatch(
+                            "q4a_expert_vector_masked",
+                            &[w, &x, &ids, out],
+                            &p,
+                            [n.div_ceil(16), entries, 1],
+                            128,
+                        );
+                    }
+                }
+                if fused == 1 {
+                    if mixed {
+                        cmd.dispatch(
+                            "q4a_expert_swiglu_masked",
+                            &[&y, &u],
+                            &p,
+                            [(entries * n).div_ceil(256), 1, 1],
+                            256,
+                        );
+                    }
+                } else {
+                    cmd.dispatch(
+                        "mlx_swiglu",
+                        &[&y, &u],
+                        &[(entries * n) as u32],
+                        [(entries * n).div_ceil(256), 1, 1],
+                        256,
+                    );
+                }
+                cmd.finish().unwrap();
+                let got = unsafe { y.read_f32(0, entries * n + 32) };
+                assert!(got[..entries * n].iter().all(|v| v.is_finite()));
+                assert!(got[entries * n..].iter().all(|v| v.is_nan()));
+                assert!(
+                    unsafe { u.read_f32(entries * n, 32) }
+                        .iter()
+                        .all(|v| v.is_nan())
+                );
+                if let Some(expected) = &expected {
+                    assert!(&got[..entries * n] == expected, "rows={rows} mixed={mixed}");
+                } else {
+                    expected = Some(got[..entries * n].to_vec());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unequal_projection_contracts_preserve_all_rows_and_guards() {
+    let d = MetalDevice::new(Some(96 << 20)).unwrap();
+    let spans = [
+        (0, 1, 1),
+        (1, 17, 700),
+        (18, 15, 750),
+        (33, 31, 800),
+        (64, 64, 1024),
+        (128, 31, 900),
+        (159, 1, 1),
+    ];
+    let rows = 160;
+    let short_spans = [
+        (0, 4, 4),
+        (4, 8, 8),
+        (12, 8, 12),
+        (20, 64, 64),
+        (84, 64, 64),
+        (148, 12, 12),
+    ];
+    let decode_spans = [
+        (0, 1, 1),
+        (1, 1, 1),
+        (2, 1, 1),
+        (3, 1, 1),
+        (4, 64, 64),
+        (68, 64, 64),
+        (132, 28, 32),
+    ];
+    let scratch = d.alloc(affine::WORKSPACE_BYTES).unwrap();
+    for (k, n, ty) in [
+        (10240, 320, affine::A4G32),
+        (2560, 6144, affine::A4G32),
+        (2560, 512, affine::A8G64),
+        (10240, 4, affine::A4G32),
+        (320, 10240, affine::A4G32),
+    ] {
+        let (bits, group) = affine::format(ty);
+        let mut raw = (0..k * n * bits / 8)
+            .map(|i| (i * 37 + 19) as u8)
+            .collect::<Vec<_>>();
+        for plane in 0..2 {
+            raw.extend((0..k * n / group).flat_map(|i| {
+                half::bf16::from_f32(if plane == 0 {
+                    0.0003 + (i % 17) as f32 * 0.0001
+                } else {
+                    -0.004 + (i % 7) as f32 * 0.0002
+                })
+                .to_le_bytes()
+            }));
+        }
+        let w = crate::weights::Weight {
+            buffer: d.upload(&raw).unwrap(),
+            ty,
+            k,
+            n,
+        };
+        let x = d
+            .upload(
+                &(0..rows * k)
+                    .flat_map(|i| ((i % 137) as f32 / 97. - 0.7).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let y = d.alloc((rows * n + 32) * 4).unwrap();
+        for spans in [&spans[..], &short_spans, &decode_spans] {
+            poison_output(&y, rows * n);
+            let cmd = d.begin().unwrap().with_projection_workspace(&scratch);
+            for &(start, count, logical) in spans {
+                affine::project_span(&cmd, &w, &x, &y, count, start, logical);
+            }
+            cmd.finish().unwrap();
+            let expected = unsafe { y.read_f32(0, rows * n) };
+            poison_output(&y, rows * n);
+            let cmd = d
+                .begin()
+                .unwrap()
+                .with_projection_workspace(&scratch)
+                .with_projection_rows(spans);
+            affine::project(&cmd, &w, &x, &y, rows);
+            cmd.finish().unwrap();
+            let got = unsafe { y.read_f32(0, rows * n + 32) };
+            assert!(
+                got[..rows * n] == expected,
+                "merged projection changed K={k} N={n} type={ty}"
+            );
+            assert!(got[rows * n..].iter().all(|v| v.is_nan()));
+        }
+    }
+}
+
+#[test]
+fn wide_physical_projection_preserves_logical_contraction_and_guards() {
+    let d = MetalDevice::new(Some(256 << 20)).unwrap();
+    let rows = 2048;
+    let spans = [
+        (0, 512, 1024),
+        (512, 512, 1024),
+        (1024, 512, 1024),
+        (1536, 512, 1024),
+    ];
+    let scratch = d.alloc(affine::workspace_bytes(rows)).unwrap();
+    for (k, n, ty) in [
+        (10240, 320, affine::A4G32),
+        (2560, 6144, affine::A4G32),
+        (2560, 512, affine::A8G64),
+        (320, 10240, affine::A4G32),
+    ] {
+        let (bits, group) = affine::format(ty);
+        let mut raw = (0..k * n * bits / 8)
+            .map(|i| (i * 37 + 19) as u8)
+            .collect::<Vec<_>>();
+        for value in [0.003f32, -0.04] {
+            raw.extend((0..k * n / group).flat_map(|_| half::bf16::from_f32(value).to_le_bytes()));
+        }
+        let w = crate::weights::Weight {
+            buffer: d.upload(&raw).unwrap(),
+            k,
+            n,
+            ty,
+        };
+        let x = d
+            .upload(
+                &(0..rows * k)
+                    .flat_map(|i| ((i % 137) as f32 / 97. - 0.7).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let y = d.alloc((rows * n + 32) * 4).unwrap();
+        poison_output(&y, rows * n);
+        let cmd = d.begin().unwrap().with_projection_workspace(&scratch);
+        for &(start, count, logical) in &spans {
+            affine::project_span(&cmd, &w, &x, &y, count, start, logical);
+        }
+        cmd.finish().unwrap();
+        let expected = unsafe { y.read_f32(0, rows * n) };
+        poison_output(&y, rows * n);
+        let cmd = d
+            .begin()
+            .unwrap()
+            .with_projection_workspace(&scratch)
+            .with_projection_rows(&spans);
+        affine::project(&cmd, &w, &x, &y, rows);
+        cmd.finish().unwrap();
+        let got = unsafe { y.read_f32(0, rows * n + 32) };
+        assert!(
+            got[..rows * n] == expected,
+            "wide physical pass changed K={k} N={n} type={ty}"
+        );
+        assert!(got[rows * n..].iter().all(|v| v.is_nan()));
+    }
+}
+
+#[test]
+fn device_input_staging_preserves_offset_tail_and_guards() {
+    let d = MetalDevice::new(Some(32 << 20)).unwrap();
+    if !d.tensor_accelerated() {
+        return;
+    }
+    let n = 515usize;
+    for (k, bits, group, kernel, baseline) in [
+        (320usize, 4, 32, "q4a_mm4_device64", "q4a_mm4_packed"),
+        (320, 8, 64, "q4a_mm8_device64", "q4a_mm8_packed"),
+        (320, 4, 32, "q4a_mm4_device64_group32", "q4a_mm4_packed"),
+        (256, 4, 32, "q4a_mm4_device128_group32", "q4a_mm4_packed"),
+        (320, 4, 32, "q4a_mm4_device64_pad8", "q4a_mm4_packed"),
+        (256, 4, 32, "q4a_mm4_device128_pad8", "q4a_mm4_packed"),
+        (320, 4, 32, "q4a_mm4_device64_pad16", "q4a_mm4_packed"),
+        (256, 4, 32, "q4a_mm4_device128_pad16", "q4a_mm4_packed"),
+    ] {
+        let mut raw = (0..k * n * bits / 8)
+            .map(|i| (i * 37 + 19) as u8)
+            .collect::<Vec<_>>();
+        for value in [0.003f32, -0.04] {
+            raw.extend(
+                (0..k * n / group)
+                    .flat_map(|_| half::bf16::from_f32(value).to_bits().to_le_bytes()),
+            );
+        }
+        let w = d.upload(&raw).unwrap();
+        for rows in [1usize, 31, 32, 33, 63, 64, 65, 129] {
+            let start = 3usize;
+            let values = (0..(start + rows) * k)
+                .map(|i| (i % 137) as f32 / 97. - 0.7)
+                .collect::<Vec<_>>();
+            let x = d
+                .upload(
+                    &values
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let padded = rows.next_multiple_of(32);
+            let stage_words = padded * k / 2;
+            let stage = d.alloc((stage_words + 16) * 4).unwrap();
+            unsafe {
+                stage.write_u32(&vec![0xdeadbeef; stage_words + 16]);
+            }
+            let count = (start + rows) * n;
+            let y = d.alloc((count + 32) * 4).unwrap();
+            let p = [
+                k as u32,
+                n as u32,
+                rows as u32,
+                bits as u32,
+                group as u32,
+                1,
+                start as u32,
+            ];
+            poison_output(&y, count);
+            let cmd = d.begin().unwrap();
+            cmd.dispatch(
+                baseline,
+                &[&w, &x, &y],
+                &p,
+                [n.div_ceil(32), rows.div_ceil(32), 1],
+                128,
+            );
+            cmd.finish().unwrap();
+            let expected = unsafe { y.read_f32(0, count + 32) };
+            poison_output(&y, count);
+            let cmd = d.begin().unwrap();
+            cmd.dispatch(
+                "q4a_input",
+                &[&x, &stage],
+                &p,
+                [(padded * k).div_ceil(256), 1, 1],
+                256,
+            );
+            cmd.dispatch(
+                kernel,
+                &[&w, &stage, &y],
+                &p,
+                [n.div_ceil(32), rows.div_ceil(32), 1],
+                128,
+            );
+            cmd.finish().unwrap();
+            let got = unsafe { y.read_f32(0, count + 32) };
+            assert_eq!(&got[start * n..count], &expected[start * n..count]);
+            assert!(
+                got[..start * n]
+                    .iter()
+                    .chain(&got[count..])
+                    .all(|v| v.is_nan())
+            );
+            let staged = unsafe { stage.read_u32(stage_words + 16) };
+            assert!(staged[stage_words..].iter().all(|&v| v == 0xdeadbeef));
+            assert!(staged[rows * k / 2..stage_words].iter().all(|&v| v == 0));
+        }
+    }
+}
+
+#[test]
+#[ignore = "rotated dense projection layout costs; exact output required, not serving timing"]
+fn dense_layout_execution_cost() {
+    let d = MetalDevice::new(Some(320 << 20)).unwrap();
+    assert!(d.tensor_accelerated());
+    for (k, n) in [
+        (2560usize, 10240usize),
+        (6144, 2560),
+        (320, 10240),
+        (10240, 320),
+        (2560, 512),
+    ] {
+        let mut raw = (0..k * n / 2)
+            .map(|i| (i * 37 + i / 127 + 19) as u8)
+            .collect::<Vec<_>>();
+        for bias in [false, true] {
+            raw.extend((0..k * n / 32).flat_map(|i| {
+                let v = if bias {
+                    -0.04 + (i % 17) as f32 * 0.001
+                } else {
+                    0.002 + (i % 31) as f32 * 0.00002
+                };
+                half::bf16::from_f32(v).to_le_bytes()
+            }));
+        }
+        let w = d.upload(&raw).unwrap();
+        for rows in [64usize, 512, 1024, 2048] {
+            let start = 3;
+            let x = d
+                .upload(
+                    &(0..(start + rows) * k)
+                        .flat_map(|i| (((i % 137) as f32 / 97.) - 0.7).to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let stage = d.alloc(rows.next_multiple_of(32) * k * 2).unwrap();
+            let count = (start + rows) * n;
+            let y = d.alloc((count + 32) * 4).unwrap();
+            let p = [k as u32, n as u32, rows as u32, 4, 32, 1, start as u32];
+            let cmd = d.begin().unwrap();
+            cmd.dispatch(
+                "q4a_input",
+                &[&x, &stage],
+                &p,
+                [(rows.next_multiple_of(32) * k).div_ceil(256), 1, 1],
+                256,
+            );
+            cmd.finish().unwrap();
+            let kernels = if k.is_multiple_of(128) {
+                [
+                    "q4a_mm4_device128_group32",
+                    "q4a_mm4_device128_pad8",
+                    "q4a_mm4_device128_pad16",
+                ]
+            } else {
+                [
+                    "q4a_mm4_device64_group32",
+                    "q4a_mm4_device64_pad8",
+                    "q4a_mm4_device64_pad16",
+                ]
+            };
+            let mut times = kernels.map(|_| Vec::new());
+            let mut expected = None;
+            for round in 0..7 {
+                for route in (0..kernels.len()).map(|i| (i + round) % kernels.len()) {
+                    poison_output(&y, count);
+                    let cmd = d.begin().unwrap();
+                    cmd.dispatch(
+                        kernels[route],
+                        &[&w, &stage, &y],
+                        &p,
+                        [n.div_ceil(32), rows.div_ceil(32), 1],
+                        128,
+                    );
+                    let gpu = cmd.finish().unwrap();
+                    let got = unsafe { y.read_f32(0, count + 32) };
+                    assert!(
+                        got[..start * n]
+                            .iter()
+                            .chain(&got[count..])
+                            .all(|x| x.is_nan())
+                    );
+                    let got = got[start * n..count]
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>();
+                    if let Some(ref want) = expected {
+                        assert!(
+                            got == *want,
+                            "layout changed k={k} n={n} rows={rows} route={route}"
+                        );
+                    } else {
+                        expected = Some(got);
+                    }
+                    if round > 0 {
+                        times[route].push(gpu);
+                    }
+                }
+            }
+            eprintln!(
+                "FLASH_DENSE_LAYOUT {}",
+                serde_json::json!({"k":k,"n":n,"rows":rows,"kernels":kernels,"gpu_seconds":times,"exact":true})
+            );
+        }
+    }
+}
+
+#[test]
+fn split_staging_preserves_contracts_offsets_and_bounded_arena() {
+    split_staging_cases(false);
+}
+
+#[test]
+#[ignore = "rotated GPU split-projection cost; not a serving benchmark"]
+fn split_staging_execution_cost() {
+    split_staging_cases(true);
+}
+
+fn split_staging_cases(measure: bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(false));
+            affine::PADDED_TILES_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let d = MetalDevice::new(Some(160 << 20)).unwrap();
+    if !d.tensor_accelerated() {
+        return;
+    }
+    for (k, n, rows, logical) in [
+        (10240usize, 320usize, 64usize, 128usize),
+        (10240, 320, 129, 512),
+        (10240, 320, 512, 512),
+        (10240, 320, 1024, 512),
+        (10240, 320, 2048, 512),
+        (10240, 320, 812, 812),
+        (10240, 320, 1024, 1024),
+        (10240, 320, 2048, 1024),
+        (2560, 515, 129, 256),
+        (2560, 515, 511, 256),
+        (320, 96, 64, 128),
+        (640, 160, 129, 256),
+        (640, 2560, 64, 128),
+    ] {
+        let parts = affine::contraction(k, n, affine::A4G32, logical).1;
+        let mut raw = (0..k * n / 2)
+            .map(|i| (i * 37 + 19) as u8)
+            .collect::<Vec<_>>();
+        for plane in 0..2 {
+            raw.extend((0..k * n / 32).flat_map(|i| {
+                let value = if plane == 0 {
+                    (1 + i % 29) as f32 * 0.0003
+                } else {
+                    -0.04 + (i % 17) as f32 * 0.002
+                };
+                half::bf16::from_f32(value).to_bits().to_le_bytes()
+            }));
+        }
+        let w = crate::weights::Weight {
+            buffer: d.upload(&raw).unwrap(),
+            ty: affine::A4G32,
+            k,
+            n,
+        };
+        let start = 3;
+        let x = d
+            .upload(
+                &(0..(start + rows) * k)
+                    .flat_map(|i| ((i % 137) as f32 / 97. - 0.7).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let count = (start + rows) * n;
+        let y = d.alloc((count + 32) * 4).unwrap();
+        let arena = d.alloc(affine::workspace_bytes(2048)).unwrap();
+        affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(true));
+        affine::PADDED_TILES_FOR_TEST.with(|v| v.set(false));
+        poison_output(&y, count);
+        let cmd = d.begin().unwrap().with_projection_workspace(&arena);
+        affine::project_span(&cmd, &w, &x, &y, rows, start, logical);
+        cmd.finish().unwrap();
+        let expected = unsafe { y.read_f32(0, count + 32) };
+        // Include an arena that forces multiple physical slices and a small
+        // arena where input staging must fall back to the original split.
+        let arenas = if measure {
+            vec![arena.len()]
+        } else {
+            vec![
+                arena.len(),
+                rows * n * parts * 2 + 128,
+                32 * (k + n * parts) * 2,
+            ]
+        };
+        for bytes in arenas {
+            // The fallback's partial-only arena must fit too.
+            let bytes = bytes.max(rows * n * parts * 2);
+            let scratch = d.alloc(bytes).unwrap();
+            let mut times = [Vec::new(), Vec::new(), Vec::new()];
+            for round in 0..if measure { 8 } else { 1 } {
+                for index in 0..3 {
+                    let route = (index + round) % 3;
+                    affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(route == 0));
+                    affine::PADDED_TILES_FOR_TEST.with(|v| v.set(route == 2));
+                    poison_output(&y, count);
+                    let cmd = d.begin().unwrap().with_projection_workspace(&scratch);
+                    affine::project_span(&cmd, &w, &x, &y, rows, start, logical);
+                    let seconds = cmd.finish().unwrap();
+                    let got = unsafe { y.read_f32(0, count + 32) };
+                    assert_eq!(
+                        &got[start * n..count],
+                        &expected[start * n..count],
+                        "split staging K={k} N={n} rows={rows} logical={logical} arena={bytes} route={route}"
+                    );
+                    assert!(
+                        got[..start * n]
+                            .iter()
+                            .chain(&got[count..])
+                            .all(|v| v.is_nan())
+                    );
+                    if round > 0 {
+                        times[route].push(seconds);
+                    }
+                }
+            }
+            if measure {
+                eprintln!(
+                    "FLASH_SPLIT_STAGING {}",
+                    serde_json::json!({
+                    "k":k,"n":n,"rows":rows,"logical":logical,"parts":parts,
+                    "arena":bytes,"gpu_seconds":times,"exact":true})
+                );
+            }
+        }
+    }
+}
+
 fn grouped_matrix_case(
     d: &MetalDevice,
     w: &crate::weights::Weight,
@@ -98,13 +866,64 @@ fn grouped_matrix_case(
     eprintln!(
         "AFFINE_GROUPED_WIDE {base} rows={rows} per_entry={per_entry} matrix_s={seconds} wide_s={wide_seconds}"
     );
+    let kernels = [
+        "q4a_expert_mm_wide",
+        "q4a_expert_mm_tail",
+        "q4a_expert_mm_group32",
+        "q4a_expert_mm_group32_pad",
+        "q4a_expert_mm_group32_packed",
+    ];
+    let mut times = std::array::from_fn::<_, 5, _>(|_| Vec::new());
+    let input_rows = if per_entry { entries } else { rows };
+    let staged = d.alloc(input_rows.div_ceil(32) * 32 * k * 2).unwrap();
+    for round in 0..7 {
+        for i in 0..kernels.len() {
+            let route = (i + round) % kernels.len();
+            poison_output(y, count);
+            let cmd = d.begin().unwrap();
+            let input = if route == 4 {
+                cmd.dispatch(
+                    "q4a_input",
+                    &[x, &staged],
+                    &[k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
+                    [(input_rows.div_ceil(32) * 32 * k).div_ceil(256), 1, 1],
+                    256,
+                );
+                &staged
+            } else {
+                x
+            };
+            cmd.dispatch(
+                kernels[route],
+                &[&w.buffer, input, &lists, &counts, &tiles, y],
+                &params,
+                [n.div_ceil(64), entries.div_ceil(32) + 512, 1],
+                128,
+            );
+            let elapsed = cmd.finish().unwrap();
+            let candidate = unsafe { y.read_f32(0, count + 32) };
+            assert!(candidate[count..].iter().all(|v| v.is_nan()));
+            assert!(
+                candidate[..count] == matrix[..count],
+                "expert tile changed arithmetic: {} {base} rows={rows} per_entry={per_entry}",
+                kernels[route]
+            );
+            if round > 0 {
+                times[route].push(elapsed);
+            }
+        }
+    }
+    eprintln!(
+        "AFFINE_EXPERT_TILES {}",
+        serde_json::json!({"base":base,"rows":rows,"per_entry":per_entry,"kernels":kernels,"gpu_seconds":times})
+    );
     for row in (0..rows).step_by(7) {
         params[5 + row / 32] &= !(1 << (row % 32));
     }
     poison_output(y, count);
     let cmd = d.begin().unwrap();
     cmd.dispatch(
-        "q4a_expert_mm_wide",
+        "q4a_expert_mm_tail",
         &[&w.buffer, x, &lists, &counts, &tiles, y],
         &params,
         [n.div_ceil(64), entries.div_ceil(32) + 512, 1],
@@ -347,6 +1166,47 @@ fn flash_next_affine_matches_mlx_gpu() {
                 );
             }
         }
+        if !experts && rows > 1 {
+            // Independent launches retain the pre-coalescing implementation
+            // as the oracle, including unaligned starts and tiny physical
+            // slices of a large logical contract.
+            let mut spans = Vec::new();
+            let mut at = 0;
+            for len in [1, 7, 23, 33, rows / 4, rows] {
+                let count = len.min(rows - at);
+                if count > 0 {
+                    spans.push((at, count, rows));
+                    at += count;
+                }
+            }
+            poison_output(&y, count);
+            let cmd = d
+                .begin()
+                .unwrap()
+                .with_projection_workspace(&scratch)
+                .with_projection_rows(&spans);
+            affine::project(&cmd, &w, &x, &y, rows);
+            let merged_seconds = cmd.finish().unwrap();
+            let merged = unsafe { y.read_f32(0, count + 32) };
+            assert!(merged[count..].iter().all(|v| v.is_nan()));
+            poison_output(&y, count);
+            let mut separate_seconds = 0.;
+            for &span in &spans {
+                let cmd = d.begin().unwrap().with_projection_workspace(&scratch);
+                affine::project_span(&cmd, &w, &x, &y, span.1, span.0, span.2);
+                separate_seconds += cmd.finish().unwrap();
+            }
+            let separate = unsafe { y.read_f32(0, count + 32) };
+            assert_eq!(
+                &merged[..count],
+                &separate[..count],
+                "dense coalescing changed {base} rows={rows}"
+            );
+            assert!(separate[count..].iter().all(|v| v.is_nan()));
+            eprintln!(
+                "AFFINE_COALESCED {base} rows={rows} merged_s={merged_seconds} separate_s={separate_seconds}"
+            );
+        }
         if !experts && [4, 128].contains(&rows) {
             let spans = if rows == 4 {
                 vec![(0, 1, 1), (1, 3, 3)]
@@ -378,6 +1238,79 @@ fn flash_next_affine_matches_mlx_gpu() {
             }
         }
         if !experts && rows >= 13 && n > 48 {
+            if affine::contraction(k, n, ty, rows).1 == 1 && k.is_multiple_of(64) {
+                let staged = d.alloc(rows.next_multiple_of(32) * k * 2).unwrap();
+                let kernel = match (ty, k.is_multiple_of(128)) {
+                    (affine::A4G32, true) => "q4a_mm4_device128",
+                    (affine::A4G32, false) => "q4a_mm4_device64",
+                    (_, true) => "q4a_mm8_device128",
+                    (_, false) => "q4a_mm8_device64",
+                };
+                let group_kernel = match (ty, k.is_multiple_of(128)) {
+                    (affine::A4G32, true) => "q4a_mm4_device128_group32",
+                    (affine::A4G32, false) => "q4a_mm4_device64_group32",
+                    _ => kernel,
+                };
+                let params = [
+                    k as u32,
+                    n as u32,
+                    rows as u32,
+                    c["bits"].as_u64().unwrap() as u32,
+                    c["group"].as_u64().unwrap() as u32,
+                    1,
+                    0,
+                ];
+                let mut times = [Vec::new(), Vec::new(), Vec::new()];
+                for round in 0..7 {
+                    for index in 0..3 {
+                        let route = (index + round) % 3;
+                        poison_output(&y, count);
+                        let cmd = d.begin().unwrap();
+                        if route > 0 {
+                            cmd.dispatch(
+                                "q4a_input",
+                                &[&x, &staged],
+                                &params,
+                                [(rows.next_multiple_of(32) * k).div_ceil(256), 1, 1],
+                                256,
+                            );
+                            cmd.dispatch(
+                                if route == 2 { group_kernel } else { kernel },
+                                &[&w.buffer, &staged, &y],
+                                &params,
+                                [n.div_ceil(32), rows.div_ceil(32), 1],
+                                128,
+                            );
+                        } else {
+                            cmd.dispatch(
+                                if ty == affine::A4G32 {
+                                    "q4a_mm4_packed"
+                                } else {
+                                    "q4a_mm8_packed"
+                                },
+                                &[&w.buffer, &x, &y],
+                                &params,
+                                [n.div_ceil(32), rows.div_ceil(32), 1],
+                                128,
+                            );
+                        }
+                        let elapsed = cmd.finish().unwrap();
+                        let got = unsafe { y.read_f32(0, count + 32) };
+                        assert!(got[count..].iter().all(|v| v.is_nan()));
+                        assert!(
+                            got[..count] == actual[..count],
+                            "device input changed {base} rows={rows} route={route}"
+                        );
+                        if round > 0 {
+                            times[route].push(elapsed);
+                        }
+                    }
+                }
+                eprintln!(
+                    "AFFINE_DEVICE_INPUT {}",
+                    serde_json::json!({"base":base,"rows":rows,"gpu_seconds":times})
+                );
+            }
             poison_output(&y, count);
             let cmd = d.begin().unwrap().with_projection_workspace(&scratch);
             affine::project(&cmd, &w, &x, &y, rows);

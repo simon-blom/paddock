@@ -462,6 +462,72 @@ __global__ void pd_nvf4_gemm_mr_kernel(
 #endif
 }
 
+#ifdef PD_BS_HOST
+// Launch election shared by the three layout launchers (row / _tm / _tf -
+// the arms differ only in where the weight word and scale byte come from).
+//
+// batch >= 9: the b16/b32 election (BR=16; BN=2 on the wide planes, KS=1).
+// batch 2..8 (a spec round's small-row planes - the DFlash drafter's MLPs
+// and fc bands, the verify rows' heads on other lanes): the FMA loop walks all BR resident rows whether they
+// exist or not, so a 4-row call under BR=16 paid 16 rows of the issue-bound
+// FFMA work. The tile is fitted instead (BR 4 / 8), and with the dead rows
+// gone the class turns latency-bound, which is what BN (rows sharing the
+// staged x) and KS (weight loads in flight per barrier) move. Measured on
+// GB10 (bench/nv4mr_small_batch_gb10_bench.cu, DRAM-honest clone rotation):
+// BR16 -> fitted BN2/KS2 at b4 fc band 55 -> 153 GB/s, gate/up 90 -> 176,
+// down 62 -> 171, lm_head 94 -> 198; b8 58 -> 113..150. BN=2 halves the CTA
+// count, so it is taken only while the grid still covers the die twice
+// (GB10's 48 SMs at a 2688-wide plane yes, a 188-SM part no). Every arm
+// keeps each row's FMA chain (ks ascending) and reduction verbatim - still
+// bit-exact per row vs the gemv.
+template <uint32_t BR, uint32_t BN, uint32_t KS, bool TM, bool FRAG>
+static int pd_nvf4_mr_go(const void* data, const void* scale, const void* bias,
+                         const void* x, void* y, float scale2, uint32_t in_dim,
+                         uint32_t out_dim, uint32_t batch, cudaStream_t st) {
+    constexpr uint32_t rows_per_cta = 8u;
+    dim3 grid((out_dim + rows_per_cta * BN - 1u) / (rows_per_cta * BN),
+              (batch + BR - 1u) / BR);
+    pd_nvf4_gemm_mr_kernel<BR, BN, KS, TM, FRAG>
+        <<<grid, rows_per_cta * 32u, 0, st>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
+            (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
+    return pd_launch_status();
+}
+
+template <bool TM, bool FRAG>
+static int pd_nvf4_mr_launch(const void* data, const void* scale,
+                             const void* bias, const void* x, void* y,
+                             float scale2, uint32_t in_dim, uint32_t out_dim,
+                             uint32_t batch, cudaStream_t st) {
+    static int nsm = 0;
+    if (nsm == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+        if (nsm <= 0) nsm = 148;
+    }
+#define PD_MR_GO(BR, BN, KS)                                                  \
+    pd_nvf4_mr_go<BR, BN, KS, TM, FRAG>(data, scale, bias, x, y, scale2,      \
+                                        in_dim, out_dim, batch, st)
+    if (batch <= 8u) {
+        const bool bn2 = (out_dim + 15u) / 16u >= 2u * (uint32_t)nsm;
+        if (batch <= 4u) return bn2 ? PD_MR_GO(4u, 2u, 2u) : PD_MR_GO(4u, 1u, 2u);
+        return bn2 ? PD_MR_GO(8u, 2u, 2u) : PD_MR_GO(8u, 1u, 2u);
+    }
+    // width gate: wide planes (the lm_head class) run the BN=2 arm - the
+    // election measured at the vocab shape: b1k1 1710 us,
+    // b2k1 1204, b2k2/b2k4 ~1155, b4 worse (occupancy). At b2k1: Issue
+    // Slots Busy 63.6% vs DRAM 17% - this scalar-FMA W4A16 class is
+    // COMPUTE-bound at batch 16, so ~1.15 ms is its structural floor at the
+    // lm_head shape (the KS barrier-thinning axis is a wash for the same
+    // reason). Going lower needs a tensor-core head class (exact-dequant
+    // bf16 or W4A4) - a numeric class change behind a quality gate, not a
+    // knob here. Thin planes keep BN=1 so the grid stays dense.
+    return out_dim >= 4096u ? PD_MR_GO(16u, 2u, 1u) : PD_MR_GO(16u, 1u, 1u);
+#undef PD_MR_GO
+}
+#endif
+
 PD_EXPORT
 int pd_nvf4_gemm_mr(const void* data, const void* scale, const void* bias,
                     const void* x, void* y, float scale2, uint32_t in_dim,
@@ -473,34 +539,9 @@ int pd_nvf4_gemm_mr(const void* data, const void* scale, const void* bias,
 #else
     if (out_dim == 0 || batch == 0) return 0;
     if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
-    constexpr uint32_t BR = 16u;
-    const uint32_t rows_per_cta = 8u;
-    // width gate: wide planes (the lm_head class) run the BN=2 arm - the
-    // election measured at the vocab shape: b1k1 1710 us,
-    // b2k1 1204, b2k2/b2k4 ~1155, b4 worse (occupancy). At b2k1: Issue
-    // Slots Busy 63.6% vs DRAM 17% - this scalar-FMA W4A16 class is
-    // COMPUTE-bound at batch 16, so ~1.15 ms is its structural floor at the
-    // lm_head shape (the KS barrier-thinning axis is a wash for the same
-    // reason). Going lower needs a tensor-core head class (exact-dequant
-    // bf16 or W4A4) - a numeric class change behind a quality gate, not a
-    // knob here. Thin planes keep BN=1 so the grid stays dense.
-    if (out_dim >= 4096u) {
-        constexpr uint32_t BN = 2u;
-        dim3 grid((out_dim + rows_per_cta * BN - 1u) / (rows_per_cta * BN),
-                  (batch + BR - 1u) / BR);
-        pd_nvf4_gemm_mr_kernel<BR, BN, 1u><<<grid, rows_per_cta * 32u, 0,
-                                             (cudaStream_t)stream>>>(
-            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
-            (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
-        return pd_launch_status();
-    }
-    dim3 grid((out_dim + rows_per_cta - 1u) / rows_per_cta,
-              (batch + BR - 1u) / BR);
-    pd_nvf4_gemm_mr_kernel<BR, 1u, 1u><<<grid, rows_per_cta * 32u, 0,
-                                         (cudaStream_t)stream>>>(
-        (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
-        (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
-    return pd_launch_status();
+    return pd_nvf4_mr_launch<false, false>(data, scale, bias, x, y, scale2,
+                                           in_dim, out_dim, batch,
+                                           (cudaStream_t)stream);
 #endif
 }
 
@@ -1750,27 +1791,10 @@ int pd_nvf4_gemm_mr_tm(const void* data, const void* scale, const void* bias,
 #else
     if (out_dim == 0 || batch == 0) return 0;
     if ((in_dim & 127u) != 0) return cudaErrorInvalidValue;
-    constexpr uint32_t BR = 16u;
-    const uint32_t rows_per_cta = 8u;
-    // same width gate as pd_nvf4_gemm_mr - the arms differ only in layout
-    if (out_dim >= 4096u) {
-        constexpr uint32_t BN = 2u;
-        dim3 grid((out_dim + rows_per_cta * BN - 1u) / (rows_per_cta * BN),
-                  (batch + BR - 1u) / BR);
-        pd_nvf4_gemm_mr_kernel<BR, BN, 1u, true>
-            <<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
-                (const uint8_t*)data, (const uint8_t*)scale,
-                (const float*)bias, (const float*)x, (float*)y, scale2,
-                in_dim, out_dim, batch);
-        return pd_launch_status();
-    }
-    dim3 grid((out_dim + rows_per_cta - 1u) / rows_per_cta,
-              (batch + BR - 1u) / BR);
-    pd_nvf4_gemm_mr_kernel<BR, 1u, 1u, true>
-        <<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
-            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
-            (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
-    return pd_launch_status();
+    // same election as pd_nvf4_gemm_mr - the arms differ only in layout
+    return pd_nvf4_mr_launch<true, false>(data, scale, bias, x, y, scale2,
+                                          in_dim, out_dim, batch,
+                                          (cudaStream_t)stream);
 #endif
 }
 
@@ -1866,26 +1890,10 @@ int pd_nvf4_gemm_mr_tf(const void* data, const void* scale, const void* bias,
 #else
     if (out_dim == 0 || batch == 0) return 0;
     if ((in_dim & 127u) != 0) return cudaErrorInvalidValue;
-    constexpr uint32_t BR = 16u;
-    const uint32_t rows_per_cta = 8u;
-    if (out_dim >= 4096u) {
-        constexpr uint32_t BN = 2u;
-        dim3 grid((out_dim + rows_per_cta * BN - 1u) / (rows_per_cta * BN),
-                  (batch + BR - 1u) / BR);
-        pd_nvf4_gemm_mr_kernel<BR, BN, 1u, false, true>
-            <<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
-                (const uint8_t*)data, (const uint8_t*)scale,
-                (const float*)bias, (const float*)x, (float*)y, scale2,
-                in_dim, out_dim, batch);
-        return pd_launch_status();
-    }
-    dim3 grid((out_dim + rows_per_cta - 1u) / rows_per_cta,
-              (batch + BR - 1u) / BR);
-    pd_nvf4_gemm_mr_kernel<BR, 1u, 1u, false, true>
-        <<<grid, rows_per_cta * 32u, 0, (cudaStream_t)stream>>>(
-            (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
-            (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
-    return pd_launch_status();
+    // same election as pd_nvf4_gemm_mr - the arms differ only in layout
+    return pd_nvf4_mr_launch<false, true>(data, scale, bias, x, y, scale2,
+                                          in_dim, out_dim, batch,
+                                          (cudaStream_t)stream);
 #endif
 }
 

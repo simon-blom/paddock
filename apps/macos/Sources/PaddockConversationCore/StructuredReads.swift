@@ -87,6 +87,7 @@ public struct ReadDraft: Equatable, Sendable {
   public var images: [ReadPicture] = []
   public var steps = 1
   public var think = 0
+  public var checkpoint: String?
   public var questions = [ReadQuestion(questionID: "q1")]
   /// 0 is auto locally; wire format always sends "auto", never 0.
   public var samples = 0
@@ -119,6 +120,7 @@ public struct ReadDraft: Equatable, Sendable {
     ]
     if steps > 1 { fields["steps"] = .number(Decimal(steps)) }
     if think > 0 { fields["think"] = .number(Decimal(think)) }
+    if let checkpoint { fields["model"] = .string(checkpoint) }
     return .object(fields)
   }
   public var ordering: [[String]] {
@@ -126,7 +128,7 @@ public struct ReadDraft: Equatable, Sendable {
   }
   public func request(model: String) -> ConversationValue {
     var v = setBody.object!
-    v["model"] = .string(model)
+    v["model"] = .string(checkpoint ?? model)
     v["state"] = .string(state)
     if !images.isEmpty { v["images"] = .array(images.map { .string($0.url) }) }
     return .object(v)
@@ -138,6 +140,11 @@ public struct ReadDraft: Equatable, Sendable {
       throw ConversationFailure.invalid("Use a questions object or a complete read request.")
     }
     var draft = ReadDraft()
+    if let name = root["model"]?.string,
+      ["english", "multilingual", "typed-decisions"].contains(name)
+    {
+      draft.checkpoint = name
+    }
     if root["images"] != nil {
       throw ConversationFailure.invalid(
         "Attach images in the State panel; question-set JSON does not import image data.")
@@ -224,14 +231,19 @@ public struct ReadResponse: Decodable, Sendable {
   public struct Answer: Decodable, Sendable {
     public let type: String
     public let confidence: Double
-    public let agreement: Double
-    public let outside: Double
+    public let agreement: Double?
+    public let outside: Double?
+    public let answerConfidence: Double?
     public let noul: Double?
     public let choice: String?
     public let score: Double?
     public let level: String?
     public let probabilities: [String: Double]?
     public let legend: [String: String]?
+    private enum CodingKeys: String, CodingKey {
+      case type, confidence, agreement, outside, noul, choice, score, level, probabilities, legend
+      case answerConfidence = "answer_confidence"
+    }
     public var label: String {
       if let noul { return noul >= 0.5 ? "Yes" : "No" }
       return choice ?? level ?? "—"
@@ -271,12 +283,26 @@ public struct ReadResponse: Decodable, Sendable {
       public let id: String
       public let label: String
       public let entropy: Double
-      public let labelMass: Double
+      public let labelMass: Double?
       public let position: Int?
       public let reads: [Sample]?
+      public let options: Int?
+      public let tokens: [Int]?
+      public let temperature: Double?
+      public let entropyConfidence: Double?
+      public struct Window: Decodable, Sendable {
+        public let index, count, tokenStart, tokenEnd: Int
+        private enum CodingKeys: String, CodingKey {
+          case index, count
+          case tokenStart = "token_start"
+          case tokenEnd = "token_end"
+        }
+      }
+      public let window: Window?
       private enum CodingKeys: String, CodingKey {
-        case id, label, entropy, reads, position
+        case id, label, entropy, reads, position, options, tokens, temperature, window
         case labelMass = "label_mass"
+        case entropyConfidence = "entropy_confidence"
       }
     }
     public struct Timing: Decodable, Sendable {
@@ -284,10 +310,23 @@ public struct ReadResponse: Decodable, Sendable {
       private enum CodingKeys: String, CodingKey { case totalMilliseconds = "total_ms" }
     }
     public let reads: Int
-    public let canvas: Int
+    public let canvas: Int?
+    public let backend: String?
+    public let checkpoint: String?
+    public let stateTokens: Int?
+    public let windowed: Bool?
     public let questions: [Question]
     public let timing: Timing
+    private enum CodingKeys: String, CodingKey {
+      case reads, canvas, backend, checkpoint, windowed, questions, timing
+      case stateTokens = "state_tokens"
+    }
   }
+  public struct Routing: Decodable, Sendable {
+    public let model: String
+    public let reason: String
+  }
+  public let routing: Routing?
   public let model: String
   public let answers: [String: Answer]
   public let diagnostics: Diagnostics
@@ -302,8 +341,13 @@ public struct ReadResponse: Decodable, Sendable {
   public let usage: Usage?
   public func validate(for questions: [ReadQuestion]) throws {
     func probability(_ p: Double) -> Bool { p.isFinite && (0...1).contains(p) }
+    let decision = diagnostics.backend == "laya"
     guard Set(answers.keys) == Set(questions.map(\.questionID)),
-      (1...32).contains(diagnostics.reads), diagnostics.canvas > 0,
+      (1...32).contains(diagnostics.reads),
+      decision
+        ? (diagnostics.reads == 1
+          && ["english", "multilingual", "typed-decisions"].contains(diagnostics.checkpoint ?? ""))
+        : (diagnostics.canvas ?? 0) > 0,
       diagnostics.timing.totalMilliseconds.isFinite, diagnostics.timing.totalMilliseconds >= 0
     else {
       throw ConversationFailure.invalid("The runner returned an incomplete or invalid read result.")
@@ -311,7 +355,11 @@ public struct ReadResponse: Decodable, Sendable {
     for question in questions {
       let answer = answers[question.questionID]!
       guard answer.type == question.kind.rawValue,
-        probability(answer.confidence), probability(answer.agreement), probability(answer.outside),
+        probability(answer.confidence),
+        decision
+          ? answer.answerConfidence.map(probability) == true
+          : (answer.agreement.map(probability) == true && answer.outside.map(probability) == true),
+        answer.agreement.map(probability) ?? true, answer.outside.map(probability) ?? true,
         answer.probabilities?.values.allSatisfy(probability) ?? true
       else {
         throw ConversationFailure.invalid("Invalid probabilities for \(question.questionID).")

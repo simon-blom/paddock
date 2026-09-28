@@ -23,6 +23,10 @@
 //! the reply in chunks, so this is the multi-turn gate's class (greedy +
 //! loose L2), not gate 1's.
 //!
+//! Gate 4 (checkpoint pages, issue #33): checkpoints are pages of the KV
+//! pool, so a context that needs them takes them - the cache yields, the
+//! request never fails for it.
+//!
 //! Heavy GPU test: PADDOCK_HEAVY_TESTS=1, --release, --test-threads=1.
 
 mod common;
@@ -248,4 +252,75 @@ fn reply_checkpoint_resumes_the_next_turn_at_the_reply() {
     );
     assert_eq!(amax(&got), amax(&reference), "greedy token flipped");
     assert!(r < LOOSE_REL, "diverged: rel {r}");
+}
+
+/// Gate 4 (issue #33): checkpoints live in the KV pool's own pages and hand
+/// them back to a live context. The pool is pinned to one slot's window plus
+/// a quarter - or, where one checkpoint outweighs that quarter (Bonsai 27B:
+/// ~300 pages), to A's pages plus one checkpoint: prompt A's checkpoints take
+/// pages, then a prompt B that needs nearly the whole window gets them - by
+/// evicting A's checkpoints, never by failing - and B is still what the
+/// cache-off path computes. A has lost its resume point to it. Greedy + loose
+/// L2 like gate 2: the cached path chunks a cold prefill at its checkpoint
+/// cuts, the pinned-off path does not.
+#[test]
+fn checkpoint_pages_yield_to_a_growing_context() {
+    let Some((mut m, tok)) = setup() else { return };
+    let b = long_prompt(&tok, 3900); // 244 of the window's 256 pages
+    let base = tok
+        .encode(
+            "Harbour records from the northern coast list every vessel by tonnage, \
+             port of origin and the cargo declared at the customs house on arrival. ",
+        )
+        .expect("enc");
+    let a: Vec<u32> = base.iter().copied().cycle().take(400).collect();
+
+    unsafe { std::env::set_var("PADDOCK_NO_PREFIX_CACHE", "1") };
+    m.enable_batch(2).expect("enable_batch pinned");
+    let reference = m.forward_prefill_slot(0, &b).expect("pinned prefill");
+    unsafe { std::env::remove_var("PADDOCK_NO_PREFIX_CACHE") };
+
+    // one checkpoint's pages are the model's: read them off an unpinned pool
+    m.enable_batch(2).expect("enable_batch");
+    let ppc = m.ckpt_pages_probe();
+    assert!(ppc > 0, "prefix cache on, yet no checkpoint pages");
+    let pool = 320usize.max(a.len().div_ceil(16) + ppc + 8);
+    unsafe { std::env::set_var("PADDOCK_KV_POOL_BLOCKS", pool.to_string()) };
+    m.enable_batch(2).expect("enable_batch with a tight pool");
+    unsafe { std::env::remove_var("PADDOCK_KV_POOL_BLOCKS") };
+
+    // A leaves a checkpoint behind: its re-prefill resumes
+    let _ = m.forward_prefill_slot(0, &a).expect("prefill A");
+    m.release_inactive_slots(&[false, false]);
+    let _ = m.forward_prefill_slot(1, &a).expect("re-prefill A");
+    let a_reused = m.take_prefill_reused(1);
+    assert!(
+        a_reused >= 16,
+        "A must have checkpointed, reused {a_reused}"
+    );
+    m.release_inactive_slots(&[false, false]);
+
+    // B's context needs the pages A's checkpoints hold
+    let got = m
+        .forward_prefill_slot(0, &b)
+        .expect("B must take the checkpoint pages, not run the pool dry");
+    assert_eq!(m.take_prefill_reused(0), 0, "B shares nothing with A");
+    let r = rel(&got, &reference);
+    eprintln!(
+        "CKPT PAGES: A resumed at {a_reused}; B cold under pressure rel {r:.2e}, greedy {} vs {}",
+        amax(&got),
+        amax(&reference)
+    );
+    assert_eq!(amax(&got), amax(&reference), "greedy token flipped");
+    assert!(r < LOOSE_REL, "diverged: rel {r}");
+
+    // ...and A paid for it
+    m.release_inactive_slots(&[false, false]);
+    let _ = m.forward_prefill_slot(1, &a).expect("prefill A again");
+    let after = m.take_prefill_reused(1);
+    eprintln!("CKPT PAGES: A after B resumed at {after}");
+    assert!(
+        after < a_reused,
+        "A's checkpoint should have gone to B's context"
+    );
 }

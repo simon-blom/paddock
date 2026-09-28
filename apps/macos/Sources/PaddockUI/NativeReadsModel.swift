@@ -42,6 +42,8 @@ private actor ReadsConnection {
     var images = false
     var maxSteps = 1
     var think = false
+    var backend: String?
+    var checkpoints: [String] = []
     var id: UInt16 { port }
   }
   struct SavedSet: Decodable, Identifiable, Equatable {
@@ -67,9 +69,10 @@ private actor ReadsConnection {
     var pictures: [ReadPicture] = []
     var steps = 1
     var think = 0
+    var checkpoint: String?
     enum CodingKeys: String, CodingKey {
       case id, at, fingerprint, excerpt, characters, questions, raw, port, elapsedMilliseconds,
-        state, fileName, samples, pictures, steps, think
+        state, fileName, samples, pictures, steps, think, checkpoint
     }
     var retainedBytes: Int {
       // Never base64-encode multi-megabyte pictures on the main actor during
@@ -131,6 +134,11 @@ private actor ReadsConnection {
   @ObservationIgnored private var originalJSON = ""
   var hasUnappliedJSON: Bool { jsonText != originalJSON }
   var current: Reader? { readers.first { $0.port == port } }
+  // A bundle id named "laya" is also upstream's explicit English alias.
+  // Automatic routing must not accidentally force English for non-English input.
+  var requestModel: String {
+    current?.backend == "laya" ? (draft.checkpoint ?? "") : (current?.model ?? "")
+  }
   var result: Run? { runs.first { $0.id == selectedRun } ?? runs.first }
   var dirty: Bool {
     draft.setBody != originalBody || draft.ordering != originalOrdering
@@ -150,6 +158,7 @@ private actor ReadsConnection {
     saved.state = last.state ?? ""
     saved.questions = last.questions
     saved.samples = last.samples
+    saved.checkpoint = last.checkpoint
     saved.images = last.pictures
     saved.steps = last.steps
     saved.think = last.think
@@ -164,6 +173,10 @@ private actor ReadsConnection {
       .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
   }
   var validation: String? {
+    if let checkpoint = draft.checkpoint, current?.checkpoints.contains(checkpoint) != true {
+      return
+        "The selected checkpoint is not available on this reader. Choose automatic routing or a Laya instance."
+    }
     if !draft.images.isEmpty && current?.images != true {
       return "This model reads text only. Remove the images or start it with vision."
     }
@@ -188,7 +201,7 @@ private actor ReadsConnection {
   var stale: Bool {
     guard let result else { return false }
     guard result.id == latestRunID else { return false }
-    return result.port != port || latestRequest != draft.request(model: current?.model ?? "")
+    return result.port != port || latestRequest != draft.request(model: requestModel)
   }
   var previousRead: Bool { result != nil && result?.id != latestRunID }
   init(client: any ManagerLoading) {
@@ -208,11 +221,13 @@ private actor ReadsConnection {
       for runner in fleet {
         try Task.checkCancellation()
         guard let number = runner["port"]?.integer, let port = UInt16(exactly: number), port > 0,
-          let id = runner["model"]?.string
+          let id = runner["reader"]?.string ?? runner["model"]?.string
         else { continue }
         do {
           let info = try await api("api/runners/\(port)/server", "GET", nil, [:])
-          guard let caps = info["structured_read"], (caps["canvas_width"]?.integer ?? 0) > 0 else {
+          guard let caps = info["structured_read"],
+            (caps["canvas_width"]?.integer ?? 0) > 0 || caps["backend"]?.string == "laya"
+          else {
             continue
           }
           next.append(
@@ -224,7 +239,9 @@ private actor ReadsConnection {
               types: caps["types"]?.array?.compactMap(\.string) ?? ["noul", "choice", "score"],
               images: caps["images"] == .bool(true),
               maxSteps: min(8, max(1, caps["max_steps"]?.integer ?? 1)),
-              think: caps["think"] == .bool(true)))
+              think: caps["think"] == .bool(true),
+              backend: caps["backend"]?.string,
+              checkpoints: caps["checkpoints"]?.array?.compactMap { $0["name"]?.string } ?? []))
         } catch is CancellationError { throw CancellationError() } catch {
           if let previous = readers.first(where: { $0.port == port && $0.model == id }) {
             next.append(previous)
@@ -417,7 +434,7 @@ private actor ReadsConnection {
       if let validation { questionsError = validation }
       return
     }
-    let request = draft.request(model: reader.model)
+    let request = draft.request(model: requestModel)
     guard draft.state.utf8.count <= 4 * 1024 * 1024 else {
       stateError = "The text exceeds the 4 MiB reading limit. Use a smaller section."
       return
@@ -425,6 +442,7 @@ private actor ReadsConnection {
     let questions = draft.questions
     let submittedFileName = fileName
     let submittedSamples = draft.samples
+    let submittedCheckpoint = draft.checkpoint
     let submittedPictures = draft.images
     let submittedSteps = draft.steps
     let submittedThink = draft.think
@@ -454,7 +472,8 @@ private actor ReadsConnection {
           questions: questions, raw: raw, port: reader.port, elapsedMilliseconds: milliseconds,
           response: response, state: request["state"]?.string,
           fileName: submittedFileName, samples: submittedSamples,
-          pictures: submittedPictures, steps: submittedSteps, think: submittedThink)
+          pictures: submittedPictures, steps: submittedSteps, think: submittedThink,
+          checkpoint: submittedCheckpoint)
         latestRequest = request
         latestRunID = result.id
         runs = Array(([result] + runs).prefix(20))
@@ -565,6 +584,7 @@ private actor ReadsConnection {
     if !run.pictures.isEmpty { fields["images"] = .array(run.pictures.map(\.historyReference)) }
     if run.steps > 1 { fields["steps"] = .number(Decimal(run.steps)) }
     if run.think > 0 { fields["think"] = .number(Decimal(run.think)) }
+    if let checkpoint = run.checkpoint { fields["checkpoint"] = .string(checkpoint) }
     let value = ConversationValue.object(fields)
     let title =
       run.fileName.isEmpty
@@ -658,7 +678,8 @@ private actor ReadsConnection {
           response: response,
           state: value["stateMissing"] == .bool(true) ? nil : input.state,
           fileName: value["fileName"]?.string ?? "", samples: input.samples,
-          pictures: input.images, steps: input.steps, think: input.think)
+          pictures: input.images, steps: input.steps, think: input.think,
+          checkpoint: input.checkpoint)
         // Legacy web runs have no UUID. Stable within this loaded document.
         run.id = value["id"]?.string.flatMap(UUID.init(uuidString:)) ?? UUID()
         run.at = Date(
@@ -675,7 +696,9 @@ private actor ReadsConnection {
       runs = restored.reversed()
       selectedRun = runs.first?.id
       latestRunID = runs.first?.id
-      latestRequest = draft.request(model: runs.first?.response.model ?? "")
+      latestRequest = draft.request(
+        model: runs.first?.response.diagnostics.backend == "laya"
+          ? "" : (runs.first?.response.model ?? ""))
       selectedSet = nil
       setName = ""
       jsonText = ""
@@ -931,6 +954,7 @@ extension NativeReadsModel.Run {
     pictures = try c.decodeIfPresent([ReadPicture].self, forKey: .pictures) ?? []
     steps = try c.decodeIfPresent(Int.self, forKey: .steps) ?? 1
     think = try c.decodeIfPresent(Int.self, forKey: .think) ?? 0
+    checkpoint = try c.decodeIfPresent(String.self, forKey: .checkpoint)
     response = try JSONDecoder().decode(ReadResponse.self, from: JSONEncoder().encode(raw))
   }
 }

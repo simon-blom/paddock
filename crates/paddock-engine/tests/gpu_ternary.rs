@@ -694,6 +694,123 @@ fn ternary_layouts_and_multi_bitmatch_the_single_walk() {
     );
 }
 
+/// The NB-row lane (slot 686, the int8 tensor cores) against the batch-1 walk:
+/// every row of a launch has to be the single-row launch's bits - one plane,
+/// three planes end to end, and gate | up + SwiGLU - at row counts on both
+/// sides of the lane's 8-column tile, and at a width that folds as two
+/// slices. That is the ternary class: a decode row scores the same alone, in
+/// a shared tick, or in a verify round.
+#[test]
+fn ternary_nb_lane_bitmatches_the_single_walk() {
+    let Some(exec) = ternary_exec() else {
+        return;
+    };
+    if !exec.has_ternary_gemv_b128() || !exec.has_ternary_gemm_nb() {
+        eprintln!("pack lacks the ternary NB lane (slot 686) - skipping");
+        return;
+    }
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+    for (in_dim, outs) in [(5120usize, [1536usize, 256, 256]), (9216, [64, 32, 32])] {
+        let planes: Vec<_> = outs
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| {
+                let bytes = plane(PTQ1_0, in_dim, o, 0x4B0 + (in_dim + i) as u64);
+                exec.repack_kquant_raw(&bytes, vec![in_dim, o], GgmlType::Ptq1_0, "synthetic")
+                    .expect("repack")
+            })
+            .collect();
+        let refs: Vec<&paddock_engine::gpu::RepackedKQ> = planes.iter().collect();
+        for rows in [1usize, 2, 3, 5, 8, 9, 16, 33] {
+            assert!(exec.ternary_nb_fits(&refs, rows));
+            let mut x = noise(rows * in_dim, 0x9B + (rows * in_dim) as u64);
+            for v in &mut x[256..384] {
+                *v *= 30.0;
+            }
+            let dx = exec.to_device(&x).expect("htod");
+            let mut xq = exec.alloc_i8(rows * in_dim).expect("alloc");
+            let mut xs = exec.alloc(rows * in_dim / 128).expect("alloc");
+            exec.quantize_q8_b128(&dx, &mut xq, &mut xs, rows * in_dim)
+                .expect("quantize");
+            // the single-row walk, row by row (a 128-block quantizes alone, so
+            // a row quantized by itself is the batch's row, byte for byte)
+            let per_row: Vec<(_, _)> = (0..rows)
+                .map(|r| {
+                    let d = exec
+                        .to_device(&x[r * in_dim..(r + 1) * in_dim])
+                        .expect("htod");
+                    let mut q = exec.alloc_i8(in_dim).expect("alloc");
+                    let mut sc = exec.alloc(in_dim / 128).expect("alloc");
+                    exec.quantize_q8_b128(&d, &mut q, &mut sc, in_dim)
+                        .expect("quantize");
+                    (q, sc)
+                })
+                .collect();
+            let single = |w: &paddock_engine::gpu::RepackedKQ| -> Vec<f32> {
+                let mut all = Vec::with_capacity(rows * w.dims[1]);
+                for (q, sc) in &per_row {
+                    let mut y = exec.alloc(w.dims[1]).expect("alloc");
+                    exec.ternary_gemv_b128(w, q, sc, &mut y).expect("gemv");
+                    all.extend(exec.to_host(&y).expect("dtoh"));
+                }
+                all
+            };
+            let want: Vec<Vec<f32>> = planes.iter().map(single).collect();
+
+            // one plane
+            let mut y = exec.alloc(rows * outs[0]).expect("alloc");
+            exec.ternary_gemm_nb(&mut [(&planes[0], &mut y)], &xq, &xs, rows)
+                .expect("nb");
+            assert!(
+                same(&exec.to_host(&y).expect("dtoh"), &want[0]),
+                "{in_dim}: {rows} rows through the NB lane differ from the single-row walk"
+            );
+
+            // three planes end to end
+            let mut ys: Vec<_> = outs
+                .iter()
+                .map(|&o| exec.alloc(rows * o).expect("alloc"))
+                .collect();
+            {
+                let mut it = ys.iter_mut();
+                let (y0, y1, y2) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+                exec.ternary_gemm_nb(
+                    &mut [(&planes[0], y0), (&planes[1], y1), (&planes[2], y2)],
+                    &xq,
+                    &xs,
+                    rows,
+                )
+                .expect("nb multi");
+            }
+            for (i, y) in ys.iter().enumerate() {
+                assert!(
+                    same(&exec.to_host(y).expect("dtoh"), &want[i]),
+                    "{in_dim}: plane {i} of the NB multi launch at {rows} rows differs"
+                );
+            }
+
+            // gate | up + SwiGLU against the batch-1 GLU launch per row
+            let mut g = exec.alloc(rows * outs[1]).expect("alloc");
+            exec.ternary_glu_nb(&planes[1], &planes[2], &xq, &xs, &mut g, rows)
+                .expect("nb glu");
+            let mut want_g = Vec::with_capacity(rows * outs[1]);
+            for (q, sc) in &per_row {
+                let mut y1 = exec.alloc(outs[1]).expect("alloc");
+                exec.ternary_glu_b128(&planes[1], &planes[2], q, sc, &mut y1)
+                    .expect("glu");
+                want_g.extend(exec.to_host(&y1).expect("dtoh"));
+            }
+            assert!(
+                same(&exec.to_host(&g).expect("dtoh"), &want_g),
+                "{in_dim}: the NB GLU launch at {rows} rows differs from the batch-1 GLU"
+            );
+            eprintln!(
+                "NB lane {in_dim} x {outs:?} at {rows} rows: bit-identical to the single-row walk"
+            );
+        }
+    }
+}
+
 /// Where the batch-1 decode lane and the rotation stand against the card:
 /// weight bytes streamed per second over planes that cannot sit in L2 (clones
 /// rotated past 4x its size), and the rotation's cost per

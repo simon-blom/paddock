@@ -40,6 +40,7 @@ mod projection;
 mod projection_tests;
 #[cfg(test)]
 mod quant_boundary_tests;
+mod retention;
 mod serving;
 mod spec;
 #[cfg(test)]
@@ -254,6 +255,13 @@ impl Qwen35 {
             return false;
         };
         self.spill_checkpoint(index);
+        if retention::trace() {
+            tracing::info!(
+                index,
+                tokens = self.cache[index].history.len(),
+                "metal-cache-pressure-evict"
+            );
+        }
         self.cache[index].table.clear(&mut self.pool);
         self.cache[index].history.clear();
         self.cache[index].images.clear();
@@ -349,6 +357,12 @@ impl Qwen35 {
         // On a miss, pos=0 lazily zeros state and the convolution window in
         // their GPU producers. No host writes to multi-megabyte state slabs.
         self.slots[slot].reused = reused;
+        if retention::trace() {
+            tracing::info!(slot, tokens = tokens.len(), reused, checkpoint = ?matched,
+                cache = ?self.cache.iter().enumerate().map(|(i, c)|
+                    (i, c.history.len(), c.touched, c.reserved)).collect::<Vec<_>>(),
+                "metal-cache-prepare");
+        }
         Ok(reused)
     }
 

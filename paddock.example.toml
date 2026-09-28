@@ -37,6 +37,19 @@
 # Env: PADDOCK_MAX_CTX   CLI: --max-ctx
 # max_ctx = 4096
 
+# Continuous-batching width: how many sequences the engine runs per step.
+# Each slot costs its own KV (and recurrent state on hybrid models), so a
+# long-context server on a tight card wants a small one.
+# Env: PADDOCK_MAX_BATCH   CLI: --max-batch
+# max_batch = 32
+
+# Hard VRAM ceiling for this server, in MiB (the units nvidia-smi shows), so
+# 23 GiB is 23552. Every pool and cache is sized inside it and a load that
+# cannot fit is refused. The manager writes it for the servers it starts; unset
+# = size against the card's free VRAM at load.
+# Env: PADDOCK_VRAM_BUDGET   CLI: --vram-budget
+# vram_budget = 23552
+
 # Vision tower GGUF (mmproj) for multimodal models - enables image input.
 # Env: PADDOCK_MMPROJ   CLI: --mmproj
 # mmproj = "~/paddock/models/Qwen3-VL-mmproj-f16.gguf"

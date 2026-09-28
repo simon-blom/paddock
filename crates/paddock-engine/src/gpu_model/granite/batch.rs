@@ -947,19 +947,31 @@ impl GpuGranite {
         self.head_row(last_len - 1)
     }
 
-    /// Admission prologue shared by every prefill entry: bounds-check the
-    /// prompt, drop the slot's previous sequence, and back the blocks the
-    /// whole prompt will need up front (so a mid-prompt chunk can never
-    /// discover the pool is dry with rows already written).
+    /// Admission prologue shared by the text prefill entries: bounds-check the
+    /// prompt and drop the slot's previous sequence. It backs NO blocks:
+    /// `prefill_resume_rows` runs next, adopts whatever the radix holds of
+    /// the prompt, and then backs every row the prompt still writes, up front
+    /// (so a mid-prompt chunk can never discover the pool is dry with rows
+    /// already written). Backing the whole prompt before the match made the
+    /// allocation evict the pages the match was about to adopt whenever a
+    /// conversation outgrew the free part of the pool (the nemotron lane,
+    /// same shape: a ~210K conversation re-prefilled every turn at 262K).
     fn admit(&mut self, slot: usize, tokens: &[u32]) -> Result<(), GpuModelError> {
-        self.admit_rows(slot, tokens.len())
+        self.admit_clear(slot, tokens.len())
     }
 
-    /// The row-counted half of admission. The multimodal lane calls this
-    /// directly because its ROW count is not its token count: one `<image>`
-    /// placeholder expands to the AnyRes row run (144 for a thumbnail, ~2.5k
-    /// for a max-grid strip), so there is no token slice to hand `admit`.
+    /// The row-counted admission with the whole prompt backed up front. The
+    /// multimodal lane calls this directly because its ROW count is not its
+    /// token count (one `<image>` placeholder expands to the AnyRes row run,
+    /// 144 for a thumbnail, ~2.5k for a max-grid strip) and because it wants
+    /// a prompt the pool cannot hold to fail before the tower burns an encode.
     pub(crate) fn admit_rows(&mut self, slot: usize, n_rows: usize) -> Result<(), GpuModelError> {
+        self.admit_clear(slot, n_rows)?;
+        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])
+    }
+
+    /// Bounds-check and drop the slot's previous sequence (blocks and media).
+    fn admit_clear(&mut self, slot: usize, n_rows: usize) -> Result<(), GpuModelError> {
         let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
         if slot >= n_slots {
             return Err(GpuModelError::Unsupported(format!(
@@ -984,7 +996,7 @@ impl GpuGranite {
         // inside the old image's position span and get vision features injected
         // into text - fluent, wrong, and completely silent.
         self.media.clear_slot(slot);
-        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])
+        Ok(())
     }
 
     /// COALESCED multi-prompt prefill: every pending prompt's rows concatenate
@@ -1083,8 +1095,9 @@ impl GpuGranite {
     }
 
     /// Shared resume for both lanes: match the radix on `keys`, adopt what it
-    /// has, then re-back the tail so every row this prompt will write has a
-    /// block. Returns the row to start computing at.
+    /// has, then back every row this prompt will still write (the whole
+    /// prompt on a miss; a no-op where `admit_rows` already backed them).
+    /// Returns the row to start computing at.
     pub(crate) fn prefill_resume_rows(
         &mut self,
         slot: usize,
@@ -1092,9 +1105,7 @@ impl GpuGranite {
         n_rows: usize,
     ) -> Result<usize, GpuModelError> {
         let start = self.prefix_resume(slot, keys)?;
-        if start > 0 {
-            self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])?;
-        }
+        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])?;
         Ok(start)
     }
 

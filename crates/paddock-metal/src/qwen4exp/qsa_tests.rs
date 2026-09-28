@@ -127,6 +127,434 @@ fn selection_zero_ties_and_invalid_scores_fail_closed() {
     }
 }
 
+#[test]
+fn compact_mlx_attention_matches_legacy_partitions_exactly() {
+    attention_staging_contracts(false);
+}
+
+#[test]
+#[ignore = "isolated GPU timing for exact Flash Next attention staging routes"]
+fn mlx_attention_staging_cost() {
+    attention_staging_contracts(true);
+}
+
+#[test]
+fn local_mlx_attention_preserves_partials_and_guards() {
+    attention_local_contracts(false);
+}
+
+#[test]
+#[ignore = "isolated on-chip attention timing; not a serving benchmark"]
+fn mlx_attention_local_cost() {
+    attention_local_contracts(true);
+}
+
+fn attention_local_contracts(benchmark: bool) {
+    let d = MetalDevice::new(Some(768 << 20)).unwrap();
+    let capacity = 2048usize;
+    let slots = 64usize;
+    let pages_per_slot = 1024usize;
+    let length = pages_per_slot * 16;
+    let values = |count: usize, scale: f32| {
+        (0..count)
+            .map(|i| (i as f32 * scale).sin() * 0.5)
+            .collect::<Vec<_>>()
+    };
+    let bf = |scale| {
+        d.upload(
+            &values(length * qsa::KV, scale)
+                .iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let k = bf(0.013);
+    let v = bf(0.017);
+    let pages = upload_u(
+        &d,
+        &(0..slots * pages_per_slot)
+            // Every slot has a different permutation: wrong-slot reads must
+            // not pass simply because all tables point to identical pages.
+            .map(|i| {
+                ((pages_per_slot - 1 - i % pages_per_slot + i / pages_per_slot * 37)
+                    % pages_per_slot) as u32
+            })
+            .collect::<Vec<_>>(),
+    );
+    let units = capacity + slots * 8 * 3;
+    let scratch_len = units * 2 * 8192;
+    let parts_len = units * qsa::HEADS * 258;
+    let scratch = upload(&d, &vec![-8765.; scratch_len + 17]);
+    let parts = upload(&d, &vec![f32::NAN; parts_len + 17]);
+    for (n, bf_query) in [1, 4, 8, 17, 32, 64, 128, 512, 1024, 2048]
+        .into_iter()
+        .flat_map(|n| [(n, false), (n, true)])
+    {
+        let mut query_values = values(n * qsa::Q, 0.019);
+        if bf_query {
+            for value in &mut query_values {
+                *value = half::bf16::from_f32(*value).to_f32();
+            }
+        }
+        let query = upload(&d, &query_values);
+        let qg = upload(&d, &values(n * qsa::Q * 2, 0.023));
+        let out = upload(&d, &vec![-9876.; n * qsa::Q + 17]);
+        for (position, ragged) in [0usize, 7, 127, 2047, 2050, 8191, 16383]
+            .into_iter()
+            .map(|p| (p, false))
+            .chain([(2050, true), (16383, true)])
+        {
+            if (n > 64 && ![127, 8191, 16383].contains(&position)) || (benchmark && ragged) {
+                continue;
+            }
+            let position_at = |i: usize| position - if ragged { i % 19 } else { 0 };
+            let meta = upload_u(
+                &d,
+                &(0..n)
+                    .flat_map(|i| {
+                        [
+                            (slots - 1 - i % slots) as u32,
+                            position_at(i) as u32,
+                            i as u32,
+                            (i + 1) as u32,
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let selected = upload_u(
+                &d,
+                &(0..n * 512)
+                    .map(|i| {
+                        let blocks = (position_at(i / 512) + 1) / 4;
+                        if blocks > 512 {
+                            ((i % 512) * blocks / 512 + (i / 512) % (blocks / 512)) as u32
+                        } else {
+                            (i % 512).min(blocks.saturating_sub(1)) as u32
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let counts = upload_u(
+                &d,
+                &(0..n)
+                    .map(|i| ((position_at(i) + 1) / 4).min(512) as u32)
+                    .collect::<Vec<_>>(),
+            );
+            // Four-part decode, sliced one-part prefill, and mixed masks,
+            // including slots above 31. Never re-elect using physical rows.
+            for mask in [[u32::MAX; 2], [0; 2], [0x55555555, 0xaaaaaaaa]] {
+                if n > 64 && mask != [0; 2] {
+                    continue;
+                }
+                let p = [
+                    pages_per_slot as u32,
+                    (pages_per_slot * 4) as u32,
+                    n as u32,
+                    slots as u32,
+                    4,
+                    mask[0],
+                    mask[1],
+                    capacity as u32,
+                ];
+                let mut reference: Option<(Vec<u32>, Vec<u32>)> = None;
+                let kernels = [
+                    "q4b_attention_compact",
+                    "q4b_attention_local",
+                    "q4b_attention_local_pad",
+                    "q4b_attention_local_wide",
+                    "q4b_attention_local_gather",
+                ];
+                let mut times = kernels.map(|_| Vec::new());
+                let routes = kernels.len();
+                for round in 0..if benchmark { 7 } else { 1 } {
+                    for route in (0..routes).map(|r| (r + round) % routes) {
+                        if round == 0 {
+                            // Poison independently after the previous command
+                            // has completed. A missing write must not inherit
+                            // the oracle's partials or joined output.
+                            unsafe {
+                                parts.write_u32(&vec![
+                                    f32::NAN.to_bits() + route as u32;
+                                    parts_len + 17
+                                ]);
+                                out.write_u32(&vec![(-9876f32).to_bits(); n * qsa::Q + 17]);
+                            }
+                        }
+                        let cmd = d.begin().unwrap();
+                        cmd.dispatch(
+                            kernels[route],
+                            &[
+                                &query, &k, &v, &meta, &pages, &selected, &counts, &scratch, &parts,
+                            ],
+                            &p,
+                            [2, n, 4],
+                            128,
+                        );
+                        cmd.dispatch(
+                            "q4b_join_gate_compact",
+                            &[&parts, &qg, &out, &meta],
+                            &p,
+                            [n * qsa::HEADS, 1, 1],
+                            32,
+                        );
+                        let elapsed = cmd.finish().unwrap();
+                        if round > 0 {
+                            times[route].push(elapsed);
+                        }
+                        let actual = unsafe { out.read_u32(n * qsa::Q + 17) };
+                        assert_eq!(&actual[n * qsa::Q..], &[(-9876f32).to_bits(); 17]);
+                        assert!(
+                            unsafe { parts.read_f32(parts_len, 17) }
+                                .iter()
+                                .all(|v| v.is_nan())
+                        );
+                        let mut active = Vec::new();
+                        for row in 0..n {
+                            let slot = slots - 1 - row % slots;
+                            let splits = if mask[slot / 32] & (1 << (slot % 32)) != 0 {
+                                4
+                            } else {
+                                1
+                            };
+                            for split in 0..splits {
+                                let unit = if split == 0 {
+                                    row
+                                } else {
+                                    capacity + 3 * (slot * 8) + split - 1
+                                };
+                                active.extend(
+                                    unsafe {
+                                        parts.read_f32(unit * qsa::HEADS * 258, qsa::HEADS * 258)
+                                    }
+                                    .into_iter()
+                                    .map(f32::to_bits),
+                                );
+                            }
+                        }
+                        if let Some((expected, partials)) = &reference {
+                            assert!(
+                                actual == *expected,
+                                "output n={n} position={position} ragged={ragged} route={route}"
+                            );
+                            assert!(
+                                active == *partials,
+                                "partials n={n} position={position} ragged={ragged} route={route}"
+                            );
+                        } else {
+                            reference = Some((actual, active));
+                        }
+                    }
+                }
+                assert_eq!(unsafe { out.read_f32(n * qsa::Q, 17) }, [-9876.; 17]);
+                assert_eq!(unsafe { scratch.read_f32(scratch_len, 17) }, [-8765.; 17]);
+                assert!(
+                    unsafe { parts.read_f32(parts_len, 17) }
+                        .iter()
+                        .all(|v| v.is_nan())
+                );
+                if benchmark {
+                    eprintln!(
+                        "FLASH_LOCAL_COST {}",
+                        serde_json::json!({"rows":n,"position":position,"ragged":ragged,"bf16_query":bf_query,
+                    "mask":mask,"gpu_seconds":times,"partials_exact":true})
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn attention_staging_contracts(benchmark: bool) {
+    // Independent legacy storage/kernel is retained as the arithmetic oracle.
+    // Sparse boundary, tail rows, four-part decode, sliced one-part prefill,
+    // non-monotonic slots and both halves of the logical mask are covered.
+    let d = MetalDevice::new(Some(768 << 20)).unwrap();
+    let pages_per_slot = 256usize;
+    let length = pages_per_slot * 16;
+    let values = |count: usize, scale: f32| {
+        (0..count)
+            .map(|i| (i as f32 * scale).sin() * 0.5)
+            .collect::<Vec<_>>()
+    };
+    let bf = |count: usize, scale| {
+        d.upload(
+            &values(count, scale)
+                .iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let k = bf(length * qsa::KV, 0.013);
+    let v = bf(length * qsa::KV, 0.017);
+    for (capacity, slots, order) in [
+        (256usize, 4usize, [3usize, 1, 2, 0]),
+        (1024, 64, [63, 1, 33, 0]),
+    ] {
+        let pages = upload_u(
+            &d,
+            &(0..slots * pages_per_slot)
+                .map(|i| (pages_per_slot - 1 - i % pages_per_slot) as u32)
+                .collect::<Vec<_>>(),
+        );
+        let n = if benchmark { capacity } else { 99 };
+        let query = upload(&d, &values(n * qsa::Q, 0.019));
+        let qg = upload(&d, &values(n * qsa::Q * 2, 0.023));
+        let legacy_scratch = d.alloc(n * 2 * 4 * 8192 * 4).unwrap();
+        let legacy_parts = d.alloc(n * qsa::HEADS * 4 * 258 * 4).unwrap();
+        let units = capacity + slots * 8 * 3;
+        let scratch_len = units * 2 * 8192;
+        let parts_len = units * qsa::HEADS * 258;
+        let compact_scratch = upload(&d, &vec![-8765.; scratch_len + 17]);
+        let compact_parts = upload(&d, &vec![f32::NAN; parts_len + 17]);
+        for position in [7usize, 128, 2047, 2050, 4095] {
+            let mut meta = Vec::new();
+            let spans = if benchmark {
+                [capacity / 4; 4]
+            } else {
+                [8, 1, 17, 73]
+            };
+            let mut start = 0;
+            for (slot, count) in order.into_iter().zip(spans) {
+                for _ in 0..count {
+                    meta.extend([
+                        slot as u32,
+                        position as u32,
+                        start as u32,
+                        (start + count) as u32,
+                    ]);
+                }
+                start += count;
+            }
+            let meta = upload_u(&d, &meta);
+            let blocks = (position + 1) / 4;
+            let selected = upload_u(
+                &d,
+                &(0..n * 512)
+                    .map(|i| (i % 512).min(blocks.saturating_sub(1)) as u32)
+                    .collect::<Vec<_>>(),
+            );
+            let counts = upload_u(&d, &vec![blocks.min(512) as u32; n]);
+            let mut p = [
+                pages_per_slot as u32,
+                (pages_per_slot * 4) as u32,
+                n as u32,
+                slots as u32,
+                4,
+                0,
+                0,
+                capacity as u32,
+            ];
+            // The eight-row span decodes, while the one physical row belongs
+            // to a wide logical prefill and must NOT use four partitions.
+            if !benchmark {
+                p[5 + order[0] / 32] = 1 << (order[0] % 32);
+            }
+            let old = upload(&d, &vec![-9876.; n * qsa::Q + 17]);
+            let new = upload(&d, &vec![-9876.; n * qsa::Q + 17]);
+            let mut times = [Vec::new(), Vec::new()];
+            let kernels = ["q4b_attention_contract", "q4b_attention_compact"];
+            for round in 0..if benchmark { 6 } else { 1 } {
+                for route in (0..2).map(|r| (r + round) % 2) {
+                    let (scratch, parts) = if route == 0 {
+                        (&legacy_scratch, &legacy_parts)
+                    } else {
+                        (&compact_scratch, &compact_parts)
+                    };
+                    let cmd = d.begin().unwrap();
+                    cmd.dispatch(
+                        kernels[route],
+                        &[
+                            &query, &k, &v, &meta, &pages, &selected, &counts, scratch, parts,
+                        ],
+                        &p,
+                        [2, n, 4],
+                        128,
+                    );
+                    let elapsed = cmd.finish().unwrap();
+                    if round > 0 {
+                        times[route].push(elapsed);
+                    }
+                    let cmd = d.begin().unwrap();
+                    if route == 0 {
+                        cmd.dispatch(
+                            "q4b_join_gate",
+                            &[parts, &qg, &old],
+                            &p,
+                            [n * qsa::HEADS, 1, 1],
+                            32,
+                        );
+                    } else {
+                        cmd.dispatch(
+                            "q4b_join_gate_compact",
+                            &[parts, &qg, &new, &meta],
+                            &p,
+                            [n * qsa::HEADS, 1, 1],
+                            32,
+                        );
+                    }
+                    cmd.finish().unwrap();
+                    if route != 0 {
+                        let actual = unsafe { new.read_f32(0, n * qsa::Q + 17) };
+                        let expected = unsafe { old.read_f32(0, n * qsa::Q + 17) };
+                        let diffs = actual
+                            .iter()
+                            .zip(&expected)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        assert_eq!(diffs, 0, "route={route} position={position} rows={n}");
+                    }
+                }
+            }
+            if benchmark {
+                eprintln!(
+                    "FLASH_ATTENTION {}",
+                    serde_json::json!({"rows":n,"position":position,"kernels":kernels,"gpu_seconds":times})
+                );
+            }
+            let expected = unsafe { old.read_f32(0, n * qsa::Q + 17) };
+            let actual = unsafe { new.read_f32(0, n * qsa::Q + 17) };
+            assert!(actual.iter().all(|v| v.is_finite()));
+            assert_eq!(actual, expected, "slots={slots} position={position}");
+            assert_eq!(&actual[n * qsa::Q..], &[-9876.; 17]);
+            assert_eq!(
+                unsafe { compact_scratch.read_f32(scratch_len, 17) },
+                [-8765.; 17]
+            );
+            assert!(
+                unsafe { compact_parts.read_f32(parts_len, 17) }
+                    .iter()
+                    .all(|v| v.is_nan())
+            );
+        }
+    }
+}
+
+#[test]
+fn mlx_workspaces_have_exact_bounded_allocation_ledgers() {
+    let d = MetalDevice::new(Some(1 << 30)).unwrap();
+    for (rows, slots) in [(1, 1), (8, 1), (128, 64), (256, 4), (512, 4), (1024, 64)] {
+        let before = d.allocated_bytes();
+        let q = qsa::Workspace::new_mlx(&d, rows, slots, 256).unwrap();
+        assert_eq!(
+            d.allocated_bytes() - before,
+            qsa::Workspace::mlx_bytes(rows, slots, 256) as u64
+        );
+        assert!(
+            qsa::Workspace::mlx_bytes(rows, slots, 256) <= qsa::Workspace::bytes(rows, slots, 256)
+        );
+        drop(q);
+        let dn = super::deltanet::Workspace::new_mlx(&d, rows, slots).unwrap();
+        assert_eq!(
+            d.allocated_bytes() - before,
+            super::deltanet::Workspace::mlx_bytes(rows, slots) as u64
+        );
+        drop(dn);
+        assert_eq!(d.allocated_bytes(), before);
+    }
+}
+
 struct Stream {
     length: usize,
     probes: Vec<usize>,

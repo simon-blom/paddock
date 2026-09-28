@@ -96,6 +96,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     "\n",
     include_str!("../../../packs/metal/qwen4exp_qsa.metal"),
     include_str!("../../../packs/metal/qwen_image.metal"),
+    include_str!("../../../packs/metal/laya.metal"),
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -349,11 +350,16 @@ impl MetalDevice {
         let lib = raw
             .newLibraryWithSource_options_error(
                 &NSString::from_str(&format!(
-                    "{}{}",
+                    "{}{}{}",
                     if raw.supportsFamily(MTLGPUFamily::Apple10) {
                         ""
                     } else {
                         "#define PADDOCK_APPLE9 1\n"
+                    },
+                    if cfg!(test) {
+                        "#define PADDOCK_KERNEL_DIAGNOSTICS 1\n"
+                    } else {
+                        ""
                     },
                     SHADER_SOURCE
                 )),
@@ -362,6 +368,17 @@ impl MetalDevice {
             .map_err(|e| MetalError::Device(e.to_string()))?;
         let mut kernels = HashMap::new();
         for name in [
+            "laya_mm",
+            "laya_geglu",
+            "laya_embed",
+            "laya_norm",
+            "laya_head_entry",
+            "laya_qkv",
+            "laya_attention12",
+            "laya_attention16",
+            "laya_gather",
+            "laya_score",
+            "laya_act",
             "qi_activation",
             "qi_vision_patches",
             "qi_vision_affine",
@@ -759,10 +776,29 @@ impl MetalDevice {
             "q4a_wide",
             "q4a_mm",
             "q4a_mm4_packed",
+            "q4a_input",
+            "q4a_mm4_device128",
+            "q4a_mm4_device128_group32",
+            "q4a_mm8_device128",
+            "q4a_mm4_device64",
+            "q4a_mm4_device64_group32",
+            "q4a_mm4_device128_pad8",
+            "q4a_mm4_device64_pad8",
+            #[cfg(test)]
+            "q4a_mm4_device128_pad16",
+            #[cfg(test)]
+            "q4a_mm4_device64_pad16",
+            "q4a_mm8_device64",
             "q4a_mm8_packed",
             "q4a_mm4_reuse",
             "q4a_mm8_reuse",
             "q4a_mm_split",
+            "q4a_mm4_split_device128_group32",
+            "q4a_mm4_split_device64_group32",
+            "q4a_mm4_split_device32_group32",
+            "q4a_mm4_split_device128_pad8",
+            "q4a_mm4_split_device64_pad8",
+            "q4a_mm4_split_device32_pad8",
             "q4a_mm_join",
             "q4b_margin",
             "q4a_expert_mv",
@@ -776,6 +812,16 @@ impl MetalDevice {
             "q4a_expert4_fast_pair",
             "q4a_expert_mm",
             "q4a_expert_mm_wide",
+            "q4a_expert_mm_tail",
+            "q4a_expert_mm_group32",
+            "q4a_expert_mm_group32_pad",
+            "q4a_expert_mm_group32_packed",
+            #[cfg(test)]
+            "q4a_expert_gate_up_packed",
+            #[cfg(test)]
+            "q4a_expert_gate_up_dispatch",
+            #[cfg(test)]
+            "q4a_expert_swiglu_masked",
             "q4a_expert_vector_masked",
             "q4b_norm",
             "q4b_trace_pointwise",
@@ -786,6 +832,14 @@ impl MetalDevice {
             "q4b_pool",
             "q4b_attention",
             "q4b_attention_contract",
+            "q4b_attention_compact",
+            "q4b_attention_local",
+            "q4b_attention_local_pad",
+            #[cfg(test)]
+            "q4b_attention_local_wide",
+            "q4b_attention_local_gather",
+            "q4b_join_gate_compact",
+            "q4a_ple_staged",
             "q4b_join_gate",
             "q4b_route",
             "q4b_fold",
@@ -1709,6 +1763,31 @@ mod tests {
 
     #[test]
     fn telemetry_async_completion_records_once_even_after_repeated_wait_and_drop() {
+        // Counters deliberately include every queue in a runner. Other GPU
+        // unit tests run concurrently, so an exact +1 assertion belongs in
+        // its own process, not behind a lock that those tests do not share.
+        // Preserve the exact assertion instead of tolerating duplicate counts.
+        const CHILD: &str = "PADDOCK_TEST_COMPLETION_TELEMETRY_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "device::tests::telemetry_async_completion_records_once_even_after_repeated_wait_and_drop",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env_remove("PADDOCK_METAL_TELEMETRY")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated telemetry check failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let raw = MTLCreateSystemDefaultDevice().expect("Apple GPU");
         let queue = raw.newCommandQueue().unwrap();
         let buffer = raw

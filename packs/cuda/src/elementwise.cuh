@@ -307,6 +307,57 @@ __global__ void pd_attn_decode_kernel(
 #define PD_ATTN_TILE_SMEM(hd) \
     (((hd) + 2u * PD_ATTN_TILE_FOR(hd) * ((hd) + 1u) + 2u * PD_ATTN_TILE_FOR(hd)) * \
      sizeof(float))
+// The tile walks' score step: s_scores[p] = scale * (q . k_p) over the
+// tile's n_t staged keys, between the walks' barriers. One body for the
+// dense and paged walks, so both keep one summation order per PS.
+template<uint32_t TILE, bool PS>
+__device__ __forceinline__ void pd_attn_tile_scores(const float* s_q, const float* s_k,
+                                                    float* s_scores, uint32_t n_t,
+                                                    uint32_t head_dim, float scale) {
+    const uint32_t d = threadIdx.x, nth = blockDim.x;
+    if (PS) {
+        // PARALLEL SCORE. The serial form below leaves n_t of nth threads
+        // working - 16 of 256 at head_dim 256 - while the other seven warps
+        // sit at the next __syncthreads() for the whole 256-step dot
+        // product. ncu on the shipped kernel: 41.5% of the average 23.0
+        // cycles between issued instructions is stall_barrier, its own rule
+        // naming "diverging code paths before a barrier" at an estimated
+        // 41.48% local speedup. DRAM throughput is 1.23% and achieved
+        // occupancy 58.9%, so neither bandwidth nor occupancy binds here -
+        // the idle warps do.
+        //
+        // Here every thread works: LPK threads cooperate on one key, each
+        // striding the head, then a width-LPK shuffle reduces. The partial
+        // sums are interleaved rather than sequential, so this is not
+        // bit-identical to the serial walk - hence a template flag, with
+        // every existing caller keeping PS=false.
+        const uint32_t lpk = nth / TILE;
+        if (lpk >= 2u) {
+            const uint32_t key = d / lpk, lane = d % lpk;
+            float sc = 0.0f;
+            if (key < n_t) {
+                const float* krow = s_k + key * (head_dim + 1u);
+                for (uint32_t dd = lane; dd < head_dim; dd += lpk)
+                    sc += s_q[dd] * krow[dd];
+            }
+            #pragma unroll
+            for (uint32_t o = 16u; o >= 1u; o >>= 1)
+                if (o < lpk) sc += __shfl_down_sync(0xffffffffu, sc, o, lpk);
+            if (key < n_t && lane == 0u) s_scores[key] = sc * scale;
+        } else if (d < n_t) {
+            float sc = 0.0f;
+            const float* krow = s_k + d * (head_dim + 1u);
+            for (uint32_t dd = 0; dd < head_dim; ++dd) sc += s_q[dd] * krow[dd];
+            s_scores[d] = sc * scale;
+        }
+    } else if (d < n_t) {
+        float sc = 0.0f;
+        const float* krow = s_k + d * (head_dim + 1u);
+        for (uint32_t dd = 0; dd < head_dim; ++dd) sc += s_q[dd] * krow[dd];
+        s_scores[d] = sc * scale;
+    }
+}
+
 template<typename KV, uint32_t TILE = PD_ATTN_TILE, bool PS = false>
 __device__ __forceinline__ void pd_attn_tile_walk(
     const KV* __restrict__ kcb, const KV* __restrict__ vcb, uint32_t first_pos,
@@ -335,47 +386,7 @@ __device__ __forceinline__ void pd_attn_tile_walk(
             vr[0] = vf.x; vr[1] = vf.y; vr[2] = vf.z; vr[3] = vf.w;
         }
         __syncthreads();
-        if (PS) {
-            // PARALLEL SCORE. The serial form below leaves n_t of nth threads
-            // working - 16 of 256 at head_dim 256 - while the other seven warps
-            // sit at the next __syncthreads() for the whole 256-step dot
-            // product. ncu on the shipped kernel: 41.5% of the average 23.0
-            // cycles between issued instructions is stall_barrier, its own rule
-            // naming "diverging code paths before a barrier" at an estimated
-            // 41.48% local speedup. DRAM throughput is 1.23% and achieved
-            // occupancy 58.9%, so neither bandwidth nor occupancy binds here -
-            // the idle warps do.
-            //
-            // Here every thread works: LPK threads cooperate on one key, each
-            // striding the head, then a width-LPK shuffle reduces. The partial
-            // sums are interleaved rather than sequential, so this is not
-            // bit-identical to the serial walk - hence a template flag, with
-            // every existing caller keeping PS=false.
-            const uint32_t lpk = nth / TILE;
-            if (lpk >= 2u) {
-                const uint32_t key = d / lpk, lane = d % lpk;
-                float sc = 0.0f;
-                if (key < n_t) {
-                    const float* krow = s_k + key * (head_dim + 1u);
-                    for (uint32_t dd = lane; dd < head_dim; dd += lpk)
-                        sc += s_q[dd] * krow[dd];
-                }
-                #pragma unroll
-                for (uint32_t o = 16u; o >= 1u; o >>= 1)
-                    if (o < lpk) sc += __shfl_down_sync(0xffffffffu, sc, o, lpk);
-                if (key < n_t && lane == 0u) s_scores[key] = sc * scale;
-            } else if (d < n_t) {
-                float sc = 0.0f;
-                const float* krow = s_k + d * (head_dim + 1u);
-                for (uint32_t dd = 0; dd < head_dim; ++dd) sc += s_q[dd] * krow[dd];
-                s_scores[d] = sc * scale;
-            }
-        } else if (d < n_t) {
-            float sc = 0.0f;
-            const float* krow = s_k + d * (head_dim + 1u);
-            for (uint32_t dd = 0; dd < head_dim; ++dd) sc += s_q[dd] * krow[dd];
-            s_scores[d] = sc * scale;
-        }
+        pd_attn_tile_scores<TILE, PS>(s_q, s_k, s_scores, n_t, head_dim, scale);
         __syncthreads();
         // every thread derives the same m_new from shared (broadcast reads)
         float m_old = *s_m;
@@ -404,7 +415,7 @@ __device__ __forceinline__ void pd_attn_tile_walk(
 // row). Each 16-token block is internally contiguous, so only the per-token
 // base computation differs from the dense walk - the inner tile loop, the
 // numerics, and every __syncthreads() are byte-identical -> bit-exact parity.
-template<typename KV, uint32_t TILE = PD_ATTN_TILE>
+template<typename KV, uint32_t TILE = PD_ATTN_TILE, bool PS = false>
 __device__ __forceinline__ void pd_attn_tile_walk_paged(
     const KV* __restrict__ pool_k, const KV* __restrict__ pool_v,
     const uint32_t* __restrict__ bt, uint32_t first_pos,
@@ -439,12 +450,7 @@ __device__ __forceinline__ void pd_attn_tile_walk_paged(
             vr[0] = vf.x; vr[1] = vf.y; vr[2] = vf.z; vr[3] = vf.w;
         }
         __syncthreads();
-        if (d < n_t) {
-            float sc = 0.0f;
-            const float* krow = s_k + d * (head_dim + 1u);
-            for (uint32_t dd = 0; dd < head_dim; ++dd) sc += s_q[dd] * krow[dd];
-            s_scores[d] = sc * scale;
-        }
+        pd_attn_tile_scores<TILE, PS>(s_q, s_k, s_scores, n_t, head_dim, scale);
         __syncthreads();
         // every thread derives the same m_new from shared (broadcast reads)
         float m_old = *s_m;
@@ -495,14 +501,57 @@ __device__ __forceinline__ void pd_attn_tile_walk_paged(
 //
 // DPL = head_dim / 32 and must be a multiple of 4 (the vector load width), so
 // head_dim 128 and 256 are served; other head_dims stay on the tile walk.
-template<typename KV, uint32_t DPL>
+//
+// PAGED (slot 689, and 690 for the split form): K/V in a block pool
+// [n_blocks, 16, kv_dim], key t of the slot at row
+// block_tables[slot*bps + t/16]*16 + t%16 - nothing else changes, so the
+// paged launch is bit-identical to the dense one over the same keys (each
+// warp still folds its keys one by one, in order). See pd_fmha_walk for how
+// the table is read.
+//
+// A warp's keys t_first, t_first + step, ... in order, each handed to `fold`
+// as its cache row. Dense: the row is the key. Paged: the walk goes in
+// windows of 32 keys; lane j holds the pool block of the window's j-th key
+// and each key takes it by a broadcast shuffle, so the loop over a window
+// has no branch and no table load and unrolls like the dense one (a per-key
+// branch cost the paged walk the compiler's 2x unroll: +56% at c1 32K,
+// bench/paged_modes_gb10_bench.cu). The next window's blocks are fetched
+// one window ahead, and unconditionally: a lane past the live keys re-reads
+// the last live key's entry, because a select on a loaded value stalls the
+// warp at the select (in-order issue) instead of where the value is used.
+// Entries past the slot's live keys are never read.
+template<bool PAGED, typename F>
+__device__ __forceinline__ void pd_fmha_walk(F&& fold, const uint32_t* __restrict__ bt,
+                                             uint32_t t_first, uint32_t end_pos, uint32_t step,
+                                             uint32_t lane) {
+    if constexpr (PAGED) {
+        const uint32_t win = 32u * step, last = end_pos - 1u;
+        uint32_t tn = t_first + lane * step;
+        uint32_t pg_next = bt[min(tn, last) >> 4];
+        for (uint32_t t0 = t_first; t0 < end_pos; t0 += win) {
+            const uint32_t pg = pg_next;
+            tn += win;
+            pg_next = bt[min(tn, last) >> 4];
+            const uint32_t t1 = min(end_pos, t0 + win);
+            uint32_t j = 0;
+            #pragma unroll 2
+            for (uint32_t t = t0; t < t1; t += step, ++j)
+                fold((size_t)__shfl_sync(0xffffffffu, pg, j) * 16u + (t & 15u));
+        }
+    } else {
+        for (uint32_t t = t_first; t < end_pos; t += step) fold((size_t)t);
+    }
+}
+
+template<typename KV, uint32_t DPL, bool PAGED = false>
 __global__ void pd_attn_decode_fmha_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
     const KV* __restrict__ vc, const float* __restrict__ sinks,
     float* __restrict__ out, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-    uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window, float scale) {
+    uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window, float scale,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
     const uint32_t h = blockIdx.x, b = blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5;
@@ -516,8 +565,11 @@ __global__ void pd_attn_decode_fmha_kernel(
     const uint32_t end_pos = pos + 1;
 
     const float* qb = q + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
-    const KV* kcb = kc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * head_dim;
-    const KV* vcb = vc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * head_dim;
+    // dense: the slot's strip; paged: the pool, rows from the slot's table
+    const size_t slot0 = PAGED ? 0 : (size_t)slot * max_ctx * kv_dim;
+    const KV* kcb = kc + slot0 + (size_t)kvh * head_dim;
+    const KV* vcb = vc + slot0 + (size_t)kvh * head_dim;
+    const uint32_t* bt = PAGED ? block_tables + (size_t)slot * bps : nullptr;
 
     const uint32_t d0 = lane * DPL;
     float qr[DPL], acc[DPL];
@@ -525,9 +577,10 @@ __global__ void pd_attn_decode_fmha_kernel(
     for (uint32_t i = 0; i < DPL; ++i) { qr[i] = qb[d0 + i]; acc[i] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
 
-    for (uint32_t t = first_pos + warp; t < end_pos; t += nw) {
-        const KV* kr = kcb + (size_t)t * kv_dim;
-        const KV* vr = vcb + (size_t)t * kv_dim;
+    // one key's fold into (m, l, acc)
+    auto fold = [&](size_t row) {
+        const KV* kr = kcb + row * kv_dim;
+        const KV* vr = vcb + row * kv_dim;
         float kk[DPL], vv[DPL];
         #pragma unroll
         for (uint32_t i = 0; i < DPL; i += 4) {
@@ -551,7 +604,8 @@ __global__ void pd_attn_decode_fmha_kernel(
         for (uint32_t i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + w * vv[i];
         l = l * corr + w;
         m = m_new;
-    }
+    };
+    pd_fmha_walk<PAGED>(fold, bt, first_pos + warp, end_pos, nw, lane);
 
     extern __shared__ float smem[];
     float* s_acc = smem;                    // [nw][head_dim]
@@ -592,14 +646,15 @@ __global__ void pd_attn_decode_fmha_kernel(
 // part[((b*n_heads + h)*S + z)*(head_dim+2)]. The sink enters once, in the
 // merge pass. At c1 the un-split form is 24 CTAs on 148 SMs and 39 us/layer
 // vs the rival's 9.1 - the die is empty and the KV stream is the wall.
-template<typename KV, uint32_t DPL>
+template<typename KV, uint32_t DPL, bool PAGED = false>
 __global__ void pd_attn_decode_fmha_sp_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
     const KV* __restrict__ vc, float* __restrict__ part,
     const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-    uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window, float scale) {
+    uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window, float scale,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
     const uint32_t h = blockIdx.x, b = blockIdx.y, z = blockIdx.z;
     const uint32_t S = gridDim.z;
     const uint32_t lane = threadIdx.x & 31u;
@@ -612,16 +667,18 @@ __global__ void pd_attn_decode_fmha_sp_kernel(
         (swa_window > 0 && pos + 1 > swa_window) ? (pos + 1 - swa_window) : 0;
     const uint32_t end_pos = pos + 1;
     const float* qb = q + (size_t)b * n_heads * head_dim + (size_t)h * head_dim;
-    const KV* kcb = kc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * head_dim;
-    const KV* vcb = vc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * head_dim;
+    const size_t slot0 = PAGED ? 0 : (size_t)slot * max_ctx * kv_dim;
+    const KV* kcb = kc + slot0 + (size_t)kvh * head_dim;
+    const KV* vcb = vc + slot0 + (size_t)kvh * head_dim;
+    const uint32_t* bt = PAGED ? block_tables + (size_t)slot * bps : nullptr;
     const uint32_t d0 = lane * DPL;
     float qr[DPL], acc[DPL];
     #pragma unroll
     for (uint32_t i = 0; i < DPL; ++i) { qr[i] = qb[d0 + i]; acc[i] = 0.0f; }
     float m = -INFINITY, l = 0.0f;
-    for (uint32_t t = first_pos + z * nw + warp; t < end_pos; t += S * nw) {
-        const KV* kr = kcb + (size_t)t * kv_dim;
-        const KV* vr = vcb + (size_t)t * kv_dim;
+    auto fold = [&](size_t row) {
+        const KV* kr = kcb + row * kv_dim;
+        const KV* vr = vcb + row * kv_dim;
         float kk[DPL], vv[DPL];
         #pragma unroll
         for (uint32_t i = 0; i < DPL; i += 4) {
@@ -644,7 +701,8 @@ __global__ void pd_attn_decode_fmha_sp_kernel(
         for (uint32_t i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + w * vv[i];
         l = l * corr + w;
         m = m_new;
-    }
+    };
+    pd_fmha_walk<PAGED>(fold, bt, first_pos + z * nw + warp, end_pos, S * nw, lane);
     extern __shared__ float smem[];
     float* s_acc = smem;
     float* s_m = s_acc + nw * head_dim;
@@ -774,8 +832,9 @@ __device__ __forceinline__ float4 pd_ld4f<__half>(const __half* p) {
     return make_float4(fa.x, fa.y, fb.x, fb.y);
 }
 
-// TQ/TO (attention streams): f16 q/out planes for the a16 route.
-template<typename KV, typename TQ = float, typename TO = float>
+// TQ/TO (attention streams): f16 q/out planes for the a16 route. PS = the
+// parallel-score walk (slot 691, the paged twin of slot 536).
+template<typename KV, typename TQ = float, typename TO = float, bool PS = false>
 __global__ void pd_attn_decode_batch_paged_kernel(
     const TQ* __restrict__ q, const KV* __restrict__ pool_k,
     const KV* __restrict__ pool_v, const float* __restrict__ sinks,
@@ -808,11 +867,13 @@ __global__ void pd_attn_decode_batch_paged_kernel(
     // pd_attn_tile_walk_paged's leading __syncthreads() orders the q stage + m/l init
 
     if (head_dim > 128u)
-        pd_attn_tile_walk_paged<KV, PD_ATTN_TILE_HD256>(pool_k, pool_v, bt, first_pos, 0, n_pos, kv_dim,
-                                                        kvh, head_dim, scale, smem, &s_m, &s_l, acc);
+        pd_attn_tile_walk_paged<KV, PD_ATTN_TILE_HD256, PS>(pool_k, pool_v, bt, first_pos, 0, n_pos,
+                                                            kv_dim, kvh, head_dim, scale, smem,
+                                                            &s_m, &s_l, acc);
     else
-        pd_attn_tile_walk_paged<KV, PD_ATTN_TILE>(pool_k, pool_v, bt, first_pos, 0, n_pos, kv_dim, kvh,
-                                                  head_dim, scale, smem, &s_m, &s_l, acc);
+        pd_attn_tile_walk_paged<KV, PD_ATTN_TILE, PS>(pool_k, pool_v, bt, first_pos, 0, n_pos,
+                                                      kv_dim, kvh, head_dim, scale, smem, &s_m,
+                                                      &s_l, acc);
     __syncthreads();
     if (d < head_dim)
         out[(size_t)b * n_heads * head_dim + (size_t)h * head_dim + d] = (TO)(acc / s_l);

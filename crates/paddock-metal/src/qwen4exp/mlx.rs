@@ -18,6 +18,31 @@ pub(super) const PLE: &str = "language_model.model.layers.1.ple";
 pub(super) const SHARD_ROWS: usize = 2_500_012;
 pub(super) const FOLDED_NORM: u32 = 0x103;
 
+/// Conservative equivalence classes for this strictly validated graph. Include
+/// every affine rank-two shape, even embedding/head planes that do not use
+/// prefill contractions. Missing an optimization is safe; omitting a numerical
+/// boundary is not. Expert and QSA elections are explicit additional fields.
+pub(super) fn arithmetic_classes() -> Vec<u16> {
+    let shapes = specs()
+        .into_values()
+        .filter(|s| affine::is_affine(s.ty) && s.shape.len() == 2)
+        .map(|s| (s.shape[1], s.shape[0], s.ty))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = BTreeMap::new();
+    let mut classes = vec![0];
+    for rows in 1..=affine::MAX_LOGICAL_ROWS {
+        let mut signature = shapes
+            .iter()
+            .map(|&(k, n, ty)| affine::contraction(k, n, ty, rows))
+            .collect::<Vec<_>>();
+        signature.push((3, usize::from(rows <= 8)));
+        signature.push((4, usize::from(rows * 10 >= 512 * 4)));
+        let next = (seen.len() + 1) as u16;
+        classes.push(*seen.entry(signature).or_insert(next));
+    }
+    classes
+}
+
 #[derive(Debug, Clone)]
 pub struct FlashNextMlxPlan {
     pub tensor_count: usize,

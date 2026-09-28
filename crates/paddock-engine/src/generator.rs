@@ -645,6 +645,15 @@ pub trait Generator: Send {
     /// this is a hint about width rather than a kill switch.
     fn spec_fuse_hint(&mut self, _on: bool) {}
 
+    /// Live slots the SAMPLED host round (phase 2b) may speculate for. The
+    /// round reads every row's logits back and samples on the host, which
+    /// measured a net loss at live 8 on its first lane, so the service caps
+    /// it at 4 by default. A backend that has measured its own round past
+    /// that says so here (never beyond `spec_live_cap`). None = the default.
+    fn spec_sampled_live_cap(&self) -> Option<usize> {
+        None
+    }
+
     /// The backend's spec-round live capacity: rounds with more live slots
     /// than this will decline (e.g. a VRAM-degraded draft-state allocation).
     /// The scheduler clamps its own spec engagement cap by it so warm/draft
@@ -821,6 +830,14 @@ pub trait Generator: Send {
     /// free-on-completion returns blocks (bit-exact - admission timing only).
     fn pool_free_blocks(&self) -> Option<usize> {
         None
+    }
+
+    /// Blocks available to admission, including cache-only pages the backend
+    /// guarantees it can reclaim before allocating. Never include active/shared
+    /// sequence pages. Kept separate from physical-free telemetry and async
+    /// decode-pipeline headroom, which cannot assume synchronous eviction.
+    fn pool_admission_blocks(&self) -> Option<usize> {
+        self.pool_free_blocks()
     }
 
     /// True when the backend supports CHUNKED prefill (prefill_begin +

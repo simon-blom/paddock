@@ -467,7 +467,7 @@ impl GpuQwen35 {
         // A rotated-basis file (prism.hadamard.*) is read and checked before
         // the first tensor: the weight loaders refuse such a file until the
         // family has said it applies the rotation.
-        let rot = Rotation::load(
+        let mut rot = Rotation::load(
             &exec,
             map,
             &super::rotation::RotationGeometry {
@@ -1983,6 +1983,56 @@ impl GpuQwen35 {
                             if [gate, up, down].into_iter().all(fits))
                     })
             };
+        // ...and the NB-row ternary lane (slot 686: the int8 tensor cores,
+        // one weight read for every row of a tick, per row the batch-1 walk's
+        // bits) serves every decode width on it - one row included, where it
+        // streams faster than the batch-1 walk. Same all-or-none rule: the
+        // projections of a layer share one staged activation.
+        let tern_nb =
+            tern_b128 && paddock_models::dev_var_os!("PADDOCK_NO_TERNARY_NB").is_none() && {
+                let fits = |ws: &[&QuantW]| {
+                    let ks: Option<Vec<&crate::gpu::RepackedKQ>> =
+                        ws.iter().map(|w| w.kq()).collect();
+                    ks.is_some_and(|ks| exec.ternary_nb_fits(&ks, 8))
+                };
+                fits(&[&output])
+                    && layers.iter().all(|l| {
+                        (match &l.mixer {
+                            Mixer::Full(w) => fits(&[&w.wq, &w.wk, &w.wv]) && fits(&[&w.wo]),
+                            Mixer::Linear(w) => fits(&[&w.in_qkv, &w.gate_w]) && fits(&[&w.out_w]),
+                        }) && matches!(&l.ffn, Ffn::Dense { gate, up, down }
+                            if fits(&[gate, up]) && fits(&[down]))
+                    })
+            };
+        // The class travels with the planes and the rotation: a prefill span
+        // of up to 64 rows stages its inputs per 128 (ops.rs `prefill_quant`,
+        // reading the rotation) and its PTQ1_0 planes take the NB lane
+        // (`kq_mm_pre`, reading the plane) - one weight read for the span
+        // where the generic lanes re-read the plane per row.
+        if tern_nb {
+            if let Some(r) = rot.as_mut() {
+                r.act128 = true;
+            }
+            let mark = |w: &mut QuantW| {
+                if let Some(k) = w.kq_mut() {
+                    k.act128 = true;
+                }
+            };
+            mark(&mut output);
+            for l in layers.iter_mut() {
+                match &mut l.mixer {
+                    Mixer::Full(w) => [&mut w.wq, &mut w.wk, &mut w.wv, &mut w.wo]
+                        .into_iter()
+                        .for_each(mark),
+                    Mixer::Linear(w) => [&mut w.in_qkv, &mut w.gate_w, &mut w.out_w]
+                        .into_iter()
+                        .for_each(mark),
+                }
+                if let Ffn::Dense { gate, up, down } = &mut l.ffn {
+                    [gate, up, down].into_iter().for_each(mark);
+                }
+            }
+        }
         // f8 lm_head (PADDOCK_F8_LMHEAD): Q8 head -> f8w -> tile-linear, the
         // same conversion pipeline as the FFN planes. The mt_dp4a head GEMM
         // measured 870 GB/s (access-pattern bound); the lin stream runs the
@@ -2701,7 +2751,10 @@ impl GpuQwen35 {
             tracing::info!(
                 "qwen35: ternary weights resident as shipped (PTQ1_0 1.75 bpw / PQ2_0 2.13 bpw), \
                  int8 activations; single-stream decode on the {}",
-                if tern_b128 {
+                if tern_nb {
+                    "ternary lanes (one activation scale per 128): every decode width on \
+                     the int8 tensor cores, one weight read a tick"
+                } else if tern_b128 {
                     "table-decoded ternary lane (one activation scale per 128)"
                 } else {
                     "generic i-quant lane (one activation scale per 32)"
@@ -2721,6 +2774,22 @@ impl GpuQwen35 {
             );
         }
 
+        // The rotated-basis ternary line (Bonsai 2 27B) pools its KV at
+        // fp8-e4m3 unless the config says otherwise - the catalog's
+        // `kv_default` mirrors this. Measured 2026-09-27 on GB10 against f16:
+        // same-weights greedy parity vs PrismML's fork unchanged in kind
+        // (step-0 17/18, the one miss the model's own 0.03-nat near-tie; 4/5
+        // generations byte-identical), teacher-forced perplexity over the
+        // 1024 tokens after a 2K / 16K / 64K prefix within noise (prose
+        // -0.05 / +0.21 / +0.39%, code +0.16 / 0.00 / -0.09%, one run a cell),
+        // while decode at depth runs +17% at 40K and +32% at 89K (the KV read
+        // is what an agent's long turns pay). A runner on a die that cannot store fp8 KV overrides
+        // this back to f16 (serving.rs), and an explicit kv_cache_dtype wins.
+        let kv_dtype = if rot.is_some() {
+            KvDtype::Fp8E4m3
+        } else {
+            KvDtype::Fp16
+        };
         Ok(Self {
             exec,
             n_layers,
@@ -2759,6 +2828,7 @@ impl GpuQwen35 {
             output,
             rot,
             tern_b128,
+            tern_nb,
             kq_resident,
             kq_max_elems,
             mtp,
@@ -2773,7 +2843,7 @@ impl GpuQwen35 {
             spec_rs_draws: None,
             spec_round_rs: false,
             sinks,
-            kv_dtype: KvDtype::Fp16,
+            kv_dtype,
             overlap_exec: None,
             lane_swapped: false,
             unified_inflight: None,
@@ -2868,17 +2938,16 @@ impl GpuQwen35 {
         let bps = self.max_ctx.div_ceil(BLOCK_TOKENS) as u64;
         let per_block = (BLOCK_TOKENS * kv_dim * kv_bytes) as u64 * 2 * n_full;
         let state_win = (state_elems + win_elems) as u64;
-        // width-independent: conv staging, the demand-sized prefix-state pool
-        // (STATE_CKPTS_PER_SLOT per requested slot, clamped - the plan may
-        // shrink it further into what the grant has left), ckpt staging, the
-        // wave buffers for a full chunk, and the graph/headroom residual. The
-        // profiled serving scratch is already in the ledger by the time `free`
-        // is read (enable_batch_sized allocates it first).
-        let ckpt_pool = (requested as u64 * super::batch::STATE_CKPTS_PER_SLOT)
-            .clamp(super::batch::STATE_CKPTS_MIN, super::batch::STATE_CKPTS_MAX)
-            * n_lin
-            * state_win
-            * 4;
+        // width-independent: conv staging, the live turns' checkpoint pages
+        // (the plan's mandatory part - the rest of the checkpoint want is
+        // bought only while the grant affords it, so it never narrows the
+        // width), ckpt staging, the wave buffers for a full chunk, and the
+        // graph/headroom residual. The profiled serving scratch is already in
+        // the ledger by the time `free` is read (enable_batch_sized allocates
+        // it first).
+        let pages_per_ckpt = (n_lin * state_win * 4).div_ceil(per_block.max(1)) as usize;
+        let ckpt_pool =
+            super::batch::ckpt_page_demand(requested, pages_per_ckpt).0 as u64 * per_block;
         let chunk = super::chunk_tick_rows();
         let fixed: u64 = 2
             * (self.conv_k as u64 - 1 + unified_prefill_rows().max(8192) as u64)

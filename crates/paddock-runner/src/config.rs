@@ -473,7 +473,32 @@ pub enum ConfigError {
     Unsupported(&'static str),
 }
 
+/// Smallest `vram_budget` that can mean what it says. The budget is in
+/// nvidia-smi units, so it has to hold the CUDA context and the kernel module
+/// before a single weight lands, and that alone is several hundred MiB. Below
+/// this the number is a unit slip, not a budget.
+const VRAM_BUDGET_FLOOR_MIB: u64 = 512;
+
 impl Config {
+    /// Refuse a `vram_budget` too small to be a real one.
+    ///
+    /// The key is MiB, and the obvious slip is writing GiB: `vram_budget =
+    /// 23` for a 24 GB card is 23 MiB, which used to go through, print "VRAM
+    /// budget 0.0 GiB" and end in a refusal about KV that pointed everywhere
+    /// but the unit (issue #33).
+    pub fn check_vram_budget(&self) -> Result<(), String> {
+        match self.vram_budget {
+            Some(mib) if mib < VRAM_BUDGET_FLOOR_MIB => Err(format!(
+                "vram_budget = {mib} is {mib} MiB, and nothing loads in under \
+                 {VRAM_BUDGET_FLOOR_MIB} MiB. The key is in MiB (nvidia-smi units): \
+                 for {mib} GiB write vram_budget = {}, or leave it out to size \
+                 against the card's free VRAM",
+                mib * 1024
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The resolved web-search provider config, if a usable provider + key are
     /// declared. Unknown provider names are a loud None with a warning - a
     /// typo'd provider must not silently disable a declared capability.
@@ -799,6 +824,21 @@ fn bad_env(name: &'static str, value: &str) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vram_budget_written_in_gib_is_refused_with_the_mib_reading() {
+        let cfg = |b| Config {
+            vram_budget: b,
+            ..Config::default()
+        };
+        let e = cfg(Some(23)).check_vram_budget().unwrap_err();
+        assert!(e.contains("23 MiB"), "{e}");
+        assert!(e.contains("vram_budget = 23552"), "{e}");
+        assert!(cfg(Some(511)).check_vram_budget().is_err());
+        assert!(cfg(Some(512)).check_vram_budget().is_ok());
+        assert!(cfg(Some(23552)).check_vram_budget().is_ok());
+        assert!(cfg(None).check_vram_budget().is_ok());
+    }
 
     #[test]
     fn forensics_block_parses_and_defaults_off() {

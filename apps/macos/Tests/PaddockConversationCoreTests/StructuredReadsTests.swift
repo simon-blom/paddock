@@ -5,6 +5,34 @@ import Testing
 
 @Suite("Structured Reads wire parity")
 struct StructuredReadsTests {
+  @Test func layaDecodesWithoutInventingDiffusionMetrics() throws {
+    let text =
+      #"{"model":"laya","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"routing":{"model":"multilingual","reason":"Swedish text"},"diagnostics":{"backend":"laya","checkpoint":"multilingual","reads":1,"state_tokens":1500,"windowed":true,"questions":[{"id":"q1","label":"yes","entropy":0.1,"options":2,"tokens":[1024,900],"temperature":1.2,"entropy_confidence":0.8,"window":{"index":1,"count":2,"token_start":400,"token_end":1500}}],"timing":{"total_ms":12}}}"#
+    let response = try JSONDecoder().decode(ReadResponse.self, from: Data(text.utf8))
+    try response.validate(for: [ReadQuestion(questionID: "q1")])
+    #expect(response.diagnostics.canvas == nil)
+    #expect(response.answers["q1"]?.outside == nil && response.answers["q1"]?.agreement == nil)
+    #expect(response.diagnostics.questions.first?.labelMass == nil)
+    #expect(response.diagnostics.questions.first?.window?.index == 1)
+    #expect(response.routing?.reason == "Swedish text")
+    let invalid = text.replacingOccurrences(
+      of: "\"backend\":\"laya\"", with: "\"backend\":\"other\"")
+    #expect(throws: (any Error).self) {
+      try JSONDecoder().decode(ReadResponse.self, from: Data(invalid.utf8))
+        .validate(for: [ReadQuestion(questionID: "q1")])
+    }
+  }
+  @Test func explicitCheckpointSurvivesQuestionSetAndHistoryRoundTrip() throws {
+    var draft = ReadDraft()
+    draft.checkpoint = "typed-decisions"
+    let restored = try ReadDraft.parse(Data(draft.orderedJSON().utf8))
+    #expect(restored.checkpoint == "typed-decisions")
+    #expect(restored.request(model: "laya")["model"] == .string("typed-decisions"))
+    let run: ConversationValue = .object([
+      "questions": draft.setBody["questions"]!, "checkpoint": .string("typed-decisions"),
+    ])
+    #expect(try ReadHistoryDocument.draft(run).checkpoint == "typed-decisions")
+  }
   @Test func picturesUseTheWebReferenceAndDoNotLeakIntoQuestionSets() throws {
     let url = "data:image/png;base64,YQ=="
     #expect(ReadPicture.reference(url) == "q-g1g74vqtuh")

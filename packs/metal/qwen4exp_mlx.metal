@@ -207,6 +207,14 @@ kernel void q4a_ple_gather(device const uchar* w [[buffer(0)]],device const uint
     // Each row occupies 80 code bytes + 10 scale bytes + 10 bias bytes.
     y[i]=shard<p[2] ? mlx_bf(q4a_value(w+ulong(shard)*p[1]*100,160,p[1],ulong(row)*160+i%160,4,32)) : NAN;
 }
+// The GPU hash is authoritative: stale/misaddressed staged rows fail closed.
+kernel void q4a_ple_staged(device const uchar* w [[buffer(0)]],device const uint* ids [[buffer(1)]],
+    device float* y [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]*160)return;
+    device const uchar* row=w+ulong(i/160)*104;
+    y[i]=*reinterpret_cast<device const uint*>(row)==ids[i/160]
+        ? mlx_bf(q4a_value(row+4,160,1,i%160,4,32)) : NAN;
+}
 kernel void q4b_ple_gate(device const float* key [[buffer(0)]],device const float* query [[buffer(1)]],
     device const float* value [[buffer(2)]],device float* gated [[buffer(3)]],constant uint* p [[buffer(4)]],
     uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {

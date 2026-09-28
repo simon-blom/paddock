@@ -8,7 +8,7 @@
 //! same block keys - a prompt walked whole, the same tokens decoded one at a
 //! time (the block a decode row closes reads its first keys off the ring
 //! earlier walks filed), odd-sized chunked spans (blocks straddle spans), and
-//! a prefix-cache resume (the side pages must hand back the keys they were
+//! a prefix-cache resume (the adopted pages must hold the keys they were
 //! given, bit for bit). One test, two loads in sequence: a second resident
 //! copy of this model does not fit the boxes it runs on.
 
@@ -440,18 +440,17 @@ fn gguf_qsa_sparse_matches_dense_inside_the_window() {
     );
 }
 
-/// Same-slot resume. A continued conversation resumes from its slot's own
-/// checkpoint - a state restore; the slot's strips already hold every row
-/// under it - so it resumes at any depth, even with a side store far too
-/// small for its history. Against the side-store resume of the same history
-/// (a store that holds it, same-slot off) it restores the same state over
-/// the same rows at the same point, so the next turn's logits must be
-/// BIT-identical. And a store too small for the path, same-slot off, must
-/// not claim a resume at all: before the publish spared its own path, such a
-/// store re-adopted evicted page ids and mapped two nodes onto one page, and
-/// a resume copied other positions' KV over the slot's rows.
+/// Zero-copy resume across a release. A continued conversation resumes from
+/// the radix: the pages its turn filed (the prompt, the reply's closed pages)
+/// are adopted by refcount, the state restored from the reply checkpoint's
+/// pool pages. Its slot's pages go back to the pool when the slot idles, and
+/// the radix keeps what it filed - so the next turn, run in ANOTHER slot
+/// after the release, must resume at the same point as the unreleased
+/// same-slot resume, with BIT-identical logits (same pages, same checkpoint,
+/// same walk geometry). Two loads: a turn-2 walk files its own checkpoints,
+/// after which the same prompt elsewhere is an exact re-send (cold).
 #[test]
-fn gguf_same_slot_resume_matches_the_side_store() {
+fn gguf_resume_survives_a_release_into_another_slot() {
     if !common::heavy() {
         return;
     }
@@ -484,17 +483,12 @@ fn gguf_same_slot_resume_matches_the_side_store() {
         .encode("Now list every parcel that went through the north depot and its weight.")
         .expect("encode");
 
-    // one conversation: the prompt, a 40-token greedy reply (its decode closes
-    // pages, so the reply checkpoint rolls), then the history + reply + a new
-    // message. Returns (resume point, the next turn's logits).
-    let turn2 = |envs: &[(&str, &str)]| -> (usize, Vec<f32>) {
-        for (k, v) in envs {
-            unsafe { std::env::set_var(k, v) };
-        }
+    // one conversation: the prompt and a 40-token greedy reply in slot 0
+    // (its decode closes pages, so the reply checkpoint rolls), then the
+    // history + reply + a new message in `slot2`, slot 0 released first when
+    // asked. Returns (resume point, the next turn's logits).
+    let turn2 = |release: bool, slot2: usize| -> (usize, Vec<f32>) {
         let mut m = load(&exec, &path);
-        for (k, _) in envs {
-            unsafe { std::env::remove_var(k) };
-        }
         let l = m.prefill_slot(0, &a).expect("prefill");
         let mut reply = vec![argmax(&l) as u32];
         for _ in 1..40 {
@@ -503,38 +497,28 @@ fn gguf_same_slot_resume_matches_the_side_store() {
                 .expect("decode");
             reply.push(argmax(&d[0]) as u32);
         }
+        if release {
+            m.release_inactive_slots(&[false, false, false]);
+        }
         let mut b = a.clone();
         b.extend(&reply);
         b.extend(&msg);
-        let l2 = m.prefill_slot(0, &b).expect("prefill turn 2");
-        (m.take_prefill_reused(0), l2)
+        let l2 = m.prefill_slot(slot2, &b).expect("prefill turn 2");
+        (m.take_prefill_reused(slot2), l2)
     };
-    let (at_side, l_side) = turn2(&[("PADDOCK_Q38FN_NO_RESIDENT", "1")]);
-    // 4 MB of side store is 10 pages - 160 tokens of a 1540-token history
-    let (at_res, l_res) = turn2(&[("PADDOCK_Q38FN_PREFIX_MB", "4")]);
-    let (at_none, _) = turn2(&[
-        ("PADDOCK_Q38FN_PREFIX_MB", "4"),
-        ("PADDOCK_Q38FN_NO_RESIDENT", "1"),
-    ]);
+    let (at_same, l_same) = turn2(false, 0);
+    let (at_moved, l_moved) = turn2(true, 1);
     eprintln!(
-        "SAME-SLOT: side store resumed at {at_side}, same-slot (160-token store) at {at_res}, \
-         the small store alone at {at_none}; logits bit-identical: {}",
-        l_side == l_res
+        "RESUME: same slot at {at_same}, released and moved at {at_moved}; logits bit-identical: {}",
+        l_same == l_moved
     );
     assert!(
-        at_side > a.len(),
-        "the side store did not resume into the reply"
+        at_same > a.len(),
+        "the resume did not reach into the reply ({at_same})"
     );
-    assert_eq!(
-        at_res, at_side,
-        "same-slot and side-store resume points differ"
-    );
+    assert_eq!(at_moved, at_same, "the moved resume point differs");
     assert!(
-        l_res == l_side,
-        "same-slot resume is not the side-store resume"
-    );
-    assert_eq!(
-        at_none, 0,
-        "a store that cannot hold the history claimed a resume"
+        l_moved == l_same,
+        "a resume after the release is not the same-slot resume"
     );
 }

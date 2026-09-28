@@ -184,7 +184,7 @@ fn mlx_direct_prefill_pages_benchmark() {
 
 fn direct_prefill_pages(measure: bool) {
     let device = MetalDevice::new(Some(256 << 20)).unwrap();
-    let (heads, kv, stride) = (24usize, 4usize, 260usize);
+    let (heads, kv, stride) = (24usize, 4usize, 1060usize);
     let upload_u = |v: &[u32]| {
         device
             .upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
@@ -228,6 +228,8 @@ fn direct_prefill_pages(measure: bool) {
         (3071, 512),
         (3584, 511),
         (4095, 1),
+        (8192, 512),
+        (16384, 511),
     ] {
         let query = device
             .upload(

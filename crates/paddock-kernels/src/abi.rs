@@ -6939,7 +6939,7 @@ pub struct KernelTableV1 {
     /// in one launch, or with `glu` a gate | up pair folded with SwiGLU into
     /// `y0`. Bit-identical per row to the single-plane launches. (d0, r0, d1,
     /// r1, d2, r2, xq, xs, y0, y1, y2, in_dim, o0, o1, o2, n_planes, glu,
-    /// stream); out dims multiples of 8.
+    /// stream).
     #[allow(clippy::type_complexity)]
     pub ternary_gemv_b128_multi: Option<
         unsafe extern "C" fn(
@@ -7430,7 +7430,410 @@ pub struct KernelTableV1 {
     /// Slot 678: `pd_laya_act_head` - the Laya act/escalate head, one block a
     /// question, off its [CLS] row and its option distribution.
     pub laya_act_head: Option<LayaActHeadFn>,
+    /// Slot 679: `pd_attn_rows_partial` - split-K decode attention over groups
+    /// of one slot's consecutive query rows (a spec verify chunk, each row
+    /// bounded at its own position; a block drafter's rows at the block end),
+    /// reading each K/V tile once per group, optionally sliding-windowed.
+    /// Partials in the decode partial's layout for the batch combine.
+    pub attn_rows_partial: Option<AttnRowsPartialFn>,
+    /// Slot 680: `pd_nvf4_moe_up_relu2_w16` - the W16 decode class's expert
+    /// up + relu^2: the checkpoint's W4A16 (bf16 activations) on tensor cores
+    /// over the tiled plane, batch-invariant - a token's bits are the same
+    /// alone or in a verify block. Routed picks as moe_align's 32-row sorting,
+    /// the shared expert over every row; bf16 activations out.
+    pub nvf4_moe_up_relu2_w16: Option<Nvf4MoeUpRelu2W16Fn>,
+    /// Slot 681: `pd_nvf4_moe_down_part_w16` - the matching down into
+    /// [rows][k + 1][embd] pre-weighted partials for `moe_slot_combine`.
+    pub nvf4_moe_down_part_w16: Option<Nvf4MoeDownPartW16Fn>,
+    /// Slot 682: `pd_dense_w16` - the class's dense half: bf16 (dtype 0) or
+    /// e4m3-with-row-scale (dtype 1) weights against 16-bit activations over
+    /// rows, batch-invariant; `x16` = activations already 16-bit.
+    pub dense_w16: Option<DenseW16Fn>,
+    /// Slot 683: `pd_attn_rows_partial_fixed` - [`Self::attn_rows_partial`]
+    /// on fixed key splits (`split_keys`, trailing): a row's partials depend
+    /// on its own keys alone, so decode ticks and verify rounds attend bit
+    /// for bit alike.
+    pub attn_rows_partial_fixed: Option<AttnRowsPartialFixedFn>,
+    /// Slot 684: `pd_dense_w16_seg` - [`Self::dense_w16`] over a plane whose
+    /// rows split into up to three outputs (`n0`, `n1`, the rest), one
+    /// launch for a fused q|k|v plane; the same class as slot 682.
+    pub dense_w16_seg: Option<DenseW16SegFn>,
+    /// Slot 685: `pd_moe_route_w16` - the W16 class's routing front in one
+    /// launch: the router matvec (the unfused router's bits), sigmoid top-k,
+    /// the rows' bf16 activations and moe_align's 32-row sorting; `tickets`
+    /// (1 + ceil(rows / 2) u32, zeroed once) hand the work to the last CTAs.
+    pub moe_route_w16: Option<MoeRouteW16Fn>,
+    /// Slot 686: `pd_ternary_gemm_nb` - slot 630 over `cols` activation rows
+    /// (decode rows sharing a tick, a verify round, a short prefill) on the
+    /// int8 tensor cores: one weight read, and per column the same bits as
+    /// slots 628 / 630 (the ternary class's fixed fold). `xq` int8
+    /// [cols][in_dim], `xs` f32 [cols][in_dim / 128], `y_p` [cols][o_p];
+    /// every `o_p` a multiple of 16.
+    pub ternary_gemm_nb: Option<TernaryGemmNbFn>,
+    /// Slot 687: `pd_matvec_f32_winv` - [`Self::matvec_f32_batch`]'s batch
+    /// body at every row count (that launcher reorders K from 16 rows on):
+    /// per row the bits of a 1-row call. `(w, x, out, in_dim, out_dim,
+    /// batch, stream)`.
+    #[allow(clippy::type_complexity)]
+    pub matvec_f32_winv: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> KernelStatus,
+    >,
+    /// Slots 688-696: the paged address mode of the kernels Flash-Next still
+    /// reads off a dense slot-major strip. Each is its dense twin with the
+    /// strip replaced by a block pool and table (`block_tables`,
+    /// `blocks_per_slot` after `slots`; no `max_ctx`): key `p` of slot `s` is
+    /// pool row `table[s*bps + p/16]*16 + p%16`, a QSA index row
+    /// `table[s*bps + b/4]*4 + b%4`. Bit-identical to the dense twin over the
+    /// same keys. Slot 688: `pd_attn_prefill_batch_paged` - see
+    /// [`AttnPrefillBatchPagedFn`].
+    pub attn_prefill_batch_paged: Option<AttnPrefillBatchPagedFn>,
+    /// Slot 689: `pd_attn_decode_fmha_paged` - [`Self::attn_decode_fmha`]
+    /// over the pool, [`Self::attn_decode_batch_paged`]'s arguments.
+    pub attn_decode_fmha_paged: Option<AttnDecodeBatchPagedFn>,
+    /// Slot 690: `pd_attn_decode_fmha_sp_paged` - [`Self::attn_decode_fmha_sp`]
+    /// over the pool.
+    pub attn_decode_fmha_sp_paged: Option<AttnDecodeFmhaSpPagedFn>,
+    /// Slot 691: `pd_attn_decode_batch_ps_paged` - [`Self::attn_decode_batch_ps`]
+    /// over the pool, [`Self::attn_decode_batch_paged`]'s arguments.
+    pub attn_decode_batch_ps_paged: Option<AttnDecodeBatchPagedFn>,
+    /// Slot 692: `pd_q4x_idx_store_paged` - [`Self::q4x_idx_store`] into a
+    /// compressed cache on the pool's block ids (`16/cr` rows a page).
+    pub q4x_idx_store_paged: Option<Q4xIdxStorePagedFn>,
+    /// Slot 693: `pd_q4x_qsa_logits_paged` - [`Self::q4x_qsa_logits`] over
+    /// the paged compressed cache (`cap` stays the scores' stride).
+    pub q4x_qsa_logits_paged: Option<Q4xQsaLogitsPagedFn>,
+    /// Slot 694: `pd_q4x_qsa_logits_mma_paged` - [`Self::q4x_qsa_logits_mma`]
+    /// over the paged compressed cache.
+    pub q4x_qsa_logits_mma_paged: Option<Q4xQsaLogitsPagedFn>,
+    /// Slot 695: `pd_q4x_qsa_attn_paged` - [`Self::q4x_qsa_attn`] over the pool.
+    pub q4x_qsa_attn_paged: Option<Q4xQsaAttnPagedFn>,
+    /// Slot 696: `pd_q4x_qsa_attn_mma_paged` - [`Self::q4x_qsa_attn_mma`]
+    /// over the pool.
+    pub q4x_qsa_attn_mma_paged: Option<Q4xQsaAttnPagedFn>,
 }
+
+/// `(q, pool_k, pool_v, sinks, out, positions, slots, block_tables,
+/// blocks_per_slot, tile_row0, tile_slot, n_qtiles, n_heads, n_kv_heads,
+/// head_dim, kv_dim, swa_window, n_rows, scale, kv_dtype, stream)` - see
+/// [`KernelTableV1::attn_prefill_batch_paged`].
+pub type AttnPrefillBatchPagedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, pool_k, pool_v, sinks, out, part, positions, slots, block_tables,
+/// blocks_per_slot, n_heads, n_kv_heads, head_dim, kv_dim, swa_window, batch,
+/// split, scale, kv_dtype, stream)` - see
+/// [`KernelTableV1::attn_decode_fmha_sp_paged`].
+pub type AttnDecodeFmhaSpPagedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(raw, stage, pos, slots, cache, ring, block_tables, blocks_per_slot, rows,
+/// hd, ld, koff, ring_len, cr, stream)` - see
+/// [`KernelTableV1::q4x_idx_store_paged`].
+pub type Q4xIdxStorePagedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, cache, pos, slots, block_tables, blocks_per_slot, scores, row0, rows,
+/// heads, hd, cap, cr, k, stream)` - see
+/// [`KernelTableV1::q4x_qsa_logits_paged`].
+pub type Q4xQsaLogitsPagedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, pool_k, pool_v, pos, slots, block_tables, blocks_per_slot, sel, cnt,
+/// part_o, part_ml, rows, nh, nkv, hd, k, cr, splits, scale, kv_dtype,
+/// stream)` - see [`KernelTableV1::q4x_qsa_attn_paged`].
+pub type Q4xQsaAttnPagedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(d0, r0, d1, r1, d2, r2, xq, xs, y0, y1, y2, in_dim, o0, o1, o2, n_planes,
+/// glu, cols, stream)` - see [`KernelTableV1::ternary_gemm_nb`].
+pub type TernaryGemmNbFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// [`AttnRowsPartialFn`]'s arguments plus `split_keys` before the stream -
+/// see [`KernelTableV1::attn_rows_partial_fixed`].
+pub type AttnRowsPartialFixedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(rdata, rscale, rscale2, sdata, sscale, sscale2, sorted_row, sorted_slot,
+/// block_expert, x_bf16, act_bf16, in_dim, ff_r, ff_s, k, n_blocks, rows,
+/// stream)` - see [`KernelTableV1::nvf4_moe_up_relu2_w16`].
+pub type Nvf4MoeUpRelu2W16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(rdata, rscale, rscale2, sdata, sscale, sscale2, sorted_row, sorted_slot,
+/// block_expert, topk_w, act_bf16, part, ff_r, ff_s, embd, k, n_blocks, rows,
+/// stream)` - see [`KernelTableV1::nvf4_moe_down_part_w16`].
+pub type Nvf4MoeDownPartW16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(router_w, x, logits, bias, routed_scale, in_dim, n_expert, k, x16,
+/// out_idx, out_w, sorted_row, sorted_slot, block_expert, max_blocks, rows,
+/// tickets, stream)` - see [`KernelTableV1::moe_route_w16`].
+pub type MoeRouteW16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    f32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(w, rscale, x, y0, y1, y2, n0, n1, in_dim, out_dim, rows, dtype, x16,
+/// stream)` - see [`KernelTableV1::dense_w16_seg`].
+pub type DenseW16SegFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(w, rscale, x, y, in_dim, out_dim, rows, y_stride, dtype, x16, stream)` -
+/// see [`KernelTableV1::dense_w16`].
+pub type DenseW16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, kc, vc, out_o, out_ml, positions, slots, groups, n_groups,
+/// block_tables, blocks_per_slot, max_ctx, n_heads, n_kv_heads, head_dim,
+/// kv_dim, n_rows, n_splits, window, scale, kv_dtype, paged, stream)` - see
+/// [`KernelTableV1::attn_rows_partial`].
+pub type AttnRowsPartialFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// `(w, x, y, bias, in_dim, out_dim, batch, stream)` - an f16-landing GEMM
 /// with a nullable per-output f32 bias.
@@ -8273,7 +8676,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 664;
+pub const KERNEL_TABLE_SLOTS: usize = 682;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

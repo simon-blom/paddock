@@ -1139,8 +1139,14 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     __half* pane = sh_q + (size_t)MR * QROW;
     unsigned char* kraw = (unsigned char*)(pane + (size_t)TK * QROW);
     unsigned char* vraw = kraw + (size_t)TK * RROW;
-    unsigned int* sh_rpos = (unsigned int*)(vraw + (size_t)TK * RROW);
-    __shared__ unsigned int sh_rwin[MR];   // per-row true positions (floors)
+    // per-row positions and true positions (floors) live in the head of the
+    // repack pane: every read of them is in the prologue, before the main
+    // loop's first barrier, and the pane's first write is K0's repack after
+    // it. Their own 512 B put the hd256 tile 256 B past GB10's 101,376-byte
+    // opt-in (static included), so it could not launch there at all.
+    static_assert(2u * MR * 4u <= TK * QROW * 2u, "positions must fit the pane");
+    unsigned int* sh_rpos = (unsigned int*)pane;
+    unsigned int* sh_rwin = sh_rpos + MR;
 
     // positions first: hi/lo gate the K0/V0 cp.async, which must be in
     // flight before the (much longer) Q stage - pf7's Q-then-stage order
@@ -1540,27 +1546,15 @@ int pd_attn_prefill_f16_paged_vl(const void* q, const void* pool_k,
     // pf7rp arm first (door 2) - bit-identical, leaner mainloop;
     // kill PADDOCK_NO_PF7RP -> pf7. Same VL item contract for both.
     static const bool no_rp_vl = pd_env("PADDOCK_NO_PF7RP") != nullptr;
-    constexpr uint32_t RPSM = 2u * 64u * 264u * 2u + 2u * 64u * 256u + 256u;
-    static int p7vcap = -1;
-    if (p7vcap < 0) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        if (cudaDeviceGetAttribute(&p7vcap,
-                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
-            p7vcap = 48 * 1024;
-    }
-    if (!no_rp_vl && RPSM <= (uint32_t)p7vcap) {
+    // Q and pane 64 x 264 halves, raw K/V 64 x 256 B (positions ride the pane)
+    constexpr uint32_t RPSM = 2u * 64u * 264u * 2u + 2u * 64u * 256u;
+    static const bool rp_vl_fits =
+        pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<4u, true>, RPSM)
+        && pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<6u, true>, RPSM)
+        && pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<8u, true>, RPSM);
+    if (!no_rp_vl && rp_vl_fits) {
         static bool arpv = false;
         if (!arpv) {
-            cudaFuncSetAttribute(
-                (const void*)pd_attn_prefill_pf7rp_kernel<4u, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
-            cudaFuncSetAttribute(
-                (const void*)pd_attn_prefill_pf7rp_kernel<6u, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
-            cudaFuncSetAttribute(
-                (const void*)pd_attn_prefill_pf7rp_kernel<8u, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
             ::fprintf(stderr, "[pf7rp-vl] ENGAGED (repacked packed varlen)\n");
             arpv = true;
         }
@@ -1580,15 +1574,13 @@ int pd_attn_prefill_f16_paged_vl(const void* q, const void* pool_k,
         return pd_launch_status();
     }
     constexpr uint32_t P7SM = 64u * 264u * 2u + 3u * 64u * 272u + 256u;
-    if (P7SM > (uint32_t)p7vcap) return cudaErrorInvalidValue;
+    static const bool p7_vl_fits =
+        pd_smem_fits((const void*)pd_attn_prefill_pf7_kernel<256u, 4u, true>, P7SM)
+        && pd_smem_fits((const void*)pd_attn_prefill_pf7_kernel<256u, 6u, true>, P7SM)
+        && pd_smem_fits((const void*)pd_attn_prefill_pf7_kernel<256u, 8u, true>, P7SM);
+    if (!p7_vl_fits) return cudaErrorInvalidValue;
     static bool a7v = false;
     if (!a7v) {
-        cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<256u, 4u, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM);
-        cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<256u, 6u, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM);
-        cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<256u, 8u, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM);
         ::fprintf(stderr, "[pf7-vl] ENGAGED (packed varlen prefill)\n");
         a7v = true;
     }

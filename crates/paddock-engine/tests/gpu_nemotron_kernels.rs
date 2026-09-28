@@ -2511,8 +2511,10 @@ fn batched_decode_steps_match_serial_loops() {
                 .expect("plane");
             // batches straddling the mr twin's 16-row group: masked
             // partial group, one exact group, two groups with a 1-row tail, two
-            // exact groups - every arm must stay bit-exact vs the serial GEMV
-            for bt in [B, 16, 17, 32] {
+            // exact groups - every arm must stay bit-exact vs the serial GEMV.
+            // 2..=8 ride the small-batch arms (4- and 8-row tiles, KS=2, BN=2
+            // where the grid covers the die): full and ragged tiles of each
+            for bt in [2, B, 4, 5, 8, 16, 17, 32] {
                 let xs = det(bt * k, 31);
                 let d_xs = exec.to_device(&xs).expect("xs");
                 let mut d_yb = exec.alloc(bt * n).expect("yb");
@@ -2737,8 +2739,9 @@ fn nvf4_tm_plane_matches_rowmajor() {
         .collect();
 
     for (name, pl) in &planes {
-        // batch lane: bt=1 rides the per-row twin, bt>=2 the mr twin
-        for bt in [1usize, 2, 9, 32] {
+        // batch lane: bt=1 rides the per-row twin, bt>=2 the mr twin (its
+        // 4- and 8-row small-batch tiles included)
+        for bt in [1usize, 2, 3, 4, 6, 8, 9, 32] {
             let xs = det(bt * k, 0x7a0 + bt as u64);
             let d_xs = exec.to_device(&xs).expect("xs");
             let mut d_yr = exec.alloc(bt * n).expect("yr");
@@ -3018,9 +3021,15 @@ fn bf16_qkv_fused_matches_segment_gemms() {
 /// premise is void - hence exact equality, not a tolerance.
 ///
 /// The failure this guards is subtle: the kernel keeps `pd_rmsnorm_batch`'s
-/// f64 reduction only if the launcher picks the same nth, and keeps the
-/// nvf4 16-block scale groups only if the 2-lane pairing survives the
-/// strided walk. Both are silent when wrong - the sums merely regroup.
+/// reduction only if it accumulates in the same elected mode AND the launcher
+/// picks the same nth, and keeps the nvf4 16-block scale groups only if the
+/// 2-lane pairing survives the strided walk. All of it is silent when wrong -
+/// the sums merely regroup, and a regrouped sum moves the f32 mean only when
+/// it sits near a rounding boundary. The kernel shipped with the f64
+/// accumulate hard-coded after df became the default and this test still
+/// passed: on uniform rows the two classes part on 0.54% of rows, and it ran
+/// 38. A residual stream's outlier channels lift that to 9.4% (GB10 probe,
+/// 2026-09-26), so the rows here carry four and there are ~420 of them.
 #[test]
 fn add_rmsnorm_quant_nvf4_matches_three_kernel_chain_bitexact() {
     let Some(exec) = common::gpu() else { return };
@@ -3030,10 +3039,16 @@ fn add_rmsnorm_quant_nvf4_matches_three_kernel_chain_bitexact() {
     }
     const EMBD: usize = 2688; // nemotron hidden; %32 == 0 keeps the 16-blocks whole
     let eps = 1e-5f32;
-    // t=1 and t=32 are the served decode widths; t=5 catches a row-stride slip
-    // that a power-of-two batch would hide.
-    for &t in &[1usize, 5, 32] {
-        let x = det(t * EMBD, 900 + t as u64);
+    // t=1 and t=32 are served decode widths and t=63 the last one; t=5 catches
+    // a row-stride slip that a power-of-two batch would hide; 64 and 256 run
+    // the wide-width branch.
+    for &t in &[1usize, 5, 32, 63, 64, 256] {
+        let mut x = det(t * EMBD, 900 + t as u64);
+        for row in x.chunks_mut(EMBD) {
+            for c in [7, 311, 1500, 2600] {
+                row[c] *= 300.0;
+            }
+        }
         let proj = det(t * EMBD, 1900 + t as u64);
         let w = det(EMBD, 77);
 

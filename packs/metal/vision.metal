@@ -181,7 +181,7 @@ template<bool Gemma,uint HD=72,uint Padded=80,uint Heads=16,bool PadTail=false,b
 inline void vis_attention_impl(device T* q,device T* k,device T* v,device ushort* out,
                           device const uint4* tiles,constant uint* p,uint2 g,uint tid,
                           threadgroup float* correction,threadgroup float* normalizer,threadgroup float* remap,
-                          device const float* rh=nullptr,device const float* rw=nullptr,uint side=0) {
+                          device const float* rh=nullptr,device const float* rw=nullptr,uint side=0,uint window=0) {
     // Split-Q ownership: each SIMD group owns 16 complete query rows.
     // Compatible score/probability layouts stay in registers; otherwise an
     // 8 KiB SIMD-private remap preserves F32 probabilities between the two
@@ -219,7 +219,9 @@ inline void vis_attention_impl(device T* q,device T* k,device T* v,device ushort
     for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
     auto tc=tensor(correction+first,extents<int,16>());
     auto tn=tensor(normalizer+first,extents<int,16>());
-    for(uint base=0;base<t.w;base+=KeyTile) {
+    uint key_first=window?(uint(max(0,int(t.x+first)-int(t.z)-int(window)))/KeyTile)*KeyTile:0;
+    uint key_end=window?min(t.w,t.x+first+count-t.z+window):t.w;
+    for(uint base=key_first;base<key_end;base+=KeyTile) {
         if constexpr(Causal) { if(t.z+base>=t.x+first+count)break; }
         auto kt=tk.slice(0,base);
         if constexpr(BF16Scaled)qk.run(qs,kt,sc);else qk.run(tq,kt,sc);
@@ -235,6 +237,7 @@ inline void vis_attention_impl(device T* q,device T* k,device T* v,device ushort
             }
             *it=ij[0]+base<t.w && ij[1]<count?*it*((Gemma||BF16Scaled)?1.0f:(HD==64?0.125f:(HD==96?0.10206207261596575f:(HD==128?0.08838834764831844f:0.1178511301977579f)))):-INFINITY;
             if constexpr(Causal) { if(t.z+base+ij[0]>t.x+first+ij[1])*it=-INFINITY; }
+            if(window && abs(int(t.z+base+ij[0])-int(t.x+first+ij[1]))>int(window))*it=-INFINITY;
             if constexpr(Sam) {
                 if(ij[0]+base<t.w && ij[1]<count) {
                     ulong at=(ulong(t.x+first+ij[1])*Heads+head)*side;
@@ -250,7 +253,7 @@ inline void vis_attention_impl(device T* q,device T* k,device T* v,device ushort
         }
         for(auto it=sc.begin();it!=sc.end();++it)if(it.is_valid_element()) {
             auto ij=it.get_multidimensional_index();
-            *it=ij[0]+base<t.w && ij[1]<count?(BF16Scaled?exp2(*it-*high.map_iterator(it)):exp(*it-*high.map_iterator(it))):0.0f;
+            *it=ij[0]+base<t.w && ij[1]<count && (!window || isfinite(*high.map_iterator(it)))?(BF16Scaled?exp2(*it-*high.map_iterator(it)):exp(*it-*high.map_iterator(it))):0.0f;
         }
         reduce_rows(sc,sum);
         for(uint i=0;i<denominator.get_capacity();++i)denominator[i]=denominator[i]*old[i]+sum[i];

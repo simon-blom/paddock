@@ -78,7 +78,7 @@ extension ReadDraft {
     if steps > 1 { fields.append("  \"steps\": \(steps)") }
     if think > 0 { fields.append("  \"think\": \(think)") }
     if let model {
-      fields.insert(try "  \"model\": " + quoted(model), at: 0)
+      fields.insert(try "  \"model\": " + quoted(checkpoint ?? model), at: 0)
       fields.insert(try "  \"state\": " + quoted(state), at: 1)
       if !images.isEmpty {
         fields.append(
@@ -87,6 +87,8 @@ extension ReadDraft {
               .array(images.map { .string(includeImageData ? $0.url : "<attached: \($0.name)>") })))
         )
       }
+    } else if let checkpoint {
+      fields.insert(try "  \"model\": " + quoted(checkpoint), at: 0)
     }
     return "{\n" + fields.joined(separator: ",\n") + "\n}"
   }

@@ -73,7 +73,7 @@ pub struct StTensor {
 pub struct SafetensorsFile {
     map: memmap2::Mmap,
     #[cfg(unix)]
-    file: std::fs::File,
+    file: std::sync::Arc<std::fs::File>,
     data_off: usize,
     tensors: HashMap<String, StTensor>,
     pub metadata: HashMap<String, String>,
@@ -176,7 +176,7 @@ impl SafetensorsFile {
         Ok(Self {
             map,
             #[cfg(unix)]
-            file: f,
+            file: std::sync::Arc::new(f),
             data_off,
             tensors,
             metadata,
@@ -208,6 +208,45 @@ impl SafetensorsFile {
         }
         self.file
             .read_exact_at(out, (self.data_off + t.begin) as u64)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn reader(&self, name: &str) -> Result<TensorFileReader, StError> {
+        let t = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
+        Ok(TensorFileReader {
+            file: self.file.clone(),
+            begin: (self.data_off + t.begin) as u64,
+            length: t.end - t.begin,
+        })
+    }
+}
+
+/// Bounded positional access to one validated tensor. Retains the opened file,
+/// not its mmap, and shares the descriptor rather than cloning it per plane.
+/// Replacing a checkpoint path cannot redirect an already opened reader.
+#[cfg(unix)]
+pub struct TensorFileReader {
+    file: std::sync::Arc<std::fs::File>,
+    begin: u64,
+    length: usize,
+}
+#[cfg(unix)]
+impl TensorFileReader {
+    pub fn read_at(&self, offset: usize, out: &mut [u8]) -> Result<(), StError> {
+        use std::os::unix::fs::FileExt;
+        if !offset
+            .checked_add(out.len())
+            .is_some_and(|end| end <= self.length)
+        {
+            return Err(StError::Header(
+                "tensor read outside validated extent".into(),
+            ));
+        }
+        self.file.read_exact_at(out, self.begin + offset as u64)?;
         Ok(())
     }
 }
@@ -274,6 +313,14 @@ impl ShardedSafetensors {
             .get(name)
             .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
         self.shards[*shard].read_into(name, out)
+    }
+    #[cfg(unix)]
+    pub fn reader(&self, name: &str) -> Result<TensorFileReader, StError> {
+        let shard = self
+            .index
+            .get(name)
+            .ok_or_else(|| StError::Header(format!("missing tensor {name}")))?;
+        self.shards[*shard].reader(name)
     }
     pub fn open_dir(dir: &Path) -> Result<Self, StError> {
         let idx_path = dir.join("model.safetensors.index.json");
@@ -761,6 +808,41 @@ mod tests {
         assert!(file.read_into("missing", &mut short).is_err());
         assert_eq!(short, [42; 2]);
         drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tensor_reader_retains_file_not_mapping_and_checks_every_extent() {
+        let path = write_st(&[("plane", "U32", vec![4], (0..16).collect())]);
+        let mapped = SafetensorsFile::open(&path).unwrap();
+        let reader = mapped.reader("plane").unwrap();
+        assert!(mapped.reader("absent").is_err());
+        drop(mapped);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = &reader;
+                scope.spawn(move || {
+                    let mut out = [42; 4];
+                    reader.read_at(5, &mut out).unwrap();
+                    assert_eq!(out, [5, 6, 7, 8]);
+                    assert!(reader.read_at(13, &mut out).is_err());
+                    assert!(reader.read_at(usize::MAX, &mut out).is_err());
+                    assert_eq!(out, [5, 6, 7, 8]);
+                    reader.read_at(16, &mut []).unwrap();
+                });
+            }
+        });
+        // No mmap remains: a truncated backing file becomes a recoverable
+        // I/O error, not an out-of-mapping access or stale-buffer success.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert!(reader.read_at(0, &mut [0; 4]).is_err());
+        drop(reader);
         std::fs::remove_file(path).unwrap();
     }
 
