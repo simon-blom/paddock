@@ -9,11 +9,13 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::tensor_slice::ShardKind;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, prefill_mm_any, prefill_mm_pre_any, prefill_quant, read_sections};
+use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, read_sections};
 use super::tp_kv::MirroredKv;
+use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
 use crate::gpu_model::tp::{TpTopology, attention::GqaPartition};
 use crate::kv_pool::BLOCK_TOKENS;
 
@@ -827,28 +829,17 @@ impl GqaTpRank {
             p.stage(&e.stream, "gqa-local", Some(layer))?;
         }
         let g = self.geometry;
-        // One activation quantization for all three projections off the same
-        // normalized input: Q/K/V share `xn` (in_dim = width), so quantize
-        // once and run the GEMM half per weight. Same layouts and scales as
-        // three `prefill_mm_any` calls (bit-identical staging bytes).
-        prefill_quant(e, &mut q.xq, &mut q.xs, &mut q.yq, xn, g.width, rows)?;
+        // One activation preparation for all three projections off the same
+        // normalized input. Generic TP owns the staging contract; Qwen's
+        // backend retains the trusted kernel-election policy.
+        let backend = Qwen35PrefillBackend;
+        backend.prepare(e, q, xn, g.width, rows)?;
         for (w, out) in [
             (&self.weights[0], &mut span.qg as &mut CudaSlice<f32>),
             (&self.weights[1], &mut span.k as &mut CudaSlice<f32>),
             (&self.weights[2], &mut span.v as &mut CudaSlice<f32>),
         ] {
-            prefill_mm_pre_any(
-                e,
-                w,
-                &q.xq,
-                &q.xs,
-                &q.yq,
-                &mut q.xsums,
-                &mut q.ssums,
-                &mut q.skfix,
-                out,
-                rows,
-            )?;
+            backend.project_prepared(e, q, w, out, rows)?;
         }
         e.split_qg(
             &span.qg,
@@ -975,15 +966,10 @@ impl GqaTpRank {
         super::tp_trace::trace_row_last(e, "b.gqa-attn-last", layer, &span.attn, rows, g.q_dim())?;
         e.mul_sigmoid(&mut span.attn, &span.gate, rows * g.q_dim())?;
         super::tp_trace::trace_row(e, "b.gqa-out", layer, &span.attn, 0, g.q_dim())?;
-        prefill_mm_any(
+        backend.project(
             e,
+            q,
             &self.weights[3],
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
             &span.attn,
             &mut span.partial,
             rows,
