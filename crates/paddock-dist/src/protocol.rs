@@ -444,8 +444,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]

@@ -3300,14 +3300,6 @@ pub fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-
-    fn sockets() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let worker = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (head, _) = listener.accept().unwrap();
-        (head, worker)
-    }
 
     #[test]
     fn prompt_owner_pins_partial_ticks_and_clears_on_finish_abort_and_reuse() {
@@ -3754,31 +3746,6 @@ mod tests {
     }
 
     #[test]
-    fn pipe_acks_defer_old_ready_until_next_is_prepared() {
-        let (mut head, mut worker) = sockets();
-        ControlMessage::TpPrepared { sequence: 2 }
-            .to_stream(&mut worker)
-            .unwrap();
-        prepared(&mut head, 2).unwrap();
-        ControlMessage::TpPrepared { sequence: 3 }
-            .to_stream(&mut worker)
-            .unwrap();
-        ControlMessage::TpReady { sequence: 2 }
-            .to_stream(&mut worker)
-            .unwrap();
-        prepared(&mut head, 3).unwrap();
-        ready(&mut head, 2).unwrap();
-        ControlMessage::TpReady { sequence: 3 }
-            .to_stream(&mut worker)
-            .unwrap();
-        ControlMessage::TpReady { sequence: 4 }
-            .to_stream(&mut worker)
-            .unwrap();
-        ready(&mut head, 3).unwrap();
-        ready(&mut head, 4).unwrap();
-    }
-
-    #[test]
     fn mirrored_two_slot_release_and_reuse_keeps_survivor() {
         let mut head = logical(32, 2).unwrap();
         let mut worker = logical(32, 2).unwrap();
@@ -4052,47 +4019,5 @@ mod tests {
             .filter_map(|(slot, was)| (*was && !scheduler_occupied[slot]).then_some(slot))
             .collect();
         assert_eq!(released, vec![1]);
-    }
-
-    #[test]
-    fn step_requires_prepared_before_completed_ack() {
-        let (mut head, mut worker) = sockets();
-        ControlMessage::TpReady { sequence: 3 }
-            .to_stream(&mut worker)
-            .unwrap();
-        assert!(
-            prepared(&mut head, 3)
-                .unwrap_err()
-                .contains("did not prepare")
-        );
-        ControlMessage::TpPrepared { sequence: 4 }
-            .to_stream(&mut worker)
-            .unwrap();
-        assert!(
-            prepared(&mut head, 3)
-                .unwrap_err()
-                .contains("did not prepare")
-        );
-        ControlMessage::TpPrepared { sequence: 3 }
-            .to_stream(&mut worker)
-            .unwrap();
-        prepared(&mut head, 3).unwrap();
-        ControlMessage::TpReady { sequence: 3 }
-            .to_stream(&mut worker)
-            .unwrap();
-        ready(&mut head, 3).unwrap();
-    }
-
-    #[test]
-    fn worker_error_and_closed_connection_fail_closed() {
-        let (mut head, mut worker) = sockets();
-        ControlMessage::TpError {
-            reason: "bad KV event".into(),
-        }
-        .to_stream(&mut worker)
-        .unwrap();
-        assert!(prepared(&mut head, 7).unwrap_err().contains("bad KV event"));
-        drop(worker);
-        assert!(ready(&mut head, 7).is_err());
     }
 }

@@ -175,6 +175,88 @@ mod tests {
         (workers, peers)
     }
 
+    fn tp2_workers() -> (WorkerSet, TcpStream) {
+        let (head, peer) = pair();
+        let mut resolved = tp4();
+        resolved.tp_size = 2;
+        let workers = WorkerSet::new(
+            vec![WorkerControl {
+                rank: 1,
+                stream: head,
+            }],
+            &resolved,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        (workers, peer)
+    }
+
+    #[test]
+    fn pipe_acks_defer_old_ready_until_next_is_prepared() {
+        let (mut workers, mut worker) = tp2_workers();
+        ControlMessage::TpPrepared { sequence: 2 }
+            .to_stream(&mut worker)
+            .unwrap();
+        workers.prepared(2).unwrap();
+        ControlMessage::TpPrepared { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        ControlMessage::TpReady { sequence: 2 }
+            .to_stream(&mut worker)
+            .unwrap();
+        workers.prepared(3).unwrap();
+        workers.ready(2).unwrap();
+        ControlMessage::TpReady { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        ControlMessage::TpReady { sequence: 4 }
+            .to_stream(&mut worker)
+            .unwrap();
+        workers.ready(3).unwrap();
+        workers.ready(4).unwrap();
+    }
+
+    #[test]
+    fn step_requires_prepared_before_completed_ack() {
+        let (mut workers, mut worker) = tp2_workers();
+        ControlMessage::TpReady { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        assert!(workers
+            .prepared(3)
+            .unwrap_err()
+            .contains("expected Prepared(3)"));
+        ControlMessage::TpPrepared { sequence: 4 }
+            .to_stream(&mut worker)
+            .unwrap();
+        assert!(workers
+            .prepared(3)
+            .unwrap_err()
+            .contains("expected Prepared(3)"));
+        ControlMessage::TpPrepared { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        workers.prepared(3).unwrap();
+        ControlMessage::TpReady { sequence: 3 }
+            .to_stream(&mut worker)
+            .unwrap();
+        workers.ready(3).unwrap();
+    }
+
+    #[test]
+    fn worker_error_and_closed_connection_fail_closed() {
+        let (mut workers, mut worker) = tp2_workers();
+        ControlMessage::TpError {
+            reason: "bad KV event".into(),
+        }
+        .to_stream(&mut worker)
+        .unwrap();
+        assert!(workers.prepared(7).unwrap_err().contains("bad KV event"));
+        drop(worker);
+        assert!(workers.ready(7).is_err());
+    }
+
     #[test]
     fn ack_kind_is_phase_specific() {
         assert_ne!(AckKind::Ready, AckKind::Prepared);
