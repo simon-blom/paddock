@@ -13,7 +13,7 @@ use crate::gpu::distributed::Communicator;
 use crate::gpu::GpuExecutor;
 use crate::gpu_model::tp::ffn::{SwiGluTpRank, SwiGluWeightNames, TpFfnError};
 
-use super::ops::{prefill_ffn_down_any, prefill_mm_pre_any, prefill_quant};
+use super::tp_prefill_backend::Qwen35PrefillBackend;
 use super::tp_span::{SpanFfn, SpanGemmStaging};
 
 pub type FfnTpError = TpFfnError;
@@ -61,9 +61,8 @@ impl FfnTpRank {
         })
     }
 
-    /// Qwen's current span adapter. The projection implementation and sharded
-    /// weights are generic; only the Qwen-owned prefill scratch/profile types
-    /// remain here until Phase 3 extracts shared prefill staging.
+    /// Qwen span adapter: generic FFN owns projection orchestration and scratch;
+    /// Qwen retains only tracing/profiling policy around the collective.
     pub(crate) fn forward_rows_capacity<'a, C: Communicator>(
         &'a mut self,
         exec: &GpuExecutor,
@@ -96,32 +95,14 @@ impl FfnTpRank {
             )));
         }
 
-        prefill_quant(
+        self.inner.prefill_local(
             exec,
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
+            &Qwen35PrefillBackend,
             xn,
-            self.hidden(),
             rows,
+            span,
+            q,
         )?;
-        for (w, out) in [
-            (self.gate(), &mut span.gate as &mut CudaSlice<f32>),
-            (self.up(), &mut span.up as &mut CudaSlice<f32>),
-        ] {
-            prefill_mm_pre_any(
-                exec,
-                w,
-                &q.xq,
-                &q.xs,
-                &q.yq,
-                &mut q.xsums,
-                &mut q.ssums,
-                &mut q.skfix,
-                out,
-                rows,
-            )?;
-        }
         super::tp_trace::trace_row(
             exec,
             "b.ffn-gate",
@@ -137,21 +118,6 @@ impl FfnTpRank {
             &span.up,
             0,
             self.local_ff(),
-        )?;
-        prefill_ffn_down_any(
-            exec,
-            self.down(),
-            &mut q.xq,
-            &mut q.xs,
-            &mut q.yq,
-            &mut q.xsums,
-            &mut q.ssums,
-            &mut q.skfix,
-            &mut span.gate,
-            &span.up,
-            &mut span.partial,
-            self.local_ff(),
-            rows,
         )?;
 
         let live = rows * self.hidden();

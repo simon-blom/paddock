@@ -21,6 +21,7 @@ use super::gqa_tp::GqaGeometry;
 use super::tp_span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
 use crate::gpu_model::tp::prefill::ProjectionStaging;
+pub(crate) use crate::gpu_model::tp::ffn::SwiGluPrefillScratch as SpanFfn;
 pub(crate) use crate::gpu_model::tp::prefill::ProjectionStaging as SpanGemmStaging;
 
 /// Whole-model activation planes for one span: residual stream, normalized
@@ -61,16 +62,6 @@ pub(crate) struct SpanGqa {
     pub(crate) slots: CudaSlice<u32>,
     pub(crate) axes: CudaSlice<u32>,
     pub(crate) block_table: CudaSlice<u32>,
-}
-
-/// Row-batched FFN planes for one span: gate/up activations and the
-/// capacity-sized all-reduce pair.
-pub(crate) struct SpanFfn {
-    pub(crate) cap: usize,
-    pub(crate) gate: CudaSlice<f32>,
-    pub(crate) up: CudaSlice<f32>,
-    pub(crate) partial: CudaSlice<f32>,
-    pub(crate) reduced: CudaSlice<f32>,
 }
 
 /// The complete span plane set owned by each `Qwen35TpRank`, including
@@ -128,13 +119,7 @@ impl TpSpanPlanes {
                 axes: e.alloc_u32(4 * cap)?,
                 block_table: e.alloc_u32(table_len)?,
             },
-            ffn: SpanFfn {
-                cap,
-                gate: e.alloc(cap * local_ff)?,
-                up: e.alloc(cap * local_ff)?,
-                partial: e.alloc(cap * hidden)?,
-                reduced: e.alloc(cap * hidden)?,
-            },
+            ffn: SpanFfn::new(e, cap, local_ff, hidden)?,
             q: ProjectionStaging::new(e, max_in, cap)?,
         })
     }

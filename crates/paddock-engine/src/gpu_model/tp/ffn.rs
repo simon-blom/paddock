@@ -17,6 +17,7 @@ use crate::gpu::{GpuError, GpuExecutor, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::projection::gemv_quant;
 
+use super::prefill::{ProjectionPrefillBackend, ProjectionStaging};
 use super::{TpLinearMode, TpTopology, TpTopologyError};
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +39,37 @@ pub struct SwiGluWeightNames<'a> {
     pub gate: &'a str,
     pub up: &'a str,
     pub down: &'a str,
+}
+
+/// Row-batched generic FFN scratch.
+pub(crate) struct SwiGluPrefillScratch {
+    pub(crate) cap: usize,
+    pub(crate) gate: CudaSlice<f32>,
+    pub(crate) up: CudaSlice<f32>,
+    pub(crate) partial: CudaSlice<f32>,
+    pub(crate) reduced: CudaSlice<f32>,
+}
+
+impl SwiGluPrefillScratch {
+    pub(crate) fn new(
+        exec: &GpuExecutor,
+        cap: usize,
+        local_ff: usize,
+        hidden: usize,
+    ) -> Result<Self, GpuError> {
+        if cap == 0 || local_ff == 0 || hidden == 0 {
+            return Err(GpuError::Unsupported(
+                "SwiGLU prefill scratch requires nonzero geometry".into(),
+            ));
+        }
+        Ok(Self {
+            cap,
+            gate: exec.alloc(cap * local_ff)?,
+            up: exec.alloc(cap * local_ff)?,
+            partial: exec.alloc(cap * hidden)?,
+            reduced: exec.alloc(cap * hidden)?,
+        })
+    }
 }
 
 /// Generic rank-local implementation of a conventional dense SwiGLU FFN.
@@ -175,6 +207,46 @@ impl SwiGluTpRank {
         gemv_quant(exec, &self.up, input, &mut self.up_buf)?;
         exec.swiglu(&mut self.gate_buf, &self.up_buf, self.local_ff)?;
         gemv_quant(exec, &self.down, &self.gate_buf, &mut self.partial)?;
+        Ok(())
+    }
+
+    /// Collective-free row-batched FFN body.
+    ///
+    /// The generic FFN owns gate/up/down orchestration; the backend owns only
+    /// projection dispatch policy. This is the override seam for a model with
+    /// a faster prefill projection implementation.
+    pub(crate) fn prefill_local<B: ProjectionPrefillBackend>(
+        &mut self,
+        exec: &GpuExecutor,
+        backend: &B,
+        input: &CudaSlice<f32>,
+        rows: usize,
+        scratch: &mut SwiGluPrefillScratch,
+        staging: &mut ProjectionStaging,
+    ) -> Result<(), TpFfnError> {
+        if rows == 0
+            || rows > scratch.cap
+            || input.len() < rows * self.hidden
+            || input.context().cu_ctx() != exec.stream.context().cu_ctx()
+        {
+            return Err(TpFfnError::Shape(
+                "FFN prefill rows/input exceed configured scratch".into(),
+            ));
+        }
+        staging.validate(self.hidden, rows)?;
+        backend.prepare(exec, staging, input, self.hidden, rows)?;
+        backend.project_prepared(exec, staging, &self.gate, &mut scratch.gate, rows)?;
+        backend.project_prepared(exec, staging, &self.up, &mut scratch.up, rows)?;
+        backend.swiglu_down(
+            exec,
+            staging,
+            &self.down,
+            &mut scratch.gate,
+            &scratch.up,
+            &mut scratch.partial,
+            self.local_ff,
+            rows,
+        )?;
         Ok(())
     }
 

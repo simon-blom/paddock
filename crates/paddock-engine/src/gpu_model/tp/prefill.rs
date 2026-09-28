@@ -6,7 +6,55 @@
 
 use cudarc::driver::CudaSlice;
 
-use crate::gpu::{GpuError, GpuExecutor};
+use crate::gpu::{GpuError, GpuExecutor, QuantW};
+use crate::gpu_model::gpt_oss::GpuModelError;
+
+/// Model-facing prefill projection backend.
+///
+/// Generic TP owns orchestration and scratch. A model may override this backend
+/// to keep an architecture-specific fast path without replacing FFN/GQA,
+/// topology, collectives, or cache machinery.
+pub(crate) trait ProjectionPrefillBackend {
+    fn prepare(
+        &self,
+        exec: &GpuExecutor,
+        staging: &mut ProjectionStaging,
+        input: &CudaSlice<f32>,
+        in_dim: usize,
+        rows: usize,
+    ) -> Result<(), GpuModelError>;
+
+    fn project_prepared(
+        &self,
+        exec: &GpuExecutor,
+        staging: &mut ProjectionStaging,
+        weight: &QuantW,
+        output: &mut CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), GpuModelError>;
+
+    fn project(
+        &self,
+        exec: &GpuExecutor,
+        staging: &mut ProjectionStaging,
+        weight: &QuantW,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), GpuModelError>;
+
+    fn swiglu_down(
+        &self,
+        exec: &GpuExecutor,
+        staging: &mut ProjectionStaging,
+        weight: &QuantW,
+        gate: &mut CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        ff: usize,
+        rows: usize,
+    ) -> Result<(), GpuModelError>;
+}
 
 /// Flat MMQ activation-layout sizing. Producer and consumer must use the same
 /// padding rule or wide-prefill activations are silently misread.
