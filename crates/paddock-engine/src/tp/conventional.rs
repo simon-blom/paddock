@@ -169,6 +169,23 @@ fn check_norm_pairing(q_norm: bool, k_norm: bool) -> Result<(), ConventionalTpEr
     Ok(())
 }
 
+/// Validate a model's attention geometry against a rank's topology BEFORE
+/// any weight load: complete Q groups following the rank's KV head, even KV
+/// split, nonzero dimensions. This is the load-time refusal rule every
+/// conventional model gets from the generic layer (Qwen's GqaGeometry
+/// applies the same rule through `GqaPartition`). Pure and host-testable.
+/// Pending seam: exercised by model #2's TP shim (`gpu_model/minicpm`).
+#[allow(dead_code)]
+pub(crate) fn validate_load_geometry(
+    topology: TpTopology,
+    width: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Result<(), ConventionalTpError> {
+    ConventionalGeometry::new(topology, width, heads, kv_heads, head_dim).map(|_| ())
+}
+
 /// Contiguous-span range validation shared by prefill staging. Pure.
 fn validate_span_range(
     position: usize,
