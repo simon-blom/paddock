@@ -1,5 +1,11 @@
 //! Generic grouped-query-attention tensor-parallel partitioning.
 
+use cudarc::driver::{DevicePtr, DevicePtrMut};
+use paddock_models::mapped::MappedGguf;
+
+use crate::gpu::distributed::{CollectiveError, Communicator};
+use crate::gpu::{GpuError, GpuExecutor, QuantW};
+
 use super::{TpTopology, TpTopologyError};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -12,6 +18,106 @@ pub enum GqaPartitionError {
     IncompleteGroups { heads: usize, kv_heads: usize },
     #[error("KV heads {kv_heads} cannot split evenly over {world_size} TP ranks")]
     UnevenKvHeads { kv_heads: usize, world_size: usize },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AttentionTpError {
+    #[error(transparent)]
+    Gpu(#[from] GpuError),
+    #[error(transparent)]
+    Collective(#[from] CollectiveError),
+    #[error(transparent)]
+    Topology(#[from] TpTopologyError),
+    #[error("tensor-parallel attention: {0}")]
+    Shape(String),
+}
+
+/// Weight names for the conventional Q/K/V column-parallel + output
+/// row-parallel attention decomposition.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionWeightNames<'a> {
+    pub q: &'a str,
+    pub k: &'a str,
+    pub v: &'a str,
+    pub output: &'a str,
+}
+
+/// Generic sharded attention projection weights.
+///
+/// This does not prescribe attention semantics. A model may use fused Q+gate,
+/// custom RoPE/norms, or a completely different attention execution while
+/// still reusing the standard sharding contract.
+pub struct AttentionTpWeights {
+    q: QuantW,
+    k: QuantW,
+    v: QuantW,
+    output: QuantW,
+    topology: TpTopology,
+}
+
+impl AttentionTpWeights {
+    pub fn load(
+        exec: &GpuExecutor,
+        map: &MappedGguf,
+        names: AttentionWeightNames<'_>,
+        topology: TpTopology,
+    ) -> Result<Self, AttentionTpError> {
+        let column = topology.tensor_slice(super::TpLinearMode::ColumnParallel.shard_kind());
+        let row = topology.tensor_slice(
+            super::TpLinearMode::RowParallel { reduce: true }.shard_kind(),
+        );
+        Ok(Self {
+            q: exec.load_quantw_shard(map, names.q, column)?,
+            k: exec.load_quantw_shard(map, names.k, column)?,
+            v: exec.load_quantw_shard(map, names.v, column)?,
+            output: exec.load_quantw_shard(map, names.output, row)?,
+            topology,
+        })
+    }
+
+    pub fn topology(&self) -> TpTopology {
+        self.topology
+    }
+
+    pub fn q(&self) -> &QuantW {
+        &self.q
+    }
+
+    pub fn k(&self) -> &QuantW {
+        &self.k
+    }
+
+    pub fn v(&self) -> &QuantW {
+        &self.v
+    }
+
+    pub fn output(&self) -> &QuantW {
+        &self.output
+    }
+}
+
+/// Complete a row-parallel attention output projection.
+pub fn reduce_output<C, S, R>(
+    exec: &GpuExecutor,
+    group: &C,
+    topology: TpTopology,
+    partial: &S,
+    reduced: &mut R,
+) -> Result<(), AttentionTpError>
+where
+    C: Communicator,
+    S: DevicePtr<f32>,
+    R: DevicePtrMut<f32>,
+{
+    if TpTopology::from_group(group)? != topology || partial.len() != reduced.len() {
+        return Err(AttentionTpError::Shape(
+            "attention reduction topology or output width changed".into(),
+        ));
+    }
+    group.after_compute(&exec.stream)?;
+    group.all_reduce(partial, reduced)?;
+    group.before_compute(&exec.stream)?;
+    Ok(())
 }
 
 /// Complete Q groups follow the rank that owns their KV head.

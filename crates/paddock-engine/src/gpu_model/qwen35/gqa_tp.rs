@@ -6,17 +6,19 @@
 //! with the Phase 3 NCCL sum. No production forward or scheduler is changed.
 use cudarc::driver::CudaSlice;
 use paddock_kernels::reference::ops::YarnRope;
-use paddock_models::tensor_slice::ShardKind;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, read_sections};
 use super::tp_kv::MirroredKv;
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
-use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
+use crate::gpu::{GpuError, GpuExecutor, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
-use crate::gpu_model::tp::{TpTopology, attention::GqaPartition};
+use crate::gpu_model::tp::attention::{
+    AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition, reduce_output,
+};
+use crate::gpu_model::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
 
 use super::tp_span::{SpanGemmStaging, SpanGqa};
@@ -29,6 +31,8 @@ pub enum GqaTpError {
     Model(#[from] GpuModelError),
     #[error(transparent)]
     Collective(#[from] CollectiveError),
+    #[error(transparent)]
+    Attention(#[from] AttentionTpError),
     #[error("GQA TP: {0}")]
     Shape(String),
 }
@@ -113,7 +117,7 @@ fn span_paged_table_refs<'a, T>(table: &'a T) -> SpanPagedTableRefs<'a, T> {
 /// NCCL sum. KV buffers are owned locally and never communicated.
 pub struct GqaTpRank {
     pub geometry: GqaGeometry,
-    weights: [QuantW; 4],
+    weights: AttentionTpWeights,
     qnorm: CudaSlice<f32>,
     knorm: CudaSlice<f32>,
     sinks: CudaSlice<f32>,
@@ -230,13 +234,21 @@ impl GqaTpRank {
                 )));
             }
         }
-        let request = |kind| topology.tensor_slice(kind);
-        let weights = [
-            e.load_quantw_shard(map, &name("attn_q"), request(ShardKind::OutputRows))?,
-            e.load_quantw_shard(map, &name("attn_k"), request(ShardKind::OutputRows))?,
-            e.load_quantw_shard(map, &name("attn_v"), request(ShardKind::OutputRows))?,
-            e.load_quantw_shard(map, &name("attn_output"), request(ShardKind::InputColumns))?,
-        ];
+        let q_name = name("attn_q");
+        let k_name = name("attn_k");
+        let v_name = name("attn_v");
+        let output_name = name("attn_output");
+        let weights = AttentionTpWeights::load(
+            e,
+            map,
+            AttentionWeightNames {
+                q: &q_name,
+                k: &k_name,
+                v: &v_name,
+                output: &output_name,
+            },
+            topology,
+        )?;
         let train = u("context_length").unwrap_or(max_ctx);
         let yarn = YarnRope::new(nrot, base, 1.0, train, 0.0, 1.0, 32.0, 1.0).kernel_params();
         Ok(Self {
@@ -408,9 +420,13 @@ impl GqaTpRank {
             .memcpy_htod(&[slot as u32], &mut self.slots)
             .map_err(GpuError::from)?;
         self.attention_run(e, input)?;
-        group.after_compute(&e.stream)?;
-        group.all_reduce(&self.partial, &mut self.reduced)?;
-        group.before_compute(&e.stream)?;
+        reduce_output(
+            e,
+            group,
+            self.topology,
+            &self.partial,
+            &mut self.reduced,
+        )?;
         if table.is_none() {
             self.pos += 1;
         }
@@ -434,9 +450,9 @@ impl GqaTpRank {
         input: &CudaSlice<f32>,
     ) -> Result<(), GqaTpError> {
         let g = self.geometry;
-        gemv_any(e, &self.weights[0], input, &mut self.qg)?;
-        gemv_any(e, &self.weights[1], input, &mut self.k)?;
-        gemv_any(e, &self.weights[2], input, &mut self.v)?;
+        gemv_any(e, self.weights.q(), input, &mut self.qg)?;
+        gemv_any(e, self.weights.k(), input, &mut self.k)?;
+        gemv_any(e, self.weights.v(), input, &mut self.v)?;
         e.split_qg(
             &self.qg,
             &mut self.q,
@@ -566,7 +582,7 @@ impl GqaTpRank {
             )?;
         }
         e.mul_sigmoid(&mut self.attn, &self.gate, g.q_dim())?;
-        gemv_any(e, &self.weights[3], &self.attn, &mut self.partial)?;
+        gemv_any(e, self.weights.output(), &self.attn, &mut self.partial)?;
         Ok(())
     }
 
@@ -576,9 +592,13 @@ impl GqaTpRank {
         e: &GpuExecutor,
         group: &C,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
-        group.after_compute(&e.stream)?;
-        group.all_reduce(&self.partial, &mut self.reduced)?;
-        group.before_compute(&e.stream)?;
+        reduce_output(
+            e,
+            group,
+            self.topology,
+            &self.partial,
+            &mut self.reduced,
+        )?;
         Ok(&self.reduced)
     }
 
@@ -835,9 +855,9 @@ impl GqaTpRank {
         let backend = Qwen35PrefillBackend;
         backend.prepare(e, q, xn, g.width, rows)?;
         for (w, out) in [
-            (&self.weights[0], &mut span.qg as &mut CudaSlice<f32>),
-            (&self.weights[1], &mut span.k as &mut CudaSlice<f32>),
-            (&self.weights[2], &mut span.v as &mut CudaSlice<f32>),
+            (self.weights.q(), &mut span.qg as &mut CudaSlice<f32>),
+            (self.weights.k(), &mut span.k as &mut CudaSlice<f32>),
+            (self.weights.v(), &mut span.v as &mut CudaSlice<f32>),
         ] {
             backend.project_prepared(e, q, w, out, rows)?;
         }
@@ -969,7 +989,7 @@ impl GqaTpRank {
         backend.project(
             e,
             q,
-            &self.weights[3],
+            self.weights.output(),
             &span.attn,
             &mut span.partial,
             rows,
@@ -991,12 +1011,13 @@ impl GqaTpRank {
             )
             .map_err(|err| GqaTpError::Shape(err.to_string()))?;
         } else {
-            group.after_compute(&e.stream)?;
-            group.all_reduce(
+            reduce_output(
+                e,
+                group,
+                self.topology,
                 &span.partial.slice(0..live),
                 &mut span.reduced.slice_mut(0..live),
             )?;
-            group.before_compute(&e.stream)?;
         }
         Ok(&span.reduced)
     }
