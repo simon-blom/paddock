@@ -75,6 +75,11 @@ pub struct Event {
 pub struct MirroredKv {
     pool: KvPool,
     tables: Vec<BlockTable>,
+    /// Monotonic per-slot BlockTable generation. This is deliberately local
+    /// derived state rather than wire identity: mirrored operations update it
+    /// deterministically on both ranks, and decode uses it only to avoid
+    /// redundant validation/uploads.
+    table_versions: Vec<u64>,
     radix: PagedRadix,
     sequence: u64,
     max_ctx: usize,
@@ -109,6 +114,7 @@ impl MirroredKv {
         Ok(Self {
             pool: KvPool::with_blocks(blocks),
             tables: (0..slots).map(|_| BlockTable::new()).collect(),
+            table_versions: vec![0; slots],
             radix: PagedRadix::new(),
             sequence: 0,
             max_ctx,
@@ -245,6 +251,45 @@ impl MirroredKv {
         self.tables.get(slot).map(|t| t.blocks())
     }
 
+    pub fn slot_table_version(&self, slot: usize) -> Option<u64> {
+        self.table_versions.get(slot).copied()
+    }
+
+    /// Hot decode validation. Geometry/coverage are checked every call, while
+    /// the O(context) block-id/refcount scan is repeated only when this slot's
+    /// physical BlockTable generation changed.
+    pub fn validate_device_table_versioned(
+        &self,
+        slot: usize,
+        position: usize,
+        pool_blocks: u32,
+        slots: usize,
+        max_ctx: usize,
+        known_version: Option<u64>,
+    ) -> Result<u64, &'static str> {
+        if pool_blocks != self.pool.capacity()
+            || slots != self.tables.len()
+            || max_ctx != self.max_ctx
+            || position >= max_ctx
+        {
+            return Err("KV GPU geometry mismatch");
+        }
+        let t = self.tables.get(slot).ok_or("KV slot out of range")?;
+        let version = *self.table_versions.get(slot).ok_or("KV slot out of range")?;
+        let needed = position / BLOCK_TOKENS + 1;
+        if t.blocks().len() < needed {
+            return Err("KV position has no live pages");
+        }
+        if known_version != Some(version)
+            && t.blocks()[..needed]
+                .iter()
+                .any(|&b| b >= pool_blocks || self.pool.refcount(b) == 0)
+        {
+            return Err("KV position has no live pages");
+        }
+        Ok(version)
+    }
+
     /// Validate that a live slot's entire read prefix is backed by allocated
     /// pages in precisely the geometry of the GPU payload. This is the hot
     /// decode check: it deliberately does not materialize the full all-slot
@@ -257,22 +302,9 @@ impl MirroredKv {
         slots: usize,
         max_ctx: usize,
     ) -> Result<(), &'static str> {
-        if pool_blocks != self.pool.capacity()
-            || slots != self.tables.len()
-            || max_ctx != self.max_ctx
-            || position >= max_ctx
-        {
-            return Err("KV GPU geometry mismatch");
-        }
-        let t = self.tables.get(slot).ok_or("KV slot out of range")?;
-        let needed = position / BLOCK_TOKENS + 1;
-        if t.blocks().len() < needed
-            || t.blocks()[..needed]
-                .iter()
-                .any(|&b| b >= pool_blocks || self.pool.refcount(b) == 0)
-        {
-            return Err("KV position has no live pages");
-        }
+        self.validate_device_table_versioned(
+            slot, position, pool_blocks, slots, max_ctx, None,
+        )?;
         Ok(())
     }
 
@@ -373,6 +405,7 @@ impl MirroredKv {
                     return Err("KV position out of range");
                 }
                 let t = self.tables.get_mut(*slot).ok_or("KV slot out of range")?;
+                let before = t.blocks().len();
                 let needed = *position / BLOCK_TOKENS + 1;
                 while needed.saturating_sub(t.blocks().len()) > self.pool.free_blocks() {
                     // A shared page may lose its radix ref without becoming
@@ -383,12 +416,17 @@ impl MirroredKv {
                 }
                 t.ensure(*position, &mut self.pool)
                     .map_err(|_| "KV pool exhausted")?;
+                if t.blocks().len() != before {
+                    self.table_versions[*slot] = self.table_versions[*slot].wrapping_add(1);
+                }
             }
             Operation::Release { slot } => {
-                self.tables
-                    .get_mut(*slot)
-                    .ok_or("KV slot out of range")?
-                    .clear(&mut self.pool);
+                let t = self.tables.get_mut(*slot).ok_or("KV slot out of range")?;
+                let changed = !t.blocks().is_empty();
+                t.clear(&mut self.pool);
+                if changed {
+                    self.table_versions[*slot] = self.table_versions[*slot].wrapping_add(1);
+                }
                 // Reserved-but-unattached checkpoint indices die with the
                 // admission that owned them; attached ones stay in the radix.
                 self.radix.drop_slot_reservations(*slot);
@@ -413,10 +451,17 @@ impl MirroredKv {
                 }
                 let blocks = self.radix.match_prefix(tokens);
                 t.share_prefix(&blocks, &mut self.pool);
+                if !blocks.is_empty() {
+                    self.table_versions[*slot] = self.table_versions[*slot].wrapping_add(1);
+                }
             }
             Operation::Reset => {
-                for t in &mut self.tables {
+                for (i, t) in self.tables.iter_mut().enumerate() {
+                    let changed = !t.blocks().is_empty();
                     t.clear(&mut self.pool);
+                    if changed {
+                        self.table_versions[i] = self.table_versions[i].wrapping_add(1);
+                    }
                 }
                 for t in &mut self.tokens {
                     t.clear();
@@ -425,8 +470,12 @@ impl MirroredKv {
                 // Cache retains published blocks; reset releases slots, not the cache.
             }
             Operation::Flush => {
-                for t in &mut self.tables {
+                for (i, t) in self.tables.iter_mut().enumerate() {
+                    let changed = !t.blocks().is_empty();
                     t.clear(&mut self.pool);
+                    if changed {
+                        self.table_versions[i] = self.table_versions[i].wrapping_add(1);
+                    }
                 }
                 for t in &mut self.tokens {
                     t.clear();
@@ -467,6 +516,9 @@ impl MirroredKv {
                             .ok_or("KV slot out of range")?;
                         t.clear(&mut self.pool);
                         t.share_prefix(&blocks, &mut self.pool);
+                    }
+                    if !blocks.is_empty() {
+                        self.table_versions[*slot] = self.table_versions[*slot].wrapping_add(1);
                     }
                     *resume
                 } else {

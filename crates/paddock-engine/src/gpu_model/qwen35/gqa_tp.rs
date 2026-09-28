@@ -137,8 +137,8 @@ pub struct GqaTpRank {
     // Per-slot host mirror of the page ids already resident in block_tables.
     // Decode positions change every token; physical page mappings normally do
     // not. This avoids re-uploading the full all-slot table at every GQA layer.
-    staged_slot_blocks: Vec<Vec<u32>>,
-    blocks_per_slot: usize,
+    staged_slot_versions: Vec<u64>,
+    blocks_per_slot: usize
     slots_count: usize,
     pos: usize,
     max_ctx: usize,
@@ -269,7 +269,7 @@ impl GqaTpRank {
             slots: e.alloc_u32(1)?,
             axes: e.alloc_u32(4)?,
             block_tables: None,
-            staged_slot_blocks: Vec::new(),
+            staged_slot_versions: Vec::new(),
             blocks_per_slot: 0,
             slots_count: 1,
             pos: 0,
@@ -315,7 +315,7 @@ impl GqaTpRank {
         rank.kc = e.alloc_u8(bytes)?;
         rank.vc = e.alloc_u8(bytes)?;
         rank.block_tables = Some(e.alloc_u32(bps * slots)?);
-        rank.staged_slot_blocks = vec![Vec::new(); slots];
+        rank.staged_slot_versions = vec![u64::MAX; slots];
         rank.blocks_per_slot = bps;
         rank.slots_count = slots;
         Ok(rank)
@@ -379,10 +379,8 @@ impl GqaTpRank {
         let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        logical
-            .validate_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
-            .map_err(|e| GqaTpError::Shape(e.into()))?;
-        self.stage_slot_block_table(e, slot, logical)?;
+        let _ = blocks;
+        self.stage_slot_block_table(e, slot, position, logical)?;
         self.forward_at(e, group, input, slot, position, Some(()))
     }
 
@@ -592,42 +590,55 @@ impl GqaTpRank {
     }
 
     /// Stage only the live block ids for one slot, and only when that slot's
-    /// physical mapping changed. The decode kernels index the persistent
-    /// all-slot device table at slot*blocks_per_slot, so unchanged mappings
-    /// remain graph-safe across positions.
+    /// physical mapping changed. MirroredKv exposes a per-slot mapping version
+    /// which advances only when the BlockTable contents change, so the hot path
+    /// is O(1) in context length.
     fn stage_slot_block_table(
         &mut self,
         e: &GpuExecutor,
         slot: usize,
+        position: usize,
         logical: &MirroredKv,
     ) -> Result<(), GqaTpError> {
+        let cached_version = *self
+            .staged_slot_versions
+            .get(slot)
+            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
+        let version = logical
+            .validate_device_table_versioned(
+                slot,
+                position,
+                u32::try_from(self.kc.len() / self.block_stride())
+                    .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?,
+                self.slots_count,
+                self.max_ctx,
+                Some(cached_version),
+            )
+            .map_err(|err| GqaTpError::Shape(err.into()))?;
+        if version == cached_version {
+            return Ok(());
+        }
         let live = logical
             .slot_blocks(slot)
             .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
-        let staged = self
-            .staged_slot_blocks
-            .get_mut(slot)
-            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
-        if staged.as_slice() == live {
-            return Ok(());
-        }
         if live.len() > self.blocks_per_slot {
             return Err(GqaTpError::Shape("block table exceeds slot capacity".into()));
         }
         let start = slot * self.blocks_per_slot;
         let stop = start + live.len();
-        e.stream
-            .memcpy_htod(
-                live,
-                &mut self
-                    .block_tables
-                    .as_mut()
-                    .expect("paged checked")
-                    .slice_mut(start..stop),
-            )
-            .map_err(GpuError::from)?;
-        staged.clear();
-        staged.extend_from_slice(live);
+        if start != stop {
+            e.stream
+                .memcpy_htod(
+                    live,
+                    &mut self
+                        .block_tables
+                        .as_mut()
+                        .expect("paged checked")
+                        .slice_mut(start..stop),
+                )
+                .map_err(GpuError::from)?;
+        }
+        self.staged_slot_versions[slot] = version;
         Ok(())
     }
 
@@ -650,10 +661,8 @@ impl GqaTpRank {
         let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        logical
-            .validate_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
-            .map_err(|err| GqaTpError::Shape(err.into()))?;
-        self.stage_slot_block_table(e, slot, logical)?;
+        let _ = blocks;
+        self.stage_slot_block_table(e, slot, position, logical)?;
         let pos =
             u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
         e.stream
