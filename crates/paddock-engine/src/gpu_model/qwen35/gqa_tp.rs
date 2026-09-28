@@ -134,11 +134,11 @@ pub struct GqaTpRank {
     slots: CudaSlice<u32>,
     axes: CudaSlice<u32>,
     block_tables: Option<CudaSlice<u32>>,
-    // Per-slot host mirror of the page ids already resident in block_tables.
-    // Decode positions change every token; physical page mappings normally do
-    // not. This avoids re-uploading the full all-slot table at every GQA layer.
+    // Per-slot generation of the physical page mapping already resident in
+    // block_tables. Position changes do not touch this; page allocation,
+    // release or reuse does.
     staged_slot_versions: Vec<u64>,
-    blocks_per_slot: usize
+    blocks_per_slot: usize,
     slots_count: usize,
     pos: usize,
     max_ctx: usize,
@@ -376,10 +376,6 @@ impl GqaTpRank {
         if self.block_tables.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
-        let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
-        let blocks = u32::try_from(self.kc.len() / stride)
-            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        let _ = blocks;
         self.stage_slot_block_table(e, slot, position, logical)?;
         self.forward_at(e, group, input, slot, position, Some(()))
     }
