@@ -871,40 +871,48 @@ impl Qwen35TpRank {
             None,
         )?;
         for layer in &mut self.layers {
-            self.exec.rmsnorm_batch(
+            crate::tp::traversal::span_normalize(
+                &self.exec,
                 &self.x,
-                &layer.attn_norm.buf,
                 &mut self.xn,
+                &layer.attn_norm.buf,
                 self.hidden,
                 self.eps,
                 1,
-            )?;
+            )
+            .map_err(Qwen35TpError::from)?;
             let mixed = match &mut layer.mixer {
                 TpMixer::Full(gqa) => {
                     gqa.forward_paged(&self.exec, group, &self.xn, slot, position, logical_kv)?
                 }
                 TpMixer::Linear(delta) => delta.decode_slot(&self.exec, group, &self.xn, slot)?,
             };
-            self.exec.add(&mut self.x, mixed, self.hidden)?;
-            self.exec.rmsnorm_batch(
+            crate::tp::traversal::span_accumulate(&self.exec, &mut self.x, mixed, self.hidden, 1)
+                .map_err(Qwen35TpError::from)?;
+            crate::tp::traversal::span_normalize(
+                &self.exec,
                 &self.x,
-                &layer.post_norm.buf,
                 &mut self.xn,
+                &layer.post_norm.buf,
                 self.hidden,
                 self.eps,
                 1,
-            )?;
+            )
+            .map_err(Qwen35TpError::from)?;
             let ffn = layer.ffn.forward(&self.exec, group, &self.xn)?;
-            self.exec.add(&mut self.x, ffn, self.hidden)?;
+            crate::tp::traversal::span_accumulate(&self.exec, &mut self.x, ffn, self.hidden, 1)
+                .map_err(Qwen35TpError::from)?;
         }
-        self.exec.rmsnorm_batch(
+        crate::tp::traversal::span_normalize(
+            &self.exec,
             &self.x,
-            &self.out_norm.buf,
             &mut self.xn,
+            &self.out_norm.buf,
             self.hidden,
             self.eps,
             1,
-        )?;
+        )
+        .map_err(Qwen35TpError::from)?;
         gemv_any(&self.exec, &self.output, &self.xn, &mut self.logits)?;
         Ok(())
     }
