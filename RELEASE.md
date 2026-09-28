@@ -1,69 +1,73 @@
-# Paddock 0.1.10
+# Paddock 0.1.11
 
-A feature release: Laya, an open model built only to answer questions about
-a text, a much richer Reads page, image input for DiffusionGemma's reads, and
-faster Qwen 3.8 Flash-Next. Windows x64, Linux x64 and the NVIDIA DGX Spark.
-NVIDIA GPUs, driver 580 or newer. The macOS pre-release for Apple Silicon is
-built from the same commit.
+A memory release: the Qwen 3.5-3.8 models, Nemotron and Qwen 3.8 Flash-Next
+fit more context on the same card, and long agent conversations resume from
+the cache on every turn. Nemotron gains speculative decoding for agent
+traffic and decodes long contexts much faster. Windows x64, Linux x64 and the
+NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS pre-release for
+Apple Silicon is built from the same commit.
 
 ## New
 
-- **Laya, a decision model.** Laya (ConvAI Innovations, Apache 2.0) answers
-  yes/no, multiple-choice and scored questions about a text with a calibrated
-  probability each, in one pass per question and without writing any text -
-  a few milliseconds a question. It serves the same `POST /v1/systemone` as
-  DiffusionGemma, so the Reads page works with it unchanged. The download
-  (2.4 GB) holds an English model, a multilingual one for 100+ languages and
-  a typed-decisions one; Paddock picks between the first two from the text
-  itself, as Laya's own server does. A text longer than one question's window
-  is read in overlapping windows instead of being cut.
+- **More context on the same card.** The resume points a long conversation
+  picks up from used to take a fixed reserve before the context got any
+  memory - on a 24 GB card that alone held a 27B model to about 21K tokens
+  at one request. They now live inside the context cache itself and hand
+  their memory back as a conversation grows. Measured on the same card and
+  budget: Qwen 3.5 9B went from 23.8K to 41.6K tokens. This covers the
+  Qwen 3.5-3.8 hybrids, Nemotron and Qwen 3.8 Flash-Next; a roomy card still
+  keeps just as many resume points as before.
 
-- **Images in reads.** DiffusionGemma reads a question set over pictures as
-  well as text, with its own vision companion (1.2 GB) built from Google's
-  checkpoint. Attach pictures on the Reads page by button, drop or paste.
+- **Qwen 3.8 Flash-Next's cache is paged.** Its memory is now planned inside
+  the endpoint's budget (it used to take fixed amounts whatever the budget
+  said), and a cached prefix is shared instead of copied, so resumed turns
+  reach their first token 10-12% sooner.
 
-- **Conditional questions.** A question can be asked only when an earlier
-  answer is one of the values you pick, or read with an earlier question's
-  answer already known. A question that is skipped answers `null` and says
-  why.
-
-- **More ways to read.** Several denoising steps with the answer template
-  held in place, a thought written before the answers, and repeated reads
-  that report how much the answer moves between them.
+- **Nemotron speculates on agent traffic** with its DFlash and DSpark
+  drafters, including sampled and tool-calling requests and any number of
+  concurrent requests. On the DGX Spark, tool-carrying sampled requests went
+  from 80 to 118 tokens/s. DSpark, NVIDIA's recommended Spark drafter, is in
+  the catalog.
 
 ## Improved
 
-- **The Reads page keeps its history** in a side panel beside the questions,
-  stored by the manager like conversations, and stays in the sidebar with no
-  model running so earlier reads open any time.
+- **Nemotron decodes long contexts about four times faster** - 12.5 to 49.8
+  tokens/s at 259K.
 
-- **DiffusionGemma's compact build starts on NVIDIA GPUs.**
+- **Long Nemotron agent conversations resume from the cache on every turn.**
+  Past about 140K tokens every turn used to start over from the system
+  prompt.
 
-- **Qwen 3.8 Flash-Next decodes faster,** with and without speculative
-  decoding, and requests that carry tools now speculate too.
-
-- **Paddock's own app icon** in the Studio, the Windows executables and the
-  menu bar.
+- **Bonsai runs faster on the DGX Spark**, with its ternary weights on the
+  tensor cores at every batch size and an fp8 KV cache by default.
 
 ## Fixed
 
-- **Flash-Next greedy decoding with speculation** no longer drifts from the
-  answer it gives without speculation on a small share of requests.
+- **A Qwen 3.8 Flash-Next reply generated while speculating keeps its resume
+  points**, so the next turn picks up at the end of the reply instead of
+  reading the whole reply again.
 
-- **The Studio over the network** opens at the key prompt again instead of
-  reporting that it could not open its saved data.
+- **A vision or drafter file beside the weights is checked against the model
+  before it loads.** A folder several models share no longer hands one model
+  another's file, and a mismatched file named in the configuration is
+  refused with the reason.
+
+- **A `vram_budget` written in GiB instead of MiB is refused** with the value
+  it should have been.
+
+- **Prefill on the DGX Spark** no longer fails for the Qwen 3.5-3.8
+  full-attention layers with an fp8 KV cache.
 
 ## macOS (pre-release)
 
-- DiffusionGemma reads images on Metal.
-- The native Reads page takes pictures by paste and import, keeps its history
-  in the shared database the web Studio uses, and navigates it from the
-  sidebar.
-- Fixes to notification previews and benchmark forms.
+- Laya runs natively on Metal, with the native Reads page.
+- Qwen 3.8 Flash-Next runs faster on Metal and reuses cached prefixes across
+  agent turns.
+- Qwen agent-turn resume points are kept on Metal.
 
 ## Known
 
-- **Laya runs on NVIDIA GPUs only** for now, and reads text only.
+- **Laya reads text only.**
 
 - **Laya's confidence on choices with more than ten options is not
   calibrated:** the English checkpoint ships an out-of-range temperature for

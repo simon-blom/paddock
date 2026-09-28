@@ -49,7 +49,14 @@ __device__ __forceinline__ uint32_t pd_w16_dq2(uint32_t b, uint32_t s2) {
     uint32_t v = __byte_perm(lo, hi, 0x5140);             // {lo0, hi0, lo1, hi1}
     v |= ((b & 0x08u) << 12) | ((b & 0x80u) << 24);      // signs -> bits 15, 31
     uint32_t r;
+#if __CUDA_ARCH__ >= 900
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(v), "r"(s2));
+#else
+    // sm_89 (PD_NV4_OK's floor) has no bf16x2 multiply. An FMA with a -0
+    // addend rounds the same product the same way - rn(a*b + -0) is rn(a*b),
+    // signed zeros included - which is how cuda_bf16's __hmul2 lowers there.
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(v), "r"(s2), "r"(0x80008000u));
+#endif
     return r;
 }
 
