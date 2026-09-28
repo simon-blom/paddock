@@ -1230,38 +1230,19 @@ impl Qwen35TpRank {
                 "span head before any span advance".into(),
             ));
         };
-        self.exec.rmsnorm_batch(
+        crate::tp::traversal::span_head_normalize_project(
+            &self.exec,
             &planes.act.x,
-            &self.out_norm.buf,
             &mut planes.act.xn,
+            &mut planes.act.x_last,
+            &self.out_norm.buf,
+            &self.output,
+            &mut self.logits,
             self.hidden,
             self.eps,
             rows,
-        )?;
-        super::tp_trace::trace_row(
-            &self.exec,
-            "b.final-norm",
-            0,
-            &planes.act.xn,
-            0,
-            self.hidden,
-        )?;
-        // Head GEMV on the LAST row only: copy the final normalized row into
-        // the one-row staging plane (gemv_any takes a whole `&CudaSlice`, not
-        // an offset view) and project that.
-        self.exec.copy_region(
-            &planes.act.xn,
-            (rows - 1) * self.hidden,
-            &mut planes.act.x_last,
-            0,
-            self.hidden,
-        )?;
-        gemv_any(
-            &self.exec,
-            &self.output,
-            &planes.act.x_last,
-            &mut self.logits,
-        )?;
+        )
+        .map_err(Qwen35TpError::from)?;
         Ok(())
     }
 
@@ -1298,14 +1279,16 @@ impl Qwen35TpRank {
                 0,
                 self.hidden,
             )?;
-            self.exec.rmsnorm_batch(
+            crate::tp::traversal::span_normalize(
+                &self.exec,
                 &planes.act.x,
-                &layer_data.attn_norm.buf,
                 &mut planes.act.xn,
+                &layer_data.attn_norm.buf,
                 self.hidden,
                 self.eps,
                 rows,
-            )?;
+            )
+            .map_err(Qwen35TpError::from)?;
             super::tp_trace::trace_row(
                 &self.exec,
                 "b.post-norm",
@@ -1354,11 +1337,14 @@ impl Qwen35TpRank {
                 0,
                 self.hidden,
             )?;
-            // The reduced span planes carry live data in their first
-            // rows*hidden elements, so a flat elementwise add covers the
-            // batch (row-wise residual without a row-broadcast kernel).
-            self.exec
-                .add(&mut planes.act.x, mixed_rows, rows * self.hidden)?;
+            crate::tp::traversal::span_accumulate(
+                &self.exec,
+                &mut planes.act.x,
+                mixed_rows,
+                self.hidden,
+                rows,
+            )
+            .map_err(Qwen35TpError::from)?;
             super::tp_trace::trace_row(
                 &self.exec,
                 "b.post-mixer",
@@ -1367,14 +1353,16 @@ impl Qwen35TpRank {
                 0,
                 self.hidden,
             )?;
-            self.exec.rmsnorm_batch(
+            crate::tp::traversal::span_normalize(
+                &self.exec,
                 &planes.act.x,
-                &layer_data.post_norm.buf,
                 &mut planes.act.xn,
+                &layer_data.post_norm.buf,
                 self.hidden,
                 self.eps,
                 rows,
-            )?;
+            )
+            .map_err(Qwen35TpError::from)?;
             super::tp_trace::trace_row(
                 &self.exec,
                 "b.ffn-norm",
@@ -1400,16 +1388,15 @@ impl Qwen35TpRank {
                     profile.as_mut(),
                 )?
             };
-            super::tp_trace::trace_row(
+            super::tp_trace::trace_row(&self.exec, "b.ffn-out", layer, ffn_rows, 0, self.hidden)?;
+            crate::tp::traversal::span_accumulate(
                 &self.exec,
-                "b.ffn-out",
-                layer,
+                &mut planes.act.x,
                 ffn_rows,
-                0,
                 self.hidden,
-            )?;
-            self.exec
-                .add(&mut planes.act.x, ffn_rows, rows * self.hidden)?;
+                rows,
+            )
+            .map_err(Qwen35TpError::from)?;
             super::tp_trace::trace_row(
                 &self.exec,
                 "b.layer-out",

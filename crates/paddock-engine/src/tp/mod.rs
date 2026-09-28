@@ -11,6 +11,7 @@ pub mod cache;
 pub(crate) mod ffn;
 pub(crate) mod prefill;
 pub(crate) mod state;
+pub(crate) mod traversal;
 
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 
