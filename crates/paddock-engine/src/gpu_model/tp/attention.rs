@@ -4,7 +4,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::distributed::{CollectiveError, Communicator};
-use crate::gpu::{GpuError, GpuExecutor, QuantW};
+use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
 use crate::gpu_model::tp::cache::MirroredKv;
 use crate::kv_pool::BLOCK_TOKENS;
 
@@ -208,6 +208,125 @@ fn paged_slot_upload(
     Ok(Some((live, version)))
 }
 
+/// Default paged GQA decode: split partial+combine when the model's policy
+/// requests multiple fixed splits, otherwise use the single-pass kernel.
+/// Models own split-count policy and may override this dispatch entirely.
+/// The split count must remain constant across graph replays.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_paged(
+    exec: &GpuExecutor,
+    q: &CudaSlice<f32>,
+    kc: &CudaSlice<u8>,
+    vc: &CudaSlice<u8>,
+    sinks: &CudaSlice<f32>,
+    attn_o: &mut CudaSlice<f32>,
+    attn_ml: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    positions: &CudaSlice<u32>,
+    slots: Option<&CudaSlice<u32>>,
+    block_tables: &CudaSlice<u32>,
+    blocks_per_slot: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    batch: usize,
+    scale: f32,
+    dtype: KvDtype,
+    n_splits: usize,
+) -> Result<(), AttentionTpError> {
+    if n_splits == 0 || n_heads == 0 || batch == 0 {
+        return Err(AttentionTpError::Shape(
+            "empty attention decode geometry".into(),
+        ));
+    }
+    if n_splits > 1 {
+        validate_decode_scratch(
+            n_heads,
+            batch,
+            head_dim,
+            n_splits,
+            attn_o.len(),
+            attn_ml.len(),
+        )?;
+        if !exec.has_attn_partial_batch_paged() {
+            return Err(AttentionTpError::Gpu(GpuError::Unsupported(
+                "pack lacks the paged attention split-partial kernel".into(),
+            )));
+        }
+        exec.attn_partial_batch_paged(
+            q,
+            kc,
+            vc,
+            attn_o,
+            attn_ml,
+            positions,
+            slots,
+            block_tables,
+            blocks_per_slot,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            0,
+            n_splits,
+            batch,
+            scale,
+            dtype,
+        )?;
+        exec.attn_combine_batch(
+            attn_o, attn_ml, sinks, out, n_heads, head_dim, n_splits, batch,
+        )?;
+    } else {
+        exec.attn_decode_batch_paged(
+            q,
+            kc,
+            vc,
+            sinks,
+            out,
+            positions,
+            slots,
+            block_tables,
+            blocks_per_slot,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            0,
+            batch,
+            scale,
+            dtype,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_decode_scratch(
+    n_heads: usize,
+    batch: usize,
+    head_dim: usize,
+    n_splits: usize,
+    attn_o_len: usize,
+    attn_ml_len: usize,
+) -> Result<(), AttentionTpError> {
+    let partials = n_heads
+        .checked_mul(batch)
+        .and_then(|n| n.checked_mul(n_splits))
+        .ok_or_else(|| AttentionTpError::Shape("attention split count overflow".into()))?;
+    let out_len = partials
+        .checked_mul(head_dim)
+        .ok_or_else(|| AttentionTpError::Shape("attention split output overflow".into()))?;
+    let ml_len = partials
+        .checked_mul(2)
+        .ok_or_else(|| AttentionTpError::Shape("attention split metadata overflow".into()))?;
+    if attn_o_len < out_len || attn_ml_len < ml_len {
+        return Err(AttentionTpError::Shape(
+            "attention split scratch too small".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Complete a row-parallel attention output projection.
 pub fn reduce_output<C, S, R>(
     exec: &GpuExecutor,
@@ -284,6 +403,16 @@ impl GqaPartition {
 mod tests {
     use super::*;
     use crate::gpu_model::tp::cache::Operation;
+
+    #[test]
+    fn decode_split_scratch_covers_local_heads_and_batch() {
+        let partials = 3 * 5;
+        assert!(validate_decode_scratch(3, 1, 64, 5, partials * 64, partials * 2).is_ok());
+        assert!(validate_decode_scratch(3, 1, 64, 5, partials * 64 - 1, partials * 2).is_err());
+        assert!(validate_decode_scratch(3, 1, 64, 5, partials * 64, partials * 2 - 1).is_err());
+        assert!(validate_decode_scratch(3, 2, 64, 5, partials * 64, partials * 2).is_err());
+        assert!(validate_decode_scratch(usize::MAX, 2, 64, 5, usize::MAX, usize::MAX).is_err());
+    }
 
     #[test]
     fn paged_upload_tracks_slot_mapping_not_decode_position() {

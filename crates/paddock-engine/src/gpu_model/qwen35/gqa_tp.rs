@@ -8,7 +8,7 @@ use cudarc::driver::CudaSlice;
 use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, read_sections};
+use super::ops::{gemv_any, prefill_attn, read_sections};
 use crate::gpu_model::tp::cache::MirroredKv;
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
@@ -16,8 +16,8 @@ use crate::gpu::{GpuError, GpuExecutor, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
 use crate::gpu_model::tp::attention::{
-    AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition, PagedAttentionTable,
-    reduce_output,
+    decode_paged, AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition,
+    PagedAttentionTable, reduce_output,
 };
 use crate::gpu_model::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
@@ -511,7 +511,10 @@ impl GqaTpRank {
                 1,
                 self.dtype,
             )?;
-            attn_decode_dispatch(
+            // TP's one-row path cannot reach Qwen's eight-row TC5 override.
+            // Keep Qwen's measured split policy; generic TP owns the paged
+            // partial/combine and single-pass kernel execution.
+            decode_paged(
                 e,
                 &self.qn,
                 &self.kc,
@@ -522,15 +525,16 @@ impl GqaTpRank {
                 &mut self.attn,
                 &self.positions,
                 Some(&self.slots),
+                bt,
+                blocks_per_slot,
                 g.local_heads,
                 g.local_kv_heads,
                 g.head_dim,
-                self.max_ctx,
                 g.kv_dim(),
                 1,
                 1.0 / (g.head_dim as f32).sqrt(),
                 self.dtype,
-                Some((bt, blocks_per_slot)),
+                super::attn_splits(g.local_heads, 1, e.sm_count()),
             )?;
         } else {
             e.kv_append_batch(
