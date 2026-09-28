@@ -90,29 +90,29 @@ pub struct Cli {
     pub device: Option<String>,
     /// Which GPU to serve on: a CUDA ordinal ("1") or a device UUID
     /// ("GPU-..." as nvidia-smi prints it; a unique prefix is enough).
-    /// In a TP=2 pair this selects the rank-0 coordinator's device only;
-    /// the rank-1 worker always uses GPU ordinal 0 on its own node.
+    /// For a TP coordinator this selects rank 0's device. Explicit workers
+    /// may select their own numeric local GPU ordinal independently.
     #[arg(long, value_name = "ID")]
     pub gpu: Option<String>,
-    /// Tensor-parallel world size (1 or 2). 2 starts this process as the
-    /// rank-0 coordinator and spawns (or waits for) a rank-1 worker.
+    /// Tensor-parallel world size. Rank 0 is the coordinator; nonzero ranks
+    /// are workers. Model geometry may reject world sizes it cannot shard.
     #[arg(long, value_name = "N")]
     pub tp_size: Option<usize>,
-    /// This process's tensor-parallel rank (0 = coordinator, 1 = worker).
-    /// Rank 1 starts in worker mode and serves no API of its own; it is
+    /// This process's tensor-parallel rank (0 = coordinator, nonzero = worker).
+    /// Worker ranks serve no API of their own and are
     /// normally set by the coordinator's spawned child, not by hand.
     #[arg(long, value_name = "RANK")]
     pub tp_rank: Option<usize>,
     /// Rank-0 control-plane address: bind target for rank 0, dial target
-    /// for rank 1 (the other node's IP on the RoCE fabric).
+    /// for every worker. Transport may be local TCP or a network fabric.
     #[arg(long, value_name = "ADDR")]
     pub tp_master_addr: Option<String>,
     /// Rank-0 control-plane TCP port (default 11560).
     #[arg(long, value_name = "PORT")]
     pub tp_master_port: Option<u16>,
-    /// Explicit worker mode: start this process as the rank-1 TP worker of a
-    /// two-node pair, mirroring a coordinator started separately (e.g. via
-    /// SSH on the other node). Takes the rank-0 address/port from
+    /// Explicit worker mode: start this process as one nonzero TP rank.
+    /// Takes world/rank from --tp-size/--tp-rank (defaults 2/1 for backward
+    /// compatibility) and the rank-0 address/port from
     /// `--tp-master-addr`/`--tp-master-port` (or the `PADDOCK_TP_*` env
     /// equivalents), the model and CUDA pack from `--model`/`--kernel-pack`
     /// (or `PADDOCK_TP_MODEL`/`PADDOCK_TP_PACK`). Serves no API.
@@ -854,15 +854,15 @@ pub fn capabilities() -> String {
     .to_string()
 }
 
-/// Pure TP=2 configuration gate, split from `run` so the accepted and refused
+/// Pure TP configuration gate, split from `run` so the accepted and refused
 /// combinations are host-testable (I1: speculation + `fp8_e4m3` KV is an
 /// accepted combination - the spec path runs the resolved-dtype KV ops with no
 /// F16-only assumption; its combined-path target validation is tracked in
 /// docs/tp/upstream-readiness-review.md).
-fn tp2_config_supported(cfg: &Config) -> bool {
+fn tp_config_supported(cfg: &Config) -> bool {
     cfg.device == "cuda"
         && (1..=2).contains(&cfg.max_batch)
-        // TP=2 now has the scheduler-owned n-gram speculative path;
+        // TP now has the scheduler-owned n-gram speculative path;
         // require an explicit policy so an unsupported/default lane cannot
         // silently change topology. `--spec on` is the bring-up spelling.
         && (cfg.no_spec || cfg.spec.as_deref() == Some("off") || cfg.spec.is_some())
@@ -883,12 +883,13 @@ fn tp_worker_runtime(
     resolved: &paddock_dist::config::Resolved,
     model: &std::path::Path,
     pack: &std::path::Path,
+    gpu: usize,
 ) -> std::process::ExitCode {
     match paddock_dist::worker::connect_worker(resolved)
         .map_err(|e| e.to_string())
         .and_then(|(stream, _)| {
             paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
-                stream, resolved, model, pack, 0,
+                stream, resolved, model, pack, gpu,
             )
         }) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -970,23 +971,23 @@ pub fn run() -> std::process::ExitCode {
                 .and_then(|v| v.parse().ok()),
         );
         // serving_mode = false: this process was spawned as a worker child,
-        // which is the one legitimate way to be rank 1.
+        // which is a legitimate worker process.
         match tp.resolved(false) {
             Ok(Some(r)) if r.is_worker() => {
                 let model = std::env::var_os("PADDOCK_TP_MODEL");
                 let pack = std::env::var_os("PADDOCK_TP_PACK");
                 let (Some(model), Some(pack)) = (model, pack) else {
-                    eprintln!("TP rank 1 requires PADDOCK_TP_MODEL and PADDOCK_TP_PACK paths");
+                    eprintln!("TP worker requires PADDOCK_TP_MODEL and PADDOCK_TP_PACK paths");
                     return std::process::ExitCode::from(2);
                 };
                 let model = std::path::PathBuf::from(model);
                 let pack = std::path::PathBuf::from(pack);
-                return tp_worker_runtime(&r, &model, &pack);
+                return tp_worker_runtime(&r, &model, &pack, 0);
             }
             _ => {
                 eprintln!(
                     "config error: PADDOCK_TP_WORKER_CHILD is set but the rank env is not a \
-                     valid rank-1 worker configuration - refusing to serve as a fallback"
+                     valid worker configuration - refusing to serve as a fallback"
                 );
                 return std::process::ExitCode::from(2);
             }
@@ -995,7 +996,7 @@ pub fn run() -> std::process::ExitCode {
 
     // --- Tensor-parallel worker, explicit operator mode ---------------------
     //
-    // `--tp-worker` is the supported way to start rank 1 by hand on a second
+    // `--tp-worker` is the supported way to start worker rank by hand on a second
     // node (e.g. over SSH) while the coordinator is started separately on the
     // first. Same worker core as the spawned child above; configuration comes
     // from the ordinary CLI/env surface instead of the coordinator's private
@@ -1003,23 +1004,24 @@ pub fn run() -> std::process::ExitCode {
     // spawn-only. serving_mode = false: this process serves no API.
     if cli.tp_worker {
         paddock_admin::logging::init(None);
-        // The worker always serves from GPU ordinal 0 on its own node; a
-        // --gpu value here would be silently ignored, so refuse it instead
-        // (no-silent-failures). Per-rank GPU selection is future work.
-        if cli.gpu.is_some() {
-            eprintln!(
-                "config error: --gpu does not apply to --tp-worker: the rank-1 worker \
-                 always uses GPU ordinal 0 on its own node"
-            );
+        let worker_gpu = match cli.gpu.as_deref() {
+            None => 0usize,
+            Some(value) => match value.parse::<usize>() {
+                Ok(gpu) => gpu,
+                Err(_) => {
+                    eprintln!(
+                        "config error: --tp-worker currently requires --gpu to be a numeric local ordinal"
+                    );
+                    return std::process::ExitCode::from(2);
+                }
+            },
+        };
+        let worker_tp_size = cli.tp_size.unwrap_or(2);
+        let worker_rank = cli.tp_rank.unwrap_or(1);
+        if worker_rank == 0 {
+            eprintln!("config error: --tp-worker requires a nonzero --tp-rank");
             return std::process::ExitCode::from(2);
         }
-        // `--tp-worker` MEANS rank 1 of 2: the role is forced, not inferred,
-        // so `--tp-rank 0 --tp-worker` cannot resolve into a coordinator.
-        // Only the dial target stays operator-configured: CLI first, then
-        // the documented PADDOCK_TP_MASTER_ADDR/PADDOCK_TP_MASTER_PORT env
-        // fallback (the same surface the spawned child reads; both names
-        // are ENV_SURFACE-registered, so hardened seals keep them). A bad
-        // env port fails here, before any dial.
         let (dial_addr, dial_port) = match paddock_dist::config::resolve_worker_dial(
             cli.tp_master_addr.clone(),
             cli.tp_master_port,
@@ -1033,8 +1035,8 @@ pub fn run() -> std::process::ExitCode {
             }
         };
         let tp = paddock_dist::config::ParallelConfig {
-            tp_size: Some(2),
-            rank: Some(1),
+            tp_size: Some(worker_tp_size),
+            rank: Some(worker_rank),
             master_addr: dial_addr,
             master_port: dial_port,
         };
@@ -1042,7 +1044,7 @@ pub fn run() -> std::process::ExitCode {
             Ok(Some(r)) if r.is_worker() => {
                 // Inputs may come from the ordinary CLI flags or, for parity
                 // with the spawn path, the TP env fallbacks. Rank/world are
-                // forced: `--tp-worker` MEANS rank 1 of 2.
+                // forced: `--tp-worker` MEANS the requested nonzero rank/world.
                 let model = cli
                     .model
                     .clone()
@@ -1070,11 +1072,11 @@ pub fn run() -> std::process::ExitCode {
                     eprintln!("--tp-worker kernel pack not found: {}", pack.display());
                     return std::process::ExitCode::from(2);
                 }
-                return tp_worker_runtime(&r, &model, &pack);
+                return tp_worker_runtime(&r, &model, &pack, worker_gpu);
             }
             Ok(Some(_)) => {
                 eprintln!(
-                    "config error: --tp-worker selects the rank-1 worker role; refusing to \
+                    "config error: --tp-worker selects the worker role; refusing to \
                      serve an API from a worker process"
                 );
                 return std::process::ExitCode::from(2);
@@ -1082,7 +1084,7 @@ pub fn run() -> std::process::ExitCode {
             Ok(None) => {
                 eprintln!(
                     "config error: --tp-worker needs the coordinator's address: \
-                     --tp-master-addr <coordinator IP on the RoCE fabric> (and \
+                     --tp-master-addr <coordinator IP or hostname> (and \
                      --tp-master-port if not the default)"
                 );
                 return std::process::ExitCode::from(2);
@@ -1150,19 +1152,30 @@ pub fn run() -> std::process::ExitCode {
         // resolved against THIS device engine-side (rank 0 demotes loudly to
         // f16 below sm_89, exactly like the TP=1 apply_kv_dtype path, and the
         // resolved value rides TpInit so both ranks load the same width).
-        if !tp2_config_supported(&cfg) {
+        if !tp_config_supported(&cfg) {
             eprintln!(
-                "TP=2 requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec/--spec off, or explicit --spec policy, KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
+                "TP requires an explicit pinned GGUF and CUDA pack, cuda, max_batch=1 or 2, --no-spec/--spec off, or explicit --spec policy, KV dtype auto/f16/fp8_e4m3, and no vision/companions/offload"
             );
             return std::process::ExitCode::from(2);
         }
         // PADDOCK_TP_NO_SPAWN is a dev/ops knob (dev builds only: the
         // hardened seal removes it) that skips the local child spawn so a
         // two-node start can wait for an SSH-started worker.
-        let spawn_worker = std::env::var_os("PADDOCK_TP_NO_SPAWN").is_none();
+        // Automatic local placement is retained only for the legacy TP=2
+        // path. Larger worlds require explicit worker processes so each rank
+        // can choose its local GPU independently; topology must not imply
+        // physical device placement.
+        let spawn_workers = resolved.tp_size == 2
+            && std::env::var_os("PADDOCK_TP_NO_SPAWN").is_none();
+        if resolved.tp_size > 2 && std::env::var_os("PADDOCK_TP_NO_SPAWN").is_none() {
+            tracing::info!(
+                tp_size = resolved.tp_size,
+                "TP>2 uses explicit worker placement; start ranks 1..N-1 separately"
+            );
+        }
         match paddock_dist::worker::coordinate_and_store(
             &resolved,
-            spawn_worker,
+            spawn_workers,
             cfg.model.as_deref(),
             cfg.kernel_pack.as_deref(),
         ) {
@@ -1422,18 +1435,18 @@ mod tests {
         gate_cli_with_model(extra, &gguf.to_string_lossy())
     }
 
-    /// The baseline accepted TP=2 lane (F16, no spec).
+    /// The baseline accepted TP lane (F16, no spec).
     #[test]
     fn tp2_gate_accepts_the_baseline_lane() {
         let cfg = gate_cli(&["--no-spec", "--max-batch", "1"]);
-        assert!(tp2_config_supported(&cfg));
+        assert!(tp_config_supported(&cfg));
     }
 
-    /// Speculation is a valid TP=2 lane with an explicit policy (Phase 15).
+    /// Speculation is a valid TP lane with an explicit policy (Phase 15).
     #[test]
     fn tp2_gate_accepts_spec_with_f16() {
         let cfg = gate_cli(&["--spec", "on", "--max-batch", "2"]);
-        assert!(tp2_config_supported(&cfg));
+        assert!(tp_config_supported(&cfg));
     }
 
     /// I1: speculation + fp8_e4m3 KV is an accepted combination, not a
@@ -1449,7 +1462,7 @@ mod tests {
             "--max-batch",
             "1",
         ]);
-        assert!(tp2_config_supported(&cfg));
+        assert!(tp_config_supported(&cfg));
     }
 
     /// fp8 KV alone stays accepted on the non-spec lane (Phase 12).
@@ -1462,7 +1475,7 @@ mod tests {
             "--max-batch",
             "1",
         ]);
-        assert!(tp2_config_supported(&cfg));
+        assert!(tp_config_supported(&cfg));
     }
 
     /// Unsupported combinations still fail closed, by name.
@@ -1470,9 +1483,9 @@ mod tests {
     fn tp2_gate_refuses_offload_and_missing_files() {
         let mut cfg = gate_cli(&["--no-spec", "--max-batch", "1"]);
         cfg.kv_offload.enabled = true;
-        assert!(!tp2_config_supported(&cfg));
+        assert!(!tp_config_supported(&cfg));
         let cfg = gate_cli(&["--no-spec", "--max-batch", "1", "--gpu", "0"]);
-        assert!(tp2_config_supported(&cfg), "--gpu alone must not refuse");
+        assert!(tp_config_supported(&cfg), "--gpu alone must not refuse");
     }
 
     /// A model path that does not exist refuses (the gate checks file
@@ -1485,6 +1498,6 @@ mod tests {
             &["--no-spec", "--max-batch", "1"],
             &missing.to_string_lossy(),
         );
-        assert!(!tp2_config_supported(&cfg));
+        assert!(!tp_config_supported(&cfg));
     }
 }

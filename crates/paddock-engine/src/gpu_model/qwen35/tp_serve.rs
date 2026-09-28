@@ -1,5 +1,5 @@
-//! Rank-0-authoritative TP=2 serving over the distributed control channel.
-//! The production scheduler owns rank 0's dense slot plan; rank 1 replays the
+//! Rank-0-authoritative tensor-parallel serving over distributed worker channels.
+//! The production scheduler owns rank 0's dense slot plan; worker rank replays the
 //! ordered live rows and mirrored KV operations. Decode runs eager per row;
 //! contiguous prompt rows use bounded batched spans.
 use std::{
@@ -17,7 +17,7 @@ use paddock_dist::{
     protocol::{
         ControlMessage, TpSpanFinisherPlan, receive_nccl_id, send_nccl_id,
     },
-    worker::shutdown_worker,
+    worker::{shutdown_worker, WorkerControl},
 };
 use paddock_models::mapped::MappedGguf;
 
@@ -37,8 +37,8 @@ const PINNED_SHA256: &str = "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The wire spelling of a KV dtype, shared by both ranks (Phase 12). Rank 0
-/// resolves the runner's dtype gate and sends the resolved value; rank 1
+/// The wire spelling of a KV dtype, shared by all ranks (Phase 12). Rank 0
+/// resolves the runner's dtype gate and sends the resolved value; worker rank
 /// parses the same string. Only the two dtypes the TP GQA path implements
 /// exist - anything else fails closed at both ends before any allocation.
 pub(super) fn kv_dtype_wire(dtype: KvDtype) -> &'static str {
@@ -60,7 +60,7 @@ pub(super) fn kv_dtype_parse(wire: &str) -> Result<KvDtype, String> {
 
 /// The KV dtype this serve runs. Rank 0 resolves it against the device's
 /// compute capability (the same sm_89 rule the runner's `apply_kv_dtype`
-/// applies for TP=1) and SENDS the resolved value; rank 1 parses what
+/// applies for TP=1) and SENDS the resolved value; worker rank parses what
 /// arrives. The ranks can therefore never disagree, which is what the old
 /// hardcoded `KvDtype::Fp16` pair silently guaranteed - and what an fp8 KV
 /// serve must keep guaranteeing before either rank allocates.
@@ -85,7 +85,7 @@ fn kv_dtype_from_env(env: Option<&str>, cc: (u32, u32)) -> KvDtype {
         Some("fp8_e4m3") => {
             if let Some(why) = paddock_models::gpu_support::fp8_kv_blocked(cc) {
                 tracing::error!(
-                    "kv cache: TP=2 asked for fp8_e4m3, but {why} (this GPU is sm_{:#02}{:#02}). \
+                    "kv cache: TP asked for fp8_e4m3, but {why} (this GPU is sm_{:#02}{:#02}). \
                      Serving f16 instead. The KV pool is twice the size it would have been - \
                      lower max_ctx if the server no longer fits.",
                     cc.0,
@@ -118,7 +118,7 @@ fn hashes(model: &Path, pack: &Path) -> Result<(String, String), String> {
     let checkpoint: String = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if checkpoint != PINNED_SHA256 {
         return Err(format!(
-            "TP=2 serving requires the pinned Qwen3.8 GGUF with SHA-256 {PINNED_SHA256}, got {checkpoint}"
+            "TP serving requires the pinned Qwen3.8 GGUF with SHA-256 {PINNED_SHA256}, got {checkpoint}"
         ));
     }
     let mut file = std::fs::File::open(pack).map_err(|e| format!("CUDA pack open: {e}"))?;
@@ -140,7 +140,7 @@ fn ready(stream: &mut TcpStream, sequence: u64) -> Result<(), String> {
         ControlMessage::TpReady { sequence: got } if got == sequence => Ok(()),
         ControlMessage::TpError { reason } | ControlMessage::Reject { reason } => Err(reason),
         other => Err(format!(
-            "rank 1 reply out of order (expected {sequence}): {other:?}"
+            "worker reply out of order (expected {sequence}): {other:?}"
         )),
     }
 }
@@ -149,7 +149,92 @@ fn prepared(stream: &mut TcpStream, sequence: u64) -> Result<(), String> {
     match ControlMessage::from_stream(stream).map_err(|e| e.to_string())? {
         ControlMessage::TpPrepared { sequence: got } if got == sequence => Ok(()),
         ControlMessage::TpError { reason } | ControlMessage::Reject { reason } => Err(reason),
-        other => Err(format!("rank 1 did not prepare step {sequence}: {other:?}")),
+        other => Err(format!("worker did not prepare step {sequence}: {other:?}")),
+    }
+}
+
+
+/// Rank-sorted control channels for every nonzero TP rank.
+struct WorkerSet {
+    controls: Vec<WorkerControl>,
+}
+
+impl WorkerSet {
+    fn new(mut controls: Vec<WorkerControl>, resolved: &Resolved) -> Result<Self, String> {
+        controls.sort_by_key(|worker| worker.rank);
+        let expected: Vec<usize> = (1..resolved.tp_size).collect();
+        let actual: Vec<usize> = controls.iter().map(|worker| worker.rank).collect();
+        if actual != expected {
+            return Err(format!(
+                "TP worker set mismatch: expected ranks {expected:?}, got {actual:?}"
+            ));
+        }
+        for worker in &mut controls {
+            worker
+                .stream
+                .set_read_timeout(Some(READY_TIMEOUT))
+                .map_err(|e| format!("rank {} read timeout: {e}", worker.rank))?;
+            worker
+                .stream
+                .set_write_timeout(Some(STEP_TIMEOUT))
+                .map_err(|e| format!("rank {} write timeout: {e}", worker.rank))?;
+        }
+        Ok(Self { controls })
+    }
+
+    fn set_step_timeouts(&mut self) -> Result<(), String> {
+        for worker in &mut self.controls {
+            worker
+                .stream
+                .set_read_timeout(Some(STEP_TIMEOUT))
+                .map_err(|e| format!("rank {} step read timeout: {e}", worker.rank))?;
+        }
+        Ok(())
+    }
+
+    fn broadcast(&mut self, msg: &ControlMessage) -> Result<(), String> {
+        for worker in &mut self.controls {
+            msg.to_stream(&mut worker.stream)
+                .map_err(|e| format!("rank {} control send: {e}", worker.rank))?;
+        }
+        Ok(())
+    }
+
+    fn ready(&mut self, sequence: u64) -> Result<(), String> {
+        for worker in &mut self.controls {
+            ready(&mut worker.stream, sequence)
+                .map_err(|e| format!("rank {}: {e}", worker.rank))?;
+        }
+        Ok(())
+    }
+
+    fn prepared(&mut self, sequence: u64) -> Result<(), String> {
+        for worker in &mut self.controls {
+            prepared(&mut worker.stream, sequence)
+                .map_err(|e| format!("rank {}: {e}", worker.rank))?;
+        }
+        Ok(())
+    }
+
+    fn send_nccl_id(&mut self, id: &[u8; paddock_dist::protocol::NCCL_ID_BYTES]) -> Result<(), String> {
+        for worker in &mut self.controls {
+            send_nccl_id(&mut worker.stream, id)
+                .map_err(|e| format!("rank {} NCCL id send: {e}", worker.rank))?;
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self, graceful: bool) -> Result<(), String> {
+        let mut first = None;
+        for worker in &mut self.controls {
+            if let Err(e) = shutdown_worker(&mut worker.stream, graceful) {
+                first.get_or_insert_with(|| format!("rank {} shutdown: {e}", worker.rank));
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -235,7 +320,7 @@ fn span_checkpoint_points_at(start: usize, len: usize, cuts: &[(usize, u32)], ca
     Ok(points)
 }
 
-/// Production chunkers read the resolved rank-symmetric cap. Both ranks
+/// Production chunkers read the resolved rank-symmetric cap. All ranks
 /// derive identical geometry from the identical resolution.
 fn span_chunk_points(len: usize) -> Vec<usize> {
     span_chunk_points_at(len, tp_span_cap())
@@ -385,7 +470,7 @@ fn reserve_cold_mixed_cuts(
 /// lands EXACTLY on (span end == cut): a checkpoint may be snapshotted only
 /// there, because the slot's live DeltaNet state is exactly the state after
 /// row `cut - 1` - the state matching KV pages `[0, cut)`. Pure, shared by
-/// both ranks' snapshot discipline.
+/// all ranks' snapshot discipline.
 fn tp_cuts_in_run(cuts: &[(usize, u32)], span_start: usize, rows: usize) -> Vec<(usize, u32)> {
     let end = span_start.saturating_add(rows);
     cuts.iter().filter(|&&(cut, _)| cut > span_start && cut <= end).copied().collect()
@@ -417,7 +502,7 @@ struct PipeFlight {
 
 /// Runs on the production engine thread; owns the control stream until drop.
 pub struct TpCoordinator {
-    stream: TcpStream,
+    workers: WorkerSet,
     group: NcclCommunicator,
     model: Qwen35TpRank,
     logical: MirroredKv,
@@ -514,7 +599,7 @@ fn wire_kv_state(value: serde_json::Value) -> Result<Snapshot, String> {
 
 /// Engine `DevicePlan` -> wire plan. Unsupported plans fail closed before
 /// any KV authorization or worker message. The reverse conversion does not
-/// exist: rank 1 never samples (the finisher sampler has no collectives and
+/// exist: worker rank never samples (the finisher sampler has no collectives and
 /// runs only on rank 0), it only reads the finisher slot ids to promote
 /// lane-local state.
 fn wire_finisher_plan(
@@ -556,7 +641,7 @@ fn mapped_pipe_plans(
 
 impl TpCoordinator {
     pub fn load(
-        mut stream: TcpStream,
+        workers: Vec<WorkerControl>,
         resolved: &Resolved,
         model: &Path,
         pack: &Path,
@@ -566,29 +651,28 @@ impl TpCoordinator {
         span_done: Arc<std::sync::atomic::AtomicBool>,
         slot_reused: Arc<std::sync::Mutex<Vec<usize>>>,
     ) -> Result<Self, String> {
-        if !resolved.is_coordinator() || max_ctx == 0 || !(1..=2).contains(&slots) {
+        if !resolved.is_coordinator()
+            || resolved.tp_size < 2
+            || max_ctx == 0
+            || !(1..=2).contains(&slots)
+        {
             return Err(
-                "TP=2 serving requires the rank-0 coordinator and a nonzero context".into(),
+                "TP serving requires the rank-0 coordinator, tp_size>=2 and a nonzero context".into(),
             );
         }
-        stream
-            .set_read_timeout(Some(READY_TIMEOUT))
-            .map_err(|e| e.to_string())?;
-        stream
-            .set_write_timeout(Some(STEP_TIMEOUT))
-            .map_err(|e| e.to_string())?;
+        let mut workers = WorkerSet::new(workers, resolved)?;
         // Phase 12 fp8 KV gate, rank-0-authoritative like everything else
         // here: the executor exists before any wire traffic, so ask THIS
         // device the same question the TP=1 apply_kv_dtype path asks. A
         // below-sm_89 card demotes LOUDLY to f16 (the fp8 ask doubles the KV
         // pool; the serve must stay attributable), and the demoted value is
-        // what TpInit carries - rank 1 never has to know the runner's env.
+        // what TpInit carries - worker rank never has to know the runner's env.
         let exec = Arc::new(GpuExecutor::new(gpu, pack).map_err(|e| e.to_string())?);
         let kv_dtype = kv_dtype_serve(exec.compute_capability());
         // Graph mode is rank-0-authoritative too (upstream-readiness I4):
         // the resolved value rides TpInit, so a hand-started remote worker
         // cannot disagree with the coordinator's env and mispair the
-        // graphed/eager collective sequencing. Both ranks then convert the
+        // graphed/eager collective sequencing. All ranks then convert the
         // decision into model state via enable_tp_graphs; execution reads
         // that state, never the environment.
         let use_graphs = Qwen35TpRank::resolve_graph_mode_for_serve();
@@ -601,7 +685,7 @@ impl TpCoordinator {
             std::env::var("PADDOCK_TP_SPAN_CAP").ok().as_deref(),
         )
         .map_err(|e| e.to_string())?;
-        ControlMessage::TpInit {
+        workers.broadcast(&ControlMessage::TpInit {
             checkpoint_sha256,
             pack_blake3,
             max_ctx,
@@ -610,13 +694,11 @@ impl TpCoordinator {
             use_graphs,
             ckpt_slots,
             span_cap,
-        }
-        .to_stream(&mut stream)
-        .map_err(|e| e.to_string())?;
-        // Rank 1 checks identity before NCCL is initialized.
-        ready(&mut stream, 0)?;
+        })?;
+        // Every worker checks identity before NCCL is initialized.
+        workers.ready(0)?;
         let id = create_unique_id().map_err(|e| e.to_string())?;
-        send_nccl_id(&mut stream, &id).map_err(|e| e.to_string())?;
+        workers.send_nccl_id(&id)?;
         let group = NcclCommunicator::from_resolved(Some(resolved), exec.stream.context(), id)
             .map_err(|e| e.to_string())?
             .ok_or("TP group absent")?;
@@ -631,7 +713,7 @@ impl TpCoordinator {
             .map_err(|e| e.to_string())?;
         drop(map);
         // The worker enables graphs from the TpInit value (never its own env),
-        // so both ranks run the identical graphed/eager sequencing.
+        // so all ranks run the identical graphed/eager sequencing.
         if use_graphs {
             model
                 .enable_tp_graphs(&group)
@@ -645,12 +727,10 @@ impl TpCoordinator {
             .map_err(|e| e.to_string())?;
         let mut kv = logical(max_ctx, slots)?;
         kv.set_state_capacity(ckpt_slots);
-        ready(&mut stream, 1)?;
-        stream
-            .set_read_timeout(Some(STEP_TIMEOUT))
-            .map_err(|e| e.to_string())?;
+        workers.ready(1)?;
+        workers.set_step_timeouts()?;
         Ok(Self {
-            stream,
+            workers,
             group,
             model,
             logical: kv,
@@ -682,9 +762,9 @@ impl TpCoordinator {
     }
 
     fn exchange(&mut self, msg: ControlMessage) -> Result<(), String> {
-        msg.to_stream(&mut self.stream).map_err(|e| e.to_string())?;
+        self.workers.broadcast(&msg)?;
         self.sequence += 1;
-        ready(&mut self.stream, self.sequence)
+        self.workers.ready(self.sequence)
     }
 
     fn reset_both(&mut self) -> Result<(), String> {
@@ -864,7 +944,7 @@ impl TpCoordinator {
     /// (no head, no readback); when `finisher` is Some the FINAL span adds
     /// the head exactly once - device-sampled or read back per the kind.
     /// The caller has already authorized KV, sent `TpMixed` and consumed
-    /// Prepared; both ranks derive the identical geometry from the shared
+    /// Prepared; all ranks derive the identical geometry from the shared
     /// pure `span_chunk_points` over the same wire rows.
     fn run_chunk_spans(
         &mut self,
@@ -941,7 +1021,7 @@ impl TpCoordinator {
             let kv_state =
                 serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
                     .map_err(|e| e.to_string())?;
-            ControlMessage::TpMixed {
+            self.workers.broadcast(&ControlMessage::TpMixed {
                 sequence: self.sequence + 1,
                 rows: rows.clone(),
                 chunk_rows: rows.len(),
@@ -950,10 +1030,8 @@ impl TpCoordinator {
                 reserve_cuts: Vec::new(),
                 ckpts: Vec::new(),
                 kv_state,
-            }
-            .to_stream(&mut self.stream)
-            .map_err(|e| e.to_string())?;
-            prepared(&mut self.stream, self.sequence + 1)?;
+            })?;
+            self.workers.prepared(self.sequence + 1)?;
             let (_, logits) = self.run_chunk_spans(
                 slot,
                 &rows,
@@ -961,7 +1039,7 @@ impl TpCoordinator {
                 &[],
             )?;
             self.sequence += 1;
-            ready(&mut self.stream, self.sequence)?;
+            self.workers.ready(self.sequence)?;
             self.positions[slot] += stop - start;
             if finishing {
                 last = logits.ok_or("TP serial prefill lost its final logits")?;
@@ -1027,14 +1105,12 @@ impl TpCoordinator {
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPipeBegin {
+        self.workers.broadcast(&ControlMessage::TpPipeBegin {
             sequence: seq,
             rows: rows.clone(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
+        })?;
+        self.workers.prepared(seq)?;
         let mut events = Vec::with_capacity(rows.len());
         for (&(slot, token, position), plan) in rows.iter().zip(devices) {
             let event = self
@@ -1129,14 +1205,12 @@ impl TpCoordinator {
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPipeBegin {
+        self.workers.broadcast(&ControlMessage::TpPipeBegin {
             sequence: seq,
             rows: wire_rows.clone(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
+        })?;
+        self.workers.prepared(seq)?;
         let mut events = Vec::with_capacity(wire_rows.len());
         for (&(slot, token, position), plan) in wire_rows.iter().zip(wire_plans) {
             let event = self
@@ -1186,16 +1260,14 @@ impl TpCoordinator {
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPipeNext {
+        self.workers.broadcast(&ControlMessage::TpPipeNext {
             sequence: seq,
             rows: rows.clone(),
             source_plane,
             next_plane,
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
+        })?;
+        self.workers.prepared(seq)?;
         let mut events = Vec::with_capacity(rows.len());
         for (&(slot, position), plan) in rows.iter().zip(devices) {
             let event = self
@@ -1214,8 +1286,8 @@ impl TpCoordinator {
             events.push((slot, event));
             self.positions[slot] += 1;
         }
-        // Rank 1 has enqueued the next tick before acknowledging the old one.
-        ready(&mut self.stream, self.sequence)?;
+        // Worker ranks has enqueued the next tick before acknowledging the old one.
+        self.workers.ready(self.sequence)?;
         let ids = {
             let old = self.pipe.as_ref().ok_or("TP pipe disappeared")?;
             self.pipe_readback(old, source_plane)?
@@ -1230,11 +1302,9 @@ impl TpCoordinator {
     fn pipe_drain(&mut self) -> Result<Vec<u32>, String> {
         let flight = self.pipe.as_ref().ok_or("TP pipe drain without begin")?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPipeDrain { sequence: seq }
-            .to_stream(&mut self.stream)
-            .map_err(|e| e.to_string())?;
-        ready(&mut self.stream, self.sequence)?;
-        ready(&mut self.stream, seq)?;
+        self.workers.broadcast(&ControlMessage::TpPipeDrain { sequence: seq })?;
+        self.workers.ready(self.sequence)?;
+        self.workers.ready(seq)?;
         let ids = self.pipe_readback(flight, flight.plane)?;
         self.group
             .stream()
@@ -1289,7 +1359,7 @@ impl TpCoordinator {
     /// A mixed tick executes the scheduler's decode rows individually,
     /// followed by one slot's contiguous prompt run as bounded batched spans.
     /// `chunk_take` supplies at most one chunk per tick. The trailing run
-    /// length is sent to rank 1 so both ranks derive the same span geometry.
+    /// length is sent to worker rank so all ranks derive the same span geometry.
     /// Only a finishing chunk produces last-row logits (or a sampled ID);
     /// interior and non-finishing spans advance state without a head.
     /// Decode plans index the compact decode rows, and host rows return in
@@ -1375,7 +1445,7 @@ impl TpCoordinator {
         }
         // Wire order: decode rows first (the scheduler's dec order - its
         // host_rows consumer pops in dec-iteration order), then the chunk
-        // run, whose length rides the message so rank 1 derives the IDENTICAL
+        // run, whose length rides the message so worker rank derives the IDENTICAL
         // batched-span geometry from the shared pure chunker (`chunk_rows`
         // <= one slot's run: chunk_take pops rows of at most one chunk).
         let mut rows: Vec<(usize, u32, usize)> =
@@ -1401,7 +1471,7 @@ impl TpCoordinator {
             .map_err(|e| e.to_string())?;
         // The chunk run's checkpoint cuts: which of the slot's reservations
         // can this tick's span end exactly on. Derived from the slot's
-        // pending-cut map (coordinator-owned, like snapshotted_cuts); rank 1
+        // pending-cut map (coordinator-owned, like snapshotted_cuts); worker rank
         // receives the cut list on the wire and derives the same spans.
         let wire_ckpts: Vec<(usize, u32)> = if chunk_rows.is_empty() {
             Vec::new()
@@ -1416,17 +1486,15 @@ impl TpCoordinator {
                 .unwrap_or_default();
             tp_cuts_in_run(&pending, span_start, span_len)
         };
-        ControlMessage::TpMixed {
+        self.workers.broadcast(&ControlMessage::TpMixed {
             sequence: self.sequence + 1,
             rows: rows.clone(),
             chunk_rows: chunk_rows.len(),
             reserve_cuts,
             ckpts: wire_ckpts.clone(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, self.sequence + 1)?;
+        })?;
+        self.workers.prepared(self.sequence + 1)?;
         let mut step = crate::generator::SampledStep {
             ids: vec![0; dec_n],
             host_rows: Vec::new(),
@@ -1458,7 +1526,7 @@ impl TpCoordinator {
         // only; the FINAL span (the finishing chunk's last span) adds the
         // head once - final norm + LM head on the run's last row - and
         // either samples it on device or reads the logits back. The head
-        // enters no collective, so rank 1 never runs it.
+        // enters no collective, so worker rank never runs it.
         let mut fin_ids = vec![0u32; finishers.len()];
         let mut fin_logits: Vec<Option<Vec<f32>>> = vec![None; finishers.len()];
         // Fail closed: a finisher outside the chunk run could never produce
@@ -1484,7 +1552,7 @@ impl TpCoordinator {
             }
         }
         self.sequence += 1;
-        ready(&mut self.stream, self.sequence)?;
+        self.workers.ready(self.sequence)?;
         record_prefill_rows(&rows, &mut self.positions, &mut self.occupied);
         let mut results = Vec::with_capacity(finishers.len());
         for (fi, fin) in finishers.iter().enumerate() {
@@ -1540,13 +1608,13 @@ impl TpCoordinator {
         // Publish pages, attach snapshotted cuts, recycle the rest. The slot
         // stays LIVE; its table refs drop at the scheduler's release tick,
         // which mirrors the same
-        // logical Release on both ranks).
+        // logical Release on all ranks).
         let ops = tp_publish_ops(slot, &reservations, tokens.clone(), &snapshotted);
         let kv_state =
             serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
                 .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPrefixPublish {
+        self.workers.broadcast(&ControlMessage::TpPrefixPublish {
             sequence: seq,
             slot,
             checkpoints: reservations
@@ -1555,10 +1623,8 @@ impl TpCoordinator {
                 .cloned()
                 .collect(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        ready(&mut self.stream, seq)?;
+        })?;
+        self.workers.ready(seq)?;
         self.sequence = seq;
         self.snapshotted_cuts
             .retain(|(s, _)| *s != slot);
@@ -1650,17 +1716,15 @@ impl TpCoordinator {
         let kv_state = serde_json::to_value(self.logical.snapshot())
             .map_err(|e| e.to_string())?;
         let seq = self.sequence + 1;
-        ControlMessage::TpPrefixAdmit {
+        self.workers.broadcast(&ControlMessage::TpPrefixAdmit {
             sequence: seq,
             slot,
             tokens: tokens.clone(),
             resume,
             cuts: reserved.iter().map(|&(cut, _)| cut).collect(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        ready(&mut self.stream, seq)?;
+        })?;
+        self.workers.ready(seq)?;
         self.sequence = seq;
         // Worker's DeltaNet restore rides the same TpReady as rank 0's: the
         // worker restores AFTER mirroring Admit, before its Ready; rank 0
@@ -1805,7 +1869,7 @@ impl TpCoordinator {
         }
         // Finishers: supported Device -> device-sampled first token; Host or
         // an unsupported plan -> full-logit readback. The wire carries EVERY
-        // finishing chunk (plan or None): rank 1 promotes exactly these
+        // finishing chunk (plan or None): worker rank promotes exactly these
         // slots' lane-local state at the span finish.
         let wire_finishers = finishers
             .iter()
@@ -1833,17 +1897,15 @@ impl TpCoordinator {
         // checkpoints their separate lane-local recurrent state.
         let wire_ckpts: Vec<(usize, u32)> = Vec::new();
         let seq = self.sequence + 1;
-        ControlMessage::TpSpanLaunch {
+        self.workers.broadcast(&ControlMessage::TpSpanLaunch {
             sequence: seq,
             rows: rows.clone(),
             finishers: wire_finishers,
             ckpts: wire_ckpts,
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, seq)?;
-        // Both ranks chunk each contiguous slot run from the same wire
+        })?;
+        self.workers.prepared(seq)?;
+        // All ranks chunk each contiguous slot run from the same wire
         // rows. Only the optional final-run finisher adds a rank-0 head
         // (and device sampling when planned); other spans advance state.
         let mut events = VecDeque::with_capacity(finishers.len());
@@ -1884,7 +1946,7 @@ impl TpCoordinator {
         // The worker sends exactly one tail Ready after enqueuing its rows.
         // Consume it before another command (pipe begin or span finish) can
         // expect its own ACK. This is an enqueue ACK, not a GPU fence.
-        ready(&mut self.stream, seq)?;
+        self.workers.ready(seq)?;
         self.sequence = seq;
         tracing::info!(
             sequence = seq,
@@ -1939,17 +2001,15 @@ impl TpCoordinator {
         Ok(true)
     }
 
-    /// Fence the in-flight span: join the lane on both ranks, then read each
+    /// Fence the in-flight span: join the lane on all ranks, then read each
     /// finisher's result on rank 0, chunk order. Returns the scheduler's
     /// `(slot, FinishSample, rows)` contract directly.
     fn span_finish(
         &mut self,
     ) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, String> {
         let seq = self.sequence + 1;
-        ControlMessage::TpSpanFinish { sequence: seq }
-            .to_stream(&mut self.stream)
-            .map_err(|e| e.to_string())?;
-        ready(&mut self.stream, seq)?;
+        self.workers.broadcast(&ControlMessage::TpSpanFinish { sequence: seq })?;
+        self.workers.ready(seq)?;
         let flight = self.span.take().ok_or("TP span finish without launch")?;
         self.group
             .stream()
@@ -2011,7 +2071,7 @@ impl TpCoordinator {
             self.model.synchronize().map_err(|e| e.to_string())?;
         }
         for &(slot, _, _) in &results {
-            // Both ranks joined/promoted. Async stores pages only; its
+            // All ranks joined/promoted. Async stores pages only; its
             // reservations were never snapshotted and are recycled here.
             self.publish_slot_cache(slot, &[])?;
         }
@@ -2085,14 +2145,12 @@ impl TpCoordinator {
             .collect();
         let kv_state = serde_json::to_value(self.logical.authorize_all(&ops).map_err(str::to_owned)?)
             .map_err(|e| e.to_string())?;
-        ControlMessage::TpBatch {
+        self.workers.broadcast(&ControlMessage::TpBatch {
             sequence: self.sequence + 1,
             rows: rows.to_vec(),
             kv_state,
-        }
-        .to_stream(&mut self.stream)
-        .map_err(|e| e.to_string())?;
-        prepared(&mut self.stream, self.sequence + 1)?;
+        })?;
+        self.workers.prepared(self.sequence + 1)?;
         let mut step = SampledStep {
             ids: vec![0; width],
             host_rows: Vec::new(),
@@ -2123,7 +2181,7 @@ impl TpCoordinator {
             }
         }
         self.sequence += 1;
-        ready(&mut self.stream, self.sequence)?;
+        self.workers.ready(self.sequence)?;
         for &(slot, _, _) in rows {
             self.positions[slot] += 1;
             self.occupied[slot] = true;
@@ -2206,13 +2264,13 @@ pub struct TpGenerator {
     /// The command thread owns the CUDA/NCCL stream and coordinator. Joining
     /// it on drop guarantees its `TpCoordinator` sends the graceful Shutdown
     /// frame before the runner exits; a detached thread could be killed after
-    /// the engine's ready waiter fired, making rank 1 report a false EOF.
+    /// the engine's ready waiter fired, making worker rank report a false EOF.
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TpGenerator {
     pub fn load(
-        stream: TcpStream,
+        workers: Vec<WorkerControl>,
         resolved: Resolved,
         path: &Path,
         pack: &Path,
@@ -2235,7 +2293,7 @@ impl TpGenerator {
             .name("qwen35-tp-rank0".into())
             .spawn(move || {
                 let mut coordinator = match TpCoordinator::load(
-                    stream,
+                    workers,
                     &resolved,
                     &path,
                     &pack,
@@ -2272,9 +2330,10 @@ impl TpGenerator {
                     let shutdown = matches!(cmd, Command::Shutdown);
                     let result = if shutdown {
                         coordinator.shutdown_sent = true;
-                        shutdown_worker(&mut coordinator.stream, coordinator.poisoned.is_none())
+                        coordinator
+                            .workers
+                            .shutdown(coordinator.poisoned.is_none())
                             .map(|_| Response::Logits(Vec::new()))
-                            .map_err(|e| e.to_string())
                     } else if coordinator.pipe.is_some()
                         && !matches!(cmd, Command::PipeNext(_) | Command::PipeDrain)
                     {
@@ -2678,7 +2737,7 @@ impl Generator for TpGenerator {
         self.max_ctx
     }
     /// Rank-local context bytes, exact (Phase 12): the GQA K/V slab pairs and
-    /// DeltaNet recurrent/conv slot state THIS rank holds. Both ranks build
+    /// DeltaNet recurrent/conv slot state THIS rank holds. All ranks build
     /// identical geometry, so the number reads as "per rank" honestly.
     fn kv_mem_bytes(&self) -> Option<u64> {
         Some(self.context_bytes)
@@ -2697,12 +2756,12 @@ impl Generator for TpGenerator {
 impl Drop for TpCoordinator {
     fn drop(&mut self) {
         if !self.shutdown_sent {
-            let _ = shutdown_worker(&mut self.stream, self.poisoned.is_none());
+            let _ = self.workers.shutdown(self.poisoned.is_none());
         }
     }
 }
 
-/// Runs in the rank-1 process, with no HTTP listener, tokenizer or sampler.
+/// Runs in any nonzero worker-rank process, with no HTTP listener, tokenizer or sampler.
 pub fn run_worker(
     mut stream: TcpStream,
     resolved: &Resolved,
@@ -2714,7 +2773,7 @@ pub fn run_worker(
     gpu: usize,
 ) -> Result<(), String> {
     if !resolved.is_worker() {
-        return Err("TP worker must have rank 1".into());
+        return Err("TP worker must have a nonzero worker rank".into());
     }
     stream
         .set_read_timeout(Some(READY_TIMEOUT))
@@ -2741,7 +2800,7 @@ pub fn run_worker(
                     // not as an identity failure.
                     let kv_dtype = kv_dtype_parse(&kv_dtype)?;
                     // The span cap installs BEFORE any span can run and
-                    // fails closed on an unsupported wire value: rank 1
+                    // fails closed on an unsupported wire value: worker rank
                     // never reads the coordinator's env (same contract as
                     // graphs/dtype/ckpt_slots).
                     super::tp_span_cap::wire_span_cap(span_cap).map_err(|e| e.to_string())?;
@@ -2751,7 +2810,7 @@ pub fn run_worker(
                         || !(1..=2).contains(&slots)
                     {
                         return Err(
-                            "rank-1 checkpoint, CUDA pack or context disagrees with rank 0".into(),
+                            "worker-rank checkpoint, CUDA pack or context disagrees with rank 0".into(),
                         );
                     }
                     (max_ctx, slots, kv_dtype, use_graphs, ckpt_slots)
@@ -2801,7 +2860,7 @@ pub fn run_worker(
         let mut pipe_slots: Option<Vec<usize>> = None;
         let mut span_in_flight = false;
         // Finishing chunks of the in-flight span (wire shape, chunk order):
-        // rank 1 promotes exactly these slots at the span finish.
+        // worker rank promotes exactly these slots at the span finish.
         let mut span_finishers: Vec<(usize, Option<TpSpanFinisherPlan>)> = Vec::new();
         let mut pipe_plane = 0usize;
         let mut pending_pipe: Option<u64> = None;
@@ -3047,7 +3106,7 @@ pub fn run_worker(
                         .map_err(str::to_owned)?;
                     // Rank-local DeltaNet restore from THIS rank's pool at
                     // the validated index, BEFORE the Ready: by the time the
-                    // coordinator proceeds, both ranks' slot state matches
+                    // coordinator proceeds, all ranks' slot state matches
                     // the checkpoint's logical position.
                     if resume > 0 {
                         // A reservation in this same admission may steal the
@@ -3145,7 +3204,7 @@ pub fn run_worker(
                     ..
                 } => {
                     // Decode rows precede the optional single-slot chunk run.
-                    // Rank 1 mirrors the authorized KV snapshot before
+                    // Worker ranks mirrors the authorized KV snapshot before
                     // Prepared, then replays the same bounded span geometry;
                     // it neither samples nor reads logits back to the host.
                     let split = validate_mixed_worker_rows(&rows, chunk_rows, &positions, max_ctx)?;
@@ -3228,7 +3287,7 @@ pub fn run_worker(
                     kv_state,
                     ..
                 } => {
-                    // The whole prompt span enqueues on rank 1's prefill lane
+                    // The whole prompt span enqueues on worker rank's prefill lane
                     // as batched sub-spans of at most tp_span_cap() contiguous
                     // rows per slot run (the shared pure `span_chunk_points`
                     // over the same wire rows rank 0 chunked from). The lane
@@ -3283,7 +3342,7 @@ pub fn run_worker(
                         }
                         at = end;
                     }
-                    // Rank 1 does not sample; its probe finisher marks span
+                    // Worker ranks does not sample; its probe finisher marks span
                     // completion for the promotion at the span finish.
                     model
                         .prefill_lane_finisher(
@@ -3307,7 +3366,7 @@ pub fn run_worker(
                     // each finished slot's lane-local state onto this rank's
                     // decode executor - same chunk order as rank 0. The lane
                     // slab and DeltaNet slot state are private allocations on
-                    // every rank, so rank 1's decode executor would otherwise
+                    // every rank, so worker rank's decode executor would otherwise
                     // never see the prompt's context.
                     exec.synchronize().map_err(|e| e.to_string())?;
                     group.stream().synchronize().map_err(|e| e.to_string())?;
@@ -3861,7 +3920,7 @@ mod tests {
         assert!(validate_multistep_positions(&[(1, 10, 32)], &start, 32).is_err());
     }
 
-    // ── production span chunking (pure, both ranks share these) ──────────
+    // ── production span chunking (pure, all ranks share these) ──────────
 
     #[test]
     fn span_chunk_points_covers_the_task_cap_boundaries() {
@@ -3905,7 +3964,7 @@ mod tests {
     #[test]
     fn span_chunk_points_is_deterministic_across_ranks() {
         // Coordinator and worker chunk from the same pure function over the
-        // same wire rows; assert the geometry a rank-1 replay derives for a
+        // same wire rows; assert the geometry a worker-rank replay derives for a
         // 200-row mixed run and a 300-row span launch matches rank 0's.
         for len in [200usize, 300, 8192] {
             let rank0 = span_chunk_points(len);

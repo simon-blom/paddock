@@ -2215,14 +2215,14 @@ fn build_engine(
                     || fp8_native.is_some()
                     || vram_budget.is_some()
                 {
-                    return Err("TP=2 requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
+                    return Err("TP requires Qwen3.8 CUDA with at most two text slots and no companions/offload".into());
                 }
                 let pack = pack
                     .as_deref()
-                    .ok_or("TP=2 serving requires an explicit CUDA pack (--kernel-pack)")?;
-                let stream = paddock_dist::worker::take_control().map_err(|e| e.to_string())?;
+                    .ok_or("TP serving requires an explicit CUDA pack (--kernel-pack)")?;
+                let workers = paddock_dist::worker::take_controls().map_err(|e| e.to_string())?;
                 let generator = paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
-                    stream, resolved, &path, pack, gpu, max_ctx, max_batch,
+                    workers, resolved, &path, pack, gpu, max_ctx, max_batch,
                 )?;
                 return Ok(Box::new(generator) as Box<dyn Generator>);
             }
