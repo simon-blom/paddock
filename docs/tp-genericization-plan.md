@@ -190,7 +190,7 @@ Implemented on `review/tp-generic-core`:
 - `Qwen35TpRank` stores topology rather than a bare rank and treats all
   nonzero ranks as equivalent model workers.
 - Mirrored paged-KV/checkpoint lifecycle moved into generic
-  `gpu_model::tp::cache`; Qwen retains only its measured resume-profitability
+  `tp::cache`; Qwen retains only its measured resume-profitability
   thresholds.
 
 The current Qwen3.8 geometry naturally supports TP=2 and TP=4 for both its four

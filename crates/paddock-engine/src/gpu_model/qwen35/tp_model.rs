@@ -19,8 +19,8 @@ use crate::{
     gpu::distributed::{CollectiveError, Communicator},
     gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, QuantW},
     gpu_model::gpt_oss::GpuModelError,
-    gpu_model::tp::state::{transfer_checkpoint, CheckpointOp, TpCheckpointState},
-    gpu_model::tp::TpTopology,
+    tp::state::{transfer_checkpoint, CheckpointOp, TpCheckpointState},
+    tp::TpTopology,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -520,7 +520,7 @@ impl Qwen35TpRank {
     pub fn forward_token<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
     ) -> Result<Vec<f32>, Qwen35TpError> {
@@ -530,7 +530,7 @@ impl Qwen35TpRank {
     pub fn forward_token_slot<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -545,7 +545,7 @@ impl Qwen35TpRank {
     pub fn forward_token_sampled_slot<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -582,7 +582,7 @@ impl Qwen35TpRank {
     pub fn forward_token_enqueue<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -636,7 +636,7 @@ impl Qwen35TpRank {
     pub fn forward_token_worker<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
     ) -> Result<(), Qwen35TpError> {
@@ -646,7 +646,7 @@ impl Qwen35TpRank {
     pub fn forward_token_worker_slot<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -667,7 +667,7 @@ impl Qwen35TpRank {
     pub fn forward_host_to_feedback<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -693,7 +693,7 @@ impl Qwen35TpRank {
     pub fn forward_feedback_to_feedback<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         position: usize,
         source_plane: usize,
@@ -797,7 +797,7 @@ impl Qwen35TpRank {
     fn forward_device_feedback<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         position: usize,
         slot: usize,
         plane: usize,
@@ -812,7 +812,7 @@ impl Qwen35TpRank {
     fn forward_token_gpu<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         token: u32,
         position: usize,
         slot: usize,
@@ -853,7 +853,7 @@ impl Qwen35TpRank {
     fn forward_token_body<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         position: usize,
         slot: usize,
         graphed: bool,
@@ -926,7 +926,7 @@ impl Qwen35TpRank {
     fn forward_token_body_graphed<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         position: usize,
         slot: usize,
     ) -> Result<(), Qwen35TpError> {
@@ -1131,7 +1131,7 @@ impl Qwen35TpRank {
     pub fn forward_span_advance<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         tokens: &[u32],
         position: usize,
@@ -1279,7 +1279,7 @@ impl Qwen35TpRank {
     fn span_layer_walk<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         position: usize,
         rows: usize,
@@ -1463,7 +1463,7 @@ impl Qwen35TpRank {
     pub fn forward_prefill_span<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         tokens: &[u32],
         position: usize,
@@ -1634,7 +1634,7 @@ impl Qwen35TpRank {
     pub fn prefill_lane_step<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         token: u32,
         position: usize,
@@ -1670,7 +1670,7 @@ impl Qwen35TpRank {
     pub fn prefill_lane_span_advance<C: Communicator>(
         &mut self,
         group: &C,
-        logical_kv: &crate::gpu_model::tp::cache::MirroredKv,
+        logical_kv: &crate::tp::cache::MirroredKv,
         slot: usize,
         tokens: &[u32],
         position: usize,

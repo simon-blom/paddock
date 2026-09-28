@@ -9,17 +9,17 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::ops::{gemv_any, prefill_attn, read_sections};
-use crate::gpu_model::tp::cache::MirroredKv;
+use crate::tp::cache::MirroredKv;
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::tp::prefill::ProjectionPrefillBackend;
-use crate::gpu_model::tp::attention::{
+use crate::tp::prefill::ProjectionPrefillBackend;
+use crate::tp::attention::{
     decode_paged, AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition,
     PagedAttentionTable, PagedKvBatch, reduce_output,
 };
-use crate::gpu_model::tp::TpTopology;
+use crate::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
 
 use super::tp_span::{SpanGemmStaging, SpanGqa};
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn span_validation_uses_nonzero_slot_and_last_row_position() {
-        use crate::gpu_model::tp::cache::Operation;
+        use crate::tp::cache::Operation;
 
         let mut kv = MirroredKv::new(4, 2, 48).unwrap();
         kv.authorize(Operation::Ensure {

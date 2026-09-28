@@ -5,7 +5,7 @@ use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
-use crate::gpu_model::tp::cache::MirroredKv;
+use crate::tp::cache::MirroredKv;
 use crate::kv_pool::BLOCK_TOKENS;
 
 use super::{TpTopology, TpTopologyError};
@@ -536,7 +536,7 @@ impl GqaPartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_model::tp::cache::Operation;
+    use crate::tp::cache::Operation;
 
     #[test]
     fn paged_kv_pair_preflights_both_planes_before_append() {

@@ -16,7 +16,7 @@ use super::tp_span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::tp::{prefill::mmq_layout, TpTopology};
+use crate::tp::{prefill::mmq_layout, TpTopology};
 
 const WIDTH: usize = 5120;
 const S: usize = 128;

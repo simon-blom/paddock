@@ -1,12 +1,12 @@
 //! Qwen3.8 policy facade over the generic TP cache lifecycle.
 //!
-//! Cache/page/checkpoint mechanics live in `gpu_model::tp::cache`. Qwen keeps
+//! Cache/page/checkpoint mechanics live in `tp::cache`. Qwen keeps
 //! only the measured policy deciding when a resume is profitable.
 
-pub use crate::gpu_model::tp::cache::{
+pub use crate::tp::cache::{
     Event, MirroredKv, Operation, PrefixProbe, Snapshot, tp_publish_ops,
 };
-use crate::gpu_model::tp::cache::{ResumePolicy, resume_decision};
+use crate::tp::cache::{ResumePolicy, resume_decision};
 
 /// Qwen3.8's measured resume-profitability policy.
 ///

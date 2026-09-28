@@ -11,7 +11,7 @@ use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::distributed::Communicator;
 use crate::gpu::GpuExecutor;
-use crate::gpu_model::tp::ffn::{SwiGluTpRank, SwiGluWeightNames, TpFfnError};
+use crate::tp::ffn::{SwiGluTpRank, SwiGluWeightNames, TpFfnError};
 
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use super::tp_span::{SpanFfn, SpanGemmStaging};
@@ -75,7 +75,7 @@ impl FfnTpRank {
         profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
         let topology = self.topology();
-        if crate::gpu_model::tp::TpTopology::from_group(group)? != topology
+        if crate::tp::TpTopology::from_group(group)? != topology
             || rows == 0
             || rows > span.cap
             || xn.len() < rows * self.hidden()

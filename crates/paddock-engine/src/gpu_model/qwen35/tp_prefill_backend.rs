@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 
 use crate::gpu::{GpuExecutor, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::tp::prefill::{ProjectionPrefillBackend, ProjectionStaging};
+use crate::tp::prefill::{ProjectionPrefillBackend, ProjectionStaging};
 
 use super::ops::{prefill_ffn_down_any, prefill_mm_any, prefill_mm_pre_any, prefill_quant};
 

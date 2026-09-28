@@ -42,6 +42,8 @@ pub mod service;
 pub mod spec;
 pub mod spec_policy;
 pub mod tickseg;
+#[cfg(feature = "cuda")]
+pub mod tp;
 pub mod transcriber;
 pub mod whisper;
 

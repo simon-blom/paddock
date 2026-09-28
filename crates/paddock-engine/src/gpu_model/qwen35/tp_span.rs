@@ -20,9 +20,9 @@ use cudarc::driver::CudaSlice;
 use super::gqa_tp::GqaGeometry;
 use super::tp_span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
-use crate::gpu_model::tp::prefill::ProjectionStaging;
-pub(crate) use crate::gpu_model::tp::ffn::SwiGluPrefillScratch as SpanFfn;
-pub(crate) use crate::gpu_model::tp::prefill::ProjectionStaging as SpanGemmStaging;
+use crate::tp::prefill::ProjectionStaging;
+pub(crate) use crate::tp::ffn::SwiGluPrefillScratch as SpanFfn;
+pub(crate) use crate::tp::prefill::ProjectionStaging as SpanGemmStaging;
 
 /// Whole-model activation planes for one span: residual stream, normalized
 /// rows, and the span's token ids.
