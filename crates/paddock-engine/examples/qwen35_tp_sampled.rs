@@ -2,7 +2,7 @@
 //! qwen35_tp_sampled RANK MASTER_IP MODEL PACK [PORT]
 use paddock_dist::{
     config::ParallelConfig,
-    worker::{connect_worker, coordinate},
+    worker::{connect_worker, coordinate_workers},
 };
 use paddock_engine::sampler::DevicePlan;
 use paddock_engine::{
@@ -38,18 +38,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     .resolved(false)?
     .ok_or("TP=2 required")?;
-    let (stream, _) = if rank == 0 {
-        coordinate(&resolved, false)?
-    } else {
-        connect_worker(&resolved)?
-    };
     let model = Path::new(&args[3]);
     let pack = Path::new(&args[4]);
     if rank == 1 {
+        let (stream, _) = connect_worker(&resolved)?;
         run_worker(stream, &resolved, model, pack, 0)?;
         return Ok(());
     }
-    let mut engine = TpGenerator::load(stream, resolved, model, pack, 0, 48, 2)?;
+    let (workers, _) = coordinate_workers(&resolved, false)?;
+    let mut engine = TpGenerator::load(workers, resolved, model, pack, 0, 48, 2)?;
     if !engine.supports_device_sampling() {
         return Err("pack missing sample_rows".into());
     }
