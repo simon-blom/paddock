@@ -255,16 +255,12 @@ impl GqaTpRank {
             qn: e.alloc(g.q_dim())?,
             kn: e.alloc(g.kv_dim())?,
             attn: e.alloc(g.q_dim())?,
-            attn_o: e.alloc(
-                2 * super::attn_fill_blocks(super::attn_boundary_sms(e.sm_count()))
-                    * super::MAX_ATTN_SPLITS
-                    * g.head_dim,
-            )?,
-            attn_ml: e.alloc(
-                2 * super::attn_fill_blocks(super::attn_boundary_sms(e.sm_count()))
-                    * super::MAX_ATTN_SPLITS
-                    * 2,
-            )?,
+            // One-token TP decode can only materialize
+            // local_heads * n_splits partial rows. Keep the MAX split ceiling
+            // so PADDOCK_ATTN_SPLITS overrides remain safe without paying the
+            // stock model's shared all-batch scratch bound once per layer.
+            attn_o: e.alloc(g.local_heads * super::MAX_ATTN_SPLITS * g.head_dim)?,
+            attn_ml: e.alloc(g.local_heads * super::MAX_ATTN_SPLITS * 2)?,
             partial: e.alloc(g.width)?,
             reduced: e.alloc(g.width)?,
             kc: e.alloc_u8(kv_bytes)?,
@@ -384,7 +380,7 @@ impl GqaTpRank {
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
         logical
-            .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
+            .validate_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
             .map_err(|e| GqaTpError::Shape(e.into()))?;
         self.stage_slot_block_table(e, slot, logical)?;
         self.forward_at(e, group, input, slot, position, Some(()))
@@ -655,7 +651,7 @@ impl GqaTpRank {
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
         logical
-            .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
+            .validate_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
             .map_err(|err| GqaTpError::Shape(err.into()))?;
         self.stage_slot_block_table(e, slot, logical)?;
         let pos =

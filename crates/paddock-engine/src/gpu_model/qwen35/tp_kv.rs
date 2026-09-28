@@ -245,16 +245,18 @@ impl MirroredKv {
         self.tables.get(slot).map(|t| t.blocks())
     }
 
-    /// Serialize only a live slot whose entire read prefix is backed by
-    /// allocated pages, in precisely the geometry of the GPU payload.
-    pub fn checked_device_table(
+    /// Validate that a live slot's entire read prefix is backed by allocated
+    /// pages in precisely the geometry of the GPU payload. This is the hot
+    /// decode check: it deliberately does not materialize the full all-slot
+    /// host table.
+    pub fn validate_device_table(
         &self,
         slot: usize,
         position: usize,
         pool_blocks: u32,
         slots: usize,
         max_ctx: usize,
-    ) -> Result<Vec<u32>, &'static str> {
+    ) -> Result<(), &'static str> {
         if pool_blocks != self.pool.capacity()
             || slots != self.tables.len()
             || max_ctx != self.max_ctx
@@ -271,6 +273,21 @@ impl MirroredKv {
         {
             return Err("KV position has no live pages");
         }
+        Ok(())
+    }
+
+    /// Serialize a validated full all-slot table for callers that actually
+    /// need host bytes to upload. Decode should use validate_device_table
+    /// and its persistent per-slot device-table cache instead.
+    pub fn checked_device_table(
+        &self,
+        slot: usize,
+        position: usize,
+        pool_blocks: u32,
+        slots: usize,
+        max_ctx: usize,
+    ) -> Result<Vec<u32>, &'static str> {
+        self.validate_device_table(slot, position, pool_blocks, slots, max_ctx)?;
         Ok(self.device_table())
     }
 
