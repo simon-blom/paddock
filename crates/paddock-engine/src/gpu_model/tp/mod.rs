@@ -4,6 +4,7 @@
 //! by individual model families. It deliberately does not know how a model
 //! schedules layers or which architecture-specific fast path it may override.
 
+pub(crate) mod attention;
 pub(crate) mod ffn;
 
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};

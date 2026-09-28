@@ -6,7 +6,7 @@
 //! with the Phase 3 NCCL sum. No production forward or scheduler is changed.
 use cudarc::driver::CudaSlice;
 use paddock_kernels::reference::ops::YarnRope;
-use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
+use paddock_models::tensor_slice::ShardKind;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, prefill_mm_any, prefill_mm_pre_any, prefill_quant, read_sections};
@@ -14,6 +14,7 @@ use super::tp_kv::MirroredKv;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::gpu_model::tp::{TpTopology, attention::GqaPartition};
 use crate::kv_pool::BLOCK_TOKENS;
 
 use super::tp_span::{SpanGemmStaging, SpanGqa};
@@ -49,30 +50,30 @@ impl GqaGeometry {
         kv_heads: usize,
         head_dim: usize,
         rank: usize,
+        world_size: usize,
     ) -> Result<Self, GqaTpError> {
-        if rank >= 2
-            || width == 0
-            || heads == 0
-            || kv_heads == 0
+        if width == 0
             || head_dim != 256
-            || !heads.is_multiple_of(kv_heads)
-            || !kv_heads.is_multiple_of(2)
             || !width.is_multiple_of(256)
             || heads.checked_mul(head_dim).is_none()
             || kv_heads.checked_mul(head_dim).is_none()
         {
-            return Err(GqaTpError::Shape("TP=2 requires even KV heads, complete Q/KV groups, 256-wide heads and block-aligned width".into()));
+            return Err(GqaTpError::Shape(
+                "Qwen GQA requires 256-wide heads and block-aligned width".into(),
+            ));
         }
-        let local_kv_heads = kv_heads / 2;
-        let local_heads = local_kv_heads * (heads / kv_heads);
+        let topology = TpTopology::new(rank, world_size)
+            .map_err(|e| GqaTpError::Shape(e.to_string()))?;
+        let partition = GqaPartition::new(topology, heads, kv_heads)
+            .map_err(|e| GqaTpError::Shape(e.to_string()))?;
         Ok(Self {
             width,
             heads,
             kv_heads,
             head_dim,
-            local_heads,
-            local_kv_heads,
-            kv_start: rank * local_kv_heads,
+            local_heads: partition.local_heads,
+            local_kv_heads: partition.local_kv_heads,
+            kv_start: partition.kv_start,
         })
     }
     pub fn kv_dim(self) -> usize {
@@ -143,7 +144,7 @@ pub struct GqaTpRank {
     pos: usize,
     max_ctx: usize,
     dtype: KvDtype,
-    rank: usize,
+    topology: TpTopology,
     nrot: usize,
     eps: f32,
     yarn: (f32, f32, f32, f32, f32, f32),
@@ -158,13 +159,11 @@ impl GqaTpRank {
         max_ctx: usize,
         dtype: KvDtype,
     ) -> Result<Self, GqaTpError> {
-        if group.world_size() != 2
-            || group.rank() >= 2
-            || max_ctx == 0
-            || max_ctx > u32::MAX as usize
-        {
+        let topology = TpTopology::from_group(group)
+            .map_err(|e| GqaTpError::Shape(e.to_string()))?;
+        if topology.world_size() < 2 || max_ctx == 0 || max_ctx > u32::MAX as usize {
             return Err(GqaTpError::Shape(
-                "expected TP=2 and nonempty u32 context".into(),
+                "expected TP>=2 and nonempty u32 context".into(),
             ));
         }
         let u = |key: &str| -> Result<usize, GqaTpError> {
@@ -180,7 +179,8 @@ impl GqaTpRank {
             u("attention.head_count")?,
             u("attention.head_count_kv")?,
             u("attention.key_length")?,
-            group.rank(),
+            topology.rank(),
+            topology.world_size(),
         )?;
         let nrot = u("rope.dimension_count")?;
         let eps = f("attention.layer_norm_rms_epsilon").unwrap_or(1e-6);
@@ -228,11 +228,7 @@ impl GqaTpRank {
                 )));
             }
         }
-        let request = |kind| TensorSliceRequest {
-            kind,
-            rank: group.rank(),
-            world_size: 2,
-        };
+        let request = |kind| topology.tensor_slice(kind);
         let weights = [
             e.load_quantw_shard(map, &name("attn_q"), request(ShardKind::OutputRows))?,
             e.load_quantw_shard(map, &name("attn_k"), request(ShardKind::OutputRows))?,
@@ -247,7 +243,7 @@ impl GqaTpRank {
             qnorm: e.upload(map, &name("attn_q_norm"))?.buf,
             knorm: e.upload(map, &name("attn_k_norm"))?.buf,
             sinks: e.alloc_no_sinks(g.local_heads)?,
-            qg: e.alloc(qdim)?,
+            qg: e.alloc(2 * g.q_dim())?,
             q: e.alloc(g.q_dim())?,
             gate: e.alloc(g.q_dim())?,
             k: e.alloc(g.kv_dim())?,
@@ -275,7 +271,7 @@ impl GqaTpRank {
             pos: 0,
             max_ctx,
             dtype,
-            rank: group.rank(),
+            topology,
             nrot,
             eps,
             yarn,
@@ -389,8 +385,7 @@ impl GqaTpRank {
         position: usize,
         table: Option<()>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
+        if TpTopology::from_group(group).ok() != Some(self.topology)
             || input.len() != self.geometry.width
             || input.context().cu_ctx() != e.stream.context().cu_ctx()
             || position >= self.max_ctx
@@ -823,8 +818,7 @@ impl GqaTpRank {
         layer: usize,
         mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
+        if TpTopology::from_group(group).ok() != Some(self.topology)
             || xn.context().cu_ctx() != e.stream.context().cu_ctx()
         {
             return Err(GqaTpError::Shape("rank or context changed".into()));
@@ -1027,7 +1021,7 @@ mod tests {
     #[test]
     fn complete_groups_and_kv_payload() {
         for rank in 0..2 {
-            let g = GqaGeometry::new(5120, 24, 4, 256, rank).unwrap();
+            let g = GqaGeometry::new(5120, 24, 4, 256, rank, 2).unwrap();
             assert_eq!(
                 (g.local_heads, g.local_kv_heads, g.kv_start),
                 (12, 2, rank * 2)
@@ -1040,10 +1034,10 @@ mod tests {
             );
         }
         for (h, kv, rank) in [(24, 3, 0), (23, 4, 0), (24, 4, 2), (0, 4, 0)] {
-            assert!(GqaGeometry::new(5120, h, kv, 256, rank).is_err());
+            assert!(GqaGeometry::new(5120, h, kv, 256, rank, 2).is_err());
         }
         assert_eq!(
-            GqaGeometry::new(5120, 24, 4, 256, 0)
+            GqaGeometry::new(5120, 24, 4, 256, 0, 2)
                 .unwrap()
                 .kv_bytes(usize::MAX, KvDtype::Fp16),
             None
@@ -1051,16 +1045,30 @@ mod tests {
     }
 
     #[test]
+    fn qwen_gqa_geometry_scales_to_tp4_without_model_changes() {
+        for rank in 0..4 {
+            let g = GqaGeometry::new(5120, 24, 4, 256, rank, 4).unwrap();
+            assert_eq!(
+                (g.local_heads, g.local_kv_heads, g.kv_start),
+                (6, 1, rank)
+            );
+        }
+        // This checkpoint has four KV heads, so TP=3 is a geometry refusal,
+        // not a different Qwen implementation.
+        assert!(GqaGeometry::new(5120, 24, 4, 256, 0, 3).is_err());
+    }
+
+    #[test]
     fn head_dim_pin_is_exact_and_fp8_halves_kv_bytes() {
         // head_dim is baked into the append/decode kernels' addressing (the
         // pack instantiates 256-wide qwen3.8 heads only); any other qwen35
         // size must refuse here, not misaddress.
-        assert!(GqaGeometry::new(5120, 24, 4, 128, 0).is_err());
-        assert!(GqaGeometry::new(5120, 24, 4, 512, 0).is_err());
-        assert!(GqaGeometry::new(2559, 24, 4, 256, 0).is_err()); // non-256-multiple width
+        assert!(GqaGeometry::new(5120, 24, 4, 128, 0, 2).is_err());
+        assert!(GqaGeometry::new(5120, 24, 4, 512, 0, 2).is_err());
+        assert!(GqaGeometry::new(2559, 24, 4, 256, 0, 2).is_err()); // non-256-multiple width
         // fp8_e4m3 KV halves the per-rank payload at identical geometry -
         // the Phase 12 accounting invariant the two-Spark gate cross-checks.
-        let g = GqaGeometry::new(5120, 24, 4, 256, 0).unwrap();
+        let g = GqaGeometry::new(5120, 24, 4, 256, 0, 2).unwrap();
         let f16 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp16).unwrap();
         let fp8 = g.kv_bytes(BLOCK_TOKENS, KvDtype::Fp8E4m3).unwrap();
         assert_eq!(fp8 * 2, f16);
