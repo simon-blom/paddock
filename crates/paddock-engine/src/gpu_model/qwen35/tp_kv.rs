@@ -251,10 +251,6 @@ impl MirroredKv {
         self.tables.get(slot).map(|t| t.blocks())
     }
 
-    pub fn slot_table_version(&self, slot: usize) -> Option<u64> {
-        self.table_versions.get(slot).copied()
-    }
-
     /// Hot decode validation. Geometry/coverage are checked every call, while
     /// the O(context) block-id/refcount scan is repeated only when this slot's
     /// physical BlockTable generation changed.
@@ -827,6 +823,33 @@ mod tests {
     fn mk(max_ctx: usize, slots: usize) -> MirroredKv {
         let blocks = (max_ctx.div_ceil(BLOCK_TOKENS) * slots) as u32;
         MirroredKv::new(blocks, slots, max_ctx).unwrap()
+    }
+
+    #[test]
+    fn table_version_changes_only_when_physical_mapping_changes() {
+        let mut kv = mk(64, 1);
+        assert_eq!(kv.table_versions[0], 0);
+
+        kv.authorize(Operation::Ensure { slot: 0, position: 0 }).unwrap();
+        let first = kv.table_versions[0];
+        assert_ne!(first, 0);
+
+        // Same physical page: position advances, mapping generation does not.
+        kv.authorize(Operation::Ensure { slot: 0, position: 15 }).unwrap();
+        assert_eq!(kv.table_versions[0], first);
+
+        // Crossing the 16-token page boundary grows the BlockTable.
+        kv.authorize(Operation::Ensure { slot: 0, position: 16 }).unwrap();
+        let grown = kv.table_versions[0];
+        assert_ne!(grown, first);
+
+        kv.authorize(Operation::Release { slot: 0 }).unwrap();
+        let released = kv.table_versions[0];
+        assert_ne!(released, grown);
+
+        // Reusing an empty cached prefix changes the physical mapping again.
+        kv.authorize(Operation::Ensure { slot: 0, position: 0 }).unwrap();
+        assert_ne!(kv.table_versions[0], released);
     }
 
     /// Admit a cold prompt, publish its pages, checkpoint at the given cut.

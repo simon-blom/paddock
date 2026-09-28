@@ -654,10 +654,6 @@ impl GqaTpRank {
         if self.block_tables.is_none() {
             return Err(GqaTpError::Shape("not a paged GQA rank".into()));
         }
-        let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
-        let blocks = u32::try_from(self.kc.len() / stride)
-            .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        let _ = blocks;
         self.stage_slot_block_table(e, slot, position, logical)?;
         let pos =
             u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
