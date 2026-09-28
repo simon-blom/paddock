@@ -2418,32 +2418,8 @@ pub(crate) fn prefill_mm_pre_any(
     batch: usize,
 ) -> Result<(), GpuModelError> {
     match w {
-        QuantW::Q8(q) => {
-            trace_dispatch(batch, &q.dims, "q8");
-            prefill_mm_pre(exec, q, xq, xs, yq, skfix, y, batch)
-        }
-        QuantW::Kq(k) => {
-            trace_dispatch(batch, &k.dims, if batch > 64 && kq_tile_ok(exec, k) { "kq-tile" } else { "kq-dp4a" });
-            kq_mm_pre(exec, k, xq, xs, yq, xsums, ssums, y, batch)
-        }
-    }
-}
-
-/// Opt-in (`PADDOCK_TP_KERNEL_TRACE=1`) one-line witness per (row band, dims,
-/// rung) so a serving log PROVES which prefill kernel family a TP span fires.
-/// Off by default: one dedup set, no per-call cost when disabled.
-fn trace_dispatch(batch: usize, dims: &[usize], rung: &'static str) {
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<std::collections::HashSet<(usize, Vec<usize>, &'static str)>>> =
-        Mutex::new(None);
-    if paddock_models::dev_var_os!("PADDOCK_TP_KERNEL_TRACE").is_none() {
-        return;
-    }
-    let key = (batch, dims.to_vec(), rung);
-    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let seen = g.get_or_insert_with(Default::default);
-    if seen.insert(key) {
-        eprintln!("[TP-KERNEL-DISPATCH] rows={batch} dims={dims:?} rung={rung}");
+        QuantW::Q8(q) => prefill_mm_pre(exec, q, xq, xs, yq, skfix, y, batch),
+        QuantW::Kq(k) => kq_mm_pre(exec, k, xq, xs, yq, xsums, ssums, y, batch),
     }
 }
 

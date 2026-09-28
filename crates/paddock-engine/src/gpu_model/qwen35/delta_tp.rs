@@ -41,19 +41,6 @@ fn input_len_matches(input_len: usize, rows: usize, prefill: bool) -> bool {
         input_len == expected
     }
 }
-
-fn profile_stage(
-    profile: &mut Option<&mut super::tp_prefill_profile::SpanProfile>,
-    e: &GpuExecutor,
-    name: &'static str,
-    layer: usize,
-) -> Result<(), DeltaTpError> {
-    if let Some(p) = profile.as_deref_mut() {
-        p.stage(&e.stream, name, Some(layer))?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum DeltaTpError {
     #[error(transparent)]
@@ -577,7 +564,7 @@ impl DeltaTpRank {
             .ok_or_else(|| DeltaTpError::Shape("slot out of range".into()))?;
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
-        let result = self.forward(e, group, input, 1, slot, false, 0).map(|_| ());
+        let result = self.forward(e, group, input, 1, slot, false).map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
@@ -726,7 +713,7 @@ impl DeltaTpRank {
         group: &C,
         input: &CudaSlice<f32>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, 1, 0, false, 0)
+        self.forward(e, group, input, 1, 0, false)
     }
     pub fn prefill<'a, C: Communicator>(
         &'a mut self,
@@ -735,13 +722,12 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward(e, group, input, rows, 0, true, 0)
+        self.forward(e, group, input, rows, 0, true)
     }
 
     /// Slot-addressed span prefill (prototype): identical math to `prefill`
     /// with the addressed slot's recurrent/conv pair swapped in for the span
     /// and swapped back after it. `layer` feeds the probe-only
-    /// `PADDOCK_TP_ABC_TRACE` substage readbacks.
     pub(crate) fn prefill_slot<'a, C: Communicator>(
         &'a mut self,
         e: &GpuExecutor,
@@ -749,11 +735,9 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         slot: usize,
         rows: usize,
-        layer: usize,
-        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         if slot == 0 {
-            return self.forward_profiled(e, group, input, rows, slot, true, layer, profile);
+            return self.forward_profiled(e, group, input, rows, slot, true);
         }
         let state = self
             .slot_states
@@ -762,7 +746,7 @@ impl DeltaTpRank {
         std::mem::swap(&mut self.recurrent, &mut state.0);
         std::mem::swap(&mut self.conv, &mut state.1);
         let result = self
-            .forward_profiled(e, group, input, rows, slot, true, layer, profile)
+            .forward_profiled(e, group, input, rows, slot, true)
             .map(|_| ());
         let state = &mut self.slot_states[slot - 1];
         std::mem::swap(&mut self.recurrent, &mut state.0);
@@ -778,9 +762,8 @@ impl DeltaTpRank {
         rows: usize,
         slot: usize,
         prefill: bool,
-        layer: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
-        self.forward_profiled(e, group, input, rows, slot, prefill, layer, None)
+        self.forward_profiled(e, group, input, rows, slot, prefill)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -792,8 +775,6 @@ impl DeltaTpRank {
         rows: usize,
         slot: usize,
         prefill: bool,
-        layer: usize,
-        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let world = group.world_size();
         let rank = group.rank();
@@ -825,8 +806,7 @@ impl DeltaTpRank {
             if self.prefill_gemm.is_none() {
                 self.prefill_gemm = Some(PrefillGemm::new(e)?);
             }
-            self.prefill_run(e, input, rows, layer, profile.as_deref_mut())?;
-            profile_stage(&mut profile, e, "delta-output-projection", layer)?;
+            self.prefill_run(e, input, rows)?;
             self.finish_partial_prefill(e, rows)?;
         } else {
             self.decode_run(e, input, rows)?;
@@ -835,43 +815,12 @@ impl DeltaTpRank {
         // Eager decode and prefill reduce only live rows. Graph decode uses
         // the same live-prefix contract in `finish` after replay.
         let live = rows * WIDTH;
-        if prefill {
-            if let Some(p) = profile {
-                p.reduce(
-                    &e.stream,
-                    group,
-                    &self.span.partial.slice(0..live),
-                    &mut self.span.reduced.slice_mut(0..live),
-                    1,
-                    layer,
-                )
-                .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
-            } else {
-                group.after_compute(&e.stream)?;
-                group.all_reduce(
-                    &self.span.partial.slice(0..live),
-                    &mut self.span.reduced.slice_mut(0..live),
-                )?;
-                group.before_compute(&e.stream)?;
-            }
-        } else if let Some(p) = profile {
-            p.reduce(
-                &e.stream,
-                group,
-                &self.span.partial.slice(0..live),
-                &mut self.span.reduced.slice_mut(0..live),
-                1,
-                layer,
-            )
-            .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
-        } else {
-            group.after_compute(&e.stream)?;
-            group.all_reduce(
-                &self.span.partial.slice(0..live),
-                &mut self.span.reduced.slice_mut(0..live),
-            )?;
-            group.before_compute(&e.stream)?;
-        }
+        group.after_compute(&e.stream)?;
+        group.all_reduce(
+            &self.span.partial.slice(0..live),
+            &mut self.span.reduced.slice_mut(0..live),
+        )?;
+        group.before_compute(&e.stream)?;
         Ok(&self.span.reduced)
     }
 
@@ -944,7 +893,7 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, false, 0, None)
+        self.run(e, input, rows, false)
     }
 
     fn prefill_run(
@@ -952,10 +901,8 @@ impl DeltaTpRank {
         e: &GpuExecutor,
         input: &CudaSlice<f32>,
         rows: usize,
-        layer: usize,
-        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<(), DeltaTpError> {
-        self.run(e, input, rows, true, layer, profile)
+        self.run(e, input, rows, true)
     }
 
     fn run(
@@ -964,16 +911,12 @@ impl DeltaTpRank {
         input: &CudaSlice<f32>,
         rows: usize,
         prefill: bool,
-        layer: usize,
-        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
         if prefill {
             let mm = self.prefill_gemm.as_mut().expect("prefill scratch allocated");
-            profile_stage(&mut profile, e, "delta-input-quant", layer)?;
             prefill_quant(e, &mut mm.xq, &mut mm.xs, &mut mm.yq, input, WIDTH, rows)?;
-            profile_stage(&mut profile, e, "delta-input-qkv-projection", layer)?;
             prefill_mm_pre_any(
                 e,
                 &self.weights[0],
@@ -986,7 +929,6 @@ impl DeltaTpRank {
                 &mut s.mixed,
                 rows,
             )?;
-            profile_stage(&mut profile, e, "delta-gate-projection", layer)?;
             prefill_mm_pre_any(
                 e,
                 &self.weights[1],
@@ -999,14 +941,7 @@ impl DeltaTpRank {
                 &mut s.z,
                 rows,
             )?;
-            // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the
-            // rank-local mixed shard and gate (z) shard, plus the whole-row
-            // mixer input, echoed under the c.* name for the host compare.
-            super::tp_trace::trace_row(e, "b.dn-in", layer, input, 0, WIDTH)?;
-            super::tp_trace::trace_row(e, "b.dn-mixed", layer, &s.mixed, 0, g.mixed())?;
-            super::tp_trace::trace_row(e, "b.dn-z", layer, &s.z, 0, g.value_dim())?;
         }
-        profile_stage(&mut profile, e, "delta-conv-split-gate-prep", layer)?;
         // One row keeps the existing conv_step arithmetic in both modes.
         // Multi-row spans keep the existing causal-conv/state path.
         if rows == 1 {
@@ -1046,7 +981,6 @@ impl DeltaTpRank {
             }
         } else {
             if prefill {
-                profile_stage(&mut profile, e, "delta-alpha-beta-batched", layer)?;
                 // Use the existing f32 repacked Q8 pair projection and gate math
                 // on all live rows. Decode keeps the fused one-row kernel.
                 if e.has_q8_0_gemm_repacked_x2() {
@@ -1072,8 +1006,6 @@ impl DeltaTpRank {
                     rows,
                     g.values(),
                 )?;
-                super::tp_trace::trace_row(e, "b.dn-gate", layer, &s.gate, 0, g.values())?;
-                super::tp_trace::trace_row(e, "b.dn-beta", layer, &s.beta, 0, g.values())?;
             } else {
                 for t in 0..rows {
                     e.copy_region(input, t * WIDTH, &mut s.input, 0, WIDTH)?;
@@ -1081,11 +1013,7 @@ impl DeltaTpRank {
                     e.copy_region(&s.convolved, 0, &mut s.mixed, t * g.mixed(), g.mixed())?;
                     gemv_any(e, &self.weights[1], &s.input, &mut s.core)?;
                     e.copy_region(&s.core, 0, &mut s.z, t * g.value_dim(), g.value_dim())?;
-                    // [PADDOCK_TP_ABC_TRACE] the remaining PER-ROW fused
-                    // alpha/beta gate work (deltanet_alpha_beta_gate): row 0 of
-                    // the span only, so a probe sees exactly this site's values.
                     if t == 0 {
-                        super::tp_trace::trace_row(e, "b.dn-in", layer, &s.input, 0, WIDTH)?;
                     }
                     e.deltanet_alpha_beta_gate(
                         &self.alpha,
@@ -1098,29 +1026,12 @@ impl DeltaTpRank {
                         g.values(),
                     )?;
                     if t == 0 {
-                        super::tp_trace::trace_row(
-                            e,
-                            "b.dn-gate",
-                            layer,
-                            &s.gate_one,
-                            0,
-                            g.values(),
-                        )?;
-                        super::tp_trace::trace_row(
-                            e,
-                            "b.dn-beta",
-                            layer,
-                            &s.beta_one,
-                            0,
-                            g.values(),
-                        )?;
                     }
                     e.copy_region(&s.gate_one, 0, &mut s.gate, t * g.values(), g.values())?;
                     e.copy_region(&s.beta_one, 0, &mut s.beta, t * g.values(), g.values())?;
                 }
             }
             if prefill {
-                profile_stage(&mut profile, e, "delta-conv-split-prep", layer)?;
             }
             e.copy_region(&self.conv, 0, &mut s.ext, 0, g.conv_elements())?;
             e.copy_region(&s.mixed, 0, &mut s.ext, g.conv_elements(), rows * g.mixed())?;
@@ -1157,15 +1068,8 @@ impl DeltaTpRank {
                 S,
             )?;
             if prefill {
-                // [PADDOCK_TP_ABC_TRACE] conv output, split+L2-norm q/k/v
-                // (row 0) on the batched span path.
-                super::tp_trace::trace_row(e, "b.dn-conv", layer, &s.convolved, 0, g.mixed())?;
-                super::tp_trace::trace_row(e, "b.dn-q", layer, &s.q, 0, g.value_dim())?;
-                super::tp_trace::trace_row(e, "b.dn-k", layer, &s.k, 0, g.value_dim())?;
-                super::tp_trace::trace_row(e, "b.dn-v", layer, &s.v, 0, g.value_dim())?;
             }
         }
-        profile_stage(&mut profile, e, "delta-recurrent", layer)?;
         e.gated_delta_recurrent_v2(
             &s.q,
             &s.k,
@@ -1183,11 +1087,7 @@ impl DeltaTpRank {
             S,
         )?;
         if prefill {
-            // [PADDOCK_TP_ABC_TRACE] recurrence output (row 0) and the gated
-            // norm's `core` (row 0) - the out projection's input.
-            super::tp_trace::trace_row(e, "b.dn-rec", layer, &s.attn, 0, g.value_dim())?;
         }
-        profile_stage(&mut profile, e, "delta-norm-gate", layer)?;
         e.gated_rmsnorm(
             &s.attn,
             &s.z,
@@ -1198,7 +1098,6 @@ impl DeltaTpRank {
             self.eps,
         )?;
         if prefill {
-            super::tp_trace::trace_row(e, "b.dn-core", layer, &s.core, 0, g.value_dim())?;
         }
         Ok(())
     }

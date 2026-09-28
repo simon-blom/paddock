@@ -62,7 +62,7 @@ impl FfnTpRank {
     }
 
     /// Qwen span adapter: generic FFN owns projection orchestration and scratch;
-    /// Qwen retains only tracing/profiling policy around the collective.
+    /// Qwen retains only the live-prefix collective contract.
     pub(crate) fn forward_rows_capacity<'a, C: Communicator>(
         &'a mut self,
         exec: &GpuExecutor,
@@ -71,8 +71,6 @@ impl FfnTpRank {
         rows: usize,
         span: &'a mut SpanFfn,
         q: &mut SpanGemmStaging,
-        layer: usize,
-        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, FfnTpError> {
         let topology = self.topology();
         if crate::tp::TpTopology::from_group(group)? != topology
@@ -103,42 +101,14 @@ impl FfnTpRank {
             span,
             q,
         )?;
-        super::tp_trace::trace_row(
-            exec,
-            "b.ffn-gate",
-            layer,
-            &span.gate,
-            0,
-            self.local_ff(),
-        )?;
-        super::tp_trace::trace_row(
-            exec,
-            "b.ffn-up",
-            layer,
-            &span.up,
-            0,
-            self.local_ff(),
-        )?;
 
         let live = rows * self.hidden();
-        if let Some(p) = profile {
-            p.reduce(
-                &exec.stream,
-                group,
-                &span.partial.slice(0..live),
-                &mut span.reduced.slice_mut(0..live),
-                2,
-                layer,
-            )
-            .map_err(|err| FfnTpError::Shape(err.to_string()))?;
-        } else {
-            group.after_compute(&exec.stream)?;
-            group.all_reduce(
-                &span.partial.slice(0..live),
-                &mut span.reduced.slice_mut(0..live),
-            )?;
-            group.before_compute(&exec.stream)?;
-        }
+        group.after_compute(&exec.stream)?;
+        group.all_reduce(
+            &span.partial.slice(0..live),
+            &mut span.reduced.slice_mut(0..live),
+        )?;
+        group.before_compute(&exec.stream)?;
         Ok(&span.reduced)
     }
 }

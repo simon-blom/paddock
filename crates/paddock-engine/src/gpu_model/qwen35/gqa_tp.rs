@@ -666,8 +666,6 @@ impl GqaTpRank {
         logical: &MirroredKv,
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
-        layer: usize,
-        profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         // The span-global metadata (block table, positions, slots, M-RoPE
         // axes) is identical for every GQA layer of one whole-model span:
@@ -676,7 +674,7 @@ impl GqaTpRank {
         // span (or changed slot/position/rows) always re-stages - no stale
         // layer-local state is ever cached.
         self.stage_span_metadata(e, slot, position, rows, logical, span)?;
-        self.span_run(e, group, xn, rows, span, q, layer, profile)
+        self.span_run(e, group, xn, rows, span, q)
     }
 
     /// Validate and upload the span-global metadata ONCE per span: the
@@ -775,7 +773,6 @@ impl GqaTpRank {
     /// norms, M-RoPE, one paged KV append per plane, paged prefill attention,
     /// sigmoid gate and the row-parallel down GEMM into the span's `partial`.
     /// The block table and row metadata were staged by `forward_paged_span`.
-    /// `layer` feeds the probe-only `PADDOCK_TP_ABC_TRACE` stage readbacks.
     #[allow(clippy::too_many_arguments)]
     fn span_run<'a, C: Communicator>(
         &'a mut self,
@@ -785,16 +782,11 @@ impl GqaTpRank {
         rows: usize,
         span: &'a mut SpanGqa,
         q: &mut SpanGemmStaging,
-        layer: usize,
-        mut profile: Option<&mut super::tp_prefill_profile::SpanProfile>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if TpTopology::from_group(group).ok() != Some(self.topology)
             || xn.context().cu_ctx() != e.stream.context().cu_ctx()
         {
             return Err(GqaTpError::Shape("rank or context changed".into()));
-        }
-        if let Some(p) = profile.as_mut() {
-            p.stage(&e.stream, "gqa-local", Some(layer))?;
         }
         let g = self.geometry;
         // One activation preparation for all three projections off the same
@@ -817,14 +809,6 @@ impl GqaTpRank {
             g.local_heads,
             g.head_dim,
         )?;
-        // [PADDOCK_TP_ABC_TRACE] substage readbacks (row 0): the fused Q|gate
-        // shard plus the rank-local Q/K/V shards (compared through the rank
-        // map on the host; gqa-qg pairs odd Q/gate element runs).
-        super::tp_trace::trace_row(e, "b.gqa-qg", layer, &span.qg, 0, 2 * g.q_dim())?;
-        super::tp_trace::trace_row(e, "b.gqa-q", layer, &span.q, 0, g.q_dim())?;
-        super::tp_trace::trace_row(e, "b.gqa-k", layer, &span.k, 0, g.kv_dim())?;
-        super::tp_trace::trace_row(e, "b.gqa-v", layer, &span.v, 0, g.kv_dim())?;
-        super::tp_trace::trace_row(e, "b.gqa-gate", layer, &span.gate, 0, g.q_dim())?;
         e.rmsnorm_batch(
             &span.q,
             &self.qnorm,
@@ -833,15 +817,6 @@ impl GqaTpRank {
             self.eps,
             rows * g.local_heads,
         )?;
-        super::tp_trace::trace_row(e, "b.gqa-qn", layer, &span.qn, 0, g.q_dim())?;
-        super::tp_trace::trace_row_last(
-            e,
-            "b.gqa-qn-last",
-            layer,
-            &span.qn,
-            rows,
-            g.q_dim(),
-        )?;
         e.rmsnorm_batch(
             &span.k,
             &self.knorm,
@@ -849,15 +824,6 @@ impl GqaTpRank {
             g.head_dim,
             self.eps,
             rows * g.local_kv_heads,
-        )?;
-        super::tp_trace::trace_row(e, "b.gqa-kn", layer, &span.kn, 0, g.kv_dim())?;
-        super::tp_trace::trace_row_last(
-            e,
-            "b.gqa-kn-last",
-            layer,
-            &span.kn,
-            rows,
-            g.kv_dim(),
         )?;
         e.mrope(
             &mut span.qn,
@@ -869,12 +835,6 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
-        super::tp_trace::trace_row(e, "b.gqa-rope-q", layer, &span.qn, 0, g.q_dim())?;
-        // [PADDOCK_TP_ABC_TRACE] last-row twin of the rope/attn stages: the
-        // final span row carries the highest text position, the only row
-        // where a four-axis staging bug actually diverges (row 0 sits at
-        // position 0, where all axes agree). Paired with c.gqa-*-last.
-        super::tp_trace::trace_row_last(e, "b.gqa-rope-q-last", layer, &span.qn, rows, g.q_dim())?;
         e.mrope(
             &mut span.kn,
             &span.axes,
@@ -885,8 +845,6 @@ impl GqaTpRank {
             self.yarn,
             self.sections,
         )?;
-        super::tp_trace::trace_row(e, "b.gqa-rope-k", layer, &span.kn, 0, g.kv_dim())?;
-        super::tp_trace::trace_row_last(e, "b.gqa-rope-k-last", layer, &span.kn, rows, g.kv_dim())?;
         let blocks_per_slot = self
             .block_table
             .as_ref()
@@ -923,10 +881,7 @@ impl GqaTpRank {
             self.dtype,
             paged_prefill_policy(g, self.max_ctx, rows, self.dtype),
         )?;
-        super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
-        super::tp_trace::trace_row_last(e, "b.gqa-attn-last", layer, &span.attn, rows, g.q_dim())?;
         e.mul_sigmoid(&mut span.attn, &span.gate, rows * g.q_dim())?;
-        super::tp_trace::trace_row(e, "b.gqa-out", layer, &span.attn, 0, g.q_dim())?;
         backend.project(
             e,
             q,
@@ -941,25 +896,13 @@ impl GqaTpRank {
         // plane is never reduced or consumed (the residual add reads only
         // the live prefix). Collective order is unchanged.
         let live = rows * g.width;
-        if let Some(p) = profile {
-            p.reduce(
-                &e.stream,
-                group,
-                &span.partial.slice(0..live),
-                &mut span.reduced.slice_mut(0..live),
-                0,
-                layer,
-            )
-            .map_err(|err| GqaTpError::Shape(err.to_string()))?;
-        } else {
-            reduce_output(
-                e,
-                group,
-                self.topology,
-                &span.partial.slice(0..live),
-                &mut span.reduced.slice_mut(0..live),
-            )?;
-        }
+        reduce_output(
+            e,
+            group,
+            self.topology,
+            &span.partial.slice(0..live),
+            &mut span.reduced.slice_mut(0..live),
+        )?;
         Ok(&span.reduced)
     }
 }

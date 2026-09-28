@@ -6107,15 +6107,6 @@ impl GpuQwen35 {
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
         // TP1 uses the unified span lane rather than the serial prefill path.
-        // Reuse the same opt-in CUDA-event semantics; whole timing stops before
-        // final norm/head/sampling, matching the TP2 span profiler boundary.
-        let mut profile = super::tp_prefill_profile::enabled(
-            std::env::var("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
-        )
-        .then(|| super::tp_prefill_profile::SerialProfile::new(r));
-        if let Some(p) = profile.as_mut() {
-            p.begin_whole(&exec.stream)?;
-        }
 
         // device inputs (eager buffers; the fused shape is variable -> no graph)
         let mut d_tokens = exec.alloc_u32(r)?;
@@ -6186,14 +6177,6 @@ impl GpuQwen35 {
                 .all(|(si, &v)| !v || shares[si].2 == 0);
 
         for (li, layer) in layers.iter().enumerate() {
-            if let Some(p) = profile.as_mut() {
-                let stage = if matches!(&layer.mixer, Mixer::Full(_)) {
-                    "gqa-local"
-                } else {
-                    "deltanet-local"
-                };
-                p.stage(&exec.stream, stage)?;
-            }
             if let Some(df) = dtap.as_mut()
                 && let Some(band) = df.target_layers.iter().position(|&t| t == li)
             {
@@ -6803,10 +6786,6 @@ impl GpuQwen35 {
                     }
                 }
                 Mixer::Linear(w) => {
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-input-norm-quant")?;
-                        p.stage(&exec.stream, "delta-input-qkv-projection")?;
-                    }
                     // one two-buffer GEMM over the fused plane when
                     // the split route covers it (see the mixed-tick site);
                     // d_z stays untouched until gated_rmsnorm below.
@@ -6924,9 +6903,6 @@ impl GpuQwen35 {
                             &mut sc.d_mixed,
                             r,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-conv-split-prep")?;
                     }
                     // conv SPLITS: decode rows advance their per-slot windows
                     // (1-step); each prefill span runs a window-extended causal
@@ -7118,9 +7094,6 @@ impl GpuQwen35 {
                             state_size,
                         )?;
                     }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-conv-split-gate-prep")?;
-                    }
                     // alpha/beta on the exact f32 repacked path (P6b decay rule)
                     if dn_ab_done {
                         // alpha/beta already landed by the fused f8t in-proj
@@ -7192,9 +7165,6 @@ impl GpuQwen35 {
                             r,
                             n_v_heads,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-recurrent")?;
                     }
                     // recurrence SPLITS: decode = multi-slot 1-step in place;
                     // each prefill span = a scan into its slot's state (base 0
@@ -7396,9 +7366,6 @@ impl GpuQwen35 {
                             state_size,
                         )?;
                     }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-gate-projection")?;
-                    }
                     if let Some(l8) = lw8 {
                         // (alpha/beta read f32 xn directly, nothing clobbers it)
                         if !dn_fused {
@@ -7426,9 +7393,6 @@ impl GpuQwen35 {
                             &mut sc.d_z,
                             r,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-norm-gate")?;
                     }
                     // DN out_proj glue (GDN formulation band):
                     // fused gated-rmsnorm + e4m3 quant on the w8 arm, with
@@ -7466,9 +7430,6 @@ impl GpuQwen35 {
                             state_size,
                             eps,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-output-projection")?;
                     }
                     if let Some(ow_t) = f8t_ow_u {
                         // gr_fused is lw8-gated, so d_core holds the gated
@@ -7566,9 +7527,6 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-            }
-            if let Some(p) = profile.as_mut() {
-                p.stage(&exec.stream, "ffn-local")?;
             }
             let mut proj_is_b16 = false;
             match &layer.ffn {
@@ -8039,9 +7997,6 @@ impl GpuQwen35 {
         }
         // Match TP2's whole-advance boundary: exclude final norm, lm-head,
         // and sampling from the profiled whole-prefill measurement.
-        if let Some(p) = profile {
-            p.finish(&exec.stream)?;
-        }
         exec.rmsnorm_batch(&sc.d_x, &out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         // rotated-basis model: the head is a rotated weight like the rest. On
         // such a model d_h feeds nothing else (no nextn block, no drafter -

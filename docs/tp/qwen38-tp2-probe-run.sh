@@ -6,7 +6,7 @@ set -euo pipefail
 # touched. Worker first (rank 1 over SSH), then rank 0 - matching the
 # probes' own bootstrap order.
 #
-#   PROBE=abc|span   which probe to run (default abc, the current B-vs-C
+#   PROBE=span       the span probe (the abc B-vs-C probe was removed with its trace)
 #                    divergence trace; span is the A-vs-B two-rank probe)
 #   BUILD=1          build the selected probe on rank 0 before launching
 #   TEST_MODE        span only: "one-row" (1/16-row cases, PADDOCK_PROBE_ONE_ROW)
@@ -28,7 +28,7 @@ DEFAULT_ENV_FILE="$SCRIPT_DIR/qwen38-tp2-two-node.env"
 ENV_FILE="${TP_ENV_FILE:-$DEFAULT_ENV_FILE}"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 
-PROBE="${PROBE:-abc}"
+PROBE="${PROBE:-span}"
 BUILD="${BUILD:-0}"
 TEST_MODE="${TEST_MODE:-one-row}"
 TP_DRY_RUN="${DRY_RUN:-${TP_DRY_RUN:-0}}"
@@ -38,9 +38,8 @@ RUN_DIR="$RUN_ROOT/$STAMP"
 
 case "$PROBE" in
   span) PROBE_BIN="qwen35_tp_span_probe" ;;
-  abc) PROBE_BIN="qwen35_tp_abc_probe" ;;
   *)
-    printf 'PROBE must be span or abc (got %s)\n' "$PROBE" >&2
+    printf 'PROBE must be span (got %s)\n' "$PROBE" >&2
     exit 2
     ;;
 esac
@@ -156,8 +155,8 @@ else
 fi
 
 # --- plan values ------------------------------------------------------------
-RANK0_ENV_PREFIX="PADDOCK_TP_ABC_TRACE=1 NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
-RANK1_ENV_PREFIX="PADDOCK_TP_ABC_TRACE=1 NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
+RANK0_ENV_PREFIX="NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
+RANK1_ENV_PREFIX="NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
 if [[ "$PROBE" == "span" ]]; then
   RANK0_ENV_PREFIX="NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME NCCL_IB_HCA=$NCCL_IB_HCA NCCL_IB_DISABLE=$NCCL_IB_DISABLE NCCL_NET=$NCCL_NET"
   RANK1_ENV_PREFIX="$RANK0_ENV_PREFIX"
@@ -282,24 +281,10 @@ emit "infrastructure: $INFRA (rank exit codes only - does not imply the comparis
 # an infrastructure pass AND a comparison failure at once (the c_stages=0
 # run summarized as PASS on exits alone - the failure mode this fixes).
 COMPARISON="INVALID: no probe verdict found in rank0 log"
-if [[ "$PROBE" == "abc" ]]; then
-  if grep -qE '^abc_probe .* b_stages=0( |$)' "$R0_LOG"; then
-    COMPARISON="INVALID: B arm traced zero stages"
-  elif grep -qE '^abc_probe .* c_stages=0( |$)' "$R0_LOG"; then
-    COMPARISON="INVALID: C arm traced zero stages"
-  elif grep -q "first material divergence" "$R0_LOG"; then
-    COMPARISON="DIVERGENCE ($(grep -m1 'first material divergence' "$R0_LOG" | sed 's/^first material divergence: //'))"
-  elif grep -qE "compared_stage_pairs=0" "$R0_LOG"; then
-    COMPARISON="INVALID: zero comparable stage pairs"
-  elif grep -q "no stage exceeded" "$R0_LOG"; then
-    COMPARISON="MATCH (all compared stages within threshold)"
-  fi
-else
-  if grep -q "VIOLATION" "$R0_LOG"; then
-    COMPARISON="DIVERGENCE ($(grep -m1 'VIOLATION' "$R0_LOG" | sed 's/.*span_probe //'))"
-  elif grep -q "span_probe OK" "$R0_LOG"; then
-    COMPARISON="MATCH (all cases within tolerance)"
-  fi
+if grep -q "VIOLATION" "$R0_LOG"; then
+  COMPARISON="DIVERGENCE ($(grep -m1 'VIOLATION' "$R0_LOG" | sed 's/.*span_probe //'))"
+elif grep -q "span_probe OK" "$R0_LOG"; then
+  COMPARISON="MATCH (all cases within tolerance)"
 fi
 emit "comparison: $COMPARISON"
 if [[ "$INFRA" == "PASS" && "$COMPARISON" != INVALID* ]]; then
@@ -311,12 +296,7 @@ else
 fi
 emit ""
 emit "--- probe result lines (rank0) ---"
-grep -E "span_probe|abc_probe|compared_stage_pairs|unmatched_[bc]_stages|first material divergence|no stage exceeded|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
-if [[ "$PROBE" == "abc" ]]; then
-  emit ""
-  emit "--- B-C per-layer trace (rank0) ---"
-  grep -E "^layer +[0-9]+ |final-norm|first material divergence|no stage exceeded|compared_stage_pairs|unmatched_[bc]_stages" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
-fi
+grep -E "span_probe|VIOLATION|max_abs" "$R0_LOG" >> "$SUMMARY" 2>/dev/null || true
 emit ""
 emit "--- WARN/ERROR/VIOLATION lines ---"
 grep -hE "WARN|ERROR|VIOLATION|panic|Error" "$R0_LOG" "$R1_LOG" >> "$SUMMARY" 2>/dev/null || true

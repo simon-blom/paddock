@@ -794,7 +794,6 @@ impl GpuQwen35 {
         let bs_w8_all = &self.bs_w8;
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
-        let profile: Option<super::tp_prefill_profile::SerialProfile> = None;
 
         // The window-extended conv stages [window | span] through the shared
         // ext buffers, which are sized for a typical resumed tail. A wider one
@@ -1749,9 +1748,6 @@ impl GpuQwen35 {
             }
         }
 
-        if let Some(p) = profile {
-            p.finish(&exec.stream)?;
-        }
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
         // rotated-basis model: the head reads the rotated row; d_h stays in
@@ -1861,16 +1857,6 @@ impl GpuQwen35 {
         let nv4_min = proj_nv4_min_batch();
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
-        let mut profile = if super::tp_prefill_profile::enabled(
-            paddock_models::dev_var!("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
-        ) {
-            let mut p = super::tp_prefill_profile::SerialProfile::new(r);
-            p.begin_whole(&exec.stream)?;
-            p.stage(&exec.stream, "other")?;
-            Some(p)
-        } else {
-            None
-        };
 
         embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
 
@@ -1900,16 +1886,6 @@ impl GpuQwen35 {
             // xn below - same seam as the FFN post-norm cut. xn still
             // written (alpha/beta + reuse comments hold).
             let entry_fused = lnv4.is_none() && lw8.is_some() && exec.has_add_rmsnorm_e4m3_xn();
-            if let Some(p) = profile.as_mut() {
-                p.stage(
-                    &exec.stream,
-                    if matches!(&layer.mixer, Mixer::Full(_)) {
-                        "gqa-local"
-                    } else {
-                        "delta-prelude"
-                    },
-                )?;
-            }
             if entry_fused {
                 exec.add_rmsnorm_e4m3_xn(
                     &mut sc.d_x,
@@ -2228,9 +2204,6 @@ impl GpuQwen35 {
                     }
                 }
                 Mixer::Linear(w) => {
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-input-norm-quant")?;
-                    }
                     // input quantized by the fused attn_norm above (P6k)
                     if let Some(l4) = lnv4 {
                         // nvf4-quant the normed hidden once; it feeds in_qkv AND
@@ -2262,9 +2235,6 @@ impl GpuQwen35 {
                             r,
                         )?;
                     } else {
-                        if let Some(p) = profile.as_mut() {
-                            p.stage(&exec.stream, "delta-input-qkv-projection")?;
-                        }
                         prefill_mm_pre_any(
                             &exec,
                             &w.in_qkv,
@@ -2277,9 +2247,6 @@ impl GpuQwen35 {
                             &mut sc.d_mixed,
                             r,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-conv-split-prep")?;
                     }
                     // window-extended conv (the spec-path pattern): rows =
                     // [slot's window | this chunk], conv over km1+r, keep the
@@ -2397,9 +2364,6 @@ impl GpuQwen35 {
                             n_v_heads,
                         )?;
                     }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-recurrent")?;
-                    }
                     prefill_delta_recurrent(
                         &exec,
                         sc,
@@ -2410,9 +2374,6 @@ impl GpuQwen35 {
                         state_size,
                         false,
                     )?;
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-gate-projection")?;
-                    }
                     // d_xn/d_pxq/d_exs (or d_yq on the Q8 path) untouched since
                     // in_qkv's quant: reuse the same e4m3 activations for gate_w.
                     if let Some(l4) = lnv4 {
@@ -2451,9 +2412,6 @@ impl GpuQwen35 {
                             r,
                         )?;
                     }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-norm-gate")?;
-                    }
                     // DN out_proj glue: gated norm + e4m3 quant in one pass
                     // on the w8 arm (scale math bit-matches the standalone
                     // quantize; f32 core still written for fallbacks).
@@ -2480,9 +2438,6 @@ impl GpuQwen35 {
                             state_size,
                             eps,
                         )?;
-                    }
-                    if let Some(p) = profile.as_mut() {
-                        p.stage(&exec.stream, "delta-output-projection")?;
                     }
                     if let Some(l4) = lnv4 {
                         exec.quantize_nvf4(
@@ -2564,9 +2519,6 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-            }
-            if let Some(p) = profile.as_mut() {
-                p.stage(&exec.stream, "ffn-local")?;
             }
             // residual add + post_norm + gate/up quantize in one pass (P6k);
             // xn skipped - the ffn quantize is its only consumer here
@@ -2940,9 +2892,6 @@ impl GpuQwen35 {
             }
         }
 
-        if let Some(p) = profile {
-            p.finish(&exec.stream)?;
-        }
         exec.rmsnorm_batch(&sc.d_x, &self.out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         exec.copy_region(&sc.d_h, (r - 1) * embd, &mut sc.d_xn, 0, embd)?;
         // rotated-basis model: the head reads the rotated row; d_h stays in
