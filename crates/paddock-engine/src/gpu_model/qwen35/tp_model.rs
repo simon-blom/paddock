@@ -1,4 +1,4 @@
-//! Eager whole-backbone TP=2 path shared by parity and serving.
+//! Eager whole-backbone tensor-parallel path shared by parity and serving.
 //!
 //! The accepted FFN, GQA/paged-KV and DeltaNet rank-local primitives are
 //! composed with replicated embeddings, norms and lm_head. KV and recurrent
@@ -19,6 +19,7 @@ use crate::{
     gpu::distributed::{CollectiveError, Communicator},
     gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, QuantW},
     gpu_model::gpt_oss::GpuModelError,
+    gpu_model::tp::TpTopology,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -50,13 +51,13 @@ struct TpLayer {
     ffn: FfnTpRank,
 }
 
-/// One process's rank-local model path for deterministic TP=2 parity.
+/// One process's rank-local model path for deterministic tensor parallelism.
 /// Inputs are fed one token at a time; CUDA graphs, speculation, scheduler
 /// concurrency, and offload are deliberately not part of this API. The
 /// optional feedback primitive samples rank 0's device-resident logits.
 pub struct Qwen35TpRank {
     exec: Arc<GpuExecutor>,
-    rank: usize,
+    topology: TpTopology,
     hidden: usize,
     vocab: usize,
     max_ctx: usize,
@@ -160,13 +161,11 @@ impl Qwen35TpRank {
         {
             return Err(Qwen35TpError::Shape("unsupported TP slot geometry".into()));
         }
-        if group.world_size() != 2
-            || group.rank() >= 2
-            || max_ctx == 0
-            || max_ctx > u32::MAX as usize
-        {
+        let topology = TpTopology::from_group(group)
+            .map_err(|e| Qwen35TpError::Shape(e.to_string()))?;
+        if topology.world_size() < 2 || max_ctx == 0 || max_ctx > u32::MAX as usize {
             return Err(Qwen35TpError::Shape(
-                "requires TP=2, rank 0/1 and a nonempty u32 context".into(),
+                "requires TP>=2 and a nonempty u32 context".into(),
             ));
         }
         let u = |key: &str| -> Result<usize, Qwen35TpError> {
@@ -279,7 +278,7 @@ impl Qwen35TpRank {
             graphs: TpGraphs::default(),
             graphs_enabled: false,
             exec,
-            rank: group.rank(),
+            topology,
             hidden,
             vocab,
             max_ctx,
@@ -302,7 +301,7 @@ impl Qwen35TpRank {
     /// per slot; both slots' first DeltaNet run is captured lazily. The
     /// prefill lane is never captured.
     pub fn enable_tp_graphs<C: Communicator>(&mut self, group: &C) -> Result<(), Qwen35TpError> {
-        if self.rank != group.rank() || group.world_size() != 2 {
+        if TpTopology::from_group(group).ok() != Some(self.topology) {
             return Err(Qwen35TpError::Shape(
                 "rank changed under graph enable".into(),
             ));
@@ -413,7 +412,11 @@ impl Qwen35TpRank {
     }
 
     pub fn rank(&self) -> usize {
-        self.rank
+        self.topology.rank()
+    }
+
+    pub fn topology(&self) -> TpTopology {
+        self.topology
     }
     pub fn vocab(&self) -> usize {
         self.vocab
@@ -430,7 +433,7 @@ impl Qwen35TpRank {
     /// This rank's context-state bytes, exactly (Phase 12 rank-local memory
     /// accounting): each full-attn layer's rank-local K/V slab pair plus each
     /// DeltaNet layer's rank-local recurrent/conv state and checkpoint pool. Identical on
-    /// both ranks by construction (the shard geometry is symmetric), so the
+    /// all ranks by construction (the shard geometry is symmetric), so the
     /// service's memory-breakdown API can report "per rank" honestly without
     /// any cross-rank query.
     pub fn context_mem_bytes(&self) -> u64 {
@@ -444,7 +447,7 @@ impl Qwen35TpRank {
     }
 
     pub fn supports_device_sampling(&self) -> bool {
-        self.rank == 0 && self.exec.has_sample_rows()
+        self.topology.rank() == 0 && self.exec.has_sample_rows()
     }
 
     pub fn synchronize(&self) -> Result<(), Qwen35TpError> {
@@ -496,7 +499,7 @@ impl Qwen35TpRank {
         slot: usize,
         plan: crate::sampler::DevicePlan,
     ) -> Result<u32, Qwen35TpError> {
-        if self.rank != 0 || !self.exec.has_sample_rows() {
+        if self.topology.rank() != 0 || !self.exec.has_sample_rows() {
             return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
         }
         let params = tp_sample_params(plan)?;
@@ -521,7 +524,7 @@ impl Qwen35TpRank {
     }
 
     /// Rank 0 enqueues one token forward WITHOUT any logits readback or
-    /// device sample: rank 1 must execute the matching `forward_token_worker_slot`
+    /// device sample: every worker rank must execute the matching `forward_token_worker_slot`
     /// for the collectives to pair. Logits stay in `self.logits`; a separate
     /// sampled pass reads them (see `sample_logits_slot`).
     pub fn forward_token_enqueue<C: Communicator>(
@@ -532,8 +535,7 @@ impl Qwen35TpRank {
         position: usize,
         slot: usize,
     ) -> Result<(), Qwen35TpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
+        if TpTopology::from_group(group).ok() != Some(self.topology)
             || position >= self.max_ctx
             || slot >= self.slots
         {
@@ -547,14 +549,14 @@ impl Qwen35TpRank {
     }
 
     /// Sample the resident `self.logits` row on device after a
-    /// `forward_token_enqueue`. Rank 1 must run the matching step via
+    /// `forward_token_enqueue`. Every worker rank must run the matching step via
     /// `forward_token_worker_slot` (its state advance pairs the collectives;
     /// it never samples).
     pub fn sample_logits_slot(
         &mut self,
         plan: crate::sampler::DevicePlan,
     ) -> Result<u32, Qwen35TpError> {
-        if self.rank != 0 || !self.exec.has_sample_rows() {
+        if self.topology.rank() != 0 || !self.exec.has_sample_rows() {
             return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
         }
         let params = tp_sample_params(plan)?;
@@ -578,7 +580,7 @@ impl Qwen35TpRank {
     }
 
     /// Worker-side execution: all collectives and state advance, but no
-    /// replicated full-vocabulary device-to-host transfer on rank 1.
+    /// replicated full-vocabulary device-to-host transfer on worker ranks.
     pub fn forward_token_worker<C: Communicator>(
         &mut self,
         group: &C,
@@ -597,9 +599,9 @@ impl Qwen35TpRank {
         position: usize,
         slot: usize,
     ) -> Result<(), Qwen35TpError> {
-        if self.rank != 1 {
+        if self.topology.rank() == 0 {
             return Err(Qwen35TpError::Shape(
-                "worker forward requires rank 1".into(),
+                "worker forward requires a non-coordinator rank".into(),
             ));
         }
         self.forward_token_gpu(group, logical_kv, token, position, slot)?;
@@ -608,7 +610,7 @@ impl Qwen35TpRank {
     }
 
     /// Rank 0 enqueues a host-token forward and samples into a chosen plane.
-    /// Rank 1 executes the matching step via `forward_token_worker_slot`.
+    /// Every worker rank executes the matching step via `forward_token_worker_slot`.
     /// The completion event does not synchronize the host.
     pub fn forward_host_to_feedback<C: Communicator>(
         &mut self,
@@ -630,12 +632,12 @@ impl Qwen35TpRank {
         self.sample_feedback(slot, plane)
     }
 
-    /// Both ranks call in identical order after rank 0's source plane was
-    /// sampled. NCCL sends that one ID to rank 1; the embedding input is a
+    /// All ranks call in identical order after rank 0's source plane was
+    /// sampled. NCCL sends that one ID to worker ranks; the embedding input is a
     /// stream-ordered device copy into persistent `token` scratch, not an
     /// upload/readback. Only rank 0 samples the alternate plane.
     /// The coordinator must drain/read a plane before reusing it, and must
-    /// authorize matching slot/position/plane parameters on both ranks.
+    /// authorize matching slot/position/plane parameters on every rank.
     pub fn forward_feedback_to_feedback<C: Communicator>(
         &mut self,
         group: &C,
@@ -653,10 +655,10 @@ impl Qwen35TpRank {
                 "feedback planes must alternate".into(),
             ));
         }
-        if group.rank() != self.rank || group.world_size() != 2 || position >= self.max_ctx {
+        if TpTopology::from_group(group).ok() != Some(self.topology) || position >= self.max_ctx {
             return Err(Qwen35TpError::Shape("rank or position changed".into()));
         }
-        if self.rank == 0 {
+        if self.topology.rank() == 0 {
             let params = tp_sample_params(plan)?;
             self.exec
                 .stream
@@ -667,7 +669,7 @@ impl Qwen35TpRank {
         group.broadcast(&mut self.feedback_ids[slot][source_plane], 0)?;
         group.before_compute(&self.exec.stream)?;
         self.forward_device_feedback(group, logical_kv, position, slot, source_plane)?;
-        if self.rank == 0 {
+        if self.topology.rank() == 0 {
             Ok(Some(self.sample_feedback(slot, next_plane)?))
         } else {
             Ok(None)
@@ -699,7 +701,7 @@ impl Qwen35TpRank {
         sampling: bool,
     ) -> Result<(), Qwen35TpError> {
         check_feedback_plane(self.slots, slot, plane)?;
-        if sampling && (self.rank != 0 || !self.exec.has_sample_rows()) {
+        if sampling && (self.topology.rank() != 0 || !self.exec.has_sample_rows()) {
             return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
         }
         Ok(())
@@ -763,8 +765,7 @@ impl Qwen35TpRank {
         position: usize,
         slot: usize,
     ) -> Result<(), Qwen35TpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
+        if TpTopology::from_group(group).ok() != Some(self.topology)
             || position >= self.max_ctx
             || slot >= self.slots
         {
@@ -780,7 +781,7 @@ impl Qwen35TpRank {
     /// Setup-time graph-mode decision (rank 0 / coordinator only). Reads the
     /// experimental dev switch (`PADDOCK_TP_GRAPH=1`; `dev_var!` keeps it out
     /// of hardened builds entirely) ONCE during serving setup. The resolved
-    /// value is composed into `TpInit` for the worker and - on both ranks -
+    /// value is composed into `TpInit` for the worker and - on all ranks -
     /// becomes model state via `enable_tp_graphs`. Execution NEVER reads this
     /// function: token forwards consult the stored `graphs_enabled` field
     /// (upstream-readiness I4), so a serving rank's sequencing is fixed
@@ -1069,7 +1070,7 @@ impl Qwen35TpRank {
     }
 
     /// Advance one slot's contiguous prompt rows through the batched
-    /// embedding and all model layers. Both ranks must call with matching
+    /// embedding and all model layers. All ranks must call with matching
     /// slot, positions and row count so their collectives pair; KV and
     /// DeltaNet state advance once per row. This skips final norm, LM head
     /// and logits readback. A finishing caller may then invoke
@@ -1083,8 +1084,7 @@ impl Qwen35TpRank {
         tokens: &[u32],
         position: usize,
     ) -> Result<(), Qwen35TpError> {
-        if group.world_size() != 2
-            || group.rank() != self.rank
+        if TpTopology::from_group(group).ok() != Some(self.topology)
             || slot >= self.slots
             || position >= self.max_ctx
         {
@@ -1101,10 +1101,10 @@ impl Qwen35TpRank {
             return Err(Qwen35TpError::Shape("span exceeds the context".into()));
         }
         // The GQA span path appends through the mirrored pool, so every page
-        // the span touches must be live on both ranks before the collectives
+        // the span touches must be live on all ranks before the collectives
         // pair. Validate (and implicitly require the caller to have ensured)
         // the LAST position's coverage once up front; the per-layer path
-        // re-validates identically on both ranks.
+        // re-validates identically on all ranks.
         if let Some(TpMixer::Full(gqa)) = self
             .layers
             .iter()
@@ -1130,7 +1130,7 @@ impl Qwen35TpRank {
         let mut profile = if super::tp_prefill_profile::enabled(
             paddock_models::dev_var!("PADDOCK_TP_PREFILL_PROFILE").ok().as_deref(),
         ) {
-            let mut p = super::tp_prefill_profile::SpanProfile::new(self.rank, rows);
+            let mut p = super::tp_prefill_profile::SpanProfile::new(self.topology.rank(), rows);
             p.begin_whole(&self.exec.stream)?;
             Some(p)
         } else {
@@ -1161,9 +1161,9 @@ impl Qwen35TpRank {
     /// over the span's residual rows and the LM-head projection of the LAST
     /// row into resident `logits`. No synchronization, no readback - the
     /// caller samples resident logits (`sample_logits_slot`) or reads them
-    /// back later. Rank 0 calls this exactly once per prompt - on the final
+    /// back later. The coordinator calls this exactly once per prompt - on the final
     /// span, immediately after that span's `forward_span_advance`. The head
-    /// enters no collective, so rank 1 never calls it; only the traversal
+    /// enters no collective, so worker ranks never call it; only the traversal
     /// halves pair across ranks. `rows` must match the advance that just
     /// ran (the head normalizes the residual plane the advance left behind).
     pub fn forward_span_head_enqueue(&mut self, rows: usize) -> Result<(), Qwen35TpError> {
@@ -1429,7 +1429,7 @@ impl Qwen35TpRank {
     /// decode lane's device buffers), and every scratch plane is freshly
     /// allocated there. GQA paged KV, DeltaNet recurrent/conv payloads and
     /// per-layer working buffers are lane-local, indexed by the SAME slot
-    /// ids the coordinator authorizes; they start zeroed. Both ranks build
+    /// ids the coordinator authorizes; they start zeroed. All ranks build
     /// a lane so the prefill collectives pair; only rank 0 ever samples.
     pub fn enable_prefill_lane<C: Communicator>(
         &mut self,
@@ -1439,9 +1439,9 @@ impl Qwen35TpRank {
         if self.prefill.is_some() {
             return Ok(());
         }
-        if group.rank() != self.rank {
+        if TpTopology::from_group(group).ok() != Some(self.topology) {
             return Err(Qwen35TpError::Shape(
-                "rank changed under the lane fork".into(),
+                "topology changed under the lane fork".into(),
             ));
         }
         // fork_stream synchronizes the decode stream internally before
@@ -1475,7 +1475,7 @@ impl Qwen35TpRank {
         .map_err(|_| Qwen35TpError::Shape("paged KV block count overflow".into()))?;
         let mut lane = Qwen35TpRank {
             exec: lane_exec.clone(),
-            rank: self.rank,
+            topology: self.topology,
             hidden: self.hidden,
             vocab: self.vocab,
             max_ctx: self.max_ctx,
@@ -1668,14 +1668,14 @@ impl Qwen35TpRank {
         // like `prefill_lane_finisher`'s contract.
         lane.model.forward_span_head_enqueue(rows)?;
         let Some(plan) = plan else {
-            // Host-finisher path (rank 1, or planless): park a probe event
+            // Host-finisher path (worker rank, or planless): park a probe event
             // so `prefill_lane_done` tracks this enqueue on every rank.
             let probe = lane.model.exec.record_event()?;
             let ev = lane.model.exec.record_event()?;
             lane.event = probe;
             return Ok(ev);
         };
-        if self.rank != 0 || !self.exec.has_sample_rows() {
+        if self.topology.rank() != 0 || !self.exec.has_sample_rows() {
             return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
         }
         let params = tp_sample_params(plan)?;
@@ -1722,14 +1722,14 @@ impl Qwen35TpRank {
         }
         Self::fence_lane_drained(lane)?;
         let Some(plan) = plan else {
-            // Host-finisher path (rank 1, or planless): park a probe event
+            // Host-finisher path (worker rank, or planless): park a probe event
             // so `prefill_lane_done` tracks this enqueue on every rank.
             let probe = lane.model.exec.record_event()?;
             let ev = lane.model.exec.record_event()?;
             lane.event = probe;
             return Ok(ev);
         };
-        if self.rank != 0 || !self.exec.has_sample_rows() {
+        if self.topology.rank() != 0 || !self.exec.has_sample_rows() {
             return Err(Qwen35TpError::Shape("TP device sampler unavailable".into()));
         }
         let params = tp_sample_params(plan)?;
@@ -1829,7 +1829,7 @@ impl Qwen35TpRank {
     }
 
     /// Record an event on the lane stream marking everything enqueued so
-    /// far. Both ranks call this after `prefill_lane_join` to hand
+    /// far. All ranks call this after `prefill_lane_join` to hand
     /// `promote_lane_slot` a completion marker (the join already guarantees
     /// it fires immediately; the device-side wait keeps the promotion
     /// contract uniform across ranks).
@@ -1842,7 +1842,7 @@ impl Qwen35TpRank {
     }
 
     /// Promote one finished prefill slot's lane-local state onto the decode
-    /// executor (rank 0, after the span join; both ranks in identical order
+    /// executor (rank 0, after the span join; all ranks in identical order
     /// on their own executors).
     ///
     /// The lane's KV slab and DeltaNet slot state are private allocations
