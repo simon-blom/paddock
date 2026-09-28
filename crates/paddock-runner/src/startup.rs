@@ -947,7 +947,7 @@ pub fn run() -> std::process::ExitCode {
         return crate::service::dispatch(action);
     }
 
-    // --- Tensor-parallel worker child (rank 1) ------------------------------
+    // --- Tensor-parallel worker child (nonzero rank) -------------------------
     //
     // A coordinator-spawned worker enters here INSTEAD of config resolution:
     // it serves nothing (no HTTP, no model scan, no banner). For Phase 9,
@@ -1146,7 +1146,7 @@ pub fn run() -> std::process::ExitCode {
     };
     if let Some(resolved) = tp.filter(|r| r.tp_size > 1) {
         // Phase 9 only implements the pinned, eager, serial Qwen3.8 lane.
-        // Refuse unsupported configurations before joining rank 1: never
+        // Refuse unsupported configurations before joining worker ranks: never
         // acknowledge a TP pair and then quietly fall back to TP=1.
         // Phase 12 widens the KV dtype arm: fp8_e4m3 is accepted here and
         // resolved against THIS device engine-side (rank 0 demotes loudly to
@@ -1160,7 +1160,7 @@ pub fn run() -> std::process::ExitCode {
         }
         // PADDOCK_TP_NO_SPAWN is a dev/ops knob (dev builds only: the
         // hardened seal removes it) that skips the local child spawn so a
-        // two-node start can wait for an SSH-started worker.
+        // manual/remote start can wait for explicitly placed workers.
         // Automatic local placement is retained only for the legacy TP=2
         // path. Larger worlds require explicit worker processes so each rank
         // can choose its local GPU independently; topology must not imply

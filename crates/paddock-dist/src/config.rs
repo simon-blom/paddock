@@ -134,10 +134,8 @@ impl ParallelConfig {
 
     /// Validate into a concrete role, or `None` for the historical
     /// single-process path. `serving_mode` is true when this process would
-    /// bind the HTTP API - a rank-1 worker never does (the runner passes
-    /// false only for its own spawned worker child, marked by
-    /// [`WORKER_CHILD_ENV`]; a user-set `PADDOCK_TP_RANK=1` on an
-    /// interactive run is refused, not silently demoted).
+    /// bind the HTTP API - nonzero worker ranks never do (the runner passes
+    /// false only for an explicit/spawned worker process).
     pub fn resolved(&self, serving_mode: bool) -> Result<Option<Resolved>, ParallelConfigError> {
         match (self.tp_size, self.rank) {
             (None, None) => Ok(None),

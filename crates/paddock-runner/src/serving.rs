@@ -1608,7 +1608,7 @@ pub(crate) fn load_with_residency(
     {
         return Err(ServeError::Open(
             path.to_path_buf(),
-            "TP=2 requires up to two CUDA text slots of Qwen3.8 GGUF without companions".into(),
+            "TP requires up to two CUDA text slots of Qwen3.8 GGUF without companions".into(),
         ));
     }
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
@@ -1654,7 +1654,7 @@ pub(crate) fn load_with_residency(
     if tp.is_some() && arch != "qwen35" {
         return Err(ServeError::Open(
             path.to_path_buf(),
-            format!("TP=2 serving requires the Qwen3.8 qwen35 architecture, got {arch}"),
+            format!("TP serving requires the Qwen3.8 qwen35 architecture, got {arch}"),
         ));
     }
 

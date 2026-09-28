@@ -133,9 +133,129 @@ fn read_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paddock_dist::{
+        config::{RankRole, Resolved},
+        worker::WorkerControl,
+    };
+    use std::net::{TcpListener, TcpStream};
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (head, _) = listener.accept().unwrap();
+        (head, peer)
+    }
+
+    fn tp4() -> Resolved {
+        Resolved {
+            tp_size: 4,
+            rank: 0,
+            role: RankRole::Coordinator,
+            master_addr: "127.0.0.1".into(),
+            master_port: 11560,
+        }
+    }
+
+    fn tp4_workers() -> (WorkerSet, Vec<(usize, TcpStream)>) {
+        let mut controls = Vec::new();
+        let mut peers = Vec::new();
+        // Deliberately unsorted: WorkerSet owns canonical rank ordering.
+        for rank in [3usize, 1, 2] {
+            let (head, peer) = pair();
+            controls.push(WorkerControl { rank, stream: head });
+            peers.push((rank, peer));
+        }
+        let workers = WorkerSet::new(
+            controls,
+            &tp4(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        (workers, peers)
+    }
 
     #[test]
     fn ack_kind_is_phase_specific() {
         assert_ne!(AckKind::Ready, AckKind::Prepared);
+    }
+
+    #[test]
+    fn worker_set_sorts_and_broadcasts_to_every_tp4_rank() {
+        let (mut workers, mut peers) = tp4_workers();
+        assert_eq!(workers.ranks().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        workers
+            .broadcast(&ControlMessage::TpReset {
+                sequence: 9,
+                kv_event: serde_json::json!({"epoch": 1}),
+            })
+            .unwrap();
+
+        peers.sort_by_key(|(rank, _)| *rank);
+        for (rank, peer) in &mut peers {
+            match ControlMessage::from_stream(peer).unwrap() {
+                ControlMessage::TpReset { sequence, .. } => assert_eq!(sequence, 9),
+                other => panic!("rank {rank} received wrong command: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn worker_set_barrier_requires_ack_from_every_tp4_rank() {
+        let (mut workers, mut peers) = tp4_workers();
+        for (_, peer) in &mut peers {
+            ControlMessage::TpPrepared { sequence: 11 }
+                .to_stream(peer)
+                .unwrap();
+        }
+        workers.prepared(11).unwrap();
+
+        for (_, peer) in &mut peers {
+            ControlMessage::TpReady { sequence: 12 }
+                .to_stream(peer)
+                .unwrap();
+        }
+        workers.ready(12).unwrap();
+    }
+
+    #[test]
+    fn worker_set_reports_the_failing_rank() {
+        let (mut workers, mut peers) = tp4_workers();
+        peers.sort_by_key(|(rank, _)| *rank);
+        ControlMessage::TpPrepared { sequence: 4 }
+            .to_stream(&mut peers[0].1)
+            .unwrap();
+        ControlMessage::TpError {
+            reason: "mirror diverged".into(),
+        }
+        .to_stream(&mut peers[1].1)
+        .unwrap();
+        ControlMessage::TpPrepared { sequence: 4 }
+            .to_stream(&mut peers[2].1)
+            .unwrap();
+
+        let err = workers.prepared(4).unwrap_err();
+        assert!(err.contains("rank 2"), "{err}");
+        assert!(err.contains("mirror diverged"), "{err}");
+    }
+
+    #[test]
+    fn worker_set_rejects_missing_or_duplicate_membership() {
+        let (h1, _p1) = pair();
+        let (h2, _p2) = pair();
+        let err = match WorkerSet::new(
+            vec![
+                WorkerControl { rank: 1, stream: h1 },
+                WorkerControl { rank: 1, stream: h2 },
+            ],
+            &tp4(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ) {
+            Ok(_) => panic!("duplicate/missing worker ranks must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("worker set mismatch"), "{err}");
     }
 }

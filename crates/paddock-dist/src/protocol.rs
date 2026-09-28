@@ -92,7 +92,7 @@ pub enum ControlMessage {
         /// Coordinator-assigned group/session id, shared by the TP world.
         session: u64,
     },
-    /// Rank 0 -> rank 1, reply to Hello. Refuses the connection.
+    /// Rank 0 -> worker, reply to Hello. Refuses the connection.
     Reject {
         /// Human-readable reason (world-size mismatch, version mismatch...).
         reason: String,
@@ -116,8 +116,8 @@ pub enum ControlMessage {
         max_ctx: usize,
         slots: usize,
         /// KV cache dtype for BOTH ranks (Phase 12 per-layer KV types: the
-        /// TP=2 path serves fp8-e4m3 KV where the device supports it, like
-        /// TP=1). `"fp16"` or `"fp8_e4m3"`; anything else fails rank 1's
+        /// TP path serves fp8-e4m3 KV where the device supports it, like
+        /// TP=1). `"fp16"` or `"fp8_e4m3"`; anything else fails each worker's
         /// identity check closed before NCCL init. Rank 0 resolves the
         /// runner's `PADDOCK_KV_CACHE_DTYPE` gate (including its sm_89
         /// device check) and sends the resolved value, so the ranks can
@@ -125,18 +125,18 @@ pub enum ControlMessage {
         kv_dtype: String,
         /// CUDA-graph mode for BOTH ranks (upstream-readiness I4). Rank 0
         /// resolves `PADDOCK_TP_GRAPH` on the coordinator and sends the
-        /// resolved value; rank 1 must not read that variable itself, so a
+        /// resolved value; worker ranks must not read that variable itself, so a
         /// hand-started remote worker cannot disagree with rank 0 about
         /// graphed/eager sequencing (a mispair hangs the collectives).
         use_graphs: bool,
         /// DeltaNet checkpoint-pool slots per layer for the mirrored prefix
         /// cache (v4). Rank 0 resolves the capacity (default 4; 0 disables
-        /// resume entirely) and both ranks size their state pools + radix
+        /// resume entirely) and all ranks size their state pools + radix
         /// free-lists from THIS value, so the pools can never disagree.
         ckpt_slots: u32,
         /// The coordinator-resolved TP prefill span row cap (v6): the
         /// maximum contiguous prompt rows one whole-model span advance
-        /// processes. Both ranks chunk every run from THIS value (the
+        /// processes. All ranks chunk every run from THIS value (the
         /// worker never reads `PADDOCK_TP_SPAN_CAP` itself), so a
         /// hand-started remote worker cannot pair a different span geometry
         /// and desynchronize the collectives.
@@ -199,7 +199,7 @@ pub enum ControlMessage {
         next_plane: usize,
         kv_state: serde_json::Value,
     },
-    /// Fence the final tick on both ranks before slot release or reuse.
+    /// Fence the final tick on all ranks before slot release or reuse.
     TpPipeDrain {
         sequence: u64,
     },
@@ -224,7 +224,7 @@ pub enum ControlMessage {
         kv_state: serde_json::Value,
     },
     /// Fence the in-flight span: join both lanes, promote each finished
-    /// slot's lane-local state lane->decode (both ranks, own executors), and
+    /// slot's lane-local state lane->decode (all ranks, own executors), and
     /// read the finisher result on rank 0 before any release/reset/reuse.
     TpSpanFinish {
         sequence: u64,
@@ -251,7 +251,7 @@ pub enum ControlMessage {
         slot: usize,
         tokens: Vec<u32>,
         resume: usize,
-        /// Ordered cuts reserved by rank 0; rank 1 reserves the same cuts
+        /// Ordered cuts reserved by rank 0; every worker reserves the same cuts
         /// before comparing the mirrored logical state.
         cuts: Vec<usize>,
         kv_state: serde_json::Value,
@@ -259,7 +259,7 @@ pub enum ControlMessage {
     /// Prefix-cache publication (v4): attach the checkpoint indices the
     /// prefill snapshotted (in cut order), publish the prompt's full pages,
     /// then recycle any reservation that was not attached. `kv_state` is the
-    /// end-of-tick mirror snapshot. Both ranks run the publication only
+    /// end-of-tick mirror snapshot. All ranks run the publication only
     /// after their rank-local GPU snapshot succeeded, so an attached
     /// checkpoint always has real state behind it on every rank.
     TpPrefixPublish {
@@ -385,13 +385,13 @@ pub fn handshake_rank(
 /// `TpInit` carries the coordinator-resolved CUDA-graph mode (I4).
 ///
 /// Version 3: `TpMixed` carries `chunk_rows` (the trailing prompt-run length
-/// the worker must execute as batched span prefill), keeping both ranks'
+/// the worker must execute as batched span prefill), keeping all ranks'
 /// span geometry host-derived from one wire value.
 ///
 /// Version 4: prefix-cache resume. `TpInit` carries the coordinator-resolved
 /// DeltaNet checkpoint-pool capacity (`ckpt_slots`); `TpPrefixAdmit` carries
 /// the full prompt tokens plus the coordinator's block-aligned resume
-/// decision (validated independently on both ranks inside `Operation::Admit`
+/// decision (validated independently on all ranks inside `Operation::Admit`
 /// before either rank adopts); `TpPrefixPublish` attaches the post-prefill
 /// checkpoint indices and publishes the full pages. Logical identity only -
 /// no physical page ids ever travel.
