@@ -8,7 +8,7 @@ use cudarc::driver::CudaSlice;
 use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{gemv_any, prefill_attn, read_sections};
+use super::ops::{gemv_any, pf_attn_dtype_ok, read_sections};
 use crate::tp::cache::MirroredKv;
 use super::tp_prefill_backend::Qwen35PrefillBackend;
 use crate::gpu::distributed::{CollectiveError, Communicator};
@@ -17,7 +17,7 @@ use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::tp::prefill::ProjectionPrefillBackend;
 use crate::tp::attention::{
     decode_paged, AttentionTpError, AttentionTpWeights, AttentionWeightNames, GqaPartition,
-    PagedAttentionTable, PagedKvBatch, reduce_output,
+    PagedAttentionTable, PagedKvBatch, PagedPrefillPolicy, prefill_paged, reduce_output,
 };
 use crate::tp::TpTopology;
 use crate::kv_pool::BLOCK_TOKENS;
@@ -93,6 +93,24 @@ impl GqaGeometry {
         max_ctx
             .checked_mul(self.kv_dim())?
             .checked_mul(dtype.bytes())
+    }
+}
+
+/// Qwen's measured span and KV-dtype thresholds; generic TP executes the
+/// selected paged prefill class or falls back when a kernel is unavailable.
+fn paged_prefill_policy(
+    g: GqaGeometry,
+    max_ctx: usize,
+    rows: usize,
+    dtype: KvDtype,
+) -> PagedPrefillPolicy {
+    let long = rows > 24;
+    PagedPrefillPolicy {
+        f16: long
+            && g.head_dim == 256
+            && max_ctx.is_multiple_of(64)
+            && pf_attn_dtype_ok(dtype, g.local_heads, g.local_kv_heads),
+        tiled: long && (g.head_dim == 128 || g.head_dim == 256),
     }
 }
 
@@ -885,7 +903,7 @@ impl GqaTpRank {
         )?;
         kv.append(e, &span.kn, &span.v, &mut self.kc, &mut self.vc)?;
         let (bt, blocks_per_slot) = kv.table();
-        prefill_attn(
+        prefill_paged(
             e,
             &span.qn,
             &self.kc,
@@ -894,16 +912,16 @@ impl GqaTpRank {
             &mut span.attn,
             &span.positions,
             &span.slots,
+            bt,
+            blocks_per_slot,
             g.local_heads,
             g.local_kv_heads,
             g.head_dim,
-            self.max_ctx,
             g.kv_dim(),
             rows,
             1.0 / (g.head_dim as f32).sqrt(),
             self.dtype,
-            Some((bt, blocks_per_slot)),
-            None,
+            paged_prefill_policy(g, self.max_ctx, rows, self.dtype),
         )?;
         super::tp_trace::trace_row(e, "b.gqa-attn", layer, &span.attn, 0, g.q_dim())?;
         super::tp_trace::trace_row_last(e, "b.gqa-attn-last", layer, &span.attn, rows, g.q_dim())?;
@@ -972,6 +990,17 @@ mod tests {
                 .kv_bytes(usize::MAX, KvDtype::Fp16),
             None
         );
+    }
+
+    #[test]
+    fn qwen_paged_prefill_policy_keeps_short_and_long_span_thresholds() {
+        let g = GqaGeometry::new(5120, 24, 4, 256, 0, 2).unwrap();
+        let short = paged_prefill_policy(g, 64, 24, KvDtype::Fp16);
+        assert!(!short.f16 && !short.tiled);
+        let long = paged_prefill_policy(g, 64, 25, KvDtype::Fp16);
+        assert!(long.f16 && long.tiled);
+        let unaligned = paged_prefill_policy(g, 65, 25, KvDtype::Fp16);
+        assert!(!unaligned.f16 && unaligned.tiled);
     }
 
     #[test]

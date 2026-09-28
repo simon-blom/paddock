@@ -342,6 +342,80 @@ fn validate_paged_kv_payload(
     Ok(())
 }
 
+/// Kernel eligibility is model policy; availability and the actual paged
+/// prefill/decode fallback are handled here. Models with custom RoPE or gate
+/// projections keep those stages outside this dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct PagedPrefillPolicy {
+    pub f16: bool,
+    pub tiled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagedPrefillKernel {
+    F16,
+    Tiled,
+    Decode,
+}
+
+fn select_paged_prefill(
+    policy: PagedPrefillPolicy,
+    has_f16: bool,
+    has_tiled: bool,
+) -> PagedPrefillKernel {
+    if policy.f16 && has_f16 {
+        PagedPrefillKernel::F16
+    } else if policy.tiled && has_tiled {
+        PagedPrefillKernel::Tiled
+    } else {
+        PagedPrefillKernel::Decode
+    }
+}
+
+/// Default paged GQA prefill execution. Qwen's measured span/dtype thresholds
+/// remain in its adapter; the selected kernel and fallback share one table.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_paged(
+    exec: &GpuExecutor,
+    q: &CudaSlice<f32>,
+    kc: &CudaSlice<u8>,
+    vc: &CudaSlice<u8>,
+    sinks: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    positions: &CudaSlice<u32>,
+    slots: &CudaSlice<u32>,
+    block_tables: &CudaSlice<u32>,
+    blocks_per_slot: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    rows: usize,
+    scale: f32,
+    dtype: KvDtype,
+    policy: PagedPrefillPolicy,
+) -> Result<(), AttentionTpError> {
+    match select_paged_prefill(
+        policy,
+        exec.has_attn_prefill_f16_paged(),
+        exec.has_attn_prefill_paged(),
+    ) {
+        PagedPrefillKernel::F16 => exec.attn_prefill_f16_paged(
+            q, kc, vc, sinks, out, positions, slots, block_tables, blocks_per_slot, n_heads,
+            n_kv_heads, head_dim, kv_dim, 0, rows, scale, dtype,
+        )?,
+        PagedPrefillKernel::Tiled => exec.attn_prefill_paged(
+            q, kc, vc, sinks, out, positions, slots, block_tables, blocks_per_slot, n_heads,
+            n_kv_heads, head_dim, kv_dim, 0, rows, scale, dtype,
+        )?,
+        PagedPrefillKernel::Decode => exec.attn_decode_batch_paged(
+            q, kc, vc, sinks, out, positions, Some(slots), block_tables, blocks_per_slot,
+            n_heads, n_kv_heads, head_dim, kv_dim, 0, rows, scale, dtype,
+        )?,
+    }
+    Ok(())
+}
+
 /// Default paged GQA decode: split partial+combine when the model's policy
 /// requests multiple fixed splits, otherwise use the single-pass kernel.
 /// Models own split-count policy and may override this dispatch entirely.
@@ -537,6 +611,42 @@ impl GqaPartition {
 mod tests {
     use super::*;
     use crate::tp::cache::Operation;
+
+    #[test]
+    fn paged_prefill_prefers_eligible_available_kernels() {
+        let policy = PagedPrefillPolicy {
+            f16: true,
+            tiled: true,
+        };
+        assert_eq!(
+            select_paged_prefill(policy, true, true),
+            PagedPrefillKernel::F16
+        );
+        assert_eq!(
+            select_paged_prefill(policy, false, true),
+            PagedPrefillKernel::Tiled
+        );
+        assert_eq!(
+            select_paged_prefill(policy, false, false),
+            PagedPrefillKernel::Decode
+        );
+        let tiled = PagedPrefillPolicy {
+            f16: false,
+            tiled: true,
+        };
+        assert_eq!(
+            select_paged_prefill(tiled, true, true),
+            PagedPrefillKernel::Tiled
+        );
+        let short = PagedPrefillPolicy {
+            f16: false,
+            tiled: false,
+        };
+        assert_eq!(
+            select_paged_prefill(short, true, true),
+            PagedPrefillKernel::Decode
+        );
+    }
 
     #[test]
     fn paged_kv_pair_preflights_both_planes_before_append() {

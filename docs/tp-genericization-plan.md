@@ -192,6 +192,11 @@ Implemented on `review/tp-generic-core`:
 - Mirrored paged-KV/checkpoint lifecycle moved into generic
   `tp::cache`; Qwen retains only its measured resume-profitability
   thresholds.
+- Generic paged GQA prefill selects the available F16/tiled kernel or the
+  paged decode fallback. Qwen retains its measured row/dtype/geometry policy
+  and its Q/gate and M-RoPE stages.
+- Worker control fan-out/fan-in handles all nonzero ranks, with rank-symmetric
+  acknowledgement failures. The two TP probe examples use this control API.
 
 The current Qwen3.8 geometry naturally supports TP=2 and TP=4 for both its four
 KV heads and its DeltaNet key-group count. TP=3 is rejected by geometry, not by
@@ -211,15 +216,14 @@ No model adapter should contain a RoCE or multi-node assumption.
 
 ### Remaining major work
 
-1. Build/static-test the current checkpoint.
-2. Decide the default generic attention execution surface. Qwen's gated
-   Q+gate/M-RoPE path should be an override, not the shape of the generic API.
-3. Generalize serving/control fan-out from one worker to `world_size - 1`
-   workers. This should not require another Qwen algorithm change.
-4. Move generic profiling/span lifecycle out of the Qwen namespace where
+1. Complete the default generic attention surface beyond paged prefill/decode
+   dispatch. Qwen's gated Q+gate/M-RoPE path remains an adapter, not the
+   shape of the generic API.
+2. Move generic profiling/span lifecycle out of the Qwen namespace where
    useful.
-5. Prove the abstraction with a second conventional model.
-6. Run TP=2 regression benchmarks and eventually TP=4 runtime validation.
+3. Prove the abstraction with a second conventional model.
+4. Run TP=2 regression benchmarks for each GPU-path change; TP=4 runtime
+   validation remains unavailable on the current hardware.
 
 ### Current architectural test
 
