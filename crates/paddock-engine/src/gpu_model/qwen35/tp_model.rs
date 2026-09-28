@@ -19,6 +19,7 @@ use crate::{
     gpu::distributed::{CollectiveError, Communicator},
     gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, QuantW},
     gpu_model::gpt_oss::GpuModelError,
+    gpu_model::tp::state::{transfer_checkpoint, CheckpointOp, TpCheckpointState},
     gpu_model::tp::TpTopology,
 };
 
@@ -49,6 +50,57 @@ struct TpLayer {
     post_norm: DeviceTensor,
     mixer: TpMixer,
     ffn: FfnTpRank,
+}
+
+impl TpCheckpointState<GpuExecutor> for TpLayer {
+    type Error = Qwen35TpError;
+
+    fn validate_checkpoint(
+        &self,
+        slot: usize,
+        index: u32,
+        op: CheckpointOp,
+    ) -> Result<(), Self::Error> {
+        let TpMixer::Linear(delta) = &self.mixer else {
+            return Ok(());
+        };
+        let (rec, conv) = delta
+            .slot_state(slot)
+            .ok_or_else(|| Qwen35TpError::Shape("checkpoint slot out of range".into()))?;
+        let (ckpt_rec, ckpt_conv) = delta
+            .ckpt_pair(index)
+            .ok_or_else(|| Qwen35TpError::Shape("checkpoint index outside the pool".into()))?;
+        if rec.len() != ckpt_rec.len() || conv.len() != ckpt_conv.len() {
+            return Err(Qwen35TpError::Shape(format!(
+                "{op:?} state/checkpoint geometry differ"
+            )));
+        }
+        Ok(())
+    }
+
+    fn snapshot(
+        &mut self,
+        context: &GpuExecutor,
+        slot: usize,
+        index: u32,
+    ) -> Result<(), Self::Error> {
+        if let TpMixer::Linear(delta) = &mut self.mixer {
+            delta.snapshot_slot_to_ckpt(context, slot, index)?;
+        }
+        Ok(())
+    }
+
+    fn restore(
+        &mut self,
+        context: &GpuExecutor,
+        slot: usize,
+        index: u32,
+    ) -> Result<(), Self::Error> {
+        if let TpMixer::Linear(delta) = &mut self.mixer {
+            delta.restore_ckpt_to_slot(context, slot, index)?;
+        }
+        Ok(())
+    }
 }
 
 /// One process's rank-local model path for deterministic tensor parallelism.
@@ -1016,30 +1068,30 @@ impl Qwen35TpRank {
         if slot >= self.slots {
             return Err(Qwen35TpError::Shape("snapshot slot out of range".into()));
         }
-        for layer in &mut self.layers {
-            if let TpMixer::Linear(delta) = &mut layer.mixer {
-                delta
-                    .snapshot_slot_to_ckpt(&self.exec, slot, index)
-                    .map_err(Qwen35TpError::from)?;
-            }
-        }
+        transfer_checkpoint(
+            &mut self.layers,
+            &self.exec,
+            slot,
+            index,
+            CheckpointOp::Snapshot,
+        )?;
         Ok(())
     }
 
     /// Restore `slot`'s DeltaNet state from checkpoint `index` - the reverse
-    /// copy, rank-local. Fails closed when the index is outside the pool;
-    /// a failed restore is the resume decision's all-or-nothing gate.
+    /// copy, rank-local. All layers preflight geometry before any copy. A GPU
+    /// copy failure remains fatal and must not publish a resumed slot.
     pub fn restore_slot_ckpt(&mut self, slot: usize, index: u32) -> Result<(), Qwen35TpError> {
         if slot >= self.slots {
             return Err(Qwen35TpError::Shape("restore slot out of range".into()));
         }
-        for layer in &mut self.layers {
-            if let TpMixer::Linear(delta) = &mut layer.mixer {
-                delta
-                    .restore_ckpt_to_slot(&self.exec, slot, index)
-                    .map_err(Qwen35TpError::from)?;
-            }
-        }
+        transfer_checkpoint(
+            &mut self.layers,
+            &self.exec,
+            slot,
+            index,
+            CheckpointOp::Restore,
+        )?;
         Ok(())
     }
 

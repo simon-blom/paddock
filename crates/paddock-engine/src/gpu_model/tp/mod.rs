@@ -9,6 +9,7 @@ pub(crate) mod control;
 pub mod cache;
 pub(crate) mod ffn;
 pub(crate) mod prefill;
+pub(crate) mod state;
 
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 
