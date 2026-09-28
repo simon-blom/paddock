@@ -4,7 +4,7 @@
 
 The current official Linux ARM64 release is Paddock `v0.1.10`, runner build `0.1.10 (g610cd8f5)`, release commit `610cd8f5ea72e7421a99ca418d51de804d312730`. Its medium-prompt decode median was **17.706 client-observed output tok/s** (range 17.653–17.712), versus **14.945 tok/s** for the TP2 eager/no-spec reference: +2.761 tok/s / +18.5%. This is the stock binary's normal behavior, including observed default MTP/speculation; it is not a like-for-like no-spec comparison.
 
-The long prompt could not be served with the published binary's built-in defaults: the startup KV plan reports `max_ctx=4096`; the 22,130-token request received HTTP 400. No long-context performance number is available without overriding the default context, which this task did not authorize.
+The 22,130-token long prompt was first rejected under untouched release defaults (`max_ctx=4096`). At the user's follow-up direction, it was rerun with 65,536 context. The release's default 32 slots could not fit that KV plan on one GB10, so `--max-batch 2` was also required; this matches the TP2 fixed base batch width. Results and the explicit deviations from release defaults are recorded below.
 
 ## Identity and setup
 
@@ -45,22 +45,49 @@ The server's exported `gen_ai_server_time_to_first_token_seconds` was 0.00704 s 
 
 These are user-visible measurements under each requested configuration, not a controlled kernel comparison: the published runner used its default MTP/spec path, while TP2 reference A disabled speculation. The outputs also differ (TP2 hash `722eb0754f07d3abfb46f6aedcf2e34359522d54f0eeb03a7437d6c2aa35a15e`). The stock result answers how fast the release serves this prompt by default; it does not isolate a single-GPU-vs-TP2 hardware effect.
 
-## Long workload: 22,130 prompt tokens
+## Long workload: 22,130 prompt tokens, 65,536 context
 
-One fresh default-config server started successfully and reported `max_ctx=4096`; the request was rejected with HTTP 400 before generation. The client reports `<HTTPError 400: 'Bad Request'>`, and the server's post-request metrics recorded one 4xx. Prompt/completion usage, TTFT, prefill/decode rates, and request wall time are unavailable for this rejected request. There is no valid long-context median or range. I did not repeat an identical startup-and-rejection three times or raise context to 65,536 because the request was specifically for normal published defaults.
+All three fresh-server requests returned HTTP 200, stopped naturally at 108 completion tokens, and produced the same output hash: `e3a07a4353b2ba6e92c9be853a7fe0815db64daa2486db3576fce19d1e5bfdd9`.
+
+The original default configuration had `max_ctx=4096` and rejected this prompt. Raising only `max_ctx` to 65,536 while leaving the default batch width (32 slots) failed startup: the runner reported 136 GiB of KV required versus 83.14 GiB available on this Spark, and estimated a maximum context near 40,048 at that width. The successful 64K run therefore used `--max-ctx 65536 --max-batch 2`; two slots match the TP2 base configuration and the KV plan then started successfully. All other serving options remained at published defaults, including built-in MTP/spec policy. The server's resolved KV plan confirmed `slots=2 max_ctx=65536`, an 8.5 GiB pool with 131,072 token capacity.
+
+| Metric | Median | Range | Timing source |
+|---|---:|---:|---|
+| Prompt / completion tokens | 22,130 / 108 | identical | Server usage in streamed response |
+| TTFT | 36.931 s | 36.767–37.099 s | Client-observed, first content chunk |
+| Prefill rate | 599.2 tok/s | 596.5–601.9 | Approximation: prompt tokens / client TTFT; not a device timer |
+| Output/decode rate | 12.054 tok/s | 12.047–12.095 | Client-observed, completion tokens / stream time after first content chunk |
+| Total client wall | 45.890 s | 45.697–46.064 s | Client-observed request start to stream completion |
+
+### Comparison to TP2 eager/no-spec
+
+| Long workload | Stock v0.1.10 single Spark, 64K / batch 2 | TP2 branch A eager/no-spec | Difference |
+|---|---:|---:|---:|
+| Client TTFT | 36.931 s | 21.097 s | stock +75.1% (slower) |
+| Approx. prefill rate | 599.2 tok/s | 1,049.0 tok/s | stock -42.9%; proxy only |
+| Output/decode tok/s | 12.054 | 6.664 | stock +80.9% (+5.390 tok/s) |
+| Client total wall | 45.890 s | 37.317 s | stock +23.0% (slower) |
+| Generated tokens | 108 | 108 | same length |
+
+So the single Spark release sustained substantially faster decode, but its much slower prefill erased that gain in end-to-end latency for this long prompt. This is an observed configuration comparison, not a controlled hardware-only comparison: one Spark vs two, and published stock defaults vs TP2 eager/no-spec.
+
+The server's `/metrics` output-token timing agreed with client decode (median 0.08296 s/token, inverse 12.05 tok/s); request-duration metrics were 45.696–46.064 s. Its `gen_ai_server_time_to_first_token_seconds` remained inconsistent with client observation: 0.0149–0.0254 s reported versus 36.767–37.099 s client-observed. Use client TTFT for the comparison and treat the server TTFT metric as unresolved. The metrics reported zero drafted/accepted speculative tokens for all three long requests, despite the model load log describing MTP support as enabled; do not attribute this long-run decode result to observed speculative acceptance. Paddock does not export a separate prefill-throughput metric.
 
 ## Logs and warnings
 
-- Successful medium requests: no CUDA, NCCL, HTTP, protocol, or worker errors; runner exit code 0 after each request.
-- Expected `tick-stall` WARN records occurred during the release's startup warm wave (about 2.2 s with 32 warmup prompts) and mixed prefill during medium requests (roughly 1.08–1.30 s). They are preserved in the per-run server logs; no GPU failure accompanied them.
-- The long request is the single expected 4xx described above, not an inference crash. Model loaded and freed cleanly.
+- The original default-context attempt is preserved at `raw/long/r1/`; it ended in the expected HTTP 400. The initial 64K/batch-32 startup failure is preserved at `raw-long64k/failed-maxbatch32-r1/`.
+- Three successful 64K-context runs, each with a fresh process, are in `raw-long64k/r{1,2,3}/`: exact command/config JSON, complete server logs, client result/SSE data, runner exit, and before/after `/metrics` snapshots. Each runner exited 0 after graceful shutdown.
+- Each successful long run emitted repeated `tick-stall` WARNs during mixed/chunked prefill (mixed phase roughly 1.08–2.50 s per logged stall); no other WARN/ERROR class, CUDA/NCCL error, HTTP error, or runner failure was observed.
+- The three `/metrics` snapshots agree on decode rate, but the server TTFT metric conflicts with the client timing as noted above.
+
 
 ## Evidence and reproducibility
 
 - Raw timestamped evidence directory: `/home/sime/.hermes/cache/scratch/paddock-stock-baseline-20260928/`.
 - `raw/medium/r{1,2,3}/`: exact CLI/config JSON, full server log, client stdout, raw SSE/response text/hash, runner exit, `/metrics` before/after.
-- `raw/long/r1/`: config, startup/server log, 400 error, post-request metrics, runner exit.
+- `raw/long/r1/`: original default-context config, startup/server log, 400 error, post-request metrics, runner exit.
+- `raw-long64k/r{1,2,3}/`: 64K-context run configs, startup/server logs, client results/SSE, runner exits, and metrics snapshots; `raw-long64k/failed-maxbatch32-r1/` preserves the insufficient-memory startup attempt.
 - Published archive/checksum, extracted version and capability output, and hashes: root-level `paddock-0.1.10-aarch64-linux.tar.gz*`, `published/`, `runner-version.txt`, `runner-capabilities.json`, and `provenance.sha256`.
-- Scratch benchmark driver: `/home/sime/.hermes/cache/scratch/paddock-stock-baseline-20260928/stock_baseline.py`; it starts and directly supervises a fresh published runner, then calls the unchanged TP2 benchmark client. Re-run a sample with `python3 <driver> --only medium-r1` after changing the selected label; it writes artifacts under `raw/`.
+- Scratch drivers: `stock_baseline.py` reproduces release-default samples; `long64k_extension.py` runs fresh 64K-context servers with the recorded batch-width adjustment. Both use the unchanged TP2 benchmark client.
 
-The repo was clean before this report was added. No source, released binary, or model was changed, and nothing was pushed.
+This follow-up changes only benchmark documentation and scratch evidence. No source, released binary, or model was changed.
