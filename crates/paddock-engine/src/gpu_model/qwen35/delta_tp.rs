@@ -808,11 +808,10 @@ impl DeltaTpRank {
             self.finish_partial_prefill(e, rows)?;
         } else {
             self.decode_run(e, input, rows)?;
-            self.finish_partial(e, rows)?;
+            self.finish_partial(e, rows, false)?;
         }
-        // Prefill reduces only the live rows*WIDTH prefix (both ranks derive
-        // identical `rows`); decode keeps the capacity-sized collective the
-        // captured graphs bake in.
+        // Both eager paths reduce only live rows; graph decode still uses
+        // `finish` and its captured capacity-sized partial buffer.
         let live = rows * WIDTH;
         if prefill {
             if let Some(p) = profile {
@@ -834,32 +833,46 @@ impl DeltaTpRank {
                 group.before_compute(&e.stream)?;
             }
         } else if let Some(p) = profile {
-            p.reduce(&e.stream, group, &self.span.partial, &mut self.span.reduced, 1, layer)
-                .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
+            p.reduce(
+                &e.stream,
+                group,
+                &self.span.partial.slice(0..live),
+                &mut self.span.reduced.slice_mut(0..live),
+                1,
+                layer,
+            )
+            .map_err(|err| DeltaTpError::Shape(err.to_string()))?;
         } else {
             group.after_compute(&e.stream)?;
-            group.all_reduce(&self.span.partial, &mut self.span.reduced)?;
+            group.all_reduce(
+                &self.span.partial.slice(0..live),
+                &mut self.span.reduced.slice_mut(0..live),
+            )?;
             group.before_compute(&e.stream)?;
         }
         Ok(&self.span.reduced)
     }
 
-    /// Stage the out-projection into the capacity-sized `partial`: zero the
-    /// whole buffer first (the unused suffix rides every all-reduce), then
-    /// the row-parallel down GEMV per row. `forward` runs this before its
-    /// collective; the graphed path bakes it into the capture.
+    /// Stage the out-projection into `partial`. Eager decode zeroes only the
+    /// live row; graph capture retains the capacity-sized zero and collective
+    /// contract in `finish`. The GEMV overwrites row 0 on each call.
     pub(crate) fn finish_partial(
         &mut self,
         e: &GpuExecutor,
         rows: usize,
+        graph_capture: bool,
     ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
-        // The capacity-sized NCCL buffer includes an unused suffix for short
-        // spans. Initialize that suffix before reducing the entire buffer.
-        e.stream
-            .memset_zeros(&mut s.partial)
-            .map_err(GpuError::from)?;
+        // Graph replay's `finish` still reduces the whole plane. Eager decode
+        // reduces row 0 only; neither its memset nor its NCCL sees the tail.
+        if graph_capture {
+            e.stream.memset_zeros(&mut s.partial).map_err(GpuError::from)?;
+        } else {
+            e.stream
+                .memset_zeros(&mut s.partial.slice_mut(0..rows * WIDTH))
+                .map_err(GpuError::from)?;
+        }
         if rows == 1 {
             gemv_any(e, &self.weights[2], &s.core, &mut s.partial)?;
         } else {

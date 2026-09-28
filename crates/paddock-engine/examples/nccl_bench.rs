@@ -134,6 +134,35 @@ fn check_collectives(compute: &Arc<CudaStream>, group: &NcclCommunicator) -> Res
     group.broadcast(&mut bcast, 0)?;
     group.before_compute(compute)?;
     assert!(compute.clone_dtoh(&bcast)?.iter().all(|x| *x == 7.0));
+
+    // DeltaNet eager decode uses a WIDTH-element view of the persistent
+    // cap*WIDTH backing allocation. Compare its row 0 against the old
+    // capacity-sized collective on identical rank-local data and a zero tail.
+    const WIDTH: usize = 5120;
+    for cap in [384, 2048] {
+        let count = cap * WIDTH;
+        let mut input = vec![0.0_f32; count];
+        for (i, x) in input[..WIDTH].iter_mut().enumerate() {
+            *x = ((i % 37) as f32 - 18.0) * (rank as f32 + 1.0) / 128.0;
+        }
+        let full_src = compute.clone_htod(&input)?;
+        let mut full_dst = compute.alloc_zeros::<f32>(count)?;
+        group.after_compute(compute)?;
+        group.all_reduce(&full_src, &mut full_dst)?;
+        group.before_compute(compute)?;
+        let old_row = compute.clone_dtoh(&full_dst)?[..WIDTH].to_vec();
+
+        let live_src = compute.clone_htod(&input)?;
+        let mut live_dst = compute.alloc_zeros::<f32>(count)?;
+        group.after_compute(compute)?;
+        group.all_reduce(&live_src.slice(0..WIDTH), &mut live_dst.slice_mut(0..WIDTH))?;
+        group.before_compute(compute)?;
+        let new_row = compute.clone_dtoh(&live_dst)?[..WIDTH].to_vec();
+        let differing = old_row.iter().zip(&new_row)
+            .filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(differing, 0, "cap={cap} row-0 bit mismatch");
+        println!("rank={rank} cap={cap} DeltaNet one-row NCCL old/new bitwise parity PASS");
+    }
     Ok(())
 }
 

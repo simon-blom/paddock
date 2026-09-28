@@ -405,7 +405,7 @@ impl Qwen35TpRank {
                 // does it after the run, inside `finish`'s contract; the
                 // graph bakes the memset + GEMV too so a replay leaves
                 // `partial` ready for the host-side collective.
-                delta.finish_partial(&self.exec, 1)?;
+                delta.finish_partial(&self.exec, 1, true)?;
             }
         }
         let _ = slot;
