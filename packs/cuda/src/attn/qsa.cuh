@@ -146,6 +146,24 @@ int pd_q4x_idx_pool(const void* raw, const void* ring, const void* pos, const vo
 // the last ring_len rows of a run land, so no two writers race for one entry.
 // ring_len >= cr + the deepest verify chunk keeps a rejected draft's entry
 // from ever aliasing a committed position the next pool still reads.
+//
+// PAGED (slot 692): the compressed cache rides the KV pool's block ids - a
+// 16-token page holds 16/cr compressed rows, so block b of slot s is row
+// block_tables[s*bps + b/(16/cr)]*(16/cr) + b%(16/cr) of a
+// [n_blocks*16/cr, hd] plane. The ring stays per slot (it is not cache: a
+// resume refills it from the rows it replays).
+template <bool PAGED>
+__device__ __forceinline__ size_t pd_qsa_idx_row(const uint32_t* __restrict__ block_tables,
+                                                 uint32_t bps, uint32_t s, uint32_t cap,
+                                                 uint32_t rpp, uint32_t b) {
+    if constexpr (PAGED) {
+        return (size_t)block_tables[(size_t)s * bps + b / rpp] * rpp + b % rpp;
+    } else {
+        return (size_t)s * cap + b;
+    }
+}
+
+template <bool PAGED = false>
 __global__ void pd_q4x_idx_store_kernel(const float* __restrict__ raw,
                                         const float* __restrict__ stage,
                                         const uint32_t* __restrict__ pos,
@@ -153,12 +171,14 @@ __global__ void pd_q4x_idx_store_kernel(const float* __restrict__ raw,
                                         __nv_bfloat16* __restrict__ cache,
                                         float* __restrict__ ring, uint32_t rows,
                                         uint32_t hd, uint32_t ld, uint32_t koff,
-                                        uint32_t ring_len, uint32_t cr, uint32_t cap) {
+                                        uint32_t ring_len, uint32_t cr, uint32_t cap,
+                                        const uint32_t* __restrict__ block_tables = nullptr,
+                                        uint32_t bps = 0) {
     const uint32_t r = blockIdx.x, i = threadIdx.x;
     const uint32_t p = pos[r], s = slots[r];
     if ((p + 1u) % cr == 0u) {
-        cache[((size_t)s * cap + p / cr) * hd + i] =
-            __float2bfloat16_rn(stage[(size_t)r * hd + i]);
+        const size_t row = pd_qsa_idx_row<PAGED>(block_tables, bps, s, cap, 16u / cr, p / cr);
+        cache[row * hd + i] = __float2bfloat16_rn(stage[(size_t)r * hd + i]);
     }
     const uint32_t later = r + ring_len;
     const bool shadowed = later < rows && slots[later] == s && pos[later] == p + ring_len;
@@ -174,9 +194,25 @@ int pd_q4x_idx_store(const void* raw, const void* stage, const void* pos, const 
                      void* stream) {
     if (rows == 0) return 0;
     if (hd == 0 || hd > 1024 || cr == 0 || ring_len < cr) return -1;
-    pd_q4x_idx_store_kernel<<<rows, hd, 0, (cudaStream_t)stream>>>(
+    pd_q4x_idx_store_kernel<false><<<rows, hd, 0, (cudaStream_t)stream>>>(
         (const float*)raw, (const float*)stage, (const uint32_t*)pos, (const uint32_t*)slots,
         (__nv_bfloat16*)cache, (float*)ring, rows, hd, ld, koff, ring_len, cr, cap);
+    return pd_launch_status();
+}
+
+// slot 692: pd_q4x_idx_store into a paged compressed cache - `block_tables`
+// + `blocks_per_slot` after `ring`, no cap. A page must hold whole blocks.
+PD_EXPORT
+int pd_q4x_idx_store_paged(const void* raw, const void* stage, const void* pos,
+                           const void* slots, void* cache, void* ring, const void* block_tables,
+                           uint32_t blocks_per_slot, uint32_t rows, uint32_t hd, uint32_t ld,
+                           uint32_t koff, uint32_t ring_len, uint32_t cr, void* stream) {
+    if (rows == 0) return 0;
+    if (hd == 0 || hd > 1024 || cr == 0 || 16u % cr != 0u || ring_len < cr) return -1;
+    pd_q4x_idx_store_kernel<true><<<rows, hd, 0, (cudaStream_t)stream>>>(
+        (const float*)raw, (const float*)stage, (const uint32_t*)pos, (const uint32_t*)slots,
+        (__nv_bfloat16*)cache, (float*)ring, rows, hd, ld, koff, ring_len, cr, 0u,
+        (const uint32_t*)block_tables, blocks_per_slot);
     return pd_launch_status();
 }
 
@@ -207,13 +243,18 @@ static __device__ __forceinline__ uint32_t pd_qsa_key(float s) {
 // per query row - at 128K a layer's compressed keys (8 MB) sit in GB10's L2,
 // which is what makes that affordable for prefill rows; the tensor-core
 // shared-tile form is the perf rung after this one.
+// PAGED (slot 693): the key row of block b comes from the table
+// (pd_qsa_idx_row) - one read per thread, only for a visible block.
+template <bool PAGED = false>
 __global__ void pd_q4x_qsa_logits_kernel(const float* __restrict__ q,
                                          const __nv_bfloat16* __restrict__ cache,
                                          const uint32_t* __restrict__ pos,
                                          const uint32_t* __restrict__ slots,
                                          float* __restrict__ scores, uint32_t row0,
                                          uint32_t heads, uint32_t hd, uint32_t cap,
-                                         uint32_t cr, uint32_t k) {
+                                         uint32_t cr, uint32_t k,
+                                         const uint32_t* __restrict__ block_tables = nullptr,
+                                         uint32_t bps = 0) {
     extern __shared__ float qs[];   // [heads][hd]
     const uint32_t br = blockIdx.x, r = row0 + br;
     const uint32_t nb = (pos[r] + 1u) / cr;
@@ -225,7 +266,8 @@ __global__ void pd_q4x_qsa_logits_kernel(const float* __restrict__ q,
     __syncthreads();
     const uint32_t b = tile0 + threadIdx.x;
     if (b >= nb) return;
-    const uint4* kr = reinterpret_cast<const uint4*>(cache + ((size_t)slots[r] * cap + b) * hd);
+    const size_t krow = pd_qsa_idx_row<PAGED>(block_tables, bps, slots[r], cap, 16u / cr, b);
+    const uint4* kr = reinterpret_cast<const uint4*>(cache + krow * hd);
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};   // heads <= 4
     for (uint32_t c = 0; c < hd / 8u; ++c) {
         const uint4 v = kr[c];
@@ -255,9 +297,31 @@ int pd_q4x_qsa_logits(const void* q, const void* cache, const void* pos, const v
     if (rows == 0 || cap == 0) return 0;
     if (heads == 0 || heads > 4 || hd == 0 || (hd & 7u) != 0 || cr == 0) return -1;
     dim3 grid(rows, (cap + 255u) / 256u);
-    pd_q4x_qsa_logits_kernel<<<grid, 256, heads * hd * sizeof(float), (cudaStream_t)stream>>>(
-        (const float*)q, (const __nv_bfloat16*)cache, (const uint32_t*)pos,
-        (const uint32_t*)slots, (float*)scores, row0, heads, hd, cap, cr, k);
+    pd_q4x_qsa_logits_kernel<false>
+        <<<grid, 256, heads * hd * sizeof(float), (cudaStream_t)stream>>>(
+            (const float*)q, (const __nv_bfloat16*)cache, (const uint32_t*)pos,
+            (const uint32_t*)slots, (float*)scores, row0, heads, hd, cap, cr, k);
+    return pd_launch_status();
+}
+
+// slot 693: pd_q4x_qsa_logits over a paged compressed cache - `block_tables`
+// + `blocks_per_slot` after `slots`; `cap` stays the scores' row stride and
+// the grid's block extent (graph-fixed).
+PD_EXPORT
+int pd_q4x_qsa_logits_paged(const void* q, const void* cache, const void* pos,
+                            const void* slots, const void* block_tables,
+                            uint32_t blocks_per_slot, void* scores, uint32_t row0,
+                            uint32_t rows, uint32_t heads, uint32_t hd, uint32_t cap,
+                            uint32_t cr, uint32_t k, void* stream) {
+    if (rows == 0 || cap == 0) return 0;
+    if (heads == 0 || heads > 4 || hd == 0 || (hd & 7u) != 0 || cr == 0 || 16u % cr != 0u)
+        return -1;
+    dim3 grid(rows, (cap + 255u) / 256u);
+    pd_q4x_qsa_logits_kernel<true>
+        <<<grid, 256, heads * hd * sizeof(float), (cudaStream_t)stream>>>(
+            (const float*)q, (const __nv_bfloat16*)cache, (const uint32_t*)pos,
+            (const uint32_t*)slots, (float*)scores, row0, heads, hd, cap, cr, k,
+            (const uint32_t*)block_tables, blocks_per_slot);
     return pd_launch_status();
 }
 
@@ -291,10 +355,23 @@ static __device__ __forceinline__ void pd_qsa_mma_bf16(float d[4], const uint32_
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// PAGED (slot 694): a slot's 64-block key tile is 16 pages. A pass stages
+// only blocks below the deepest visible one of that slot's rows, from the
+// pages of the row that reaches it (a table entry past a slot's context need
+// not name a block it owns - the dense form stages to `cap`, reading rows no
+// score is written for). Every row's pages for this tile are loaded in the
+// prologue into registers, issued before the query staging and stored to
+// shared after it (a load's first use stalls the warp, in-order issue), and
+// each row's deepest same-slot row is found by warp 0's shuffles there too:
+// a thread-0 scan per pass left 127 threads at the barrier (+15% / +23%
+// alone). GB10, 32K, scrambled pool: 8 decode rows of 8 slots +7%, a 512-row
+// chunk +2.9% against the dense form (bench/paged_modes_gb10_bench.cu).
+template <bool PAGED = false>
 __global__ void __launch_bounds__(128) pd_q4x_qsa_logits_mma_kernel(
     const float* __restrict__ q, const __nv_bfloat16* __restrict__ cache,
     const uint32_t* __restrict__ pos, const uint32_t* __restrict__ slots,
-    float* __restrict__ scores, uint32_t row0, uint32_t rows, uint32_t cap, uint32_t k) {
+    float* __restrict__ scores, uint32_t row0, uint32_t rows, uint32_t cap, uint32_t k,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
 #if PD_FA_OK
     constexpr uint32_t HD = 128u, H = 4u, KP = HD + 8u, KS = HD / 16u;
     constexpr uint32_t NR = PD_QSA_LG_ROWS, NB = PD_QSA_LG_NB;
@@ -302,6 +379,9 @@ __global__ void __launch_bounds__(128) pd_q4x_qsa_logits_mma_kernel(
     __shared__ __align__(16) __nv_bfloat16 s_b[NB * KP];
     __shared__ uint32_t s_nb[NR], s_slot[NR];
     __shared__ uint32_t s_cur;
+    // paged: the pass's deepest row, each row's deepest same-slot row, the
+    // rows' pages under this tile
+    __shared__ uint32_t s_curi, s_deep[NR], s_pg[PAGED ? NR : 1u][NB / 4u];
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t g0 = blockIdx.x * NR, tile0 = blockIdx.y * NB;
     if (tid < NR) {
@@ -320,11 +400,43 @@ __global__ void __launch_bounds__(128) pd_q4x_qsa_logits_mma_kernel(
 #pragma unroll
     for (uint32_t i = 0; i < NR; ++i) live |= (s_nb[i] ? 1u : 0u) << i;
     if (live == 0u) return;   // uniform per CTA
+    // paged: each live row's pages under this tile, clamped to its own last
+    // visible block, into registers now and shared after the query staging;
+    // warp 0 finds each row's deepest same-slot row
+    static_assert(NR * (NB / 4u) == 2u * 128u, "two page ids a thread");
+    uint32_t pr[2] = {0u, 0u};
+    if constexpr (PAGED) {
+#pragma unroll
+        for (uint32_t u = 0; u < 2u; ++u) {
+            const uint32_t i = tid + u * 128u, ri = i / (NB / 4u), pj = i % (NB / 4u);
+            const uint32_t nbr = s_nb[ri], b = min(tile0 + 4u * pj, nbr - 1u);
+            if (nbr) pr[u] = block_tables[(size_t)s_slot[ri] * bps + (b >> 2)];
+        }
+        if (warp == 0) {
+            const uint32_t me = lane < NR ? lane : 0u;
+            const uint32_t my_s = s_slot[me], my_nb = lane < NR ? s_nb[me] : 0u;
+            uint32_t best = me, bnb = my_nb;
+#pragma unroll
+            for (uint32_t r = 0; r < NR; ++r) {
+                const uint32_t rs = __shfl_sync(0xffffffffu, my_s, r);
+                const uint32_t rn = __shfl_sync(0xffffffffu, my_nb, r);
+                if (rs == my_s && rn > bnb) { bnb = rn; best = r; }
+            }
+            if (lane < NR) s_deep[lane] = best;
+        }
+    }
 
     for (uint32_t i = tid; i < NR * H * HD; i += 128u) {
         const uint32_t ra = i / HD, d = i % HD, br = g0 + ra / H;
         const float v = br < rows ? q[((size_t)(row0 + br) * H + ra % H) * HD + d] : 0.0f;
         s_a[ra * KP + d] = __float2bfloat16_rn(v);
+    }
+    if constexpr (PAGED) {
+#pragma unroll
+        for (uint32_t u = 0; u < 2u; ++u) {
+            const uint32_t i = tid + u * 128u;
+            s_pg[i / (NB / 4u)][i % (NB / 4u)] = pr[u];
+        }
     }
     __syncthreads();
     uint32_t af[KS][4];
@@ -339,18 +451,27 @@ __global__ void __launch_bounds__(128) pd_q4x_qsa_logits_mma_kernel(
         if (tid == 0) {
             s_cur = 0xffffffffu;
             for (uint32_t i = 0; i < NR; ++i) {
-                if ((live >> i & 1u) && !(done >> i & 1u)) { s_cur = s_slot[i]; break; }
+                if ((live >> i & 1u) && !(done >> i & 1u)) {
+                    s_cur = s_slot[i];
+                    if constexpr (PAGED) s_curi = s_deep[i];
+                    break;
+                }
             }
         }
         __syncthreads();
         const uint32_t sc = s_cur;
         if (sc == 0xffffffffu) break;
-        // this slot's 64-block key tile; blocks past the capacity read as zero
+        const uint32_t ci = PAGED ? s_curi : 0u;
+        const uint32_t lim = PAGED ? min(s_nb[ci], cap) : cap;
+        // this slot's 64-block key tile; blocks past the capacity (paged: past
+        // the visible extent) read as zero
         for (uint32_t i = tid; i < NB * (HD / 8u); i += 128u) {
             const uint32_t j = i / (HD / 8u), l = i % (HD / 8u);
             __nv_bfloat16* dst = s_b + j * KP + l * 8u;
-            if (tile0 + j < cap) {
-                pd_attn_cpa16(dst, cache + ((size_t)sc * cap + tile0 + j) * HD + l * 8u);
+            if (tile0 + j < lim) {
+                const size_t row = PAGED ? (size_t)s_pg[ci][j >> 2] * 4u + (j & 3u)
+                                         : (size_t)sc * cap + tile0 + j;
+                pd_attn_cpa16(dst, cache + row * HD + l * 8u);
             } else {
                 *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -415,9 +536,28 @@ int pd_q4x_qsa_logits_mma(const void* q, const void* cache, const void* pos, con
     if (heads != 4u || hd != 128u || cr != 4u) return -1;
     dim3 grid((rows + PD_QSA_LG_ROWS - 1u) / PD_QSA_LG_ROWS,
               (cap + PD_QSA_LG_NB - 1u) / PD_QSA_LG_NB);
-    pd_q4x_qsa_logits_mma_kernel<<<grid, 128, 0, (cudaStream_t)stream>>>(
+    pd_q4x_qsa_logits_mma_kernel<false><<<grid, 128, 0, (cudaStream_t)stream>>>(
         (const float*)q, (const __nv_bfloat16*)cache, (const uint32_t*)pos,
         (const uint32_t*)slots, (float*)scores, row0, rows, cap, k);
+    return pd_launch_status();
+}
+
+// slot 694: pd_q4x_qsa_logits_mma over a paged compressed cache - slot 693's
+// arguments.
+PD_EXPORT
+int pd_q4x_qsa_logits_mma_paged(const void* q, const void* cache, const void* pos,
+                                const void* slots, const void* block_tables,
+                                uint32_t blocks_per_slot, void* scores, uint32_t row0,
+                                uint32_t rows, uint32_t heads, uint32_t hd, uint32_t cap,
+                                uint32_t cr, uint32_t k, void* stream) {
+    if (rows == 0 || cap == 0) return 0;
+    if (heads != 4u || hd != 128u || cr != 4u) return -1;
+    dim3 grid((rows + PD_QSA_LG_ROWS - 1u) / PD_QSA_LG_ROWS,
+              (cap + PD_QSA_LG_NB - 1u) / PD_QSA_LG_NB);
+    pd_q4x_qsa_logits_mma_kernel<true><<<grid, 128, 0, (cudaStream_t)stream>>>(
+        (const float*)q, (const __nv_bfloat16*)cache, (const uint32_t*)pos,
+        (const uint32_t*)slots, (float*)scores, row0, rows, cap, k,
+        (const uint32_t*)block_tables, blocks_per_slot);
     return pd_launch_status();
 }
 
@@ -551,13 +691,18 @@ int pd_q4x_qsa_topk(const void* scores, const void* pos, void* sel, void* cnt, u
 #define PD_QSA_TT 16u
 #define PD_QSA_G_MAX 16u
 
-template <typename KV>
+//
+// PAGED (slot 695): K/V in a block pool [n_blocks, 16, kv_dim]; token tp of
+// slot s is row block_tables[s*bps + tp/16]*16 + tp%16, resolved once per
+// token per tile into the row list the staging already reads.
+template <typename KV, bool PAGED = false>
 __global__ __launch_bounds__(256) void pd_q4x_qsa_attn_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc, const KV* __restrict__ vc,
     const uint32_t* __restrict__ pos, const uint32_t* __restrict__ slots,
     const uint32_t* __restrict__ sel, const uint32_t* __restrict__ cnt,
     float* __restrict__ part_o, float* __restrict__ part_ml, uint32_t nh, uint32_t nkv,
-    uint32_t hd, uint32_t max_ctx, uint32_t k, uint32_t cr, float scale) {
+    uint32_t hd, uint32_t max_ctx, uint32_t k, uint32_t cr, float scale,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
     extern __shared__ float sm[];
     const uint32_t G = nh / nkv;
     const uint32_t r = blockIdx.x, kvh = blockIdx.y, sp = blockIdx.z, ns = gridDim.z;
@@ -592,7 +737,11 @@ __global__ __launch_bounds__(256) void pd_q4x_qsa_attn_kernel(
         if (tid < nt) {
             const uint32_t t = tb + tid;           // this row's t-th token
             const uint32_t tp = t < c * cr ? rs[t / cr] * cr + t % cr : nb * cr + (t - c * cr);
-            ts[tid] = s * max_ctx + tp;
+            if constexpr (PAGED) {
+                ts[tid] = block_tables[(size_t)s * bps + (tp >> 4)] * 16u + (tp & 15u);
+            } else {
+                ts[tid] = s * max_ctx + tp;
+            }
         }
         __syncthreads();
         for (uint32_t i = tid; i < nt * hd; i += blockDim.x) {
@@ -652,12 +801,13 @@ __global__ __launch_bounds__(256) void pd_q4x_qsa_attn_kernel(
     }
 }
 
-PD_EXPORT
-int pd_q4x_qsa_attn(const void* q, const void* kc, const void* vc, const void* pos,
-                    const void* slots, const void* sel, const void* cnt, void* part_o,
-                    void* part_ml, uint32_t rows, uint32_t nh, uint32_t nkv, uint32_t hd,
-                    uint32_t max_ctx, uint32_t k, uint32_t cr, uint32_t splits, float scale,
-                    uint32_t kv_dtype, void* stream) {
+template <bool PAGED>
+static int pd_q4x_qsa_attn_go(const void* q, const void* kc, const void* vc, const void* pos,
+                              const void* slots, const void* block_tables, uint32_t bps,
+                              const void* sel, const void* cnt, void* part_o, void* part_ml,
+                              uint32_t rows, uint32_t nh, uint32_t nkv, uint32_t hd,
+                              uint32_t max_ctx, uint32_t k, uint32_t cr, uint32_t splits,
+                              float scale, uint32_t kv_dtype, void* stream) {
     if (rows == 0) return 0;
     if (nkv == 0 || nh % nkv != 0 || nh / nkv > PD_QSA_G_MAX || hd == 0 || hd > 256 ||
         cr == 0 || splits == 0)
@@ -668,23 +818,50 @@ int pd_q4x_qsa_attn(const void* q, const void* kc, const void* vc, const void* p
                                          PD_QSA_TT * hd + G * PD_QSA_TT + PD_QSA_G_MAX) +
                         sizeof(uint32_t) * PD_QSA_TT;
     dim3 grid(rows, nkv, splits);
+    const auto bt = (const uint32_t*)block_tables;
     if (kv_dtype == PD_KV_FP8_E4M3) {
-        cudaFuncSetAttribute(pd_q4x_qsa_attn_kernel<__nv_fp8_e4m3>,
+        cudaFuncSetAttribute(pd_q4x_qsa_attn_kernel<__nv_fp8_e4m3, PAGED>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        pd_q4x_qsa_attn_kernel<__nv_fp8_e4m3><<<grid, 256, smem, (cudaStream_t)stream>>>(
+        pd_q4x_qsa_attn_kernel<__nv_fp8_e4m3, PAGED><<<grid, 256, smem, (cudaStream_t)stream>>>(
             (const float*)q, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc,
             (const uint32_t*)pos, (const uint32_t*)slots, (const uint32_t*)sel,
             (const uint32_t*)cnt, (float*)part_o, (float*)part_ml, nh, nkv, hd, max_ctx, k, cr,
-            scale);
+            scale, bt, bps);
     } else {
-        cudaFuncSetAttribute(pd_q4x_qsa_attn_kernel<__half>,
+        cudaFuncSetAttribute(pd_q4x_qsa_attn_kernel<__half, PAGED>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-        pd_q4x_qsa_attn_kernel<__half><<<grid, 256, smem, (cudaStream_t)stream>>>(
+        pd_q4x_qsa_attn_kernel<__half, PAGED><<<grid, 256, smem, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)kc, (const __half*)vc, (const uint32_t*)pos,
             (const uint32_t*)slots, (const uint32_t*)sel, (const uint32_t*)cnt,
-            (float*)part_o, (float*)part_ml, nh, nkv, hd, max_ctx, k, cr, scale);
+            (float*)part_o, (float*)part_ml, nh, nkv, hd, max_ctx, k, cr, scale, bt, bps);
     }
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_q4x_qsa_attn(const void* q, const void* kc, const void* vc, const void* pos,
+                    const void* slots, const void* sel, const void* cnt, void* part_o,
+                    void* part_ml, uint32_t rows, uint32_t nh, uint32_t nkv, uint32_t hd,
+                    uint32_t max_ctx, uint32_t k, uint32_t cr, uint32_t splits, float scale,
+                    uint32_t kv_dtype, void* stream) {
+    return pd_q4x_qsa_attn_go<false>(q, kc, vc, pos, slots, nullptr, 0u, sel, cnt, part_o,
+                                     part_ml, rows, nh, nkv, hd, max_ctx, k, cr, splits, scale,
+                                     kv_dtype, stream);
+}
+
+// slot 695: pd_q4x_qsa_attn over a paged pool - `block_tables` +
+// `blocks_per_slot` after `slots`, no max_ctx. Bit-identical to the dense
+// entry over the same keys.
+PD_EXPORT
+int pd_q4x_qsa_attn_paged(const void* q, const void* pool_k, const void* pool_v,
+                          const void* pos, const void* slots, const void* block_tables,
+                          uint32_t blocks_per_slot, const void* sel, const void* cnt,
+                          void* part_o, void* part_ml, uint32_t rows, uint32_t nh, uint32_t nkv,
+                          uint32_t hd, uint32_t k, uint32_t cr, uint32_t splits, float scale,
+                          uint32_t kv_dtype, void* stream) {
+    return pd_q4x_qsa_attn_go<true>(q, pool_k, pool_v, pos, slots, block_tables,
+                                    blocks_per_slot, sel, cnt, part_o, part_ml, rows, nh, nkv,
+                                    hd, 0u, k, cr, splits, scale, kv_dtype, stream);
 }
 
 // Merge the split partials: per (row, head), out = sum_s acc_s e^(m_s-M) /
@@ -750,13 +927,20 @@ int pd_q4x_qsa_combine(const void* part_o, const void* part_ml, void* out, uint3
 #define PD_QSA_MMA_PT 16u
 #endif
 
-template <typename KV, uint32_t HD, uint32_t PT>
+//
+// PAGED (slot 696): K/V in a block pool [n_blocks, 16, kv_dim]. A selected
+// block's 4 tokens sit in one 16-token page, and so does the tail (under 4
+// tokens, inside one block), so the selection list is translated once at
+// entry - each block's pool row, not its id - plus one tail row, and the
+// gather's per-line address stays the dense form's add.
+template <typename KV, uint32_t HD, uint32_t PT, bool PAGED = false>
 __global__ void __launch_bounds__(PD_QSA_MMA_WARPS * 32u) pd_q4x_qsa_attn_mma_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc, const KV* __restrict__ vc,
     const uint32_t* __restrict__ pos, const uint32_t* __restrict__ slots,
     const uint32_t* __restrict__ sel, const uint32_t* __restrict__ cnt,
     float* __restrict__ part_o, float* __restrict__ part_ml, uint32_t nh, uint32_t nkv,
-    uint32_t max_ctx, uint32_t k, float scale) {
+    uint32_t max_ctx, uint32_t k, float scale,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
 #if PD_FA_OK
     constexpr bool F8 = sizeof(KV) == 1;
     constexpr uint32_t NT = PD_QSA_MMA_WARPS * 32u;
@@ -794,7 +978,14 @@ __global__ void __launch_bounds__(PD_QSA_MMA_WARPS * 32u) pd_q4x_qsa_attn_mma_ke
     __half* s_pf = (__half*)(s_corr + 16u);                  // [16][FP]
     uint32_t* s_blk = (uint32_t*)(s_pf + 16u * FP);          // [k]
 
-    for (uint32_t i = tid; i < c; i += NT) s_blk[i] = sel[(size_t)r * k + i];
+    for (uint32_t i = tid; i < c; i += NT) {
+        const uint32_t b = sel[(size_t)r * k + i];
+        if constexpr (PAGED) {
+            s_blk[i] = block_tables[(size_t)s * bps + (b >> 2)] * 16u + (b & 3u) * 4u;
+        } else {
+            s_blk[i] = b;
+        }
+    }
     for (uint32_t i = tid; i < 16u * HD; i += NT) {
         const uint32_t g = i / HD, d = i % HD;
         s_q[g * KP + d] = g < G ? __float2half(q[((size_t)r * nh + kvh * G + g) * HD + d])
@@ -819,9 +1010,18 @@ __global__ void __launch_bounds__(PD_QSA_MMA_WARPS * 32u) pd_q4x_qsa_attn_mma_ke
 
     // the token list: selected blocks' 4 rows each, then the tail
     const uint32_t c4 = c * 4u, nb4 = nb * 4u;
+    uint32_t tail0 = 0u;   // paged: the tail's first pool row (only when there is a tail)
+    if constexpr (PAGED) {
+        if (p + 1u > nb4)
+            tail0 = block_tables[(size_t)s * bps + (nb4 >> 4)] * 16u + (nb4 & 15u);
+    }
     auto cache_row = [&](uint32_t t) -> size_t {
-        const uint32_t tp = t < c4 ? s_blk[t >> 2] * 4u + (t & 3u) : nb4 + (t - c4);
-        return (size_t)s * max_ctx + tp;
+        if constexpr (PAGED) {
+            return t < c4 ? (size_t)s_blk[t >> 2] + (t & 3u) : (size_t)tail0 + (t - c4);
+        } else {
+            const uint32_t tp = t < c4 ? s_blk[t >> 2] * 4u + (t & 3u) : nb4 + (t - c4);
+            return (size_t)s * max_ctx + tp;
+        }
     };
     // issue tile [tb, tb+n) into buffer bf. f16: each 16-byte line straight
     // to its half row. e4m3: the raw byte row into the region's upper byte
@@ -1000,23 +1200,24 @@ __global__ void __launch_bounds__(PD_QSA_MMA_WARPS * 32u) pd_q4x_qsa_attn_mma_ke
 #endif
 }
 
-template <typename KV, uint32_t HD>
+template <typename KV, uint32_t HD, bool PAGED = false>
 static int pd_q4x_qsa_attn_mma_go(const void* q, const void* kc, const void* vc,
                                   const void* pos, const void* slots, const void* sel,
                                   const void* cnt, void* part_o, void* part_ml, uint32_t rows,
                                   uint32_t nh, uint32_t nkv, uint32_t max_ctx, uint32_t k,
-                                  uint32_t splits, float scale, cudaStream_t st) {
+                                  uint32_t splits, float scale, cudaStream_t st,
+                                  const void* block_tables = nullptr, uint32_t bps = 0) {
     constexpr uint32_t PT = PD_QSA_MMA_PT;
     constexpr uint32_t KP = HD + 8u;
     const size_t smem = sizeof(__half) * (16u * KP + 4u * PT * KP) +
                         sizeof(float) * (16u * (PT + 1u) + 48u) +
                         sizeof(__half) * 16u * (PT + 8u) + sizeof(uint32_t) * k;
-    auto kern = pd_q4x_qsa_attn_mma_kernel<KV, HD, PT>;
+    auto kern = pd_q4x_qsa_attn_mma_kernel<KV, HD, PT, PAGED>;
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     kern<<<dim3(rows, nkv, splits), PD_QSA_MMA_WARPS * 32u, smem, st>>>(
         (const float*)q, (const KV*)kc, (const KV*)vc, (const uint32_t*)pos,
         (const uint32_t*)slots, (const uint32_t*)sel, (const uint32_t*)cnt, (float*)part_o,
-        (float*)part_ml, nh, nkv, max_ctx, k, scale);
+        (float*)part_ml, nh, nkv, max_ctx, k, scale, (const uint32_t*)block_tables, bps);
     return pd_launch_status();
 }
 
@@ -1049,4 +1250,28 @@ int pd_q4x_qsa_attn_mma(const void* q, const void* kc, const void* vc, const voi
               : pd_q4x_qsa_attn_mma_go<__half, 128u>(q, kc, vc, pos, slots, sel, cnt, part_o,
                                                     part_ml, rows, nh, nkv, max_ctx, k, splits,
                                                     scale, st);
+}
+
+// slot 696: pd_q4x_qsa_attn_mma over a paged pool - slot 695's arguments; -1
+// for a shape it does not take.
+PD_EXPORT
+int pd_q4x_qsa_attn_mma_paged(const void* q, const void* pool_k, const void* pool_v,
+                              const void* pos, const void* slots, const void* block_tables,
+                              uint32_t blocks_per_slot, const void* sel, const void* cnt,
+                              void* part_o, void* part_ml, uint32_t rows, uint32_t nh,
+                              uint32_t nkv, uint32_t hd, uint32_t k, uint32_t cr,
+                              uint32_t splits, float scale, uint32_t kv_dtype, void* stream) {
+    if (rows == 0) return 0;
+    if (cr != 4u || nkv == 0 || nh % nkv != 0 || nh / nkv > 16u || splits == 0 ||
+        (hd != 128u && hd != 256u))
+        return -1;
+    const cudaStream_t st = (cudaStream_t)stream;
+#define PD_QSAMP(KVT, HDV)                                                                 \
+    pd_q4x_qsa_attn_mma_go<KVT, HDV, true>(q, pool_k, pool_v, pos, slots, sel, cnt, part_o, \
+                                           part_ml, rows, nh, nkv, 0u, k, splits, scale, st, \
+                                           block_tables, blocks_per_slot)
+    if (kv_dtype == PD_KV_FP8_E4M3)
+        return hd == 256u ? PD_QSAMP(__nv_fp8_e4m3, 256u) : PD_QSAMP(__nv_fp8_e4m3, 128u);
+    return hd == 256u ? PD_QSAMP(__half, 256u) : PD_QSAMP(__half, 128u);
+#undef PD_QSAMP
 }

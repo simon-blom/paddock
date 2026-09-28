@@ -1358,6 +1358,29 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
     return pd_launch_status();
 }
 
+// slot 687: pd_matvec_f32_batch's BATCH BODY at every row count. The launcher
+// above leaves it for the lane-strided tile kernel from 16 rows (and for the
+// tiled GEMMs from 256 / 1024) - each a different K order, so a row's sum
+// depends on how many rows share the launch. Decode ticks that must score a
+// row the same at any width (qwen35's alpha|beta decay plane, 96 x 5120 f32,
+// L2-resident) take this entry: per row the bits of a 1-row call, since the
+// body is BT-invariant (same i stride, same shfl tree, same serial
+// cross-warp sum). BT only trades L2 re-reads for blocks.
+PD_EXPORT
+int pd_matvec_f32_winv(const void* w, const void* x, void* out, uint32_t in_dim,
+                       uint32_t out_dim, uint32_t batch, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    const uint32_t bt = batch < 16u ? 2u : 4u;
+    dim3 grid(out_dim, (batch + bt - 1u) / bt);
+    if (bt == 4u)
+        pd_pdl_go(pd_matvec_f32_batch_kernel<4u>, grid, 256, 0u, (cudaStream_t)stream,
+            (const float*)w, (const float*)x, (float*)out, in_dim, out_dim, batch);
+    else
+        pd_pdl_go(pd_matvec_f32_batch_kernel<2u>, grid, 256, 0u, (cudaStream_t)stream,
+            (const float*)w, (const float*)x, (float*)out, in_dim, out_dim, batch);
+    return pd_launch_status();
+}
+
 // Unconditionally-tiled f32 GEMM over a [out, in]-major weight (y = x·Wᵀ per
 // row): the k-quant batch/prefill interim's compute stage - its weights are
 // WIDE (ffn outs), where the matvec tile's per-TT-token weight re-read is
@@ -2831,72 +2854,133 @@ int pd_attn_decode_batch_ps(const void* q, const void* kc, const void* vc, const
     return pd_launch_status();
 }
 
+// The fmha walks' thread count (slots 537 / 545 and their paged twins 689 /
+// 690). Warp count = KV-split parallelism: the walk stripes t across warps, so
+// more warps is split-KV inside one launch. At c1 (24 blocks) the 8-warp
+// form is 39 us/layer vs the rival fmha's 9.1 - 4x the warps quadruples
+// the stream count for a one-line change. Merge grouping changes with nw
+// (f32 online-softmax merge order), so the widening is env-gated and
+// battery-judged, never a silent default - and one election serves the dense
+// and paged entries, which must fold alike.
+// DEFAULT 512 (16 warps), measured 2026-09-01 on qwen4exp's decode geometry
+// (24 q heads / 4 kv / head_dim 256) with scratch fmha_probe, us a launch:
+//
+//           b8 sl256   b8 sl4095   b1 sl256
+//   nw=8      20.73      245.51      18.45
+//   nw=16     18.58      185.71      14.37
+//   nw=32     24.62      176.33      14.34
+//
+// 16 warps dominates 8 at every point measured, so this is a strict
+// improvement on the old 256 default. 32 wins only once the walk is long
+// enough to amortise the epilogue -- warp 0 merges nw partials SERIALLY --
+// and is 24% worse at the c8 serve shape, which is what the 1024 the board
+// had been electing was costing: c8 688.1 at 512 against 683.7 at 1024,
+// four legs against three, non-overlapping.
+static uint32_t pd_fmha_nth() {
+    static const uint32_t nth = [] {
+        const char* v = pd_env("PADDOCK_Q38FN_FMHA_NTH");
+        const uint32_t n = v ? (uint32_t)atoi(v) : 512u;
+        return (n == 256u || n == 512u || n == 1024u) ? n : 512u;
+    }();
+    return nth;
+}
+
+template <bool PAGED>
+static int pd_attn_decode_fmha_go(const void* q, const void* kc, const void* vc,
+                                  const void* sinks, void* out, const void* positions,
+                                  const void* slots, const void* block_tables, uint32_t bps,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window,
+                                  uint32_t batch, float scale, uint32_t kv_dtype,
+                                  void* stream) {
+    if (n_heads == 0 || batch == 0) return 0;
+    if (head_dim != 128u && head_dim != 256u) return 1;
+    dim3 grid(n_heads, batch);
+    const uint32_t nth = pd_fmha_nth();
+    const uint32_t nw = nth / 32u;
+    const uint32_t smem = (nw * head_dim + 2u * nw) * (uint32_t)sizeof(float);
+    const auto st = (cudaStream_t)stream;
+    const auto bt = (const uint32_t*)block_tables;
+#define PD_FMHA(KVT, DPLV)                                                              \
+    pd_attn_decode_fmha_kernel<KVT, DPLV, PAGED><<<grid, nth, smem, st>>>(              \
+        (const float*)q, (const KVT*)kc, (const KVT*)vc, (const float*)sinks, (float*)out, \
+        (const unsigned int*)positions, (const unsigned int*)slots, n_heads, n_kv_heads,  \
+        head_dim, max_ctx, kv_dim, swa_window, scale, bt, bps)
+    const bool f8 = kv_dtype == PD_KV_FP8_E4M3;
+    if (head_dim == 256u) {
+        if (f8) PD_FMHA(__nv_fp8_e4m3, 8); else PD_FMHA(__half, 8);
+    } else {
+        if (f8) PD_FMHA(__nv_fp8_e4m3, 4); else PD_FMHA(__half, 4);
+    }
+#undef PD_FMHA
+    return pd_launch_status();
+}
+
 // FMHA-style decode attention (slot 537). Same ABI as pd_attn_decode_batch.
 // The register layout needs head_dim % 32 == 0 and (head_dim/32) % 4 == 0, so
-// only 128 and 256 are served. The CALLER elects on head_dim; the guard below
-// is a safety net and returns non-zero (surfacing as a launch error) rather
-// than silently writing garbage.
+// only 128 and 256 are served. The CALLER elects on head_dim; the guard in
+// the launcher is a safety net and returns non-zero (surfacing as a launch
+// error) rather than silently writing garbage.
 PD_EXPORT
 int pd_attn_decode_fmha(const void* q, const void* kc, const void* vc, const void* sinks,
                         void* out, const void* positions, const void* slots, uint32_t n_heads,
                         uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx, uint32_t kv_dim,
                         uint32_t swa_window, uint32_t batch, float scale, uint32_t kv_dtype,
                         void* stream) {
+    return pd_attn_decode_fmha_go<false>(q, kc, vc, sinks, out, positions, slots, nullptr, 0u,
+                                         n_heads, n_kv_heads, head_dim, max_ctx, kv_dim,
+                                         swa_window, batch, scale, kv_dtype, stream);
+}
+
+// slot 689: pd_attn_decode_fmha over a paged pool [n_blocks, 16, kv_dim] -
+// pd_attn_decode_batch_paged's arguments. Bit-identical to the dense entry
+// over the same keys.
+PD_EXPORT
+int pd_attn_decode_fmha_paged(const void* q, const void* pool_k, const void* pool_v,
+                              const void* sinks, void* out, const void* positions,
+                              const void* slots, const void* block_tables,
+                              uint32_t blocks_per_slot, uint32_t n_heads, uint32_t n_kv_heads,
+                              uint32_t head_dim, uint32_t kv_dim, uint32_t swa_window,
+                              uint32_t batch, float scale, uint32_t kv_dtype, void* stream) {
+    return pd_attn_decode_fmha_go<true>(q, pool_k, pool_v, sinks, out, positions, slots,
+                                        block_tables, blocks_per_slot, n_heads, n_kv_heads,
+                                        head_dim, 0u, kv_dim, swa_window, batch, scale,
+                                        kv_dtype, stream);
+}
+
+template <bool PAGED>
+static int pd_attn_decode_fmha_sp_go(const void* q, const void* kc, const void* vc,
+                                     const void* sinks, void* out, void* part,
+                                     const void* positions, const void* slots,
+                                     const void* block_tables, uint32_t bps, uint32_t n_heads,
+                                     uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx,
+                                     uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                     uint32_t split, float scale, uint32_t kv_dtype,
+                                     void* stream) {
     if (n_heads == 0 || batch == 0) return 0;
     if (head_dim != 128u && head_dim != 256u) return 1;
-    dim3 grid(n_heads, batch);
-    // Warp count = KV-split parallelism: the walk stripes t across warps, so
-    // more warps is split-KV inside one launch. At c1 (24 blocks) the 8-warp
-    // form is 39 us/layer vs the rival fmha's 9.1 - 4x the warps quadruples
-    // the stream count for a one-line change. Merge grouping changes with nw
-    // (f32 online-softmax merge order), so the widening is env-gated and
-    // battery-judged, never a silent default.
-    // DEFAULT 512 (16 warps), measured 2026-09-01 on qwen4exp's decode geometry
-    // (24 q heads / 4 kv / head_dim 256) with scratch fmha_probe, us a launch:
-    //
-    //           b8 sl256   b8 sl4095   b1 sl256
-    //   nw=8      20.73      245.51      18.45
-    //   nw=16     18.58      185.71      14.37
-    //   nw=32     24.62      176.33      14.34
-    //
-    // 16 warps dominates 8 at every point measured, so this is a strict
-    // improvement on the old 256 default. 32 wins only once the walk is long
-    // enough to amortise the epilogue -- warp 0 merges nw partials SERIALLY --
-    // and is 24% worse at the c8 serve shape, which is what the 1024 the board
-    // had been electing was costing: c8 688.1 at 512 against 683.7 at 1024,
-    // four legs against three, non-overlapping.
-    static const uint32_t nth = [] {
-        const char* v = pd_env("PADDOCK_Q38FN_FMHA_NTH");
-        const uint32_t n = v ? (uint32_t)atoi(v) : 512u;
-        return (n == 256u || n == 512u || n == 1024u) ? n : 512u;
-    }();
+    if (split < 2u || split > 64u) return 1;
+    const uint32_t nth = pd_fmha_nth();
     const uint32_t nw = nth / 32u;
     const uint32_t smem = (nw * head_dim + 2u * nw) * (uint32_t)sizeof(float);
+    dim3 grid(n_heads, batch, split);
+    const auto st = (cudaStream_t)stream;
+    const auto bt = (const uint32_t*)block_tables;
+#define PD_FMHA_SP(KVT, DPLV)                                                           \
+    pd_attn_decode_fmha_sp_kernel<KVT, DPLV, PAGED><<<grid, nth, smem, st>>>(           \
+        (const float*)q, (const KVT*)kc, (const KVT*)vc, (float*)part,                  \
+        (const unsigned int*)positions, (const unsigned int*)slots, n_heads, n_kv_heads, \
+        head_dim, max_ctx, kv_dim, swa_window, scale, bt, bps)
+    const bool f8 = kv_dtype == PD_KV_FP8_E4M3;
     if (head_dim == 256u) {
-        if (kv_dtype == PD_KV_FP8_E4M3)
-            pd_attn_decode_fmha_kernel<__nv_fp8_e4m3, 8><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc,
-                (const float*)sinks, (float*)out, (const unsigned int*)positions,
-                (const unsigned int*)slots, n_heads, n_kv_heads, head_dim, max_ctx, kv_dim,
-                swa_window, scale);
-        else
-            pd_attn_decode_fmha_kernel<__half, 8><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
-                (float*)out, (const unsigned int*)positions, (const unsigned int*)slots, n_heads,
-                n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
+        if (f8) PD_FMHA_SP(__nv_fp8_e4m3, 8); else PD_FMHA_SP(__half, 8);
     } else {
-        if (kv_dtype == PD_KV_FP8_E4M3)
-            pd_attn_decode_fmha_kernel<__nv_fp8_e4m3, 4><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc,
-                (const float*)sinks, (float*)out, (const unsigned int*)positions,
-                (const unsigned int*)slots, n_heads, n_kv_heads, head_dim, max_ctx, kv_dim,
-                swa_window, scale);
-        else
-            pd_attn_decode_fmha_kernel<__half, 4><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __half*)kc, (const __half*)vc, (const float*)sinks,
-                (float*)out, (const unsigned int*)positions, (const unsigned int*)slots, n_heads,
-                n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
+        if (f8) PD_FMHA_SP(__nv_fp8_e4m3, 4); else PD_FMHA_SP(__half, 4);
     }
+#undef PD_FMHA_SP
+    dim3 mgrid(n_heads, batch);
+    pd_attn_fmha_merge_kernel<<<mgrid, head_dim, 0, st>>>(
+        (const float*)part, (const float*)sinks, (float*)out, n_heads, head_dim, split);
     return pd_launch_status();
 }
 
@@ -2914,45 +2998,27 @@ int pd_attn_decode_fmha_sp(const void* q, const void* kc, const void* vc, const 
                            uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window,
                            uint32_t batch, uint32_t split, float scale, uint32_t kv_dtype,
                            void* stream) {
-    if (n_heads == 0 || batch == 0) return 0;
-    if (head_dim != 128u && head_dim != 256u) return 1;
-    if (split < 2u || split > 64u) return 1;
-    // same 16-warp default as the unsplit form above
-    static const uint32_t nth = [] {
-        const char* v = pd_env("PADDOCK_Q38FN_FMHA_NTH");
-        const uint32_t n = v ? (uint32_t)atoi(v) : 512u;
-        return (n == 256u || n == 512u || n == 1024u) ? n : 512u;
-    }();
-    const uint32_t nw = nth / 32u;
-    const uint32_t smem = (nw * head_dim + 2u * nw) * (uint32_t)sizeof(float);
-    dim3 grid(n_heads, batch, split);
-    if (head_dim == 256u) {
-        if (kv_dtype == PD_KV_FP8_E4M3)
-            pd_attn_decode_fmha_sp_kernel<__nv_fp8_e4m3, 8><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc,
-                (float*)part, (const unsigned int*)positions, (const unsigned int*)slots,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
-        else
-            pd_attn_decode_fmha_sp_kernel<__half, 8><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __half*)kc, (const __half*)vc, (float*)part,
-                (const unsigned int*)positions, (const unsigned int*)slots,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
-    } else {
-        if (kv_dtype == PD_KV_FP8_E4M3)
-            pd_attn_decode_fmha_sp_kernel<__nv_fp8_e4m3, 4><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __nv_fp8_e4m3*)kc, (const __nv_fp8_e4m3*)vc,
-                (float*)part, (const unsigned int*)positions, (const unsigned int*)slots,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
-        else
-            pd_attn_decode_fmha_sp_kernel<__half, 4><<<grid, nth, smem, (cudaStream_t)stream>>>(
-                (const float*)q, (const __half*)kc, (const __half*)vc, (float*)part,
-                (const unsigned int*)positions, (const unsigned int*)slots,
-                n_heads, n_kv_heads, head_dim, max_ctx, kv_dim, swa_window, scale);
-    }
-    dim3 mgrid(n_heads, batch);
-    pd_attn_fmha_merge_kernel<<<mgrid, head_dim, 0, (cudaStream_t)stream>>>(
-        (const float*)part, (const float*)sinks, (float*)out, n_heads, head_dim, split);
-    return pd_launch_status();
+    return pd_attn_decode_fmha_sp_go<false>(q, kc, vc, sinks, out, part, positions, slots,
+                                            nullptr, 0u, n_heads, n_kv_heads, head_dim,
+                                            max_ctx, kv_dim, swa_window, batch, split, scale,
+                                            kv_dtype, stream);
+}
+
+// slot 690: pd_attn_decode_fmha_sp over a paged pool - `block_tables` +
+// `blocks_per_slot` after `slots`, no max_ctx. Bit-identical to the dense
+// entry over the same keys.
+PD_EXPORT
+int pd_attn_decode_fmha_sp_paged(const void* q, const void* pool_k, const void* pool_v,
+                                 const void* sinks, void* out, void* part,
+                                 const void* positions, const void* slots,
+                                 const void* block_tables, uint32_t blocks_per_slot,
+                                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                 uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                 uint32_t split, float scale, uint32_t kv_dtype, void* stream) {
+    return pd_attn_decode_fmha_sp_go<true>(q, pool_k, pool_v, sinks, out, part, positions,
+                                           slots, block_tables, blocks_per_slot, n_heads,
+                                           n_kv_heads, head_dim, 0u, kv_dim, swa_window, batch,
+                                           split, scale, kv_dtype, stream);
 }
 
 // Paged decode launcher: same shape/carveout as pd_attn_decode_batch, but K/V
@@ -2990,6 +3056,52 @@ int pd_attn_decode_batch_paged(const void* q, const void* pool_k, const void* po
             n_heads, n_kv_heads, head_dim, kv_dim, swa_window, scale);
     else
         pd_attn_decode_batch_paged_kernel<__half><<<grid, attn_nth, attn_smem, (cudaStream_t)stream>>>(
+            (const float*)q, (const __half*)pool_k, (const __half*)pool_v, (const float*)sinks,
+            (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
+            (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, head_dim,
+            kv_dim, swa_window, scale);
+    return pd_launch_status();
+}
+
+// slot 691: pd_attn_decode_batch_paged with the PARALLEL-SCORE walk - the
+// paged twin of slot 536, bit-identical to it over the same keys (the tile
+// walks share one score step; see pd_attn_tile_scores). Same arguments,
+// grid, carveout and smem as pd_attn_decode_batch_paged.
+PD_EXPORT
+int pd_attn_decode_batch_ps_paged(const void* q, const void* pool_k, const void* pool_v,
+                                  const void* sinks, void* out, const void* positions,
+                                  const void* slots, const void* block_tables,
+                                  uint32_t blocks_per_slot, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t head_dim, uint32_t kv_dim,
+                                  uint32_t swa_window, uint32_t batch, float scale,
+                                  uint32_t kv_dtype, void* stream) {
+    if (n_heads == 0 || batch == 0) return 0;
+    dim3 grid(n_heads, batch);
+    uint32_t attn_nth = head_dim > 256 ? head_dim : 256;
+    uint32_t attn_smem = (uint32_t)PD_ATTN_TILE_SMEM(head_dim);
+    auto k8 = pd_attn_decode_batch_paged_kernel<__nv_fp8_e4m3, float, float, true>;
+    auto k16 = pd_attn_decode_batch_paged_kernel<__half, float, float, true>;
+    static uint32_t smem_set_psp = 0;
+    if (smem_set_psp == 0) {
+        pd_prefer_max_shared(k8);
+        pd_prefer_max_shared(k16);
+        smem_set_psp = 1;
+    }
+    if (attn_smem > 48u * 1024u && attn_smem > smem_set_psp) {
+        cudaFuncSetAttribute((const void*)k8, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             attn_smem);
+        cudaFuncSetAttribute((const void*)k16, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             attn_smem);
+        smem_set_psp = attn_smem;
+    }
+    if (kv_dtype == PD_KV_FP8_E4M3)
+        k8<<<grid, attn_nth, attn_smem, (cudaStream_t)stream>>>(
+            (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
+            (const float*)sinks, (float*)out, (const unsigned int*)positions,
+            (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
+            n_heads, n_kv_heads, head_dim, kv_dim, swa_window, scale);
+    else
+        k16<<<grid, attn_nth, attn_smem, (cudaStream_t)stream>>>(
             (const float*)q, (const __half*)pool_k, (const __half*)pool_v, (const float*)sinks,
             (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
             (const uint32_t*)block_tables, blocks_per_slot, n_heads, n_kv_heads, head_dim,
@@ -4004,10 +4116,22 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
     // vec8 walk's 327 us per layer (GB10, 2026-09-11). The r = 1
     // lane thereby joins the r >= 2 class (the NXQ2/NXP3 split-f16 walk);
     // its gates are the class gates, not bit-identity.
+    //
+    // f16 KV at G 9..16 joined on GB10 2026-09-25. f16 G<=8 was always lagd
+    // (the GQA branch below); past 8 the GQA gate dropped it onto the plain
+    // per-(q-head, split) walk, where each of the group's heads re-reads the
+    // group's KV: ~24 GB/s, nemotron's whole decode-vs-depth cliff (67.9 ->
+    // 12.5 tok/s from 10K to 259K). bench/nemo_dec_attn_long_gb10_bench.cu,
+    // 32q/2kv: 256K 11.2 ms -> 1.38 ms a layer (~193 GB/s); laguna's G9
+    // window-512 shape 43 -> 9-10 us at one row, 394 -> 94 at r 8. Class:
+    // the lagd split-f16 walk (rel 1e-6..7e-5 vs the exact-f32 walk, the
+    // same class the G<=8 f16 lane and every fp8 hp16 row already serve).
+    const bool hp_f8 = kv_dtype == PD_KV_FP8_E4M3 && group >= 8u;
+    const bool hp_f16 = kv_dtype == PD_KV_FP16 && group > 8u;
     static int no_hp16 = -1;
     if (no_hp16 < 0) no_hp16 = pd_env("PADDOCK_NO_ATTN_HP16") ? 1 : 0;
-    if (!no_hp16 && kv_dtype == PD_KV_FP8_E4M3 && head_dim == 128u
-        && group >= 8u && group <= 16u && batch >= 1u
+    if (!no_hp16 && (hp_f8 || hp_f16) && head_dim == 128u
+        && group <= 16u && batch >= 1u
         && n_heads == n_kv_heads * group) {
         static uint32_t hp16_set_p = 0;
         if (hp16_set_p == 0) {
@@ -4015,10 +4139,19 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
                 pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, true>);
             pd_prefer_max_shared(
                 pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, false>);
+            pd_prefer_max_shared(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __half, true>);
             hp16_set_p = 1;
         }
         dim3 hgrid(n_kv_heads, batch, n_splits);
-        if (group > 8u)
+        if (hp_f16)
+            pd_pdl_go(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __half, true>,
+                      hgrid, 256u, PD_LAGD_SMEM_SPLIT, (cudaStream_t)stream,
+                      (const float*)q, (const __half*)pool_k, (const __half*)pool_v,
+                      (float*)out_o, (float*)out_ml, (const unsigned int*)positions,
+                      (const unsigned int*)slots, (const uint32_t*)block_tables,
+                      blocks_per_slot, 0u, n_heads, n_kv_heads, kv_dim, swa_window,
+                      n_splits, scale);
+        else if (group > 8u)
             pd_pdl_go(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, true>,
                       hgrid, 256u, PD_LAGD_SMEM_SPLIT, (cudaStream_t)stream,
                       (const float*)q, (const __nv_fp8_e4m3*)pool_k,

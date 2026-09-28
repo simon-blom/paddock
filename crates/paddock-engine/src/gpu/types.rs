@@ -266,6 +266,13 @@ pub struct RepackedKQ {
     /// GGUF order: dims[0] = in_dim, dims[1] = out_dim.
     pub dims: Vec<usize>,
     pub ty: GgmlType,
+    /// The plane's int8 activation class is ONE scale per 128 (the ternary
+    /// lanes' class, slot 627) at every width that stages its input per
+    /// row block, instead of the k-quant lanes' one per 32. Set by a loader
+    /// that elected the class for the whole model (qwen35 `tern_nb`): the
+    /// planes that read one staged input share its class, and the staging
+    /// site reads this flag (or the model's rotation) to stage it that way.
+    pub act128: bool,
 }
 
 /// (GGUF raw id, source block bytes, repacked data bytes) per 256-weight
@@ -453,6 +460,13 @@ impl QuantW {
 
     /// Some for the k-quant arm (the serial-path dispatch match).
     pub fn kq(&self) -> Option<&RepackedKQ> {
+        match self {
+            QuantW::Q8(_) => None,
+            QuantW::Kq(w) => Some(w),
+        }
+    }
+
+    pub fn kq_mut(&mut self) -> Option<&mut RepackedKQ> {
         match self {
             QuantW::Q8(_) => None,
             QuantW::Kq(w) => Some(w),

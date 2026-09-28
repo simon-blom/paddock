@@ -9,9 +9,39 @@ use paddock_models::safetensors::{ShardedSafetensors, StDtype};
 
 pub(super) const A4G32: u32 = 0x101;
 pub(super) const A8G64: u32 = 0x102;
-// Split-K targets at most 512 output tiles, each 32x32 BF16 values.
-// Partial storage is bounded independently of the model's weight sizes.
-pub(super) const WORKSPACE_BYTES: usize = 512 * 32 * 32 * 2;
+#[cfg(test)]
+thread_local! {
+    pub(super) static SEPARATE_SPANS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static SHAPE_ONLY_SPANS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static INLINE_INPUT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PLAIN_DENSE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PLAIN_SPLIT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static PADDED_TILES_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+// Padding changes only the on-chip weight pitch, not the logical tensor,
+// accumulation or split/join contract. The previous pitch remains a test
+// comparator; production elects this only in the staged M5 matrix paths.
+fn padded_tiles() -> bool {
+    #[cfg(test)]
+    return PADDED_TILES_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    true
+}
+// Split-K partials and bounded BF16 inputs share one reusable allocation
+// with single-part dense and routed-expert input staging. Wide dense
+// projections slice physical rows to fit, retaining their logical contraction;
+// top-10 expert-down K=640 needs 6400 values per model row. These uses never
+// overlap. No weight expansion or post-load GPU allocation.
+// Physical dispatch capacity is independent from a prompt's immutable
+// arithmetic shape. Wider shared passes must not re-elect split-K or masks.
+pub(super) const MAX_LOGICAL_ROWS: usize = 1024;
+pub(super) const MAX_ROWS: usize = 2048;
+#[cfg(test)]
+pub(super) const WORKSPACE_BYTES: usize = MAX_ROWS * 6400 * 2;
+pub(super) const fn workspace_bytes(capacity: usize) -> usize {
+    capacity * 6400 * 2
+}
 pub(super) fn is_affine(ty: u32) -> bool {
     matches!(ty, A4G32 | A8G64)
 }
@@ -22,6 +52,26 @@ pub(super) fn format(ty: u32) -> (usize, usize) {
         A8G64 => (8, 64),
         _ => panic!("not a Flash Next affine tensor"),
     }
+}
+
+/// Complete row-count-dependent dense contraction: vector, wide vector or
+/// tiled split-K. Prefix compatibility consumes the very same election as
+/// dispatch, not a separately maintained list of numerical breakpoints.
+pub(super) fn contraction(k: usize, n: usize, ty: u32, rows: usize) -> (u8, usize) {
+    if rows == 1 || n <= 48 {
+        return (0, 1);
+    }
+    if rows < 13 {
+        return (1, 1);
+    }
+    let align = format(ty).1.max(32);
+    let mut parts = (512 / (n.div_ceil(32) * rows.div_ceil(32)))
+        .min(k / align)
+        .max(1);
+    while !k.is_multiple_of(parts * align) {
+        parts -= 1;
+    }
+    (2, parts)
 }
 
 /// Validate all three planes before allocating. Shape is logical row-major,
@@ -105,10 +155,23 @@ pub(super) fn project(cmd: &Commands<'_>, w: &Weight, x: &Buffer, y: &Buffer, ro
     if !cmd.independent_rows()
         && let Some(spans) = cmd.projection_rows()
     {
+        #[cfg(test)]
+        if SEPARATE_SPANS_FOR_TEST.with(|v| v.get()) {
+            for &(start, count, logical) in spans {
+                project_span(cmd, w, x, y, count, start, logical);
+            }
+            return;
+        }
         let mut end = 0;
-        for &(start, count, logical_count) in spans {
+        for (start, count, logical_count) in coalesced_spans(
+            w.k,
+            w.n,
+            w.ty,
+            cmd.projection_workspace().map(Buffer::len),
+            spans,
+        ) {
             assert!(start == end && count > 0 && start + count <= rows);
-            assert!(count <= logical_count && logical_count <= 1024);
+            assert!(count <= MAX_ROWS && logical_count <= MAX_LOGICAL_ROWS);
             project_span(cmd, w, x, y, count, start, logical_count);
             end += count;
         }
@@ -118,7 +181,57 @@ pub(super) fn project(cmd: &Commands<'_>, w: &Weight, x: &Buffer, y: &Buffer, ro
     project_span(cmd, w, x, y, rows, 0, rows);
 }
 
-fn project_span(
+/// Dense projections are row-local. Adjacent physical slices may share a
+/// dispatch only when this weight's arithmetic contract is identical. Logical
+/// lengths need not be equal: many lengths elect the same vector or split-K
+/// contraction. Physical rows are bounded separately by capacity and the
+/// actual split-K workspace. Do not re-elect arithmetic using the merged row
+/// count: that would change vector/tile or partition order. This is per projection;
+/// recurrent/attention/expert metadata and prefix compatibility are untouched.
+fn coalesced_spans(
+    k: usize,
+    n: usize,
+    ty: u32,
+    workspace: Option<usize>,
+    spans: &[(usize, usize, usize)],
+) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+    let mut next = 0;
+    std::iter::from_fn(move || {
+        let &(start, mut count, mut logical) = spans.get(next)?;
+        assert!(count > 0 && count <= logical && logical <= MAX_LOGICAL_ROWS);
+        let signature = contraction(k, n, ty, logical);
+        let capacity = if signature.0 == 2 && signature.1 > 1 {
+            workspace.map_or(MAX_ROWS, |bytes| {
+                MAX_ROWS.min(bytes / (n * signature.1 * 2))
+            })
+        } else {
+            MAX_ROWS
+        };
+        next += 1;
+        while let Some(&(at, len, contract)) = spans.get(next) {
+            assert!(len > 0 && len <= contract && contract <= MAX_LOGICAL_ROWS);
+            let compatible = contract == logical || signature == contraction(k, n, ty, contract);
+            #[cfg(test)]
+            let compatible =
+                compatible && (!SHAPE_ONLY_SPANS_FOR_TEST.with(|v| v.get()) || contract == logical);
+            #[cfg(test)]
+            let capacity = if SHAPE_ONLY_SPANS_FOR_TEST.with(|v| v.get()) {
+                logical
+            } else {
+                capacity
+            };
+            if at != start + count || !compatible || count + len > capacity {
+                break;
+            }
+            count += len;
+            logical = logical.max(contract);
+            next += 1;
+        }
+        Some((start, count, logical))
+    })
+}
+
+pub(super) fn project_span(
     cmd: &Commands<'_>,
     w: &Weight,
     x: &Buffer,
@@ -129,8 +242,18 @@ fn project_span(
 ) {
     let (bits, group) = format(w.ty);
     assert!(rows > 0 && x.len() >= (start + rows) * w.k * 4 && y.len() >= (start + rows) * w.n * 4);
-    let tile = !cmd.independent_rows() && logical_rows >= 13 && w.n > 48;
-    let wide = !cmd.independent_rows() && !tile && logical_rows > 1 && w.n > 48;
+    let (kind, parts) = contraction(
+        w.k,
+        w.n,
+        w.ty,
+        if cmd.independent_rows() {
+            1
+        } else {
+            logical_rows
+        },
+    );
+    let tile = kind == 2;
+    let wide = kind == 1;
     // Test-binary-only arithmetic bisect. No runner setting or production
     // branch: isolate compiler specialization from the prefill graph.
     #[cfg(test)]
@@ -175,16 +298,128 @@ fn project_span(
         && w.n >= 8
         && w.n <= 512
         && w.n.is_multiple_of(8);
-    let align = group.max(32);
-    let mut parts = if tile {
-        (512 / (w.n.div_ceil(32) * logical_rows.div_ceil(32)))
-            .min(w.k / align)
-            .max(1)
-    } else {
-        1
-    };
-    while !w.k.is_multiple_of(parts * align) {
-        parts -= 1;
+    let staged_split = tile && parts > 1 && bits == 4 && rows >= 64 && cmd.tensor_accelerated();
+    #[cfg(test)]
+    let staged_split = staged_split && !PLAIN_SPLIT_FOR_TEST.with(|v| v.get());
+    if staged_split && let Some(scratch) = cmd.projection_workspace() {
+        // Reserve padded input and partials together. Bound physical slicing
+        // by the actual arena, never by an assumed allocation. The logical
+        // partition count stays fixed even at a short final physical slice.
+        let capacity = (scratch.len() / (2 * (w.k + parts * w.n)) / 32) * 32;
+        if capacity >= 32 {
+            for offset in (0..rows).step_by(capacity) {
+                let count = capacity.min(rows - offset);
+                let padded = count.next_multiple_of(32);
+                let partial_offset = padded * w.k * 2;
+                assert!(partial_offset + count * w.n * parts * 2 <= scratch.len());
+                let p = [
+                    w.k as u32,
+                    w.n as u32,
+                    count as u32,
+                    bits as u32,
+                    group as u32,
+                    parts as u32,
+                    (start + offset) as u32,
+                ];
+                cmd.dispatch(
+                    "q4a_input",
+                    &[x, scratch],
+                    &p,
+                    [(padded * w.k).div_ceil(256), 1, 1],
+                    256,
+                );
+                let span = w.k / parts;
+                let kernel = if padded_tiles() && span.is_multiple_of(128) {
+                    "q4a_mm4_split_device128_pad8"
+                } else if padded_tiles() && span.is_multiple_of(64) {
+                    "q4a_mm4_split_device64_pad8"
+                } else if padded_tiles() {
+                    "q4a_mm4_split_device32_pad8"
+                } else if span.is_multiple_of(128) {
+                    "q4a_mm4_split_device128_group32"
+                } else if span.is_multiple_of(64) {
+                    "q4a_mm4_split_device64_group32"
+                } else {
+                    "q4a_mm4_split_device32_group32"
+                };
+                cmd.dispatch_at(
+                    kernel,
+                    &[&w.buffer, scratch, scratch],
+                    &[0, 0, partial_offset],
+                    &p,
+                    [w.n.div_ceil(32), count.div_ceil(32), parts],
+                    128,
+                );
+                cmd.dispatch_at(
+                    "q4a_mm_join",
+                    &[scratch, y],
+                    &[partial_offset, 0],
+                    &p,
+                    [(count * w.n).div_ceil(256), 1, 1],
+                    256,
+                );
+            }
+            return;
+        }
+    }
+    let hc_down = bits == 4 && w.k == 10240 && w.n == 320;
+    #[cfg(test)]
+    let hc_down = hc_down && !PLAIN_SPLIT_FOR_TEST.with(|v| v.get());
+    let staged_input = tile
+        && parts == 1
+        && cmd.tensor_accelerated()
+        && rows >= 64
+        && ((w.n >= 512 && w.k <= 6144) || hc_down)
+        && w.k.is_multiple_of(64);
+    #[cfg(test)]
+    let staged_input = staged_input && !INLINE_INPUT_FOR_TEST.with(|v| v.get());
+    if staged_input
+        && let Some(scratch) = cmd.projection_workspace()
+        && scratch.len() / (w.k * 2) >= 32
+    {
+        let capacity = (scratch.len() / (w.k * 2) / 32) * 32;
+        for offset in (0..rows).step_by(capacity) {
+            let count = capacity.min(rows - offset);
+            let padded = count.next_multiple_of(32);
+            let p = [
+                w.k as u32,
+                w.n as u32,
+                count as u32,
+                bits as u32,
+                group as u32,
+                1,
+                (start + offset) as u32,
+            ];
+            cmd.dispatch(
+                "q4a_input",
+                &[x, scratch],
+                &p,
+                [(padded * w.k).div_ceil(256), 1, 1],
+                256,
+            );
+            #[cfg(test)]
+            let grouped = !PLAIN_DENSE_FOR_TEST.with(|v| v.get());
+            #[cfg(not(test))]
+            let grouped = true;
+            cmd.dispatch(
+                match (bits, w.k.is_multiple_of(128), grouped) {
+                    (4, true, true) if padded_tiles() => "q4a_mm4_device128_pad8",
+                    (4, false, true) if padded_tiles() => "q4a_mm4_device64_pad8",
+                    (4, true, true) => "q4a_mm4_device128_group32",
+                    (4, false, true) => "q4a_mm4_device64_group32",
+                    (4, true, false) => "q4a_mm4_device128",
+                    (4, false, false) => "q4a_mm4_device64",
+                    (8, true, _) => "q4a_mm8_device128",
+                    (8, false, _) => "q4a_mm8_device64",
+                    _ => unreachable!(),
+                },
+                &[&w.buffer, scratch, y],
+                &p,
+                [w.n.div_ceil(32), count.div_ceil(32), 1],
+                128,
+            );
+        }
+        return;
     }
     if tile
         && parts > 1
@@ -316,7 +551,7 @@ pub(super) fn experts_ordered(
     assert_eq!(w.ty, A4G32);
     assert!(w.n.is_multiple_of(512));
     let n = w.n / 512;
-    assert!(entries > 0 && entries <= 10240 && entries.is_multiple_of(10));
+    assert!(entries > 0 && entries <= MAX_ROWS * 10 && entries.is_multiple_of(10));
     assert!(ids.len() >= entries * 4 && y.len() >= entries * n * 4);
     assert!(
         x.len()
@@ -365,4 +600,92 @@ pub(super) fn experts_ordered(
         },
         128,
     );
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::{
+        A4G32, A8G64, MAX_LOGICAL_ROWS, MAX_ROWS, WORKSPACE_BYTES, coalesced_spans, contraction,
+    };
+
+    #[test]
+    fn dense_coalescing_preserves_contract_and_scratch_bound() {
+        let spans = [
+            (0, 1, 1),
+            (1, 1, 1),
+            (2, 1, 1024),
+            (3, 255, 1024),
+            (258, 256, 1024),
+            (514, 512, 1024),
+            (1026, 128, 1024),
+            (1154, 127, 128),
+            (1281, 1, 128),
+            (1282, 1, 1),
+        ];
+        assert_eq!(
+            coalesced_spans(10240, 320, A4G32, Some(WORKSPACE_BYTES), &spans).collect::<Vec<_>>(),
+            [(0, 2, 1), (2, 1152, 1024), (1154, 128, 128), (1282, 1, 1),]
+        );
+        assert_eq!(coalesced_spans(10240, 320, A4G32, None, &[]).count(), 0);
+        assert_eq!(
+            coalesced_spans(10240, 320, A4G32, None, &[(0, 1, 4), (2, 1, 4)]).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unequal_lengths_merge_only_with_the_same_weight_contraction() {
+        let spans = [
+            (0, 1, 1),
+            (1, 17, 700),
+            (18, 15, 750),
+            (33, 31, 800),
+            (64, 64, 1024),
+            (128, 31, 900),
+            (159, 1, 1),
+        ];
+        assert_eq!(
+            coalesced_spans(10240, 320, A4G32, Some(WORKSPACE_BYTES), &spans).collect::<Vec<_>>(),
+            [(0, 1, 1), (1, 63, 800), (64, 95, 1024), (159, 1, 1)]
+        );
+        assert_eq!(
+            coalesced_spans(2560, 6144, A4G32, Some(WORKSPACE_BYTES), &spans).collect::<Vec<_>>(),
+            [(0, 1, 1), (1, 158, 1024), (159, 1, 1)]
+        );
+        for (k, n, ty) in [
+            (10240, 320, A4G32),
+            (2560, 6144, A4G32),
+            (2560, 512, A8G64),
+            (10240, 4, A4G32),
+            (320, 10240, A4G32),
+        ] {
+            for a in 1..=MAX_LOGICAL_ROWS {
+                for b in 1..=MAX_LOGICAL_ROWS {
+                    let rows = [(0, 1, a), (1, 1, b)];
+                    let merged =
+                        coalesced_spans(k, n, ty, Some(WORKSPACE_BYTES), &rows).collect::<Vec<_>>();
+                    assert_eq!(merged.iter().map(|s| s.1).sum::<usize>(), 2);
+                    for &(start, count, logical) in &merged {
+                        assert!(count <= MAX_ROWS && logical <= MAX_ROWS);
+                        let (kind, parts) = contraction(k, n, ty, logical);
+                        if kind == 2 && parts > 1 {
+                            assert!(count * n * parts * 2 <= WORKSPACE_BYTES);
+                        }
+                        for s in &rows[start..start + count] {
+                            assert_eq!(contraction(k, n, ty, logical), contraction(k, n, ty, s.2));
+                        }
+                    }
+                }
+            }
+        }
+        let rows = [(0, 64, 64), (64, 64, 64)];
+        assert_eq!(
+            coalesced_spans(10240, 320, A4G32, Some(1 << 20), &rows).count(),
+            2
+        );
+        assert_eq!(
+            coalesced_spans(10240, 320, A4G32, Some(WORKSPACE_BYTES), &rows).collect::<Vec<_>>(),
+            [(0, 128, 64)]
+        );
+    }
 }

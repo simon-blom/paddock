@@ -1459,3 +1459,77 @@ fn native_checkpoint_relocation_replay_and_abort_are_exact() {
     assert!(model.forward_mixed(&[(4, 1, 0)], 1).is_err());
     assert!(model.forward_prefill(0, &vec![1; 1025]).is_err());
 }
+
+#[test]
+#[ignore = "requires PADDOCK_METAL_MLX_MODEL; concurrent tool-turn checkpoint retention and exact replay"]
+fn native_tool_turns_retain_waiting_conversations() {
+    let path = std::env::var("PADDOCK_METAL_MLX_MODEL").unwrap();
+    let mut model = Qwen35::load(Path::new(&path), 1024, 4, None).unwrap();
+    let prompts: Vec<Vec<u32>> = (0..4)
+        .map(|branch| (0..537).map(|n| 1000 + branch * 1000 + n).collect())
+        .collect();
+    let mut expected = Vec::new();
+    for (slot, prompt) in prompts.iter().enumerate() {
+        assert_eq!(model.prepare(slot, prompt).unwrap(), 0);
+        for (first, end) in [(0, 512), (512, 528)] {
+            model
+                .execute(
+                    &(first..end)
+                        .map(|n| (slot, prompt[n], n as u32))
+                        .collect::<Vec<_>>(),
+                    &[],
+                )
+                .unwrap();
+        }
+        let logits = model
+            .execute(
+                &(528..537)
+                    .map(|n| (slot, prompt[n], n as u32))
+                    .collect::<Vec<_>>(),
+                &[8],
+            )
+            .unwrap();
+        let next = model.execute(&[(slot, 42, 537)], &[0]).unwrap();
+        expected.push((logits, next));
+    }
+    model.release_inactive_slots(&[false; 4]);
+    let mut fast = prompts[0].clone();
+    for _ in 0..4 {
+        fast.extend([42; 64]);
+        assert!(model.prepare(0, &fast).unwrap() >= 528);
+        while model.slots[0].history.len() < fast.len() {
+            let start = model.slots[0].history.len();
+            let end = (start + 16).min(fast.len());
+            model
+                .execute(
+                    &(start..end)
+                        .map(|n| (0, fast[n], n as u32))
+                        .collect::<Vec<_>>(),
+                    &[],
+                )
+                .unwrap();
+        }
+        model.release_inactive_slots(&[false; 4]);
+    }
+    for slot in 1..4 {
+        assert_eq!(
+            model.prepare(slot, &prompts[slot]).unwrap(),
+            528,
+            "waiting conversation {slot}"
+        );
+        let logits = model
+            .execute(
+                &(528..537)
+                    .map(|n| (slot, prompts[slot][n], n as u32))
+                    .collect::<Vec<_>>(),
+                &[8],
+            )
+            .unwrap();
+        assert_eq!(expected[slot].0, logits);
+        assert_eq!(
+            expected[slot].1,
+            model.execute(&[(slot, 42, 537)], &[0]).unwrap()
+        );
+    }
+    assert_eq!(model.cache.len(), 8);
+}

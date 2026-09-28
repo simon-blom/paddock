@@ -162,19 +162,27 @@ impl Qwen35 {
                 }) {
                     continue;
                 }
-                let Some(index) = self
-                    .cache
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| !c.reserved)
-                    .min_by_key(|(_, c)| (usize::from(!c.history.is_empty()), c.touched))
-                    .map(|(i, _)| i)
+                let images = self.slots[slot].mm.as_ref().map_or(&[][..], |m| &m.keys);
+                let keep_from = self.slots[slot].cuts[0];
+                let Some(index) = retention::replacement(&self.cache, &history, images, keep_from)
                 else {
                     // Async cold restores can still own checkpoint state after
                     // a requesting slot is cancelled/reused. Capturing a prefix
                     // is optional; never steal their destination or panic.
                     continue;
                 };
+                if retention::trace() {
+                    tracing::info!(
+                        slot,
+                        index,
+                        previous = self.cache[index].history.len(),
+                        tokens = history.len(),
+                        keep_from,
+                        superseded =
+                            retention::superseded(&self.cache[index], &history, images, keep_from),
+                        "metal-cache-capture"
+                    );
+                }
                 self.spill_checkpoint(index);
                 self.cache[index].reserved = true;
                 self.cache[index].table.clear(&mut self.pool);

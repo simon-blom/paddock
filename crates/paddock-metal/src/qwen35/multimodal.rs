@@ -741,7 +741,26 @@ mod budget_tests {
             std::slice::from_ref(&a),
             80
         ));
-        assert!(!prefix_images_match(&[a], &[b], 80));
+        assert!(!prefix_images_match(
+            std::slice::from_ref(&a),
+            std::slice::from_ref(&b),
+            80
+        ));
+        let checkpoint = super::Checkpoint {
+            history: vec![1; 80],
+            images: vec![a.clone()],
+            ..Default::default()
+        };
+        assert!(super::retention::superseded(
+            &checkpoint,
+            &[1; 112],
+            &[a],
+            96
+        ));
+        assert!(
+            !super::retention::superseded(&checkpoint, &[1; 112], &[b], 96),
+            "same placeholder tokens with different pixels are not a superseded branch"
+        );
     }
 
     #[test]

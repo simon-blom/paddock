@@ -743,6 +743,35 @@ impl GpuExecutor {
     /// One launch for a batch of device-to-device copies: `descs` holds n
     /// consecutive `{src_ptr, dst_ptr, bytes}` u64 triples; bytes % 16 == 0.
     /// The pointers must stay valid until the stream reaches the launch.
+    /// Upload `descs` - (src, dst, len) triples - into the caller-owned
+    /// `scratch` and run them as one batched copy. The scratch is the point:
+    /// a fresh device allocation per call is a synchronizing cudaMalloc, and
+    /// the checkpoint copies that use this run several times a tick. A list
+    /// larger than the scratch is refused rather than truncated.
+    pub fn batched_copy_upload(
+        &self,
+        scratch: &mut CudaSlice<u64>,
+        descs: &[u64],
+    ) -> Result<(), GpuError> {
+        let n = descs.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if n > scratch.len() {
+            return Err(GpuError::Driver(format!(
+                "batched copy needs {n} descriptor words, scratch holds {}",
+                scratch.len()
+            )));
+        }
+        {
+            let mut v = scratch.slice_mut(0..n);
+            self.stream
+                .memcpy_htod(descs, &mut v)
+                .map_err(|e| GpuError::Driver(e.to_string()))?;
+        }
+        self.batched_copy(scratch, n / 3)
+    }
+
     pub fn batched_copy(&self, descs: &CudaSlice<u64>, n: usize) -> Result<(), GpuError> {
         let f = self
             .kernels

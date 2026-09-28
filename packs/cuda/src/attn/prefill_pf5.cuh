@@ -2828,29 +2828,16 @@ static int pd_attn_prefill_f16_paged_impl(
         // -5..-21% across the ladder legs. Kill: PADDOCK_NO_PF7RP -> pf7.
         static const bool no_rp = pd_env("PADDOCK_NO_PF7RP") != nullptr;
         if (f8v4 && !no_pf7 && !no_rp && !no_v4s) {
-            constexpr uint32_t RPSM =
-                2u * 64u * 264u * 2u + 2u * 64u * 256u + 256u;
-            static int rpcap = -1;
-            if (rpcap < 0) {
-                int dev = 0;
-                cudaGetDevice(&dev);
-                if (cudaDeviceGetAttribute(&rpcap,
-                        cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
-                    != cudaSuccess)
-                    rpcap = 48 * 1024;
-            }
-            if (RPSM <= (uint32_t)rpcap) {
+            // Q and pane 64 x 264 halves, raw K/V 64 x 256 B (the per-row
+            // positions ride the pane - see the kernel)
+            constexpr uint32_t RPSM = 2u * 64u * 264u * 2u + 2u * 64u * 256u;
+            static const bool rp_fits =
+                pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<4u>, RPSM)
+                && pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<6u>, RPSM)
+                && pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<8u>, RPSM);
+            if (rp_fits) {
                 static bool arp = false;
                 if (!arp) {
-                    cudaFuncSetAttribute(
-                        (const void*)pd_attn_prefill_pf7rp_kernel<4u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
-                    cudaFuncSetAttribute(
-                        (const void*)pd_attn_prefill_pf7rp_kernel<6u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
-                    cudaFuncSetAttribute(
-                        (const void*)pd_attn_prefill_pf7rp_kernel<8u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM);
                     ::fprintf(stderr, "[pf7rp] ENGAGED (repacked-pane hd256 fp8)\n");
                     arp = true;
                 }
@@ -3048,33 +3035,20 @@ static int pd_attn_prefill_f16_paged_impl(
         if (f8v4n && !no_rp128 && (g_ == 4u || g_ == 6u || g_ == 8u
                                    || g_ == 9u || g_ == 16u)) {
             constexpr uint32_t RPMR = 64u, RPTK = 48u, RPHD = 128u;
-            // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each |
-            // rpos MR uints. Every term carries its own shape factor.
+            // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each (the
+            // per-row positions ride the pane). Every term carries its own
+            // shape factor.
             constexpr uint32_t RPSM =
                 RPMR * (RPHD + 8u) * 2u + RPTK * (RPHD + 8u) * 2u
-                + 2u * RPTK * RPHD + RPMR * 4u;             // 43,008 -> 2 CTA/SM
-            static int rpc = -1;
-            if (rpc < 0) {
-                int dev = 0; cudaGetDevice(&dev);
-                if (cudaDeviceGetAttribute(&rpc,
-                        cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess)
-                    rpc = 48 * 1024;
-            }
-            if (RPSM <= (uint32_t)rpc) {
-                static bool arp128 = false;
-                if (!arp128) {
-#define PD_PF7RP_128_SMEM(GV)                                                  \
-    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7rp_kernel<GV, false,  \
-                                                                   RPHD, RPTK>, \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)RPSM)
-                    PD_PF7RP_128_SMEM(4u);
-                    PD_PF7RP_128_SMEM(6u);
-                    PD_PF7RP_128_SMEM(8u);
-                    PD_PF7RP_128_SMEM(9u);
-                    PD_PF7RP_128_SMEM(16u);
-#undef PD_PF7RP_128_SMEM
-                    arp128 = true;
-                }
+                + 2u * RPTK * RPHD;                         // 42,752 -> 2 CTA/SM
+#define PD_PF7RP_128_FITS(GV)                                                  \
+    pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, RPHD,    \
+                                                           RPTK>, RPSM)
+            static const bool rp128_fits = PD_PF7RP_128_FITS(4u)
+                && PD_PF7RP_128_FITS(6u) && PD_PF7RP_128_FITS(8u)
+                && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(16u);
+#undef PD_PF7RP_128_FITS
+            if (rp128_fits) {
                 const bool multi = pd_pf_runs_offs != nullptr;
                 const dim3 gr = multi
                     ? dim3(n_kv_heads, (pd_pf_runs_maxn * g_ + RPMR - 1u) / RPMR,

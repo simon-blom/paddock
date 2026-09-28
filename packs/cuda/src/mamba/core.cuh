@@ -792,6 +792,13 @@ int pd_mamba2_scan_seq_f16(void* state, const void* xbc, const void* dt_raw,
 // Seq walk + per-row snapshots, f16 arena AND f16 snap blob - a partial
 // spec accept rolls back by flat-copying a snap row over the live state, so
 // the two must share a representation or the rollback re-rounds.
+// Row t+1 starts from row t's STORED (f16-rounded) state, exactly as a
+// one-row decode step starts from the arena: this walk verifies decode
+// steps, so it reproduces them bit for bit (the step's arithmetic verbatim;
+// y reads the pre-round state as the step's does). It carried the f32 state
+// across rows instead - more precise, but every verify row after the first
+// then scored its token from a state no decode step ever holds, and the
+// drift reached the logits (GB10 2026-09-26: 0.02-0.2 at rows 1-7).
 template <uint32_t S_, uint32_t HD_ = 0u>
 __global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_snap_f16_kernel(
         __half* __restrict__ state, const float* __restrict__ xbc,
@@ -828,18 +835,17 @@ __global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_snap_f16_kernel(
         const float x_ti = row[(size_t)h * head_dim + i];
         const float contrib = dt * x_ti;
         float acc = 0.0f;
-        #pragma unroll
-        for (uint32_t j = 0; j < S_; ++j) {
-            const float s = decay * st[j] + contrib * sB[j];
-            st[j] = s;
-            acc += s * sC[j];
-        }
-        y[(size_t)t * d_inner + (size_t)h * head_dim + i] = acc + d_h * x_ti;
         __half* snrow = snap + (size_t)t * d_inner * S_
                         + (size_t)h * head_dim * S_ + i;
         #pragma unroll
-        for (uint32_t j = 0; j < S_; ++j)
-            snrow[(size_t)j * head_dim] = __float2half_rn(st[j]);
+        for (uint32_t j = 0; j < S_; ++j) {
+            const float s = decay * st[j] + contrib * sB[j];
+            const __half sh = __float2half_rn(s);
+            snrow[(size_t)j * head_dim] = sh;
+            st[j] = __half2float(sh);
+            acc += s * sC[j];
+        }
+        y[(size_t)t * d_inner + (size_t)h * head_dim + i] = acc + d_h * x_ti;
         __syncthreads();
     }
 

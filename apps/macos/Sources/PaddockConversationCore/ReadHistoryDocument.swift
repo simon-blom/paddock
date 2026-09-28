@@ -45,6 +45,7 @@ public struct ReadHistoryDocument: Sendable {
           "samples": run["samples"] ?? .string("auto"),
           "steps": run["steps"] ?? .number(1),
           "think": run["think"] ?? .number(0),
+          "model": run["checkpoint"] ?? .null,
         ])))
     if let order = run["questionOrder"]?.array {
       let original = result.questions

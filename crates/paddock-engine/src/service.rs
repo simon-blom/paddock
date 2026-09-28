@@ -3789,7 +3789,7 @@ fn run_batched(
             .map(|s| s.history.len().div_ceil(crate::kv_pool::BLOCK_TOKENS))
             .sum();
         let mut admit_budget = generator
-            .pool_free_blocks()
+            .pool_admission_blocks()
             .map(|f| f.saturating_sub(committed));
         // P5b-3: re-admit preempted (recompute) sequences before new arrivals -
         // they are already-accepted in-flight work. Each needs room for its
@@ -6481,7 +6481,11 @@ fn run_batched(
                     paddock_models::dev_var!("PADDOCK_SPEC_SAMPLED_LIVE_MAX")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(4);
+                        .unwrap_or_else(|| {
+                            generator
+                                .spec_sampled_live_cap()
+                                .map_or(4, |c| c.min(generator.spec_live_cap()))
+                        });
                 let spec_safe = !live.is_empty()
                     && live.len() <= sampled_live_max.min(serve_spec_max_rows())
                     && live.iter().all(|&k| {
@@ -7366,6 +7370,90 @@ fn sample_slot_row(slot_opt: &mut Option<Slot>, row: &mut [f32]) {
     slot.draft.push(next);
     if !slot.accept(next, lp) {
         *slot_opt = None;
+    }
+}
+
+#[cfg(test)]
+mod cache_admission_tests {
+    use super::*;
+
+    struct CachedPool {
+        waves: Vec<usize>,
+        reclaimable: usize,
+    }
+    impl Generator for CachedPool {
+        fn reset(&mut self) {}
+        fn vocab(&self) -> usize {
+            2
+        }
+        fn forward(&mut self, _: u32) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0., 1.])
+        }
+        fn pool_free_blocks(&self) -> Option<usize> {
+            Some(0)
+        }
+        fn pool_admission_blocks(&self) -> Option<usize> {
+            Some(self.reclaimable)
+        }
+        fn forward_prefill_batch(
+            &mut self,
+            items: &[(usize, Vec<u32>)],
+        ) -> Result<Vec<Vec<f32>>, GenError> {
+            self.waves.push(items.len());
+            Ok(items.iter().map(|_| vec![0., 1.]).collect())
+        }
+    }
+
+    #[test]
+    fn cache_only_pages_allow_concurrent_admission_but_active_pages_do_not() {
+        for (reclaimable, expected) in [(128, vec![2]), (0, vec![1, 1])] {
+            let (send, requests) = std::sync::mpsc::channel();
+            let mut receivers = Vec::new();
+            for _ in 0..2 {
+                let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+                receivers.push(receiver);
+                send.send(GenRequest {
+                    prompt: vec![0; 16],
+                    max_tokens: 1,
+                    sampler: SamplingParams::default(),
+                    stop_tokens: vec![],
+                    events,
+                    mm_chunks: None,
+                    constraint: None,
+                    logprobs: None,
+                    submitted: None,
+                    canvas_read: None,
+                })
+                .unwrap();
+            }
+            drop(send);
+            let mut generator = CachedPool {
+                waves: Vec::new(),
+                reclaimable,
+            };
+            run_batched(
+                &mut generator,
+                &requests,
+                2,
+                2,
+                &Arc::new(EngineMetrics::default()),
+                &ShutdownCtl::new(),
+            );
+            assert_eq!(generator.waves, expected);
+            assert_eq!(
+                generator.pool_free_blocks(),
+                Some(0),
+                "do not falsify occupancy"
+            );
+            for mut receiver in receivers {
+                let mut completed = false;
+                while let Ok(event) = receiver.try_recv() {
+                    assert!(!matches!(event, TokenEvent::Error(_)));
+                    completed |= matches!(event, TokenEvent::Done(..));
+                }
+                assert!(completed);
+            }
+        }
     }
 }
 

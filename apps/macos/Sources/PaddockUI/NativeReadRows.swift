@@ -178,8 +178,8 @@ struct NativeReadAnswerView: View {
       }
       // Conditional label probabilities and outside mass are different
       // quantities; never combine them into a normalized stacked chart.
-      probability("Outside the options", answer.outside)
-      if answer.outside > 0.5 {
+      if let outside = answer.outside { probability("Outside the options", outside) }
+      if (answer.outside ?? 0) > 0.5 {
         Text("Most probability is outside these options.").font(.caption).foregroundStyle(
           PaddockStyle.caution)
       }
@@ -189,9 +189,9 @@ struct NativeReadAnswerView: View {
             "Entropy \(diagnostic.entropy, specifier: "%.3f") · \(diagnostic.entropy < 0.1 ? "settled" : diagnostic.entropy < log(2) ? "unsettled" : "split")"
           )
           Spacer()
-          if readCount > 1 {
+          if readCount > 1, let agreement = answer.agreement {
             Text(
-              "\(Int((answer.agreement * Double(readCount)).rounded())) of \(readCount) reads agree"
+              "\(Int((agreement * Double(readCount)).rounded())) of \(readCount) reads agree"
             )
           }
         }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
@@ -209,6 +209,10 @@ struct NativeReadAnswerView: View {
             }
           }
         }
+      }
+      if let confidence = answer.answerConfidence {
+        Text("Answer probability \(confidence, format: .percent.precision(.fractionLength(1)))")
+          .font(.caption).foregroundStyle(.secondary).monospacedDigit()
       }
     }.padding(14).background(PaddockStyle.canvas, in: RoundedRectangle(cornerRadius: 8))
   }

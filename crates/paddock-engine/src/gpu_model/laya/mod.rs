@@ -139,28 +139,7 @@ impl GpuLaya {
     }
 }
 
-/// One question's sequence as the runner built it.
-pub struct LayaSeq<'a> {
-    pub ids: &'a [u32],
-    /// each option's `[MASK]` position inside the sequence
-    pub markers: &'a [u32],
-    /// 0 choice, 1 score, 2 noul (`paddock_models::laya::QTYPE_*`)
-    pub qtype: u32,
-}
-
-/// What one pass returns, sequence-major.
-#[derive(Debug, Clone)]
-pub struct LayaOut {
-    /// every sequence's option logits, back to back (raw - no temperature)
-    pub logits: Vec<f32>,
-    /// `offsets[s]..offsets[s + 1]` are sequence s's logits
-    pub offsets: Vec<usize>,
-    /// `[seqs][n_act]` act-head probabilities
-    pub act: Vec<f32>,
-    pub n_act: usize,
-    /// tokens through the encoder
-    pub rows: usize,
-}
+pub use crate::decision::{LayaOut, LayaSeq};
 
 /// Every buffer a pass touches, sized once. Shared by every checkpoint on the
 /// engine thread (a pass runs one checkpoint), so it is sized for the widest.

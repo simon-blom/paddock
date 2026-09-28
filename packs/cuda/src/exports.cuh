@@ -620,6 +620,17 @@ extern "C" int pd_quantize_q8_b128(const void*, void*, void*, uint32_t, void*);
 extern "C" int pd_ternary_gemv_b128(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_hadamard_rows_q8_b128(const void*, void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_ternary_gemv_b128_multi(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_ternary_gemm_nb(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_matvec_f32_winv(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_attn_prefill_batch_paged(const void*, const void*, const void*, const void*, void*, const void*, const void*, const void*, uint32_t, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_attn_decode_fmha_paged(const void*, const void*, const void*, const void*, void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_attn_decode_fmha_sp_paged(const void*, const void*, const void*, const void*, void*, void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_attn_decode_batch_ps_paged(const void*, const void*, const void*, const void*, void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_q4x_idx_store_paged(const void*, const void*, const void*, const void*, void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_logits_paged(const void*, const void*, const void*, const void*, const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_logits_mma_paged(const void*, const void*, const void*, const void*, const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q4x_qsa_attn_paged(const void*, const void*, const void*, const void*, const void*, const void*, uint32_t, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_q4x_qsa_attn_mma_paged(const void*, const void*, const void*, const void*, const void*, const void*, uint32_t, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 extern "C" int pd_nvf4_moe_gu_swiglu_bs(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_gated_delta_recurrent_runs_slots(const void*, const void*, const void*, const void*, const void*, void*, void*, const void*, const void*, const void*, const void*, const void*, float, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_bf16_hc_perm_pad(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
@@ -1713,6 +1724,32 @@ static const KernelTableV1 PD_KERNELS = {
     pd_gather_rows,
     pd_laya_rowdot,
     pd_laya_act_head,
+    // 679: split-K multi-row decode attention (attn/rows.cuh)
+    pd_attn_rows_partial,
+    // 680-682: the W16 decode class (moe/nvf4_w16.cuh, gemm/dense_w16.cuh)
+    pd_nvf4_moe_up_relu2_w16,
+    pd_nvf4_moe_down_part_w16,
+    pd_dense_w16,
+    // 683: fixed-split rows partial (attn/rows.cuh)
+    pd_attn_rows_partial_fixed,
+    // 684: segmented W16 dense (gemm/dense_w16.cuh)
+    pd_dense_w16_seg,
+    // 685: the W16 routing front (moe/nvf4_w16.cuh)
+    pd_moe_route_w16,
+    // 686: ternary NB columns on the int8 tensor cores (quant/ternary.cuh)
+    pd_ternary_gemm_nb,
+    // 687: the width-invariant f32 matvec (gemm/f32_qkv.cuh)
+    pd_matvec_f32_winv,
+    // 688-696: paged address modes (attn/prefill.cuh, gemm/f32_qkv.cuh, attn/qsa.cuh)
+    pd_attn_prefill_batch_paged,
+    pd_attn_decode_fmha_paged,
+    pd_attn_decode_fmha_sp_paged,
+    pd_attn_decode_batch_ps_paged,
+    pd_q4x_idx_store_paged,
+    pd_q4x_qsa_logits_paged,
+    pd_q4x_qsa_logits_mma_paged,
+    pd_q4x_qsa_attn_paged,
+    pd_q4x_qsa_attn_mma_paged,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -1798,6 +1835,9 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_moe_down_stw = NULL;
             t.nvf4_moe_up_relu2_mtt = NULL;
             t.nvf4_moe_down_part_tt = NULL;
+            // the W16 expert pair reads the same tiled plane (680-681)
+            t.nvf4_moe_up_relu2_w16 = NULL;
+            t.nvf4_moe_down_part_w16 = NULL;
         }
         // NVFP4 checkpoint-plane consumers: the host half of PD_NV4_OK
         // (moe/block_scale_quant.cuh), and it must stay identical to it -
@@ -1818,6 +1858,9 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
         // neither is validated here - widening an unmeasured gate is how the
         // silent-empty-kernel bug got written in the first place.
         if (!(cma > 8 || (cma == 8 && cmi >= 9))) {
+            // the W16 dense half widens e4m3 with the sm_89 cvt (PD_DW16_OK)
+            t.dense_w16 = NULL;
+            t.dense_w16_seg = NULL;
             t.nvf4_dequant = NULL;
             t.nvf4_gemv = NULL;
             t.nvf4_gemv_batch = NULL;

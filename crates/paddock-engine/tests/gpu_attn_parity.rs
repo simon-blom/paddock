@@ -2920,3 +2920,169 @@ fn fused_kv_writers_match_the_chain_at_both_dtypes() {
         // one KV writer with no fp8 evidence either way (task filed).
     }
 }
+
+/// The multi-row split partial (slot 679) against the CPU reference: groups
+/// of one slot's rows, each row bounded at its own position - a verify
+/// chunk's causal tail, and a shared bound (a block drafter's rows) - over
+/// the paged pool at both widths and over the dense f16 cache, which reads
+/// the same bytes and must agree with the paged arm bitwise. The tiny-context
+/// case splits 3 rows 24 ways, so the early rows meet splits past their own
+/// position (m = -inf partials the combine has to fold as nothing); the swa
+/// cases bound each row to its last 1024 keys (DSpark's layers).
+#[test]
+fn attn_rows_partial_matches_reference() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_attn_rows_partial() {
+        eprintln!("pack has no multi-row split partial - skipping");
+        return;
+    }
+    // nemotron's geometry, target and drafter alike: 32q/2kv, hd128 (G16)
+    let (n_heads, n_kv_heads, head_dim) = (32usize, 2usize, 128usize);
+    let kv_dim = n_kv_heads * head_dim;
+    let qdim = n_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let max_ctx = 2048usize;
+    let bps = max_ctx / 16;
+    let n_slots = 2usize;
+    let kc = det(n_slots * max_ctx * kv_dim, 11);
+    let vc = det(n_slots * max_ctx * kv_dim, 12);
+    let sinks = det(n_heads, 13);
+    // identity block table: pool index == slot * max_ctx + pos, so the paged
+    // pool and the dense [slots, max_ctx, kv_dim] cache are the same bytes
+    let bt_host: Vec<u32> = (0..(n_slots * bps) as u32).collect();
+    let d_bt = exec.stream.clone_htod(&bt_host).expect("bt");
+    let d_s = exec.to_device(&sinks).expect("sinks");
+
+    // (rows as (slot, position), groups as (first row, rows))
+    let verify: Vec<(u32, u32)> = (0..8).map(|i| (1, 1500 + i)).collect();
+    let two: Vec<(u32, u32)> = (0..4)
+        .map(|i| (1, 300 + i))
+        .chain((0..5).map(|i| (0, 1000 + i)))
+        .collect();
+    let drafter: Vec<(u32, u32)> = vec![(0, 777); 8];
+    let tiny: Vec<(u32, u32)> = (0..3).map(|i| (1, i)).collect();
+    // a causal sliding-window block (DSpark's layers): rows at their own
+    // positions, each bounded to its last `window` keys
+    let swa: Vec<(u32, u32)> = (0..4).map(|i| (0, 1300 + i)).collect();
+    let swa_short: Vec<(u32, u32)> = (0..4).map(|i| (1, 200 + i)).collect();
+    let cases: [(&str, &[(u32, u32)], Vec<u32>, usize); 6] = [
+        ("verify chunk", &verify, vec![0, 8], 0),
+        ("two slots", &two, vec![0, 4, 4, 5], 0),
+        ("drafter block", &drafter, vec![0, 8], 0),
+        ("tiny context", &tiny, vec![0, 3], 0),
+        ("swa block", &swa, vec![0, 4], 1024),
+        ("swa under the window", &swa_short, vec![0, 4], 1024),
+    ];
+    for dt in KV_DTYPES {
+        let d_k = kv_dev_u8(&exec, &kc, dt);
+        let d_v = kv_dev_u8(&exec, &vc, dt);
+        let (kr, vr) = (kv_round(&kc, dt), kv_round(&vc, dt));
+        for (name, rows, groups, window) in &cases {
+            let window = *window;
+            let n_rows = rows.len();
+            let n_groups = groups.len() / 2;
+            let q = det(n_rows * qdim, 21);
+            let d_q = exec.to_device(&q).expect("q");
+            let d_pos = exec
+                .stream
+                .clone_htod(&rows.iter().map(|r| r.1).collect::<Vec<u32>>())
+                .expect("pos");
+            let d_slots = exec
+                .stream
+                .clone_htod(&rows.iter().map(|r| r.0).collect::<Vec<u32>>())
+                .expect("slots");
+            let d_groups = exec.stream.clone_htod(groups).expect("groups");
+            let want: Vec<f32> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &(slot, pos))| {
+                    let base = slot as usize * max_ctx * kv_dim;
+                    let span = base..base + max_ctx * kv_dim;
+                    let first = if window > 0 && pos as usize + 1 > window {
+                        pos as usize + 1 - window
+                    } else {
+                        0
+                    };
+                    cpu_attn(
+                        &q[i * qdim..(i + 1) * qdim],
+                        &kr[span.clone()],
+                        &vr[span],
+                        &sinks,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        first,
+                        pos as usize + 1 - first,
+                        kv_dim,
+                        scale,
+                    )
+                })
+                .collect();
+            let peak = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for n_splits in [1usize, 7, 24] {
+                let run = |paged: bool| -> Vec<f32> {
+                    let mut d_o = exec
+                        .alloc(n_heads * n_rows * n_splits * head_dim)
+                        .expect("o");
+                    let mut d_ml = exec.alloc(n_heads * n_rows * n_splits * 2).expect("ml");
+                    let mut d_out = exec.alloc(n_rows * qdim).expect("out");
+                    exec.attn_rows_partial(
+                        &d_q,
+                        &d_k,
+                        &d_v,
+                        &mut d_o,
+                        &mut d_ml,
+                        &d_pos,
+                        &d_slots,
+                        &d_groups,
+                        n_groups,
+                        paged.then_some((&d_bt, bps)),
+                        max_ctx,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        kv_dim,
+                        n_rows,
+                        n_splits,
+                        window,
+                        scale,
+                        dt,
+                    )
+                    .expect("rows partial");
+                    exec.attn_combine_batch(
+                        &d_o, &d_ml, &d_s, &mut d_out, n_heads, head_dim, n_splits, n_rows,
+                    )
+                    .expect("combine");
+                    exec.to_host(&d_out).expect("out host")
+                };
+                let got = run(true);
+                let maxd = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "{dt:?} rows partial {name} splits {n_splits}: max |d| {maxd:.2e} (peak {peak:.3})"
+                );
+                // q big+residual and the 3-split P carry the f32 score/PV
+                // class; what is left is summation order
+                assert!(
+                    got.iter().all(|v| v.is_finite()) && maxd <= 1e-4 * peak.max(1.0),
+                    "{dt:?} {name} splits {n_splits}: max |d| {maxd:.3e} vs peak {peak:.3}"
+                );
+                if dt == KvDtype::Fp16 {
+                    let dense = run(false);
+                    assert!(
+                        dense
+                            .iter()
+                            .zip(&got)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{name} splits {n_splits}: dense cache arm parted from the paged pool"
+                    );
+                }
+            }
+        }
+    }
+}

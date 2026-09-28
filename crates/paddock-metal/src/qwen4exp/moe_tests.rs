@@ -55,13 +55,16 @@ fn rows<T: Copy>(all: &[T], ids: &[usize], width: usize) -> Vec<T> {
 
 #[test]
 fn memory_bounds_are_exact_and_fail_before_allocation() {
-    let d = MetalDevice::new(Some(256 << 20)).unwrap();
-    for n in [0, 1025, usize::MAX] {
+    let d = MetalDevice::new(Some(
+        Workspace::bytes(super::super::affine::MAX_ROWS).unwrap() as u64,
+    ))
+    .unwrap();
+    for n in [0, super::super::affine::MAX_ROWS + 1, usize::MAX] {
         assert!(Workspace::bytes(n).is_err());
         assert!(Workspace::new(&d, n).is_err());
         assert_eq!(d.allocated_bytes(), 0);
     }
-    for n in [1, 4, 9, 31, 128, 256, 512, 1024] {
+    for n in [1, 4, 9, 31, 128, 256, 512, 1024, 2048] {
         let s = Workspace::new(&d, n).unwrap();
         assert_eq!(d.allocated_bytes(), Workspace::bytes(n).unwrap() as u64);
         drop(s);

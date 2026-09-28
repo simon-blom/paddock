@@ -118,22 +118,21 @@ fn bulk_prefill_matches_serial() {
         logits_s = model.forward(t).expect("serial forward");
     }
     let mut ids_s = Vec::with_capacity(GREEDY_STEPS);
+    let mut steps_s = Vec::with_capacity(GREEDY_STEPS);
     let mut l = logits_s.clone();
     for _ in 0..GREEDY_STEPS {
         let tok = argmax(&l);
         ids_s.push(tok);
         l = model.forward(tok).expect("serial decode");
+        steps_s.push(l.clone());
     }
 
-    // ---- bulk prefill + the same greedy continuation ----------------------
+    // ---- bulk prefill + the serial stream, teacher-forced ------------------
     model.reset();
     let logits_b = model.forward_prefill_stream(&prompt).expect("bulk prefill");
-    let mut ids_b = Vec::with_capacity(GREEDY_STEPS);
-    let mut l = logits_b.clone();
-    for _ in 0..GREEDY_STEPS {
-        let tok = argmax(&l);
-        ids_b.push(tok);
-        l = model.forward(tok).expect("bulk-side decode");
+    let mut steps_b = Vec::with_capacity(GREEDY_STEPS);
+    for &tok in &ids_s {
+        steps_b.push(model.forward(tok).expect("bulk-side decode"));
     }
 
     // logit closeness at the prompt boundary. Exactness is impossible by
@@ -165,7 +164,7 @@ fn bulk_prefill_matches_serial() {
     for (id, ls) in top.iter().take(5) {
         println!("  top5 id {id}: serial {ls:.4} bulk {:.4}", logits_b[*id]);
     }
-    println!("greedy serial: {ids_s:?}\ngreedy bulk:   {ids_b:?}");
+    println!("greedy serial: {ids_s:?}");
 
     assert_eq!(
         argmax(&logits_s),
@@ -176,12 +175,38 @@ fn bulk_prefill_matches_serial() {
     // 6.5%, smooth across the row (p99 0.64, max 1.17), top-5 order and
     // margins intact - the W8A16 -> W8A8-dynamic activation quantization on
     // 46 projections, not chunking structure. A carry bug (conv window, scan
-    // state, KV positions) lands O(rms) and kills the greedy match below.
+    // state, KV positions) lands O(rms) and breaks the continuation below.
     assert!(
         mean_abs / rms.max(1e-3) < 0.10,
         "boundary logits drifted structurally: mean |delta| {mean_abs:.4} vs rms {rms:.3}"
     );
-    assert_eq!(ids_s, ids_b, "greedy continuation diverged");
+    // The continuation, teacher-forced on the serial stream: every step stays
+    // in the class band and picks the serial pick wherever the serial margin
+    // clears twice the drift. Free-running greedy equality is not the gate:
+    // at a near-tie (a 0.005 margin four steps in on this prompt) the class
+    // drift parts the streams without either being wrong.
+    for (i, (a, b)) in steps_s.iter().zip(&steps_b).enumerate() {
+        let (sum, md) = a.iter().zip(b).fold((0.0f64, 0.0f32), |(s, m), (x, y)| {
+            let d = (x - y).abs();
+            (s + d as f64, m.max(d))
+        });
+        let srms =
+            (a.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / a.len() as f64).sqrt();
+        let mut top = a.clone();
+        top.sort_by(|x, y| y.total_cmp(x));
+        let margin = top[0] - top[1];
+        assert!(
+            sum / a.len() as f64 / srms.max(1e-3) < 0.10,
+            "step {i}: continuation drifted structurally"
+        );
+        if margin > 2.0 * md {
+            assert_eq!(
+                argmax(b),
+                argmax(a),
+                "step {i}: bulk side picked off the serial stream"
+            );
+        }
+    }
 
     // ---- short-prompt path (single chunk, T near the conv window) ---------
     let short: Vec<u32> = prompt[..9].to_vec();

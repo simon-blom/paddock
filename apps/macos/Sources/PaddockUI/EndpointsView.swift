@@ -161,11 +161,17 @@ struct EndpointsView: View {
   private func actions(_ row: EndpointRow) -> some View {
     HStack(spacing: 8) {
       if row.runner?.status == "ok" {
-        Button("Open Studio", systemImage: "bubble") { workspace.request(.chat(port: row.port)) }
-          .buttonStyle(FlatButtonStyle(primary: true))
-          .disabled(workspace.desktopNavigationBlocked || row.job?.isActive == true)
-          .help("Start a conversation with this endpoint")
-          .accessibilityIdentifier("endpoint-studio-\(row.port)")
+        Button(
+          row.runner?.reader != nil ? "Open Reads" : "Open Studio",
+          systemImage: row.runner?.reader != nil ? "list.bullet.clipboard" : "bubble"
+        ) { workspace.request(.chat(port: row.port)) }
+        .buttonStyle(FlatButtonStyle(primary: true))
+        .disabled(workspace.desktopNavigationBlocked || row.job?.isActive == true)
+        .help(
+          row.runner?.reader != nil
+            ? "Read with this endpoint" : "Start a conversation with this endpoint"
+        )
+        .accessibilityIdentifier("endpoint-studio-\(row.port)")
       } else if row.runner == nil, row.job?.isActive != true {
         Button("Start", systemImage: "play.fill") {
           if row.configured?.localOnly != true {

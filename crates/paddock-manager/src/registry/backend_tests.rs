@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn laya_metal_uses_original_bundle_and_encoder_memory_not_chat_kv() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("laya").unwrap();
+    let artifact = model.default_weights_for_backend("metal", None).unwrap();
+    assert_eq!(artifact.id, "f16");
+    assert_eq!(artifact.capabilities(model), ["decision"]);
+    assert!(artifact.runtime.checkpoint_dir);
+    assert_eq!(artifact.runtime.kv_cache_dtype.as_deref(), Some("auto"));
+    assert_eq!(artifact.files.len(), 16);
+    let memory = artifact.runtime.memory.as_ref().unwrap();
+    assert_eq!(memory.weight_bytes, 2_330_839_064);
+    assert_eq!(memory.workspace_bytes, Some(109_651_460));
+    assert_eq!(memory.kv_reserve_sequences, 0);
+    assert!(artifact.shape.as_ref().unwrap().kv_layers.is_empty());
+    assert!(
+        artifact
+            .entry_path(metal.models_dir())
+            .unwrap()
+            .ends_with("laya")
+    );
+    let cuda = metal.with_backend("cuda");
+    let artifact = cuda.catalog_of("laya").unwrap().default_weights().unwrap();
+    assert_eq!(artifact.workspace, Some(337_865_736));
+    assert!(artifact.runtime.memory.is_none());
+}
+
+#[test]
 fn diffusion_metal_catalog_exposes_vision_in_three_formats_without_cuda_drift() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("diffusiongemma-26b-a4b").unwrap();

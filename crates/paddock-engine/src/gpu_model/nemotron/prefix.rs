@@ -18,7 +18,12 @@
 //! GEMM passes and the tick structure stay whole (splitting a chunk at a
 //! cut would re-stream all 20 GiB of weights per split; qwen35's
 //! d_ckpt_stage exists for exactly this reason). After the pass, the blob
-//! flat-copies into the checkpoint pool under the radix node.
+//! copies into the checkpoint's pool pages under the radix node: since
+//! issue #33 a checkpoint lives in the attention pool's own pages
+//! (`PagedRadix::set_state_paged`), so it is cache that a growing context
+//! takes back, not a fixed reserve. Live-state snapshots and restores pass
+//! through one flat bounce blob, because the SSM arena may be f16 and
+//! widens/narrows only into a contiguous f32 span.
 
 use crate::gpu::GpuError;
 use crate::gpu_model::gpt_oss::GpuModelError;
@@ -86,25 +91,13 @@ pub(super) fn ckpt_cuts(t_len: usize, step: usize) -> [usize; 2] {
 }
 
 impl GpuNemotron {
-    /// f32 elements one checkpoint holds: every mamba layer's SSM state +
-    /// conv window, in layer order (the staging blob and the pool share this
-    /// layout).
-    pub(super) fn state_ckpt_f32(&self) -> usize {
-        let hp = &self.hp;
-        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
-        let win_elems = (hp.d_conv - 1) * hp.conv_dim();
-        let n_mamba = hp
-            .blocks
-            .iter()
-            .filter(|b| matches!(b, paddock_models::nemotron::NemotronBlock::Mamba))
-            .count();
-        n_mamba * (state_elems + win_elems)
-    }
-
     /// Match `keys` against the radix; on a hit with a reachable checkpoint,
-    /// adopt the KV blocks, restore the mamba state snapshot, re-back the
-    /// tail, and return the resume position. 0 = cold (admission already
-    /// zeroed the arenas). Called after `admit_rows`.
+    /// adopt the KV blocks and restore the mamba state snapshot. Then back
+    /// every row the prompt still writes (the whole prompt on a miss) and
+    /// return the resume position, 0 = cold (admission already zeroed the
+    /// arenas). Called right after `admit_rows`, which backs nothing: the
+    /// adopted blocks are the slot's before the tail allocation can make the
+    /// pool shed retention, so the tail never evicts the prefix it extends.
     pub(super) fn prefix_resume_rows(
         &mut self,
         slot: usize,
@@ -112,6 +105,24 @@ impl GpuNemotron {
         n_rows: usize,
     ) -> Result<usize, GpuModelError> {
         self.last_reused[slot] = 0;
+        let pos = self.prefix_adopt(slot, keys)?;
+        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])?;
+        // the drafter's rows came with the adopted pages wherever a live
+        // span completed them (see dflash_adopt_slot)
+        self.dflash_adopt_slot(slot, pos);
+        if pos > 0 {
+            self.last_reused[slot] = pos;
+            // The MTP twin also zeroes its pending_h - the chain vector
+            // belonged to the old end (see mtp_trim_slot).
+            self.mtp_trim_slot(slot, pos)?;
+        }
+        Ok(pos)
+    }
+
+    /// The adopting half of `prefix_resume_rows`: the deepest checkpointed
+    /// match of `keys`, its blocks shared into the slot's table and its mamba
+    /// state restored. Returns the resume position, 0 on a miss.
+    fn prefix_adopt(&mut self, slot: usize, keys: &[u32]) -> Result<usize, GpuModelError> {
         let m = {
             let bs = self.batch.as_mut().expect("batch enabled");
             let Some(radix) = bs.prefix.as_mut() else {
@@ -141,7 +152,7 @@ impl GpuNemotron {
         }
         {
             let bs = self.batch.as_mut().expect("batch enabled");
-            // release the admission's fresh backing, adopt the shared blocks
+            // adopt the shared blocks (admission left the table empty)
             bs.tables[slot].clear(&mut bs.pool);
             bs.tables[slot].share_prefix(&m.blocks[..pos / BLOCK_TOKENS], &mut bs.pool);
             let base = slot * bs.bps;
@@ -154,16 +165,6 @@ impl GpuNemotron {
                 .map_err(|e| GpuError::Driver(e.to_string()))?;
         }
         self.restore_state(slot, idx)?;
-        // re-back the tail the prompt will still write
-        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])?;
-        self.last_reused[slot] = pos;
-        // drafter coverage trims to the resume point (gemma4's trim-not-
-        // clear: rows below the resume still describe the same tokens; a
-        // clear here made every prefix hit a cold drafter). The MTP twin
-        // also zeroes its pending_h - the chain vector belonged to the old
-        // end (see mtp_trim_slot).
-        self.dflash_trim_slot(slot, pos);
-        self.mtp_trim_slot(slot, pos)?;
         Ok(pos)
     }
 
@@ -196,24 +197,15 @@ impl GpuNemotron {
                     // evict_lru here discarded the blobs and left the tier
                     // restore-blind (probe hit, aux None, every repeat
                     // recomputed)
+                    // The blobs are pool pages; the tier reads them off the radix.
                     let exec = self.exec.clone();
-                    let state_bytes = (bs.state_ckpt_f32 * 4) as u64;
-                    let state = bs.d_state_pool.as_ref().map(|sp| {
-                        use cudarc::driver::DevicePtr;
-                        let (pp, _g) = sp.device_ptr(&exec.stream);
-                        (pp, state_bytes)
-                    });
-                    tier.press(radix, &mut bs.pool, margin, state, &mut || {
+                    tier.press(radix, &mut bs.pool, margin, None, &mut || {
                         exec.record_event().ok()
                     });
                     tier.pump_completions(radix, &mut bs.pool);
                 }
                 (None, Some(radix)) => {
-                    while bs.pool.free_blocks() < margin {
-                        if radix.evict_lru(&mut bs.pool).is_none() {
-                            break;
-                        }
-                    }
+                    radix.make_room(&mut bs.pool, margin, 0);
                 }
                 _ => {}
             }
@@ -221,11 +213,11 @@ impl GpuNemotron {
     }
 
     /// Commit one staged checkpoint after its pass: insert the pages up to
-    /// `cut`, attach a state index under the radix node, and flat-copy the
-    /// staging blob into the pool at that index. No-ops (reuse loss only)
-    /// when the cache is off or the node can't take a checkpoint.
+    /// `cut`, attach a state index under the radix node (drawing its pool
+    /// pages), and copy the staging blob into those pages. No-ops (reuse loss
+    /// only) when the cache is off or the node can't take a checkpoint.
     pub(super) fn commit_stage(&mut self, stage: usize, slot: usize, keys: &[u32], cut: usize) {
-        let n = self.state_ckpt_f32();
+        use cudarc::driver::DevicePtr;
         let exec = self.exec.clone();
         let bs = self.batch.as_mut().expect("batch enabled");
         let Some(radix) = bs.prefix.as_mut() else {
@@ -236,33 +228,88 @@ impl GpuNemotron {
             None => return,
         };
         radix.insert(&keys[..cut], &blocks, &mut bs.pool);
-        let Some(idx) = radix.attach_state(keys, cut) else {
+        let Some(idx) = radix.attach_state_with_pool(keys, cut, &mut bs.pool) else {
             return;
         };
-        let Some(sp) = bs.d_state_pool.as_mut() else {
+        let (Some(layout), Some(radix), Some(db)) = (
+            bs.ckpt_layout.as_ref(),
+            bs.prefix.as_ref(),
+            bs.d_ckpt_desc.as_mut(),
+        ) else {
             return;
         };
-        if let Err(e) = exec.copy_region(&bs.d_ckpt_stage[stage], 0, sp, idx as usize * n, n) {
+        let (sp, _g) = bs.d_ckpt_stage[stage].device_ptr(&exec.stream);
+        let mut descs = Vec::new();
+        layout.push_copy(
+            radix.state_pages(idx),
+            0,
+            sp,
+            (bs.state_ckpt_f32 * 4) as u64,
+            crate::ckpt_pages::Dir::ToPages,
+            &mut descs,
+        );
+        if let Err(e) = exec.batched_copy_upload(db, &descs) {
             tracing::warn!("nemotron ckpt commit failed (stage {stage}): {e}");
         }
     }
 
+    /// Move checkpoint `idx` between the bounce blob and its pool pages:
+    /// `ToPages` files the snapshot the bounce holds, `FromPages` brings one
+    /// back for a restore. The pages hold the flat blob's layout.
+    pub(super) fn ckpt_pages_copy(
+        &mut self,
+        idx: u32,
+        dir: crate::ckpt_pages::Dir,
+    ) -> Result<(), GpuModelError> {
+        use cudarc::driver::DevicePtr;
+        let exec = self.exec.clone();
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let (Some(layout), Some(radix), Some(bounce), Some(db)) = (
+            bs.ckpt_layout.as_ref(),
+            bs.prefix.as_ref(),
+            bs.d_ckpt_bounce.as_ref(),
+            bs.d_ckpt_desc.as_mut(),
+        ) else {
+            return Err(GpuModelError::Unsupported(
+                "checkpoint copy without paged checkpoints".into(),
+            ));
+        };
+        let pages = radix.state_pages(idx);
+        if pages.is_empty() {
+            return Err(GpuModelError::Unsupported(
+                "checkpoint index holds no pages".into(),
+            ));
+        }
+        let (bp, _g) = bounce.device_ptr(&exec.stream);
+        let mut descs = Vec::new();
+        layout.push_copy(
+            pages,
+            0,
+            bp,
+            (bs.state_ckpt_f32 * 4) as u64,
+            dir,
+            &mut descs,
+        );
+        exec.batched_copy_upload(db, &descs)?;
+        Ok(())
+    }
+
     /// Restore `slot`'s mamba state from checkpoint `idx` - the reverse of
-    /// the staged snapshot: pool blob -> each mamba layer's slot arena
-    /// windows, in the same layer order the blob was written in.
+    /// the staged snapshot: the checkpoint's pages -> the bounce blob -> each
+    /// mamba layer's slot arena and window, in the layer order it was written.
     fn restore_state(&mut self, slot: usize, idx: u32) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let hp = self.hp.clone();
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * hp.conv_dim();
-        let n = self.state_ckpt_f32();
+        self.ckpt_pages_copy(idx, crate::ckpt_pages::Dir::FromPages)?;
         let bs = self.batch.as_mut().expect("batch enabled");
-        let Some(sp) = bs.d_state_pool.as_ref() else {
+        let Some(sp) = bs.d_ckpt_bounce.as_ref() else {
             return Err(GpuModelError::Unsupported(
-                "resume without a state pool".into(),
+                "resume without a checkpoint bounce blob".into(),
             ));
         };
-        let mut boff = idx as usize * n;
+        let mut boff = 0usize;
         for li in 0..hp.n_layer {
             let Some(s) = bs.ssm[li].as_mut() else {
                 continue;
@@ -286,22 +333,21 @@ impl GpuNemotron {
     /// `tier_pump` drives the flow and the wake re-enters admission.
     pub(crate) fn tier_consult_impl(&mut self, slot: usize, tokens: &[u32]) -> bool {
         use crate::kv_tier::{Election, FlowStatus};
-        use cudarc::driver::DevicePtr;
         let exec = self.exec.clone();
         let Some(bs) = self.batch.as_mut() else {
             return false;
         };
-        let state_bytes = (bs.state_ckpt_f32 * 4) as u64;
+        if bs.ckpt_layout.is_none() {
+            return false; // no checkpoints, so nothing a hybrid can resume at
+        }
         let (Some(tier), Some(pr)) = (bs.tier.as_mut(), bs.prefix.as_mut()) else {
-            return false;
-        };
-        let Some(sp) = bs.d_state_pool.as_ref() else {
             return false;
         };
         tier.pump_completions(pr, &mut bs.pool);
         {
             let exec2 = exec.clone();
-            tier.pump_flows(pr, &mut || exec2.record_event().ok());
+            // an aux round reserves its checkpoint's pages from the pool
+            tier.pump_flows_with_pool(pr, &mut bs.pool, &mut || exec2.record_event().ok());
         }
         match tier.flow_status(slot, tokens) {
             FlowStatus::Loading => return true,
@@ -330,16 +376,15 @@ impl GpuNemotron {
             let want = a.end_block + 2 * r;
             let after = exec.record_event().ok();
             let (_e, taken) = tier.pressure_demote(pr, &mut bs.pool, want, after);
-            let (cp, _g) = sp.device_ptr(&exec.stream);
             for t in taken {
                 if t.end_block % r == 0 {
-                    let blob = cp + t.state_idx as u64 * state_bytes;
                     let ev = exec.record_event().ok();
-                    tier.demote_aux(pr, t, blob, state_bytes, ev);
+                    tier.demote_aux_paged(pr, &mut bs.pool, t, ev);
                 } else {
                     pr.recycle_state(t.state_idx);
                 }
             }
+            pr.reclaim(&mut bs.pool);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             while bs.pool.free_blocks() < want && tier.stats().2 > 0 {
                 tier.pump_completions(pr, &mut bs.pool);
@@ -382,11 +427,12 @@ impl GpuNemotron {
             return false;
         };
         let after = exec.record_event().ok();
-        let (cp, _g) = sp.device_ptr(&exec.stream);
+        // the blob lands in pool pages the flow reserves; the radix names
+        // them, so there is no slot base to hand over
         let plan = crate::kv_tier::AuxPlan {
             hit: aux,
-            state_base: cp,
-            state_stride: state_bytes,
+            state_base: 0,
+            state_stride: 0,
         };
         match crate::kv_tier::RestoreFlow::begin(
             tier,
@@ -420,15 +466,11 @@ impl GpuNemotron {
             return;
         };
         tier.pump_completions(pr, &mut bs.pool);
-        tier.pump_flows(pr, &mut || exec.record_event().ok());
+        tier.pump_flows_with_pool(pr, &mut bs.pool, &mut || exec.record_event().ok());
         // 2.3 write-through: retained chains AND live state blobs
-        // pre-store in slack so eviction (and ckpt-slot recycling) is free
-        let state = bs.d_state_pool.as_ref().map(|sp| {
-            use cudarc::driver::DevicePtr;
-            let (cp, _g) = sp.device_ptr(&exec.stream);
-            (cp, (bs.state_ckpt_f32 * 4) as u64)
-        });
-        tier.mirror_slack(pr, &mut bs.pool, exec.record_event().ok(), 2, state);
+        // pre-store in slack so eviction (and ckpt-slot recycling) is free.
+        // The blobs are pool pages; the tier reads them off the radix.
+        tier.mirror_slack(pr, &mut bs.pool, exec.record_event().ok(), 2, None);
     }
 
     pub(crate) fn tier_stats_impl(&self) -> Option<crate::kv_tier::TierStats> {
@@ -466,9 +508,9 @@ impl GpuNemotron {
 // index recycled), so the next turn resumes at the END of the reply.
 //
 // The sequence is tracked per slot: the prompt's keys at admission, then
-// every decode token a tick FEEDS (so the tracked length always equals the
-// next position; any gap - a tier restore, a spec round, a recompute - ends
-// tracking for the slot until its next admission). The decode pipe enqueues
+// every decode token a tick FEEDS and every row a spec round commits (so the
+// tracked length always equals the next position; any gap - a tier restore,
+// a recompute - ends tracking for the slot until its next admission). The decode pipe enqueues
 // the copy the moment the tick is launched (stream-ordered behind it) and
 // files the pages when the ids reach the host.
 impl GpuNemotron {
@@ -480,7 +522,7 @@ impl GpuNemotron {
         };
         if reply_ckpt_disabled()
             || bs.prefix.is_none()
-            || bs.d_state_pool.is_none()
+            || bs.ckpt_layout.is_none()
             || slot >= bs.seq.len()
         {
             return;
@@ -523,6 +565,114 @@ impl GpuNemotron {
         Ok(())
     }
 
+    /// A spec round committed `accepts[i].2` rows of request `i`: feed them
+    /// and checkpoint every page the commit closes, at the exact closing
+    /// row. The verify keeps a state snapshot per row, so the cut need not
+    /// fall on the round's end - at c committed rows a round, a round end
+    /// lands on a given page edge about 1/c of the time. Runs before the rollback:
+    /// a row's conv window is the pre-round window followed by the round's
+    /// conv-input rows, and the rollback overwrites the former.
+    pub(super) fn reply_after_spec(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        accepts: &[(usize, usize, usize)],
+    ) -> Result<(), GpuModelError> {
+        for (&(slot, pos0, ref chunk), &(_, off, acc)) in reqs.iter().zip(accepts) {
+            for (j, &tok) in chunk.iter().enumerate().take(acc) {
+                self.reply_feed(slot, (pos0 + j) as u32, tok);
+                let cut = pos0 + j + 1;
+                if cut.is_multiple_of(BLOCK_TOKENS) {
+                    self.reply_snapshot_row(slot, cut, off + j, j + 1)?;
+                }
+            }
+        }
+        self.reply_resolve_pending();
+        Ok(())
+    }
+
+    /// `reply_snapshot` for a verify row: the state is the row's snapshot,
+    /// the conv window the last k-1 rows of [pre-round window ∥ the round's
+    /// first `n_new` conv-input rows], assembled in the bounce blob and then
+    /// copied into the checkpoint's pages.
+    fn reply_snapshot_row(
+        &mut self,
+        slot: usize,
+        cut: usize,
+        row: usize,
+        n_new: usize,
+    ) -> Result<(), GpuModelError> {
+        if !self.reply_tracking(slot) {
+            return Ok(());
+        }
+        let exec = self.exec.clone();
+        let hp = self.hp.clone();
+        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
+        let conv_dim = hp.conv_dim();
+        let km1 = hp.d_conv - 1;
+        let win_elems = km1 * conv_dim;
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let Some(radix) = bs.prefix.as_mut() else {
+            return Ok(());
+        };
+        let Some(idx) = radix.reserve_state_slot_with_pool(&mut bs.pool) else {
+            return Ok(());
+        };
+        let (Some(sp), Some(vp)) = (bs.d_ckpt_bounce.as_mut(), bs.verify.as_ref()) else {
+            radix.recycle_state(idx);
+            return Ok(());
+        };
+        let keep_old = km1.saturating_sub(n_new);
+        let take_new = km1 - keep_old;
+        let mut boff = 0usize;
+        for li in 0..hp.n_layer {
+            let Some(snap) = vp.snap[li].as_ref() else {
+                continue;
+            };
+            snap.save_to_blob(&exec, row * state_elems, sp, boff, state_elems)?;
+            boff += state_elems;
+            let w = bs.conv_win[li].as_ref().expect("mamba layer has window");
+            let xbc = vp.xbc[li].as_ref().expect("mamba layer has xbc rows");
+            if keep_old > 0 {
+                exec.copy_region(
+                    w,
+                    slot * win_elems + (km1 - keep_old) * conv_dim,
+                    sp,
+                    boff,
+                    keep_old * conv_dim,
+                )?;
+            }
+            exec.copy_region(
+                xbc,
+                (row + 1 - take_new) * conv_dim,
+                sp,
+                boff + keep_old * conv_dim,
+                take_new * conv_dim,
+            )?;
+            boff += win_elems;
+        }
+        self.reply_file_bounce(slot, cut, idx)
+    }
+
+    /// Copy the snapshot the bounce blob now holds into reserved checkpoint
+    /// `idx`'s pages and queue it for filing - or give the index back if the
+    /// copy failed.
+    fn reply_file_bounce(
+        &mut self,
+        slot: usize,
+        cut: usize,
+        idx: u32,
+    ) -> Result<(), GpuModelError> {
+        if let Err(e) = self.ckpt_pages_copy(idx, crate::ckpt_pages::Dir::ToPages) {
+            if let Some(radix) = self.batch.as_mut().and_then(|b| b.prefix.as_mut()) {
+                radix.recycle_state(idx);
+            }
+            return Err(e);
+        }
+        let bs = self.batch.as_mut().expect("batch enabled");
+        bs.reply_pending.push((slot, cut, idx));
+        Ok(())
+    }
+
     /// The pipe's ids for tick `k - 1` arrived: they are the tokens fed at
     /// `pos0 + k`. Feed them and file the snapshots they complete.
     pub(super) fn reply_pipe_ids(
@@ -545,8 +695,8 @@ impl GpuNemotron {
             .is_some_and(|bs| bs.seq.get(slot).is_some_and(|s| !s.is_empty()))
     }
 
-    /// Copy `slot`'s live state into a reserved pool index (the reverse of
-    /// `restore_state`) and queue it for filing.
+    /// Copy `slot`'s live state into a reserved checkpoint (the reverse of
+    /// `restore_state`, through the bounce blob) and queue it for filing.
     fn reply_snapshot(&mut self, slot: usize, cut: usize) -> Result<(), GpuModelError> {
         if !self.reply_tracking(slot) {
             return Ok(());
@@ -555,19 +705,18 @@ impl GpuNemotron {
         let hp = self.hp.clone();
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * hp.conv_dim();
-        let n = self.state_ckpt_f32();
         let bs = self.batch.as_mut().expect("batch enabled");
         let Some(radix) = bs.prefix.as_mut() else {
             return Ok(());
         };
-        let Some(idx) = radix.reserve_state_slot() else {
+        let Some(idx) = radix.reserve_state_slot_with_pool(&mut bs.pool) else {
             return Ok(());
         };
-        let Some(sp) = bs.d_state_pool.as_mut() else {
+        let Some(sp) = bs.d_ckpt_bounce.as_mut() else {
             radix.recycle_state(idx);
             return Ok(());
         };
-        let mut boff = idx as usize * n;
+        let mut boff = 0usize;
         for li in 0..hp.n_layer {
             let Some(s) = bs.ssm[li].as_ref() else {
                 continue;
@@ -578,8 +727,7 @@ impl GpuNemotron {
             exec.copy_region(w, slot * win_elems, sp, boff, win_elems)?;
             boff += win_elems;
         }
-        bs.reply_pending.push((slot, cut, idx));
-        Ok(())
+        self.reply_file_bounce(slot, cut, idx)
     }
 
     /// File every pending snapshot whose ids have arrived: the reply's pages
@@ -619,7 +767,7 @@ impl GpuNemotron {
                 if filed {
                     filed_any = true;
                     if let Some((old_cut, old_idx)) = bs.reply_ckpt[slot].replace((cut, idx))
-                        && radix.detach_state_at(seq, old_cut) == Some(old_idx)
+                        && radix.detach_state_if(seq, old_cut, old_idx)
                     {
                         radix.recycle_state(old_idx);
                     }

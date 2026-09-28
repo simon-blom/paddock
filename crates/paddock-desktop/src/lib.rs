@@ -409,6 +409,7 @@ fn project_for_ui(key: &str, value: &mut serde_json::Value) -> Result<(), String
                         "asr",
                         "aligner",
                         "image",
+                        "reader",
                         "display",
                         "endpoint",
                         "version",
@@ -862,7 +863,7 @@ mod tests {
     #[test]
     fn runner_credentials_never_cross_the_native_boundary() {
         let mut runners = serde_json::json!([{
-            "port": 12345, "pid": 42, "model": "qwen", "status": "running",
+            "port": 12345, "pid": 42, "reader": "laya", "status": "running",
             "endpoint": "http://127.0.0.1:12345", "in_flight": 2,
             "api_key": "test-only-root-secret",
             "future_secret_field": "test-only-future-secret",
@@ -872,6 +873,7 @@ mod tests {
         project_for_ui("runners", &mut runners).unwrap();
         assert_eq!(runners[0]["port"], 12345);
         assert_eq!(runners[0]["in_flight"], 2);
+        assert_eq!(runners[0]["reader"], "laya");
         assert!(!runners.to_string().contains("secret"));
         assert!(runners[0].get("config").is_none());
         assert!(project_for_ui("arbitrary", &mut runners).is_err());

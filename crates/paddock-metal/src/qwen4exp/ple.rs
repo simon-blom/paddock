@@ -11,6 +11,31 @@ use crate::{
 use paddock_models::mapped::MappedGguf;
 
 pub(super) const TABLE_ROWS: usize = 320001536;
+pub(super) enum Table {
+    Resident(Weight),
+    Paged(super::ple_paged::PagedTable),
+}
+impl Table {
+    pub(super) fn stage(&mut self, plan: &Plan, state: &State) -> Result<()> {
+        match self {
+            Self::Resident(_) => Ok(()),
+            Self::Paged(table) => table.stage(plan, &state.history),
+        }
+    }
+    pub(super) fn encode(
+        &self,
+        state: &State,
+        cmd: &Commands<'_>,
+        weights: &Weights,
+        plan: &Plan,
+        hidden: &Buffer,
+    ) {
+        match self {
+            Self::Resident(w) => state.encode(cmd, weights, w, plan, hidden),
+            Self::Paged(w) => state.encode_inner(cmd, weights, &w.staging, plan, hidden, true),
+        }
+    }
+}
 pub(super) struct Weights {
     key: Weight,
     value: Weight,
@@ -60,8 +85,8 @@ pub(super) fn load_table(d: &MetalDevice, map: &MappedGguf) -> Result<Weight> {
 // contiguity are checked before touching the first GPU-owned history byte.
 #[derive(Debug)]
 pub(super) struct Plan {
-    tokens: Vec<u32>,
-    meta: Vec<u32>,
+    pub(super) tokens: Vec<u32>,
+    pub(super) meta: Vec<u32>,
     spans: Vec<u32>,
     lengths: Vec<usize>,
 }
@@ -147,12 +172,12 @@ pub(super) struct State {
 }
 impl State {
     pub(super) fn bytes(capacity: usize, slots: usize, context: usize) -> Result<usize> {
-        if !(1..=1024).contains(&capacity)
+        if !(1..=affine::MAX_ROWS).contains(&capacity)
             || !(1..=64).contains(&slots)
             || !(1..=262144).contains(&context)
         {
             return Err(MetalError::Model(
-                "Flash Next PLE bounds: rows 1..=1024, slots 1..=64, context 1..=262144".into(),
+                "Flash Next PLE bounds: rows 1..=2048, slots 1..=64, context 1..=262144".into(),
             ));
         }
         Ok(4 * (capacity * (1 + 4 + 16 + WIDTH * 2 + WIDE * 4) + slots * (4 + 2 + 9 * WIDE)))
@@ -220,6 +245,17 @@ impl State {
         plan: &Plan,
         hidden: &Buffer,
     ) {
+        self.encode_inner(cmd, weights, table, plan, hidden, false);
+    }
+    fn encode_inner(
+        &self,
+        cmd: &Commands<'_>,
+        weights: &Weights,
+        table: &Weight,
+        plan: &Plan,
+        hidden: &Buffer,
+        paged: bool,
+    ) {
         let n = plan.tokens.len();
         let mlx = affine::is_affine(table.ty);
         cmd.dispatch(
@@ -231,7 +267,11 @@ impl State {
         );
         if mlx {
             cmd.dispatch(
-                "q4a_ple_gather",
+                if paged {
+                    "q4a_ple_staged"
+                } else {
+                    "q4a_ple_gather"
+                },
                 &[&table.buffer, &self.ids, &self.embedding],
                 &[(n * 16) as u32, mlx::SHARD_ROWS as u32, 128],
                 [(n * WIDTH).div_ceil(256), 1, 1],
@@ -369,7 +409,7 @@ mod tests {
         assert!(Plan::new(&[(0, 1, 1)], &lengths, 8, 1).is_err());
         for args in [
             (0, 1, 1),
-            (1025, 1, 1),
+            (affine::MAX_ROWS + 1, 1, 1),
             (usize::MAX, 1, 1),
             (1, 0, 1),
             (1, 65, 1),

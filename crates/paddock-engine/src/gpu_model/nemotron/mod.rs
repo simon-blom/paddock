@@ -21,13 +21,16 @@
 //!     bf16/f32 -> f32 (exact widening)
 
 pub(crate) mod batch;
+mod chunked;
 pub(crate) mod dflash;
 mod forward;
 mod load;
 pub(crate) mod mtp;
 mod prefix;
+mod sampled;
 mod spec;
 pub(crate) mod ssm_arena;
+mod walk;
 
 use std::sync::Arc;
 
@@ -210,12 +213,16 @@ pub(crate) enum HeadW {
 /// PADDOCK_NVF4_TC=0 is the A/B kill switch. The election lives here, not
 /// in the generic wrapper, so every other nvf4_gemv_batch consumer stays in
 /// the exact class.
+///
+/// `w16` = the rows run the W16 decode class (batch::w16_class): the tile
+/// serves one row too, so a row's logits do not depend on the row count.
 pub(crate) fn head_nvf4_batch(
     exec: &GpuExecutor,
     h: &Nvf4Plane,
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
     rows: usize,
+    w16: bool,
 ) -> Result<(), crate::gpu::GpuError> {
     static TC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *TC.get_or_init(|| {
@@ -223,7 +230,11 @@ pub(crate) fn head_nvf4_batch(
             .map(|v| v != "0")
             .unwrap_or(true)
     });
-    if on && rows > 1 && h.out_dim >= 4096 && h.in_dim.is_multiple_of(16) && exec.has_nvf4_gemm_tc()
+    if on
+        && (rows > 1 || w16)
+        && h.out_dim >= 4096
+        && h.in_dim.is_multiple_of(16)
+        && exec.has_nvf4_gemm_tc()
     {
         exec.nvf4_gemm_tc(h, x, y, None, rows)
     } else {

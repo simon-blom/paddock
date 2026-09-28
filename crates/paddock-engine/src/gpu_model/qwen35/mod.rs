@@ -1628,6 +1628,12 @@ pub struct GpuQwen35 {
     /// linear of the file on the lane. `PADDOCK_NO_TERNARY_B128` pins the
     /// per-32 i-quant lane for A/B.
     tern_b128: bool,
+    /// Every decode width of a `tern_b128` model rides slot 686 (the NB-row
+    /// ternary lane on the int8 tensor cores, one weight read a tick) - the
+    /// same bits per row as the batch-1 walk, so a row scores the same alone
+    /// or sharing its tick. `PADDOCK_NO_TERNARY_NB` pins the batch-1 walk at
+    /// b = 1 and the generic lanes above it, for A/B.
+    tern_nb: bool,
     /// True when any weight is k-quant resident (UD/Q4_K-class file). Stage-1
     /// serving keeps such models on the serial spine: decode via the fused
     /// k-quant GEMV, prefill via dequant+f32-GEMM; the batched pipe / spec /
@@ -2197,16 +2203,20 @@ struct BatchState {
     /// P5c zero-copy radix prefix cache over the pool: a new sequence sharing a
     /// prompt prefix ADOPTS the cached full-attn KV blocks (refcount++) instead
     /// of recomputing/copying them, and restores the hybrid DeltaNet recurrent
-    /// state at the resume boundary from `d_state_pool`. `None` when the pool is
-    /// off or `PADDOCK_NO_PREFIX_CACHE` is set.
+    /// state at the resume boundary from its checkpoint's pool pages. `None`
+    /// when the pool is off or `PADDOCK_NO_PREFIX_CACHE` is set.
     paged_prefix: Option<PagedRadix>,
     /// KV tier over the full-attn pool + DeltaNet checkpoint blobs as aux
     /// components (kv-offload 1b.3, the tier-1 family). None unless the
     /// `[kv_offload]` config / dev flag arms it.
     tier: Option<crate::kv_tier::PoolTier<crate::kv_tier::RamTransport>>,
-    /// Device pool of DeltaNet state checkpoints (f32), `state_ckpt_f32` per
-    /// checkpoint, indexed by `PagedRadix` state indices.
-    d_state_pool: Option<CudaSlice<f32>>,
+    /// Where DeltaNet state checkpoints live: in the KV pool's own pages
+    /// (issue #33). `PagedRadix` owns each checkpoint's page list; this is the
+    /// plane geometry that turns a checkpoint byte into a device address. A
+    /// checkpoint is `state_ckpt_f32` f32 laid out per linear layer as state
+    /// then conv window, exactly the flat blob it used to be. `None` when the
+    /// prefix cache is off.
+    ckpt_layout: Option<crate::ckpt_pages::PageLayout>,
     state_ckpt_f32: usize,
     /// Caller-owned descriptor scratch for the checkpoint snapshot/restore
     /// batched copy. It exists because both used to build their descriptor
@@ -2214,8 +2224,8 @@ struct BatchState {
     /// call - 32 of them in one tick when a c32 cohort all resume, and
     /// cudaMalloc is a synchronizing call. That is what made the prefix
     /// cache cost ~1 s tick-stalls and turned the c32 cell bimodal
-    /// (2690 good mode vs 2355 with the stalls). Sized for one call's
-    /// descriptors (6 u64 per linear layer) and reused forever.
+    /// (2690 good mode vs 2355 with the stalls). Sized for one checkpoint's
+    /// page-split descriptors (see `ckpt_desc_cap`) and reused forever.
     d_ckpt_desc: Option<CudaSlice<u64>>,
     /// One captured step graph per batch size (grid shapes bake in B): replaying
     /// it collapses the ~500 launches + ~26 quantize/MMQ pairs into one submit -
@@ -2277,6 +2287,9 @@ const ARGMAX_PARTS: usize = 512;
 /// Max rows per speculative verify chunk (1 committed token + up to SPEC_ROWS-1
 /// drafts). Bounds the per-layer recurrent-state snapshot buffers.
 const SPEC_ROWS: usize = 12;
+/// Decode widths the NB-row ternary lane (slot 686) serves: past 8 rows it
+/// tiles columns over grid.y, and 64 is the batched decode step's rung ceiling.
+const TERN_NB_MAX_ROWS: usize = 64;
 
 /// Rows per MTP warm/catch-up chunk (bounds the concat staging buffers).
 const WARM_CHUNK: usize = 64;
@@ -2588,6 +2601,31 @@ fn ab_gate(
         exec.matvec_f32_batch(ab, xn, d_ab, n)?;
         exec.delta_gate_ab(d_ab, ssm_a, dt_bias, g, beta, n, n_heads)?;
     }
+    Ok(())
+}
+
+/// [`ab_gate`] for a decode tick: the decay plane's matvec in one K order at
+/// every tick width (slot 687), so a decode row's g / beta - and everything
+/// the recurrence derives from them - are its bits alone at any width. The
+/// shared launcher reorders K from 16 rows on (its tile arm).
+#[allow(clippy::too_many_arguments)]
+fn ab_gate_dec(
+    exec: &GpuExecutor,
+    ab: &DeviceTensor,
+    xn: &CudaSlice<f32>,
+    d_ab: &mut CudaSlice<f32>,
+    ssm_a: &CudaSlice<f32>,
+    dt_bias: &CudaSlice<f32>,
+    g: &mut CudaSlice<f32>,
+    beta: &mut CudaSlice<f32>,
+    n: usize,
+    n_heads: usize,
+) -> Result<(), GpuModelError> {
+    if !exec.has_matvec_f32_winv() {
+        return ab_gate(exec, ab, xn, d_ab, ssm_a, dt_bias, g, beta, n, n_heads);
+    }
+    exec.matvec_f32_winv(ab, xn, d_ab, n)?;
+    exec.delta_gate_ab(d_ab, ssm_a, dt_bias, g, beta, n, n_heads)?;
     Ok(())
 }
 
@@ -2929,6 +2967,25 @@ fn attn_splits(n_heads: usize, batch: usize, sm_count: usize) -> usize {
     // rows-tiered count needs the spec-verify paths pinned to one count first
     // (the B=8 K=4 exact gate compares r=40 batched vs r=5 single-slot).
     16
+}
+
+/// [`attn_splits`] for a tick whose rows must score the same at any width (the
+/// ternary class): the fixed split count at every width the partial scratch
+/// holds - no collapse to the serial walk at the walk-length boundary, since
+/// the two walks sum a row's keys in different orders. The scratch holds
+/// 2 * fill * MAX_ATTN_SPLITS (head, row, split) partials: 24 heads x 64 rows
+/// x 16 splits fit. PADDOCK_NO_ATTN_SPLIT (every width serial) is invariant
+/// too and wins.
+pub(super) fn attn_splits_wi(n_heads: usize, batch: usize, sm_count: usize) -> usize {
+    if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
+        return 1;
+    }
+    let n = attn_splits(n_heads, 1, sm_count);
+    if n_heads * batch * n <= 2 * attn_fill_blocks(attn_boundary_sms(sm_count)) * MAX_ATTN_SPLITS {
+        n
+    } else {
+        attn_splits(n_heads, batch, sm_count)
+    }
 }
 
 /// `CapturedGraph` holds raw CUDA handles and is `!Send`, but the model is driven from

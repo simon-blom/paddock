@@ -138,6 +138,13 @@ pub struct Demand {
     /// Blocks the radix tree may hold above the addressable ceiling (nodes keep
     /// blocks after their sequence ends). 0 when the prefix cache is off.
     pub retention_blocks: usize,
+    /// Blocks the plan must back ON TOP of full context: the live turns'
+    /// resume checkpoints, where a family keeps them in pool pages
+    /// (`PagedRadix::set_state_paged`). Unlike `retention_blocks` they are not
+    /// optional - a config that cannot back them refuses the way one that
+    /// cannot back its context does, because without them a hybrid's next
+    /// turn re-reads the whole conversation.
+    pub ckpt_blocks: usize,
     /// Blocks each slot must be able to hold before admission can make
     /// progress - one prefill chunk, or a sequence deadlocks on its own first
     /// chunk.
@@ -172,6 +179,7 @@ impl Default for Demand {
             block_bytes: 0,
             per_slot_bytes: 0,
             retention_blocks: 0,
+            ckpt_blocks: 0,
             floor_blocks_per_slot: 0,
             floor_blocks_min: 0,
             reserves: Vec::new(),
@@ -233,7 +241,9 @@ impl Demand {
     /// `blocks_per_slot` entries, so anything above this is VRAM taken off the
     /// desktop that no sequence can ever reach.
     fn ceiling(&self, slots: usize) -> u64 {
-        slots as u64 * self.blocks_per_slot as u64 + self.retention_blocks as u64
+        slots as u64 * self.blocks_per_slot as u64
+            + self.retention_blocks as u64
+            + self.ckpt_blocks as u64
     }
 
     /// Blocks needed before admission can make progress at this width, never
@@ -244,9 +254,10 @@ impl Demand {
             .min(self.ceiling(slots))
     }
 
-    /// Blocks needed for every seated slot to hold `max_ctx` at once.
+    /// Blocks needed for every seated slot to hold `max_ctx` at once, with the
+    /// mandatory checkpoint pages beside them.
     fn full_context(&self, slots: usize) -> u64 {
-        slots as u64 * self.blocks_per_slot as u64
+        slots as u64 * self.blocks_per_slot as u64 + self.ckpt_blocks as u64
     }
 
     fn fixed(&self) -> u64 {
@@ -384,7 +395,12 @@ impl Demand {
             self.affordable(grant, n)
                 .is_some_and(|b| b >= self.floor(n))
         });
-        let fit_ctx = (got as usize).checked_div(asked).unwrap_or(0) * BLOCK_TOKENS;
+        // the checkpoint pages come off the top before any context does
+        let fit_ctx = (got as usize)
+            .saturating_sub(self.ckpt_blocks)
+            .checked_div(asked)
+            .unwrap_or(0)
+            * BLOCK_TOKENS;
         if fit_ctx >= BLOCK_TOKENS && fit_ctx < self.max_ctx {
             fixes.push(format!("lower max_ctx to <={fit_ctx}"));
         }
@@ -427,9 +443,17 @@ impl Demand {
         // (The first version led with the ledger and the toast was way too
         // long - correct, and unreadable, which is the same bug the timestamp
         // preamble had.)
+        let ckpt_note = if self.ckpt_blocks > 0 {
+            format!(
+                " ({:.2} GiB of it the live turns' resume checkpoints)",
+                gib(self.ckpt_blocks as u64 * per_block)
+            )
+        } else {
+            String::new()
+        };
         WontFit {
             message: format!(
-                "{} cannot serve max_ctx {} x max_batch {asked}: needs {:.2} GiB of KV, \
+                "{} cannot serve max_ctx {} x max_batch {asked}: needs {:.2} GiB of KV{ckpt_note}, \
                  only {:.2} GiB fits. {}. \
                  Budget: {} => {:.2} GiB for KV at {:.2} MiB/block \
                  ({got} of {need} blocks, {} tokens shared across all sequences).{}",
@@ -749,6 +773,29 @@ mod tests {
                 p.pool_bytes
             )
         }
+    }
+
+    /// Mandatory checkpoint pages sit on top of full context: a grant that
+    /// backs the context but not them refuses, the message says how much of
+    /// the need they are, and the context it offers leaves them room.
+    #[test]
+    fn checkpoint_pages_are_mandatory_and_named() {
+        let d = Demand {
+            slots: 1,
+            ckpt_blocks: 256,
+            when_short: WhenShort::Refuse,
+            ..pooled()
+        };
+        // 2 GiB of reserves; the context is 512 x 4 MiB = 2 GiB, the
+        // checkpoints 256 x 4 MiB = 1 GiB
+        let p = d.plan(5 * GIB).expect("context and checkpoints fit");
+        assert_eq!(p.pool_blocks, 512 + 256);
+        let e = d.plan(4 * GIB).unwrap_err().message;
+        assert!(
+            e.contains("1.00 GiB of it the live turns' resume checkpoints"),
+            "{e}"
+        );
+        assert!(e.contains("Lower max_ctx to <=4096"), "{e}");
     }
 
     #[test]

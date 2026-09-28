@@ -150,6 +150,34 @@ pub struct ModelReport {
     pub cross_kv: Option<CrossKv>,
 }
 
+/// Parse a GGUF file's header - metadata and tensor table, never the weights -
+/// reading only as much as it takes.
+///
+/// Starts at 4 MiB and doubles while the header runs past what was read, up
+/// to the probe's own cap. A header is small unless it carries a big
+/// tokenizer (a 262k vocab is ~10 MB), so a companion check at startup that
+/// opens a handful of these pays a few MiB each, not the probe's 256.
+pub fn read_header(path: &Path) -> Result<GgufFile, ProbeError> {
+    use std::io::Read;
+    let io_err = |e| ProbeError::Io(path.to_path_buf(), e);
+    let mut file = std::fs::File::open(path).map_err(io_err)?;
+    let file_size = file.metadata().map_err(io_err)?.len();
+    let cap = file_size.min(PROBE_PREFIX) as usize;
+    let mut head = Vec::new();
+    let mut want = cap.min(4 << 20);
+    loop {
+        let have = head.len();
+        head.resize(want, 0);
+        file.read_exact(&mut head[have..]).map_err(io_err)?;
+        match GgufFile::parse_prefix(&head, file_size) {
+            Err(GgufError::Truncated { .. }) if want < cap => {
+                want = (want * 2).min(cap);
+            }
+            r => return r.map_err(|e| ProbeError::Parse(path.to_path_buf(), e)),
+        }
+    }
+}
+
 /// Read and parse one file's header region (never the weights).
 fn parse_header(path: &Path) -> Result<(GgufFile, u64), ProbeError> {
     let io_err = |e| ProbeError::Io(path.to_path_buf(), e);
@@ -692,5 +720,36 @@ mod tests {
         let r = probe_synthetic("clip", 4, &[], |_| 0);
         assert!(r.kv_layers.is_empty());
         assert!(r.recurrent.is_none());
+    }
+
+    /// A header bigger than the first read (a big vocab) has to come back
+    /// whole: the reader doubles until the tensor table after it parses.
+    #[test]
+    fn read_header_grows_past_a_big_vocab() {
+        let vocab: Vec<String> = (0..400_000).map(|i| format!("token-{i:08}")).collect();
+        let refs: Vec<&str> = vocab.iter().map(String::as_str).collect();
+        let mut w = Writer::new(1, 3);
+        w.kv_str("general.architecture", "qwen35");
+        w.kv_u32("qwen35.embedding_length", N_EMBD as u32);
+        w.kv_str_array("tokenizer.ggml.tokens", &refs);
+        w.tensor_f32("token_embd.weight", &[N_EMBD, KV_DIM], 0);
+        let bytes = w.finish_with_data(TENSOR_BYTES as usize);
+        assert!(
+            bytes.len() > 4 << 20,
+            "the fixture must outgrow the first read"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big-vocab.gguf");
+        std::fs::write(&path, &bytes).expect("write");
+        let f = read_header(&path).expect("header");
+        assert_eq!(f.architecture(), Some("qwen35"));
+        assert_eq!(
+            f.tensors
+                .iter()
+                .find(|t| t.name == "token_embd.weight")
+                .map(|t| t.dims.clone()),
+            Some(vec![N_EMBD, KV_DIM])
+        );
     }
 }

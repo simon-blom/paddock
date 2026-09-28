@@ -33,7 +33,7 @@ use crate::kv_plan;
 use crate::kv_pool::{BlockTable, KvPool};
 
 use super::*;
-use crate::gpu_model::qwen35::{gemv_any, mmq_pre, mmq_pre_any, prefill_mm_pre_any, prefill_quant};
+use crate::gpu_model::qwen35::{mmq_pre_any, prefill_mm_pre_any, prefill_quant};
 use paddock_models::nemotron::NemotronBlock;
 
 /// Prefill-mode dispatch cuts for one pass (granite's PfCuts with the slot
@@ -55,12 +55,116 @@ pub(super) struct PfCuts {
 }
 
 /// VRAM slack the slot-fit math leaves untouched (graph/scratch churn).
-const VRAM_HEADROOM: usize = 1 << 30;
+pub(super) const VRAM_HEADROOM: usize = 1 << 30;
 
-/// FlashDecoding split ceiling for the batched decode attention (partial
-/// plane sizing). Nemotron is 32q/2kv hd128 - the q-head grid is already
-/// wide, so granite's fused-walk cap is plenty.
+/// Mamba state checkpoints the prefix cache wants per seated slot (see the
+/// plan in `enable_batch_sized` for how 8 was measured; the per-turn floor
+/// and caps every hybrid shares are `ckpt_pages::page_demand`'s).
+const CKPTS_PER_SLOT: u64 = 8;
+
+/// FlashDecoding split ceiling for the per-q-head decode walk (the arm a
+/// geometry off the head-packed election rides). Nemotron is 32q/2kv hd128 -
+/// that q-head grid is already wide, so granite's fused-walk cap is plenty.
 pub(crate) const MAX_ATTN_SPLITS: usize = 16;
+
+/// Split election for the batched decode attention at `r` rows: (head-packed
+/// arm?, splits per row). Position-independent, so the per-r decode graph
+/// bakes it, and the partial scratch is sized from the same function
+/// ([`attn_partial_rows`]) - the budget and the plane can't drift apart.
+///
+/// Head-packed arm: hd128 at G=16, either KV class (no window) - the pack
+/// elects the lagd WIDE partial, grid (n_kv, r, ns), one CTA per KV head
+/// streaming the group's KV once. f16 joined on GB10 2026-09-25: it rode the
+/// per-(q-head, split) walk, 16 heads each re-reading the group's KV, at ~24
+/// GB/s - 11.2 ms a layer at 256K, the whole of the decode-vs-depth cliff
+/// (67.9 -> 12.5 tok/s from 10K to 259K). The same kernel on f16 streams at
+/// ~193 GB/s (1.38 ms).
+///
+/// Budget: ONE live CTA per SM (T = n_kv * r * ns ~= sm). The lagd partial
+/// is tile-rate bound per CTA (~5 GB/s fp8, ~10 f16 at 47 KB smem), so the
+/// stream saturates at ~185-195 GB/s once the die is covered: measured
+/// (32q/2kv, r 1..8, ctx 2K..256K) fp8 is best at T 48-64 and f16 flat from
+/// T 32, with T 96+ a few % worse (combine + DRAM contention). The old
+/// `3*sm/(n_kv*r)` capped at 8 gave T = 16 at one row - a third of the die,
+/// fp8 at 81 GB/s (256K: 1647 -> 700 us a layer at T 48). ns may be 1: the
+/// head-packed arm then still runs partial + combine, because the unsplit
+/// decode kernel is the per-q-head walk again.
+/// `PADDOCK_NO_ATTN_HP16` (the pack's own kill) returns the walk's budget.
+pub(crate) fn attn_split_election(
+    nh: usize,
+    n_kv: usize,
+    hd: usize,
+    sm: usize,
+    r: usize,
+) -> (bool, usize) {
+    let hp = hd == 128
+        && n_kv > 0
+        && nh == n_kv * 16
+        && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_HP16").is_none();
+    if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
+        return (hp, 1);
+    }
+    let r = r.max(1);
+    if hp {
+        (true, sm.div_ceil(n_kv * r).max(1))
+    } else {
+        (
+            false,
+            (2 * 3 * sm).div_ceil(nh * r).clamp(1, MAX_ATTN_SPLITS),
+        )
+    }
+}
+
+/// Rows per group of the multi-row split partial (`attn_rows_partial`): one
+/// warp a row, eight warps a CTA.
+pub(crate) const ROWS_GROUP: usize = 8;
+
+/// Split the rows of each same-slot run `(first row, rows)` into the
+/// multi-row partial's groups - flat `[first row, rows <= ROWS_GROUP]` pairs.
+pub(crate) fn rows_groups(runs: impl IntoIterator<Item = (usize, usize)>) -> Vec<u32> {
+    let mut g = Vec::new();
+    for (off, len) in runs {
+        let mut o = off;
+        while o < off + len {
+            let n = (off + len - o).min(ROWS_GROUP);
+            g.extend([o as u32, n as u32]);
+            o += n;
+        }
+    }
+    g
+}
+
+/// Splits for the multi-row partial: one live CTA per SM over the (kv head,
+/// group) pairs - the head-packed decode law (`attn_split_election`), which
+/// the same measurement motivates: the stream saturates at one live CTA per
+/// SM, and every group reads its context once whatever its row count.
+pub(crate) fn rows_split(n_kv: usize, n_groups: usize, sm: usize) -> usize {
+    sm.div_ceil(n_kv.max(1) * n_groups.max(1)).max(1)
+}
+
+/// Partial-plane rows (rows x splits) a multi-row round of up to `max_rows`
+/// rows can address, worst over how its rows fall into groups.
+pub(crate) fn rows_partial_cap(n_kv: usize, sm: usize, max_rows: usize) -> usize {
+    (1..=max_rows.max(1))
+        .map(|g| (ROWS_GROUP * g).min(max_rows) * rows_split(n_kv, g, sm))
+        .max()
+        .unwrap_or(1)
+}
+
+/// Partial-plane rows (q-head-major rows x splits) the decode attention can
+/// address over every tick width 1..=`max_rows`: max of r * ns(r).
+pub(crate) fn attn_partial_rows(
+    nh: usize,
+    n_kv: usize,
+    hd: usize,
+    sm: usize,
+    max_rows: usize,
+) -> usize {
+    (1..=max_rows.max(1))
+        .map(|r| r * attn_split_election(nh, n_kv, hd, sm, r).1)
+        .max()
+        .unwrap_or(1)
+}
 
 // dead_code allows below: the stage-C batched ticks are these fields'
 // consumers - stage B only allocates and accounts them. Drop the allows
@@ -128,6 +232,27 @@ pub(crate) struct NemoBatchScratch {
     /// r=1 decode keeps the serial lane's fused wave-dense MoE pair (the bs
     /// tiles pad 1 row to 32); these are its activation + partial planes
     pub d_act: CudaSlice<f32>,
+    /// the W16 decode class's 16-bit planes (W16_ROWS rows): activations cast
+    /// once for the experts and wide attention calls (bf16), for the wide FP8
+    /// projections (f16), and the experts' up output (bf16)
+    pub d_x16b: CudaSlice<half::bf16>,
+    pub d_x16h: CudaSlice<half::f16>,
+    pub d_act16: CudaSlice<half::bf16>,
+    /// the routing front's hand-off tickets (zeroed once; the kernel leaves
+    /// them zero)
+    pub d_route_tickets: CudaSlice<u32>,
+    /// a mixed tick's decode band: its residual rows, held while the
+    /// chunk's MoE folds over every row (W16_ROWS rows)
+    pub d_band_x: CudaSlice<f32>,
+    /// the W16 class's attention: fixed-split partial planes for up to
+    /// `w16_rows` rows x `w16_ns` splits of `w16_split` keys, and the
+    /// one-row-a-group list a decode tick attends through
+    pub w16_split: usize,
+    pub w16_ns: usize,
+    pub w16_rows: usize,
+    pub d_w16o: CudaSlice<f32>,
+    pub d_w16ml: CudaSlice<f32>,
+    pub d_w16_groups: CudaSlice<u32>,
     pub d_part7: CudaSlice<f32>,
     /// [n_slots, vocab] logits - decode graphs bake this address
     pub head_logits: CudaSlice<f32>,
@@ -145,9 +270,10 @@ pub(crate) struct NemoBatchScratch {
     pub d_pipe_tpar: CudaSlice<u32>,
     /// decode-pipe sampled-id ring [2, n_slots]
     pub d_pipe_out: CudaSlice<u32>,
-    /// FlashDecoding partial scratch [n_heads, n_slots, MAX_ATTN_SPLITS, hd]
+    /// FlashDecoding partial scratch [n_heads, attn_partial_rows(n_slots), hd]
+    /// (rows x splits of the widest tick the split election hands out)
     pub attn_o: CudaSlice<f32>,
-    /// per-partial (m, l) [n_heads, n_slots, MAX_ATTN_SPLITS, 2]
+    /// per-partial (m, l) [n_heads, attn_partial_rows(n_slots), 2]
     pub attn_ml: CudaSlice<f32>,
     /// GGUF-lane extras (None on the NVFP4 lane) - the serial lane's
     /// PrefillQ8/ScratchQ8 union at batch capacity
@@ -214,9 +340,18 @@ pub(crate) struct NemoBatch {
     /// KV tier over the attention-layer pool planes; mamba state checkpoint
     /// blobs ride as aux components (qwen35's hybrid recipe).
     pub tier: Option<crate::kv_tier::PoolTier<crate::kv_tier::RamTransport>>,
-    /// mamba state checkpoint pool [n_ckpt, state_ckpt_f32] f32 - the blobs
-    /// `PagedRadix::attach_state` indices point into
-    pub d_state_pool: Option<CudaSlice<f32>>,
+    /// Where mamba state checkpoints live: in the attention pool's own pages
+    /// (issue #33). `PagedRadix` owns each checkpoint's page list; this is
+    /// the plane geometry that turns a checkpoint byte into a device address.
+    /// `None` when the prefix cache is off.
+    pub ckpt_layout: Option<crate::ckpt_pages::PageLayout>,
+    /// One checkpoint's flat f32 blob, which every live-state snapshot and
+    /// restore passes through: the SSM arena may be f16 and widens/narrows
+    /// into a contiguous f32 span, which pages are not.
+    pub d_ckpt_bounce: Option<CudaSlice<f32>>,
+    /// Descriptor scratch for the page-split copies (see
+    /// `GpuExecutor::batched_copy_upload`).
+    pub d_ckpt_desc: Option<CudaSlice<u64>>,
     /// f32 elements per checkpoint (all mamba layers' state+window)
     pub state_ckpt_f32: usize,
     /// per-pass staging blobs the layer walk fills at break rows
@@ -261,7 +396,7 @@ pub(crate) struct PipeB {
     pub slots: Option<Vec<u32>>,
 }
 
-fn drv(e: cudarc::driver::DriverError) -> GpuError {
+pub(super) fn drv(e: cudarc::driver::DriverError) -> GpuError {
     crate::gpu::from_driver(e)
 }
 
@@ -288,7 +423,7 @@ fn drv(e: cudarc::driver::DriverError) -> GpuError {
 /// The BM=8 analog of [`moe_live_blocks`] for the skinny decode pair: an
 /// expert with p picks takes ceil(p/8) blocks, and
 /// sum(ceil(p_e/8)) <= min(pairs, experts) + pairs/8 for any distribution.
-fn moe_live_blocks_bm8(rows: usize, picks: usize, experts: usize, cap: usize) -> usize {
+pub(super) fn moe_live_blocks_bm8(rows: usize, picks: usize, experts: usize, cap: usize) -> usize {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_MOE_NBLIVE").is_some()) {
         return cap;
@@ -297,7 +432,7 @@ fn moe_live_blocks_bm8(rows: usize, picks: usize, experts: usize, cap: usize) ->
     (experts.min(pairs) + pairs / 8).min(cap)
 }
 
-fn moe_live_blocks(rows: usize, picks: usize, experts: usize, cap: usize) -> usize {
+pub(super) fn moe_live_blocks(rows: usize, picks: usize, experts: usize, cap: usize) -> usize {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_MOE_NBLIVE").is_some()) {
         return cap;
@@ -359,7 +494,7 @@ fn moe_live_blocks(rows: usize, picks: usize, experts: usize, cap: usize) -> usi
 /// granite's law (every prefill row takes the same rungs at any r, so a warm
 /// resume reproduces the cold chunk's bytes) forbids splitting a chunk's
 /// route by width.
-const MOE_DEC2_MAX_ROWS: usize = 64;
+pub(super) const MOE_DEC2_MAX_ROWS: usize = 64;
 
 /// Whether this pack carries the decode-band MoE route. Not part of the
 /// family's capability gate: a pack without it serves fine on the sorted
@@ -367,12 +502,48 @@ const MOE_DEC2_MAX_ROWS: usize = 64;
 /// shape is auditing for.
 /// Lever 14: the BM=8 shared-expert fold on the skinny decode path
 /// (`PADDOCK_NO_NEMO_SH_FOLD8=1` keeps the separate wide pair).
-fn sh_fold8_on() -> bool {
+/// Rows that stand in for decode steps - one-row decode, a decode tick's
+/// rows, a spec verify round's - run the W16 decode class: the checkpoint's
+/// W4A16 experts with bf16 activations (moe/nvf4_w16), the FP8 mamba
+/// projections widened to f16 against f16 activations and the bf16
+/// attention planes against bf16 ones (gemm/dense_w16), the head's
+/// tensor-core tile - all on tensor cores, all batch-invariant: a row's bits
+/// do not depend on what shares its tick. The lanes they replace changed
+/// class with the row count (W4A16 at f32 activations for one row, W4A4 /
+/// dynamic-e4m3 W8A8 / bf16-cast past it), so a verify row sat up to 1.5
+/// logits from the one-row tick it stands for and the DFlash spec loop parted
+/// from greedy (GB10 2026-09-26). Prefill keeps the block-scaled lanes; past
+/// this many rows a tick does too (the class's scratch is sized for it).
+pub(crate) const W16_ROWS: usize = 64;
+
+/// The W16 class's attention splits: fixed key ranges of `split` keys (a
+/// multiple of the rows kernel's 32-key tile), `n` of them covering the
+/// context, at most 128 - the partial planes scale with it, so a long
+/// context limit coarsens the split rather than growing the planes. A row's
+/// splits depend on its own keys alone (see attn_rows_partial_fixed).
+pub(crate) fn w16_attn_splits(max_ctx: usize) -> (usize, usize) {
+    let split = max_ctx.div_ceil(128).next_multiple_of(32).max(256);
+    (split, max_ctx.div_ceil(split))
+}
+
+/// The W16 decode class serves `rows` rows: the pack carries its kernels and
+/// `PADDOCK_NO_NEMO_W16` does not pin the old lanes back (dev: the A/B).
+pub(crate) fn w16_class(exec: &GpuExecutor, rows: usize) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    (1..=W16_ROWS).contains(&rows)
+        && exec.has_nvf4_moe_w16()
+        && exec.has_dense_w16()
+        && exec.has_nvf4_gemm_tc()
+        && exec.has_attn_rows_partial_fixed()
+        && !*OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NEMO_W16").is_some())
+}
+
+pub(super) fn sh_fold8_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NEMO_SH_FOLD8").is_none())
 }
 
-fn moe_dec2_ok(exec: &GpuExecutor) -> bool {
+pub(super) fn moe_dec2_ok(exec: &GpuExecutor) -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         paddock_models::dev_var_os!("PADDOCK_NO_NEMO_MOEDEC2").is_none()
@@ -382,7 +553,7 @@ fn moe_dec2_ok(exec: &GpuExecutor) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dense_mm_pre(
+pub(super) fn dense_mm_pre(
     exec: &GpuExecutor,
     w: &QuantW,
     xq: &CudaSlice<i8>,
@@ -498,8 +669,10 @@ impl GpuNemotron {
             .count();
 
         // One block id addresses every attention layer (combined table), so a
-        // block costs all n_attn layers' K+V at once.
-        let block_bytes = n_attn * 16 * kv_dim * 2 * kvb;
+        // block costs all n_attn layers' K+V at once - and the drafter's
+        // stripes, which ride the same ids (dflash.rs).
+        let block_bytes = n_attn * 16 * kv_dim * 2 * kvb
+            + self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim));
         // per-slot recurrent state (flat, not paged)
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * conv_dim;
@@ -542,7 +715,7 @@ impl GpuNemotron {
             + nb_r * 32 * (hp.moe_ff / 2 + hp.moe_ff / 16)
             + nb_s * 32 * (hp.shared_ff / 2 + hp.shared_ff / 16)
             + max_batch * hp.vocab * 4
-            + nh * max_batch * MAX_ATTN_SPLITS * (hd + 2) * 4
+            + nh * attn_partial_rows(nh, n_kv, hd, self.exec.sm_count(), max_batch) * (hd + 2) * 4
             + (128 << 20);
         let px_on = !super::prefix::prefix_disabled();
         let retain = if px_on {
@@ -561,19 +734,23 @@ impl GpuNemotron {
         // What the process holds as the plan is made: the audit at the end
         // adds the plan's charges to it.
         let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
-        // Mamba state checkpoints for the prefix cache, sized by DEMAND and
-        // charged as a reserve (the qwen35 rule, 2026-09-06): eight per
-        // requested slot, clamped 16..256, then capped by what the grant has
-        // left once every other term - including a full-context pool for
-        // every slot - is charged. It used to be computed after the plan as a
-        // fifth of whatever was still free, clamped to 256, with no reserve:
-        // 256 f32 snapshots (~6 GiB) for a one-slot server on a 96 GB card.
-        // Two per slot (16 at 8 slots) was the working set of one wave: an
-        // agentic session keeps two live cuts and its previous turn's two
-        // until the next commit, so eight sessions cycled the pool every
-        // turn and resumed from the shared system prompt instead of their
-        // own boundary (GB10 2026-09-11; 64 held every session's cut).
-        // The staging blobs (one pass's cuts) are charged the same way.
+        // Mamba state checkpoints for the prefix cache, sized by DEMAND (the
+        // qwen35 rule, 2026-09-06): eight per requested slot, clamped 16..256.
+        // It used to be computed after the plan as a fifth of whatever was
+        // still free, clamped to 256, with no reserve: 256 f32 snapshots
+        // (~6 GiB) for a one-slot server on a 96 GB card. Two per slot (16 at
+        // 8 slots) was the working set of one wave: an agentic session keeps
+        // two live cuts and its previous turn's two until the next commit, so
+        // eight sessions cycled the pool every turn and resumed from the
+        // shared system prompt instead of their own boundary (GB10
+        // 2026-09-11; 64 held every session's cut).
+        //
+        // Since issue #33 they live in the attention pool's own pages: the
+        // live turns' checkpoints are backed beside full context, the rest of
+        // the want rides retention (bought only while the grant affords it),
+        // and pages a context has not reached yet hold more for free. The
+        // staging blobs (one pass's cuts, plus the bounce blob every live
+        // snapshot and restore goes through) stay a reserve.
         let state_ckpt_f32 = n_mamba * (state_elems + win_elems);
         let per_ckpt = (state_ckpt_f32 * 4) as u64;
         let n_stages = if px_on {
@@ -581,7 +758,8 @@ impl GpuNemotron {
         } else {
             0
         };
-        let staging_bytes = n_stages as u64 * per_ckpt;
+        let bounce = usize::from(px_on && per_ckpt > 0);
+        let staging_bytes = (n_stages + bounce) as u64 * per_ckpt;
         let tier_staging: u64 = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
             crate::kv_tier::ram_transport::device_staging_bytes()
         } else {
@@ -590,25 +768,16 @@ impl GpuNemotron {
         // the Mamba arenas: one recurrent state + conv window per slot per
         // mamba layer (`arena_bytes` was max_batch x this)
         let per_slot_bytes = (n_mamba * (state_elems + win_elems) * 4) as u64;
-        let charged_without_pool = VRAM_HEADROOM as u64
-            + scratch_est as u64
-            + tier_staging
-            + staging_bytes
-            + max_batch as u64 * per_slot_bytes
-            + (max_batch * bps * block_bytes) as u64;
-        let n_ckpt: u32 = if !px_on || per_ckpt == 0 {
-            0
-        } else if let Some(n) = paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| n > 0)
-        {
-            n
+        // a page's payload: its slot in every attention layer's K and V plane
+        // (the drafter's stripes ride the same ids but are not part of it)
+        let page_payload = (n_attn * 16 * kv_dim * 2 * kvb) as u64;
+        let pages_per_ckpt = if px_on && per_ckpt > 0 && page_payload > 0 {
+            per_ckpt.div_ceil(page_payload) as usize
         } else {
-            let want = (max_batch as u64 * 8).clamp(16, 256);
-            let leftover = grant.saturating_sub(charged_without_pool);
-            want.min(leftover / per_ckpt).max(16) as u32
+            0
         };
+        let (ckpt_blocks, ckpt_retention) =
+            crate::ckpt_pages::page_demand(max_batch, pages_per_ckpt, CKPTS_PER_SLOT);
         let demand = kv_plan::Demand {
             family: "nemotron",
             max_ctx: self.max_ctx,
@@ -619,7 +788,8 @@ impl GpuNemotron {
             // Cap the pool at what (slots × max_ctx) can actually ADDRESS plus
             // explicit radix retention (blocks the tree may hold after their
             // sequence ends - cheap here at 96 KiB/block-set, ~48 MB default).
-            retention_blocks: retain,
+            retention_blocks: retain + ckpt_retention,
+            ckpt_blocks,
             // every slot must at least hold a base tick's worth of prompt, or
             // admission deadlocks on its own first chunk. The BASE tick, not
             // the scratch cap: with the cap at 8192 rows on small dies the
@@ -634,7 +804,6 @@ impl GpuNemotron {
             reserves: vec![
                 kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
                 kv_plan::Reserve::new("prefill scratch", scratch_est as u64),
-                kv_plan::Reserve::new("prefix state pool", n_ckpt as u64 * per_ckpt),
                 kv_plan::Reserve::new("prefix state staging", staging_bytes),
                 kv_plan::Reserve::new("kv-tier staging", tier_staging),
             ],
@@ -657,7 +826,8 @@ impl GpuNemotron {
         let mut kv: Vec<Option<LayerKvPaged>> = Vec::with_capacity(hp.n_layer);
         let mut ssm: Vec<Option<SsmArena>> = Vec::with_capacity(hp.n_layer);
         let mut conv_win: Vec<Option<CudaSlice<f32>>> = Vec::with_capacity(hp.n_layer);
-        let mut kv_bytes = arena_bytes as u64;
+        let mut kv_bytes = arena_bytes as u64
+            + (pool_blocks * self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim))) as u64;
         for li in 0..hp.n_layer {
             match hp.blocks[li] {
                 NemotronBlock::Attention => {
@@ -685,6 +855,9 @@ impl GpuNemotron {
             }
         }
 
+        // the W16 class's attention: a decode tick's rows or a verify round's
+        let (w16_split, w16_ns) = w16_attn_splits(self.max_ctx);
+        let w16_rows = slots.clamp(super::spec::SPEC_ROWS_NEMO, W16_ROWS).min(cap);
         let d_sh_w = e.to_device(&vec![1.0f32; cap])?;
         let sc = NemoBatchScratch {
             d_tok: e.alloc_u32(cap)?,
@@ -735,6 +908,22 @@ impl GpuNemotron {
             d_fs_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 16)?,
             d_part: e.alloc(cap * kw_r.max(hp.n_active + 1) * embd)?,
             d_act: e.alloc(hp.n_active * hp.moe_ff + hp.shared_ff)?,
+            d_x16b: e.stream_alloc_bf16(W16_ROWS.min(cap) * embd.max(q_dim))?,
+            d_x16h: e.alloc_f16(W16_ROWS.min(cap) * embd.max(d_inner))?,
+            d_act16: e
+                .stream_alloc_bf16(W16_ROWS.min(cap) * (hp.n_active * hp.moe_ff + hp.shared_ff))?,
+            d_route_tickets: e.alloc_u32(GpuExecutor::moe_route_w16_tickets(W16_ROWS.min(cap)))?,
+            d_band_x: e.alloc(W16_ROWS.min(cap) * embd)?,
+            w16_split,
+            w16_ns,
+            w16_rows,
+            d_w16o: e.alloc(nh * w16_rows * w16_ns * hd)?,
+            d_w16ml: e.alloc(nh * w16_rows * w16_ns * 2)?,
+            d_w16_groups: e.to_device_u32(
+                &(0..w16_rows as u32)
+                    .flat_map(|i| [i, 1u32])
+                    .collect::<Vec<_>>(),
+            )?,
             d_part7: e.alloc((hp.n_active + 1) * embd)?,
             head_logits: e.alloc(slots * hp.vocab)?,
             d_par: e.alloc_u32(slots * 4)?,
@@ -743,8 +932,8 @@ impl GpuNemotron {
             d_pipe_par: e.alloc_u32(2 * slots * 4)?,
             d_pipe_tpar: e.alloc_u32(2 * slots * 4)?,
             d_pipe_out: e.alloc_u32(2 * slots)?,
-            attn_o: e.alloc(nh * slots * MAX_ATTN_SPLITS * hd)?,
-            attn_ml: e.alloc(nh * slots * MAX_ATTN_SPLITS * 2)?,
+            attn_o: e.alloc(nh * attn_partial_rows(nh, n_kv, hd, e.sm_count(), slots) * hd)?,
+            attn_ml: e.alloc(nh * attn_partial_rows(nh, n_kv, hd, e.sm_count(), slots) * 2)?,
             q8: if self.is_gguf() {
                 Some(BatchQ8 {
                     xq: e.alloc_i8(cap * qmax)?,
@@ -772,21 +961,52 @@ impl GpuNemotron {
             },
         };
 
-        // Stage D: the radix + mamba state-checkpoint pool. Each checkpoint
-        // is a full 23-layer state snapshot (~48 MB on this geometry), so
-        // The checkpoint pool at the count the plan charged (see the reserve
-        // above) - the reservation and the allocation cannot drift apart.
-        let (prefix, d_state_pool, d_ckpt_stage, n_ckpt) = if px_on && n_ckpt > 0 {
-            let mut pr = crate::paged_radix::PagedRadix::new();
-            pr.set_state_capacity(n_ckpt);
-            let pool_f32 = self.exec.alloc(n_ckpt as usize * state_ckpt_f32)?;
-            let stages = (0..n_stages)
-                .map(|_| self.exec.alloc(state_ckpt_f32))
-                .collect::<Result<Vec<_>, _>>()?;
-            (Some(pr), Some(pool_f32), stages, n_ckpt)
-        } else {
-            (None, None, Vec::new(), 0)
-        };
+        // Stage D: the radix + mamba state checkpoints. Each checkpoint is a
+        // full 23-layer state snapshot (~48 MB on this geometry), held in the
+        // attention pool's own pages (issue #33) - the plan above backed the
+        // live turns' pages beside full context.
+        let (prefix, ckpt_layout, d_ckpt_stage, d_ckpt_bounce, d_ckpt_desc) =
+            if px_on && pages_per_ckpt > 0 {
+                use cudarc::driver::DevicePtr;
+                let mut pr = crate::paged_radix::PagedRadix::new();
+                // the K and V plane of each attention layer, in layer order - the
+                // KV tier's plane order too, so a checkpoint's pages ship to RAM
+                // as they are
+                let slot = (16 * kv_dim * kvb) as u64;
+                let mut planes = Vec::with_capacity(2 * n_attn);
+                for l in kv.iter().flatten() {
+                    for plane in [&l.k, &l.v] {
+                        let (pp, _g) = plane.device_ptr(&self.exec.stream);
+                        planes.push((pp, slot));
+                    }
+                }
+                let layout = crate::ckpt_pages::PageLayout::new(planes);
+                debug_assert_eq!(layout.payload(), page_payload);
+                // index bookkeeping only: as many as the pool could ever hold
+                let max_ckpts = pool_blocks.checked_div(pages_per_ckpt).unwrap_or(0).max(1) as u32;
+                pr.set_state_paged(max_ckpts, pages_per_ckpt);
+                let stages = (0..n_stages)
+                    .map(|_| self.exec.alloc(state_ckpt_f32))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let desc = self
+                    .exec
+                    .alloc_u64(crate::ckpt_pages::desc_cap(per_ckpt, slot, 1))?;
+                tracing::info!(
+                    pages_per_checkpoint = pages_per_ckpt,
+                    guaranteed = ckpt_blocks / pages_per_ckpt,
+                    wanted = (ckpt_blocks + ckpt_retention) / pages_per_ckpt,
+                    "nemotron prefix cache active - checkpoints in pool pages"
+                );
+                (
+                    Some(pr),
+                    Some(layout),
+                    stages,
+                    Some(self.exec.alloc(state_ckpt_f32)?),
+                    Some(desc),
+                )
+            } else {
+                (None, None, Vec::new(), None, None)
+            };
 
         // KV tier (kv-offload): attention-layer pool planes; mamba state
         // checkpoint blobs ride as aux components. Loud decline on any
@@ -819,7 +1039,9 @@ impl GpuNemotron {
                         model_tensors: &content_id.0,
                         adapter: b"",
                         architecture: architecture.as_bytes(),
-                        cache_schema: b"pool-planes k/v interleaved + mamba-ckpt aux v1",
+                        // v2: checkpoint blobs are pool pages (issue #33) - a
+                        // v1 cache's flat blobs must never load into them
+                        cache_schema: b"pool-planes k/v interleaved + mamba-ckpt paged aux v2",
                         layout_abi: 1,
                         tokenizer: &content_id.1,
                     }),
@@ -867,7 +1089,9 @@ impl GpuNemotron {
             graphs: HashMap::new(),
             prefix,
             tier,
-            d_state_pool,
+            ckpt_layout,
+            d_ckpt_bounce,
+            d_ckpt_desc,
             state_ckpt_f32,
             d_ckpt_stage,
             verify: None,
@@ -881,7 +1105,7 @@ impl GpuNemotron {
         self.mtp_ensure_state()?;
         tracing::info!(
             "nemotron batch: {slots} slots, {n_attn}-attn-layer pool {pool_blocks} blocks \
-             ({:.2} GiB, {} tokens), mamba arenas {:.2} GiB, {n_ckpt} state ckpts, \
+             ({:.2} GiB, {} tokens), mamba arenas {:.2} GiB, checkpoints in pool pages, \
              {} rows/chunk; left {:.2} GiB of the {:.2} GiB granted",
             (pool_blocks * block_bytes) as f64 / (1u64 << 30) as f64,
             pool_blocks * 16,
@@ -939,19 +1163,20 @@ impl GpuNemotron {
                     Err(_) => {
                         let shed = match (bs.tier.as_mut(), bs.prefix.as_mut()) {
                             (Some(tier), Some(pr)) => {
+                                // the checkpoints are pool pages, which the
+                                // tier reads off the radix
                                 let exec = self.exec.clone();
-                                let state_bytes = (bs.state_ckpt_f32 * 4) as u64;
-                                let state = bs.d_state_pool.as_ref().map(|sp| {
-                                    use cudarc::driver::DevicePtr;
-                                    let (pp, _g) = sp.device_ptr(&exec.stream);
-                                    (pp, state_bytes)
-                                });
                                 let want = bs.pool.free_blocks() + 1;
-                                tier.make_room_blocking(pr, &mut bs.pool, want, state, &mut || {
+                                tier.make_room_blocking(pr, &mut bs.pool, want, None, &mut || {
                                     exec.record_event().ok()
                                 })
                             }
-                            (None, Some(pr)) => pr.evict_lru(&mut bs.pool).is_some(),
+                            // dead KV, then the stalest checkpoint's pages,
+                            // then LRU KV - promised context outranks cache
+                            (None, Some(pr)) => {
+                                let want = bs.pool.free_blocks() + 1;
+                                pr.make_room(&mut bs.pool, want, 0)
+                            }
                             _ => false,
                         };
                         if !shed {
@@ -979,13 +1204,24 @@ impl GpuNemotron {
     }
 
     /// Admission prologue: bounds-check, drop the slot's previous sequence
-    /// (blocks AND recurrent state), back the whole prompt's blocks up front
-    /// (a mid-prompt chunk must never find the pool dry with rows written),
-    /// and zero the slot's mamba arenas - the recurrent twin of "fresh
-    /// sequence: old pool blocks return first". Stale state here is not a
-    /// crash, it's silent cross-request contamination.
+    /// (blocks AND recurrent state) and zero the slot's mamba arenas - the
+    /// recurrent twin of "fresh sequence: old pool blocks return first".
+    /// Stale state here is not a crash, it's silent cross-request
+    /// contamination.
+    ///
+    /// It backs NO rows: `prefix_resume_rows` runs next, adopts whatever the
+    /// radix holds of the prompt, and only then backs the rows the prompt
+    /// still writes - all of them, up front, so a mid-prompt chunk never finds
+    /// the pool dry with rows written. Backing the whole prompt here first
+    /// made the allocation evict the very pages the match was about to adopt
+    /// whenever the conversation outgrew the free part of the pool: a 262K
+    /// single-slot serve (270K-token pool) holding a ~210K Claude Code
+    /// conversation re-prefilled all of it every turn, resuming at the 1856-
+    /// token system-prompt checkpoint (GB10, 2026-09-25).
     pub(super) fn admit_rows(&mut self, slot: usize, n_rows: usize) -> Result<(), GpuModelError> {
-        self.dflash_clear_slot(slot);
+        // the drafter span restarts with the pages; prefix_resume_rows
+        // re-derives it from whatever pages the radix hands back
+        self.dflash_reset_slot(slot);
         self.mtp_clear_slot(slot)?;
         let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
         if slot >= n_slots {
@@ -1015,7 +1251,7 @@ impl GpuNemotron {
                 exec.zero_region(w, slot * win_elems, win_elems)?;
             }
         }
-        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])
+        Ok(())
     }
 
     /// Free-on-completion: an idle slot's blocks return to the shared pool
@@ -1025,7 +1261,8 @@ impl GpuNemotron {
         for (s, &occ) in occupied.iter().enumerate() {
             if !occ {
                 self.reply_release(s);
-                self.dflash_clear_slot(s);
+                // the drafter's rows ride the pages: whatever of them the
+                // radix keeps is re-adopted with the pages (dflash_adopt_slot)
                 // release is not a data path - a clear-copy failure here
                 // can't corrupt anything the next admit won't re-clear
                 let _ = self.mtp_clear_slot(s);
@@ -1085,14 +1322,15 @@ impl GpuNemotron {
         }
         self.upload_rows(&toks, &positions, &slots_v)?;
         self.embed_rows(chunk.len())?;
-        let note: Vec<(usize, usize, usize)> = {
-            // per-slot covered spans for the drafter's coverage bookkeeping
-            let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-            for x in chunk.iter() {
+        let note: Vec<(usize, usize, usize, usize)> = {
+            // per-slot covered spans (slot, first pos, end pos, first chunk
+            // row) for the drafters' coverage bookkeeping
+            let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+            for (i, x) in chunk.iter().enumerate() {
                 let (s, p) = (x.0 as usize, x.1 as usize);
                 match spans.last_mut() {
-                    Some((ls, _, le)) if *ls == s && *le == p => *le += 1,
-                    _ => spans.push((s, p, p + 1)),
+                    Some((ls, _, le, _)) if *ls == s && *le == p => *le += 1,
+                    _ => spans.push((s, p, p + 1, i)),
                 }
             }
             spans
@@ -1100,8 +1338,8 @@ impl GpuNemotron {
         self.layer_walk(chunk.len(), Some(&PfCuts { runs, dec, breaks }), false)?;
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
             self.dflash_append_features(chunk.len())?;
-            for &(s, a, b) in &note {
-                self.dflash_note_rows(s, a, b);
+            for &(s, a, b, _) in &note {
+                self.dflash_note_rows(s, a, b - a);
             }
         }
         if self.mtp.as_ref().is_some_and(|m| m.state.is_some()) {
@@ -1111,13 +1349,13 @@ impl GpuNemotron {
             // spec.rs owns that call site)
             let mut mruns = Vec::with_capacity(note.len());
             let mut off = 0usize;
-            for &(s, a, b) in &note {
+            for &(s, a, b, _) in &note {
                 mruns.push((s, off, b - a));
                 off += b - a;
             }
             self.mtp_append_rows(&mruns)?;
             let mut off = 0usize;
-            for &(s, a, b) in &note {
+            for &(s, a, b, _) in &note {
                 self.mtp_advance(s, a, b, off + (b - a) - 1)?;
                 off += b - a;
             }
@@ -1176,1506 +1414,9 @@ impl GpuNemotron {
         Ok(())
     }
 
-    /// The whole-stack walk over r rows. `cuts`: Some = prefill mode (append
-    /// the whole chunk, attend + advance recurrent state per same-slot run);
-    /// None = decode mode (every row is one new token of its slot, the
-    /// stage-A batched step kernels advance the arenas by d_slots).
-    ///
-    /// Compute classes, keyed on MODE (granite's law - every prefill row
-    /// takes the same rungs at any r, so a warm-resume tail reproduces the
-    /// cold chunk's bytes): prefill rows ride the serial bulk-prefill lane's
-    /// W8A8 f8row GEMM / gemm_f32 / sorted-tile bs MoE, all arbiter-gated by
-    /// the bulk-prefill parity gate. A PURE r==1 decode tick rides the
-    /// serial decode twins (f8r GEMV, bf16 GEMV, fused mt MoE) so the c1
-    /// battery stays in the serial lane's numeric class; r>1 decode takes
-    /// the batched GEMM class - attention projections in the twins' bf16
-    /// class when the pack carries them (the serial GEMV twins' own class),
-    /// f32 otherwise; prefill rows always the exact-f32 planes.
-    /// `verify` (spec core): the mamba advance runs the spec
-    /// verify's non-committing discipline - conv on the slot's SCRATCH
-    /// window (the live window stays pre-round for the commit rebuild),
-    /// scan on the live state with per-row snapshots, and the xBC rows
-    /// snapshot so a partial accept can rebuild the window. Everything else
-    /// (KV, attention, MoE, residuals) is byte-identical to the plain walk -
-    /// KV needs no rollback (stale cells past the accept are overwritten
-    /// before any later read). Requires `bs.verify` populated.
-    pub(super) fn layer_walk(
-        &mut self,
-        r: usize,
-        cuts: Option<&PfCuts>,
-        verify: bool,
-    ) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let hp = self.hp.clone();
-        let (embd, eps) = (hp.hidden, hp.eps);
-        let kv_dim = hp.n_kv_heads * hp.head_dim;
-        let q_dim = hp.n_heads * hp.head_dim;
-        let (nh, n_kv, hd) = (hp.n_heads, hp.n_kv_heads, hp.head_dim);
-        let d_inner = hp.d_inner();
-        let conv_dim = hp.conv_dim();
-        let in_rows = hp.in_proj_rows();
-        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
-        let win_elems = (hp.d_conv - 1) * conv_dim;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let kv_dtype = self.kv_dtype;
-        let pf = cuts.is_some();
-        // pure single-row decode: the serial lane's kernel twins
-        let dec1 = r == 1 && !pf;
-        // KV splits for the batched decode attention (position-independent,
-        // so the per-r graph can bake it): nh×r blocks starve the die at
-        // small r - budget ~2-3 CTAs/SM like granite.
-        //
-        // Head-packed arm: at this exact shape (fp8
-        // KV, hd128, G=16, no window, r>=2) the pack elects the lagd WIDE
-        // partial whose grid is (n_kv, r, ns) - 16x fewer blocks than
-        // vec8's (nh, r, ns) - so the budget divides by n_kv and caps at 8
-        // (ctx/8 chunks keep the 32-token tiles full at serve contexts).
-        // The kill env is the same one the pack's election reads, so an
-        // off-arm A/B leg gets vec8's budget too.
-        // r >= 1 since GB10 2026-09-11 (the pack's gate widened with it): the
-        // head-packed arm wins at one row at every context, and the c1 cell
-        // at 7.5k tokens was lost on vec8's walk (GB10, 2026-09-11).
-        let hp16 = matches!(kv_dtype, KvDtype::Fp8E4m3)
-            && hd == 128
-            && n_kv > 0
-            && nh == n_kv * 16
-            && r >= 1
-            && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_HP16").is_none();
-        let ns = if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
-            1
-        } else if hp16 {
-            (3 * exec.sm_count()).div_ceil(n_kv * r).clamp(1, 8)
-        } else {
-            (2 * 3 * exec.sm_count())
-                .div_ceil(nh * r)
-                .clamp(1, MAX_ATTN_SPLITS)
-        };
-        // f16 always rides the wmma tile; fp8 rides its raw-e4m3 hd128 arm
-        // (pack group set {4,6,8,9,16} - nemotron is G=16). PADDOCK_NO_NPF8
-        // pins fp8 back onto the scalar paged walk (granite's A/B precedent).
-        let pf8_ok = match kv_dtype {
-            KvDtype::Fp16 => true,
-            KvDtype::Fp8E4m3 => {
-                n_kv > 0
-                    && nh == n_kv * 16
-                    && paddock_models::dev_var_os!("PADDOCK_NO_NPF8").is_none()
-            }
-        };
-        let wmma_pf = pf
-            && hd == 128
-            && pf8_ok
-            && exec.has_attn_prefill_f16_paged()
-            && paddock_models::dev_var_os!("PADDOCK_NO_WMMA_PREFILL").is_none();
-        let bs = self.batch.as_mut().expect("batch enabled");
-        let bps = bs.bps;
-        // running mamba-layer index: the checkpoint blob offset for a layer
-        // is mi * (state + win), matching the pool/restore layout
-        let mut mi = 0usize;
-
-        // Glue rung: every MoE layer's prologue is add(x += proj)
-        // + rmsnorm + quantize_nvf4, three latency-bound launches, and the
-        // checkpoint's pattern makes that 23 of them per decode tick. One
-        // fused row-per-CTA kernel does all three, so the previous layer's
-        // trailing add is hoisted into it. Only the bs arm consumes the nvf4
-        // planes, so dec1 (which takes the mt path) keeps the plain chain.
-        // Bit-exact - PADDOCK_NO_GLUE_FUSE restores the three launches for the
-        // A/B on one binary.
-        let glue_fuse = !dec1
-            && paddock_models::dev_var_os!("PADDOCK_NO_GLUE_FUSE").is_none()
-            && exec.has_add_rmsnorm_quant_nvf4();
-        let mut fused_pro = false;
-        for (li, layer) in self.layers.iter().enumerate() {
-            let pro_done = std::mem::take(&mut fused_pro);
-            let sc = &mut bs.sc;
-            // DFlash aux tap: d_x here is the post-block residual of layer
-            // li-1 - copy it into the drafter's aux band when li-1 is a
-            // target layer (the last target layer taps after the loop)
-            if li > 0
-                && let Some(df) = self.dflash.as_mut()
-                && let Some(st) = df.state.as_mut()
-                && let Some(ai) = df.target_layers.iter().position(|&t| t == li - 1)
-            {
-                exec.copy_region(&sc.d_x, 0, &mut st.aux[ai], 0, r * embd)?;
-            }
-            if !pro_done {
-                exec.rmsnorm_batch(&sc.d_x, &layer.norm.buf, &mut sc.d_xn, embd, eps, r)?;
-            }
-            match &layer.mixer {
-                Mixer::Mamba(w) => {
-                    match &w.in_proj {
-                        LinW::F8(p) => {
-                            if dec1 {
-                                exec.f8r_gemv(p, &sc.d_xn, &mut sc.d_zxbcdt, embd, in_rows)?;
-                            } else {
-                                exec.quantize_e4m3_row(
-                                    &sc.d_xn,
-                                    &mut sc.d_xq,
-                                    &mut sc.d_xrs,
-                                    embd,
-                                    r,
-                                )?;
-                                exec.f8row_gemm(
-                                    p,
-                                    &sc.d_xq,
-                                    &sc.d_xrs,
-                                    &mut sc.d_zxbcdt,
-                                    embd,
-                                    in_rows,
-                                    r,
-                                )?;
-                            }
-                        }
-                        // GGUF lane: repacked GEMV at r=1 (the serial decode
-                        // class), the int8 mmq ladder above it
-                        LinW::Qw(q) => {
-                            if dec1 {
-                                gemv_any(&exec, q, &sc.d_xn, &mut sc.d_zxbcdt)?;
-                            } else {
-                                let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                                prefill_quant(
-                                    &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_xn, embd, r,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    q,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_zxbcdt,
-                                    r,
-                                    pf,
-                                )?;
-                            }
-                        }
-                    }
-                    let win = bs.conv_win[li].as_mut().expect("conv arena");
-                    let ssm = bs.ssm[li].as_mut().expect("ssm arena");
-                    match cuts {
-                        None => {
-                            // every row advances its own slot's arena
-                            exec.mamba_conv_step_batch(
-                                win,
-                                &sc.d_zxbcdt,
-                                d_inner,
-                                in_rows,
-                                &sc.d_slots,
-                                &w.conv_w,
-                                &w.conv_b,
-                                &mut sc.d_conv,
-                                conv_dim,
-                                hp.d_conv,
-                                r,
-                            )?;
-                            ssm.scan_step_batch(
-                                &exec,
-                                &sc.d_conv,
-                                &sc.d_zxbcdt,
-                                d_inner + conv_dim,
-                                in_rows,
-                                &sc.d_slots,
-                                &w.a,
-                                &w.d,
-                                &w.dt_bias,
-                                &mut sc.d_y,
-                                r,
-                                hp.mamba_heads,
-                                hp.mamba_head_dim,
-                                hp.d_state,
-                                hp.n_groups,
-                            )?;
-                        }
-                        Some(c) => {
-                            if c.dec > 0 {
-                                exec.mamba_conv_step_batch(
-                                    win,
-                                    &sc.d_zxbcdt,
-                                    d_inner,
-                                    in_rows,
-                                    &sc.d_slots,
-                                    &w.conv_w,
-                                    &w.conv_b,
-                                    &mut sc.d_conv,
-                                    conv_dim,
-                                    hp.d_conv,
-                                    c.dec,
-                                )?;
-                                ssm.scan_step_batch(
-                                    &exec,
-                                    &sc.d_conv,
-                                    &sc.d_zxbcdt,
-                                    d_inner + conv_dim,
-                                    in_rows,
-                                    &sc.d_slots,
-                                    &w.a,
-                                    &w.d,
-                                    &w.dt_bias,
-                                    &mut sc.d_y,
-                                    c.dec,
-                                    hp.mamba_heads,
-                                    hp.mamba_head_dim,
-                                    hp.d_state,
-                                    hp.n_groups,
-                                )?;
-                            }
-                            if verify {
-                                // spec verify: conv on the slot's SCRATCH
-                                // window (live stays pre-round), scan on the
-                                // live state with per-row snapshots, xBC rows
-                                // snapshotted for the window rebuild
-                                let vp = bs.verify.as_mut().expect("verify planes");
-                                let vw = vp.vwin[li].as_mut().expect("vwin");
-                                let snap = vp.snap[li].as_mut().expect("snap");
-                                for &(off, len, slot) in &c.runs {
-                                    let s = slot as usize;
-                                    exec.copy_region(
-                                        win,
-                                        s * win_elems,
-                                        vw,
-                                        s * win_elems,
-                                        win_elems,
-                                    )?;
-                                    exec.mamba_conv_seq_at(
-                                        vw,
-                                        s * win_elems,
-                                        &sc.d_zxbcdt,
-                                        off * in_rows + d_inner,
-                                        in_rows,
-                                        &w.conv_w,
-                                        &w.conv_b,
-                                        &mut sc.d_conv,
-                                        off * conv_dim,
-                                        conv_dim,
-                                        hp.d_conv,
-                                        len,
-                                    )?;
-                                    ssm.scan_seq_snap_at(
-                                        &exec,
-                                        s * state_elems,
-                                        &sc.d_conv,
-                                        off * conv_dim,
-                                        &sc.d_zxbcdt,
-                                        off * in_rows + d_inner + conv_dim,
-                                        in_rows,
-                                        &w.a,
-                                        &w.d,
-                                        &w.dt_bias,
-                                        &mut sc.d_y,
-                                        off * d_inner,
-                                        snap,
-                                        off * state_elems,
-                                        len,
-                                        hp.mamba_heads,
-                                        hp.mamba_head_dim,
-                                        hp.d_state,
-                                        hp.n_groups,
-                                    )?;
-                                }
-                                exec.copy_rows_strided(
-                                    &sc.d_zxbcdt,
-                                    d_inner,
-                                    in_rows,
-                                    vp.xbc[li].as_mut().expect("xbc"),
-                                    0,
-                                    conv_dim,
-                                    r,
-                                )?;
-                                // falls through to the arm's shared tail
-                                // (gated norm + out_proj + residual)
-                            } else {
-                                // each chunk run advances its slot's arena
-                                // sequentially - the run walk is the whole reason
-                                // runs carry their slot. Checkpoint break rows
-                                // split the ADVANCE only (never the pass): the
-                                // state at the break is copied into the staging
-                                // blob before the tail of the run continues.
-                                for &(off, len, slot) in &c.runs {
-                                    let s = slot as usize;
-                                    let mut seg = off;
-                                    for &(brow, stg) in
-                                        c.breaks.iter().filter(|&&(b, _)| b > off && b <= off + len)
-                                    {
-                                        if brow > seg {
-                                            exec.mamba_conv_seq_at(
-                                                win,
-                                                s * win_elems,
-                                                &sc.d_zxbcdt,
-                                                seg * in_rows + d_inner,
-                                                in_rows,
-                                                &w.conv_w,
-                                                &w.conv_b,
-                                                &mut sc.d_conv,
-                                                seg * conv_dim,
-                                                conv_dim,
-                                                hp.d_conv,
-                                                brow - seg,
-                                            )?;
-                                            ssm.scan_seq_at(
-                                                &exec,
-                                                s * state_elems,
-                                                &sc.d_conv,
-                                                seg * conv_dim,
-                                                &sc.d_zxbcdt,
-                                                seg * in_rows + d_inner + conv_dim,
-                                                in_rows,
-                                                &w.a,
-                                                &w.d,
-                                                &w.dt_bias,
-                                                &mut sc.d_y,
-                                                seg * d_inner,
-                                                brow - seg,
-                                                hp.mamba_heads,
-                                                hp.mamba_head_dim,
-                                                hp.d_state,
-                                                hp.n_groups,
-                                            )?;
-                                            seg = brow;
-                                        }
-                                        let blob = mi * (state_elems + win_elems);
-                                        let stage_buf = &mut bs.d_ckpt_stage[stg];
-                                        ssm.save_to_blob(
-                                            &exec,
-                                            s * state_elems,
-                                            stage_buf,
-                                            blob,
-                                            state_elems,
-                                        )?;
-                                        exec.copy_region(
-                                            win,
-                                            s * win_elems,
-                                            stage_buf,
-                                            blob + state_elems,
-                                            win_elems,
-                                        )?;
-                                    }
-                                    if off + len > seg {
-                                        exec.mamba_conv_seq_at(
-                                            win,
-                                            s * win_elems,
-                                            &sc.d_zxbcdt,
-                                            seg * in_rows + d_inner,
-                                            in_rows,
-                                            &w.conv_w,
-                                            &w.conv_b,
-                                            &mut sc.d_conv,
-                                            seg * conv_dim,
-                                            conv_dim,
-                                            hp.d_conv,
-                                            off + len - seg,
-                                        )?;
-                                        ssm.scan_seq_at(
-                                            &exec,
-                                            s * state_elems,
-                                            &sc.d_conv,
-                                            seg * conv_dim,
-                                            &sc.d_zxbcdt,
-                                            seg * in_rows + d_inner + conv_dim,
-                                            in_rows,
-                                            &w.a,
-                                            &w.d,
-                                            &w.dt_bias,
-                                            &mut sc.d_y,
-                                            seg * d_inner,
-                                            off + len - seg,
-                                            hp.mamba_heads,
-                                            hp.mamba_head_dim,
-                                            hp.d_state,
-                                            hp.n_groups,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    exec.mamba_rmsnorm_gated_g(
-                        &sc.d_y,
-                        &sc.d_zxbcdt,
-                        0,
-                        in_rows,
-                        &w.norm_w,
-                        &mut sc.d_yn,
-                        r,
-                        d_inner,
-                        hp.n_groups,
-                        eps,
-                    )?;
-                    match &w.out_proj {
-                        LinW::F8(p) => {
-                            if dec1 {
-                                exec.f8r_gemv(p, &sc.d_yn, &mut sc.d_proj, d_inner, embd)?;
-                            } else {
-                                exec.quantize_e4m3_row(
-                                    &sc.d_yn,
-                                    &mut sc.d_xq,
-                                    &mut sc.d_xrs,
-                                    d_inner,
-                                    r,
-                                )?;
-                                exec.f8row_gemm(
-                                    p,
-                                    &sc.d_xq,
-                                    &sc.d_xrs,
-                                    &mut sc.d_proj,
-                                    d_inner,
-                                    embd,
-                                    r,
-                                )?;
-                            }
-                        }
-                        LinW::Qw(q) => {
-                            if dec1 {
-                                gemv_any(&exec, q, &sc.d_yn, &mut sc.d_proj)?;
-                            } else {
-                                let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                                prefill_quant(
-                                    &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_yn, d_inner, r,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    q,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_proj,
-                                    r,
-                                    pf,
-                                )?;
-                            }
-                        }
-                    }
-                    mi += 1;
-                }
-                Mixer::Attn(w) => {
-                    // NoPE - no rotary anywhere, projections go to the pool
-                    // as computed
-                    match w {
-                        AttnWeights::F32 {
-                            wq, wk, wv, bf16, ..
-                        } => {
-                            if dec1 {
-                                if let Some(b) = bf16 {
-                                    exec.bf16_gemv_rows(
-                                        &b.wqkv,
-                                        0,
-                                        b.q_dim,
-                                        &sc.d_xn,
-                                        &mut sc.d_q,
-                                    )?;
-                                    exec.bf16_gemv_rows(
-                                        &b.wqkv,
-                                        b.q_dim,
-                                        b.kv_dim,
-                                        &sc.d_xn,
-                                        &mut sc.d_k,
-                                    )?;
-                                    exec.bf16_gemv_rows(
-                                        &b.wqkv,
-                                        b.q_dim + b.kv_dim,
-                                        b.kv_dim,
-                                        &sc.d_xn,
-                                        &mut sc.d_v,
-                                    )?;
-                                } else {
-                                    exec.matvec_f32_batch(wq, &sc.d_xn, &mut sc.d_q, 1)?;
-                                    exec.matvec_f32_batch(wk, &sc.d_xn, &mut sc.d_k, 1)?;
-                                    exec.matvec_f32_batch(wv, &sc.d_xn, &mut sc.d_v, 1)?;
-                                }
-                            } else {
-                                match (pf, bf16) {
-                                    // batched decode/verify rows: the twins'
-                                    // bf16 class (half the plane bytes - the
-                                    // The c32 ledger had these f32 GEMMs at
-                                    // 8.6% of GPU time). One fused launch past
-                                    // the mr band - the thin k/v rows ride the
-                                    // q grid instead of starving on their own
-                                    // (thin-k/v rung). Prefill stays
-                                    // on the exact-f32 planes, the
-                                    // arbiter-gated class.
-                                    (false, Some(b)) => {
-                                        super::attn_qkv_batch(
-                                            &exec,
-                                            b,
-                                            &sc.d_xn,
-                                            &mut sc.d_q,
-                                            &mut sc.d_k,
-                                            &mut sc.d_v,
-                                            r,
-                                        )?;
-                                    }
-                                    _ => {
-                                        exec.gemm_f32(
-                                            &wq.buf,
-                                            embd,
-                                            q_dim,
-                                            &sc.d_xn,
-                                            &mut sc.d_q,
-                                            r,
-                                        )?;
-                                        exec.gemm_f32(
-                                            &wk.buf,
-                                            embd,
-                                            kv_dim,
-                                            &sc.d_xn,
-                                            &mut sc.d_k,
-                                            r,
-                                        )?;
-                                        exec.gemm_f32(
-                                            &wv.buf,
-                                            embd,
-                                            kv_dim,
-                                            &sc.d_xn,
-                                            &mut sc.d_v,
-                                            r,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                        AttnWeights::Qw { wq, wk, wv, .. } => {
-                            if dec1 {
-                                gemv_any(&exec, wq, &sc.d_xn, &mut sc.d_q)?;
-                                gemv_any(&exec, wk, &sc.d_xn, &mut sc.d_k)?;
-                                gemv_any(&exec, wv, &sc.d_xn, &mut sc.d_v)?;
-                            } else {
-                                let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                                prefill_quant(
-                                    &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_xn, embd, r,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    wq,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_q,
-                                    r,
-                                    pf,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    wk,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_k,
-                                    r,
-                                    pf,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    wv,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_v,
-                                    r,
-                                    pf,
-                                )?;
-                            }
-                        }
-                    }
-                    let kvs = bs.kv[li].as_mut().expect("paged kv");
-                    exec.kv_append_batch_paged(
-                        &sc.d_k,
-                        &mut kvs.k,
-                        &sc.d_pos,
-                        Some(&sc.d_slots),
-                        &bs.d_bt,
-                        bps,
-                        kv_dim,
-                        r,
-                        kv_dtype,
-                    )?;
-                    exec.kv_append_batch_paged(
-                        &sc.d_v,
-                        &mut kvs.v,
-                        &sc.d_pos,
-                        Some(&sc.d_slots),
-                        &bs.d_bt,
-                        bps,
-                        kv_dim,
-                        r,
-                        kv_dtype,
-                    )?;
-                    match cuts {
-                        None => {
-                            if ns > 1 && exec.has_attn_partial_batch_paged() {
-                                exec.attn_partial_batch_paged(
-                                    &sc.d_q,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &mut sc.attn_o,
-                                    &mut sc.attn_ml,
-                                    &sc.d_pos,
-                                    Some(&sc.d_slots),
-                                    &bs.d_bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    0,
-                                    ns,
-                                    r,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                                exec.attn_combine_batch(
-                                    &sc.attn_o,
-                                    &sc.attn_ml,
-                                    &sc.d_sinks,
-                                    &mut sc.d_attn,
-                                    nh,
-                                    hd,
-                                    ns,
-                                    r,
-                                )?;
-                            } else {
-                                exec.attn_decode_batch_paged(
-                                    &sc.d_q,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.d_sinks,
-                                    &mut sc.d_attn,
-                                    &sc.d_pos,
-                                    Some(&sc.d_slots),
-                                    &bs.d_bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    0,
-                                    r,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            }
-                        }
-                        Some(c) => {
-                            if c.dec > 0 {
-                                exec.attn_decode_batch_rows_paged(
-                                    &sc.d_q,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.d_sinks,
-                                    &mut sc.d_attn,
-                                    &sc.d_pos,
-                                    Some(&sc.d_slots),
-                                    &bs.d_bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    0,
-                                    0,
-                                    c.dec,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            }
-                            for &(off, len, _slot) in &c.runs {
-                                if wmma_pf {
-                                    exec.attn_prefill_f16_paged_at(
-                                        &sc.d_q,
-                                        &kvs.k,
-                                        &kvs.v,
-                                        &sc.d_sinks,
-                                        &mut sc.d_attn,
-                                        &sc.d_pos,
-                                        &sc.d_slots,
-                                        off,
-                                        &bs.d_bt,
-                                        bps,
-                                        nh,
-                                        n_kv,
-                                        hd,
-                                        kv_dim,
-                                        0,
-                                        len,
-                                        scale,
-                                        kv_dtype,
-                                    )?;
-                                } else if len > 24 && exec.has_attn_prefill_paged() {
-                                    exec.attn_prefill_rows_paged(
-                                        &sc.d_q,
-                                        &kvs.k,
-                                        &kvs.v,
-                                        &sc.d_sinks,
-                                        &mut sc.d_attn,
-                                        &sc.d_pos,
-                                        &sc.d_slots,
-                                        &bs.d_bt,
-                                        bps,
-                                        nh,
-                                        n_kv,
-                                        hd,
-                                        kv_dim,
-                                        0,
-                                        off,
-                                        len,
-                                        scale,
-                                        kv_dtype,
-                                    )?;
-                                } else {
-                                    exec.attn_decode_batch_rows_paged(
-                                        &sc.d_q,
-                                        &kvs.k,
-                                        &kvs.v,
-                                        &sc.d_sinks,
-                                        &mut sc.d_attn,
-                                        &sc.d_pos,
-                                        Some(&sc.d_slots),
-                                        &bs.d_bt,
-                                        bps,
-                                        nh,
-                                        n_kv,
-                                        hd,
-                                        kv_dim,
-                                        0,
-                                        off,
-                                        len,
-                                        scale,
-                                        kv_dtype,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    match w {
-                        AttnWeights::F32 { wo, bf16, .. } => {
-                            if dec1 {
-                                if let Some(b) = bf16 {
-                                    exec.bf16_gemv(&b.wo, None, &sc.d_attn, &mut sc.d_proj)?;
-                                } else {
-                                    exec.matvec_f32_batch(wo, &sc.d_attn, &mut sc.d_proj, 1)?;
-                                }
-                            } else {
-                                match (pf, bf16) {
-                                    // batched decode: bf16 twin class (see
-                                    // the QKV arm above)
-                                    (false, Some(b)) => {
-                                        exec.bf16_gemm(&b.wo, None, &sc.d_attn, &mut sc.d_proj, r)?;
-                                    }
-                                    _ => {
-                                        exec.gemm_f32(
-                                            &wo.buf,
-                                            q_dim,
-                                            embd,
-                                            &sc.d_attn,
-                                            &mut sc.d_proj,
-                                            r,
-                                        )?;
-                                    }
-                                }
-                            }
-                        }
-                        AttnWeights::Qw { wo, .. } => {
-                            if dec1 {
-                                gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
-                            } else {
-                                let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                                prefill_quant(
-                                    &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_attn, q_dim, r,
-                                )?;
-                                dense_mm_pre(
-                                    &exec,
-                                    wo,
-                                    &s8.xq,
-                                    &s8.xs,
-                                    &s8.yq,
-                                    &mut s8.xsums,
-                                    &mut s8.ssums,
-                                    &mut s8.skfix,
-                                    &mut sc.d_part,
-                                    &mut sc.d_proj,
-                                    r,
-                                    pf,
-                                )?;
-                            }
-                        }
-                    }
-                }
-                Mixer::Moe(w) => {
-                    exec.matvec_f32_batch(&w.router, &sc.d_xn, &mut sc.d_logits_r, r)?;
-                    // shared fold-: the loader registers the
-                    // shared expert as ns_sh pseudo-experts appended to the
-                    // NVFP4 routed planes; the r>1 path then widens the topk
-                    // rows by ns_sh constant picks and serves everything in
-                    // one sorted-tile pair (the separate 1-block shared pass
-                    // ran at 10-12% of the stream roof). dec1 and the Q8
-                    // lane keep the plain k-wide rows.
-                    let (ns_sh, moe_tiled) = match &w.planes {
-                        MoePlanes::Nvf4 { up, .. } => (
-                            up.n_expert - hp.n_expert,
-                            up.layout == crate::gpu::Nvf4MoeLayout::Tiled64,
-                        ),
-                        _ => (0, false),
-                    };
-                    // skinny-tile decode election: tiled
-                    // planes + a pure-decode tick route the ROUTED experts
-                    // through the BM=8 pair (fill is ~2.4 at c32; 32-wide
-                    // blocks are ~7.5% live) and the shared expert through
-                    // the WIDE tiled pair on its resident planes - a BM=8
-                    // fold-in would split the always-full shared pseudo-
-                    // experts into ceil(r/8) blocks and re-read their strips.
-                    // The tiny shared grid rides the routed grid's PDL tail
-                    // (the rung-17 law working for us, not against).
-                    let skinny = moe_tiled && !pf && !dec1;
-                    // BM=8 fold of the shared expert (lever 14, GB10 c8):
-                    // at r <= 8 every pseudo-expert is one block, so the
-                    // strip re-read the comment above fears does not
-                    // happen, and the separate wide pair - 28.6 + 26.1 us
-                    // per layer PDL-accounted, 2.5x its 7.5 MB byte floor,
-                    // 1.26 ms of a 25.4 ms c8 tick - becomes two more
-                    // blocks of a launch that streams at ~93% of the roof.
-                    // PADDOCK_NO_NEMO_SH_FOLD8=1 keeps the separate pair.
-                    let fold8 = skinny && ns_sh > 0 && r <= 8 && sh_fold8_on();
-                    if ns_sh > 0 && !dec1 && (!skinny || fold8) {
-                        exec.moe_topk_sigmoid_batch_sh(
-                            &sc.d_logits_r,
-                            &w.bias.buf,
-                            hp.routed_scale,
-                            hp.n_expert,
-                            hp.n_active,
-                            ns_sh,
-                            hp.n_expert,
-                            &mut sc.d_idx,
-                            &mut sc.d_w,
-                            r,
-                        )?;
-                    } else {
-                        exec.moe_topk_sigmoid_batch(
-                            &sc.d_logits_r,
-                            &w.bias.buf,
-                            hp.routed_scale,
-                            hp.n_expert,
-                            hp.n_active,
-                            &mut sc.d_idx,
-                            &mut sc.d_w,
-                            r,
-                        )?;
-                    }
-                    //  diagnostic (PADDOCK_MOE_UNIQ=path), the task
-                    // The MoE rung's attribution instrument: the real
-                    // uniq-routed-experts-per-(tick,layer) histogram -
-                    // pairs walks the full idx rows (k routed picks + the
-                    // ns_sh shared folds in the _sh lane; the kernel's
-                    // 128-bit bitmap skips ids >= 128, so uniq = ROUTED
-                    // uniq and the shared folds only ride the pairs
-                    // totals). Sits before the arm branches so every route
-                    // is measured; launch-only, so captured decode graphs
-                    // bake it in and it keeps counting on replays.
-                    if sc.moe_uniq_dev != 0 {
-                        let kw = if ns_sh > 0 && !dec1 && (!skinny || fold8) {
-                            hp.n_active + ns_sh
-                        } else {
-                            hp.n_active
-                        };
-                        exec.moe_uniq_hist(&sc.d_idx, r * kw, hp.n_expert, sc.moe_uniq_dev)?;
-                    }
-                    let MoePlanes::Nvf4 {
-                        up,
-                        down,
-                        sh_up,
-                        sh_down,
-                    } = &w.planes
-                    else {
-                        // GGUF lane: same class split as the serial spine -
-                        // r=1 decode on the token-batched dp4a relu2 pair
-                        // (write + one add; falls through to the residual
-                        // add), r>1 on the sorted tiles folding straight
-                        // into the residual
-                        let MoePlanes::Q8 {
-                            up,
-                            down,
-                            sh_up,
-                            sh_down,
-                        } = &w.planes
-                        else {
-                            unreachable!("nemotron MoePlanes is Nvf4 or Q8");
-                        };
-                        let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                        if dec1 {
-                            exec.quantize_q8(&sc.d_xn, &mut s8.xq, &mut s8.xs, embd)?;
-                            exec.q8_0_moe_up_relu2(
-                                up,
-                                &sc.d_idx,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.act_r,
-                                hp.n_active,
-                                1,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.act_r,
-                                &mut s8.fq_r1,
-                                &mut s8.fs_r1,
-                                hp.n_active * hp.moe_ff,
-                            )?;
-                            exec.q8_0_moe_down(
-                                down,
-                                &sc.d_idx,
-                                &sc.d_w,
-                                &s8.fq_r1,
-                                &s8.fs_r1,
-                                &mut sc.d_proj,
-                                hp.n_active,
-                                1,
-                            )?;
-                            exec.q8_0_moe_up_relu2(
-                                sh_up,
-                                &sc.d_sh_idx,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.act_s,
-                                1,
-                                1,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.act_s,
-                                &mut s8.fq_s1,
-                                &mut s8.fs_s1,
-                                hp.shared_ff,
-                            )?;
-                            exec.q8_0_moe_down(
-                                sh_down,
-                                &sc.d_sh_idx,
-                                &sc.d_sh_w,
-                                &s8.fq_s1,
-                                &s8.fs_s1,
-                                &mut s8.shproj,
-                                1,
-                                1,
-                            )?;
-                            exec.add(&mut sc.d_proj, &s8.shproj, embd)?;
-                        } else if !pf && r <= MOE_DEC2_MAX_ROWS && moe_dec2_ok(&exec) {
-                            // DECODE BAND. Two separate
-                            // shape mistakes shared one arm before this:
-                            //
-                            //  - the ROUTED experts rode the sorted BM=32
-                            //    tile, which at r=4/top-6 over 128 experts
-                            //    puts one real row in a 32-row block. It is
-                            //    not just wasted flops: the tile measured
-                            //    FLAT at ~144 GB/s where the same bytes on
-                            //    the dec2 pair (warp per output row, no pad,
-                            //    no align, no combine) stream at ~660.
-                            //  - the shared expert is not an expert at all.
-                            //    Every row uses it, so it is a plain dense
-                            //    FFN, and it belongs on the same q8 ladder
-                            //    the dense projections took at the time: one
-                            //    weight pass for the whole tick instead of
-                            //    the 1-block align+tile pair, which was
-                            //    another flat ~117 GB/s. The only thing that
-                            //    was missing is the activation - hence
-                            //    quantize_q8_relu2, which folds relu(x)^2
-                            //    into the quantize between up and down and
-                            //    is bit-identical to doing it in f32.
-                            //
-                            // The epilogue quantize shrinks with the routed
-                            // plane too: nb*32*moe_ff -> r*n_active*moe_ff,
-                            // 24x fewer elements at r=4 (it was 16% of the
-                            // tick in the profile).
-                            exec.quantize_q8(&sc.d_xn, &mut s8.xq, &mut s8.xs, r * embd)?;
-                            exec.q8_0_moe_up_relu2_dec2(
-                                up,
-                                &sc.d_idx,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.fu_r,
-                                hp.n_active,
-                                r,
-                                0,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.fu_r,
-                                &mut s8.fq_r,
-                                &mut s8.fs_r,
-                                r * hp.n_active * hp.moe_ff,
-                            )?;
-                            exec.q8_0_moe_dn_dec2(
-                                down,
-                                &sc.d_idx,
-                                &sc.d_w,
-                                &s8.fq_r,
-                                &s8.fs_r,
-                                &mut sc.d_proj,
-                                hp.n_active,
-                                r,
-                            )?;
-                            mmq_pre(
-                                &exec,
-                                sh_up,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut sc.d_part,
-                                &mut s8.fu_s,
-                                r,
-                            )?;
-                            exec.quantize_q8_relu2(
-                                &s8.fu_s,
-                                &mut s8.fq_s,
-                                &mut s8.fs_s,
-                                r * hp.shared_ff,
-                            )?;
-                            mmq_pre(
-                                &exec,
-                                sh_down,
-                                &s8.fq_s,
-                                &s8.fs_s,
-                                &mut sc.d_part,
-                                &mut s8.shproj,
-                                r,
-                            )?;
-                            exec.add(&mut sc.d_proj, &s8.shproj, r * embd)?;
-                        } else {
-                            exec.quantize_q8(&sc.d_xn, &mut s8.xq, &mut s8.xs, r * embd)?;
-                            let nbr = moe_live_blocks(r, hp.n_active, hp.n_expert, sc.nb_r);
-                            exec.moe_align(
-                                &sc.d_idx,
-                                &mut sc.d_srow,
-                                &mut sc.d_sslot,
-                                &mut sc.d_bexp,
-                                r,
-                                hp.n_active,
-                                hp.n_expert,
-                                nbr,
-                            )?;
-                            exec.q8_0_moe_up_relu2_sorted(
-                                up,
-                                &sc.d_srow,
-                                &sc.d_bexp,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.fu_r,
-                                nbr,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.fu_r,
-                                &mut s8.fq_r,
-                                &mut s8.fs_r,
-                                nbr * 32 * hp.moe_ff,
-                            )?;
-                            exec.q8_0_moe_down_sorted(
-                                down,
-                                &sc.d_srow,
-                                &sc.d_sslot,
-                                &sc.d_bexp,
-                                &sc.d_w,
-                                &s8.fq_r,
-                                &s8.fs_r,
-                                &mut sc.d_part,
-                                hp.n_active,
-                                nbr,
-                            )?;
-                            exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, hp.n_active, r)?;
-                            let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
-                            exec.moe_align(
-                                &sc.d_sh_idx,
-                                &mut sc.d_srow_s,
-                                &mut sc.d_sslot_s,
-                                &mut sc.d_bexp_s,
-                                r,
-                                1,
-                                1,
-                                nbs,
-                            )?;
-                            exec.q8_0_moe_up_relu2_sorted(
-                                sh_up,
-                                &sc.d_srow_s,
-                                &sc.d_bexp_s,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.fu_s,
-                                nbs,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.fu_s,
-                                &mut s8.fq_s,
-                                &mut s8.fs_s,
-                                nbs * 32 * hp.shared_ff,
-                            )?;
-                            exec.q8_0_moe_down_sorted(
-                                sh_down,
-                                &sc.d_srow_s,
-                                &sc.d_sslot_s,
-                                &sc.d_bexp_s,
-                                &sc.d_sh_w,
-                                &s8.fq_s,
-                                &s8.fs_s,
-                                &mut sc.d_proj,
-                                1,
-                                nbs,
-                            )?;
-                            exec.moe_slot_combine(&sc.d_proj, &mut sc.d_x, embd, 1, r)?;
-                            continue;
-                        }
-                        // residual add for the two arms that leave their
-                        // whole MoE output in d_proj (dec1 and the decode
-                        // band); the sorted arm folds through slot_combine
-                        // and skips this with its own continue
-                        exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?;
-                        continue;
-                    };
-                    if dec1 {
-                        // the serial decode's fused wave-dense pair + the
-                        // fixed ascending-slot fold into the residual
-                        // (tiled planes ride the regrouped _mtt twins)
-                        if moe_tiled {
-                            exec.nvf4_moe_up_relu2_mtt(
-                                up,
-                                sh_up,
-                                &sc.d_idx,
-                                &sc.d_xn,
-                                &mut sc.d_act,
-                                hp.n_active,
-                            )?;
-                            exec.nvf4_moe_down_part_tt(
-                                down,
-                                sh_down,
-                                &sc.d_idx,
-                                &sc.d_w,
-                                &sc.d_act,
-                                &mut sc.d_part7,
-                                hp.n_active,
-                            )?;
-                        } else {
-                            exec.nvf4_moe_up_relu2_mt(
-                                up,
-                                sh_up,
-                                &sc.d_idx,
-                                &sc.d_xn,
-                                &mut sc.d_act,
-                                hp.n_active,
-                            )?;
-                            exec.nvf4_moe_down_part(
-                                down,
-                                sh_down,
-                                &sc.d_idx,
-                                &sc.d_w,
-                                &sc.d_act,
-                                &mut sc.d_part7,
-                                hp.n_active,
-                            )?;
-                        }
-                        exec.moe_slot_combine(&sc.d_part7, &mut sc.d_x, embd, hp.n_active + 1, 1)?;
-                        continue;
-                    }
-                    // sorted-tile mxf4nvf4 MMA class (the serial bulk
-                    // prefill's rung-2 lane at r rows; BM=32 pad waste at
-                    // small r is the accepted first cut). With the shared
-                    // fold-in (ns_sh > 0) the shared expert's pseudo-expert
-                    // blocks ride the same align + pair launch - its picks
-                    // occupy slots n_active.., and the fixed-order combine
-                    // sums the down K halves (the sanctioned split-K
-                    // regroup, same class as the slot fold itself).
-                    if skinny {
-                        // routed experts: plain topk rows, BM=8 blocks; with
-                        // the fold the shared pseudo-experts ride along as
-                        // picks n_active.. (one block each at r <= 8)
-                        let ns_f = if fold8 { ns_sh } else { 0 };
-                        let kw = hp.n_active + ns_f;
-                        let np = if fold8 { kw } else { hp.n_active + 1 };
-                        if !pro_done {
-                            exec.quantize_nvf4(&sc.d_xn, &mut sc.d_xq4, &mut sc.d_xs4, r * embd)?;
-                        }
-                        let nbr = moe_live_blocks_bm8(r, kw, hp.n_expert + ns_f, sc.nb_r);
-                        exec.moe_align_bm(
-                            &sc.d_idx,
-                            &mut sc.d_srow,
-                            &mut sc.d_sslot,
-                            &mut sc.d_bexp,
-                            r,
-                            kw,
-                            hp.n_expert + ns_f,
-                            8,
-                            nbr,
-                        )?;
-                        exec.nvf4_moe_up_relu2_st(
-                            up,
-                            &sc.d_srow,
-                            &sc.d_bexp,
-                            &sc.d_xq4,
-                            &sc.d_xs4,
-                            &mut sc.d_fq,
-                            &mut sc.d_fs,
-                            nbr,
-                            8,
-                        )?;
-                        exec.nvf4_moe_down_st(
-                            down,
-                            &sc.d_srow,
-                            &sc.d_sslot,
-                            &sc.d_bexp,
-                            Some(&sc.d_w),
-                            &sc.d_fq,
-                            &sc.d_fs,
-                            &mut sc.d_part,
-                            kw,
-                            np,
-                            0,
-                            nbr,
-                            8,
-                        )?;
-                        if !fold8 {
-                            // shared expert: resident sh planes, WIDE tiled
-                            // pair (full 32-blocks; the 1-block grid
-                            // overlaps the routed grid's drain under PDL)
-                            let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
-                            exec.moe_align(
-                                &sc.d_sh_idx,
-                                &mut sc.d_srow_s,
-                                &mut sc.d_sslot_s,
-                                &mut sc.d_bexp_s,
-                                r,
-                                1,
-                                1,
-                                nbs,
-                            )?;
-                            exec.nvf4_moe_up_relu2_st(
-                                sh_up,
-                                &sc.d_srow_s,
-                                &sc.d_bexp_s,
-                                &sc.d_xq4,
-                                &sc.d_xs4,
-                                &mut sc.d_fq_s,
-                                &mut sc.d_fs_s,
-                                nbs,
-                                32,
-                            )?;
-                            exec.nvf4_moe_down_st(
-                                sh_down,
-                                &sc.d_srow_s,
-                                &sc.d_sslot_s,
-                                &sc.d_bexp_s,
-                                None,
-                                &sc.d_fq_s,
-                                &sc.d_fs_s,
-                                &mut sc.d_part,
-                                1,
-                                np,
-                                hp.n_active,
-                                nbs,
-                                32,
-                            )?;
-                        }
-                        exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, np, r)?;
-                        continue;
-                    }
-                    let kw = hp.n_active + ns_sh;
-                    let np = if ns_sh > 0 { kw } else { hp.n_active + 1 };
-                    if !pro_done {
-                        exec.quantize_nvf4(&sc.d_xn, &mut sc.d_xq4, &mut sc.d_xs4, r * embd)?;
-                    }
-                    // same live-block extent as the Q8 arm - this one has no
-                    // capacity-sized epilogue quantize (up_bs writes fq/fs per
-                    // block), so all it drops is pad CTAs. UNMEASURED on
-                    // sm_120: nvf4 needs a Blackwell die.
-                    let nbr = moe_live_blocks(r, kw, hp.n_expert + ns_sh, sc.nb_r);
-                    exec.moe_align(
-                        &sc.d_idx,
-                        &mut sc.d_srow,
-                        &mut sc.d_sslot,
-                        &mut sc.d_bexp,
-                        r,
-                        kw,
-                        hp.n_expert + ns_sh,
-                        nbr,
-                    )?;
-                    if moe_tiled {
-                        exec.nvf4_moe_up_relu2_st(
-                            up,
-                            &sc.d_srow,
-                            &sc.d_bexp,
-                            &sc.d_xq4,
-                            &sc.d_xs4,
-                            &mut sc.d_fq,
-                            &mut sc.d_fs,
-                            nbr,
-                            32,
-                        )?;
-                        exec.nvf4_moe_down_st(
-                            down,
-                            &sc.d_srow,
-                            &sc.d_sslot,
-                            &sc.d_bexp,
-                            Some(&sc.d_w),
-                            &sc.d_fq,
-                            &sc.d_fs,
-                            &mut sc.d_part,
-                            kw,
-                            np,
-                            0,
-                            nbr,
-                            32,
-                        )?;
-                    } else {
-                        exec.nvf4_moe_up_relu2_bs(
-                            up,
-                            &sc.d_srow,
-                            &sc.d_bexp,
-                            &sc.d_xq4,
-                            &sc.d_xs4,
-                            &mut sc.d_fq,
-                            &mut sc.d_fs,
-                            nbr,
-                        )?;
-                        exec.nvf4_moe_down_bs(
-                            down,
-                            &sc.d_srow,
-                            &sc.d_sslot,
-                            &sc.d_bexp,
-                            Some(&sc.d_w),
-                            &sc.d_fq,
-                            &sc.d_fs,
-                            &mut sc.d_part,
-                            kw,
-                            np,
-                            0,
-                            nbr,
-                        )?;
-                    }
-                    if ns_sh == 0 {
-                        // No fold-in (shared_ff not a clean multiple of
-                        // moe_ff): the separate 1-block shared pass. Its grid
-                        // is (1, rt) - 29 and 21 CTAs on a 188-SM die at ~20%
-                        // of peak DRAM - which looks like an obvious
-                        // underfill rung and is not one: a delete-the-work
-                        // probe measured its WALL cost at ~zero. It rides
-                        // entirely in the routed pair's PDL shadow. Do not
-                        // build a K-split for it without new evidence.
-                        let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
-                        exec.moe_align(
-                            &sc.d_sh_idx,
-                            &mut sc.d_srow_s,
-                            &mut sc.d_sslot_s,
-                            &mut sc.d_bexp_s,
-                            r,
-                            1,
-                            1,
-                            nbs,
-                        )?;
-                        if moe_tiled {
-                            exec.nvf4_moe_up_relu2_st(
-                                sh_up,
-                                &sc.d_srow_s,
-                                &sc.d_bexp_s,
-                                &sc.d_xq4,
-                                &sc.d_xs4,
-                                &mut sc.d_fq_s,
-                                &mut sc.d_fs_s,
-                                nbs,
-                                32,
-                            )?;
-                            exec.nvf4_moe_down_st(
-                                sh_down,
-                                &sc.d_srow_s,
-                                &sc.d_sslot_s,
-                                &sc.d_bexp_s,
-                                None,
-                                &sc.d_fq_s,
-                                &sc.d_fs_s,
-                                &mut sc.d_part,
-                                1,
-                                np,
-                                hp.n_active,
-                                nbs,
-                                32,
-                            )?;
-                        } else {
-                            exec.nvf4_moe_up_relu2_bs(
-                                sh_up,
-                                &sc.d_srow_s,
-                                &sc.d_bexp_s,
-                                &sc.d_xq4,
-                                &sc.d_xs4,
-                                &mut sc.d_fq_s,
-                                &mut sc.d_fs_s,
-                                nbs,
-                            )?;
-                            exec.nvf4_moe_down_bs(
-                                sh_down,
-                                &sc.d_srow_s,
-                                &sc.d_sslot_s,
-                                &sc.d_bexp_s,
-                                None,
-                                &sc.d_fq_s,
-                                &sc.d_fs_s,
-                                &mut sc.d_part,
-                                1,
-                                np,
-                                hp.n_active,
-                                nbs,
-                            )?;
-                        }
-                    }
-                    exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, np, r)?;
-                    continue;
-                }
-            }
-            // Hoist this add into the next layer's prologue when that layer is
-            // an nvf4 MoE on the bs arm - the shape the fused kernel serves,
-            // and the one every non-MoE layer in this checkpoint precedes.
-            let next_bs_moe = glue_fuse
-                && matches!(
-                    self.layers.get(li + 1).map(|l| &l.mixer),
-                    Some(Mixer::Moe(w)) if matches!(w.planes, MoePlanes::Nvf4 { .. })
-                );
-            if next_bs_moe {
-                let next_w = &self.layers[li + 1].norm.buf;
-                exec.add_rmsnorm_quant_nvf4_batch(
-                    &mut bs.sc.d_x,
-                    Some(&bs.sc.d_proj),
-                    next_w,
-                    &mut bs.sc.d_xn,
-                    &mut bs.sc.d_xq4,
-                    &mut bs.sc.d_xs4,
-                    embd,
-                    eps,
-                    r,
-                )?;
-                fused_pro = true;
-            } else {
-                exec.add(&mut bs.sc.d_x, &bs.sc.d_proj, r * embd)?;
-            }
-        }
-        // last aux tap: the final layer's post-block residual
-        if let Some(df) = self.dflash.as_mut()
-            && let Some(st) = df.state.as_mut()
-            && let Some(ai) = df
-                .target_layers
-                .iter()
-                .position(|&t| t == self.hp.n_layer - 1)
-        {
-            let sc = &bs.sc;
-            exec.copy_region(&sc.d_x, 0, &mut st.aux[ai], 0, r * embd)?;
-        }
-        Ok(())
-    }
-
     /// Final norm + lm_head over rows 0..rows, leaving [rows, vocab] in
     /// head_logits (row-batched GEMV - bit-exact per row vs the serial head).
-    fn head_rows(&mut self, rows: usize) -> Result<(), GpuModelError> {
+    pub(super) fn head_rows(&mut self, rows: usize) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let (embd, eps) = (self.hp.hidden, self.hp.eps);
         let final_norm = self.final_norm.buf.clone();
@@ -2683,9 +1424,14 @@ impl GpuNemotron {
         let sc = &mut bs.sc;
         exec.rmsnorm_batch(&sc.d_x, &final_norm, &mut sc.d_xn, embd, eps, rows)?;
         match &self.lm_head {
-            HeadW::Nvf4(h) => {
-                super::head_nvf4_batch(&exec, h, &sc.d_xn, &mut sc.head_logits, rows)?
-            }
+            HeadW::Nvf4(h) => super::head_nvf4_batch(
+                &exec,
+                h,
+                &sc.d_xn,
+                &mut sc.head_logits,
+                rows,
+                w16_class(&exec, rows),
+            )?,
             // GGUF lane: the mmq ladder at batch=rows (strided mma at the
             // decode widths) - row-batched, same class as the serial head
             HeadW::Qw(q) => {
@@ -2712,7 +1458,7 @@ impl GpuNemotron {
 
     /// Stage residual row `row` at row 0 so a single-row head pass reads it.
     /// Bounced through `d_proj` because src and dst share a buffer.
-    fn head_row_at(&mut self, row: usize) -> Result<(), GpuModelError> {
+    pub(super) fn head_row_at(&mut self, row: usize) -> Result<(), GpuModelError> {
         let embd = self.hp.hidden;
         if row > 0 {
             let exec = self.exec.clone();
@@ -2772,7 +1518,7 @@ impl GpuNemotron {
     /// (d_tok/d_pos/d_slots + the block tables); the mamba step kernels read
     /// their slot indirection from d_slots, so one capture serves any slot
     /// composition at this r.
-    fn step_body(&mut self, r: usize) -> Result<(), GpuModelError> {
+    pub(super) fn step_body(&mut self, r: usize) -> Result<(), GpuModelError> {
         self.embed_rows(r)?;
         self.layer_walk(r, None, false)?;
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
@@ -2787,7 +1533,7 @@ impl GpuNemotron {
 
     /// Record `body`'s launches into a CUDA graph (recording only). An alloc
     /// during capture is a hard driver error - every plane exists at enable.
-    fn capture_body(
+    pub(super) fn capture_body(
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<(), GpuModelError>,
         what: &str,
@@ -2809,7 +1555,11 @@ impl GpuNemotron {
     }
 
     /// Replay the fixed-r decode tick, capturing it first if unseen.
-    fn step_replay(&mut self, r: usize) -> Result<(), GpuModelError> {
+    pub(super) fn step_replay(&mut self, r: usize) -> Result<(), GpuModelError> {
+        // the serial path's eager pin covers the batch ticks too
+        if paddock_models::dev_var_os!("PADDOCK_NO_NEMO_GRAPH").is_some() {
+            return self.step_body(r);
+        }
         if !self
             .batch
             .as_ref()
@@ -2852,12 +1602,7 @@ impl GpuNemotron {
         }
         self.step_replay(r)?;
         self.reply_after_rows(slots, positions)?;
-        if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
-            for i in 0..r {
-                let p = positions[i] as usize;
-                self.dflash_note_rows(slots[i] as usize, p, p + 1);
-            }
-        }
+        self.dflash_note_ticks(slots, positions);
         self.mtp_append_ticks(slots, positions)?;
         Ok(())
     }
@@ -2873,932 +1618,9 @@ impl GpuNemotron {
 
     // ── prefill lanes ──────────────────────────────────────────────────────
 
-    /// The checkpoint plan for rows covering positions `[base, base+len)` of
-    /// a prompt of `t_len` rows resumed at `start`: which pass rows (offset
-    /// by `row0`, the rows' base index within the whole pass) end at a
-    /// `ckpt_cuts` boundary. Returns (pass-row breaks for PfCuts, and the
-    /// (stage, cut) commits to run after the pass). `stage0` threads the
-    /// stage counter across multiple prompts sharing one pass.
-    fn stage_plan(
-        t_len: usize,
-        start: usize,
-        base: usize,
-        len: usize,
-        row0: usize,
-        stage0: &mut usize,
-        step: usize,
-        max_stages: usize,
-    ) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
-        let mut breaks = Vec::new();
-        let mut after = Vec::new();
-        for cut in super::prefix::ckpt_cuts(t_len, step) {
-            if cut > start.max(base) && cut <= base + len && *stage0 < max_stages {
-                breaks.push((row0 + (cut - base), *stage0));
-                after.push((*stage0, cut));
-                *stage0 += 1;
-            }
-        }
-        (breaks, after)
-    }
-
-    /// Prefill a whole prompt into `slot` (chunked at `prefill_chunk`) and
-    /// return the last token's logits. Trailing-boundary checkpoints stage
-    /// during the passes and commit between chunks (stage D).
-    pub(crate) fn forward_prefill_impl(
-        &mut self,
-        slot: usize,
-        tokens: &[u32],
-    ) -> Result<Vec<f32>, GpuModelError> {
-        self.admit_rows(slot, tokens.len())?;
-        let start = self.prefix_resume_rows(slot, tokens, tokens.len())?;
-        self.reply_track_admit(slot, tokens);
-        let mut base = start;
-        let mut last_len = 0usize;
-        for chunk in tokens[base..].chunks(self.prefill_chunk) {
-            let rows: Vec<(u32, u32, u32)> = chunk
-                .iter()
-                .enumerate()
-                .map(|(j, &t)| (slot as u32, (base + j) as u32, t))
-                .collect();
-            let mut stage = 0usize;
-            let (breaks, after) = if !self.has_ckpt_stages() {
-                (Vec::new(), Vec::new())
-            } else {
-                Self::stage_plan(
-                    tokens.len(),
-                    start,
-                    base,
-                    chunk.len(),
-                    0,
-                    &mut stage,
-                    self.tier_ckpt_step(),
-                    self.ckpt_stage_count(),
-                )
-            };
-            self.rows_pass_body(&rows, 0, breaks)?;
-            for (st, cut) in after {
-                self.commit_stage(st, slot, tokens, cut);
-            }
-            base += chunk.len();
-            last_len = chunk.len();
-        }
-        self.prefix_insert(slot, tokens);
-        self.head_row(last_len - 1)
-    }
-
-    /// COALESCED multi-prompt prefill: every pending prompt's rows
-    /// concatenate into shared chunks - one weight-amortized pass over the
-    /// wave (granite's shape; run isolation keeps attention AND the
-    /// recurrent advance per slot).
-    pub(crate) fn forward_prefill_batch_impl(
-        &mut self,
-        items: &[(usize, Vec<u32>)],
-    ) -> Result<Vec<Vec<f32>>, GpuModelError> {
-        if items.len() == 1 || paddock_models::dev_var_os!("PADDOCK_NO_COALESCED_PREFILL").is_some()
-        {
-            return items
-                .iter()
-                .map(|(slot, toks)| self.forward_prefill_impl(*slot, toks))
-                .collect();
-        }
-        let mut starts = vec![0usize; items.len()];
-        for (it, (slot, tokens)) in items.iter().enumerate() {
-            self.admit_rows(*slot, tokens.len())?;
-            starts[it] = self.prefix_resume_rows(*slot, tokens, tokens.len())?;
-            self.reply_track_admit(*slot, tokens);
-        }
-        let mut rows: Vec<(u32, u32, u32)> = Vec::new();
-        let mut last_row = vec![0usize; items.len()];
-        for (it, (slot, toks)) in items.iter().enumerate() {
-            for (j, &t) in toks.iter().enumerate().skip(starts[it]) {
-                rows.push((*slot as u32, j as u32, t));
-            }
-            last_row[it] = rows.len() - 1;
-        }
-        // per-item global row base within the wave stream, for the cut plan
-        let mut item_base = vec![0usize; items.len()];
-        {
-            let mut acc = 0usize;
-            for (it, (_, toks)) in items.iter().enumerate() {
-                item_base[it] = acc;
-                acc += toks.len() - starts[it];
-            }
-        }
-        let mut out: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
-        let step = self.tier_ckpt_step();
-        let mut base = 0usize;
-        for chunk in rows.chunks(self.prefill_chunk) {
-            let r = chunk.len();
-            // finishers whose last row landed in this chunk read inside the
-            // pass - the next chunk's embed overwrites d_x. Ascending by row
-            // because head_row bounces its row through x[0].
-            let mut fin: Vec<(usize, usize)> = last_row
-                .iter()
-                .enumerate()
-                .filter(|&(_, &lr)| lr >= base && lr < base + r)
-                .map(|(it, &lr)| (lr - base, it))
-                .collect();
-            fin.sort_unstable();
-            // checkpoint cuts of every item whose boundary rows land in this
-            // chunk; global row of item position p = item_base + (p - start)
-            let mut breaks: Vec<(usize, usize)> = Vec::new();
-            let mut after: Vec<(usize, usize, usize)> = Vec::new();
-            let mut stage = 0usize;
-            let max_stages = self.ckpt_stage_count();
-            for (it, (_, toks)) in items.iter().enumerate() {
-                for cut in super::prefix::ckpt_cuts(toks.len(), step) {
-                    if cut <= starts[it] || stage >= max_stages {
-                        continue;
-                    }
-                    let grow = item_base[it] + (cut - starts[it]);
-                    if grow > base && grow <= base + r {
-                        breaks.push((grow - base, stage));
-                        after.push((stage, it, cut));
-                        stage += 1;
-                    }
-                }
-            }
-            breaks.sort_unstable();
-            self.rows_pass_body(chunk, 0, breaks)?;
-            for (st, it, cut) in after {
-                let (slot, toks) = &items[it];
-                let keys = toks.clone();
-                self.commit_stage(st, *slot, &keys, cut);
-            }
-            for (row, it) in fin {
-                out[it] = self.head_row(row)?;
-            }
-            base += r;
-        }
-        for (slot, toks) in items {
-            self.prefix_insert(*slot, toks);
-        }
-        Ok(out)
-    }
-
-    /// Queue a prompt for STALL-FREE chunked prefill (Sarathi shape). Does
-    /// the whole admission prologue now, so a mixed tick only moves rows.
-    pub(crate) fn prefill_begin_impl(
-        &mut self,
-        slot: usize,
-        tokens: Vec<u32>,
-    ) -> Result<(), GpuModelError> {
-        // a queued entry for this slot is stale (the old request died and the
-        // slot was reused): evict rather than wedge the slot
-        self.chunked.retain(|c| c.slot != slot);
-        self.admit_rows(slot, tokens.len())?;
-        let cursor = self.prefix_resume_rows(slot, &tokens, tokens.len())?;
-        if paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG_IDS").is_some() {
-            tracing::info!("[spec2a-ids] admit slot={slot} cursor={cursor} prompt={tokens:?}");
-        }
-        self.reply_track_admit(slot, &tokens);
-        self.chunked.push(ChunkedPrefill {
-            slot,
-            keys: tokens.clone(),
-            tokens,
-            cursor,
-        });
-        Ok(())
-    }
-
-    /// Drop slot's in-flight prefill (client hung up mid-prompt).
-    pub(crate) fn prefill_abort_impl(&mut self, slot: usize) -> bool {
-        let n = self.chunked.len();
-        self.chunked.retain(|c| c.slot != slot);
-        self.chunked.len() != n
-    }
-
-    /// Pick this tick's chunk rows: FIFO over the queue, up to `budget`
-    /// rows, splitting the last prompt if it does not fit. The tick's width
-    /// is the WHOLE-PROMPT rule: `PREFILL_TICK_BASE` rows, or the first
-    /// queued prompt's remaining rows when that is more, never past the
-    /// scratch cap - a cohort of short prompts ramps through base-width
-    /// ticks (the median first token comes earlier that way), a long prompt
-    /// streams the experts once instead of once per base width (GB10
-    /// 2026-09-11: 2048 / 4096 / 8192 rows per tick measured on the 8x1k
-    /// cohort and on 4k / 8k prompts).
-    fn plan_chunk(&self, budget: usize) -> (Vec<(u32, u32, u32)>, Vec<(usize, usize, bool)>) {
-        let mut rows: Vec<(u32, u32, u32)> = Vec::new();
-        let mut take: Vec<(usize, usize, bool)> = Vec::new();
-        if self.chunked.is_empty() {
-            return (rows, take);
-        }
-        let first_rem = self.chunked[0].tokens.len() - self.chunked[0].cursor;
-        let width = super::forward::PREFILL_TICK_BASE.max(first_rem);
-        let cap = budget.clamp(1, self.prefill_chunk).min(width.max(1));
-        // Prompt-aligned ticks (GB10, 2026-09-11):
-        // a prompt after the first joins the tick only whole - within the
-        // cap, or within a quarter-base overshoot the scratch can take - and
-        // the tick ends at the previous prompt's boundary otherwise. A prompt
-        // cut at the tick edge costs its owner a whole extra tick of
-        // first-token latency and one more mamba segment split: the 8 x 1k
-        // cohort ran as 2048-row cuts (five ticks, the 4th and 5th first
-        // tokens on the 3rd tick) and now runs as 2-prompt ticks (four). The
-        // first prompt keeps the whole-prompt rule above; on the big die the
-        // scratch cap binds first and nothing changes.
-        // PADDOCK_NO_PROMPT_ALIGN=1 restores the row-exact cut.
-        let align = paddock_models::dev_var_os!("PADDOCK_NO_PROMPT_ALIGN").is_none();
-        let slack_cap = if align {
-            (cap + super::forward::PREFILL_TICK_BASE / 4)
-                .min(budget.max(1))
-                .min(self.prefill_chunk)
-                .max(cap)
-        } else {
-            cap
-        };
-        for (qi, c) in self.chunked.iter().enumerate() {
-            if rows.len() >= cap {
-                break;
-            }
-            let remaining = c.tokens.len() - c.cursor;
-            let limit = if qi == 0 { cap } else { slack_cap };
-            if align && qi > 0 && rows.len() + remaining > limit {
-                break;
-            }
-            let n = remaining.min(limit - rows.len()).max(1);
-            for j in 0..n {
-                let p = c.cursor + j;
-                rows.push((c.slot as u32, p as u32, c.tokens[p]));
-            }
-            take.push((qi, n, n == remaining));
-        }
-        (rows, take)
-    }
-
-    /// Advance cursors and drop finished prompts from the queue.
-    fn commit_chunk(
-        &mut self,
-        take: &[(usize, usize, bool)],
-        finished_raw: Vec<(usize, crate::generator::FinishSample)>,
-    ) -> Vec<(usize, crate::generator::FinishSample, usize)> {
-        for &(qi, n, _) in take {
-            self.chunked[qi].cursor += n;
-        }
-        let mut out = Vec::new();
-        for (qi, fs) in finished_raw {
-            let slot = self.chunked[qi].slot;
-            let toks = std::mem::take(&mut self.chunked[qi].tokens);
-            let keys = std::mem::take(&mut self.chunked[qi].keys);
-            self.prefix_insert(slot, &keys);
-            out.push((slot, fs, toks.len()));
-        }
-        self.chunked.retain(|c| !c.tokens.is_empty());
-        out
-    }
-
-    /// Build the fused tick's row stream: decode rows first (one band), then
-    /// as much of the prefill queue as scratch capacity allows.
-    /// Whether checkpoint staging buffers exist (prefix cache armed with a
-    /// state pool); the checkpoint planners emit no cuts without them.
-    fn has_ckpt_stages(&self) -> bool {
-        self.ckpt_stage_count() > 0
-    }
-
-    /// Staging blobs this serve allocated (`prefix::ckpt_stages` at enable;
-    /// 0 with the cache off) - the per-pass cap every stage plan honours.
-    fn ckpt_stage_count(&self) -> usize {
-        self.batch.as_ref().map_or(0, |b| b.d_ckpt_stage.len())
-    }
-
-    fn fuse_rows(
-        &self,
-        decodes: &[(usize, u32, u32)],
-        budget: usize,
-    ) -> (
-        Vec<(u32, u32, u32)>,
-        usize,
-        Vec<(usize, usize)>,
-        Vec<(usize, usize, bool)>,
-    ) {
-        let mut rows: Vec<(u32, u32, u32)> =
-            decodes.iter().map(|&(s, t, p)| (s as u32, p, t)).collect();
-        let dec_n = rows.len();
-        let room = self
-            .batch
-            .as_ref()
-            .expect("batch enabled")
-            .cap
-            .saturating_sub(dec_n);
-        let (chunk_rows, take) = if room == 0 {
-            (Vec::new(), Vec::new())
-        } else {
-            self.plan_chunk(budget.min(room))
-        };
-        rows.extend_from_slice(&chunk_rows);
-        let mut fin: Vec<(usize, usize)> = Vec::new();
-        let mut off = dec_n;
-        for &(qi, n, done) in &take {
-            if done {
-                fin.push((off + n - 1, qi));
-            }
-            off += n;
-        }
-        (rows, dec_n, fin, take)
-    }
-
-    /// The mixed tick's checkpoint plan: cuts of any queued prompt whose
-    /// boundary rows land inside this tick's take. Returns (PfCuts breaks,
-    /// (stage, queue index, cut) commits for after the pass).
-    fn mixed_stage_plan(
-        &self,
-        take: &[(usize, usize, bool)],
-        dec_n: usize,
-    ) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize)>) {
-        let mut breaks = Vec::new();
-        let mut after = Vec::new();
-        // No staging buffers (prefix cache off, or no checkpoint pool fit):
-        // nothing to stage into, so no cuts. Without this the walk indexed
-        // `d_ckpt_stage[stg]` on an empty vec (PADDOCK_NO_PREFIX_CACHE=1
-        // panicked on the first prompt past a page boundary, GB10 2026-09-11).
-        if !self.has_ckpt_stages() {
-            return (breaks, after);
-        }
-        let mut stage = 0usize;
-        let mut row_base = dec_n;
-        let step = self.tier_ckpt_step();
-        let max_stages = self.ckpt_stage_count();
-        for &(qi, n, _) in take {
-            let c = &self.chunked[qi];
-            for cut in super::prefix::ckpt_cuts(c.tokens.len(), step) {
-                if cut > c.cursor && cut <= c.cursor + n && stage < max_stages {
-                    breaks.push((row_base + (cut - c.cursor), stage));
-                    after.push((stage, qi, cut));
-                    stage += 1;
-                }
-            }
-            row_base += n;
-        }
-        (breaks, after)
-    }
-
-    /// Run the staged checkpoint commits after a mixed tick's pass.
-    fn mixed_stage_commit(&mut self, after: Vec<(usize, usize, usize)>) {
-        for (st, qi, cut) in after {
-            let slot = self.chunked[qi].slot;
-            let keys = self.chunked[qi].keys.clone();
-            self.commit_stage(st, slot, &keys, cut);
-        }
-    }
-
-    /// One FUSED mixed tick: decode rows and the prefill chunk in a single
-    /// weight-amortized pass, decode rows device-sampled (granite's shape).
-    pub(crate) fn forward_mixed_sampled_impl(
-        &mut self,
-        decodes: &[(usize, u32, u32)],
-        budget: usize,
-        plans: &[crate::generator::RowSample],
-        fin_plans: &[(usize, crate::generator::RowSample)],
-    ) -> Result<
-        (
-            crate::generator::SampledStep,
-            Vec<(usize, crate::generator::FinishSample, usize)>,
-        ),
-        GpuModelError,
-    > {
-        use crate::generator::{FinishSample, SampledStep};
-        // Nothing queued -> a plain decode tick on the captured graph.
-        if self.chunked.is_empty() {
-            let step = if decodes.is_empty() {
-                SampledStep {
-                    ids: Vec::new(),
-                    host_rows: Vec::new(),
-                }
-            } else {
-                let toks: Vec<u32> = decodes.iter().map(|d| d.1).collect();
-                let pos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-                let slots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-                self.forward_batch_sampled_slots(&toks, &pos, Some(&slots), plans)?
-            };
-            return Ok((step, Vec::new()));
-        }
-        let (rows, dec_n, fin, take) = self.fuse_rows(decodes, budget);
-        if dec_n > 0 {
-            let slots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-            let pos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-            self.ensure_rows(&slots, &pos)?;
-        }
-        let (breaks, after) = self.mixed_stage_plan(&take, dec_n);
-        for &(slot, tok, pos) in decodes {
-            self.reply_feed(slot, pos, tok);
-        }
-        self.rows_pass_body(&rows, dec_n, breaks)?;
-        self.mixed_stage_commit(after);
-        {
-            let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-            let dpos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-            self.reply_after_rows(&dslots, &dpos)?;
-        }
-        // Decode rows first: one bulk head over rows 0..dec_n, then device
-        // sampling - it must precede the finisher heads because head_row
-        // bounces through x[0] and rewrites head_logits[0..vocab].
-        let step = if dec_n > 0 {
-            self.head_rows(dec_n)?;
-            self.sample_head_rows(dec_n, plans)?
-        } else {
-            SampledStep {
-                ids: Vec::new(),
-                host_rows: Vec::new(),
-            }
-        };
-        let mut finished_raw = Vec::with_capacity(fin.len());
-        for &(row, qi) in &fin {
-            let slot = self.chunked[qi].slot;
-            let plan = fin_plans.iter().find(|(s, _)| *s == slot).map(|(_, p)| *p);
-            let fs = match plan {
-                Some(p @ crate::generator::RowSample::Device(_)) => {
-                    self.head_row_at(row)?;
-                    let s = self.sample_head_rows(1, std::slice::from_ref(&p))?;
-                    FinishSample::Sampled(s.ids[0])
-                }
-                _ => FinishSample::Logits(self.head_row(row)?),
-            };
-            finished_raw.push((qi, fs));
-        }
-        let finished = self.commit_chunk(&take, finished_raw);
-        Ok((step, finished))
-    }
-
-    /// The unsampled mixed tick (full logits readback).
-    pub(crate) fn forward_mixed_impl(
-        &mut self,
-        decodes: &[(usize, u32, u32)],
-        budget: usize,
-    ) -> Result<(Vec<f32>, Vec<(usize, Vec<f32>, usize)>), GpuModelError> {
-        if self.chunked.is_empty() {
-            if decodes.is_empty() {
-                return Ok((Vec::new(), Vec::new()));
-            }
-            let toks: Vec<u32> = decodes.iter().map(|d| d.1).collect();
-            let pos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-            let slots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-            self.batch_step_slots(&toks, &pos, &slots)?;
-            return Ok((self.read_batch_logits(decodes.len())?, Vec::new()));
-        }
-        let (rows, dec_n, fin, take) = self.fuse_rows(decodes, budget);
-        if dec_n > 0 {
-            let slots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-            let pos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-            self.ensure_rows(&slots, &pos)?;
-        }
-        let (breaks, after) = self.mixed_stage_plan(&take, dec_n);
-        for &(slot, tok, pos) in decodes {
-            self.reply_feed(slot, pos, tok);
-        }
-        self.rows_pass_body(&rows, dec_n, breaks)?;
-        self.mixed_stage_commit(after);
-        {
-            let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
-            let dpos: Vec<u32> = decodes.iter().map(|d| d.2).collect();
-            self.reply_after_rows(&dslots, &dpos)?;
-        }
-        let mut dec_logits = Vec::new();
-        if dec_n > 0 {
-            self.head_rows(dec_n)?;
-            dec_logits = self.read_batch_logits(dec_n)?;
-        }
-        let mut finished_raw = Vec::with_capacity(fin.len());
-        for &(row, qi) in &fin {
-            finished_raw.push((
-                qi,
-                crate::generator::FinishSample::Logits(self.head_row(row)?),
-            ));
-        }
-        let finished = self
-            .commit_chunk(&take, finished_raw)
-            .into_iter()
-            .map(|(slot, fs, n)| match fs {
-                crate::generator::FinishSample::Logits(l) => (slot, l, n),
-                crate::generator::FinishSample::Sampled(_) => unreachable!("unsampled mixed tick"),
-            })
-            .collect();
-        Ok((dec_logits, finished))
-    }
-
     // ── device sampling ────────────────────────────────────────────────────
 
-    /// Pack per-row sampler params (inv_t, u, mode, pad). Host/Hole rows
-    /// stay mode 0 = untouched.
-    /// TruncCat rows pack mode 5 (top_k 1..=64) or mode 6 (k-less -
-    /// nemotron's own election) + the tpar side plane (Some iff any).
-    fn pack_samp_par(
-        plans: &[crate::generator::RowSample],
-    ) -> (Vec<u32>, Option<Vec<u32>>, bool, bool) {
-        use crate::generator::RowSample;
-        use crate::sampler::DevicePlan;
-        let mut par = vec![0u32; plans.len() * 4];
-        let mut tpar = vec![0u32; plans.len() * 4];
-        // which trunc chains a tick actually needs: nemotron's own election
-        // is pure mode 6, so the mode-5 launches would all early-return -
-        // skip whole chains, not rows (a launch is the unit of waste here)
-        let (mut any5, mut any6) = (false, false);
-        for (i, p) in plans.iter().enumerate() {
-            match p {
-                RowSample::Hole | RowSample::Host => {}
-                RowSample::Device(DevicePlan::Greedy) => par[i * 4 + 2] = 1,
-                RowSample::Device(DevicePlan::Categorical { inv_t, u }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    par[i * 4 + 2] = 2;
-                }
-                RowSample::Device(DevicePlan::TruncCat {
-                    inv_t,
-                    u,
-                    k,
-                    top_p,
-                    min_p,
-                }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    let mode5 = *k >= 1 && *k <= 64;
-                    par[i * 4 + 2] = if mode5 { 5 } else { 6 };
-                    tpar[i * 4] = *k;
-                    tpar[i * 4 + 1] = top_p.to_bits();
-                    tpar[i * 4 + 2] = min_p.to_bits();
-                    if mode5 { any5 = true } else { any6 = true }
-                }
-                // RS plans are spec-only; nemotron's batch lane has no
-                // drafter yet
-                RowSample::Device(DevicePlan::RsVerify { .. })
-                | RowSample::Device(DevicePlan::RsTrunc { .. }) => {}
-            }
-        }
-        (par, (any5 || any6).then_some(tpar), any5, any6)
-    }
-
-    /// device-truncation engagement witness (bisect-trap law): once per process.
-    fn trunc_dev_witness(rows: usize) {
-        static DEV: std::sync::Once = std::sync::Once::new();
-        DEV.call_once(|| {
-            eprintln!("[trunc-dev6] engaged: r={rows} (nemotron device truncation sampling)");
-        });
-    }
-
-    /// TruncCat rows execute fully on device (slots 435+436).
-    pub(crate) fn device_trunc_supported(&self) -> bool {
-        self.batch.is_some() && self.exec.has_sample_rows_t() && self.exec.has_sample_rows_p()
-    }
-
-    pub(crate) fn supports_device_sampling_impl(&self) -> bool {
-        self.batch.is_some() && self.exec.has_sample_rows()
-    }
-
-    /// Sample head_logits rows 0..r on device with `plans`; only Host-plan
-    /// rows pay a vocab-row readback. Assumes the head already ran.
-    fn sample_head_rows(
-        &mut self,
-        r: usize,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        use crate::generator::{RowSample, SampledStep};
-        assert_eq!(plans.len(), r, "one plan per row");
-        let exec = self.exec.clone();
-        let vocab = self.hp.vocab;
-        let (par, tpar, any5, any6) = Self::pack_samp_par(plans);
-        {
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            let mut v = sc
-                .d_par
-                .try_slice_mut(0..r * 4)
-                .ok_or_else(|| GpuError::Driver("d_par slice".into()))?;
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
-            if let Some(t) = &tpar {
-                let mut v = sc
-                    .d_tpar
-                    .try_slice_mut(0..r * 4)
-                    .ok_or_else(|| GpuError::Driver("d_tpar slice".into()))?;
-                exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
-            }
-            exec.sample_rows_at(&sc.head_logits, &sc.d_par, 0, &mut sc.d_out, 0, r, vocab)?;
-            if tpar.is_some() {
-                Self::trunc_dev_witness(r);
-                if any5 {
-                    exec.sample_rows_t_at(
-                        &sc.head_logits,
-                        &sc.d_par,
-                        0,
-                        &sc.d_tpar,
-                        0,
-                        &mut sc.d_out,
-                        0,
-                        r,
-                        vocab,
-                    )?;
-                }
-                if any6 {
-                    exec.sample_rows_p_at(
-                        &sc.head_logits,
-                        &sc.d_par,
-                        0,
-                        &sc.d_tpar,
-                        0,
-                        &mut sc.d_out,
-                        0,
-                        r,
-                        vocab,
-                    )?;
-                }
-            }
-        }
-        let sc = &self.batch.as_ref().expect("batch enabled").sc;
-        let ids_view = sc
-            .d_out
-            .try_slice(0..r)
-            .ok_or_else(|| GpuError::Driver("d_out slice".into()))?;
-        let ids = exec.stream.clone_dtoh(&ids_view).map_err(drv)?;
-        let mut host_rows = Vec::new();
-        for (i, p) in plans.iter().enumerate() {
-            if matches!(p, RowSample::Host) {
-                let v = sc
-                    .head_logits
-                    .try_slice(i * vocab..(i + 1) * vocab)
-                    .ok_or_else(|| GpuError::Driver("host row slice".into()))?;
-                host_rows.push((i, exec.stream.clone_dtoh(&v).map_err(drv)?));
-            }
-        }
-        Ok(SampledStep { ids, host_rows })
-    }
-
-    /// Device-sampled decode tick: graph replay + sample_rows.
-    pub(crate) fn forward_batch_sampled_impl(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        self.forward_batch_sampled_slots(tokens, positions, None, plans)
-    }
-
-    pub(crate) fn forward_batch_sampled_slots(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<crate::generator::SampledStep, GpuModelError> {
-        let r = tokens.len();
-        let owned: Vec<u32> = (0..r as u32).collect();
-        let ident: &[u32] = slots.unwrap_or(&owned);
-        assert_eq!(ident.len(), r, "one slot per row");
-        self.ensure_rows(ident, positions)?;
-        self.upload_rows(tokens, positions, ident)?;
-        for i in 0..r {
-            self.reply_feed(ident[i] as usize, positions[i], tokens[i]);
-        }
-        self.step_replay(r)?;
-        self.reply_after_rows(ident, positions)?;
-        let step = self.sample_head_rows(r, plans)?;
-        self.mtp_append_ticks(ident, positions)?;
-        Ok(step)
-    }
-
     // ── batched depth-2 decode pipe (stage E, granite's pipe-under-pool) ───
-
-    pub(crate) fn supports_decode_pipe_batch(&self) -> bool {
-        self.exec.has_sample_rows()
-            && self.exec.has_pipe_advance()
-            && paddock_models::dev_var_os!("PADDOCK_NO_DECODE_PIPE").is_none()
-            // the in-file MTP's h chain needs host staging around every
-            // tick - incompatible with the pipe's fire-and-forget replays.
-            // Spec-on serving decodes through spec rounds instead; --no-spec
-            // serves never load the block, so the pipe survives there.
-            && !self.mtp_active()
-    }
-
-    fn pipe_launch_tick_b(
-        &mut self,
-        plans: &[crate::generator::RowSample],
-        advance: bool,
-    ) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let vocab = self.hp.vocab;
-        let (b, tick) = {
-            let p = self.pipe_b.as_ref().expect("pipe active");
-            (p.b, p.tick)
-        };
-        // back every row's this-tick write position before anything mutates -
-        // a growth error leaves the rings/inputs untouched
-        let (slots_v, pos_v) = {
-            let (pos0, slot_map) = {
-                let p = self.pipe_b.as_ref().expect("pipe active");
-                (p.pos0.clone(), p.slots.clone())
-            };
-            let slots_v: Vec<u32> = (0..b as u32)
-                .map(|i| slot_map.as_ref().map_or(i, |s| s[i as usize]))
-                .collect();
-            let pos_v: Vec<u32> = pos0.iter().map(|&p0| p0 + tick as u32).collect();
-            self.ensure_rows(&slots_v, &pos_v)?;
-            (slots_v, pos_v)
-        };
-        let ring = tick % 2;
-        let (par, tpar, any5, any6) = Self::pack_samp_par(plans);
-        let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
-        {
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            let off = ring * n_slots * 4;
-            let mut v = sc
-                .d_pipe_par
-                .try_slice_mut(off..off + b * 4)
-                .ok_or_else(|| GpuError::Driver("d_pipe_par slice".into()))?;
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
-            if let Some(t) = &tpar {
-                let mut v = sc
-                    .d_pipe_tpar
-                    .try_slice_mut(off..off + b * 4)
-                    .ok_or_else(|| GpuError::Driver("d_pipe_tpar slice".into()))?;
-                exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
-            }
-        }
-        if advance {
-            // tokens <- previous ring's sampled ids, positions += 1, on device
-            let prev = (tick + 1) % 2;
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            let (out, tok, pos) = (&sc.d_pipe_out, &mut sc.d_tok, &mut sc.d_pos);
-            exec.pipe_advance(out, prev * n_slots, tok, pos, b)?;
-        }
-        self.step_replay(b)?;
-        // stage F: the snapshot copies ride the stream behind this tick; the
-        // ids that complete their pages arrive with the next host read
-        self.reply_after_rows(&slots_v, &pos_v)?;
-        {
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            exec.sample_rows_at(
-                &sc.head_logits,
-                &sc.d_pipe_par,
-                ring * n_slots * 4,
-                &mut sc.d_pipe_out,
-                ring * n_slots,
-                b,
-                vocab,
-            )?;
-            // trunc rows draw into the same out ring - pipe_advance
-            // feeds their ids forward exactly like mode-1/2 rows
-            if tpar.is_some() {
-                Self::trunc_dev_witness(b);
-                if any5 {
-                    exec.sample_rows_t_at(
-                        &sc.head_logits,
-                        &sc.d_pipe_par,
-                        ring * n_slots * 4,
-                        &sc.d_pipe_tpar,
-                        ring * n_slots * 4,
-                        &mut sc.d_pipe_out,
-                        ring * n_slots,
-                        b,
-                        vocab,
-                    )?;
-                }
-                if any6 {
-                    exec.sample_rows_p_at(
-                        &sc.head_logits,
-                        &sc.d_pipe_par,
-                        ring * n_slots * 4,
-                        &sc.d_pipe_tpar,
-                        ring * n_slots * 4,
-                        &mut sc.d_pipe_out,
-                        ring * n_slots,
-                        b,
-                        vocab,
-                    )?;
-                }
-            }
-        }
-        let ev = exec.record_event()?;
-        self.pipe_b.as_mut().expect("pipe active").ev[ring] = Some(ev);
-        Ok(())
-    }
-
-    pub(crate) fn decode_pipe_begin_b(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<(), GpuModelError> {
-        let b = tokens.len();
-        assert_eq!(plans.len(), b, "one plan per row");
-        assert_eq!(positions.len(), b, "one position per row");
-        if !self.supports_decode_pipe_batch() {
-            return Err(GpuModelError::Config("decode pipe unsupported".into()));
-        }
-        match &self.batch {
-            None => return Err(GpuModelError::BatchDisabled),
-            Some(bs) if b > bs.n_slots => {
-                return Err(GpuModelError::BatchTooLarge {
-                    got: b,
-                    max: bs.n_slots,
-                });
-            }
-            _ => {}
-        }
-        if let Some(s) = slots {
-            assert_eq!(s.len(), b, "one slot per row");
-        }
-        assert!(self.pipe_b.is_none(), "decode pipe already active");
-        // tick-0 inputs land in the fixed graph buffers (advance=false keeps
-        // them); ensure_rows runs inside pipe_launch_tick_b at tick 0
-        let ident: Vec<u32> = (0..b as u32).collect();
-        self.upload_rows(tokens, positions, slots.unwrap_or(&ident))?;
-        for i in 0..b {
-            let slot = slots.map_or(i, |s| s[i] as usize);
-            self.reply_feed(slot, positions[i], tokens[i]);
-        }
-        self.pipe_b = Some(PipeB {
-            b,
-            tick: 0,
-            ev: [None, None],
-            pos0: positions.to_vec(),
-            slots: slots.map(<[u32]>::to_vec),
-        });
-        if let Err(e) = self.pipe_launch_tick_b(plans, false) {
-            self.pipe_b_abort();
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Enqueue the next tick and return the OLDEST in-flight tick's ids, read
-    /// via the copy stream while the new tick executes.
-    pub(crate) fn decode_pipe_next_b(
-        &mut self,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<Vec<u32>, GpuModelError> {
-        let exec = self.exec.clone();
-        let (b, j) = {
-            let p = self
-                .pipe_b
-                .as_ref()
-                .ok_or_else(|| GpuModelError::Config("decode_pipe_next without begin".into()))?;
-            (p.b, p.tick)
-        };
-        assert_eq!(plans.len(), b, "one plan per row");
-        self.pipe_b.as_mut().expect("pipe active").tick = j + 1;
-        if let Err(e) = self.pipe_launch_tick_b(plans, true) {
-            self.pipe_b_abort();
-            return Err(e);
-        }
-        let ring = j % 2;
-        let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
-        let r = {
-            let sc = &self.batch.as_ref().expect("batch enabled").sc;
-            let ev = self.pipe_b.as_ref().expect("pipe active").ev[ring]
-                .as_ref()
-                .expect("in-flight event");
-            exec.to_host_u32_after(ev, &sc.d_pipe_out, ring * n_slots, b)
-        };
-        match r {
-            Ok(ids) => {
-                let (pos0, slots) = {
-                    let p = self.pipe_b.as_ref().expect("pipe active");
-                    (p.pos0.clone(), p.slots.clone())
-                };
-                self.reply_pipe_ids(&ids, &pos0, slots.as_deref(), j + 1);
-                Ok(ids)
-            }
-            Err(e) => {
-                self.pipe_b_abort();
-                Err(e.into())
-            }
-        }
-    }
-
-    /// End the pipe: return the last in-flight tick's ids. The fixed input
-    /// buffers are stale after this - every other path re-uploads them.
-    pub(crate) fn decode_pipe_drain_b(&mut self) -> Result<Vec<u32>, GpuModelError> {
-        let exec = self.exec.clone();
-        let st = self
-            .pipe_b
-            .take()
-            .ok_or_else(|| GpuModelError::Config("decode_pipe_drain without begin".into()))?;
-        let ring = st.tick % 2;
-        let n_slots = self
-            .batch
-            .as_ref()
-            .ok_or(GpuModelError::BatchDisabled)?
-            .n_slots;
-        let ev = st.ev[ring].as_ref().expect("in-flight event");
-        let r = {
-            let sc = &self.batch.as_ref().expect("batch enabled").sc;
-            exec.to_host_u32_after(ev, &sc.d_pipe_out, ring * n_slots, st.b)
-        };
-        match r {
-            Ok(ids) => {
-                self.reply_pipe_ids(&ids, &st.pos0, st.slots.as_deref(), st.tick + 1);
-                Ok(ids)
-            }
-            Err(e) => {
-                let _ = exec.synchronize(); // state gone - quiesce ring readers
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Kill an in-flight batch pipe (error/reset/re-enable): quiesce so
-    /// nothing still reads the rings, then drop the state.
-    pub(crate) fn pipe_b_abort(&mut self) {
-        if self.pipe_b.take().is_some() {
-            let _ = self.exec.synchronize();
-        }
-    }
 
     // ── stage-B gate probes (tests/gpu_nemotron_batch.rs) ──────────────────
 
@@ -3809,7 +1631,29 @@ impl GpuNemotron {
 
     #[doc(hidden)]
     pub fn batch_admit_probe(&mut self, slot: usize, n_rows: usize) -> Result<(), GpuModelError> {
-        self.admit_rows(slot, n_rows)
+        self.admit_rows(slot, n_rows)?;
+        self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])
+    }
+
+    /// Whether `rows` decode-class rows ride the W16 class on this pack -
+    /// the gates assert bit-exactness only where the class serves.
+    #[doc(hidden)]
+    pub fn w16_class_probe(&self, rows: usize) -> bool {
+        self.w16_lane() && w16_class(&self.exec, rows)
+    }
+
+    /// The model is on the lane whose kernels define the W16 class: the
+    /// NVFP4 checkpoint (NVFP4 experts and head, the FP8 / bf16 dense
+    /// planes). The GGUF lane's planes are Q8_0, which the class's kernels do
+    /// not read - elected there anyway (the class was keyed on the pack
+    /// alone), its decode ticks and verify rounds took the class's attention
+    /// law while every projection stayed Q8_0, and the in-file MTP drafts
+    /// stopped landing: gpu_nemotron_gguf's mtp_drafts_accept accepted 0 of
+    /// 7 drafts and spec_serve_cadence left the greedy stream (GB10,
+    /// 2026-09-27, bisected to the class's first commit). The GGUF lane keeps
+    /// its own decode class.
+    pub(super) fn w16_lane(&self) -> bool {
+        matches!(self.lm_head, HeadW::Nvf4(_))
     }
 
     /// Diagnostic: host copies of one slot's per-mamba-layer SSM state and
@@ -3837,6 +1681,31 @@ impl GpuNemotron {
             out.push((li, sh, wh));
         }
         out
+    }
+
+    /// Diagnostic: `slot`'s live reply checkpoint as (cut, its pool blob -
+    /// per mamba layer the f32 state, then the conv window). Test-only.
+    #[doc(hidden)]
+    pub fn reply_ckpt_probe(&mut self, slot: usize) -> Option<(usize, Vec<f32>)> {
+        let (cut, idx) = (*self.batch.as_ref()?.reply_ckpt.get(slot)?)?;
+        // gather the checkpoint's pages into the bounce blob, read that
+        self.ckpt_pages_copy(idx, crate::ckpt_pages::Dir::FromPages)
+            .ok()?;
+        let bs = self.batch.as_ref()?;
+        let v = bs.d_ckpt_bounce.as_ref()?;
+        Some((cut, self.exec.stream.clone_dtoh(v).ok()?))
+    }
+
+    /// (pages one checkpoint draws, checkpoint pages the plan bought beside
+    /// full context and retention) - the pool's size over what its slots
+    /// address, by design since checkpoints live in its pages (issue #33).
+    /// None before `enable_batch` or with the prefix cache off.
+    #[doc(hidden)]
+    pub fn batch_ckpt_plan_probe(&self) -> Option<(usize, usize)> {
+        let bs = self.batch.as_ref()?;
+        let ppc = bs.prefix.as_ref()?.pages_per_ckpt();
+        let (must, want) = crate::ckpt_pages::page_demand(bs.n_slots, ppc, CKPTS_PER_SLOT);
+        Some((ppc, must + want))
     }
 
     /// (free blocks, pool capacity) - None until enable succeeded.

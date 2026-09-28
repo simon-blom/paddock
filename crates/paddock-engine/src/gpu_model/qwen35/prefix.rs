@@ -16,24 +16,22 @@ impl GpuQwen35 {
     /// normal resume path adopts whatever published via an ordinary match.
     pub(crate) fn tier_consult_impl(&mut self, slot: usize, tokens: &[u32]) -> bool {
         use crate::kv_tier::{Election, FlowStatus};
-        use cudarc::driver::DevicePtr;
         let exec = self.exec.clone();
         let Some(bs) = self.batch.as_mut() else {
             return false;
         };
-        let state_bytes = (bs.state_ckpt_f32 * 4) as u64;
+        if bs.ckpt_layout.is_none() {
+            return false; // no checkpoints, so nothing a hybrid can resume at
+        }
         let (Some(tier), Some(pr), Some(pool)) =
             (bs.tier.as_mut(), bs.paged_prefix.as_mut(), bs.pool.as_mut())
         else {
             return false;
         };
-        let Some(sp) = bs.d_state_pool.as_ref() else {
-            return false;
-        };
         tier.pump_completions(pr, pool);
         {
             let exec2 = exec.clone();
-            tier.pump_flows(pr, &mut || exec2.record_event().ok());
+            tier.pump_flows_with_pool(pr, pool, &mut || exec2.record_event().ok());
         }
         match tier.flow_status(slot, tokens) {
             FlowStatus::Loading => return true,
@@ -63,16 +61,15 @@ impl GpuQwen35 {
             let want = a.end_block + 2 * r;
             let after = exec.record_event().ok();
             let (_e, taken) = tier.pressure_demote(pr, pool, want, after);
-            let (cp, _g) = sp.device_ptr(&exec.stream);
             for t in taken {
                 if t.end_block % r == 0 {
-                    let blob = cp + t.state_idx as u64 * state_bytes;
                     let ev = exec.record_event().ok();
-                    tier.demote_aux(pr, t, blob, state_bytes, ev);
+                    tier.demote_aux_paged(pr, pool, t, ev);
                 } else {
                     pr.recycle_state(t.state_idx);
                 }
             }
+            pr.reclaim(pool);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             while pool.free_blocks() < want && tier.stats().2 > 0 {
                 tier.pump_completions(pr, pool);
@@ -115,11 +112,12 @@ impl GpuQwen35 {
             return false;
         };
         let after = exec.record_event().ok();
-        let (cp, _g) = sp.device_ptr(&exec.stream);
+        // the checkpoint lands in pool pages the flow reserves; the radix
+        // names them, so there is no slot base to hand over
         let plan = crate::kv_tier::AuxPlan {
             hit: aux,
-            state_base: cp,
-            state_stride: state_bytes,
+            state_base: 0,
+            state_stride: 0,
         };
         match crate::kv_tier::RestoreFlow::begin(
             tier,
@@ -400,10 +398,11 @@ impl GpuQwen35 {
             }
             let idx = {
                 let bs = self.batch.as_mut().expect("batch");
+                let pool = bs.pool.as_mut().expect("paged tail: the pool");
                 bs.paged_prefix
                     .as_mut()
                     .expect("paged tail: prefix cache on")
-                    .attach_state(tokens, c)
+                    .attach_state_with_pool(tokens, c, pool)
             };
             if let Some(idx) = idx {
                 self.snapshot_paged_state(slot, idx)?;
@@ -693,7 +692,9 @@ impl GpuQwen35 {
             let pool = bs.pool.as_mut().expect("prefix requires the pool");
             let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
             radix.insert(&keys[..nb * BLOCK_TOKENS], &blocks, pool);
-            checkpoint.then(|| radix.attach_state(keys, upto)).flatten()
+            checkpoint
+                .then(|| radix.attach_state_with_pool(keys, upto, pool))
+                .flatten()
         };
         if let Some(idx) = idx {
             self.snapshot_paged_state(slot, idx)?;
@@ -3054,7 +3055,7 @@ impl GpuQwen35 {
         };
         if crate::gpu_model::prefix_cache::reply_ckpt_disabled()
             || bs.paged_prefix.is_none()
-            || bs.d_state_pool.is_none()
+            || bs.ckpt_layout.is_none()
             || slot >= bs.seq.len()
         {
             return;
@@ -3147,15 +3148,17 @@ impl GpuQwen35 {
             };
             if bs.seq.get(slot).is_none_or(|s| s.len() < cut)
                 || bs.tables[slot].blocks().len() < cut / BLOCK_TOKENS
-                || bs.d_state_pool.is_none()
+                || bs.ckpt_layout.is_none()
             {
                 return Ok(());
             }
-            let Some(radix) = bs.paged_prefix.as_mut() else {
+            let (Some(radix), Some(pool)) = (bs.paged_prefix.as_mut(), bs.pool.as_mut()) else {
                 return Ok(());
             };
-            let Some(idx) = radix.reserve_state_slot() else {
-                return Ok(()); // pool full of proven cuts - skip this one
+            // the reply's own pages are the slot's, not the tree's yet, so
+            // making room here can never take them
+            let Some(idx) = radix.reserve_state_slot_with_pool(pool) else {
+                return Ok(()); // no pages spare, or a pool full of proven cuts
             };
             idx
         };
@@ -3179,7 +3182,7 @@ impl GpuQwen35 {
         let bs = self.batch.as_mut().expect("batch checked above");
         if let Some((old_cut, old_idx)) = bs.reply_ckpt[slot].replace((cut, idx))
             && let Some(radix) = bs.paged_prefix.as_mut()
-            && radix.detach_state_at(&seq, old_cut) == Some(old_idx)
+            && radix.detach_state_if(&seq, old_cut, old_idx)
         {
             radix.recycle_state(old_idx);
         }

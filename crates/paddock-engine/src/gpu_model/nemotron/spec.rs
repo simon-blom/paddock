@@ -50,6 +50,27 @@ pub(crate) struct VerifyPlanes {
     pub d_h: CudaSlice<f32>,
     /// per-row picks (device argmax / device sample)
     pub d_picks: CudaSlice<u32>,
+    /// per-row sampler params for device-sampled rounds [SPEC_ROWS, 4]
+    /// (`sample_rows` packing + the truncation plane) - the batch scratch's
+    /// own planes are sized for one row per slot, a round is not
+    pub d_par: CudaSlice<u32>,
+    pub d_tpar: CudaSlice<u32>,
+    /// the round `forward_spec_verify` opened, awaiting the service's
+    /// host-sampled counts in `spec_commit`
+    pub open: Option<Vec<(usize, usize, Vec<u32>)>>,
+    /// the multi-row attention partial's groups + partial planes (sized for
+    /// the worst grouping of SPEC_ROWS rows - see `rows_partial_cap`)
+    pub d_groups: CudaSlice<u32>,
+    pub attn_o: CudaSlice<f32>,
+    pub attn_ml: CudaSlice<f32>,
+}
+
+/// How a verify round's rows are picked on device before the commit.
+enum VerifyPick<'a> {
+    /// argmax - the greedy round
+    Greedy,
+    /// one sampler plan per row - the device-sampled round
+    Plans(&'a [crate::sampler::DevicePlan]),
 }
 
 impl GpuNemotron {
@@ -68,6 +89,7 @@ impl GpuNemotron {
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * hp.conv_dim();
         let ssm_dt = self.ssm_dtype;
+        let rows_cap = super::batch::rows_partial_cap(hp.n_kv_heads, e.sm_count(), SPEC_ROWS_NEMO);
         let mut snap = Vec::with_capacity(hp.n_layer);
         let mut xbc = Vec::with_capacity(hp.n_layer);
         let mut vwin = Vec::with_capacity(hp.n_layer);
@@ -94,6 +116,12 @@ impl GpuNemotron {
             d_logits: e.alloc(SPEC_ROWS_NEMO * hp.vocab)?,
             d_h: e.alloc(SPEC_ROWS_NEMO * hp.hidden)?,
             d_picks: e.alloc_u32(SPEC_ROWS_NEMO)?,
+            d_par: e.alloc_u32(SPEC_ROWS_NEMO * 4)?,
+            d_tpar: e.alloc_u32(SPEC_ROWS_NEMO * 4)?,
+            open: None,
+            d_groups: e.alloc_u32(SPEC_ROWS_NEMO * 2)?,
+            attn_o: e.alloc(hp.n_heads * rows_cap * hp.head_dim)?,
+            attn_ml: e.alloc(hp.n_heads * rows_cap * 2)?,
         });
         tracing::info!(
             "nemotron spec: verify planes up ({} rows, {:.2} GiB snapshots)",
@@ -111,11 +139,113 @@ impl GpuNemotron {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        self.spec_verify_picked(reqs, VerifyPick::Greedy)
+    }
+
+    /// Device-sampled verify round: the greedy round with every row drawn
+    /// from its slot's own plan (temperature, top-k/top-p/min-p) instead of
+    /// argmax'd. The drafts are deterministic, so accepting while the draw
+    /// equals the draft is exact rejection sampling - the emitted stream has
+    /// the dense sampler's distribution.
+    pub(crate) fn forward_spec_batch_plans_impl(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        use crate::sampler::DevicePlan;
+        let total: usize = reqs.iter().map(|r| r.2.len()).sum();
+        let runnable = plans.iter().all(|p| match p {
+            DevicePlan::Greedy | DevicePlan::Categorical { .. } => true,
+            DevicePlan::TruncCat { .. } => self.device_trunc_supported(),
+            // no rejection-sampling resolve on this lane: its drafts are
+            // argmaxes, which accept-while-match already samples exactly
+            DevicePlan::RsVerify { .. } | DevicePlan::RsTrunc { .. } => false,
+        });
+        if plans.len() != total || !runnable || !self.supports_device_sampling_impl() {
+            return Ok(None);
+        }
+        self.spec_verify_picked(reqs, VerifyPick::Plans(plans))
+    }
+
+    /// Host-sampled verify round, phase 1: the rows' raw logits for the
+    /// service's own sampler - the round a constrained slot rides (a tool
+    /// grammar walks each pick on the host). Phase 2 is `spec_commit_impl`
+    /// with the counts the service accepted.
+    pub(crate) fn forward_spec_verify_impl(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, GpuModelError> {
+        let Some(total) = self.spec_verify_walk(reqs)? else {
+            return Ok(None);
+        };
+        let vocab = self.hp.vocab;
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let vp = bs.verify.as_mut().expect("verify planes");
+        let view = vp
+            .d_logits
+            .try_slice(0..total * vocab)
+            .ok_or_else(|| GpuError::Driver("verify logits view".into()))?;
+        let rows = self
+            .exec
+            .stream
+            .clone_dtoh(&view)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        vp.open = Some(reqs.to_vec());
+        Ok(Some(rows))
+    }
+
+    /// Host-sampled verify round, phase 2: commit `committed[i]` rows of the
+    /// open round's request `i` (the pending row plus the accepted drafts).
+    pub(crate) fn spec_commit_impl(&mut self, committed: &[u32]) -> Result<(), GpuModelError> {
+        let reqs = self
+            .batch
+            .as_mut()
+            .and_then(|bs| bs.verify.as_mut())
+            .and_then(|vp| vp.open.take())
+            .ok_or_else(|| GpuModelError::Config("spec_commit with no open verify".into()))?;
+        if committed.len() != reqs.len() {
+            return Err(GpuModelError::Config(format!(
+                "spec_commit: {} counts for {} requests",
+                committed.len(),
+                reqs.len()
+            )));
+        }
+        let mut off = 0usize;
+        let mut accepts = Vec::with_capacity(reqs.len());
+        for (&(slot, _, ref chunk), &c) in reqs.iter().zip(committed) {
+            let c = c as usize;
+            if c == 0 || c > chunk.len() {
+                return Err(GpuModelError::Config(format!(
+                    "spec_commit: slot {slot} commits {c} of {} rows",
+                    chunk.len()
+                )));
+            }
+            accepts.push((slot, off, c));
+            off += chunk.len();
+        }
+        self.spec_round_commit(&reqs, &accepts)
+    }
+
+    /// The verify walk every round shares: flatten the ragged chunks, run
+    /// them through the trunk (mamba rows snapshot their state per row) and
+    /// the head into the verify logits. `Ok(None)` = decline.
+    fn spec_verify_walk(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<usize>, GpuModelError> {
         let total: usize = reqs.iter().map(|r| r.2.len()).sum();
         if total == 0 || total > SPEC_ROWS_NEMO || !self.spec_verify_ready() {
             return Ok(None);
         }
         if self.batch.is_none() {
+            return Ok(None);
+        }
+        // A round with no draft in it is a decode tick taken the slow way:
+        // the eager walk instead of the captured graph (66.7 vs 82.7 tok/s on
+        // a slot whose drafter is cold for its whole sequence, GB10). Decline
+        // it - the service cools down onto the dense tick, whose walk still
+        // advances both drafters' coverage.
+        if reqs.iter().all(|r| r.2.len() < 2) {
             return Ok(None);
         }
         self.pipe_b_abort();
@@ -145,49 +275,127 @@ impl GpuNemotron {
         self.layer_walk(total, Some(&cuts), true)?;
 
         // head over every row: final norm -> h (the drafters' h source) ->
-        // logits -> device argmax -> host picks
+        // logits
         let exec = self.exec.clone();
-        let (embd, eps, vocab) = (self.hp.hidden, self.hp.eps, self.hp.vocab);
+        let (embd, eps) = (self.hp.hidden, self.hp.eps);
         let final_norm = self.final_norm.buf.clone();
-        {
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let sc = &mut bs.sc;
+        let vp = bs.verify.as_mut().expect("verify planes");
+        // a host round the service never committed is abandoned here - its
+        // rows were overwritten by this walk
+        vp.open = None;
+        exec.rmsnorm_batch(&sc.d_x, &final_norm, &mut vp.d_h, embd, eps, total)?;
+        match &self.lm_head {
+            HeadW::Nvf4(h) => super::head_nvf4_batch(
+                &exec,
+                h,
+                &vp.d_h,
+                &mut vp.d_logits,
+                total,
+                super::batch::w16_class(&exec, total),
+            )?,
+            HeadW::Qw(q) => {
+                let s8 = sc.q8.as_mut().expect("q8 batch scratch");
+                prefill_quant(
+                    &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &vp.d_h, embd, total,
+                )?;
+                prefill_mm_pre_any(
+                    &exec,
+                    q,
+                    &s8.xq,
+                    &s8.xs,
+                    &s8.yq,
+                    &mut s8.xsums,
+                    &mut s8.ssums,
+                    &mut s8.skfix,
+                    &mut vp.d_logits,
+                    total,
+                )?;
+            }
+        }
+        Ok(Some(total))
+    }
+
+    /// Walk, pick every row on device, accept per slot and commit.
+    fn spec_verify_picked(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        pick: VerifyPick<'_>,
+    ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        let Some(total) = self.spec_verify_walk(reqs)? else {
+            return Ok(None);
+        };
+        let exec = self.exec.clone();
+        let vocab = self.hp.vocab;
+        let picks: Vec<u32> = {
             let bs = self.batch.as_mut().expect("batch enabled");
-            let sc = &mut bs.sc;
             let vp = bs.verify.as_mut().expect("verify planes");
-            exec.rmsnorm_batch(&sc.d_x, &final_norm, &mut vp.d_h, embd, eps, total)?;
-            match &self.lm_head {
-                HeadW::Nvf4(h) => {
-                    super::head_nvf4_batch(&exec, h, &vp.d_h, &mut vp.d_logits, total)?
+            match pick {
+                VerifyPick::Greedy => {
+                    exec.argmax_rows(&vp.d_logits, &mut vp.d_picks, total, vocab)?
                 }
-                HeadW::Qw(q) => {
-                    let s8 = sc.q8.as_mut().expect("q8 batch scratch");
-                    prefill_quant(
-                        &exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &vp.d_h, embd, total,
-                    )?;
-                    prefill_mm_pre_any(
-                        &exec,
-                        q,
-                        &s8.xq,
-                        &s8.xs,
-                        &s8.yq,
-                        &mut s8.xsums,
-                        &mut s8.ssums,
-                        &mut s8.skfix,
-                        &mut vp.d_logits,
+                VerifyPick::Plans(plans) => {
+                    let rows: Vec<crate::generator::RowSample> = plans
+                        .iter()
+                        .map(|&p| crate::generator::RowSample::Device(p))
+                        .collect();
+                    let (par, tpar, any5, any6) = Self::pack_samp_par(&rows);
+                    let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
+                    let mut v = vp
+                        .d_par
+                        .try_slice_mut(0..total * 4)
+                        .ok_or_else(|| GpuError::Driver("verify d_par".into()))?;
+                    exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
+                    exec.sample_rows_at(
+                        &vp.d_logits,
+                        &vp.d_par,
+                        0,
+                        &mut vp.d_picks,
+                        0,
                         total,
+                        vocab,
                     )?;
+                    if let Some(t) = &tpar {
+                        let mut v = vp
+                            .d_tpar
+                            .try_slice_mut(0..total * 4)
+                            .ok_or_else(|| GpuError::Driver("verify d_tpar".into()))?;
+                        exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+                        if any5 {
+                            exec.sample_rows_t_at(
+                                &vp.d_logits,
+                                &vp.d_par,
+                                0,
+                                &vp.d_tpar,
+                                0,
+                                &mut vp.d_picks,
+                                0,
+                                total,
+                                vocab,
+                            )?;
+                        }
+                        if any6 {
+                            exec.sample_rows_p_at(
+                                &vp.d_logits,
+                                &vp.d_par,
+                                0,
+                                &vp.d_tpar,
+                                0,
+                                &mut vp.d_picks,
+                                0,
+                                total,
+                                vocab,
+                            )?;
+                        }
+                    }
                 }
             }
-            exec.argmax_rows(&vp.d_logits, &mut vp.d_picks, total, vocab)?;
-        }
-        let picks: Vec<u32> = {
-            let bs = self.batch.as_ref().expect("batch enabled");
-            let vp = bs.verify.as_ref().expect("verify planes");
             let view = vp
                 .d_picks
                 .try_slice(0..total)
                 .ok_or_else(|| GpuError::Driver("picks view".into()))?;
-            self.exec
-                .stream
+            exec.stream
                 .clone_dtoh(&view)
                 .map_err(|e| GpuError::Driver(e.to_string()))?
         };
@@ -208,15 +416,28 @@ impl GpuNemotron {
                 (slot, off, a + 1)
             })
             .collect();
-        self.spec_verify_commit(reqs, &accepts)?;
+        self.spec_round_commit(reqs, &accepts)?;
+        Ok(Some(picks))
+    }
+
+    /// Commit a verified round: `accepts[i] = (slot, first row, committed
+    /// rows)` for request `i`. The reply checkpoints read the pre-round conv
+    /// windows, so they go before the rollback rewrites them.
+    fn spec_round_commit(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        accepts: &[(usize, usize, usize)],
+    ) -> Result<(), GpuModelError> {
+        self.reply_after_spec(reqs, accepts)?;
+        self.spec_verify_commit(reqs, accepts)?;
         // the verified rows carry the drafter's features (the aux taps ran
         // during the walk); coverage advances only through ACCEPTED rows -
         // KV cells past that get overwritten by the next round's append
+        let total: usize = reqs.iter().map(|r| r.2.len()).sum();
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
             self.dflash_append_features(total)?;
-            for &(slot, _, acc) in &accepts {
-                let pos0 = reqs.iter().find(|r| r.0 == slot).map(|r| r.1).unwrap_or(0);
-                self.dflash_note_rows(slot, pos0, pos0 + acc);
+            for (&(slot, pos0, _), &(_, _, acc)) in reqs.iter().zip(accepts) {
+                self.dflash_note_rows(slot, pos0, acc);
             }
         }
         if self.mtp.as_ref().is_some_and(|m| m.state.is_some()) {
@@ -231,12 +452,11 @@ impl GpuNemotron {
                 base2 += chunk.len();
             }
             self.mtp_append_rows(&mruns)?;
-            for &(slot, off, acc) in &accepts {
-                let pos0 = reqs.iter().find(|r| r.0 == slot).map(|r| r.1).unwrap_or(0);
+            for (&(slot, pos0, _), &(_, off, acc)) in reqs.iter().zip(accepts) {
                 self.mtp_advance(slot, pos0, pos0 + acc, off + acc - 1)?;
             }
         }
-        Ok(Some(picks))
+        Ok(())
     }
 
     /// Roll every partially-accepted slot's mamba state back to the accepted

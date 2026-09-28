@@ -76,6 +76,10 @@ const PREFILL_SPAN: u64 = 8192;
 const PREFIX_CKPT_FLOOR: u64 = 16;
 /// ...and the ceiling, matching the engine's own clamp.
 const PREFIX_CKPT_CAP: u64 = 256;
+/// Checkpoints one turn writes (two prompt cuts and the reply's) - what a
+/// family with paged checkpoints must back per slot, up to the floor above.
+/// Mirrors qwen35's `STATE_CKPTS_PER_TURN`.
+const PREFIX_CKPTS_PER_TURN: u64 = 3;
 /// Divisor on the grant that the checkpoint pool may spend - the engine's
 /// `STATE_CKPT_GRANT_DIV`. The pool is SELF-SIZED from what the endpoint was
 /// given, not fixed at its floor, and modelling only the floor is how this
@@ -168,6 +172,13 @@ pub struct RecurrentShape {
     pub conv_elems: u64,
     pub conv_dim: u64,
     pub elem_bytes: u64,
+    /// The engine keeps this family's prefix checkpoints in the KV pool's own
+    /// pages (issue #33; the qwen35 and nemotron families). Then only the live turns'
+    /// checkpoints are a load-time cost, and the rest is bought from what the
+    /// grant has left after the context - never out of it. Families on a
+    /// fixed checkpoint pool keep the floor-plus-pool pricing.
+    #[serde(default)]
+    pub paged_checkpoints: bool,
 }
 
 /// How paddock serves a model - which decides whether a KV cache exists at all.
@@ -457,6 +468,19 @@ impl ModelShape {
                 conv_elems: s.conv_elems,
                 conv_dim: s.conv_dim,
                 elem_bytes: s.elem_bytes,
+                // the archs whose engine family keeps its checkpoints in
+                // pool pages: GpuQwen35, GpuNemotron and Qwen4ExpGpu
+                paged_checkpoints: matches!(
+                    r.architecture.as_deref(),
+                    Some(
+                        "qwen35"
+                            | "qwen35moe"
+                            | "nemotron_h_moe"
+                            | "nemotron_h"
+                            | "nemotron-h"
+                            | "qwen4exp"
+                    )
+                ),
             }),
             cross_kv: r.cross_kv.as_ref().map(|c| CrossKv {
                 layers: c.layers,
@@ -765,7 +789,25 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
         (Some(r), false) => r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes,
         _ => 0,
     };
-    let prefix_ckpt = PREFIX_CKPT_FLOOR * per_ckpt + 2 * per_ckpt;
+    // Paged checkpoints (issue #33) put only the live turns' pages in front of
+    // the context - three a slot, up to the old floor - and each occupies
+    // whole pool pages, so it is priced in pages.
+    let paged_ckpts = shape
+        .recurrent
+        .as_ref()
+        .is_some_and(|r| r.paged_checkpoints);
+    let ckpt_floor = if paged_ckpts {
+        (PREFIX_CKPTS_PER_TURN * n).min(PREFIX_CKPT_FLOOR)
+    } else {
+        PREFIX_CKPT_FLOOR
+    };
+    let ckpt_bytes = if paged_ckpts {
+        let page = shape.kv_per_sequence(16, env.kv_dtype).max(1);
+        per_ckpt.div_ceil(page) * page
+    } else {
+        per_ckpt
+    };
+    let prefix_ckpt = ckpt_floor * ckpt_bytes + 2 * per_ckpt;
     // ...and the pool above its floor, which is a different kind of number.
     //
     // Measured: the engine self-sizes this pool from the grant -
@@ -779,7 +821,12 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     // The engine spends this out of the GRANT, where it competes with the KV
     // pool - so that is where it is charged. Load-time requirement: the
     // floor. Division of what is left: this.
-    let prefix_pool_extra = {
+    //
+    // Paged, there is no such pool: the wanted checkpoints beyond the floor
+    // are bought only from what the context leaves, so they take nothing.
+    let prefix_pool_extra = if paged_ckpts {
+        0
+    } else {
         let planes_now = shape.weight_bytes + shape.tower_bytes + shape.workspace_bytes;
         let grant = dev
             .free_bytes
@@ -909,9 +956,10 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
         // "tight" verdict, and the question it asks is whether the endpoint
         // can cache prefixes at all. The pool being able to grow past its
         // minimum is not what makes an endpoint workable.
-        shape.recurrent.as_ref().map_or(0, |r| {
-            PREFIX_CKPT_FLOOR * r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes
-        })
+        shape
+            .recurrent
+            .as_ref()
+            .map_or(0, |_| ckpt_floor * ckpt_bytes)
     };
 
     // Fit is decided by `resident` alone. A model that loads but can't reach a
@@ -1036,6 +1084,7 @@ mod tests {
                 conv_elems: 24_576,
                 conv_dim: 8_192,
                 elem_bytes: 4,
+                paged_checkpoints: true,
             }),
             cross_kv: None,
             max_ctx: 262_144,
@@ -1471,7 +1520,17 @@ mod tests {
             f16.max_ctx,
             fp8.max_ctx
         );
-        assert_eq!(fp8.resident, f16.resident);
+        // The floor does not move with the KV dtype - except by page
+        // rounding: paged checkpoints occupy whole pool pages, and a page is
+        // half the bytes at fp8, so each checkpoint rounds up by less than
+        // one f16 page either way.
+        let page = shape.kv_per_sequence(16, KvDtype::F16);
+        assert!(
+            fp8.resident.abs_diff(f16.resident) <= PREFIX_CKPT_FLOOR * page,
+            "f16 {} vs fp8 {}",
+            f16.resident,
+            fp8.resident
+        );
     }
 
     /// Sliding-window blocks stop growing at their window - the property that
@@ -1670,6 +1729,55 @@ mod tests {
         assert!(with_tower.max_ctx <= text_only.max_ctx);
     }
 
+    /// Issue #33: a family whose checkpoints live in pool pages is charged one
+    /// turn of them per slot, up to the old floor, and loses no pool out of
+    /// its context; a fixed-pool family keeps the 16-deep floor and its pool.
+    #[test]
+    fn paged_checkpoints_price_the_live_turns_not_a_fixed_pool() {
+        let paged = qwen35_9b();
+        let mut fixed = qwen35_9b();
+        if let Some(r) = fixed.recurrent.as_mut() {
+            r.paged_checkpoints = false;
+        }
+        let dev = Device {
+            free_bytes: 24 << 30,
+            total_bytes: 24 << 30,
+        };
+        let one = Envelope {
+            concurrency: 1,
+            kv_dtype: KvDtype::F16,
+            spec: None,
+            offload: None,
+        };
+        let (p, f) = (estimate(&paged, &one, &dev), estimate(&fixed, &one, &dev));
+        let r = paged.recurrent.expect("hybrid");
+        let per_ckpt = r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes;
+        assert!(
+            f.overhead_parts.prefix_checkpoints - p.overhead_parts.prefix_checkpoints
+                >= 12 * per_ckpt,
+            "one slot pays 3 checkpoints, not 16"
+        );
+        assert_eq!(p.overhead_parts.prefix_pool_extra, 0);
+        assert!(
+            p.max_ctx >= f.max_ctx,
+            "and the context gets the difference"
+        );
+        // at width 8 the turns (24) are capped at the old floor (16)
+        let eight = Envelope {
+            concurrency: 8,
+            ..one
+        };
+        let (p8, f8) = (
+            estimate(&paged, &eight, &dev),
+            estimate(&fixed, &eight, &dev),
+        );
+        assert!(
+            p8.overhead_parts.prefix_checkpoints
+                <= f8.overhead_parts.prefix_checkpoints + 16 * per_ckpt / 8,
+            "a wide paged server reserves no more than the fixed floor (up to page rounding)"
+        );
+    }
+
     /// The three terms the engine reserves before the KV pool and this crate
     /// used to ignore. Measured on Qwen3.8-27B: the engine charged
     /// itself 7.49 GiB, this estimate charged 3.78, and the difference is why
@@ -1698,12 +1806,13 @@ mod tests {
 
         let r = shape.recurrent.expect("qwen35 is a hybrid");
         let per_ckpt = r.layers * (r.state_elems + r.conv_elems) * r.elem_bytes;
-        // the checkpoint pool at its floor, plus the two staging blobs
+        // one slot's turn of checkpoints (qwen35's are pool pages), plus the
+        // two staging blobs
         assert!(
-            a.overhead >= (PREFIX_CKPT_FLOOR + 2) * per_ckpt,
+            a.overhead >= (PREFIX_CKPTS_PER_TURN + 2) * per_ckpt,
             "prefix checkpoints unpriced: overhead {} < {}",
             a.overhead,
-            (PREFIX_CKPT_FLOOR + 2) * per_ckpt
+            (PREFIX_CKPTS_PER_TURN + 2) * per_ckpt
         );
         // the allocator's rounding on every resident plane
         assert!(a.overhead >= (shape.weight_bytes as f64 * ALLOCATOR_SLACK_SHARE) as u64);

@@ -18,6 +18,7 @@
 mod forward;
 mod load;
 mod load_gguf;
+mod pages;
 mod prefix;
 
 pub use forward::{QsaMode, Qwen4ExpGpu};

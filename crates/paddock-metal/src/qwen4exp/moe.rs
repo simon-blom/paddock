@@ -12,6 +12,12 @@ use paddock_models::mapped::MappedGguf;
 const EXPERTS: usize = 512;
 const ACTIVE: usize = 10;
 const FF: usize = 640;
+#[cfg(test)]
+thread_local! {
+    pub(super) static BASELINE_EXPERT_TAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static EXPERT_LOADER_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
+    pub(super) static FUSED_GATE_UP_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 pub(super) struct Weights {
     router: Weight,
@@ -218,7 +224,7 @@ impl Weights {
             32,
         );
         let entries = rows * ACTIVE;
-        let mut matrix_mask = [0u32; 32];
+        let mut matrix_mask = [0u32; affine::MAX_ROWS.div_ceil(32)];
         if let Some(spans) = cmd.projection_rows() {
             for &(start, count, logical) in spans {
                 // Match the checkpoint's sorted RHS matrix contraction at
@@ -264,7 +270,7 @@ impl Weights {
         let project_experts = |w: &Weight, x: &Buffer, y: &Buffer, per_entry: bool| {
             if matrix {
                 let n = w.n / EXPERTS;
-                let mut p = [0u32; 37];
+                let mut p = [0u32; 5 + affine::MAX_ROWS.div_ceil(32)];
                 p[..5].copy_from_slice(&[
                     w.k as u32,
                     n as u32,
@@ -273,9 +279,44 @@ impl Weights {
                     512,
                 ]);
                 p[5..].copy_from_slice(&matrix_mask);
+                let tail = cmd.tensor_accelerated();
+                #[cfg(test)]
+                let tail = tail && !BASELINE_EXPERT_TAIL_FOR_TEST.with(|v| v.get());
+                #[cfg(test)]
+                let loader = EXPERT_LOADER_FOR_TEST.with(|v| v.get());
+                #[cfg(not(test))]
+                let loader = 2;
+                let input_rows = if per_entry { entries } else { rows };
+                let packed = cmd.projection_workspace().filter(|workspace| {
+                    tail && loader == 2 && workspace.len() >= input_rows.div_ceil(32) * 32 * w.k * 2
+                });
+                if let Some(packed) = packed {
+                    cmd.dispatch(
+                        "q4a_input",
+                        &[x, packed],
+                        &[w.k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
+                        [(input_rows.div_ceil(32) * 32 * w.k).div_ceil(256), 1, 1],
+                        256,
+                    );
+                }
                 cmd.dispatch(
-                    "q4a_expert_mm_wide",
-                    &[&w.buffer, x, &s.lists, &s.counts, &s.tiles, y],
+                    if packed.is_some() {
+                        "q4a_expert_mm_group32_packed"
+                    } else if tail && loader > 0 {
+                        "q4a_expert_mm_group32_pad"
+                    } else if tail {
+                        "q4a_expert_mm_tail"
+                    } else {
+                        "q4a_expert_mm_wide"
+                    },
+                    &[
+                        &w.buffer,
+                        packed.unwrap_or(x),
+                        &s.lists,
+                        &s.counts,
+                        &s.tiles,
+                        y,
+                    ],
                     &p,
                     [n.div_ceil(64), Workspace::tiles(rows), 1],
                     128,
@@ -293,17 +334,107 @@ impl Weights {
                 affine::experts_ordered(cmd, w, x, &s.ids, y, entries, per_entry, order);
             }
         };
-        project_experts(&self.gate, x, &s.act, false);
-        // The down-output allocation is dead until gate/up activation is
-        // complete, and is larger than the routed up plane. Reuse its prefix.
-        project_experts(&self.up, x, &s.down, false);
-        cmd.dispatch(
-            "mlx_swiglu",
-            &[&s.act, &s.down],
-            &[(entries * FF) as u32],
-            [(entries * FF).div_ceil(256), 1, 1],
-            256,
-        );
+        #[cfg(test)]
+        let fused = FUSED_GATE_UP_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let fused = 0;
+        let packed = cmd.projection_workspace().filter(|workspace| {
+            fused > 0
+                && matrix
+                && cmd.tensor_accelerated()
+                && workspace.len() >= rows.next_multiple_of(32) * self.gate.k * 2
+        });
+        if let Some(packed) = packed {
+            let mut p = [0u32; 5 + affine::MAX_ROWS.div_ceil(32)];
+            p[..5].copy_from_slice(&[self.gate.k as u32, FF as u32, entries as u32, 0, 512]);
+            p[5..].copy_from_slice(&matrix_mask);
+            cmd.dispatch(
+                "q4a_input",
+                &[x, packed],
+                &[self.gate.k as u32, FF as u32, rows as u32, 0, 0, 0, 0],
+                [
+                    (rows.next_multiple_of(32) * self.gate.k).div_ceil(256),
+                    1,
+                    1,
+                ],
+                256,
+            );
+            if fused == 2 {
+                cmd.dispatch(
+                    "q4a_expert_gate_up_dispatch",
+                    &[
+                        &self.gate.buffer,
+                        &self.up.buffer,
+                        packed,
+                        &s.lists,
+                        &s.counts,
+                        &s.tiles,
+                        &s.act,
+                        &s.down,
+                    ],
+                    &p,
+                    [FF.div_ceil(64), Workspace::tiles(rows), 2],
+                    128,
+                );
+            } else {
+                cmd.dispatch(
+                    "q4a_expert_gate_up_packed",
+                    &[
+                        &self.gate.buffer,
+                        &self.up.buffer,
+                        packed,
+                        &s.lists,
+                        &s.counts,
+                        &s.tiles,
+                        &s.act,
+                    ],
+                    &p,
+                    [FF.div_ceil(64), Workspace::tiles(rows), 1],
+                    128,
+                );
+            }
+            if vectors {
+                for (w, y) in [(&self.gate, &s.act), (&self.up, &s.down)] {
+                    cmd.dispatch(
+                        "q4a_expert_vector_masked",
+                        &[&w.buffer, x, &s.ids, y],
+                        &p,
+                        [FF.div_ceil(16), entries, 1],
+                        128,
+                    );
+                }
+                if fused == 1 {
+                    cmd.dispatch(
+                        "q4a_expert_swiglu_masked",
+                        &[&s.act, &s.down],
+                        &p,
+                        [(entries * FF).div_ceil(256), 1, 1],
+                        256,
+                    );
+                }
+            }
+            if fused == 2 {
+                cmd.dispatch(
+                    "mlx_swiglu",
+                    &[&s.act, &s.down],
+                    &[(entries * FF) as u32],
+                    [(entries * FF).div_ceil(256), 1, 1],
+                    256,
+                );
+            }
+        } else {
+            project_experts(&self.gate, x, &s.act, false);
+            // The down-output allocation is dead until gate/up activation is
+            // complete, and is larger than the routed up plane. Reuse its prefix.
+            project_experts(&self.up, x, &s.down, false);
+            cmd.dispatch(
+                "mlx_swiglu",
+                &[&s.act, &s.down],
+                &[(entries * FF) as u32],
+                [(entries * FF).div_ceil(256), 1, 1],
+                256,
+            );
+        }
         project_experts(&self.down, &s.act, &s.down, true);
         affine::project(cmd, &self.shared_gate, x, &s.shared_gate, rows);
         affine::project(cmd, &self.shared_up, x, &s.shared_up, rows);
@@ -449,9 +580,9 @@ impl Workspace {
         (rows * ACTIVE).div_ceil(32) + EXPERTS
     }
     pub(super) fn bytes(rows: usize) -> Result<usize> {
-        if !(1..=1024).contains(&rows) {
+        if !(1..=affine::MAX_ROWS).contains(&rows) {
             return Err(MetalError::Model(
-                "Flash Next MoE rows must be 1..=1024".into(),
+                "Flash Next MoE rows must be 1..=2048".into(),
             ));
         }
         Ok(4 * (rows

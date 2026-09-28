@@ -1191,6 +1191,8 @@ __global__ void pd_attn_decode_vec8_paged_kernel(
 }
 
 
+#define PD_COMBINE_STAGE 256u   // splits the batch combine stages in shared memory
+
 // Batched FlashDecoding combine: merge the n_splits partials for each (head, seq)
 // into the final output, folding the per-head sink into the denominator. grid
 // (n_heads, batch); one thread per output dim. Empty splits carry m=-inf -> drop.
@@ -1204,21 +1206,38 @@ __global__ void pd_attn_decode_batch_combine_kernel(
     uint32_t h = blockIdx.x, b = blockIdx.y;
     uint32_t d = threadIdx.x;
     size_t pbase = (size_t)(h * gridDim.y + b) * n_splits;
+    // the splits' (m, l) pairs staged once by the whole CTA: every thread
+    // walks all of them twice, and reading them from global each step was a
+    // chain of n_splits dependent round trips per loop (GB10 2026-09-26: 6.1
+    // us at the W16 class's 128 fixed splits, 3.0 at lagd's 24). Same
+    // values, same fold order - bit-identical to the global walk.
+    __shared__ float2 sml[PD_COMBINE_STAGE];
+    const bool staged = n_splits <= PD_COMBINE_STAGE;
+    if (staged) {
+        for (uint32_t s = d; s < n_splits; s += blockDim.x)
+            sml[s] = reinterpret_cast<const float2*>(in_ml)[pbase + s];
+        __syncthreads();
+    }
+    auto split_ml = [&](uint32_t s) {
+        return staged ? sml[s]
+                      : make_float2(in_ml[(pbase + s) * 2], in_ml[(pbase + s) * 2 + 1]);
+    };
 
     float gm = sinks[h];
     for (uint32_t s = 0; s < n_splits; ++s)
-        gm = fmaxf(gm, in_ml[(pbase + s) * 2 + 0]);
+        gm = fmaxf(gm, split_ml(s).x);
 
     float acc = 0.0f, l = 0.0f;
     for (uint32_t s = 0; s < n_splits; ++s) {
-        float m = in_ml[(pbase + s) * 2 + 0];
+        const float2 mls = split_ml(s);
+        float m = mls.x;
         if (m == -INFINITY) continue;  // empty split: sc = expf(-inf-gm) = 0
                                        // and o = 0 - an exact +0 term. Skip
                                        // the head_dim-float o read; at short
                                        // kv the GV adaptive-split arm leaves
                                        // most splits empty (s_eff << n_splits)
                                        // and this drops ~7/8 of the o traffic.
-        float ls = in_ml[(pbase + s) * 2 + 1];
+        float ls = mls.y;
         float sc = __expf(m - gm);
         acc += sc * in_o[(pbase + s) * head_dim + d];
         l += sc * ls;
@@ -1579,15 +1598,15 @@ __global__ void pd_moe_topk_batch_shm_kernel_t(const float* __restrict__ logits,
 // is BIT-IDENTICAL to the original (same per-thread i stride, same shfl
 // tree, same serial cross-warp sum) - the router feeds topk, where a last-
 // ulp change could flip a tie - so this is a pure schedule change.
+// The body is shared with the W16 class's fused router (moe/nvf4_w16.cuh):
+// one source, so its logits are these bits.
 template <uint32_t BT>
-__global__ void pd_matvec_f32_batch_kernel(const float* __restrict__ w,
-                                           const float* __restrict__ x,
-                                           float* __restrict__ out,
-                                           uint32_t in_dim, uint32_t out_dim,
-                                           uint32_t batch) {
-    // cascade (laguna router): x is the predecessor rmsnorm's output
-    PD_PDL_ARM();
-    const uint32_t o = blockIdx.x, t0 = blockIdx.y * BT;
+__device__ __forceinline__ void pd_matvec_f32_batch_body(const float* __restrict__ w,
+                                                         const float* __restrict__ x,
+                                                         float* __restrict__ out,
+                                                         uint32_t in_dim, uint32_t out_dim,
+                                                         uint32_t batch, uint32_t o,
+                                                         uint32_t t0) {
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const float* wr = w + (size_t)o * in_dim;
     float acc[BT] = {};
@@ -1641,6 +1660,17 @@ __global__ void pd_matvec_f32_batch_kernel(const float* __restrict__ w,
             out[(size_t)(t0 + b) * out_dim + o] = v;
         }
     }
+}
+
+template <uint32_t BT>
+__global__ void pd_matvec_f32_batch_kernel(const float* __restrict__ w,
+                                           const float* __restrict__ x,
+                                           float* __restrict__ out,
+                                           uint32_t in_dim, uint32_t out_dim,
+                                           uint32_t batch) {
+    // cascade (laguna router): x is the predecessor rmsnorm's output
+    PD_PDL_ARM();
+    pd_matvec_f32_batch_body<BT>(w, x, out, in_dim, out_dim, batch, blockIdx.x, blockIdx.y * BT);
 }
 
 // Fused MXFP4-dequant + GEMV for one expert selected by a device index (so the
@@ -2280,11 +2310,14 @@ __global__ void pd_mxfp4_repack_kernel(const unsigned char* __restrict__ src,
 //   sorted_row[max_blocks*BM]  : source token row per entry (PD_MOE_PAD = padding)
 //   sorted_slot[max_blocks*BM] : which of the token's n_active picks (topk_w/output)
 //   block_expert[max_blocks]   : expert id per BM-block (PD_MOE_PAD = unused block)
-__global__ void pd_moe_align_kernel(
+// The body runs in any block size over `ash` (3 * n_expert u32 of shared
+// memory); the W16 class's fused router (moe/nvf4_w16.cuh) runs it in its
+// last CTA.
+__device__ __forceinline__ void pd_moe_align_body(
     const unsigned int* __restrict__ idx, unsigned int* __restrict__ sorted_row,
     unsigned int* __restrict__ sorted_slot, unsigned int* __restrict__ block_expert,
-    uint32_t rows, uint32_t n_active, uint32_t n_expert, uint32_t bm, uint32_t max_blocks) {
-    PD_PDL_ARM();
+    uint32_t rows, uint32_t n_active, uint32_t n_expert, uint32_t bm, uint32_t max_blocks,
+    unsigned int* ash) {
     // histogram -> block-wide scan -> scatter. The first cut had one thread
     // serially walk all experts for the prefix AND the block_expert writes -
     // 21.7 us at c32/128e with the whole block idle
@@ -2293,7 +2326,6 @@ __global__ void pd_moe_align_kernel(
     // works), per-expert parallel block_expert writes, and PAD-fill of only
     // the used entry region (the tail past bacc*bm is never read - its
     // block_expert says PAD and every consumer early-outs on that).
-    extern __shared__ unsigned int ash[];
     unsigned int* count = ash;              // [n_expert]
     unsigned int* boff = count + n_expert;  // [n_expert] first block index
     unsigned int* fill = boff + n_expert;   // [n_expert] running scatter counter
@@ -2351,6 +2383,16 @@ __global__ void pd_moe_align_kernel(
         sorted_row[pos] = p / n_active;
         sorted_slot[pos] = p % n_active;
     }
+}
+
+__global__ void pd_moe_align_kernel(
+    const unsigned int* __restrict__ idx, unsigned int* __restrict__ sorted_row,
+    unsigned int* __restrict__ sorted_slot, unsigned int* __restrict__ block_expert,
+    uint32_t rows, uint32_t n_active, uint32_t n_expert, uint32_t bm, uint32_t max_blocks) {
+    PD_PDL_ARM();
+    extern __shared__ unsigned int ash[];
+    pd_moe_align_body(idx, sorted_row, sorted_slot, block_expert, rows, n_active, n_expert, bm,
+                      max_blocks, ash);
 }
 
 // Sorted tiled MoE gate+up+swiglu: like pd_mxfp4_moe_gate_up_gemm but reads the

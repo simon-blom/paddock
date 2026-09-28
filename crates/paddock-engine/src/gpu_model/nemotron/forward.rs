@@ -1862,6 +1862,62 @@ impl Generator for GpuNemotron {
         (self.dflash.is_some() || self.mtp.is_some()) && self.spec_verify_ready()
     }
 
+    fn forward_spec_batch_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<u32>>, GenError> {
+        self.forward_spec_batch_plans_impl(reqs, plans)
+            .map_err(gen_err)
+    }
+
+    fn forward_spec_verify(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+    ) -> Result<Option<Vec<f32>>, GenError> {
+        self.forward_spec_verify_impl(reqs).map_err(gen_err)
+    }
+
+    fn spec_commit(&mut self, committed: &[u32]) -> Result<(), GenError> {
+        self.spec_commit_impl(committed).map_err(gen_err)
+    }
+
+    fn spec_block_width(&self) -> Option<usize> {
+        self.dflash
+            .as_ref()
+            .map(|_| crate::gpu_model::nemotron::dflash::BLOCK)
+    }
+
+    fn spec_fixed_draft_depth(&self) -> Option<usize> {
+        // the elected verify depth over the trained block (dflash.rs): the
+        // chain ramp's per-slot k resized the block every round instead
+        self.dflash.as_ref().map(|d| d.verify_depth())
+    }
+
+    fn spec_live_cap(&self) -> usize {
+        // every live slot's verify rows must fit the round's snapshot planes
+        // at depth 1 or more; the per-live budget below narrows the depth
+        match &self.dflash {
+            Some(d) => (1..=crate::gpu_model::nemotron::spec::SPEC_ROWS_NEMO)
+                .take_while(|&live| d.depth_for_live(live) > 0)
+                .last()
+                .unwrap_or(0),
+            None => usize::MAX,
+        }
+    }
+
+    fn spec_batch_draft_budget(&self, live: usize) -> Option<usize> {
+        self.dflash.as_ref().map(|d| d.depth_for_live(live))
+    }
+
+    fn spec_sampled_live_cap(&self) -> Option<usize> {
+        // the block drafter's rounds pay for themselves at every width the
+        // per-live depth budget speculates at - tool-carrying sampled traffic
+        // at 6 / 8 live: 191 -> 229 and 215 -> 271 tok/s against no drafter
+        // (GB10 2026-09-26), where the service's generic 4-live cap had it off
+        self.dflash.as_ref().map(|_| self.spec_live_cap())
+    }
+
     fn spec_ensure_warm(
         &mut self,
         slot: usize,
@@ -1890,9 +1946,13 @@ impl Generator for GpuNemotron {
             .and_then(|d| d.state.as_ref())
             .is_some()
         {
-            let k = k.min(crate::gpu_model::nemotron::dflash::MAX_DRAFT);
-            let mut out = Vec::with_capacity(pendings.len());
-            for &(slot, tok) in pendings {
+            use crate::gpu_model::nemotron::dflash::{BLOCK, MAX_DRAFT};
+            let k = k.min(MAX_DRAFT);
+            // warm slots draft together in one pass; features cover committed
+            // rows [0, end), the pending token sits at `end`
+            let mut reqs = Vec::with_capacity(pendings.len());
+            let mut at = Vec::with_capacity(pendings.len());
+            for (i, &(slot, tok)) in pendings.iter().enumerate() {
                 let end = {
                     let st = self
                         .dflash
@@ -1903,13 +1963,37 @@ impl Generator for GpuNemotron {
                         .expect("dflash state");
                     st.feat[slot].1 as usize
                 };
-                if !self.dflash_warm(slot, end) || end == 0 {
-                    out.push(Vec::new());
-                    continue;
+                if end > 0 && self.dflash_warm(slot, end) {
+                    reqs.push((slot, end, tok));
+                    at.push(i);
                 }
-                // features cover committed rows [0, end); the pending token
-                // sits at position `end` and drafts follow it
-                out.push(self.dflash_draft(slot, end, tok, k).map_err(gen_err)?);
+            }
+            let mut out = vec![Vec::new(); pendings.len()];
+            // a verify round takes SPEC_ROWS rows, one per pending slot:
+            // drafts past that would only make the round decline
+            let kr = if reqs.is_empty() {
+                0
+            } else {
+                k.min(
+                    crate::gpu_model::nemotron::spec::SPEC_ROWS_NEMO.saturating_sub(pendings.len())
+                        / reqs.len(),
+                )
+            };
+            if kr > 0 {
+                // DFlash runs its trained block whatever the round verifies
+                // (see dflash::BLOCK) and the verify takes the leading kr;
+                // DSpark's block is causal, so its first kr rows ARE the
+                // trained block's first kr - drafting more buys nothing
+                let causal = self.dflash.as_ref().is_some_and(|d| d.causal);
+                let kg = if causal {
+                    kr
+                } else {
+                    k.clamp(BLOCK - 1, MAX_DRAFT)
+                };
+                let d = self.dflash_draft_batch(&reqs, kg, kr).map_err(gen_err)?;
+                for (i, d) in at.into_iter().zip(d) {
+                    out[i] = d;
+                }
             }
             return Ok(Some(out));
         }

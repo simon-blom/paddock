@@ -78,9 +78,13 @@ fn enable_batch_builds_pool_and_arenas() {
     let (free, capacity) = model.batch_pool_stats().expect("batch populated");
     assert!(capacity >= 256, "pool below the floor: {capacity}");
     // ceiling = addressable (slots × bps) + the stage-D radix retention slack
+    // + the recurrent-state checkpoints the plan bought, which live in the
+    // pool's own pages (issue #33)
+    let (ppc, ckpt_pages) = model.batch_ckpt_plan_probe().unwrap_or((0, 0));
     assert!(
-        capacity <= 4 * MAX_CTX.div_ceil(16) + 512,
-        "pool over the addressable + retention ceiling: {capacity}"
+        capacity <= 4 * MAX_CTX.div_ceil(16) + 512 + ckpt_pages,
+        "pool over the addressable + retention + checkpoint ceiling: {capacity} \
+         ({ckpt_pages} checkpoint pages, {ppc} a checkpoint)"
     );
     assert_eq!(free, capacity, "fresh pool must be all-free");
 
@@ -336,30 +340,31 @@ fn prefix_cache_resumes_with_state_snapshot() {
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 
-    let greedy8 = |model: &mut GpuNemotron, slot: usize, first: &[f32], pos0: usize| {
-        let mut ids = Vec::new();
-        let mut tok = argmax(first);
-        for pos in (pos0 as u32..).take(8) {
-            ids.push(tok);
-            let (step, _) = model
-                .forward_mixed_sampled(
-                    &[(slot, tok, pos)],
-                    usize::MAX,
-                    &[paddock_engine::generator::RowSample::Device(
-                        paddock_engine::sampler::DevicePlan::Greedy,
-                    )],
-                    &[],
-                )
+    // 8 decode ticks on `slot` from PROMPT_LEN: fed `feed` when given (the
+    // teacher-forced twin), else its own greedy picks. Returns the fed
+    // tokens and each tick's logits.
+    let decode8 = |model: &mut GpuNemotron, slot: usize, first: u32, feed: &[u32]| {
+        let mut fed = Vec::new();
+        let mut logits: Vec<Vec<f32>> = Vec::new();
+        let mut tok = first;
+        for i in 0..8usize {
+            if let Some(&f) = feed.get(i) {
+                tok = f;
+            }
+            fed.push(tok);
+            let (l, _) = model
+                .forward_mixed(&[(slot, tok, (PROMPT_LEN + i) as u32)], usize::MAX)
                 .expect("decode tick");
-            tok = step.ids[0];
+            tok = argmax(&l);
+            logits.push(l);
         }
-        ids
+        (fed, logits)
     };
 
     // cold prefill (slot 0): plants checkpoints at 672 and 688
     let cold = model.forward_prefill(0, &prompt).expect("cold prefill");
     assert_eq!(model.take_prefill_reused(0), 0, "first sight cannot reuse");
-    let cold_ids = greedy8(&mut model, 0, &cold, PROMPT_LEN);
+    let (cold_ids, cold_l) = decode8(&mut model, 0, argmax(&cold), &[]);
 
     // exact repeat (slot 1): resumes at the deepest checkpoint
     let warm = model.forward_prefill(1, &prompt).expect("warm prefill");
@@ -382,19 +387,47 @@ fn prefix_cache_resumes_with_state_snapshot() {
         argmax(&warm),
         "resume flipped the boundary pick"
     );
-    // The 12-row resumed tail crosses pd_matvec_f32_batch's r=16 rung
-    // boundary (the MoE router's lane-strided vs thread-strided sums - a
-    // sanctioned order change), so 23 MoE layers compound a
-    // smooth few-percent drift (measured 4.5% of rms). The band gates that
-    // it stays in the sanctioned class; the STRUCTURAL gate - a wrong
-    // snapshot, a stale window, a misaligned resume - is the greedy-stream
-    // equality below, which numeric reorder does not break.
+    // The 12-row resumed tail rides a narrower prefill pass than the cold
+    // walk's 700 rows (the MoE router's r=16 rung, the GEMM tiles - sanctioned
+    // order changes), so 23 MoE layers compound a smooth few-percent drift
+    // (measured 4.5% of rms). The band gates that it stays in the sanctioned
+    // class. The STRUCTURAL gate - a wrong snapshot, a stale window, a
+    // misaligned resume - is the decode below, teacher-forced on the cold
+    // stream: every tick stays in the band, and picks the cold pick wherever
+    // the cold margin clears twice the drift. Free-running greedy equality
+    // is not the gate: at a near-tie (a 0.005 margin at tick 4 of this
+    // prompt) the drift parts the streams without either being wrong.
     assert!(
         mean_abs / rms.max(1e-3) < 0.10,
         "resumed logits drifted past the reorder class: mean |d| {mean_abs:.5} vs rms {rms:.3}"
     );
-    let warm_ids = greedy8(&mut model, 1, &warm, PROMPT_LEN);
-    assert_eq!(cold_ids, warm_ids, "greedy stream diverged after resume");
+    let (_, warm_l) = decode8(&mut model, 1, argmax(&warm), &cold_ids);
+    for (i, (c, w)) in cold_l.iter().zip(&warm_l).enumerate() {
+        let (sum, md) = c.iter().zip(w).fold((0.0f64, 0.0f32), |(s, m), (a, b)| {
+            let d = (a - b).abs();
+            (s + d as f64, m.max(d))
+        });
+        let crms =
+            (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / c.len() as f64).sqrt();
+        let mean = sum / c.len() as f64;
+        let mut top = c.clone();
+        top.sort_by(|a, b| b.total_cmp(a));
+        let margin = top[0] - top[1];
+        println!(
+            "tick {i}: mean |d| {mean:.5} max {md:.4} vs rms {crms:.3}, cold margin {margin:.4}"
+        );
+        assert!(
+            mean / crms.max(1e-3) < 0.10,
+            "tick {i}: resumed decode drifted past the reorder class"
+        );
+        if margin > 2.0 * md {
+            assert_eq!(
+                argmax(w),
+                argmax(c),
+                "tick {i}: resumed decode picked off the cold stream"
+            );
+        }
+    }
 
     // divergent tail (slot 2): shares 680 tokens -> page 43 differs -> the
     // 672 checkpoint is the deepest reachable one
@@ -438,6 +471,71 @@ fn prefix_cache_resumes_with_state_snapshot() {
     println!(
         "prefix cache: exact repeat 688, divergent-tail 672, chunked lane resumed in {ticks} tick(s)"
     );
+}
+
+/// A conversation longer than half the pool still resumes from the cache.
+/// A single-slot serve's pool holds max_ctx plus the retention reserve, so
+/// once a conversation passes half of it the pool cannot hold the cached
+/// prompt AND a fresh backing of the next, longer one. Admission used to back
+/// the whole new prompt before matching: the allocation shed the cached pages
+/// under it and every turn resumed at the system prompt's checkpoint (a 262K
+/// serve re-prefilled a ~210K Claude Code conversation each turn, GB10
+/// 2026-09-25). The second prompt here extends the first in the same slot and
+/// must resume at the first one's deepest checkpoint.
+#[test]
+fn prefix_cache_resumes_a_conversation_past_half_the_pool() {
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    if !exec.has_paged_kv()
+        || !exec.has_mamba2_batch()
+        || !exec.has_nvf4_gemv_batch()
+        || !exec.has_nvf4_ckpt()
+        || !exec.has_nemotron_prefill_f8()
+    {
+        common::missing("pack lacks the nemotron batch kernel set (cc != 12.0?)");
+        return;
+    }
+    let Some(dir) = common::model_dir(CKPT_ENV, &[CKPT_DIR]) else {
+        return;
+    };
+    const CTX: usize = 16384;
+    let mut model = GpuNemotron::load_dir(exec, &dir, CTX).expect("load");
+    assert_eq!(model.batch_enable_probe(1).expect("enable"), 1);
+    // the KV share of the pool: its checkpoint pages (issue #33) are not
+    // context a conversation can fill
+    let (_, ckpt_pages) = model.batch_ckpt_plan_probe().unwrap_or((0, 0));
+    let pool_tokens = (model.pool_free_blocks().expect("pool") - ckpt_pages) * 16;
+    let n1 = pool_tokens / 2 + 1000;
+    let n2 = n1 + 1000;
+    assert!(
+        n2 <= CTX,
+        "pool {pool_tokens} tokens leaves no room for the probe"
+    );
+    let Some(p2) = oracle_prompt(n2) else {
+        common::missing("no oracle dump for prompt ids");
+        return;
+    };
+    let p1 = &p2[..n1];
+
+    let first = model.forward_prefill(0, p1).expect("first turn");
+    assert_eq!(model.take_prefill_reused(0), 0, "first sight cannot reuse");
+    assert!(first.iter().all(|v| v.is_finite()));
+
+    // the next turn in the same slot: the cached pages of the first prompt
+    // plus its own tail must fit where the first prompt plus a whole second
+    // backing did not
+    let second = model.forward_prefill(0, &p2).expect("second turn");
+    let reused = model.take_prefill_reused(0);
+    let deepest = (n1 - 1) / 16 * 16;
+    println!(
+        "pool {pool_tokens} tokens: first turn {n1}, second {n2} resumed at {reused} (deepest checkpoint {deepest})"
+    );
+    assert_eq!(
+        reused, deepest,
+        "the second turn must resume at the first turn's deepest checkpoint"
+    );
+    assert!(second.iter().all(|v| v.is_finite()));
 }
 
 /// Stage-E fp8-KV smoke: the batch lane serves the checkpoint's own KV spec

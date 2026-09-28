@@ -12,6 +12,7 @@ use std::{collections::VecDeque, path::Path};
 
 mod forward;
 mod mlx_load;
+mod prefix;
 mod serving;
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ struct Scratch {
 struct Slot {
     table: BlockTable,
     length: usize,
+    reused: usize,
 }
 struct Pending {
     slot: usize,
@@ -63,15 +65,19 @@ pub struct FlashNext {
     head: Weight,
     output_hc: HyperConnection,
     ple_weights: ple::Weights,
-    ple_table: Weight,
+    ple_table: ple::Table,
     layers: Vec<Layer>,
     scratch: Scratch,
     affine_scratch: Option<Buffer>,
     slots: Vec<Slot>,
     pool: KvPool,
+    prefix: prefix::PrefixCache,
     pending: VecDeque<Pending>,
     context: usize,
     chunk: usize,
+    // Maximum physical rows shared across requests; `chunk` still defines
+    // each request's arithmetic and cache-compatible prompt boundaries.
+    capacity: usize,
     pages: usize,
     weight_bytes: u64,
     cache_bytes: u64,
@@ -105,7 +111,7 @@ impl FlashNext {
         let head = residual::load_weight(&device, &map, "output.weight", &[WIDTH, VOCAB], 14)?;
         let output_hc = HyperConnection::load(&device, &map, "output_hc", false)?;
         let ple_weights = ple::Weights::load(&device, &map)?;
-        let ple_table = ple::load_table(&device, &map)?;
+        let ple_table = ple::Table::Resident(ple::load_table(&device, &map)?);
         let mut layers = Vec::with_capacity(48);
         for li in 0..48 {
             let hc = HyperConnection::load(&device, &map, &format!("blk.{li}.hc_attn"), true)?;
@@ -157,9 +163,11 @@ impl FlashNext {
             affine_scratch: None,
             slots: (0..batch).map(|_| Slot::default()).collect(),
             pool: KvPool::with_blocks((pages * batch) as u32),
+            prefix: prefix::PrefixCache::default(),
             pending: VecDeque::new(),
             context,
             chunk: CHUNK,
+            capacity: CHUNK,
             pages,
             weight_bytes,
             cache_bytes,
@@ -175,9 +183,9 @@ impl FlashNext {
     fn memory_rows(context: usize, batch: usize, rows: usize) -> Result<(u64, u64)> {
         if !(1..=262144).contains(&context)
             || !(1..=64).contains(&batch)
-            || !(1..=MLX_CHUNK).contains(&rows)
+            || !(1..=super::affine::MAX_ROWS).contains(&rows)
         {
-            return Err(MetalError::Model("Flash Next bounds: context 1..=262144, batch 1..=64, prefill rows 1..=1024 (implementation limits, not qualification)".into()));
+            return Err(MetalError::Model("Flash Next bounds: context 1..=262144, batch 1..=64, physical prefill rows 1..=2048 (implementation limits, not qualification)".into()));
         }
         let pages = context.div_ceil(BLOCK_TOKENS);
         let pc = ple::State::cache_bytes(batch);
@@ -190,6 +198,15 @@ impl FlashNext {
             + moe::Workspace::bytes(rows)?
             + Scratch::own_bytes(batch, rows);
         Ok((cache as u64, scratch as u64))
+    }
+    fn mlx_memory_rows(context: usize, batch: usize, rows: usize) -> Result<(u64, u64)> {
+        let (cache, scratch) = Self::memory_rows(context, batch, rows)?;
+        let pages = context.div_ceil(BLOCK_TOKENS);
+        let saved = deltanet::Workspace::bytes(rows, batch)
+            - deltanet::Workspace::mlx_bytes(rows, batch)
+            + qsa::Workspace::bytes(rows, batch, pages)
+            - qsa::Workspace::mlx_bytes(rows, batch, pages);
+        Ok((cache, scratch - saved as u64))
     }
     fn healthy(&self) -> Result<()> {
         if self.poisoned {
@@ -207,9 +224,10 @@ impl FlashNext {
         if let Some(s) = self.slots.get_mut(slot) {
             s.table.clear(&mut self.pool);
             s.length = 0;
+            s.reused = 0;
         }
     }
-    fn prepare(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
+    fn prepare(&mut self, slot: usize, tokens: &[u32]) -> Result<usize> {
         self.healthy()?;
         if slot >= self.slots.len()
             || tokens.is_empty()
@@ -222,30 +240,39 @@ impl FlashNext {
             ));
         }
         self.release(slot);
-        Ok(())
+        let reused = self.restore_prefix(slot, tokens)?;
+        self.slots[slot].reused = reused;
+        Ok(reused)
     }
     fn prefill(&mut self, slot: usize, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.prepare(slot, tokens)?;
+        let mut pos = self.prepare(slot, tokens)?;
         let mut logits = Vec::new();
-        let body = tokens.len() - usize::from(self.is_mlx() && tokens.len() > 1);
         // The checkpoint's GPU reference uses decode arithmetic for the
         // final prompt token. Preserve that boundary even for short prompts.
-        for chunk in tokens[..body]
-            .chunks(self.chunk)
-            .chain((body < tokens.len()).then_some(&tokens[body..]))
-        {
-            let pos = self.slots[slot].length;
-            let rows = chunk
+        while pos < tokens.len() {
+            let (logical, mut n) = if self.is_mlx() {
+                serving::logical_chunk(tokens.len(), pos, self.chunk)
+            } else {
+                let n = self.chunk.min(tokens.len() - pos);
+                (n, n)
+            };
+            if self.prefix.enabled() {
+                n = n.min(prefix::rows_until_cut(tokens.len(), pos, self.chunk));
+            }
+            let rows = tokens[pos..pos + n]
                 .iter()
                 .enumerate()
                 .map(|(i, &t)| (slot, t, (pos + i) as u32))
                 .collect::<Vec<_>>();
-            let outputs = if pos + chunk.len() == tokens.len() {
-                vec![chunk.len() - 1]
+            let outputs = if pos + n == tokens.len() {
+                vec![n - 1]
             } else {
                 Vec::new()
             };
-            logits = self.execute(&rows, &outputs)?;
+            logits =
+                self.execute_contracts(&rows, &outputs, self.is_mlx().then_some(&[logical]))?;
+            self.capture_prefix(slot, tokens)?;
+            pos += n;
         }
         Ok(logits)
     }
@@ -255,6 +282,18 @@ impl Scratch {
         4 * (rows + batch + 1 + rows * (WIDTH * 2 + WIDE) + batch * (WIDE + VOCAB))
     }
     fn new(d: &MetalDevice, context: usize, batch: usize, rows: usize) -> Result<Self> {
+        Self::new_inner(d, context, batch, rows, false)
+    }
+    fn new_mlx(d: &MetalDevice, context: usize, batch: usize, rows: usize) -> Result<Self> {
+        Self::new_inner(d, context, batch, rows, true)
+    }
+    fn new_inner(
+        d: &MetalDevice,
+        context: usize,
+        batch: usize,
+        rows: usize,
+        mlx: bool,
+    ) -> Result<Self> {
         let b = |n| d.alloc(n * 4);
         Ok(Self {
             ids: b(rows)?,
@@ -267,8 +306,16 @@ impl Scratch {
             logits: b(batch * VOCAB)?,
             hc: residual::Workspace::new(d, rows)?,
             moe: moe::Workspace::new(d, rows)?,
-            dn: deltanet::Workspace::new(d, rows, batch)?,
-            qsa: qsa::Workspace::new(d, rows, batch, context.div_ceil(BLOCK_TOKENS))?,
+            dn: if mlx {
+                deltanet::Workspace::new_mlx(d, rows, batch)?
+            } else {
+                deltanet::Workspace::new(d, rows, batch)?
+            },
+            qsa: if mlx {
+                qsa::Workspace::new_mlx(d, rows, batch, context.div_ceil(BLOCK_TOKENS))?
+            } else {
+                qsa::Workspace::new(d, rows, batch, context.div_ceil(BLOCK_TOKENS))?
+            },
             ple: ple::State::new(d, rows, batch, context)?,
         })
     }

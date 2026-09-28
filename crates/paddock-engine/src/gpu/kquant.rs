@@ -423,6 +423,7 @@ impl GpuExecutor {
             scales,
             dims,
             ty,
+            act128: false,
         })
     }
 
@@ -544,6 +545,7 @@ impl GpuExecutor {
             scales,
             dims: vec![in_dim, out_dim],
             ty,
+            act128: false,
         })
     }
 

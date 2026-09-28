@@ -101,9 +101,9 @@ pub(super) struct Workspace {
 }
 impl Workspace {
     pub(super) fn bytes(rows: usize) -> Result<usize> {
-        if !(1..=1024).contains(&rows) {
+        if !(1..=affine::MAX_ROWS).contains(&rows) {
             return Err(MetalError::Model(
-                "Flash Next residual rows must be 1..=1024".into(),
+                "Flash Next residual rows must be 1..=2048".into(),
             ));
         }
         Ok(rows * (WIDE * 2 + LOW + 4 + WIDTH) * 4)

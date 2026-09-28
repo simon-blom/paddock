@@ -345,6 +345,42 @@ impl GpuExecutor {
         })
     }
 
+    /// The pack carries the width-invariant f32 matvec (slot 687).
+    pub fn has_matvec_f32_winv(&self) -> bool {
+        self.kernels.matvec_f32_winv.is_some()
+    }
+
+    /// [`Self::matvec_f32_batch`] with the same K order at every row count -
+    /// per row the bits of a 1-row call (slot 687). For decode rows that must
+    /// score the same whatever the tick width.
+    pub fn matvec_f32_winv(
+        &self,
+        w: &DeviceTensor,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .matvec_f32_winv
+            .ok_or(GpuError::MissingOp("matvec_f32_winv"))?;
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (xp, _g2) = x.device_ptr(&self.stream);
+        let (yp, _g3) = y.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; caller sizes x [batch, in_dim], y [batch, out_dim]
+        check(unsafe {
+            f(
+                wp as *const _,
+                xp as *const _,
+                yp as *mut _,
+                w.dims[0] as u32,
+                w.dims[1] as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// [`Self::matvec_f32_batch`] over an f16 weight plane and f16 activations,
     /// accumulating in f32 - the tensor-core class. Same layout convention
     /// (dims[0] = in_dim), and the caller naming the precision keeps "which

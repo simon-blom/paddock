@@ -3156,9 +3156,9 @@ struct KernelTableV1 {
     // (x f32 [n], q int8 [n], scale f32 [n/128], n, stream). Pure append.
     int (*quantize_q8_b128)(const void*, void*, void*, uint32_t, void*);
     // 628: ternary_gemv_b128 - batch-1 PTQ1_0 GEMV off slot 627's
-    // activations: one table read per weight byte, a lane owns whole
-    // super-blocks. (data, scales, xq, xs, y, in_dim, out_dim, dtype,
-    // stream). Pure append.
+    // activations: one table read per weight byte, a warp per row, the
+    // ternary class's fixed fold (quant/ternary.cuh). (data, scales, xq, xs,
+    // y, in_dim, out_dim, dtype, stream). Pure append.
     int (*ternary_gemv_b128)(const void*, const void*, const void*, const void*, void*,
                              uint32_t, uint32_t, uint32_t, void*);
     // 629: hadamard_rows_q8_b128 - slot 626's forward rotation and slot 627's
@@ -3350,6 +3350,113 @@ struct KernelTableV1 {
     int (*laya_act_head)(const void*, const void*, const void*, const void*, const void*,
                          const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
                          uint32_t, void*);
+    // 679: split-K decode attention over runs of one slot's query rows - a
+    // spec verify chunk or a block drafter's rows, optionally windowed
+    // (attn/rows.cuh). Pure append.
+    int (*attn_rows_partial)(const void*, const void*, const void*, void*, void*,
+                             const void*, const void*, const void*, uint32_t, const void*,
+                             uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                             uint32_t, uint32_t, uint32_t, float, uint32_t, uint32_t, void*);
+    // 680-681: the W16 decode class's experts - the checkpoint's W4A16 on
+    // tensor cores over the tiled plane, batch-invariant (moe/nvf4_w16.cuh).
+    int (*nvf4_moe_up_relu2_w16)(const void*, const void*, const void*, const void*,
+                                 const void*, const void*, const void*, const void*,
+                                 const void*, const void*, void*, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*nvf4_moe_down_part_w16)(const void*, const void*, const void*, const void*,
+                                  const void*, const void*, const void*, const void*,
+                                  const void*, const void*, const void*, void*, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 682: its dense half - bf16 / e4m3 weights x 16-bit activations over rows,
+    // batch-invariant (gemm/dense_w16.cuh). Pure append.
+    int (*dense_w16)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                     uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 683: the rows partial on fixed key splits (attn/rows.cuh) - 679's
+    // arguments plus split_keys. Pure append.
+    int (*attn_rows_partial_fixed)(const void*, const void*, const void*, void*, void*,
+                                   const void*, const void*, const void*, uint32_t,
+                                   const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                   uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                                   uint32_t, uint32_t, uint32_t, void*);
+    // 684: 682 over a plane whose rows split into up to three outputs (a
+    // fused q|k|v plane in one launch). Pure append.
+    int (*dense_w16_seg)(const void*, const void*, const void*, void*, void*, void*,
+                         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // 685: the W16 class's routing front - router matvec + sigmoid top-k +
+    // bf16 activations + 32-row align in one launch (moe/nvf4_w16.cuh).
+    // Pure append.
+    int (*moe_route_w16)(const void*, const void*, void*, const void*, float, uint32_t,
+                         uint32_t, uint32_t, void*, void*, void*, void*, void*, void*,
+                         uint32_t, uint32_t, void*, void*);
+    // 686: ternary_gemm_nb - slot 630 over NB activation columns (decode rows
+    // sharing a tick, a verify round, a short prefill) on the int8 tensor
+    // cores, one weight read, per column bit-identical to 628 / 630.
+    // (d0, r0, d1, r1, d2, r2, xq, xs, y0, y1, y2, in_dim, o0, o1, o2,
+    // n_planes, glu, cols, stream); every o_p a multiple of 16. Pure append.
+    int (*ternary_gemm_nb)(const void*, const void*, const void*, const void*, const void*,
+                           const void*, const void*, const void*, void*, void*, void*,
+                           uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                           uint32_t, void*);
+    // 687: matvec_f32_winv - slot matvec_f32_batch's batch body at every row
+    // count (the launcher's tile / tiled-GEMM arms reorder K from 16 rows):
+    // per row the bits of a 1-row call. (w, x, out, in_dim, out_dim, batch,
+    // stream). Pure append.
+    int (*matvec_f32_winv)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                           void*);
+    // 688-696: the paged address mode of the kernels Flash-Next still reads
+    // off a dense slot-major strip - each is its dense twin with the strip
+    // replaced by a block pool + table (block_tables, blocks_per_slot after
+    // slots, max_ctx dropped), bit-identical over the same keys. Pure append.
+    // 688: attn_prefill_batch_paged (q, pool_k, pool_v, sinks, out, positions,
+    // slots, block_tables, bps, tile_row0, tile_slot, n_qtiles, n_heads,
+    // n_kv_heads, head_dim, kv_dim, swa_window, n_rows, scale, kv_dtype, stream)
+    int (*attn_prefill_batch_paged)(const void*, const void*, const void*, const void*, void*,
+                                    const void*, const void*, const void*, uint32_t,
+                                    const void*, const void*, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t,
+                                    void*);
+    // 689: attn_decode_fmha_paged - attn_decode_batch_paged's arguments
+    int (*attn_decode_fmha_paged)(const void*, const void*, const void*, const void*, void*,
+                                  const void*, const void*, const void*, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                                  uint32_t, void*);
+    // 690: attn_decode_fmha_sp_paged (q, pool_k, pool_v, sinks, out, part,
+    // positions, slots, block_tables, bps, n_heads, n_kv_heads, head_dim,
+    // kv_dim, swa_window, batch, split, scale, kv_dtype, stream)
+    int (*attn_decode_fmha_sp_paged)(const void*, const void*, const void*, const void*, void*,
+                                     void*, const void*, const void*, const void*, uint32_t,
+                                     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                     uint32_t, uint32_t, float, uint32_t, void*);
+    // 691: attn_decode_batch_ps_paged - attn_decode_batch_paged's arguments
+    int (*attn_decode_batch_ps_paged)(const void*, const void*, const void*, const void*,
+                                      void*, const void*, const void*, const void*, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, float, uint32_t, void*);
+    // 692: q4x_idx_store_paged (raw, stage, pos, slots, cache, ring,
+    // block_tables, bps, rows, hd, ld, koff, ring_len, cr, stream)
+    int (*q4x_idx_store_paged)(const void*, const void*, const void*, const void*, void*,
+                               void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, void*);
+    // 693-694: q4x_qsa_logits_paged / _mma_paged (q, cache, pos, slots,
+    // block_tables, bps, scores, row0, rows, heads, hd, cap, cr, k, stream)
+    int (*q4x_qsa_logits_paged)(const void*, const void*, const void*, const void*,
+                                const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t,
+                                uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*q4x_qsa_logits_mma_paged)(const void*, const void*, const void*, const void*,
+                                    const void*, uint32_t, void*, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 695-696: q4x_qsa_attn_paged / _mma_paged (q, pool_k, pool_v, pos, slots,
+    // block_tables, bps, sel, cnt, part_o, part_ml, rows, nh, nkv, hd, k, cr,
+    // splits, scale, kv_dtype, stream)
+    int (*q4x_qsa_attn_paged)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, uint32_t, const void*, const void*, void*, void*,
+                              uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                              uint32_t, float, uint32_t, void*);
+    int (*q4x_qsa_attn_mma_paged)(const void*, const void*, const void*, const void*,
+                                  const void*, const void*, uint32_t, const void*, const void*,
+                                  void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 };
 
 } // extern "C"

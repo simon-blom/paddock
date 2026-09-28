@@ -40,7 +40,11 @@ impl GpuExecutor {
     /// entry points must actually hold bf16 bytes. The loader decides the
     /// class from the file, so a mismatch here is a routing bug, not user
     /// input - but it would read garbage weights silently, so name it.
-    fn bf16_plane<'a>(&self, w: &'a QuantTensor, who: &str) -> Result<&'a QuantTensor, GpuError> {
+    pub(super) fn bf16_plane<'a>(
+        &self,
+        w: &'a QuantTensor,
+        who: &str,
+    ) -> Result<&'a QuantTensor, GpuError> {
         if w.ty != GgmlType::Bf16 {
             return Err(GpuError::NoKernel {
                 name: format!("{who}: plane is not bf16"),

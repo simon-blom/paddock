@@ -22,6 +22,7 @@ mod deltanet;
 mod deltanet_tests;
 mod moe;
 mod ple;
+mod ple_paged;
 mod qsa;
 #[cfg(test)]
 mod qsa_tests;

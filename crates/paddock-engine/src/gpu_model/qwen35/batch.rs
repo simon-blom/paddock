@@ -148,63 +148,32 @@ pub(super) fn host_top64(row: &[f32]) -> Vec<(u32, f32)> {
 /// Varlen chunked-GDN route gate - the same env chain the unified tick's
 /// `vl_route` static checks (GDN formulation band); kept in
 /// sync by hand because that one is fn-local. Kill: PADDOCK_NO_DNC_VL.
-/// DeltaNet state checkpoints the prefix cache holds per seated slot.
+/// DeltaNet state checkpoints the prefix cache WANTS per seated slot.
 ///
 /// Sized by demand, not by the card. Each checkpoint is a whole recurrent-state
 /// snapshot (~150 MiB f32 on the 27B: 48 GDN layers of state + conv window),
 /// and the working set a slot generates is its own conversation: the two
 /// `ckpt_cuts` per prompt plus the reply checkpoint (prefix.rs stage F) -
-/// three per turn. But the pool is a plain LRU and an agentic cohort's turns
+/// three per turn. But the cache is LRU and an agentic cohort's turns
 /// arrive as a WAVE: every slot's new cuts land before the later slots have
 /// touched theirs, so one wave of demand (three per slot) is not enough -
 /// the wave steals its own not-yet-used cuts and every session past the
 /// second falls back to the shared prefix (GB10 2026-09-12: eight sessions,
 /// every c8 turn resumed at the system-prompt cut with two per slot). Two
-/// waves is the floor at which every session's latest cut survives the
-/// cohort's next wave; the plan still shrinks the pool into what the grant
-/// has left (`state_ckpt_count`). Until 2026-09-06 the pool was a fifth of
-/// the grant regardless of width: 11.5 GiB of snapshots on a 96 GB card for
-/// a single-slot server that could use a handful, measured against vLLM's
-/// on-demand state pages and SGLang's int8 idle store as the largest single
-/// policy term in paddock's one-slot 262k floor.
+/// waves is the level at which every session's latest cut survives the
+/// cohort's next wave. Until 2026-09-06 the pool was a fifth of the grant
+/// regardless of width: 11.5 GiB of snapshots on a 96 GB card for a
+/// single-slot server that could use a handful.
+///
+/// Since issue #33 checkpoints live in the KV pool's own pages, so this want
+/// is bought only while the grant affords it (the plan's retention), and
+/// pages a live context is not using hold more of them for free.
 pub(super) const STATE_CKPTS_PER_SLOT: u64 = 6;
-/// Floor: keeps prefix reuse alive at width 1 and on small cards - a 16-turn
-/// restore window for one conversation. Mandatory: below it the plan refuses
-/// rather than serve without a prefix cache.
-pub(super) const STATE_CKPTS_MIN: u64 = 16;
-/// Cap: a 128-distinct-prefix working set at two cuts per prompt.
-pub(super) const STATE_CKPTS_MAX: u64 = 256;
-
-/// How many DeltaNet state checkpoints the prefix cache may hold.
-///
-/// One definition, deliberately, called by both the `kv_plan` reserve and the
-/// device allocation. They used to derive this separately - the reserve from
-/// `grant`, the allocation from `vram_headroom()` - and only the allocation
-/// honoured the override, so `PADDOCK_KV_STATE_CKPTS=256` asked the allocator
-/// for ~42.5 GiB against a 14.61 GiB reservation. That is not a bigger cache,
-/// it is an unplanned allocation, and it is why the 256-checkpoint arm read
-/// the widest spread of its ladder (30.8%, one leg at 1743) rather than the
-/// win its slot count promised.
-///
-/// `leftover` is what the grant has left once every other term is charged: the
-/// other reserves, the seated slots' state, and a full-context KV pool. The
-/// pool takes its demand out of that and never out of the KV a slot was
-/// promised, so a card that can seat the configuration but not the whole
-/// checkpoint want gets a smaller cache, not a refusal. The floor stays
-/// mandatory either way.
-fn state_ckpt_count(slots: usize, per_ckpt: u64, leftover: u64) -> u32 {
-    if per_ckpt == 0 {
-        return 0; // pure full-attn: no recurrent state to checkpoint
-    }
-    if let Some(n) = paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    let want = (slots as u64 * STATE_CKPTS_PER_SLOT).clamp(STATE_CKPTS_MIN, STATE_CKPTS_MAX);
-    want.min(leftover / per_ckpt).max(STATE_CKPTS_MIN) as u32
+/// The checkpoint pages qwen35's plan asks for, in pool blocks: (mandatory,
+/// wanted beyond) - see `ckpt_pages::page_demand`, which holds the per-turn,
+/// floor and cap rules every hybrid family shares.
+pub(super) fn ckpt_page_demand(slots: usize, pages_per_ckpt: usize) -> (usize, usize) {
+    crate::ckpt_pages::page_demand(slots, pages_per_ckpt, STATE_CKPTS_PER_SLOT)
 }
 
 /// The `graph pools + headroom` reserve: what the plan cannot meet in the
@@ -489,23 +458,18 @@ impl GpuQwen35 {
         // recurrent + conv state, this slot's logits row, its block table
         let per_slot_bytes =
             n_lin * state_win * 4 + self.vocab as u64 * 4 + blocks_per_slot as u64 * 4;
-        // The checkpoint pool is sized by demand out of what the grant has left
-        // once everything else - including a full-context pool for every slot -
-        // is charged. Same count for the reserve and the P5c allocation below.
-        let charged_without_pool = conv_staging
-            + ckpt_staging
-            + spec_est
-            + wave_bufs
-            + graph_headroom
-            + tier_staging
-            + max_batch as u64 * per_slot_bytes
-            + max_batch as u64 * blocks_per_slot as u64 * block_bytes;
-        let n_ckpt_planned = state_ckpt_count(
-            max_batch,
-            per_ckpt,
-            grant.saturating_sub(charged_without_pool),
-        );
-        let n_ckpt_est = n_ckpt_planned as u64;
+        // Checkpoints are pool pages (issue #33): a page holds its slot in
+        // every main K/V plane, so its payload is exactly `per_block_bytes`.
+        // The live turns' pages are mandatory beside full context; the rest
+        // of the want rides retention, bought only while the grant affords
+        // it - and pages a context has not reached yet hold more for free.
+        let prefix_on = paged && paddock_models::dev_var_os!("PADDOCK_NO_PREFIX_CACHE").is_none();
+        let pages_per_ckpt = if prefix_on && per_ckpt > 0 && per_block_bytes > 0 {
+            per_ckpt.div_ceil(per_block_bytes as u64) as usize
+        } else {
+            0
+        };
+        let (ckpt_blocks, ckpt_retention) = ckpt_page_demand(max_batch, pages_per_ckpt);
         let demand = kv_plan::Demand {
             family: "qwen35",
             max_ctx: self.max_ctx,
@@ -513,10 +477,11 @@ impl GpuQwen35 {
             blocks_per_slot,
             block_bytes,
             per_slot_bytes,
+            ckpt_blocks,
+            retention_blocks: ckpt_retention,
             floor_blocks_per_slot: 128,
             reserves: vec![
                 kv_plan::Reserve::new("conv staging", conv_staging),
-                kv_plan::Reserve::new("prefix state pool", n_ckpt_est * per_ckpt),
                 kv_plan::Reserve::new("checkpoint staging", ckpt_staging),
                 kv_plan::Reserve::new("draft state (spec)", spec_est),
                 kv_plan::Reserve::new("prefill wave buffers", wave_bufs),
@@ -654,33 +619,51 @@ impl GpuQwen35 {
         };
         // P5c zero-copy radix prefix cache (pool mode, unless PADDOCK_NO_PREFIX_CACHE).
         // Caches full-attn KV blocks (shared by refcount) + DeltaNet recurrent-state
-        // checkpoints in d_state_pool (state_ckpt_f32 per checkpoint = the linear
-        // layers' state + conv window).
+        // checkpoints, which live in the pool's own pages (issue #33):
+        // state_ckpt_f32 per checkpoint = the linear layers' state + conv window.
         let state_ckpt_f32 = self.n_linear_layers() * (state_elems + win_elems);
-        let (paged_prefix, d_state_pool) = if pool_active
-            && paddock_models::dev_var_os!("PADDOCK_NO_PREFIX_CACHE").is_none()
-        {
-            // Exactly what the kv_plan reserve above charged for: same fn,
-            // same budget. Deriving it a second time here (and from
-            // `vram_headroom()` rather than the grant) is what let the
-            // reservation and the allocation disagree.
-            let n_ckpt = n_ckpt_planned;
+        let (paged_prefix, ckpt_layout) = if pool_active && prefix_on {
             let mut pr = PagedRadix::new();
             // State-pool admission control. The board's c32 leg cycles 128
             // distinct prefixes through this pool, so plain LRU steal thrashes
             // it to a ~0% checkpoint hit rate; protecting proven prefixes also
             // skips the ~170 MiB snapshot on every refused admission.
             pr.set_protect_proven(paddock_models::dev_var_os!("PADDOCK_CKPT_PROTECT").is_some());
-            let pool_f32 = if state_ckpt_f32 > 0 {
-                pr.set_state_capacity(n_ckpt);
-                Some(e.alloc(n_ckpt as usize * state_ckpt_f32)?)
+            let layout = if pages_per_ckpt > 0 {
+                use cudarc::driver::DevicePtr;
+                // The K and V plane of each full-attn layer, in layer order -
+                // the KV tier's plane order too, so a checkpoint's pages ship
+                // to RAM as they are.
+                let slot = (BLOCK_TOKENS * kv_dim * kv_bytes) as u64;
+                let mut planes = Vec::with_capacity(2 * n_full);
+                for li in 0..self.layers.len() {
+                    if let (Some(k), Some(v)) = (kv_k[li].as_ref(), kv_v[li].as_ref()) {
+                        for plane in [k, v] {
+                            let (pp, _g) = plane.device_ptr(&e.stream);
+                            planes.push((pp, slot));
+                        }
+                    }
+                }
+                let layout = crate::ckpt_pages::PageLayout::new(planes);
+                debug_assert_eq!(layout.payload(), per_block_bytes as u64);
+                // Index bookkeeping only - how many exist at once is whatever
+                // the pool spares, so allow as many as it could ever hold.
+                let max_ckpts = pool_block_count
+                    .checked_div(pages_per_ckpt)
+                    .unwrap_or(0)
+                    .max(1) as u32;
+                pr.set_state_paged(max_ckpts, pages_per_ckpt);
+                tracing::info!(
+                    pages_per_checkpoint = pages_per_ckpt,
+                    guaranteed = ckpt_blocks / pages_per_ckpt,
+                    wanted = (ckpt_blocks + ckpt_retention) / pages_per_ckpt,
+                    "qwen35 paged zero-copy prefix cache active - checkpoints in pool pages"
+                );
+                Some(layout)
             } else {
                 None // pure full-attn model: no DeltaNet state to checkpoint
             };
-            tracing::info!(
-                "qwen35 paged zero-copy prefix cache active ({n_ckpt} state checkpoints)"
-            );
-            (Some(pr), pool_f32)
+            (Some(pr), layout)
         } else {
             (None, None)
         };
@@ -720,7 +703,9 @@ impl GpuQwen35 {
                         model_tensors: &content_id.0,
                         adapter: b"",
                         architecture: architecture.as_bytes(),
-                        cache_schema: b"pool-planes k/v interleaved + dn-ckpt aux v1",
+                        // v2: checkpoint blobs are pool pages (issue #33) - a
+                        // v1 cache's flat blobs must never load into them
+                        cache_schema: b"pool-planes k/v interleaved + dn-ckpt paged aux v2",
                         layout_abi: 1,
                         tokenizer: &content_id.1,
                     }),
@@ -858,12 +843,20 @@ impl GpuQwen35 {
             tables,
             block_table_host,
             paged_prefix,
-            d_ckpt_desc: if d_state_pool.is_some() {
-                Some(self.exec.alloc_u64(self.n_layers * 6)?)
+            // one checkpoint's page-split copy: a triple per page slot it
+            // spans plus the partial slots its 2 x n_lin segments open
+            d_ckpt_desc: if ckpt_layout.is_some() {
+                let slot = (BLOCK_TOKENS * kv_dim * kv_bytes) as u64;
+                let cap = crate::ckpt_pages::desc_cap(
+                    state_ckpt_f32 as u64 * 4,
+                    slot,
+                    2 * self.n_linear_layers(),
+                );
+                Some(self.exec.alloc_u64(cap)?)
             } else {
                 None
             },
-            d_state_pool,
+            ckpt_layout,
             state_ckpt_f32,
             graphs: std::collections::HashMap::new(),
             pf_bufs: None,
@@ -1020,37 +1013,26 @@ impl GpuQwen35 {
             }
             let evicted = {
                 let exec = self.exec.clone();
-                let state_bytes;
-                let ckpt_base;
-                {
-                    let bs = self.batch.as_ref().expect("batch enabled");
-                    state_bytes = (bs.state_ckpt_f32 * 4) as u64;
-                    ckpt_base = bs.d_state_pool.as_ref().map(|sp| {
-                        use cudarc::driver::DevicePtr;
-                        let (pp, _g) = sp.device_ptr(&exec.stream);
-                        pp
-                    });
-                }
                 let bs = self.batch.as_mut().expect("batch enabled");
                 let pool = bs.pool.as_mut().expect("pool checked above");
+                let want = pool.free_blocks() + 1;
                 match (bs.tier.as_mut(), bs.paged_prefix.as_mut()) {
                     (Some(tier), Some(pr)) => {
                         // tier-aware shed: closing runs (and their DeltaNet
                         // checkpoint blobs) demote to T1 before eviction -
                         // the cliff-grade press (see `make_room_blocking`:
                         // one pressure pass + 50ms was not enough while a
-                        // parked restore's loads held the lane)
-                        let want = pool.free_blocks() + 1;
-                        tier.make_room_blocking(
-                            pr,
-                            pool,
-                            want,
-                            ckpt_base.map(|b| (b, state_bytes)),
-                            &mut || exec.record_event().ok(),
-                        )
+                        // parked restore's loads held the lane). The
+                        // checkpoints are pool pages, which the tier reads off
+                        // the radix, so there is no blob base to pass.
+                        tier.make_room_blocking(pr, pool, want, None, &mut || {
+                            exec.record_event().ok()
+                        })
                         .then_some(0u32)
                     }
-                    (None, Some(pr)) => pr.evict_lru(pool),
+                    // dead KV, then the stalest checkpoint's pages, then LRU
+                    // KV - context a slot was promised outranks all cache
+                    (None, Some(pr)) => pr.make_room(pool, want, 0).then_some(0u32),
                     _ => None,
                 }
             };
@@ -1136,73 +1118,21 @@ impl GpuQwen35 {
     }
 
     /// P5c: snapshot `slot`'s DeltaNet recurrent state (states + conv windows,
-    /// per linear layer) into the paged state pool at checkpoint index `idx` -
-    /// the persisted resume point a later shared-prefix request restores.
+    /// per linear layer) into checkpoint `idx`'s pool pages - the persisted
+    /// resume point a later shared-prefix request restores.
     pub(super) fn snapshot_paged_state(
         &mut self,
         slot: usize,
         idx: u32,
     ) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let state_elems = self.n_v_heads * self.state_size * self.state_size;
-        let win_elems = (self.conv_k - 1) * self.conv_dim;
-        let n_layers = self.n_layers;
-        let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
-        let Some(sp) = bs.d_state_pool.as_ref() else {
-            return Ok(());
-        };
-        let (pp, _g) = sp.device_ptr(&exec.stream);
-        let mut descs: Vec<u64> = Vec::new();
-        // state elements may be bf16 (PADDOCK_DN_STATE_BF16): the recur-side
-        // offsets/lengths scale by esz, while the pool layout stays f32-sized
-        // (checkpoint blocks half-used under bf16 - correctness over compaction)
-        let esz = GpuExecutor::dn_state_esz();
-        let mut boff = (idx as usize * bs.state_ckpt_f32 * 4) as u64;
-        for li in 0..n_layers {
-            let Some(r) = bs.recur[li].as_ref() else {
-                continue;
-            };
-            let (rp, _g1) = r.device_ptr(&exec.stream);
-            descs.extend([
-                rp + slot as u64 * state_elems as u64 * esz,
-                pp + boff,
-                state_elems as u64 * esz,
-            ]);
-            boff += (state_elems * 4) as u64;
-            let w = bs.conv_win[li].as_ref().expect("linear layer has window");
-            let (wp, _g2) = w.device_ptr(&exec.stream);
-            descs.extend([
-                wp + (slot * win_elems * 4) as u64,
-                pp + boff,
-                (win_elems * 4) as u64,
-            ]);
-            boff += (win_elems * 4) as u64;
-        }
-        // No allocation on this path: the descriptor buffer is owned by the
-        // batch state and address-stable (see BatchState::d_ckpt_desc).
-        let n = descs.len();
-        if n == 0 {
-            return Ok(());
-        }
-        let Some(db) = bs.d_ckpt_desc.as_mut() else {
-            return Ok(());
-        };
-        debug_assert!(n <= db.len());
-        {
-            let mut v = db.slice_mut(0..n);
-            exec.stream
-                .memcpy_htod(&descs, &mut v)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-        }
-        exec.batched_copy(&*db, n / 3)?;
-        Ok(())
+        self.slot_ckpt_copy(slot, idx, crate::ckpt_pages::Dir::ToPages)
     }
 
     /// P5c fused-tail variant: attach checkpoint `idx` from staging blob
     /// `stage` (d_ckpt_stage - filled per-layer at the boundary during a
     /// fused tick) instead of the slot's live state, which by finish has
-    /// advanced past the boundary. The blob is laid out exactly like a pool
-    /// checkpoint, so this is one flat copy.
+    /// advanced past the boundary. The blob is laid out exactly like a
+    /// checkpoint, so this is one flat span split over the pages.
     pub(super) fn snapshot_staged_pool(
         &mut self,
         stage: usize,
@@ -1210,72 +1140,105 @@ impl GpuQwen35 {
     ) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
-        let n = bs.state_ckpt_f32;
-        let Some(sp) = bs.d_state_pool.as_mut() else {
+        let (Some(layout), Some(pr)) = (bs.ckpt_layout.as_ref(), bs.paged_prefix.as_ref()) else {
             return Ok(());
         };
-        exec.copy_region(&bs.d_ckpt_stage[stage], 0, sp, idx as usize * n, n)?;
-        Ok(())
+        let pages = pr.state_pages(idx);
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let mut descs: Vec<u64> = Vec::new();
+        let (sp, _g) = bs.d_ckpt_stage[stage].device_ptr(&exec.stream);
+        layout.push_copy(
+            pages,
+            0,
+            sp,
+            (bs.state_ckpt_f32 * 4) as u64,
+            crate::ckpt_pages::Dir::ToPages,
+            &mut descs,
+        );
+        Self::run_ckpt_descs(&exec, bs.d_ckpt_desc.as_mut(), &descs)
     }
 
-    /// P5c: restore `slot`'s DeltaNet state from the paged state pool checkpoint
-    /// `idx` (the reverse of `snapshot_paged_state`) - the hybrid half of a
+    /// P5c: restore `slot`'s DeltaNet state from checkpoint `idx`'s pool
+    /// pages (the reverse of `snapshot_paged_state`) - the hybrid half of a
     /// zero-copy resume (the KV half is `BlockTable::share_prefix`).
     pub(super) fn restore_paged_state(
         &mut self,
         slot: usize,
         idx: u32,
     ) -> Result<(), GpuModelError> {
+        self.slot_ckpt_copy(slot, idx, crate::ckpt_pages::Dir::FromPages)
+    }
+
+    /// The copy both of the above are: per linear layer, the slot's state and
+    /// its conv window against the checkpoint's bytes at the same running
+    /// offset - the flat blob layout, laid over pages by `ckpt_pages`.
+    fn slot_ckpt_copy(
+        &mut self,
+        slot: usize,
+        idx: u32,
+        dir: crate::ckpt_pages::Dir,
+    ) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let state_elems = self.n_v_heads * self.state_size * self.state_size;
         let win_elems = (self.conv_k - 1) * self.conv_dim;
         let n_layers = self.n_layers;
         let bs = self.batch.as_mut().ok_or(GpuModelError::BatchDisabled)?;
-        let Some(sp) = bs.d_state_pool.as_ref() else {
+        let (Some(layout), Some(pr)) = (bs.ckpt_layout.as_ref(), bs.paged_prefix.as_ref()) else {
             return Ok(());
         };
-        let (pp, _g) = sp.device_ptr(&exec.stream);
+        let pages = pr.state_pages(idx);
+        if pages.is_empty() {
+            return Ok(());
+        }
         let mut descs: Vec<u64> = Vec::new();
+        // state elements may be bf16 (PADDOCK_DN_STATE_BF16): the recur-side
+        // offsets/lengths scale by esz, while the checkpoint layout stays
+        // f32-sized (half-used under bf16 - correctness over compaction)
         let esz = GpuExecutor::dn_state_esz();
-        let mut boff = (idx as usize * bs.state_ckpt_f32 * 4) as u64;
+        let mut boff = 0u64;
         for li in 0..n_layers {
             let Some(r) = bs.recur[li].as_ref() else {
                 continue;
             };
             let (rp, _g1) = r.device_ptr(&exec.stream);
-            descs.extend([
-                pp + boff,
+            layout.push_copy(
+                pages,
+                boff,
                 rp + slot as u64 * state_elems as u64 * esz,
                 state_elems as u64 * esz,
-            ]);
+                dir,
+                &mut descs,
+            );
             boff += (state_elems * 4) as u64;
             let w = bs.conv_win[li].as_ref().expect("linear layer has window");
             let (wp, _g2) = w.device_ptr(&exec.stream);
-            descs.extend([
-                pp + boff,
+            layout.push_copy(
+                pages,
+                boff,
                 wp + (slot * win_elems * 4) as u64,
                 (win_elems * 4) as u64,
-            ]);
+                dir,
+                &mut descs,
+            );
             boff += (win_elems * 4) as u64;
         }
-        // No allocation on this path: the descriptor buffer is owned by the
-        // batch state and address-stable (see BatchState::d_ckpt_desc).
-        let n = descs.len();
-        if n == 0 {
-            return Ok(());
+        Self::run_ckpt_descs(&exec, bs.d_ckpt_desc.as_mut(), &descs)
+    }
+
+    /// Run a checkpoint copy's descriptors through the batch's descriptor
+    /// scratch (address-stable, owned by the batch state - see
+    /// BatchState::d_ckpt_desc). No scratch = no checkpoints to copy.
+    fn run_ckpt_descs(
+        exec: &GpuExecutor,
+        db: Option<&mut CudaSlice<u64>>,
+        descs: &[u64],
+    ) -> Result<(), GpuModelError> {
+        match db {
+            Some(db) => Ok(exec.batched_copy_upload(db, descs)?),
+            None => Ok(()),
         }
-        let Some(db) = bs.d_ckpt_desc.as_mut() else {
-            return Ok(());
-        };
-        debug_assert!(n <= db.len());
-        {
-            let mut v = db.slice_mut(0..n);
-            exec.stream
-                .memcpy_htod(&descs, &mut v)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-        }
-        exec.batched_copy(&*db, n / 3)?;
-        Ok(())
     }
 
     /// The checkpoint alignment step: the tier's run span when armed (runs
@@ -1300,15 +1263,12 @@ impl GpuQwen35 {
             return;
         };
         tier.pump_completions(pr, pool);
-        tier.pump_flows(pr, &mut || exec.record_event().ok());
+        // an aux round reserves its checkpoint's pages from the pool
+        tier.pump_flows_with_pool(pr, pool, &mut || exec.record_event().ok());
         // 2.3 write-through: retained chains AND live checkpoint blobs
-        // pre-store in slack so eviction (and ckpt-slot recycling) is free
-        let state = bs.d_state_pool.as_ref().map(|sp| {
-            use cudarc::driver::DevicePtr;
-            let (cp, _g) = sp.device_ptr(&exec.stream);
-            (cp, (bs.state_ckpt_f32 * 4) as u64)
-        });
-        tier.mirror_slack(pr, pool, exec.record_event().ok(), 2, state);
+        // pre-store in slack so eviction (and ckpt-slot recycling) is free.
+        // The checkpoints are pool pages; the tier reads them off the radix.
+        tier.mirror_slack(pr, pool, exec.record_event().ok(), 2, None);
     }
 
     pub fn tier_observe_prefill_impl(&mut self, tokens: u32, wall_us: f64) {
@@ -1391,6 +1351,18 @@ impl GpuQwen35 {
             .iter()
             .filter(|l| matches!(l.mixer, Mixer::Linear(_)))
             .count()
+    }
+
+    /// Pool pages one recurrent-state checkpoint draws (0 with the prefix
+    /// cache off or before `enable_batch`) - what a gate sizes a pinned pool
+    /// by, since a checkpoint's page count is the model's (state bytes over
+    /// one page's payload across every full-attention K/V plane).
+    #[doc(hidden)]
+    pub fn ckpt_pages_probe(&self) -> usize {
+        self.batch
+            .as_ref()
+            .and_then(|b| b.paged_prefix.as_ref())
+            .map_or(0, |p| p.pages_per_ckpt())
     }
 
     /// Tokens the last prefill of `slot` served from the prefix cache (taken:
@@ -5232,7 +5204,7 @@ impl GpuQwen35 {
             let pool = bs.pool.as_mut().expect("prefix cache implies pool");
             let radix = bs.paged_prefix.as_mut().expect("prefix cache built");
             radix.insert(toks, &blocks, pool);
-            radix.attach_state(toks, cut)
+            radix.attach_state_with_pool(toks, cut, pool)
         };
         if let Some(idx) = idx {
             self.snapshot_paged_state(slot, idx)?;
@@ -5752,10 +5724,10 @@ impl GpuQwen35 {
         let state_elems = n_v_heads * state_size * state_size;
         let moe_dims = self.moe;
         let exec = self.exec.clone();
-        // fused-ckpt staging geometry: the stage blob mirrors a pool
-        // checkpoint (f32-strided per linear layer: [state][window]; bf16
-        // states half-fill their region, exactly like d_state_pool), so the
-        // finish-side attach is one flat copy (snapshot_staged_pool).
+        // fused-ckpt staging geometry: the stage blob mirrors a checkpoint
+        // (f32-strided per linear layer: [state][window]; bf16 states
+        // half-fill their region, exactly like a checkpoint's pages), so the
+        // finish-side attach is one span over the pages (snapshot_staged_pool).
         let win_elems = km1 * conv_dim;
         let st_copy = state_elems * GpuExecutor::dn_state_esz() as usize / 4;
         let lin_ord: Vec<usize> = {
@@ -8650,7 +8622,7 @@ impl GpuQwen35 {
                         bs.paged_prefix
                             .as_mut()
                             .expect("prefix cache checked above")
-                            .attach_state(&toks, landed)
+                            .attach_state_with_pool(&toks, landed, pool)
                     };
                     if let Some(si) = si {
                         // fused tail in the same tick: the slot's live state
@@ -9451,7 +9423,15 @@ impl GpuQwen35 {
         let bs_w8_dec = &self.bs_w8;
         // decode norm+e4m3 fuse: stage the group e4m3 inside the norms when
         // the f8 lane serves this model (arms skip their d_xn quantizes)
-        let e4m3_norms = !self.bs_f8ffn.is_empty() && b >= 8 && exec.has_add_rmsnorm_e4m3_xn();
+        // (the loader pushes one entry per layer, Some or None, so the vec is
+        // never empty: "the lane serves this model" is ANY plane present. The
+        // bare `!is_empty()` switched every model without f8 planes - Bonsai's
+        // ternary lanes among them - onto the fused e4m3 norm from b = 8, a
+        // different norm rounding than rmsnorm_batch's on some rows plus an
+        // e4m3 staging nothing read: a decode row scored differently at
+        // b >= 8 than alone. gpu_qwen35_ternary_class holds it.)
+        let e4m3_norms =
+            self.bs_f8ffn.iter().any(Option::is_some) && b >= 8 && exec.has_add_rmsnorm_e4m3_xn();
         let tok_embd = &self.tok_embd;
         let rot = self.rot.as_ref();
         // b=1 serving class for k-quant weights: the W4A8 dp4a GEMV (mmvq
@@ -9462,14 +9442,26 @@ impl GpuQwen35 {
         let kq_w4a8_b1 = self.kq_resident
             && self.exec.has_kquant_gemv_w4a8()
             && paddock_models::dev_var_os!("PADDOCK_KQ_EXACT_GEMV").is_none();
-        // ...and a rotated PTQ1_0 model takes its own b=1 lane instead: the
-        // table-decoded ternary GEMV off per-128 int8 activations (mod.rs
-        // `tern_b128`). One class for every consumer of a staged input.
-        let tern_b1 = self.tern_b128 && kq_w4a8_b1 && b == 1;
+        // ...and a rotated PTQ1_0 model takes its own lanes instead, off
+        // per-128 int8 activations (mod.rs `tern_b128` / `tern_nb`): the
+        // NB-row walk on the int8 tensor cores (slot 686) at every width it
+        // serves - one weight read for all b rows, one row included - and the
+        // batch-1 walk (628 / 630) where the pack predates it. Both are the
+        // ternary class, so a row scores the same alone or sharing its tick.
+        // One class for every consumer of a staged input.
+        // The class reaches past the projections: a ternary tick also keeps
+        // the fused v2f recurrence at every width it serves (its q.S readout
+        // carries FMA-contraction ulps against the chain dn_v2f_bmax hands
+        // wider ticks) and the width-invariant decay matvec (ab_gate_dec).
+        // Held by gpu_qwen35_ternary_class for widths 1..63; at 64 rows the
+        // norm launchers take their wide block and regroup the reduction - a
+        // width-stable norm reduction is the open item that closes it.
+        let tern_nb = self.tern_nb && kq_w4a8_b1 && b <= TERN_NB_MAX_ROWS;
+        let tern = self.tern_b128 && kq_w4a8_b1 && (b == 1 || tern_nb);
         // ...with its int8 operand staged INSIDE the rotation launch where the
         // pack fuses the two (slot 629): ~257 rotate-then-quantize pairs a
         // token become one launch each. Bit-identical to the pair.
-        let tern_fused = tern_b1 && self.exec.has_hadamard_q8_b128();
+        let tern_fused = tern && self.exec.has_hadamard_q8_b128();
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
 
@@ -9526,11 +9518,20 @@ impl GpuQwen35 {
                 match $w {
                     QuantW::Q8(q) => bmm!(q, $x, $y, $pre),
                     QuantW::Kq(k) => {
-                        if tern_b1 {
+                        if tern {
                             if !$pre {
-                                exec.quantize_q8_b128($x, &mut bs.d_xq, &mut bs.d_xs, k.dims[0])?;
+                                exec.quantize_q8_b128(
+                                    $x,
+                                    &mut bs.d_xq,
+                                    &mut bs.d_xs,
+                                    b * k.dims[0],
+                                )?;
                             }
-                            exec.ternary_gemv_b128(k, &bs.d_xq, &bs.d_xs, $y)?;
+                            if tern_nb {
+                                exec.ternary_gemm_nb(&mut [(k, $y)], &bs.d_xq, &bs.d_xs, b)?;
+                            } else {
+                                exec.ternary_gemv_b128(k, &bs.d_xq, &bs.d_xs, $y)?;
+                            }
                         } else if b == 1 {
                             if kq_w4a8_b1 {
                                 // fused quantize+sums: one node; $pre means the
@@ -9817,8 +9818,8 @@ impl GpuQwen35 {
                 // one quantize serves every xn consumer in this layer's group;
                 // the b=1 kq tick uses the fused variant so the group's per-16
                 // sums land in the same node
-                if tern_b1 {
-                    exec.quantize_q8_b128(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, embd)?;
+                if tern {
+                    exec.quantize_q8_b128(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
                 } else if b == 1 && kq_w4a8_b1 {
                     exec.quantize_q8_sums(
                         &sc.d_xn,
@@ -10021,21 +10022,23 @@ impl GpuQwen35 {
                             // staging, one launch (wk / wv are 1024 rows -
                             // their own launches are nearly all toll)
                             (QuantW::Kq(kq), QuantW::Kq(kk), QuantW::Kq(kv))
-                                if tern_b1 && exec.ternary_multi_fits(&[kq, kk, kv]) =>
+                                if tern && (tern_nb || exec.ternary_multi_fits(&[kq, kk, kv])) =>
                             {
                                 if !(xn_staged || qdedup) {
                                     exec.quantize_q8_b128(
                                         &sc.d_xn,
                                         &mut bs.d_xq,
                                         &mut bs.d_xs,
-                                        embd,
+                                        b * embd,
                                     )?;
                                 }
-                                exec.ternary_gemv_b128_multi(
-                                    &mut [(kq, &mut sc.d_qg), (kk, &mut sc.d_k), (kv, &mut sc.d_v)],
-                                    &bs.d_xq,
-                                    &bs.d_xs,
-                                )?;
+                                let mut planes =
+                                    [(kq, &mut sc.d_qg), (kk, &mut sc.d_k), (kv, &mut sc.d_v)];
+                                if tern_nb {
+                                    exec.ternary_gemm_nb(&mut planes, &bs.d_xq, &bs.d_xs, b)?;
+                                } else {
+                                    exec.ternary_gemv_b128_multi(&mut planes, &bs.d_xq, &bs.d_xs)?;
+                                }
                                 exec.split_qg(
                                     &sc.d_qg,
                                     &mut sc.d_q,
@@ -10145,7 +10148,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     }
-                    attn_decode_dispatch(
+                    attn_decode_dispatch_c(
                         &exec,
                         &sc.d_qn,
                         bs.kv_k[li].as_ref().expect("full-attn layer KV"),
@@ -10168,6 +10171,7 @@ impl GpuQwen35 {
                             .as_ref()
                             .filter(|_| bs.paged)
                             .map(|bt| (bt, bs.blocks_per_slot)),
+                        tern,
                     )?;
                     exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, b * q_dim)?;
                     let attn_staged = rot_stage!(&mut sc.d_attn, q_dim);
@@ -10303,7 +10307,7 @@ impl GpuQwen35 {
                         if dn_ab_done
                             && strided_on
                             && !grer_env
-                            && b <= dn_v2f_bmax()
+                            && (b <= dn_v2f_bmax() || tern)
                             && exec.has_gated_delta_recurrent_v2f()
                             && dn_v2f_on()
                             && exec.has_dn_fused_strided()
@@ -10424,21 +10428,22 @@ impl GpuQwen35 {
                                 dn_z_early = true;
                             }
                             (QuantW::Kq(iq), QuantW::Kq(gw))
-                                if tern_b1 && exec.ternary_multi_fits(&[iq, gw]) =>
+                                if tern && (tern_nb || exec.ternary_multi_fits(&[iq, gw])) =>
                             {
                                 if !(xn_staged || qdedup) {
                                     exec.quantize_q8_b128(
                                         &sc.d_xn,
                                         &mut bs.d_xq,
                                         &mut bs.d_xs,
-                                        embd,
+                                        b * embd,
                                     )?;
                                 }
-                                exec.ternary_gemv_b128_multi(
-                                    &mut [(iq, &mut sc.d_mixed), (gw, &mut sc.d_z)],
-                                    &bs.d_xq,
-                                    &bs.d_xs,
-                                )?;
+                                let mut planes = [(iq, &mut sc.d_mixed), (gw, &mut sc.d_z)];
+                                if tern_nb {
+                                    exec.ternary_gemm_nb(&mut planes, &bs.d_xq, &bs.d_xs, b)?;
+                                } else {
+                                    exec.ternary_gemv_b128_multi(&mut planes, &bs.d_xq, &bs.d_xs)?;
+                                }
                                 dn_z_early = true;
                             }
                             _ => bmmq!(&w.in_qkv, &sc.d_xn, &mut sc.d_mixed, qdedup),
@@ -10515,7 +10520,7 @@ impl GpuQwen35 {
                         // non-Q8 alpha/beta: the mandatory f32 decay plane
                         // (exactly the serial spine's path, batched)
                         let ab = w.ab_f32.as_ref().expect("ab plane (loader guarantees)");
-                        ab_gate(
+                        ab_gate_dec(
                             &exec,
                             ab,
                             &sc.d_xn,
@@ -10558,7 +10563,7 @@ impl GpuQwen35 {
                             n_v_heads,
                             state_size,
                         )?;
-                    } else if b <= dn_v2f_bmax()
+                    } else if (b <= dn_v2f_bmax() || tern)
                         && exec.has_gated_delta_recurrent_v2f()
                         && dn_v2f_on()
                     {
@@ -11033,8 +11038,8 @@ impl GpuQwen35 {
                                     )?;
                                     exec.swiglu_fused(fused, &mut sc.d_ffn_gate, ff, b)?;
                                 } else if let (QuantW::Kq(kg), QuantW::Kq(ku)) = (gate, up)
-                                    && tern_b1
-                                    && exec.ternary_multi_fits(&[kg, ku])
+                                    && tern
+                                    && (tern_nb || exec.ternary_multi_fits(&[kg, ku]))
                                 {
                                     // gate, up and the SwiGLU in one launch
                                     if !pn_staged {
@@ -11042,21 +11047,32 @@ impl GpuQwen35 {
                                             &sc.d_xn,
                                             &mut bs.d_xq,
                                             &mut bs.d_xs,
-                                            embd,
+                                            b * embd,
                                         )?;
                                     }
-                                    exec.ternary_glu_b128(
-                                        kg,
-                                        ku,
-                                        &bs.d_xq,
-                                        &bs.d_xs,
-                                        &mut sc.d_ffn_gate,
-                                    )?;
+                                    if tern_nb {
+                                        exec.ternary_glu_nb(
+                                            kg,
+                                            ku,
+                                            &bs.d_xq,
+                                            &bs.d_xs,
+                                            &mut sc.d_ffn_gate,
+                                            b,
+                                        )?;
+                                    } else {
+                                        exec.ternary_glu_b128(
+                                            kg,
+                                            ku,
+                                            &bs.d_xq,
+                                            &bs.d_xs,
+                                            &mut sc.d_ffn_gate,
+                                        )?;
+                                    }
                                 } else {
                                     bmmq!(gate, &sc.d_xn, &mut sc.d_ffn_gate, pn_staged);
                                     // the ternary lane: gate just staged this
                                     // same d_xn, so up reads it as is
-                                    bmmq!(up, &sc.d_xn, &mut sc.d_ffn_up, tern_b1);
+                                    bmmq!(up, &sc.d_xn, &mut sc.d_ffn_up, tern);
                                     exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, b * ff)?;
                                 }
                                 let ffn_staged = rot_stage!(&mut sc.d_ffn_gate, ff);
@@ -11250,11 +11266,20 @@ impl GpuQwen35 {
                 )?;
             } else {
                 match &self.output {
-                    QuantW::Kq(k) if tern_b1 => {
+                    QuantW::Kq(k) if tern => {
                         if !h_staged {
                             exec.quantize_q8_b128(&sc.d_h, &mut bs.d_xq, &mut bs.d_xs, embd)?;
                         }
-                        exec.ternary_gemv_b128(k, &bs.d_xq, &bs.d_xs, &mut bs.d_logits)?;
+                        if tern_nb {
+                            exec.ternary_gemm_nb(
+                                &mut [(k, &mut bs.d_logits)],
+                                &bs.d_xq,
+                                &bs.d_xs,
+                                1,
+                            )?;
+                        } else {
+                            exec.ternary_gemv_b128(k, &bs.d_xq, &bs.d_xs, &mut bs.d_logits)?;
+                        }
                     }
                     // W4A8 lm head in the captured b=1 tick - profiling caught
                     // this site still on the exact-f32 GEMV (1.39 ms/token, the
@@ -11279,6 +11304,16 @@ impl GpuQwen35 {
                     _ => gemv_any(&exec, &self.output, &sc.d_h, &mut bs.d_logits)?,
                 }
             }
+        } else if let QuantW::Kq(k) = &self.output
+            && tern
+        {
+            // the ternary head at every decode width: one read of the vocab
+            // plane for all b rows (the generic k-quant GEMM below re-read it
+            // per row - 278 MB a row on Bonsai 27B)
+            if !h_staged {
+                exec.quantize_q8_b128(&sc.d_h, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
+            }
+            exec.ternary_gemm_nb(&mut [(k, &mut bs.d_logits)], &bs.d_xq, &bs.d_xs, b)?;
         } else if let Some((pt, pi, po)) = self
             .out_f8t
             .as_ref()

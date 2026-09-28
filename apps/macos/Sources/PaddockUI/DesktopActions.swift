@@ -105,6 +105,27 @@ extension WorkspaceModel {
       return
     default: break
     }
+    if case .chat(let port) = request.action,
+      snapshot?.runners.contains(where: { $0.port == port && $0.reader != nil }) == true
+    {
+      // Decision endpoints have no chat model. Preserve both drafts, discover
+      // capabilities and select the existing endpoint in the native Reads UI.
+      guard !reads.historyNavigationBlocked, reads.port == port || !reads.hasWork else {
+        desktopError = "Finish the current read before switching models. Nothing was discarded."
+        return
+      }
+      desktopTransition = true
+      defer { desktopTransition = false }
+      await reads.refresh()
+      guard reads.readers.contains(where: { $0.port == port }) else {
+        desktopError = "This reader is not ready. Check Settings > Instances."
+        return
+      }
+      reads.port = port
+      navigation.mode = .studio
+      navigation.studio = .reads
+      return
+    }
     navigation.mode = .studio
     navigation.studio = .newChat
     if case .conversation(let id) = request.action, id == chat.conversation?.id { return }

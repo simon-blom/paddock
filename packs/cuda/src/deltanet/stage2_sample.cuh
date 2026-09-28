@@ -1887,31 +1887,72 @@ int pd_gated_delta_chunked_rs_vl_qkc(
 // ties - matches the host argmax's strict-greater ascending scan). One block per
 // row; used by batched speculative decoding so per-row token picks stay on
 // device instead of reading back [rows, vocab] logits.
-__global__ void pd_argmax_rows_kernel(const float* __restrict__ logits,
-                                      unsigned int* __restrict__ out, uint32_t n) {
+//
+// A vocab row is 512 KB (131072 f32) and one block reads it alone, so the
+// block has to keep that SM's memory pipe full: 1024 threads, 16-byte loads,
+// PD_AMX_U of them in flight per thread before any compare. The old body - 256
+// threads, one dependent scalar load each - ran ~8 loads deep per SM: 2.7 GB/s,
+// ~190 us a row on GB10, paid five times a round by DSpark's Markov walk and
+// once a round by every verify. Each thread scans its indices in ascending
+// order with a strict compare and the combine takes the lower index on ties,
+// so the pick is the old kernel's bit for bit.
+#define PD_AMX_U 4
+__global__ void __launch_bounds__(1024)
+pd_argmax_rows_kernel(const float* __restrict__ logits, unsigned int* __restrict__ out,
+                      uint32_t n) {
     const uint32_t row = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
     const float* x = logits + (size_t)row * n;
     float bv = -3.402823466e+38f;
     uint32_t bi = 0;
-    for (uint32_t i = tid; i < n; i += nth) {
-        float v = x[i];
+    // a row whose base is off the 16-byte grid (an odd vocab's later rows)
+    // walks its first few elements scalar up to it; every thread still
+    // meets its indices in ascending order (head, vector body, tail)
+    const uint32_t head =
+        min(n, (uint32_t)(((16u - (reinterpret_cast<uintptr_t>(x) & 15u)) & 15u) >> 2));
+    if (tid < head && x[tid] > bv) { bv = x[tid]; bi = tid; }
+    const float4* x4 = reinterpret_cast<const float4*>(x + head);
+    const uint32_t n4 = (n - head) >> 2;
+    for (uint32_t b = tid; b < n4; b += nth * PD_AMX_U) {
+        float4 r[PD_AMX_U];
+#pragma unroll
+        for (int u = 0; u < PD_AMX_U; ++u) {
+            const uint32_t j = b + (uint32_t)u * nth;
+            r[u] = j < n4 ? __ldg(x4 + j) : make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+        }
+#pragma unroll
+        for (int u = 0; u < PD_AMX_U; ++u) {
+            const uint32_t j = head + (b + (uint32_t)u * nth) * 4u;
+            if (r[u].x > bv) { bv = r[u].x; bi = j; }
+            if (r[u].y > bv) { bv = r[u].y; bi = j + 1u; }
+            if (r[u].z > bv) { bv = r[u].z; bi = j + 2u; }
+            if (r[u].w > bv) { bv = r[u].w; bi = j + 3u; }
+        }
+    }
+    for (uint32_t i = head + (n4 << 2) + tid; i < n; i += nth) {
+        const float v = x[i];
         if (v > bv) { bv = v; bi = i; }
     }
 #pragma unroll
     for (uint32_t off = 16; off > 0; off >>= 1) {
-        float ov = __shfl_down_sync(0xffffffffu, bv, off);
-        uint32_t oi = __shfl_down_sync(0xffffffffu, bi, off);
+        const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        const uint32_t oi = __shfl_down_sync(0xffffffffu, bi, off);
         if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
     }
-    __shared__ float sv[8];
-    __shared__ uint32_t si[8];
-    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    __shared__ float sv[32];
+    __shared__ uint32_t si[32];
+    const uint32_t lane = tid & 31u, warp = tid >> 5, nw = (nth + 31u) >> 5;
     if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
     __syncthreads();
-    if (tid == 0) {
-        for (uint32_t w = 1; w < ((nth + 31u) >> 5); ++w)
-            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-        out[row] = bi;
+    if (warp == 0) {
+        bv = lane < nw ? sv[lane] : -INFINITY;
+        bi = lane < nw ? si[lane] : 0xffffffffu;
+#pragma unroll
+        for (uint32_t off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+            const uint32_t oi = __shfl_down_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) out[row] = bi;
     }
 }
 
@@ -1919,7 +1960,7 @@ PD_EXPORT
 int pd_argmax_rows(const void* logits, void* out, uint32_t rows, uint32_t n,
                    void* stream) {
     if (rows == 0 || n == 0) return 0;
-    pd_argmax_rows_kernel<<<rows, 256, 0, (cudaStream_t)stream>>>(
+    pd_argmax_rows_kernel<<<rows, 1024, 0, (cudaStream_t)stream>>>(
         (const float*)logits, (unsigned int*)out, n);
     return pd_launch_status();
 }

@@ -1,6 +1,14 @@
 use super::*;
 use paddock_engine::generator::{GenError, Generator};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static POLICY_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    // Arithmetic experiment only. Do not expose a runner bypass for the
+    // prefix compatibility guard: qualify the graph before changing it.
+    pub(super) static CANONICAL_PREFILL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Generator for FlashNext {
     fn reset(&mut self) {
         self.pending.clear();
@@ -30,6 +38,14 @@ impl Generator for FlashNext {
     }
     fn pool_free_blocks(&self) -> Option<usize> {
         Some(self.pool.free_blocks())
+    }
+    fn pool_admission_blocks(&self) -> Option<usize> {
+        Some(self.pool.free_blocks() + self.prefix.reclaimable_blocks(&self.pool))
+    }
+    fn take_prefill_reused(&mut self, slot: usize) -> usize {
+        self.slots
+            .get_mut(slot)
+            .map_or(0, |s| std::mem::take(&mut s.reused))
     }
     fn forward(&mut self, token: u32) -> std::result::Result<Vec<f32>, GenError> {
         if self.pending.iter().any(|p| p.slot == 0) {
@@ -105,18 +121,25 @@ impl Generator for FlashNext {
     }
     // the pass chunk less the decode rows sharing it
     fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
-        self.chunk.saturating_sub(decode_rows)
+        // The wider physical pass is cold-prefill only. A live decoder must
+        // not inherit twice the previous maximum work between tokens.
+        if decode_rows == 0 {
+            self.capacity
+        } else {
+            self.chunk
+        }
+        .saturating_sub(decode_rows)
     }
     fn prefill_begin(
         &mut self,
         slot: usize,
         tokens: Vec<u32>,
     ) -> std::result::Result<(), GenError> {
-        self.prepare(slot, &tokens)?;
+        let reused = self.prepare(slot, &tokens)?;
         self.pending.push_back(Pending {
             slot,
             tokens,
-            offset: 0,
+            offset: reused,
         });
         Ok(())
     }
@@ -143,6 +166,15 @@ impl Generator for FlashNext {
         let mut rows = decodes.to_vec();
         let mut complete = Vec::new();
         let mlx = self.is_mlx();
+        #[cfg(test)]
+        let policy = POLICY_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let policy = 0;
+        let budget = if policy == 2 && !decodes.is_empty() {
+            budget.min(crate::schedule::row_cap(decodes.len(), self.chunk) - decodes.len())
+        } else {
+            budget
+        };
         let advances = crate::schedule::grants(
             &self
                 .pending
@@ -151,16 +183,23 @@ impl Generator for FlashNext {
                     // Cap eligible work before apportionment. Otherwise a
                     // logical boundary discards most of a grant while a
                     // neighbouring prompt could have used the spare rows.
-                    let remaining = if mlx {
+                    let mut remaining = if mlx {
                         logical_chunk(p.tokens.len(), p.offset, self.chunk).1
                     } else {
                         p.tokens.len() - p.offset
                     };
+                    if self.prefix.enabled() {
+                        remaining = remaining.min(prefix::rows_until_cut(
+                            p.tokens.len(),
+                            p.offset,
+                            self.chunk,
+                        ));
+                    }
                     (remaining, p.tokens.len())
                 })
                 .collect::<Vec<_>>(),
-            budget.min(self.chunk.saturating_sub(rows.len())),
-            decodes.is_empty(),
+            budget.min(self.prefill_tick_cap(decodes.len())),
+            decodes.is_empty() && policy == 0,
         );
         let mut contracts = if mlx {
             vec![1; decodes.len()]
@@ -192,6 +231,20 @@ impl Generator for FlashNext {
         for (p, n) in self.pending.iter_mut().zip(advances) {
             p.offset += n;
         }
+        let captures = self
+            .pending
+            .iter()
+            .filter(|p| {
+                self.prefix.enabled()
+                    && p.offset > 0
+                    && p.offset < p.tokens.len()
+                    && prefix::cuts(p.tokens.len(), self.chunk).contains(&p.offset)
+            })
+            .map(|p| (p.slot, p.tokens.clone()))
+            .collect::<Vec<_>>();
+        for (slot, tokens) in captures {
+            self.capture_prefix(slot, &tokens)?;
+        }
         let done = complete
             .iter()
             .enumerate()
@@ -207,7 +260,7 @@ impl Generator for FlashNext {
 
 /// (Arithmetic shape, rows before the next boundary). Prompt-only serial
 /// execution and arbitrary bounded mixed grants must use the same graph.
-fn logical_chunk(tokens: usize, offset: usize, chunk: usize) -> (usize, usize) {
+pub(super) fn logical_chunk(tokens: usize, offset: usize, chunk: usize) -> (usize, usize) {
     assert!(tokens > 0 && offset < tokens);
     let body = tokens - 1;
     if offset == body {
@@ -215,7 +268,15 @@ fn logical_chunk(tokens: usize, offset: usize, chunk: usize) -> (usize, usize) {
     }
     let start = offset / chunk * chunk;
     let length = (body - start).min(chunk);
-    (length, start + length - offset)
+    #[cfg(test)]
+    let logical = if CANONICAL_PREFILL_FOR_TEST.with(|v| v.get()) {
+        chunk
+    } else {
+        length
+    };
+    #[cfg(not(test))]
+    let logical = length;
+    (logical, start + length - offset)
 }
 
 #[cfg(test)]

@@ -45,6 +45,30 @@ __device__ __forceinline__ uint32_t pd_pf_floor(uint32_t wpos, uint32_t swa) {
     return (swa > 0 && wpos + 1u > swa) ? wpos + 1u - swa : 0u;
 }
 
+// Host: can `fn` launch with `dyn` bytes of dynamic shared memory on this
+// device? The opt-in cap bounds STATIC + dynamic, and a kernel's static
+// arrays (its own and its inlined helpers') are invisible at the call site,
+// so a guard on `dyn` alone admits a launch the driver refuses: pf7rp's
+// 100,608 dynamic + 1,024 static bytes against GB10's 101,376 failed every
+// hd256 fp8 prefill with cudaErrorInvalidValue (the attribute set had failed
+// unchecked). Raises the kernel's dynamic limit when it fits; false = take
+// the next arm.
+static inline bool pd_smem_fits(const void* fn, uint32_t dyn) {
+    int dev = 0, cap = 0;
+    cudaFuncAttributes a;
+    if (cudaGetDevice(&dev) != cudaSuccess
+        || cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
+               != cudaSuccess
+        || cudaFuncGetAttributes(&a, fn) != cudaSuccess)
+        return false;
+    if (a.sharedSizeBytes + (size_t)dyn > (size_t)cap) return false;
+    return cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn)
+           == cudaSuccess;
+}
+// (No PD_BS_HOST guard: the pf7/pf7rp launch guards call this on every
+// build, and a single-arch pack - which defines no PD_BS_HOST - failed to
+// compile with it hidden. It needs nothing but the CUDA runtime.)
+
 template<typename KV, uint32_t HD>
 __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
@@ -531,7 +555,22 @@ int pd_attn_prefill_paged(const void* q, const void* pool_k, const void* pool_v,
 // slots[b]==slot test, so they contribute nothing and are covered by the next
 // text's own tile. Same value math / numeric class as attn_prefill (and thus
 // attn_decode_batch): f32 dot + scale, per-32-key online softmax.
-template<typename KV, uint32_t HD>
+//
+// PAGED (slot 688): K/V live in a block pool [n_blocks, 16, kv_dim] and key
+// p of the tile's slot is row block_tables[slot*bps + p/16]*16 + p%16. The
+// only change is that row: staging, masking and every fold are the dense
+// walk's, so a paged launch is bit-identical to the dense one over the same
+// keys. A tile starts TK-aligned (TK 16 or 32), so it spans one or two pool
+// blocks - read once per tile, never per staged element, and one tile ahead
+// with the index clamped to the slot's last live key rather than a select on
+// the loaded value (in-order issue stalls the warp at the first use of a
+// load, and a select is a use): a table entry past a slot's live keys need
+// not name a block the slot owns, so it is never read. GB10, 24 q / 2 kv of
+// 256, scrambled pool (bench/paged_modes_gb10_bench.cu): +2.5% on a fresh
+// 1024-row prompt, +3.3% on a 512-row chunk at 16K - against +3.0 / +6.0%
+// for a table read at each tile's top, +7.4 / +8.2% for the unclamped
+// prefetch.
+template<typename KV, uint32_t HD, bool PAGED = false>
 __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
     const KV* __restrict__ vc, const float* __restrict__ sinks,
@@ -540,7 +579,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     const unsigned int* __restrict__ tile_slot,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
     uint32_t swa_window, uint32_t n_rows, float scale,
-    const unsigned int* __restrict__ win_pos) {
+    const unsigned int* __restrict__ win_pos,
+    const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;
@@ -589,8 +629,10 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     float m0 = sinks[h], l0 = 1.f, m1 = m0, l1 = 1.f;
     float a0[DPL] = {}, a1[DPL] = {};
 
-    const KV* kcb = kc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * HD;
-    const KV* vcb = vc + (size_t)slot * max_ctx * kv_dim + (size_t)kvh * HD;
+    // dense: the slot's strip; paged: the pool itself, rows from the table
+    const size_t slot0 = PAGED ? 0 : (size_t)slot * max_ctx * kv_dim;
+    const KV* kcb = kc + slot0 + (size_t)kvh * HD;
+    const KV* vcb = vc + slot0 + (size_t)kvh * HD;
 
     // SWA layers: START at the block's window edge instead of masking ~all
     // of history (a 4k-prompt chunk computed ~4000 masked KV columns per
@@ -607,14 +649,29 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
         if (lo1 != 0xFFFFFFFFu && lo1 > swa_window)
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
+    // paged: the pool blocks of the tile at `t` (clamped to the last live key)
+    uint32_t pn0 = 0, pn1 = 0;
+    auto fetch = [&](uint32_t t) {
+        const uint32_t* bt = block_tables + (size_t)slot * bps;
+        pn0 = bt[min(t, hi - 1u) >> 4];
+        if constexpr (TK > 16u) pn1 = bt[min(t + 16u, hi - 1u) >> 4];
+    };
+    if constexpr (PAGED) fetch(lo_t);
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
         __syncthreads();
+        const uint32_t pb0 = pn0, pb1 = pn1;   // this tile's (paged)
+        if constexpr (PAGED) fetch(t0 + TK);
         #pragma unroll
         for (uint32_t it = 0; it < TK * HD / 256u; ++it) {
             const uint32_t i = it * 256u + tid, kk = i / HD, dd = i % HD;
             const uint32_t kp = t0 + kk;
-            const float kvl = kp < hi ? pd_kv_load(kcb[(size_t)kp * kv_dim + dd]) : 0.f;
-            const float vvl = kp < hi ? pd_kv_load(vcb[(size_t)kp * kv_dim + dd]) : 0.f;
+            // t0 is 16-aligned, so kp % 16 == kk % 16: an address affine in
+            // the unrolled kk, which the compiler strength-reduces as it does
+            // the dense one
+            const size_t row = PAGED ? (size_t)((kk >> 4) ? pb1 : pb0) * 16u + (kk & 15u)
+                                     : (size_t)kp;
+            const float kvl = kp < hi ? pd_kv_load(kcb[row * kv_dim + dd]) : 0.f;
+            const float vvl = kp < hi ? pd_kv_load(vcb[row * kv_dim + dd]) : 0.f;
             sh_k[dd * (TK + 1u) + kk] = kvl;
             sh_v[kk * QPAD + dd] = vvl;
         }
@@ -691,28 +748,30 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     }
 }
 
-template<typename KV, uint32_t HD>
+template<typename KV, uint32_t HD, bool PAGED = false>
 static int pd_attn_prefill_batch_launch(
         const void* q, const void* kc, const void* vc, const void* sinks, void* out,
         const void* positions, const void* slots, const void* tile_row0,
         const void* tile_slot, uint32_t n_qtiles, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window,
-        uint32_t n_rows, float scale, cudaStream_t st) {
+        uint32_t n_rows, float scale, cudaStream_t st,
+        const void* block_tables = nullptr, uint32_t bps = 0) {
     constexpr uint32_t TK = HD == 128u ? 32u : 16u;
     constexpr uint32_t QPAD = HD + 4u;
     constexpr uint32_t SMEM =
         (PD_APF_TQ * QPAD + HD * (TK + 1u) + TK * QPAD + PD_APF_TQ) * 4u;
     static cudaError_t attr = cudaFuncSetAttribute(
-        (const void*)pd_attn_prefill_batch_kernel<KV, HD>,
+        (const void*)pd_attn_prefill_batch_kernel<KV, HD, PAGED>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
     if (attr != cudaSuccess) return attr;
     dim3 grid(n_heads, n_qtiles);
-    pd_attn_prefill_batch_kernel<KV, HD><<<grid, 256, SMEM, st>>>(
+    pd_attn_prefill_batch_kernel<KV, HD, PAGED><<<grid, 256, SMEM, st>>>(
         (const float*)q, (const KV*)kc, (const KV*)vc, (const float*)sinks,
         (float*)out, (const unsigned int*)positions, (const unsigned int*)slots,
         (const unsigned int*)tile_row0, (const unsigned int*)tile_slot,
         n_heads, n_kv_heads, max_ctx, kv_dim, swa_window, n_rows, scale,
-        nullptr);  // causal rows only (the encoder's ragged batch): floors from positions
+        nullptr,  // causal rows only (the encoder's ragged batch): floors from positions
+        (const uint32_t*)block_tables, bps);
     return pd_launch_status();
 }
 
@@ -752,6 +811,37 @@ int pd_attn_prefill_batch(const void* q, const void* kc, const void* vc, const v
 #undef PD_APB
 }
 
+// slot 688: pd_attn_prefill_batch over a paged pool - `block_tables` +
+// `blocks_per_slot` after `slots`, no max_ctx (the pool replaces the strip).
+// Bit-identical to the dense entry over the same keys (see the kernel).
+PD_EXPORT
+int pd_attn_prefill_batch_paged(const void* q, const void* pool_k, const void* pool_v,
+                                const void* sinks, void* out, const void* positions,
+                                const void* slots, const void* block_tables,
+                                uint32_t blocks_per_slot, const void* tile_row0,
+                                const void* tile_slot, uint32_t n_qtiles, uint32_t n_heads,
+                                uint32_t n_kv_heads, uint32_t head_dim, uint32_t kv_dim,
+                                uint32_t swa_window, uint32_t n_rows, float scale,
+                                uint32_t kv_dtype, void* stream) {
+    if (n_heads == 0 || n_qtiles == 0 || n_rows == 0) return 0;
+    if (head_dim != 128u && head_dim != 256u && head_dim != 512u)
+        return cudaErrorInvalidValue;
+    auto st = (cudaStream_t)stream;
+#define PD_APBP(KVT, HDV)                                                      \
+    pd_attn_prefill_batch_launch<KVT, HDV, true>(                              \
+        q, pool_k, pool_v, sinks, out, positions, slots, tile_row0, tile_slot, \
+        n_qtiles, n_heads, n_kv_heads, 0u, kv_dim, swa_window, n_rows, scale,  \
+        st, block_tables, blocks_per_slot)
+    if (kv_dtype == PD_KV_FP8_E4M3)
+        return head_dim == 128u   ? PD_APBP(__nv_fp8_e4m3, 128u)
+               : head_dim == 256u ? PD_APBP(__nv_fp8_e4m3, 256u)
+                                  : PD_APBP(__nv_fp8_e4m3, 512u);
+    return head_dim == 128u   ? PD_APBP(__half, 128u)
+           : head_dim == 256u ? PD_APBP(__half, 256u)
+                              : PD_APBP(__half, 512u);
+#undef PD_APBP
+}
+
 // ------------------------------------------------------- attn prefill f16
 // Tensor-core prefill attention (P6i) - the fattn-wmma class (design studied
 // from ggml fattn-wmma-f16.cu; implementation ours). S = Q K^T and O += V P
@@ -770,8 +860,16 @@ int pd_attn_prefill_batch(const void* q, const void* kc, const void* vc, const v
 //   - Sinks fold in at the epilogue: l += exp(sink - m) with the same
 //     max-rebase as the decode kernel, so semantics match it exactly.
 //   - exp() flushes to zero below -20 (the fattn FTZ rule) - also what
-//     makes masked keys exact zeros; stale cache rows beyond a query's
-//     bound are finite garbage times a 0.0 weight, never NaN.
+//     makes masked keys exact zeros.
+//   - Nothing at or past `hi` (the block's deepest live key + 1) reaches a
+//     product: a 16-key K strip or V sub-tile wholly past it is skipped (its
+//     scores are masked, its weights exact zeros), and the V sub-tile that
+//     straddles it is staged through this warp's slice of sh_q with the rows
+//     past it ZEROED - FlashAttention's out-of-bounds clear. Those rows are
+//     not the sequence's: a paged pool hands tables pages that held other
+//     records (checkpoint f32 bits read as f16 are ~1.5% Inf / NaN), and
+//     0 x NaN is NaN in the mma. So the kernel reads only rows of pages
+//     holding a live key - no table entry, and no dense row, past them.
 // Numeric class: f16 Q/K/V inputs, f32 score accumulate + softmax, f16 O
 // accumulate - llama's own prefill attention class on this hardware.
 // Requirements: head_dim == 64 or 256, fp16 KV, max_ctx % 64 == 0, slots
@@ -779,6 +877,32 @@ int pd_attn_prefill_batch(const void* q, const void* kc, const void* vc, const v
 // over the 4 warps, so D must be a multiple of 64.)
 #define PD_AF16_NCOLS 32  // queries per block
 #define PD_AF16_TK 64     // keys per tile (= 4 warps x 16 fragment rows)
+
+// Row stride of a warp's V staging slice in sh_q (see the kernel note): DW
+// dims plus a conflict-avoid pad where the four slices still fit, else DW
+// (D = 512's NC 16 tile). A multiple of 8 halves, as wmma's ldm needs, and
+// every slice and 16-dim column group stays 32-byte aligned.
+template<uint32_t D, uint32_t NC>
+__device__ __host__ constexpr uint32_t pd_af16_vld() {
+    return 4u * 16u * (D / 4u + 8u) <= NC * (D + 8u) ? D / 4u + 8u : D / 4u;
+}
+
+// Stage the 16-key V sub-tile [kb, kb+16) of this warp's DW dims into `sv`
+// (row stride VLD), rows at or past `hi` zeroed. `row(k)` points at key k's
+// first dim of this kv head. Warp-cooperative, 16-byte moves.
+template<uint32_t DW, uint32_t VLD, typename RowFn>
+__device__ __forceinline__ void pd_af16_stage_v_tail(half* sv, uint32_t kb, uint32_t hi,
+                                                     uint32_t d0, uint32_t lane, RowFn row) {
+    constexpr uint32_t C8 = DW / 8u;  // 16-byte chunks per row
+    #pragma unroll
+    for (uint32_t i = lane; i < 16u * C8; i += 32u) {
+        const uint32_t r = i / C8, c = (i % C8) * 8u;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (kb + r < hi) v = *(const uint4*)(row(kb + r) + d0 + c);
+        *(uint4*)(sv + r * VLD + c) = v;
+    }
+    __syncwarp();
+}
 template<uint32_t D>
 __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
     const float* __restrict__ q, const __half* __restrict__ kc,
@@ -873,8 +997,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
-        // S = Q K^T for this warp's 16-key strip x all 32 queries
-        {
+        // S = Q K^T for this warp's 16-key strip x all 32 queries (a strip
+        // wholly past `hi` is never read - its scores are masked below)
+        if (t0 + 16u * warp < hi) {
             frag_s S_c[NC / 16u];
             #pragma unroll
             for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) wmma::fill_fragment(S_c[j0], 0.f);
@@ -950,12 +1075,25 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
                         DP, wmma::mem_col_major);
             #pragma unroll
             for (uint32_t kf = 0; kf < TK / 16u; ++kf) {
+                const uint32_t kb = t0 + kf * 16u;
+                if (kb >= hi) break;  // weights all exact zeros
                 frag_v V_a[DW / 16u];
-                #pragma unroll
-                for (uint32_t df = 0; df < DW / 16u; ++df)
-                    wmma::load_matrix_sync(
-                        V_a[df], vcb + (size_t)(t0 + kf * 16u) * kv_dim + DW * warp + df * 16u,
-                        kv_dim);
+                if (kb + 16u <= hi) {
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(
+                            V_a[df], vcb + (size_t)kb * kv_dim + DW * warp + df * 16u,
+                            kv_dim);
+                } else {
+                    constexpr uint32_t VLD = pd_af16_vld<D, NC>();
+                    half* sv = sh_q + warp * 16u * VLD;
+                    pd_af16_stage_v_tail<DW, VLD>(
+                        sv, kb, hi, DW * warp, lane,
+                        [&](uint32_t k) { return vcb + (size_t)k * kv_dim; });
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], sv + df * 16u, VLD);
+                }
                 #pragma unroll
                 for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) {
                     frag_b P_b;
@@ -1014,7 +1152,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
 // load_matrix_sync tile is one contiguous block - the FlashInfer BSR property.
 // Only the base setup + the two K/V load bases change (dense slot base ->
 // block-table lookup); the fragments, mma_sync, and softmax are byte-identical,
-// so it is bit-exact vs the dense WMMA prefill.
+// so it is bit-exact vs the dense WMMA prefill. Like its twin it reads no row
+// at or past `hi` into a product (see the dense note), so it touches only the
+// table entries of pages holding a live key.
 template<uint32_t D>
 __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
     const float* __restrict__ q, const __half* __restrict__ pool_k,
@@ -1102,7 +1242,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
-        {
+        // a strip wholly past `hi` is never read: its scores are masked, and
+        // its table entry may name no page of this slot
+        if (t0 + 16u * warp < hi) {
             frag_s S_c[NC / 16u];
             #pragma unroll
             for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) wmma::fill_fragment(S_c[j0], 0.f);
@@ -1178,15 +1320,25 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
                         DP, wmma::mem_col_major);
             #pragma unroll
             for (uint32_t kf = 0; kf < TK / 16u; ++kf) {
+                const uint32_t kb = t0 + kf * 16u;
+                if (kb >= hi) break;  // weights all exact zeros
                 frag_v V_a[DW / 16u];
-                #pragma unroll
-                for (uint32_t df = 0; df < DW / 16u; ++df)
-                    // paged V tile: block bt[(t0+kf*16)>>4], within-block row 0.
-                    wmma::load_matrix_sync(
-                        V_a[df],
-                        pool_v + (size_t)bt[(t0 + kf * 16u) >> 4] * 16u * kv_dim
-                            + (size_t)kvh * D + DW * warp + df * 16u,
-                        kv_dim);
+                // paged V tile: block bt[kb>>4], within-block row 0.
+                const __half* vb = pool_v + (size_t)bt[kb >> 4] * 16u * kv_dim + (size_t)kvh * D;
+                if (kb + 16u <= hi) {
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], vb + DW * warp + df * 16u, kv_dim);
+                } else {
+                    constexpr uint32_t VLD = pd_af16_vld<D, NC>();
+                    half* sv = sh_q + warp * 16u * VLD;
+                    pd_af16_stage_v_tail<DW, VLD>(
+                        sv, kb, hi, DW * warp, lane,
+                        [&](uint32_t k) { return vb + (size_t)(k - kb) * kv_dim; });
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], sv + df * 16u, VLD);
+                }
                 #pragma unroll
                 for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) {
                     frag_b P_b;

@@ -56,6 +56,11 @@ pub(crate) struct Rotation {
     gdn: Option<HadamardGdnHeads>,
     /// the token embedding stores rotated rows
     embd_inverse: bool,
+    /// every rotated linear's staged input is the ternary class (one int8
+    /// scale per 128) at the widths that stage per row block - the model
+    /// elected the NB-row ternary lane (load.rs `tern_nb`), and the prefill
+    /// staging sites read it here (ops.rs `prefill_quant`)
+    pub(crate) act128: bool,
 }
 
 fn refuse(msg: String) -> GpuModelError {
@@ -195,6 +200,7 @@ impl Rotation {
             signs,
             gdn,
             embd_inverse: spec.embd_inverse,
+            act128: false,
         }))
     }
 

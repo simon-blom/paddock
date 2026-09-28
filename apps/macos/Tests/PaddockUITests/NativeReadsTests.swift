@@ -7,6 +7,50 @@ import Testing
 
 @Suite("Native Reads state", .serialized) @MainActor
 struct NativeReadsTests {
+  @Test func layaReaderRoutesAutomaticallyAndKeepsNativeHistory() async throws {
+    let m = model()
+    var stored: ConversationValue?
+    m.api = { path, method, body, _ in
+      if path == "api/runners" {
+        return try value(#"[{"port":1234,"reader":"laya","display":"Laya"}]"#)
+      }
+      if path.hasSuffix("/server") {
+        return try value(
+          #"{"structured_read":{"backend":"laya","max_samples":1,"max_steps":1,"images":false,"think":false,"checkpoints":[{"name":"english"},{"name":"multilingual"},{"name":"typed-decisions"}]}}"#
+        )
+      }
+      if path.hasSuffix("/systemone") {
+        #expect(body?["model"] == .string(""))  // bundle id must not force English
+        #expect(body?["samples"] == .string("auto"))
+        return try value(
+          #"{"model":"laya","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"routing":{"model":"multilingual","reason":"Swedish text"},"diagnostics":{"backend":"laya","checkpoint":"multilingual","reads":1,"questions":[],"timing":{"total_ms":12}}}"#
+        )
+      }
+      if path.hasPrefix("api/read-history/") {
+        if method == "PUT" {
+          stored = body
+          return .object(["read": .object(["revision": .string("saved")])])
+        }
+        return .object(["doc": stored!["doc"]!, "revision": .string("saved")])
+      }
+      return .array([])
+    }
+    await m.refresh()
+    m.draft.state = "Mitt konto debiterades två gånger."
+    #expect(m.current?.backend == "laya" && m.current?.maxSamples == 1 && m.canRun)
+    #expect(m.current?.checkpoints.count == 3)
+    m.run()
+    await m.settle()
+    #expect(m.error == nil && m.historyError == nil && stored != nil)
+    let id = try #require(m.activeSession?.id)
+    m.reset()
+    await m.openSession(id)
+    #expect(m.result?.response.diagnostics.checkpoint == "multilingual" && !m.stale)
+    m.draft.checkpoint = "typed-decisions"
+    #expect(m.canRun && m.stale && m.requestModel == "typed-decisions")
+    m.draft.images = [ReadPicture(name: "x.png", url: "data:image/png;base64,YQ==")]
+    #expect(!m.canRun)
+  }
   @Test func visionReadsRetainPixelsAndStepsInSharedHistory() async throws {
     let m = model()
     let originalAPI = m.api

@@ -8,6 +8,22 @@ import Testing
 
 @Suite("Acknowledged native endpoint editing", .timeLimit(.minutes(1))) @MainActor
 struct EndpointEditorTests {
+  @Test func layaUsesOfficialF16CheckpointAndNoChatFeatures() throws {
+    let editor = EndpointEditor(
+      client: EndpointEditFixture(), endpoint: try editEndpoint(), pid: nil)
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(
+        #"{"schema":3,"models":[{"id":"laya","display":"Laya","capability":["decision"],"installed":true,"total_size":2370000000,"artifacts":[{"id":"f16","kind":"weights","format":"safetensors","label":"Official F16 checkpoints (all three)","installed":true,"total_size":2370000000,"backend_supported":true,"runtime":{"checkpoint_dir":true,"kv_cache_dtype":"auto","default_max_batch":1}}]}]}"#
+          .utf8))
+    editor.catalog = catalog.models
+    editor.modelID = "laya"
+    editor.artifactID = "f16"
+    editor.selectArtifact(try #require(editor.selectedArtifact), newModel: true)
+    #expect(editor.checkpointLabel == "F16 checkpoint" && !editor.isMLX)
+    #expect(editor.kvDtype == "auto" && editor.capabilities == ["decision"])
+    #expect(!editor.canSpeculate && !editor.canTools && !editor.embeddedVision)
+  }
   @Test func residencyEditsAreValidatedAndDoNotChangeServingGeometry() throws {
     let data = try JSONSerialization.data(withJSONObject: [
       "port": 12345, "model": "kb-whisper-large", "running": true, "revision": "before",

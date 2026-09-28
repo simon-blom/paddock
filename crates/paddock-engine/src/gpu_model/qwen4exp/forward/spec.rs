@@ -23,6 +23,12 @@
 //! - attention KV: nothing - cells past the accept are rewritten before any
 //!   read, the argument every paged lane makes.
 //!
+//! A round that closes a page takes the reply checkpoint a decode tick takes
+//! there (`reply_after_spec`), at the exact closing row: when the round ends
+//! on the boundary the committed state is the checkpoint's, and when it runs
+//! past it the state at the boundary is rebuilt from the same planes a
+//! rollback reads (`reply_snapshot_mid`).
+//!
 //! Rows are decode-exact (`verify_exact_on`): every row-count-sensitive op of
 //! the walk runs the decode tick's own reduction for that row, and the replay
 //! re-advances the recurrence through the tick's kernel too, so a spec stream
@@ -32,8 +38,10 @@
 //! This is save-and-replay, not per-row state snapshots inside the recurrence
 //! kernel (qwen35's `gated_delta_recurrent_snap` shape): one state copy per
 //! layer per round instead of one per row, and the replay launches only when a
-//! round rejects. The snapshot kernel is the SOTA form and the next step if
-//! these copies show up in a profile.
+//! round rejects - or runs past a page boundary, for the reply checkpoint
+//! there (at most the chunk's rows, once per 16 tokens of reply). The snapshot
+//! kernel is the SOTA form and the next step if these copies show up in a
+//! profile.
 
 use super::*;
 use crate::gpu::GpuError;
@@ -97,6 +105,9 @@ pub(crate) struct Verify {
     sh_ring: Option<CudaSlice<f32>>,
     /// window rebuild staging (the live window is source and destination)
     bounce: CudaSlice<f32>,
+    /// one layer's recurrence re-advanced to a page boundary inside the
+    /// round, for the reply checkpoint there (`reply_snapshot_mid`)
+    snap_state: CudaSlice<f32>,
     pub(crate) rows: VerifyRows,
 }
 
@@ -140,6 +151,7 @@ impl Verify {
                 Some(e.alloc(slots * (c.ple_conv - 1) * PLE_DILATION * c.hc_width())?)
             },
             bounce: e.alloc(wl)?,
+            snap_state: e.alloc(st)?,
             rows: VerifyRows {
                 q: e.alloc(kdim)?,
                 k: e.alloc(kdim)?,
@@ -551,7 +563,214 @@ impl Qwen4ExpGpu {
             }
             self.pos[r.slot] = r.row0 + c;
         }
-        self.mtp_flush()
+        self.mtp_flush()?;
+        self.reply_after_spec(runs, counts)
+    }
+
+    /// A round committed `counts[i]` rows of run i: the reply checkpoint a
+    /// decode tick takes at every page it closes, for the page this round
+    /// closed (a round commits at most `VERIFY_MAX_CHUNK` rows, so one page
+    /// at most). When the round ends on the boundary the committed state is
+    /// the checkpoint's; when it runs past it, the state at the boundary is
+    /// rebuilt from the round's own planes. Without this a speculating reply
+    /// checkpointed only on its non-spec ticks - with MTP on, next to never -
+    /// and the next turn re-prefilled the whole reply.
+    fn reply_after_spec(&mut self, runs: &[Run], counts: &[usize]) -> Result<(), GpuModelError> {
+        const { assert!(VERIFY_MAX_CHUNK <= BLOCK_TOKENS) };
+        for (r, &c) in runs.iter().zip(counts) {
+            self.qsa_dense_guard(r.slot);
+            if !self.reply_track[r.slot] {
+                continue;
+            }
+            let cut = (r.row0 + c) / BLOCK_TOKENS * BLOCK_TOKENS;
+            if cut <= r.row0 {
+                continue;
+            }
+            if cut == r.row0 + c {
+                self.reply_snapshot(r.slot)?;
+            } else {
+                self.reply_snapshot_mid(r, cut)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The reply checkpoint at `cut`, a page boundary run `r` committed
+    /// `cut - r.row0` rows into and then passed. The state there is rebuilt
+    /// in the prefix cache's staging blob from what the round keeps for a
+    /// rollback, and committed into a reserved checkpoint's pages: each GDN
+    /// recurrence is the pre-round copy re-advanced over those rows through
+    /// the rollback's decode-exact replay, each conv window the last k-1 rows
+    /// of [pre-round window ; those rows' conv inputs], and the PLE ring the
+    /// live one with the slots of the positions past `cut` taken back from
+    /// the pre-round copy (a chunk never exceeds the ring, so every such slot
+    /// held a position before the round). The live state is not touched.
+    fn reply_snapshot_mid(&mut self, r: &Run, cut: usize) -> Result<(), GpuModelError> {
+        let (slot, pos0, off) = (r.slot, r.row0, r.off);
+        let n = cut - pos0;
+        if self.stream[slot].len() < cut + 2 {
+            self.reply_track[slot] = false;
+            return Ok(());
+        }
+        {
+            let Self {
+                exec: e,
+                cfg: c,
+                ple_win,
+                sc,
+                verify,
+                prefix,
+                ..
+            } = self;
+            let Some(pc) = prefix.as_mut() else {
+                return Ok(());
+            };
+            let vf: &mut Verify = verify.as_mut().expect("a round just ran");
+            let sink = pc.ckpt_sink();
+            let (hv, kd) = (c.gdn_v_heads, c.gdn_k_dim);
+            let (kdim, vdim) = (hv * kd, hv * c.gdn_v_dim);
+            let st = hv * kd * c.gdn_v_dim;
+            let (qr, km1) = (c.gdn_qkv_rows(), c.gdn_conv - 1);
+            let wl = km1 * qr;
+            let keep_old = km1.saturating_sub(n);
+            let take_new = km1 - keep_old;
+            if verify_exact_on() {
+                // the replay's one-run table: this run's first n rows, onto
+                // the scratch plane's only slot
+                e.upload_u32(&[0], &mut vf.rows.slot)?;
+                e.upload_u32(&[off as u32], &mut vf.rows.run_off)?;
+                e.upload_u32(&[n as u32], &mut vf.rows.run_len)?;
+            }
+            let mut ord = 0usize;
+            for li in 0..c.n_layer {
+                if vf.sh_state[li].is_none() {
+                    continue;
+                }
+                e.copy_region(
+                    gdn_plane(&vf.sh_state, li),
+                    slot * st,
+                    &mut vf.snap_state,
+                    0,
+                    st,
+                )?;
+                if verify_exact_on() {
+                    let walked = e.gated_delta_recurrent_runs_slots(
+                        gdn_plane(&vf.cap_q, li),
+                        gdn_plane(&vf.cap_k, li),
+                        gdn_plane(&vf.cap_v, li),
+                        gdn_plane(&vf.cap_g, li),
+                        gdn_plane(&vf.cap_b, li),
+                        &mut vf.snap_state,
+                        &mut sc.d_dattn,
+                        &vf.rows.run_off,
+                        &vf.rows.run_len,
+                        &vf.rows.slot,
+                        None,
+                        1,
+                        hv,
+                        kd,
+                    )?;
+                    for t in 0..if walked { 0 } else { n } {
+                        let rw = &mut vf.rows;
+                        let row = off + t;
+                        e.copy_region(gdn_plane(&vf.cap_q, li), row * kdim, &mut rw.q, 0, kdim)?;
+                        e.copy_region(gdn_plane(&vf.cap_k, li), row * kdim, &mut rw.k, 0, kdim)?;
+                        e.copy_region(gdn_plane(&vf.cap_v, li), row * vdim, &mut rw.v, 0, vdim)?;
+                        e.copy_region(gdn_plane(&vf.cap_g, li), row * hv, &mut rw.g, 0, hv)?;
+                        e.copy_region(gdn_plane(&vf.cap_b, li), row * hv, &mut rw.b, 0, hv)?;
+                        e.gated_delta_recurrent_slots(
+                            &rw.q,
+                            &rw.k,
+                            &rw.v,
+                            &rw.g,
+                            &rw.b,
+                            &rw.slot,
+                            &mut vf.snap_state,
+                            &mut rw.attn,
+                            1,
+                            hv,
+                            kd,
+                        )?;
+                    }
+                } else {
+                    let plane = |v| gdn_plane(v, li);
+                    e.copy_region(plane(&vf.cap_q), off * kdim, &mut sc.d_dq, 0, n * kdim)?;
+                    e.copy_region(plane(&vf.cap_k), off * kdim, &mut sc.d_dk, 0, n * kdim)?;
+                    e.copy_region(plane(&vf.cap_v), off * vdim, &mut sc.d_dv, 0, n * vdim)?;
+                    e.copy_region(plane(&vf.cap_g), off * hv, &mut sc.d_g, 0, n * hv)?;
+                    e.copy_region(plane(&vf.cap_b), off * hv, &mut sc.d_beta, 0, n * hv)?;
+                    e.gated_delta_recurrent_at(
+                        &sc.d_dq,
+                        &sc.d_dk,
+                        &sc.d_dv,
+                        &sc.d_g,
+                        &sc.d_beta,
+                        &mut vf.snap_state,
+                        0,
+                        &mut sc.d_dattn,
+                        n,
+                        hv,
+                        kd,
+                    )?;
+                }
+                let so = sink.state_off(0, ord);
+                e.copy_region(&vf.snap_state, 0, &mut *sink.pool, so, st)?;
+                let wo = sink.win_off(0, ord);
+                for j in 0..keep_old {
+                    e.copy_region(
+                        gdn_plane(&vf.sh_win, li),
+                        slot * wl + (n + j) * qr,
+                        &mut *sink.pool,
+                        wo + j * qr,
+                        qr,
+                    )?;
+                }
+                e.copy_region(
+                    gdn_plane(&vf.cap_qkv, li),
+                    (off + n - take_new) * qr,
+                    &mut *sink.pool,
+                    wo + keep_old * qr,
+                    take_new * qr,
+                )?;
+                ord += 1;
+            }
+            if let (Some(ring), Some(sh)) = (ple_win.as_ref(), vf.sh_ring.as_ref()) {
+                let hw = c.hc_width();
+                let wrows = (c.ple_conv - 1) * PLE_DILATION;
+                let pbase = slot * wrows * hw;
+                let po = sink.ple_off(0, ord);
+                e.copy_region(ring, pbase, &mut *sink.pool, po, wrows * hw)?;
+                for q in cut..pos0 + r.len {
+                    let ri = q % wrows;
+                    e.copy_region(sh, pbase + ri * hw, &mut *sink.pool, po + ri * hw, hw)?;
+                }
+            }
+        }
+        let tokens: Vec<u32> = self.stream[slot][2..2 + cut]
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        let Some(pc) = self.prefix.as_mut() else {
+            return Ok(());
+        };
+        let Some(idx) = pc.reserve_ckpt(&mut self.pages) else {
+            return Ok(());
+        };
+        if let Err(err) = pc.commit_staged(&self.exec, &self.pages, 0, idx) {
+            pc.recycle_ckpt(idx, &mut self.pages);
+            return Err(err);
+        }
+        // the reply's pages up to the cut under the radix, then the
+        // checkpoint on the node that ends there
+        if let Err(err) = self.prefix_publish(slot, &tokens, cut, false) {
+            self.recycle_reserved(&[(cut, idx)]);
+            return Err(err);
+        }
+        let pc = self.prefix.as_mut().expect("checked above");
+        if pc.attach_reply(&tokens, cut, idx, &mut self.pages) {
+            self.reply_filed(slot, &tokens, cut, idx);
+        }
+        Ok(())
     }
 
     /// Copy `slot`'s carried state before a verify walk moves it.

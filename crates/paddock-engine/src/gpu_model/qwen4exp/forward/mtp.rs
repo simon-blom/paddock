@@ -51,9 +51,14 @@ const SEED_CHUNK: usize = 256;
 
 pub(crate) struct Mtp {
     w: crate::gpu_model::qwen4exp::load_gguf::MtpWeights,
-    /// the head block's KV, in the trunk's class: [slots, max_tokens, kv_dim]
+    /// the head block's KV, in the trunk's class: [slots, bps * 16, kv_dim],
+    /// its own dense planes (the prefix cache never carries it)
     kv_k: CudaSlice<u8>,
     kv_v: CudaSlice<u8>,
+    /// the identity table the trunk's paged attention kernels read those
+    /// planes through: page `j` of slot `s` is block `s * bps + j`
+    tab: CudaSlice<u32>,
+    bps: usize,
     tracked: Vec<bool>,
     base: Vec<usize>,
     end: Vec<usize>,
@@ -219,7 +224,11 @@ impl Qwen4ExpGpu {
     ) -> Result<(), GpuModelError> {
         let (c, e) = (&self.cfg, &self.exec);
         let (slots, t) = (self.slots, self.max_tokens);
-        let kv_bytes = slots * t * c.n_kv_heads * c.head_dim * KV().bytes();
+        // whole pages per slot, so the identity table's block s * bps + j is
+        // exactly row s * bps * 16 + pos
+        let bps = super::super::pages::blocks_per_slot(t);
+        let kv_bytes =
+            slots * bps * crate::kv_pool::BLOCK_TOKENS * c.n_kv_heads * c.head_dim * KV().bytes();
         let seed = SEED_CHUNK.min(t);
         // moe_align's bound: every expert rounds its pairs up to one block
         let nb = seed * c.n_active / 32 + c.n_expert;
@@ -266,6 +275,8 @@ impl Qwen4ExpGpu {
             w,
             kv_k: e.alloc_u8(kv_bytes)?,
             kv_v: e.alloc_u8(kv_bytes)?,
+            tab: super::super::pages::identity_table(e, slots, bps)?,
+            bps,
             tracked: vec![false; slots],
             base: vec![0; slots],
             end: vec![0; slots],
@@ -669,6 +680,8 @@ impl Qwen4ExpGpu {
             w,
             kv_k,
             kv_v,
+            tab,
+            bps,
             multi,
             logits,
             pick,
@@ -727,6 +740,8 @@ impl Qwen4ExpGpu {
             None, // the MTP head's attention is dense: it drafts, the model verifies
             false,
             *max_tokens,
+            tab,
+            *bps,
             n,
             phase,
             &[],

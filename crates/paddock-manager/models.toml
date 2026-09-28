@@ -2154,7 +2154,11 @@ display = "Bonsai 2 27B"
 family = "bonsai"
 capability = ["chat", "vision", "tools", "reasoning"]
 license = "apache-2.0"
-revision = "2026-09-21"
+revision = "2026-09-27"
+# the CUDA engine pools this line's KV at fp8-e4m3 when nothing overrides it
+# (gpu_model/qwen35/load.rs, the rotated-basis election) - keep in step with
+# the engine. Metal's artifacts carry their own KV contract below.
+kv_default = "fp8_e4m3"
 
   [model.specs]
   params = "27B"
@@ -5523,16 +5527,66 @@ revision = "2026-08-18"
     sha256 = "60f74211be1d81624807ca626462778610960cf20adc989140118da37d80a86b"
     size = 2145
 
+  # NVIDIA's DSpark drafter for this checkpoint - their recommended drafter for
+  # the DGX Spark (card: accepted length 3.75 vs DFlash's 3.16), attached with
+  # --mtp like DFlash (the same seat: a causal sliding-window block with sinks
+  # and a low-rank Markov head, nemotron/dflash.rs). Listed ahead of DFlash so
+  # every "the model's drafter" lookup lands here. Measured on GB10 (32K, 1
+  # slot, DSpark vs DFlash at their elected depths): tool-carrying sampled
+  # 126.5 vs 118.0 tok/s, code 129.7 vs 105.4, 24K code 120.8 vs ~111; and it
+  # keeps paying up to 8 live sessions. Not default, same stance as DFlash
+  # below: speculation is a user toggle and the drafter costs VRAM (its K/V
+  # rides the KV pool). Mirror bytes verified identical to the upstream
+  # download (weights: the R2 ETag is the file's MD5; the README is the
+  # mirror's own revision).
+  [[model.artifact]]
+  id = "dspark"
+  kind = "drafter"
+  format = "safetensors"
+  label = "Speed boost (draft model)"
+  default = false
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/model.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/model.safetensors"
+    sha256 = "27e3225376a7d65e2b602a3909c8526217bdc7ad29a2310f5f8b66f7d5343d13"
+    size = 1349057504
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/config.json"
+    dest = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/config.json"
+    sha256 = "e390ae49aaf2137b4bf3009c229cba852c44032163bb151b20bbc2376d3a6125"
+    size = 1995
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/hf_quant_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/hf_quant_config.json"
+    sha256 = "5b4eea93e73f8b14ac5a8ec98369c8100fb9911e25fe030afe87a82d44e68887"
+    size = 280
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/LICENSE"
+    dest = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/LICENSE"
+    sha256 = "8a0c5e232551abcb102d1bd39a34866ef4520361b613bd6405d55b36562e4d88"
+    size = 2618
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/README.md"
+    dest = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/README.md"
+    sha256 = "ef31e101956ab8f01c0e5a766c2f994088c7c786ba2c87e8dc1a2c284c015174"
+    size = 13745
+
   # NVIDIA's own DFlash drafter for this checkpoint, attached with --mtp. The
   # in-file mtp.* planes are bf16 - a residency class the NVFP4 expert enums do
-  # not carry - so DFlash is the NVFP4 lane's drafter (nemotron/load.rs).
-  # Not default: speculation is a user toggle, it costs VRAM, and its
-  # acceptance on this lane measured 33.6% .
+  # not carry - so a sideloaded block drafter is the NVFP4 lane's
+  # (nemotron/load.rs). Superseded by DSpark above on every measured leg; kept
+  # so existing installs and pins still resolve.
+  # Not default: speculation is a user toggle and it costs VRAM.
   [[model.artifact]]
   id = "dflash"
   kind = "drafter"
   format = "safetensors"
-  label = "Speed boost (draft model)"
+  label = "Speed boost (earlier DFlash drafter)"
   default = false
 
     [[model.artifact.file]]
@@ -5917,6 +5971,23 @@ revision = "2026-09-25"
   quant = "F16"
   default = true
   workspace = 337865736
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass encoder: no drafter, no vision tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 2330839064
+  workspace_bytes = 109651460
+  source = "measured"
+  max_ctx = 1024
+  max_batch = 128
+  full_paged_kv = false
+  kv_reserve_sequences = 0
 
   [model.artifact.shape]
   weight_bytes = 2330884120

@@ -1,5 +1,5 @@
 //! Decision-model service seam (Laya) - the `segment.rs` shape: a dedicated
-//! CUDA thread owning every loaded checkpoint and one shared workspace,
+//! GPU thread owning every loaded checkpoint and one shared workspace,
 //! oneshot request/response, no decode loop.
 //!
 //! The workload is many short sequences. A request is a handful of
@@ -26,13 +26,73 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 use std::time::Instant;
 
 use paddock_models::laya::{Checkpoint, LayaConfig};
 use tokio::sync::oneshot;
 
-use crate::gpu_model::laya::{GpuLaya, LayaSeq, LayaWorkspace};
+#[cfg(feature = "cuda")]
+use crate::gpu_model::laya::{GpuLaya, LayaWorkspace};
+
+/// Borrowed packed input, shared by native CUDA and Metal implementations.
+pub struct LayaSeq<'a> {
+    pub ids: &'a [u32],
+    pub markers: &'a [u32],
+    pub qtype: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayaOut {
+    pub logits: Vec<f32>,
+    pub offsets: Vec<usize>,
+    pub act: Vec<f32>,
+    pub n_act: usize,
+    pub rows: usize,
+}
+
+/// Constructed and owned on the decision thread. Scheduling, cancellation,
+/// calibration and language routing do not depend on the GPU API.
+pub trait DecisionBackend {
+    fn info(&self) -> DecisionInfo;
+    fn forward(&mut self, checkpoint: Checkpoint, seqs: &[LayaSeq<'_>]) -> Result<LayaOut, String>;
+}
+
+#[cfg(feature = "cuda")]
+struct CudaDecision {
+    models: Vec<(Checkpoint, GpuLaya)>,
+    ws: LayaWorkspace,
+}
+
+#[cfg(feature = "cuda")]
+impl DecisionBackend for CudaDecision {
+    fn info(&self) -> DecisionInfo {
+        DecisionInfo {
+            checkpoints: self
+                .models
+                .iter()
+                .map(|(c, m)| (*c, m.config().clone()))
+                .collect(),
+            rows_cap: self.ws.rows_cap(),
+            seq_cap: self.ws.seq_cap(),
+            weight_bytes: self.models.iter().map(|(_, m)| m.weight_bytes()).sum(),
+            workspace_bytes: self.ws.bytes(),
+        }
+    }
+
+    fn forward(&mut self, checkpoint: Checkpoint, seqs: &[LayaSeq<'_>]) -> Result<LayaOut, String> {
+        let model = self
+            .models
+            .iter()
+            .find(|(c, _)| *c == checkpoint)
+            .ok_or_else(|| format!("the {} checkpoint is not loaded", checkpoint.name()))?;
+        model
+            .1
+            .forward(&mut self.ws, seqs)
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// One question's sequence, as the runner built it.
 #[derive(Debug, Clone)]
@@ -93,56 +153,78 @@ type Incoming = (
     DecisionRequest,
     oneshot::Sender<Result<DecisionReply, String>>,
 );
+const QUEUE_CAP: usize = 128;
 
 /// Handle to the decision thread. Cloneable; sequences are served FIFO.
 #[derive(Clone)]
 pub struct Decider {
-    tx: Sender<Incoming>,
+    tx: SyncSender<Incoming>,
     info: Arc<DecisionInfo>,
+    metrics: Arc<crate::metrics::EngineMetrics>,
 }
 
 impl Decider {
     /// Spawn the decision thread. `build` constructs the checkpoints and the
     /// workspace on that thread (the CUDA context binds to it) and may fail;
     /// spawn blocks until it has and propagates the error.
+    #[cfg(feature = "cuda")]
     pub fn spawn<F>(build: F) -> Result<Self, String>
     where
         F: FnOnce() -> Result<(Vec<(Checkpoint, GpuLaya)>, LayaWorkspace), String> + Send + 'static,
     {
-        let (tx, rx) = channel();
+        Self::spawn_backend(move || {
+            let (models, ws) = build()?;
+            Ok(CudaDecision { models, ws })
+        })
+    }
+
+    pub fn spawn_backend<F, B>(build: F) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<B, String> + Send + 'static,
+        B: DecisionBackend + 'static,
+    {
+        let (tx, rx) = sync_channel(QUEUE_CAP);
+        let metrics = Arc::new(crate::metrics::EngineMetrics::default());
+        let worker_metrics = Arc::clone(&metrics);
         let (ready_tx, ready_rx) = channel::<Result<DecisionInfo, String>>();
         std::thread::Builder::new()
             .name("paddock-decision".into())
             .spawn(move || {
-                let (models, ws) = match build() {
+                let backend = match build() {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok(DecisionInfo {
-                    checkpoints: models
-                        .iter()
-                        .map(|(c, m)| (*c, m.config().clone()))
-                        .collect(),
-                    rows_cap: ws.rows_cap(),
-                    seq_cap: ws.seq_cap(),
-                    weight_bytes: models.iter().map(|(_, m)| m.weight_bytes()).sum(),
-                    workspace_bytes: ws.bytes(),
-                }));
-                serve(models, ws, rx);
+                let info = backend.info();
+                if info.rows_cap == 0 || info.seq_cap == 0 {
+                    let _ = ready_tx.send(Err("decision backend has an empty workspace".into()));
+                    return;
+                }
+                worker_metrics
+                    .weights_mem_bytes
+                    .store(info.weight_bytes, Relaxed);
+                worker_metrics
+                    .model_mem_bytes
+                    .store(info.weight_bytes + info.workspace_bytes, Relaxed);
+                let _ = ready_tx.send(Ok(info));
+                serve(backend, rx, worker_metrics);
             })
             .map_err(|e| e.to_string())?;
         let info = ready_rx.recv().map_err(|e| e.to_string())??;
         Ok(Self {
             tx,
             info: Arc::new(info),
+            metrics,
         })
     }
 
     pub fn info(&self) -> &DecisionInfo {
         &self.info
+    }
+    pub fn metrics(&self) -> Arc<crate::metrics::EngineMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Run a request's sequences; resolves when the last one has landed.
@@ -153,11 +235,16 @@ impl Decider {
                 req.checkpoint.name()
             ));
         };
-        if let Some(s) = req
-            .seqs
-            .iter()
-            .find(|s| s.ids.is_empty() || s.ids.len() > cfg.max_len || s.markers.is_empty())
-        {
+        if let Some(s) = req.seqs.iter().find(|s| {
+            s.ids.is_empty()
+                || s.ids.len() > cfg.max_len
+                || s.ids.len() > self.info.rows_cap
+                || s.markers.is_empty()
+                || s.markers.len() + 1 > self.info.rows_cap / 2 + self.info.seq_cap
+                || s.qtype > 2
+                || s.ids.iter().any(|&id| id as usize >= cfg.encoder.vocab)
+                || s.markers.iter().any(|&m| m as usize >= s.ids.len())
+        }) {
             return Err(format!(
                 "a sequence of {} tokens with {} options (the checkpoint takes 1..={} tokens \
                  and at least one option)",
@@ -167,16 +254,24 @@ impl Decider {
             ));
         }
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send((req, tx))
-            .map_err(|_| "decision thread gone".to_string())?;
+        self.tx.try_send((req, tx)).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => {
+                "decision queue is full; retry shortly".to_string()
+            }
+            std::sync::mpsc::TrySendError::Disconnected(_) => "decision thread gone".to_string(),
+        })?;
         rx.await
             .map_err(|_| "decision thread dropped the request".to_string())?
     }
 }
 
-fn serve(models: Vec<(Checkpoint, GpuLaya)>, mut ws: LayaWorkspace, rx: Receiver<Incoming>) {
-    let (rows_cap, seq_cap) = (ws.rows_cap(), ws.seq_cap());
+fn serve(
+    mut backend: impl DecisionBackend,
+    rx: Receiver<Incoming>,
+    metrics: Arc<crate::metrics::EngineMetrics>,
+) {
+    let info = backend.info();
+    let (rows_cap, seq_cap) = (info.rows_cap, info.seq_cap);
     // the head's last layer continues on markers + [CLS] rows; bound them the
     // way the workspace was sized (see LayaWorkspace::new)
     let gather_cap = rows_cap / 2 + seq_cap;
@@ -210,8 +305,11 @@ fn serve(models: Vec<(Checkpoint, GpuLaya)>, mut ws: LayaWorkspace, rx: Receiver
         }
         // sweep in whatever arrived while the last pass was on the GPU; a
         // disconnect finishes what is queued, then the recv above exits
-        while let Ok(j) = rx.try_recv() {
-            admit(&mut queue, j);
+        while queue.len() < QUEUE_CAP {
+            match rx.try_recv() {
+                Ok(j) => admit(&mut queue, j),
+                Err(_) => break,
+            }
         }
         // a caller that went away takes its unserved sequences with it
         queue.retain(|j| !j.reply.is_closed());
@@ -219,13 +317,13 @@ fn serve(models: Vec<(Checkpoint, GpuLaya)>, mut ws: LayaWorkspace, rx: Receiver
             continue;
         };
         let ck = front.req.checkpoint;
-        let Some(model) = models.iter().find(|(c, _)| *c == ck).map(|(_, m)| m) else {
+        if info.config(ck).is_none() {
             let j = queue.pop_front().expect("front checked");
             let _ = j
                 .reply
                 .send(Err(format!("the {} checkpoint is not loaded", ck.name())));
             continue;
-        };
+        }
 
         // ---- pack one pass: this checkpoint's sequences, FIFO ----
         // take[i] = (job index, sequences taken from it)
@@ -268,7 +366,14 @@ fn serve(models: Vec<(Checkpoint, GpuLaya)>, mut ws: LayaWorkspace, rx: Receiver
             })
             .collect();
         let t0 = Instant::now();
-        let result = model.forward(&mut ws, &seqs);
+        metrics.active_slots.store(nseq as u32, Relaxed);
+        metrics.phase.store(crate::metrics::PHASE_PREFILL, Relaxed);
+        let result = backend.forward(ck, &seqs);
+        metrics.phase.store(crate::metrics::PHASE_IDLE, Relaxed);
+        metrics.active_slots.store(0, Relaxed);
+        if result.is_ok() {
+            metrics.prefill_tokens_total.fetch_add(rows as u64, Relaxed);
+        }
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         drop(seqs);
         match result {
@@ -314,5 +419,199 @@ fn serve(models: Vec<(Checkpoint, GpuLaya)>, mut ws: LayaWorkspace, rx: Receiver
                 i += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paddock_models::laya::ModernBertConfig;
+    struct Fake;
+    fn config() -> LayaConfig {
+        LayaConfig {
+            dir: Default::default(),
+            name: "test".into(),
+            head_layers: 2,
+            n_act: 2,
+            max_len: 4,
+            head_max_len: 2,
+            temperature: [1.0; 3],
+            temperature_by_options: vec![],
+            encoder: ModernBertConfig {
+                hidden: 64,
+                n_layer: 1,
+                n_heads: 1,
+                intermediate: 64,
+                vocab: 16,
+                global: vec![true],
+                window: 1,
+                rope_theta_global: 160000.0,
+                rope_theta_local: 10000.0,
+                eps: 1e-5,
+                max_position: 4,
+            },
+        }
+    }
+    impl DecisionBackend for Fake {
+        fn info(&self) -> DecisionInfo {
+            DecisionInfo {
+                checkpoints: vec![
+                    (Checkpoint::English, config()),
+                    (Checkpoint::Multilingual, config()),
+                ],
+                rows_cap: 4,
+                seq_cap: 2,
+                weight_bytes: 100,
+                workspace_bytes: 20,
+            }
+        }
+        fn forward(&mut self, ck: Checkpoint, seqs: &[LayaSeq<'_>]) -> Result<LayaOut, String> {
+            assert!(seqs.len() <= 2 && seqs.iter().map(|s| s.ids.len()).sum::<usize>() <= 4);
+            let mut out = LayaOut {
+                logits: vec![],
+                offsets: vec![0],
+                act: vec![],
+                n_act: 2,
+                rows: 0,
+            };
+            for s in seqs {
+                out.logits
+                    .extend(s.markers.iter().map(|&m| s.ids[m as usize] as f32));
+                out.offsets.push(out.logits.len());
+                out.rows += s.ids.len();
+                out.act.extend(if ck == Checkpoint::English {
+                    [1.0, 0.0]
+                } else {
+                    [0.0, 1.0]
+                });
+            }
+            Ok(out)
+        }
+    }
+    fn seq() -> DecisionSeq {
+        DecisionSeq {
+            ids: vec![1, 2],
+            markers: vec![1],
+            qtype: 0,
+        }
+    }
+    #[tokio::test]
+    async fn decision_service_splits_requests_and_reports_actual_memory_without_cuda() {
+        let d = Decider::spawn_backend(|| Ok(Fake)).unwrap();
+        let (a, b) = tokio::join!(
+            d.decide(DecisionRequest {
+                checkpoint: Checkpoint::English,
+                seqs: vec![seq(); 5]
+            }),
+            d.decide(DecisionRequest {
+                checkpoint: Checkpoint::Multilingual,
+                seqs: vec![seq(); 2]
+            })
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_eq!(a.logits, vec![vec![2.0]; 5]);
+        assert_eq!(a.tokens, 10);
+        assert_eq!(a.passes, 3);
+        assert_eq!(b.act, vec![vec![0.0, 1.0]; 2]);
+        assert_eq!(d.metrics().model_mem_bytes.load(Relaxed), 120);
+        assert_eq!(d.metrics().prefill_tokens_total.load(Relaxed), 14);
+        assert_eq!(d.metrics().active_slots.load(Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn decision_service_rejects_invalid_gpu_indices_and_handles_empty_requests() {
+        let d = Decider::spawn_backend(|| Ok(Fake)).unwrap();
+        for s in [
+            DecisionSeq {
+                ids: vec![],
+                ..seq()
+            },
+            DecisionSeq {
+                ids: vec![16, 1],
+                ..seq()
+            },
+            DecisionSeq {
+                markers: vec![2],
+                ..seq()
+            },
+            DecisionSeq { qtype: 3, ..seq() },
+            DecisionSeq {
+                markers: vec![0; 5],
+                ..seq()
+            },
+            DecisionSeq {
+                ids: vec![1; 5],
+                ..seq()
+            },
+        ] {
+            assert!(
+                d.decide(DecisionRequest {
+                    checkpoint: Checkpoint::English,
+                    seqs: vec![s]
+                })
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            d.decide(DecisionRequest {
+                checkpoint: Checkpoint::TypedDecisions,
+                seqs: vec![seq()]
+            })
+            .await
+            .is_err()
+        );
+        let out = d
+            .decide(DecisionRequest {
+                checkpoint: Checkpoint::English,
+                seqs: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(out.logits.is_empty());
+        assert_eq!(out.passes, 0);
+    }
+    #[test]
+    fn cancelled_requests_are_never_run() {
+        let (tx, rx) = sync_channel(2);
+        let (reply, wait) = oneshot::channel();
+        tx.send((
+            DecisionRequest {
+                checkpoint: Checkpoint::English,
+                seqs: vec![seq()],
+            },
+            reply,
+        ))
+        .unwrap();
+        drop(wait);
+        drop(tx);
+        let metrics = Arc::new(crate::metrics::EngineMetrics::default());
+        serve(Fake, rx, metrics.clone());
+        assert_eq!(metrics.prefill_tokens_total.load(Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn queue_overload_never_blocks_an_async_executor() {
+        let (tx, _rx) = sync_channel(1);
+        let (reply, _wait) = oneshot::channel();
+        tx.send((
+            DecisionRequest {
+                checkpoint: Checkpoint::English,
+                seqs: vec![seq()],
+            },
+            reply,
+        ))
+        .unwrap();
+        let d = Decider {
+            tx,
+            info: Arc::new(Fake.info()),
+            metrics: Default::default(),
+        };
+        let out = d
+            .decide(DecisionRequest {
+                checkpoint: Checkpoint::English,
+                seqs: vec![seq()],
+            })
+            .await;
+        assert!(out.unwrap_err().starts_with("decision queue is full"));
     }
 }

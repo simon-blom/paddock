@@ -15,6 +15,10 @@ pub(super) const VD: usize = VH * 128;
 pub(super) const CONV: usize = 2 * KH * 128 + VD;
 pub(super) const CELLS: usize = VH * 128 * 128;
 const PREPARED: usize = VH * 17408;
+#[cfg(test)]
+thread_local! {
+    pub(super) static BASELINE_RECURRENT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(super) struct Weights {
     #[cfg(test)]
@@ -231,14 +235,23 @@ pub(super) struct Workspace {
     beta: Buffer,
     pub(super) gates: Buffer,
     pub(super) attn: Buffer,
-    prepared: Buffer,
+    prepared: Option<Buffer>,
 }
 impl Workspace {
     pub(super) fn bytes(capacity: usize, slots: usize) -> usize {
         let chunks = (capacity / 16).max(1);
         4 * (capacity * (5 + 2 * CONV + 2 * VD + 4 * VH) + slots * 8 + chunks * (4 + PREPARED))
     }
+    pub(super) fn mlx_bytes(capacity: usize, slots: usize) -> usize {
+        Self::bytes(capacity, slots) - (capacity / 16).max(1) * PREPARED * 4
+    }
     pub(super) fn new(d: &MetalDevice, capacity: usize, slots: usize) -> Result<Self> {
+        Self::new_inner(d, capacity, slots, false)
+    }
+    pub(super) fn new_mlx(d: &MetalDevice, capacity: usize, slots: usize) -> Result<Self> {
+        Self::new_inner(d, capacity, slots, true)
+    }
+    fn new_inner(d: &MetalDevice, capacity: usize, slots: usize, mlx: bool) -> Result<Self> {
         let chunks = (capacity / 16).max(1);
         Ok(Self {
             slots,
@@ -255,7 +268,13 @@ impl Workspace {
             beta: d.alloc(capacity * VH * 4)?,
             gates: d.alloc(capacity * VH * 2 * 4)?,
             attn: d.alloc(capacity * VD * 4)?,
-            prepared: d.alloc(chunks * PREPARED * 4)?,
+            // The MLX exact recurrent walk never uses GGUF's WY operands.
+            // Do not reserve up to 204 MiB of unreachable workspace for it.
+            prepared: if mlx {
+                None
+            } else {
+                Some(d.alloc(chunks * PREPARED * 4)?)
+            },
         })
     }
     /// Caller has waited for the previous whole model submission.
@@ -346,10 +365,11 @@ impl Workspace {
             );
         }
         if chunks > 0 {
+            let prepared = self.prepared.as_ref().expect("GGUF WY workspace");
             for kernel in ["dn_chunk_dots_strict", "dn_chunk_prepare_strict"] {
                 cmd.dispatch(
                     kernel,
-                    &[&self.convolved, &self.gates, &self.chunks, &self.prepared],
+                    &[&self.convolved, &self.gates, &self.chunks, prepared],
                     &p,
                     [VH, chunks, 1],
                     128,
@@ -358,7 +378,7 @@ impl Workspace {
             cmd.dispatch(
                 "dn_chunk_walk_strict",
                 &[
-                    &self.prepared,
+                    prepared,
                     &self.gates,
                     &self.spans,
                     &self.chunks,
@@ -450,11 +470,19 @@ impl Workspace {
             [(n * VH).div_ceil(256), 1, 1],
             256,
         );
-        // MLX weights use repeat-interleaved heads, unlike GGUF's tiled
-        // export. This existing BF16-input/F32-state encoder has that exact
-        // ownership contract. All spans use it, including long prefill.
+        // Same 16/48-head geometry and arithmetic as the qualified dense-27B
+        // packed encoder. Reuse each query/key across eight value rows on M5
+        // only; decode and older GPU families retain the original route.
+        let packed =
+            cmd.tensor_accelerated() && plan.spans.chunks_exact(4).any(|span| span[1] >= 32);
+        #[cfg(test)]
+        let packed = packed && !BASELINE_RECURRENT_FOR_TEST.with(|v| v.get());
         cmd.dispatch(
-            "mlx_dn_recurrent",
+            if packed {
+                "mlx_dn_recurrent_packed"
+            } else {
+                "mlx_dn_recurrent"
+            },
             &[
                 &self.convolved,
                 &self.gates,
@@ -465,7 +493,7 @@ impl Workspace {
                 &self.checkpoint_rows,
             ],
             &p,
-            [32, VH, spans],
+            [if packed { 4 } else { 32 }, VH, spans],
             128,
         );
         cmd.dispatch(

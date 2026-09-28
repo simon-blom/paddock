@@ -205,6 +205,7 @@ impl Cache {
     }
 }
 pub(super) struct Workspace {
+    compact_capacity: usize,
     slots: usize,
     pages_per_slot: usize,
     blocks: usize,
@@ -223,7 +224,29 @@ pub(super) struct Workspace {
     scratch: Buffer,
     parts: Buffer,
 }
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOCAL_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static PADDED_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static GATHER_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 impl Workspace {
+    fn partition_units(capacity: usize, slots: usize, mlx: bool) -> usize {
+        if mlx && capacity > slots * 8 {
+            // One partition for every row; only <=8-row logical spans need
+            // three more. Slot-local tails avoid prefix sums or a GPU->CPU
+            // dependency and preserve the existing four-part decode order.
+            capacity + slots * 8 * (SPLITS - 1)
+        } else {
+            capacity * SPLITS
+        }
+    }
+    pub(super) fn mlx_bytes(capacity: usize, slots: usize, pages: usize) -> usize {
+        Self::bytes(capacity, slots, pages)
+            - (capacity * SPLITS - Self::partition_units(capacity, slots, true))
+                * (2 * 8192 + HEADS * 258)
+                * 4
+    }
     pub(super) fn bytes(capacity: usize, slots: usize, pages: usize) -> usize {
         slots * pages * 4
             + capacity
@@ -246,11 +269,34 @@ impl Workspace {
         slots: usize,
         pages: usize,
     ) -> Result<Self> {
+        Self::new_inner(d, capacity, slots, pages, false)
+    }
+    pub(super) fn new_mlx(
+        d: &MetalDevice,
+        capacity: usize,
+        slots: usize,
+        pages: usize,
+    ) -> Result<Self> {
+        Self::new_inner(d, capacity, slots, pages, true)
+    }
+    fn new_inner(
+        d: &MetalDevice,
+        capacity: usize,
+        slots: usize,
+        pages: usize,
+        mlx: bool,
+    ) -> Result<Self> {
         let blocks = pages * 4;
+        let units = Self::partition_units(capacity, slots, mlx);
         // Diagnostic owners use this nonidentity mapping. The model replaces
         // it with its engine pool's block tables before each whole walk.
         let table: Vec<u32> = (0..slots * pages).rev().map(|i| i as u32).collect();
         Ok(Self {
+            compact_capacity: if mlx && capacity > slots * 8 {
+                capacity
+            } else {
+                0
+            },
             slots,
             pages_per_slot: pages,
             blocks,
@@ -271,8 +317,8 @@ impl Workspace {
             selected: d.alloc(capacity * BUDGET * 4)?,
             counts: d.alloc(capacity * 4)?,
             attn: d.alloc(capacity * Q * 4)?,
-            scratch: d.alloc(capacity * 2 * SPLITS * 8192 * 4)?,
-            parts: d.alloc(capacity * HEADS * SPLITS * 258 * 4)?,
+            scratch: d.alloc(units * 2 * 8192 * 4)?,
+            parts: d.alloc(units * HEADS * 258 * 4)?,
         })
     }
     fn p(&self, rows: usize) -> [u32; 5] {
@@ -399,7 +445,16 @@ impl Workspace {
             [n, 1, 1],
             256,
         );
-        let mut attention_params = [p[0], p[1], p[2], p[3], p[4], 0, 0];
+        let mut attention_params = [
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            0,
+            0,
+            self.compact_capacity as u32,
+        ];
         let logical_rows = if mlx { cmd.projection_rows() } else { None };
         if let Some(logical_rows) = logical_rows {
             // The mask is bounded host scheduling metadata, not GPU state.
@@ -412,10 +467,43 @@ impl Workspace {
                     mask[slot / 32] |= 1 << (slot % 32);
                 }
             }
-            attention_params[5..].copy_from_slice(&mask);
+            attention_params[5..7].copy_from_slice(&mask);
+        } else if self.compact_capacity != 0 {
+            for row in plan.meta.chunks_exact(4) {
+                if row[3] - row[2] <= 8 {
+                    attention_params[5 + row[0] as usize / 32] |= 1 << (row[0] % 32);
+                }
+            }
         }
+        // Local BF16 staging is lossless for this BF16 cache. Keep F32
+        // queries/probabilities/partials and the existing logical split mask.
+        // Padding the two on-chip tensor pitches avoids the power-of-two
+        // transposed layout. Arithmetic and logical partitioning are unchanged.
+        let local_attention =
+            mlx && self.compact_capacity != 0 && cmd.tensor_accelerated() && n <= 64;
+        #[cfg(test)]
+        let local_attention = local_attention && LOCAL_ATTENTION_FOR_TEST.with(|v| v.get());
+        let padded_attention = mlx && self.compact_capacity != 0 && cmd.tensor_accelerated();
+        #[cfg(test)]
+        let padded_attention = padded_attention
+            && PADDED_ATTENTION_FOR_TEST.with(|v| v.get())
+            && LOCAL_ATTENTION_FOR_TEST.with(|v| v.get());
+        // Share sparse/page addressing across each SIMD group and reuse it
+        // for K/V. Wider loads retain the exact same padded BF16 tensors.
+        let gather_attention = padded_attention;
+        #[cfg(test)]
+        let gather_attention = gather_attention && GATHER_ATTENTION_FOR_TEST.with(|v| v.get());
         cmd.dispatch(
-            if logical_rows.is_some() {
+            if gather_attention {
+                "q4b_attention_local_gather"
+            } else if padded_attention {
+                "q4b_attention_local_pad"
+            } else if local_attention {
+                "q4b_attention_local"
+            } else if self.compact_capacity != 0 {
+                assert!(mlx, "compact workspace is MLX-only");
+                "q4b_attention_compact"
+            } else if logical_rows.is_some() {
                 "q4b_attention_contract"
             } else if mlx {
                 "q4b_attention"
@@ -437,17 +525,27 @@ impl Workspace {
             [2, n, p[4] as usize],
             128,
         );
-        cmd.dispatch(
-            if mlx {
-                "q4b_join_gate"
-            } else {
-                "q4s_join_gate"
-            },
-            &[&self.parts, &self.qg, &self.attn],
-            &p,
-            [n * HEADS, 1, 1],
-            32,
-        );
+        if self.compact_capacity != 0 {
+            cmd.dispatch(
+                "q4b_join_gate_compact",
+                &[&self.parts, &self.qg, &self.attn, &self.meta],
+                &attention_params,
+                [n * HEADS, 1, 1],
+                32,
+            );
+        } else {
+            cmd.dispatch(
+                if mlx {
+                    "q4b_join_gate"
+                } else {
+                    "q4s_join_gate"
+                },
+                &[&self.parts, &self.qg, &self.attn],
+                &p,
+                [n * HEADS, 1, 1],
+                32,
+            );
+        }
         project(cmd, &w.out, &self.attn, out, n);
     }
 }
