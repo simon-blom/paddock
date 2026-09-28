@@ -405,7 +405,7 @@ impl Qwen35TpRank {
                 // does it after the run, inside `finish`'s contract; the
                 // graph bakes the memset + GEMV too so a replay leaves
                 // `partial` ready for the host-side collective.
-                delta.finish_partial(&self.exec, 1, true)?;
+                delta.finish_partial(&self.exec, 1)?;
             }
         }
         let _ = slot;
@@ -923,7 +923,7 @@ impl Qwen35TpRank {
                     // (advanced) state pair back first - the swap is host-side
                     // pointer surgery touching no stream work - then reduce.
                     delta.swap_state_out(slot)?;
-                    delta.finish(&self.exec, group)?
+                    delta.finish(&self.exec, group, 1)?
                 }
             };
             self.exec.add(&mut self.x, mixed_ref, self.hidden)?;

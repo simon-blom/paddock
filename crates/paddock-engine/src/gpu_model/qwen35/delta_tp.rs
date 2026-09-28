@@ -808,10 +808,10 @@ impl DeltaTpRank {
             self.finish_partial_prefill(e, rows)?;
         } else {
             self.decode_run(e, input, rows)?;
-            self.finish_partial(e, rows, false)?;
+            self.finish_partial(e, rows)?;
         }
-        // Both eager paths reduce only live rows; graph decode still uses
-        // `finish` and its captured capacity-sized partial buffer.
+        // Eager decode and prefill reduce only live rows. Graph decode uses
+        // the same live-prefix contract in `finish` after replay.
         let live = rows * WIDTH;
         if prefill {
             if let Some(p) = profile {
@@ -853,26 +853,19 @@ impl DeltaTpRank {
         Ok(&self.span.reduced)
     }
 
-    /// Stage the out-projection into `partial`. Eager decode zeroes only the
-    /// live row; graph capture retains the capacity-sized zero and collective
-    /// contract in `finish`. The GEMV overwrites row 0 on each call.
+    /// Stage the out-projection into `partial`. Both eager and graph decode
+    /// zero only the live prefix. The graph captures its stable prefix pointer
+    /// and fixed decode width; the GEMV overwrites row 0 on each call.
     pub(crate) fn finish_partial(
         &mut self,
         e: &GpuExecutor,
         rows: usize,
-        graph_capture: bool,
     ) -> Result<(), DeltaTpError> {
         let g = &self.geometry;
         let s = &mut self.span;
-        // Graph replay's `finish` still reduces the whole plane. Eager decode
-        // reduces row 0 only; neither its memset nor its NCCL sees the tail.
-        if graph_capture {
-            e.stream.memset_zeros(&mut s.partial).map_err(GpuError::from)?;
-        } else {
-            e.stream
-                .memset_zeros(&mut s.partial.slice_mut(0..rows * WIDTH))
-                .map_err(GpuError::from)?;
-        }
+        e.stream
+            .memset_zeros(&mut s.partial.slice_mut(0..rows * WIDTH))
+            .map_err(GpuError::from)?;
         if rows == 1 {
             gemv_any(e, &self.weights[2], &s.core, &mut s.partial)?;
         } else {
@@ -897,18 +890,22 @@ impl DeltaTpRank {
         Ok(())
     }
 
-    /// The post-run NCCL fences + all-reduce over the staged `partial`;
-    /// returns the reduced output. `forward` calls this after
-    /// `finish_partial`; the graphed path runs the fences + all-reduce
-    /// inline (its capture already staged `partial`).
+    /// Post-replay NCCL fences + all-reduce over the staged live prefix.
+    /// Graph capture stages `partial` at a fixed decode width; NCCL remains
+    /// outside the graph, with the same rank-local backing addresses.
     pub(crate) fn finish<'a, C: Communicator>(
         &'a mut self,
         e: &GpuExecutor,
         group: &C,
+        rows: usize,
     ) -> Result<&'a CudaSlice<f32>, DeltaTpError> {
         let s = &mut self.span;
+        let live = rows * WIDTH;
         group.after_compute(&e.stream)?;
-        group.all_reduce(&s.partial, &mut s.reduced)?;
+        group.all_reduce(
+            &s.partial.slice(0..live),
+            &mut s.reduced.slice_mut(0..live),
+        )?;
         group.before_compute(&e.stream)?;
         Ok(&s.reduced)
     }
