@@ -183,6 +183,7 @@ pub struct PagedRadix {
 /// are drawn (`*_with_pool`). An index returned without a pool at hand (the
 /// tier's completion paths) parks its pages in `released` until the next call
 /// that has one.
+#[derive(Clone)]
 struct PagedState {
     pages_per_ckpt: usize,
     /// Pool pages each state index owns (empty = it holds none).

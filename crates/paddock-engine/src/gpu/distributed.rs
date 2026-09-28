@@ -127,9 +127,9 @@ impl NcclCommunicator {
         let Some(resolved) = resolved else {
             return Ok(None);
         };
-        if resolved.tp_size != 2 || resolved.rank >= 2 {
+        if resolved.tp_size < 2 || resolved.rank >= resolved.tp_size {
             return Err(CollectiveError::InvalidGroup(format!(
-                "expected TP=2 rank 0 or 1, got TP={} rank {}",
+                "expected TP>=2 and rank inside the group, got TP={} rank {}",
                 resolved.tp_size, resolved.rank
             )));
         }
@@ -139,7 +139,7 @@ impl NcclCommunicator {
         let internal = unique_id.map(|byte| std::ffi::c_char::from_ne_bytes([byte]));
         let comm = nccl_result(
             "init rank",
-            Comm::from_rank(stream.clone(), resolved.rank, 2, Id::uninit(internal)),
+            Comm::from_rank(stream.clone(), resolved.rank, resolved.tp_size, Id::uninit(internal)),
         )?;
         Ok(Some(Self { comm, stream }))
     }

@@ -66,8 +66,8 @@ fn slice_matrix<'a>(
     request: TensorSliceRequest,
 ) -> Result<TensorShard<'a>, TensorSliceError> {
     let [input, output] = dims;
-    if !matches!(request.world_size, 1 | 2) || request.rank >= request.world_size {
-        return Err(invalid(name, "expected TP=1/2 and a rank inside the group"));
+    if request.world_size == 0 || request.rank >= request.world_size {
+        return Err(invalid(name, "world_size must be nonzero and rank must be inside the group"));
     }
     if input == 0 || output == 0 || block_elems == 0 || block_bytes == 0 {
         return Err(invalid(name, "empty matrix or unknown block layout"));
@@ -342,6 +342,64 @@ mod tests {
             ),
         ] {
             assert!(bad.is_err());
+        }
+    }
+
+    #[test]
+    fn arbitrary_world_size_reconstructs_rows_and_columns() {
+        let input = 12usize;
+        let output = 12usize;
+        let bytes: Vec<u8> = (0..input * output).map(|n| (n % 251) as u8).collect();
+        for world_size in [3usize, 4] {
+            let row_shards: Vec<_> = (0..world_size)
+                .map(|rank| {
+                    slice_matrix(
+                        "w",
+                        &bytes,
+                        [input, output],
+                        (1, 1),
+                        TensorSliceRequest {
+                            kind: ShardKind::OutputRows,
+                            rank,
+                            world_size,
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let rejoined_rows: Vec<u8> = row_shards
+                .iter()
+                .flat_map(|shard| shard.bytes.iter().copied())
+                .collect();
+            assert_eq!(rejoined_rows, bytes);
+
+            let col_shards: Vec<_> = (0..world_size)
+                .map(|rank| {
+                    slice_matrix(
+                        "w",
+                        &bytes,
+                        [input, output],
+                        (1, 1),
+                        TensorSliceRequest {
+                            kind: ShardKind::InputColumns,
+                            rank,
+                            world_size,
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let local = input / world_size;
+            let rejoined_cols: Vec<u8> = (0..output)
+                .flat_map(|row| {
+                    col_shards.iter().flat_map(move |shard| {
+                        shard.bytes[row * local..(row + 1) * local]
+                            .iter()
+                            .copied()
+                    })
+                })
+                .collect();
+            assert_eq!(rejoined_cols, bytes);
         }
     }
 

@@ -20,4 +20,5 @@ pub mod qwen3_asr;
 pub mod qwen4exp;
 pub mod qwen_image;
 pub(crate) mod st_load;
+pub(crate) mod tp;
 pub mod whisper;
