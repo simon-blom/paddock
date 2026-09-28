@@ -159,9 +159,6 @@ pub(super) struct PrefixCache {
     stage: CudaSlice<f32>,
     /// batched-copy descriptors (src, dst, bytes) x max_descs
     descs: CudaSlice<u64>,
-    /// a zeroed span as wide as the widest page slot: the source that
-    /// clears a page a table takes (`zero_pages`)
-    zeros: CudaSlice<u8>,
     max_descs: usize,
     last_reused: Vec<usize>,
     stats: bool,
@@ -204,8 +201,6 @@ impl PrefixCache {
         let max_descs = pages * layout.planes().len() + 2 * parts + 8;
         let stage = exec.alloc(STAGED_CUTS * geo.ckpt_f32)?;
         let descs = exec.alloc_u64(3 * max_descs)?;
-        let widest = layout.planes().iter().map(|p| p.1).max().unwrap_or(16);
-        let zeros = exec.alloc_u8(widest as usize)?;
         tracing::info!(
             "qwen4exp prefix cache: zero-copy radix over the KV pool; a checkpoint is {} MB \
              over {pages} pool pages",
@@ -217,7 +212,6 @@ impl PrefixCache {
             stage,
             descs,
             max_descs,
-            zeros,
             last_reused: vec![0; slots],
             stats: paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some(),
             src: vec![None; n_ckpt as usize],
@@ -392,15 +386,42 @@ impl PrefixCache {
         idx: u32,
         pages: &mut KvPages,
     ) -> bool {
+        let src = Some((tokens.len(), prompt_hash(tokens)));
+        self.attach_staged(tokens, cut, idx, pages, src, "in-walk cut")
+    }
+
+    /// Attach reserved checkpoint `idx` - a reply checkpoint a speculative
+    /// round rebuilt, already committed into its pages - at `cut` of the
+    /// slot's sequence. No prompt took it inside its own walk, so a re-send
+    /// resumes from it; on a miss the index and its pages go back.
+    pub(super) fn attach_reply(
+        &mut self,
+        tokens: &[u32],
+        cut: usize,
+        idx: u32,
+        pages: &mut KvPages,
+    ) -> bool {
+        self.attach_staged(tokens, cut, idx, pages, None, "in-round reply cut")
+    }
+
+    fn attach_staged(
+        &mut self,
+        tokens: &[u32],
+        cut: usize,
+        idx: u32,
+        pages: &mut KvPages,
+        src: Option<(usize, u64)>,
+        what: &str,
+    ) -> bool {
         let Some((radix, pool)) = pages.radix_pool() else {
             return false;
         };
         if radix.attach_state_at(tokens, cut, idx) {
             if let Some(s) = self.src.get_mut(idx as usize) {
-                *s = Some((tokens.len(), prompt_hash(tokens)));
+                *s = src;
             }
             if self.stats {
-                tracing::info!("qwen4exp-ckpt: in-walk cut {cut} idx {idx}");
+                tracing::info!("qwen4exp-ckpt: {what} {cut} idx {idx}");
             }
             true
         } else {
@@ -469,26 +490,6 @@ impl PrefixCache {
             let w = st.ple_win.expect("model has a PLE ring");
             let (wp, _g3) = w.device_ptr(&exec.stream);
             part(&mut descs, wp, ple_elems);
-        }
-        self.run_descs(exec, &descs)
-    }
-
-    /// Zero `blocks` in every pool plane - the partly written page a walk's
-    /// table just took, which may hold a dropped checkpoint's record (see
-    /// `back_rows`). One batched copy from the zero span.
-    pub(super) fn zero_pages(
-        &mut self,
-        exec: &GpuExecutor,
-        blocks: &[BlockId],
-    ) -> Result<(), GpuModelError> {
-        let mut descs = Vec::with_capacity(3 * blocks.len() * self.layout.planes().len());
-        {
-            let (zp, _g) = self.zeros.device_ptr(&exec.stream);
-            for &b in blocks {
-                for &(base, slot) in self.layout.planes() {
-                    descs.extend([zp, base + b as u64 * slot, slot]);
-                }
-            }
         }
         self.run_descs(exec, &descs)
     }

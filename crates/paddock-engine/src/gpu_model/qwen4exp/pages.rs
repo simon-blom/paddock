@@ -130,9 +130,9 @@ pub(super) struct KvPages {
     tables: Vec<BlockTable>,
     /// host mirror of `d_tab`, `[slots * bps]`. An entry a slot has not
     /// backed names the pool's spare block - a block no slot owns, allocated
-    /// first and never freed. The new paged modes read nothing past a row's
-    /// keys, but P6i stages whole 64-key tiles (weight 0 past the row), so
-    /// every entry must name a real block of finite (zeroed) rows.
+    /// first and never freed. No kernel of this lane reads a table entry past
+    /// the pages under a row's keys; the spare keeps every entry a real
+    /// address anyway.
     host: Vec<BlockId>,
     /// the table every trunk attention launch reads, `[slots * bps]` u32.
     /// Address-stable for the whole serve: captured decode graphs bake the

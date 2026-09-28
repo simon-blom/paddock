@@ -1695,15 +1695,22 @@ impl Qwen4ExpGpu {
         let Some(idx) = self.prefix_publish(slot, &tokens, cut, true)? else {
             return Ok(());
         };
+        self.reply_filed(slot, &tokens, cut, idx);
+        Ok(())
+    }
+
+    /// Reply checkpoint `idx` is filed at `cut` of `tokens` (the slot's
+    /// sequence up to there): it becomes the slot's rolling one and the
+    /// previous rolling one is dropped.
+    fn reply_filed(&mut self, slot: usize, tokens: &[u32], cut: usize, idx: u32) {
         if let Some((old_cut, old_idx)) = self.reply_ckpt[slot].replace((cut, idx))
             && let Some(pc) = self.prefix.as_mut()
         {
-            pc.drop_ckpt(&tokens, old_cut, old_idx, &mut self.pages);
+            pc.drop_ckpt(tokens, old_cut, old_idx, &mut self.pages);
         }
         if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
             tracing::info!("qwen4exp-reply-ckpt: slot {slot} cut {cut} idx {idx}");
         }
-        Ok(())
     }
 
     /// The reply just started its first tool call (see
@@ -2234,33 +2241,13 @@ impl Qwen4ExpGpu {
         &mut self,
         reach: impl IntoIterator<Item = (usize, usize)>,
     ) -> Result<(), GpuModelError> {
-        // With checkpoints in the pool a freed page may still hold a
-        // checkpoint's f32 record, whose halves read as f16 include Inf / NaN;
-        // P6i stages whole 64-key tiles and weighs the keys past a row's by
-        // 0, and 0 x NaN poisons it. The only unwritten rows a tile can reach
-        // are the tail of the page holding a walk's last row: the walk writes
-        // every row of the other pages it takes (a slot's rows below a walk
-        // are always written, adopted pages are whole, and past the table
-        // the entries name the zeroed spare). So that one page is zeroed as
-        // the table takes it - zeroing every page taken cost ~1% of a 16.5K
-        // prefill, mostly its descriptor upload stalling the host behind the
-        // previous walk. Interim: the SOTA fix is in the kernel - P6i
-        // zero-filling the V rows past the walk's last written key as it
-        // stages them (FlashAttention's out-of-bounds clear), after which a
-        // stale page is harmless and this copy goes.
-        let mut tails: Vec<crate::kv_pool::BlockId> = Vec::new();
+        // A page a table takes may hold anything - with checkpoints in the
+        // pool, a dropped checkpoint's f32 record (Inf / NaN read as f16).
+        // No attention kernel of this lane lets a row past its keys into a
+        // product (P6i and tc5 zero the V rows past the last key as they
+        // stage them, the rest never load them), so nothing is cleared here.
         for (slot, upto) in reach {
-            let had = self.pages.blocks(slot).len();
             self.pages.back(slot, upto)?;
-            let now = self.pages.blocks(slot).len();
-            if now > had && !upto.is_multiple_of(BLOCK_TOKENS) {
-                tails.push(self.pages.blocks(slot)[now - 1]);
-            }
-        }
-        if let Some(pc) = self.prefix.as_mut()
-            && !tails.is_empty()
-        {
-            pc.zero_pages(&self.exec, &tails)?;
         }
         self.pages.sync(&self.exec)
     }
@@ -5687,9 +5674,6 @@ fn attn_core(
             Phase::Prefill
                 if hd == 256
                     && KV() == KvDtype::Fp16
-                    // P6i stages whole 64-key tiles: every table entry up to
-                    // the tile boundary is inside the slot's row
-                    && max_ctx.is_multiple_of(64)
                     && super::attn_pf16_enabled()
                     && e.has_attn_prefill_f16_paged() =>
             {

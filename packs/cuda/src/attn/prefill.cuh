@@ -860,8 +860,16 @@ int pd_attn_prefill_batch_paged(const void* q, const void* pool_k, const void* p
 //   - Sinks fold in at the epilogue: l += exp(sink - m) with the same
 //     max-rebase as the decode kernel, so semantics match it exactly.
 //   - exp() flushes to zero below -20 (the fattn FTZ rule) - also what
-//     makes masked keys exact zeros; stale cache rows beyond a query's
-//     bound are finite garbage times a 0.0 weight, never NaN.
+//     makes masked keys exact zeros.
+//   - Nothing at or past `hi` (the block's deepest live key + 1) reaches a
+//     product: a 16-key K strip or V sub-tile wholly past it is skipped (its
+//     scores are masked, its weights exact zeros), and the V sub-tile that
+//     straddles it is staged through this warp's slice of sh_q with the rows
+//     past it ZEROED - FlashAttention's out-of-bounds clear. Those rows are
+//     not the sequence's: a paged pool hands tables pages that held other
+//     records (checkpoint f32 bits read as f16 are ~1.5% Inf / NaN), and
+//     0 x NaN is NaN in the mma. So the kernel reads only rows of pages
+//     holding a live key - no table entry, and no dense row, past them.
 // Numeric class: f16 Q/K/V inputs, f32 score accumulate + softmax, f16 O
 // accumulate - llama's own prefill attention class on this hardware.
 // Requirements: head_dim == 64 or 256, fp16 KV, max_ctx % 64 == 0, slots
@@ -869,6 +877,32 @@ int pd_attn_prefill_batch_paged(const void* q, const void* pool_k, const void* p
 // over the 4 warps, so D must be a multiple of 64.)
 #define PD_AF16_NCOLS 32  // queries per block
 #define PD_AF16_TK 64     // keys per tile (= 4 warps x 16 fragment rows)
+
+// Row stride of a warp's V staging slice in sh_q (see the kernel note): DW
+// dims plus a conflict-avoid pad where the four slices still fit, else DW
+// (D = 512's NC 16 tile). A multiple of 8 halves, as wmma's ldm needs, and
+// every slice and 16-dim column group stays 32-byte aligned.
+template<uint32_t D, uint32_t NC>
+__device__ __host__ constexpr uint32_t pd_af16_vld() {
+    return 4u * 16u * (D / 4u + 8u) <= NC * (D + 8u) ? D / 4u + 8u : D / 4u;
+}
+
+// Stage the 16-key V sub-tile [kb, kb+16) of this warp's DW dims into `sv`
+// (row stride VLD), rows at or past `hi` zeroed. `row(k)` points at key k's
+// first dim of this kv head. Warp-cooperative, 16-byte moves.
+template<uint32_t DW, uint32_t VLD, typename RowFn>
+__device__ __forceinline__ void pd_af16_stage_v_tail(half* sv, uint32_t kb, uint32_t hi,
+                                                     uint32_t d0, uint32_t lane, RowFn row) {
+    constexpr uint32_t C8 = DW / 8u;  // 16-byte chunks per row
+    #pragma unroll
+    for (uint32_t i = lane; i < 16u * C8; i += 32u) {
+        const uint32_t r = i / C8, c = (i % C8) * 8u;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (kb + r < hi) v = *(const uint4*)(row(kb + r) + d0 + c);
+        *(uint4*)(sv + r * VLD + c) = v;
+    }
+    __syncwarp();
+}
 template<uint32_t D>
 __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
     const float* __restrict__ q, const __half* __restrict__ kc,
@@ -963,8 +997,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
-        // S = Q K^T for this warp's 16-key strip x all 32 queries
-        {
+        // S = Q K^T for this warp's 16-key strip x all 32 queries (a strip
+        // wholly past `hi` is never read - its scores are masked below)
+        if (t0 + 16u * warp < hi) {
             frag_s S_c[NC / 16u];
             #pragma unroll
             for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) wmma::fill_fragment(S_c[j0], 0.f);
@@ -1040,12 +1075,25 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
                         DP, wmma::mem_col_major);
             #pragma unroll
             for (uint32_t kf = 0; kf < TK / 16u; ++kf) {
+                const uint32_t kb = t0 + kf * 16u;
+                if (kb >= hi) break;  // weights all exact zeros
                 frag_v V_a[DW / 16u];
-                #pragma unroll
-                for (uint32_t df = 0; df < DW / 16u; ++df)
-                    wmma::load_matrix_sync(
-                        V_a[df], vcb + (size_t)(t0 + kf * 16u) * kv_dim + DW * warp + df * 16u,
-                        kv_dim);
+                if (kb + 16u <= hi) {
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(
+                            V_a[df], vcb + (size_t)kb * kv_dim + DW * warp + df * 16u,
+                            kv_dim);
+                } else {
+                    constexpr uint32_t VLD = pd_af16_vld<D, NC>();
+                    half* sv = sh_q + warp * 16u * VLD;
+                    pd_af16_stage_v_tail<DW, VLD>(
+                        sv, kb, hi, DW * warp, lane,
+                        [&](uint32_t k) { return vcb + (size_t)k * kv_dim; });
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], sv + df * 16u, VLD);
+                }
                 #pragma unroll
                 for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) {
                     frag_b P_b;
@@ -1104,7 +1152,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_kernel(
 // load_matrix_sync tile is one contiguous block - the FlashInfer BSR property.
 // Only the base setup + the two K/V load bases change (dense slot base ->
 // block-table lookup); the fragments, mma_sync, and softmax are byte-identical,
-// so it is bit-exact vs the dense WMMA prefill.
+// so it is bit-exact vs the dense WMMA prefill. Like its twin it reads no row
+// at or past `hi` into a product (see the dense note), so it touches only the
+// table entries of pages holding a live key.
 template<uint32_t D>
 __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
     const float* __restrict__ q, const __half* __restrict__ pool_k,
@@ -1192,7 +1242,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
             lo_t = ((lo1 - swa_window) / TK) * TK;
     }
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
-        {
+        // a strip wholly past `hi` is never read: its scores are masked, and
+        // its table entry may name no page of this slot
+        if (t0 + 16u * warp < hi) {
             frag_s S_c[NC / 16u];
             #pragma unroll
             for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) wmma::fill_fragment(S_c[j0], 0.f);
@@ -1268,15 +1320,25 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_f16_paged_kernel(
                         DP, wmma::mem_col_major);
             #pragma unroll
             for (uint32_t kf = 0; kf < TK / 16u; ++kf) {
+                const uint32_t kb = t0 + kf * 16u;
+                if (kb >= hi) break;  // weights all exact zeros
                 frag_v V_a[DW / 16u];
-                #pragma unroll
-                for (uint32_t df = 0; df < DW / 16u; ++df)
-                    // paged V tile: block bt[(t0+kf*16)>>4], within-block row 0.
-                    wmma::load_matrix_sync(
-                        V_a[df],
-                        pool_v + (size_t)bt[(t0 + kf * 16u) >> 4] * 16u * kv_dim
-                            + (size_t)kvh * D + DW * warp + df * 16u,
-                        kv_dim);
+                // paged V tile: block bt[kb>>4], within-block row 0.
+                const __half* vb = pool_v + (size_t)bt[kb >> 4] * 16u * kv_dim + (size_t)kvh * D;
+                if (kb + 16u <= hi) {
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], vb + DW * warp + df * 16u, kv_dim);
+                } else {
+                    constexpr uint32_t VLD = pd_af16_vld<D, NC>();
+                    half* sv = sh_q + warp * 16u * VLD;
+                    pd_af16_stage_v_tail<DW, VLD>(
+                        sv, kb, hi, DW * warp, lane,
+                        [&](uint32_t k) { return vb + (size_t)(k - kb) * kv_dim; });
+                    #pragma unroll
+                    for (uint32_t df = 0; df < DW / 16u; ++df)
+                        wmma::load_matrix_sync(V_a[df], sv + df * 16u, VLD);
+                }
                 #pragma unroll
                 for (uint32_t j0 = 0; j0 < NC / 16u; ++j0) {
                     frag_b P_b;

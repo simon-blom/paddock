@@ -917,15 +917,17 @@ fn qsa_attn_paged_matches_dense() {
 /// at its 24 / 2 x 256 geometry they must be the same bits too (the paged
 /// f16 entry's pf5 / pf7 arms take other group sizes and fall to P6i's twin
 /// here). One slot's resumed chunk, every row the same slot as the
-/// single-slot entries require. P6i stages whole 64-key tiles and weighs
-/// the keys past a row by zero - finite stale rows are harmless, a NaN one
-/// is not (dense or paged alike) - so here the slot is backed to its tile
-/// boundary (384 for rows reaching 340), and a paged caller must name a
-/// block (any block) in every table entry up to that boundary.
+/// single-slot entries require. The slot is backed only to its live keys
+/// (rows reaching 340): every row past them is NaN and every table entry
+/// past its pages names the poison block, so a kernel that reads a stale
+/// row into a product - P6i staged whole 64-key tiles and weighed the keys
+/// past a row by zero, and 0 x NaN is NaN - fails here. Its two query
+/// blocks end mid-page (keys to 332 and to 341), so both the straddling
+/// sub-tile's zeroed rows and the skipped strips past it are exercised.
 #[test]
 fn single_slot_prefill_twins_match_dense() {
     let Some(e) = exec_with_modes() else { return };
-    let lay = Layout::new(512, vec![384, 18, 71, 512], 0x5eed);
+    let lay = Layout::new(512, vec![341, 18, 71, 512], 0x5eed);
     let (nh, nkv, hd) = GEOMS[0];
     let kv_dim = nkv * hd;
     let scale = 1.0 / (hd as f32).sqrt();
