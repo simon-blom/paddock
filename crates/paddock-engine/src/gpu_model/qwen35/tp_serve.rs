@@ -14,10 +14,8 @@ use std::{
 use cudarc::driver::CudaEvent;
 use paddock_dist::{
     config::Resolved,
-    protocol::{
-        ControlMessage, TpSpanFinisherPlan, receive_nccl_id, send_nccl_id,
-    },
-    worker::{shutdown_worker, WorkerControl},
+    protocol::{ControlMessage, TpSpanFinisherPlan, receive_nccl_id},
+    worker::WorkerControl,
 };
 use paddock_models::mapped::MappedGguf;
 
@@ -25,6 +23,7 @@ use super::{
     tp_kv::{tp_publish_ops, tp_resume_decision, Event, MirroredKv, Operation, Snapshot},
     tp_model::Qwen35TpRank,
 };
+use crate::gpu_model::tp::control::WorkerSet;
 use crate::{
     generator::{GenError, Generator, RowSample, SampledStep},
     gpu::{
@@ -60,7 +59,7 @@ pub(super) fn kv_dtype_parse(wire: &str) -> Result<KvDtype, String> {
 
 /// The KV dtype this serve runs. Rank 0 resolves it against the device's
 /// compute capability (the same sm_89 rule the runner's `apply_kv_dtype`
-/// applies for TP=1) and SENDS the resolved value; worker rank parses what
+/// applies for TP=1) and SENDS the resolved value; worker ranks parse what
 /// arrives. The ranks can therefore never disagree, which is what the old
 /// hardcoded `KvDtype::Fp16` pair silently guaranteed - and what an fp8 KV
 /// serve must keep guaranteeing before either rank allocates.
@@ -133,109 +132,6 @@ fn hashes(model: &Path, pack: &Path) -> Result<(String, String), String> {
         hasher.update(&buf[..n]);
     }
     Ok((checkpoint, hasher.finalize().to_hex().to_string()))
-}
-
-fn ready(stream: &mut TcpStream, sequence: u64) -> Result<(), String> {
-    match ControlMessage::from_stream(stream).map_err(|e| e.to_string())? {
-        ControlMessage::TpReady { sequence: got } if got == sequence => Ok(()),
-        ControlMessage::TpError { reason } | ControlMessage::Reject { reason } => Err(reason),
-        other => Err(format!(
-            "worker reply out of order (expected {sequence}): {other:?}"
-        )),
-    }
-}
-
-fn prepared(stream: &mut TcpStream, sequence: u64) -> Result<(), String> {
-    match ControlMessage::from_stream(stream).map_err(|e| e.to_string())? {
-        ControlMessage::TpPrepared { sequence: got } if got == sequence => Ok(()),
-        ControlMessage::TpError { reason } | ControlMessage::Reject { reason } => Err(reason),
-        other => Err(format!("worker did not prepare step {sequence}: {other:?}")),
-    }
-}
-
-
-/// Rank-sorted control channels for every nonzero TP rank.
-struct WorkerSet {
-    controls: Vec<WorkerControl>,
-}
-
-impl WorkerSet {
-    fn new(mut controls: Vec<WorkerControl>, resolved: &Resolved) -> Result<Self, String> {
-        controls.sort_by_key(|worker| worker.rank);
-        let expected: Vec<usize> = (1..resolved.tp_size).collect();
-        let actual: Vec<usize> = controls.iter().map(|worker| worker.rank).collect();
-        if actual != expected {
-            return Err(format!(
-                "TP worker set mismatch: expected ranks {expected:?}, got {actual:?}"
-            ));
-        }
-        for worker in &mut controls {
-            worker
-                .stream
-                .set_read_timeout(Some(READY_TIMEOUT))
-                .map_err(|e| format!("rank {} read timeout: {e}", worker.rank))?;
-            worker
-                .stream
-                .set_write_timeout(Some(STEP_TIMEOUT))
-                .map_err(|e| format!("rank {} write timeout: {e}", worker.rank))?;
-        }
-        Ok(Self { controls })
-    }
-
-    fn set_step_timeouts(&mut self) -> Result<(), String> {
-        for worker in &mut self.controls {
-            worker
-                .stream
-                .set_read_timeout(Some(STEP_TIMEOUT))
-                .map_err(|e| format!("rank {} step read timeout: {e}", worker.rank))?;
-        }
-        Ok(())
-    }
-
-    fn broadcast(&mut self, msg: &ControlMessage) -> Result<(), String> {
-        for worker in &mut self.controls {
-            msg.to_stream(&mut worker.stream)
-                .map_err(|e| format!("rank {} control send: {e}", worker.rank))?;
-        }
-        Ok(())
-    }
-
-    fn ready(&mut self, sequence: u64) -> Result<(), String> {
-        for worker in &mut self.controls {
-            ready(&mut worker.stream, sequence)
-                .map_err(|e| format!("rank {}: {e}", worker.rank))?;
-        }
-        Ok(())
-    }
-
-    fn prepared(&mut self, sequence: u64) -> Result<(), String> {
-        for worker in &mut self.controls {
-            prepared(&mut worker.stream, sequence)
-                .map_err(|e| format!("rank {}: {e}", worker.rank))?;
-        }
-        Ok(())
-    }
-
-    fn send_nccl_id(&mut self, id: &[u8; paddock_dist::protocol::NCCL_ID_BYTES]) -> Result<(), String> {
-        for worker in &mut self.controls {
-            send_nccl_id(&mut worker.stream, id)
-                .map_err(|e| format!("rank {} NCCL id send: {e}", worker.rank))?;
-        }
-        Ok(())
-    }
-
-    fn shutdown(&mut self, graceful: bool) -> Result<(), String> {
-        let mut first = None;
-        for worker in &mut self.controls {
-            if let Err(e) = shutdown_worker(&mut worker.stream, graceful) {
-                first.get_or_insert_with(|| format!("rank {} shutdown: {e}", worker.rank));
-            }
-        }
-        match first {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
 }
 
 fn validate_multistep_positions(
@@ -599,7 +495,7 @@ fn wire_kv_state(value: serde_json::Value) -> Result<Snapshot, String> {
 
 /// Engine `DevicePlan` -> wire plan. Unsupported plans fail closed before
 /// any KV authorization or worker message. The reverse conversion does not
-/// exist: worker rank never samples (the finisher sampler has no collectives and
+/// exist: worker ranks never samples (the finisher sampler has no collectives and
 /// runs only on rank 0), it only reads the finisher slot ids to promote
 /// lane-local state.
 fn wire_finisher_plan(
@@ -660,13 +556,13 @@ impl TpCoordinator {
                 "TP serving requires the rank-0 coordinator, tp_size>=2 and a nonzero context".into(),
             );
         }
-        let mut workers = WorkerSet::new(workers, resolved)?;
+        let mut workers = WorkerSet::new(workers, resolved, READY_TIMEOUT, STEP_TIMEOUT)?;
         // Phase 12 fp8 KV gate, rank-0-authoritative like everything else
         // here: the executor exists before any wire traffic, so ask THIS
         // device the same question the TP=1 apply_kv_dtype path asks. A
         // below-sm_89 card demotes LOUDLY to f16 (the fp8 ask doubles the KV
         // pool; the serve must stay attributable), and the demoted value is
-        // what TpInit carries - worker rank never has to know the runner's env.
+        // what TpInit carries - worker ranks never has to know the runner's env.
         let exec = Arc::new(GpuExecutor::new(gpu, pack).map_err(|e| e.to_string())?);
         let kv_dtype = kv_dtype_serve(exec.compute_capability());
         // Graph mode is rank-0-authoritative too (upstream-readiness I4):
@@ -728,7 +624,7 @@ impl TpCoordinator {
         let mut kv = logical(max_ctx, slots)?;
         kv.set_state_capacity(ckpt_slots);
         workers.ready(1)?;
-        workers.set_step_timeouts()?;
+        workers.set_read_timeout(STEP_TIMEOUT)?;
         Ok(Self {
             workers,
             group,
@@ -1286,7 +1182,7 @@ impl TpCoordinator {
             events.push((slot, event));
             self.positions[slot] += 1;
         }
-        // Worker ranks has enqueued the next tick before acknowledging the old one.
+        // Worker ranks have enqueued the next tick before acknowledging the old one.
         self.workers.ready(self.sequence)?;
         let ids = {
             let old = self.pipe.as_ref().ok_or("TP pipe disappeared")?;
@@ -1526,7 +1422,7 @@ impl TpCoordinator {
         // only; the FINAL span (the finishing chunk's last span) adds the
         // head once - final norm + LM head on the run's last row - and
         // either samples it on device or reads the logits back. The head
-        // enters no collective, so worker rank never runs it.
+        // enters no collective, so worker ranks never runs it.
         let mut fin_ids = vec![0u32; finishers.len()];
         let mut fin_logits: Vec<Option<Vec<f32>>> = vec![None; finishers.len()];
         // Fail closed: a finisher outside the chunk run could never produce
@@ -1869,7 +1765,7 @@ impl TpCoordinator {
         }
         // Finishers: supported Device -> device-sampled first token; Host or
         // an unsupported plan -> full-logit readback. The wire carries EVERY
-        // finishing chunk (plan or None): worker rank promotes exactly these
+        // finishing chunk (plan or None): worker ranks promote exactly these
         // slots' lane-local state at the span finish.
         let wire_finishers = finishers
             .iter()
@@ -2860,7 +2756,7 @@ pub fn run_worker(
         let mut pipe_slots: Option<Vec<usize>> = None;
         let mut span_in_flight = false;
         // Finishing chunks of the in-flight span (wire shape, chunk order):
-        // worker rank promotes exactly these slots at the span finish.
+        // worker ranks promote exactly these slots at the span finish.
         let mut span_finishers: Vec<(usize, Option<TpSpanFinisherPlan>)> = Vec::new();
         let mut pipe_plane = 0usize;
         let mut pending_pipe: Option<u64> = None;
@@ -3204,7 +3100,7 @@ pub fn run_worker(
                     ..
                 } => {
                     // Decode rows precede the optional single-slot chunk run.
-                    // Worker ranks mirrors the authorized KV snapshot before
+                    // Worker ranks mirror the authorized KV snapshot before
                     // Prepared, then replays the same bounded span geometry;
                     // it neither samples nor reads logits back to the host.
                     let split = validate_mixed_worker_rows(&rows, chunk_rows, &positions, max_ctx)?;
@@ -3287,7 +3183,7 @@ pub fn run_worker(
                     kv_state,
                     ..
                 } => {
-                    // The whole prompt span enqueues on worker rank's prefill lane
+                    // The whole prompt span enqueues on each worker rank's prefill lane
                     // as batched sub-spans of at most tp_span_cap() contiguous
                     // rows per slot run (the shared pure `span_chunk_points`
                     // over the same wire rows rank 0 chunked from). The lane
@@ -3342,7 +3238,7 @@ pub fn run_worker(
                         }
                         at = end;
                     }
-                    // Worker ranks does not sample; its probe finisher marks span
+                    // Worker ranks do not sample; its probe finisher marks span
                     // completion for the promotion at the span finish.
                     model
                         .prefill_lane_finisher(
@@ -3366,7 +3262,7 @@ pub fn run_worker(
                     // each finished slot's lane-local state onto this rank's
                     // decode executor - same chunk order as rank 0. The lane
                     // slab and DeltaNet slot state are private allocations on
-                    // every rank, so worker rank's decode executor would otherwise
+                    // every rank, so each worker rank's decode executor would otherwise
                     // never see the prompt's context.
                     exec.synchronize().map_err(|e| e.to_string())?;
                     group.stream().synchronize().map_err(|e| e.to_string())?;
