@@ -80,7 +80,7 @@ Earlier measured six-run benchmark for `472c9c283253b11cfc85a3cd0c4b85e9c539dadf
 ## Progress log
 
 - 2026-09-29 (OVERNIGHT RUN HANDOFF — read this first):
-  - **Branches**: `review/tp-generic-core` at `8473aea` (pushed; Part 1 done), `review/tp-model2-proof` at `817f0f7` (pushed; branched from the generic-core tip; Parts 2–5 in progress).
+  - **Branches**: `review/tp-generic-core` at `8473aea` (pushed; Part 1 done), `review/tp-model2-proof` at `d8ade3e` (pushed; branched from the generic-core tip; Parts 2–5 done to the last host-verifiable boundary).
   - **Part 1 (generic serving/runtime)**: `tp/serve.rs` extracted (see the Part 1 entry below) — `ServeModel` trait, `TpCoordinator<M>`, `TpGenerator<M>`, `run_worker<M>`, all flight/validation/protocol machinery and 29 host tests. Qwen `qwen35/tp_serve.rs` is now a ~280-line `ServeModel` binding + re-exports. GPU validation PENDING (see the pending-GPU section).
   - **Part 3 (model #2 = MiniCPM5-2B)**: rationale in `docs/tp/model2-selection.md`. head_dim 128 rides existing decode/prefill kernel arms; 16q/2kv partitions exactly at TP=2 (8q/1kv per rank); group 8 passes the fp8 KV rule; plain-llama = the generic defaults; granite 4.1-3b rejected for hd 64 (fp8 prefill gap, less clean proof).
   - **Part 4 (download)**: `openbmb/MiniCPM5-2B-GGUF` file `MiniCPM5-2B-Q8_0.gguf` → `/media/sime/KINGSTON/models/minicpm5-2b/` (2,679,710,688 bytes; SHA-256 `c5415f8989bf88a8288f1b55a3cc371af53c07b0faa220a63bd7a990cfaba078` verified against HF's LFS manifest; also the safetensors reference tree downloaded). Q8_0 = the pinned Qwen3.8 TP lane's proven weight class.
