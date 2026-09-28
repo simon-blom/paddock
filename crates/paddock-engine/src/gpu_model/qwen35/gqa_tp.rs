@@ -9,7 +9,7 @@ use paddock_kernels::reference::ops::YarnRope;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest};
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
-use super::ops::{gemv_any, prefill_attn, prefill_mm_any, prefill_mm_pre_any, prefill_quant, read_sections};
+use super::ops::{attn_decode_dispatch, gemv_any, prefill_attn, prefill_mm_any, prefill_mm_pre_any, prefill_quant, read_sections};
 use super::tp_kv::MirroredKv;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
@@ -122,6 +122,10 @@ pub struct GqaTpRank {
     qn: CudaSlice<f32>,
     kn: CudaSlice<f32>,
     attn: CudaSlice<f32>,
+    // FlashDecoding partial+combine scratch. Decode uses the same dispatcher
+    // as the stock Qwen3.8 path instead of the under-occupied unsplit KV walk.
+    attn_o: CudaSlice<f32>,
+    attn_ml: CudaSlice<f32>,
     partial: CudaSlice<f32>,
     reduced: CudaSlice<f32>,
     kc: CudaSlice<u8>,
@@ -130,6 +134,10 @@ pub struct GqaTpRank {
     slots: CudaSlice<u32>,
     axes: CudaSlice<u32>,
     block_tables: Option<CudaSlice<u32>>,
+    // Per-slot host mirror of the page ids already resident in block_tables.
+    // Decode positions change every token; physical page mappings normally do
+    // not. This avoids re-uploading the full all-slot table at every GQA layer.
+    staged_slot_blocks: Vec<Vec<u32>>,
     blocks_per_slot: usize,
     slots_count: usize,
     pos: usize,
@@ -247,6 +255,16 @@ impl GqaTpRank {
             qn: e.alloc(g.q_dim())?,
             kn: e.alloc(g.kv_dim())?,
             attn: e.alloc(g.q_dim())?,
+            attn_o: e.alloc(
+                2 * super::attn_fill_blocks(super::attn_boundary_sms(e.sm_count()))
+                    * super::MAX_ATTN_SPLITS
+                    * g.head_dim,
+            )?,
+            attn_ml: e.alloc(
+                2 * super::attn_fill_blocks(super::attn_boundary_sms(e.sm_count()))
+                    * super::MAX_ATTN_SPLITS
+                    * 2,
+            )?,
             partial: e.alloc(g.width)?,
             reduced: e.alloc(g.width)?,
             kc: e.alloc_u8(kv_bytes)?,
@@ -255,6 +273,7 @@ impl GqaTpRank {
             slots: e.alloc_u32(1)?,
             axes: e.alloc_u32(4)?,
             block_tables: None,
+            staged_slot_blocks: Vec::new(),
             blocks_per_slot: 0,
             slots_count: 1,
             pos: 0,
@@ -300,6 +319,7 @@ impl GqaTpRank {
         rank.kc = e.alloc_u8(bytes)?;
         rank.vc = e.alloc_u8(bytes)?;
         rank.block_tables = Some(e.alloc_u32(bps * slots)?);
+        rank.staged_slot_blocks = vec![Vec::new(); slots];
         rank.blocks_per_slot = bps;
         rank.slots_count = slots;
         Ok(rank)
@@ -363,10 +383,11 @@ impl GqaTpRank {
         let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        let table = logical
+        logical
             .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
             .map_err(|e| GqaTpError::Shape(e.into()))?;
-        self.forward_at(e, group, input, slot, position, Some(&table))
+        self.stage_slot_block_table(e, slot, logical)?;
+        self.forward_at(e, group, input, slot, position, Some(()))
     }
 
     fn forward_at<'a, C: Communicator>(
@@ -376,7 +397,7 @@ impl GqaTpRank {
         input: &CudaSlice<f32>,
         slot: usize,
         position: usize,
-        table: Option<&[u32]>,
+        table: Option<()>,
     ) -> Result<&'a CudaSlice<f32>, GqaTpError> {
         if group.world_size() != 2
             || group.rank() != self.rank
@@ -399,11 +420,6 @@ impl GqaTpRank {
         e.stream
             .memcpy_htod(&[slot as u32], &mut self.slots)
             .map_err(GpuError::from)?;
-        if let Some(host) = table {
-            e.stream
-                .memcpy_htod(host, self.block_tables.as_mut().expect("paged checked"))
-                .map_err(GpuError::from)?;
-        }
         self.attention_run(e, input)?;
         group.after_compute(&e.stream)?;
         group.all_reduce(&self.partial, &mut self.reduced)?;
@@ -501,24 +517,26 @@ impl GqaTpRank {
                 1,
                 self.dtype,
             )?;
-            e.attn_decode_batch_paged(
+            attn_decode_dispatch(
+                e,
                 &self.qn,
                 &self.kc,
                 &self.vc,
                 &self.sinks,
+                &mut self.attn_o,
+                &mut self.attn_ml,
                 &mut self.attn,
                 &self.positions,
                 Some(&self.slots),
-                bt,
-                self.blocks_per_slot,
                 g.local_heads,
                 g.local_kv_heads,
                 g.head_dim,
+                self.max_ctx,
                 g.kv_dim(),
-                0,
                 1,
                 1.0 / (g.head_dim as f32).sqrt(),
                 self.dtype,
+                Some((bt, self.blocks_per_slot)),
             )?;
         } else {
             e.kv_append_batch(
@@ -577,6 +595,46 @@ impl GqaTpRank {
         Ok(&self.reduced)
     }
 
+    /// Stage only the live block ids for one slot, and only when that slot's
+    /// physical mapping changed. The decode kernels index the persistent
+    /// all-slot device table at slot*blocks_per_slot, so unchanged mappings
+    /// remain graph-safe across positions.
+    fn stage_slot_block_table(
+        &mut self,
+        e: &GpuExecutor,
+        slot: usize,
+        logical: &MirroredKv,
+    ) -> Result<(), GqaTpError> {
+        let live = logical
+            .slot_blocks(slot)
+            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
+        let staged = self
+            .staged_slot_blocks
+            .get_mut(slot)
+            .ok_or_else(|| GqaTpError::Shape("slot out of range".into()))?;
+        if staged.as_slice() == live {
+            return Ok(());
+        }
+        if live.len() > self.blocks_per_slot {
+            return Err(GqaTpError::Shape("block table exceeds slot capacity".into()));
+        }
+        let start = slot * self.blocks_per_slot;
+        let stop = start + live.len();
+        e.stream
+            .memcpy_htod(
+                live,
+                &mut self
+                    .block_tables
+                    .as_mut()
+                    .expect("paged checked")
+                    .slice_mut(start..stop),
+            )
+            .map_err(GpuError::from)?;
+        staged.clear();
+        staged.extend_from_slice(live);
+        Ok(())
+    }
+
     /// Re-stage ALL varying attention inputs into their fixed device buffers
     /// without running any kernel: position, axes, slot id and the slot's
     /// validated block table. The graphed caller uses this between replays:
@@ -596,9 +654,10 @@ impl GqaTpRank {
         let stride = BLOCK_TOKENS * self.geometry.kv_dim() * self.dtype.bytes();
         let blocks = u32::try_from(self.kc.len() / stride)
             .map_err(|_| GqaTpError::Shape("KV pool too large".into()))?;
-        let table = logical
+        logical
             .checked_device_table(slot, position, blocks, self.slots_count, self.max_ctx)
             .map_err(|err| GqaTpError::Shape(err.into()))?;
+        self.stage_slot_block_table(e, slot, logical)?;
         let pos =
             u32::try_from(position).map_err(|_| GqaTpError::Shape("position overflow".into()))?;
         e.stream
@@ -609,9 +668,6 @@ impl GqaTpRank {
             .map_err(GpuError::from)?;
         e.stream
             .memcpy_htod(&[slot as u32], &mut self.slots)
-            .map_err(GpuError::from)?;
-        e.stream
-            .memcpy_htod(&table, self.block_tables.as_mut().expect("paged checked"))
             .map_err(GpuError::from)?;
         Ok(())
     }
