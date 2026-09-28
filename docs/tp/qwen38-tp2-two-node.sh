@@ -9,7 +9,7 @@ ENV_FILE="${TP_ENV_FILE:-$DEFAULT_ENV_FILE}"
 CONFIG_KEYS=(
   RUNNER REMOTE_RUNNER MODEL REMOTE_MODEL PACK REMOTE_PACK
   WORKER_HOST MASTER_ADDR MASTER_PORT HTTP_HOST HTTP_PORT MAX_CTX MAX_BATCH
-  KV_DTYPE SPEC TP_GRAPH SSH_OPTS NCCL_SOCKET_IFNAME NCCL_IB_HCA
+  KV_DTYPE SPEC TP_GRAPH SPEC_GRAPH NO_PREFIX_CACHE SSH_OPTS NCCL_SOCKET_IFNAME NCCL_IB_HCA
   NCCL_IB_DISABLE NCCL_NET REMOTE_PIDFILE REMOTE_LOG REMOTE_STATUSFILE LD_LIBRARY_PATH
 )
 
@@ -61,6 +61,8 @@ load_env_file "$ENV_FILE"
 : "${KV_DTYPE:=f16}"
 : "${SPEC:=on}"
 : "${TP_GRAPH:=1}"
+: "${SPEC_GRAPH:=on}"
+: "${NO_PREFIX_CACHE:=0}"
 : "${SSH_OPTS:=}"
 : "${NCCL_SOCKET_IFNAME:=enp1s0f0np0}"
 : "${NCCL_IB_HCA:=rocep1s0f0}"
@@ -77,9 +79,11 @@ require_nonempty() {
   [[ -n "$value" ]] || { printf '%s must be set\n' "$name" >&2; exit 2; }
 }
 
-for name in RUNNER MODEL PACK WORKER_HOST MASTER_ADDR MASTER_PORT HTTP_PORT MAX_CTX MAX_BATCH KV_DTYPE SPEC TP_GRAPH; do
+for name in RUNNER MODEL PACK WORKER_HOST MASTER_ADDR MASTER_PORT HTTP_PORT MAX_CTX MAX_BATCH KV_DTYPE SPEC TP_GRAPH SPEC_GRAPH NO_PREFIX_CACHE; do
   require_nonempty "$name"
 done
+[[ "$SPEC_GRAPH" == on || "$SPEC_GRAPH" == off ]] || { printf 'SPEC_GRAPH must be on or off\n' >&2; exit 2; }
+[[ "$NO_PREFIX_CACHE" == 0 || "$NO_PREFIX_CACHE" == 1 ]] || { printf 'NO_PREFIX_CACHE must be 0 or 1\n' >&2; exit 2; }
 
 if [[ "$TP_DRY_RUN" != 1 ]]; then
   [[ -x "$RUNNER" ]] || { printf 'RUNNER is not executable: %s\n' "$RUNNER" >&2; exit 2; }
@@ -182,12 +186,15 @@ remote_env=(
   "NCCL_IB_HCA=$NCCL_IB_HCA"
   "NCCL_IB_DISABLE=$NCCL_IB_DISABLE"
   "NCCL_NET=$NCCL_NET"
+  PADDOCK_UNIFIED=1
 )
+[[ "$SPEC_GRAPH" == off ]] && remote_env+=(PADDOCK_SPEC_NOGRAPH=1)
+[[ "$NO_PREFIX_CACHE" == 1 ]] && remote_env+=(PADDOCK_NO_PREFIX_CACHE=1)
 [[ -n "$LD_LIBRARY_PATH" ]] && remote_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
 # Opt-in diagnostics must run on both ranks; their collectives and event
 # timings are measured independently on each node.
 [[ "${PADDOCK_TP_PREFILL_PROFILE:-0}" == 1 ]] && remote_env+=("PADDOCK_TP_PREFILL_PROFILE=1")
-for arg in env -u PADDOCK_TP_GRAPH -u PADDOCK_TP_NO_SPAWN "${remote_env[@]}" \
+for arg in env -u PADDOCK_TP_GRAPH -u PADDOCK_TP_NO_SPAWN -u PADDOCK_SPEC_NOGRAPH -u PADDOCK_NO_PREFIX_CACHE "${remote_env[@]}" \
   "$REMOTE_RUNNER" --tp-worker \
   --model "$REMOTE_MODEL" --kernel-pack "$REMOTE_PACK" \
   --tp-master-addr "$MASTER_ADDR" --tp-master-port "$MASTER_PORT"; do
@@ -197,7 +204,11 @@ done
 if [[ "$TP_DRY_RUN" == 1 ]]; then
   printf 'env file: %s\n' "$ENV_FILE"
   printf 'remote worker: ssh %s %s\n' "$WORKER_HOST" "$remote_worker_cmd"
-  printf 'coordinator: PADDOCK_TP_GRAPH=%q PADDOCK_TP_NO_SPAWN=1 %q' "$TP_GRAPH" "$RUNNER"
+  if [[ "$SPEC_GRAPH" == off ]]; then
+    printf 'coordinator: PADDOCK_TP_GRAPH=%q PADDOCK_TP_NO_SPAWN=1 PADDOCK_SPEC_NOGRAPH=1 PADDOCK_UNIFIED=1 %q' "$TP_GRAPH" "$RUNNER"
+  else
+    printf 'coordinator: PADDOCK_TP_GRAPH=%q PADDOCK_TP_NO_SPAWN=1 PADDOCK_UNIFIED=1 %q' "$TP_GRAPH" "$RUNNER"
+  fi
   printf ' --model %q --kernel-pack %q --device cuda --tp-size 2' "$MODEL" "$PACK"
   printf ' --tp-master-addr %q --tp-master-port %q --host %q --port %q' "$MASTER_ADDR" "$MASTER_PORT" "$HTTP_HOST" "$HTTP_PORT"
   printf ' --max-ctx %q --max-batch %q --kv-cache-dtype %q' "$MAX_CTX" "$MAX_BATCH" "$KV_DTYPE"
@@ -258,14 +269,17 @@ fi
 coordinator_env=(
   "PADDOCK_TP_GRAPH=$TP_GRAPH"
   PADDOCK_TP_NO_SPAWN=1
+  PADDOCK_UNIFIED=1
   "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
   "NCCL_IB_HCA=$NCCL_IB_HCA"
   "NCCL_IB_DISABLE=$NCCL_IB_DISABLE"
   "NCCL_NET=$NCCL_NET"
 )
+[[ "$SPEC_GRAPH" == off ]] && coordinator_env+=(PADDOCK_SPEC_NOGRAPH=1)
+[[ "$NO_PREFIX_CACHE" == 1 ]] && coordinator_env+=(PADDOCK_NO_PREFIX_CACHE=1)
 [[ -n "$LD_LIBRARY_PATH" ]] && coordinator_env+=("LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
 set +e
-env "${coordinator_env[@]}" "${coordinator[@]}"
+env -u PADDOCK_SPEC_NOGRAPH -u PADDOCK_NO_PREFIX_CACHE "${coordinator_env[@]}" "${coordinator[@]}"
 coordinator_rc=$?
 set -e
 remote_cleanup
