@@ -64,8 +64,26 @@ generic layer gets fixed instead.
   ffn 6144, vocab 130,560, rope_theta 5,000,000, rms_eps 1e-06, ctx 131,072
 - Total: ~4.8 GB (bf16 safetensors; the weights file is 5,033,557,096 bytes)
 - Local path: `~/models/minicpm5-2b/` → `/media/sime/KINGSTON/models/minicpm5-2b/` (KINGSTON volume, symlinked)
-- Weights SHA-256: `14fb8e7f0a18d53d1f239773758bf581cee7e456a4523a54622c3a245b64402c`
+- Safetensors weights SHA-256: `14fb8e7f0a18d53d1f239773758bf581cee7e456a4523a54622c3a245b64402c`
   (verified byte-for-byte against HF's LFS manifest for the file)
+
+### Revision: the TP lane rides the official GGUF
+
+The TP serving path hashes and shards a single-file **GGUF** (`TpInit`
+identity + `load_quantw_shard`), and MiniCPM5-2B on CUDA is served from GGUF
+through the granite/llama graph. `openbmb` ships official GGUF conversions,
+so the safetensors directory above is reference material only and the TP
+checkpoint is:
+
+- HF repo: `openbmb/MiniCPM5-2B-GGUF`, file `MiniCPM5-2B-Q8_0.gguf`
+- Local: `/media/sime/KINGSTON/models/minicpm5-2b/MiniCPM5-2B-Q8_0.gguf`
+  (2,679,710,688 bytes, ~2.5 GB)
+- SHA-256: `c5415f8989bf88a8288f1b55a3cc371af53c07b0faa220a63bd7a990cfaba078`
+  (verified against HF's LFS manifest)
+- Q8_0 is the proven TP weight class (the pinned Qwen3.8 TP checkpoint packs
+  the same numeric format); metadata confirms `general.architecture = llama`,
+  42 blocks, 16q/2kv hd 128, ffn 6144, ctx 131,072, rope base 5e6, eps 1e-6,
+  untied `output.weight` Q8_0 [2048, 130560]
 - Tensor map (381 tensors): `model.embed_tokens.weight`, `lm_head.weight`
   (untied), per-layer `model.layers.{i}.{self_attn.{q,k,v,o}_proj,
   mlp.{gate,up,down}_proj, input_layernorm, post_attention_layernorm}.weight`,

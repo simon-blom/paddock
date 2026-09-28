@@ -16,9 +16,15 @@
 //! granite multipliers at identity (llama arch = granite at defaults).
 
 use std::path::Path;
-use paddock_dist::config::Resolved;
+use std::sync::Arc;
+
 use paddock_models::mapped::MappedGguf;
 
+use crate::gpu::{GpuExecutor, KvDtype, QuantW};
+use crate::gpu::distributed::NcclCommunicator;
+use crate::tp::attention::AttentionWeightNames;
+use crate::tp::conventional::{ConventionalAttentionSpec, ConventionalGqaRank, DecodeSplitPolicy};
+use crate::tp::ffn::{SwiGluTpRank, SwiGluWeightNames};
 use crate::tp::TpTopology;
 
 /// The checkpoint identity this TP lane accepts (SHA-256 of the single-file
@@ -122,11 +128,36 @@ impl MiniCpmTpSpec {
     }
 }
 
+/// One MiniCPM layer's TP rank state: the two generic ranks plus the two
+/// layer norms (llama's pre/post residual norms). All weight loading goes
+/// through the generic components' loaders — no weight-name duplication
+/// beyond the llama name FORMULA this shim declares.
+///
+/// Pending GPU-spine seam: the fields read when the `ServeModel` impl wires
+/// the decode/span/pipe forwards (the next slice on this branch; inference
+/// validation is the user's GPU gate).
+#[allow(dead_code)] // spine fields; consumed by the ServeModel impl slice
+pub(crate) struct MiniCpmTpLayer {
+    pub(crate) gqa: ConventionalGqaRank,
+    pub(crate) ffn: SwiGluTpRank,
+    pub(crate) attn_norm: cudarc::driver::CudaSlice<f32>,
+    pub(crate) post_norm: cudarc::driver::CudaSlice<f32>,
+}
+
 /// The MiniCPM5-2B TP rank: conventional GQA + SwiGLU over the generic
-/// machinery. Model state will be exactly the generic ranks plus the spec;
-/// the rank composes them when the GPU spine slice lands.
+/// machinery, composed per layer from `tp::conventional` and `tp::ffn`.
+/// Embedding, final norm and LM head are replicated (identical on every
+/// rank; only attention/FFN shards differ).
+///
+/// Pending GPU-spine seam: same as [`MiniCpmTpLayer`].
+#[allow(dead_code)] // spine fields; consumed by the ServeModel impl slice
 pub struct MiniCpmTpRank {
     pub spec: MiniCpmTpSpec,
+    exec: Arc<GpuExecutor>,
+    tok_embd: QuantW,
+    out_norm: cudarc::driver::CudaSlice<f32>,
+    lm_head: QuantW,
+    layers: Vec<MiniCpmTpLayer>,
 }
 
 impl MiniCpmTpRank {
@@ -161,12 +192,92 @@ impl MiniCpmTpRank {
             logit_scale: 1.0,
         }
     }
-}
 
-/// The `ServeModel` impl lands with the GPU spine slice (composing
-/// `ConventionalGqaRank` + `SwiGluTpRank` per rank and wiring the decode/
-/// span/pipe forwards). The spec/geometry proof above is the host-verifiable
-/// half of the adoption claim; the spine is next on this branch.
+    /// Load the whole rank from the mapped GGUF. The only weight knowledge
+    /// in this file is the llama name formula:
+    /// `blk.{i}.{attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down}.weight`,
+    /// `blk.{i}.{attn_norm,ffn_norm}.weight`, `token_embd.weight`,
+    /// `output.weight`, `model.norm.weight`.
+    #[allow(dead_code)] // spine builder; consumed by the ServeModel impl slice
+    fn load_layers(
+        exec: &GpuExecutor,
+        map: &MappedGguf,
+        spec: &MiniCpmTpSpec,
+        _topology: TpTopology,
+        group: &NcclCommunicator,
+        n_layers: usize,
+        max_ctx: usize,
+        slots: usize,
+        kv_dtype: KvDtype,
+    ) -> Result<Vec<MiniCpmTpLayer>, String> {
+        let name = |i: usize, part: &str| format!("blk.{i}.{part}");
+        let mut layers = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let gqa = ConventionalGqaRank::load(
+                exec,
+                map,
+                ConventionalAttentionSpec {
+                    names: AttentionWeightNames {
+                        q: &name(i, "attn_q.weight"),
+                        k: &name(i, "attn_k.weight"),
+                        v: &name(i, "attn_v.weight"),
+                        output: &name(i, "attn_output.weight"),
+                    },
+                    // llama carries NO per-head Q/K norms — the generic
+                    // hooks default to the exact identity.
+                    q_norm: None,
+                    k_norm: None,
+                    // llama has no attention sinks.
+                    sinks: None,
+                    eps: spec.eps,
+                    // RoPE is applied by the shim's spine (NORM convention,
+                    // one rope call per plane per decode/span stage).
+                    rope: None,
+                    prefill_policy: crate::tp::attention::PagedPrefillPolicy {
+                        // hd 128 rides the tiled prefill arm.
+                        f16: false,
+                        tiled: true,
+                    },
+                },
+                spec.heads,
+                spec.kv_heads,
+                spec.head_dim,
+                group,
+                max_ctx,
+                slots,
+                // rank-local KV pool blocks: ctx/slots page granularity
+                (max_ctx.div_ceil(crate::kv_pool::BLOCK_TOKENS) * slots) as u32,
+                kv_dtype,
+                // Fixed split policy: hd 128, group 8 — one pass suffices at
+                // MiniCPM's small per-rank head count; the model owns the
+                // policy choice (measured on-device later).
+                DecodeSplitPolicy::SinglePass,
+            )
+            .map_err(|e| e.to_string())?;
+            let ffn = SwiGluTpRank::load(
+                exec,
+                map,
+                SwiGluWeightNames {
+                    gate: &name(i, "ffn_gate.weight"),
+                    up: &name(i, "ffn_up.weight"),
+                    down: &name(i, "ffn_down.weight"),
+                },
+                group,
+            )
+            .map_err(|e| e.to_string())?;
+            let upload = |part: &str| -> Result<cudarc::driver::CudaSlice<f32>, String> {
+                Ok(exec.upload(map, &name(i, part)).map_err(|e| e.to_string())?.buf)
+            };
+            layers.push(MiniCpmTpLayer {
+                gqa,
+                ffn,
+                attn_norm: upload("attn_norm.weight")?,
+                post_norm: upload("ffn_norm.weight")?,
+            });
+        }
+        Ok(layers)
+    }
+}
 
 
 /// Host check entry: read the spec from a checkpoint without a device.
