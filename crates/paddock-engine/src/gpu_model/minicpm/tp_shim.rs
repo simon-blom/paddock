@@ -138,10 +138,8 @@ impl MiniCpmTpSpec {
 /// through the generic components' loaders — no weight-name duplication
 /// beyond the llama name FORMULA this shim declares.
 ///
-/// Pending GPU-spine seam: the fields read when the `ServeModel` impl wires
-/// the decode/span/pipe forwards (the next slice on this branch; inference
-/// validation is the user's GPU gate).
-#[allow(dead_code)] // spine fields; consumed by the ServeModel impl slice
+/// The unified correctness lane consumes these directly. Optional overlap,
+/// device-sampling and graph facilities remain capability-gated separately.
 pub(crate) struct MiniCpmTpLayer {
     pub(crate) gqa: ConventionalGqaRank,
     pub(crate) ffn: SwiGluTpRank,
@@ -154,8 +152,9 @@ pub(crate) struct MiniCpmTpLayer {
 /// Embedding, final norm and LM head are replicated (identical on every
 /// rank; only attention/FFN shards differ).
 ///
-/// Pending GPU-spine seam: same as [`MiniCpmTpLayer`].
-#[allow(dead_code)] // spine fields; consumed by the ServeModel impl slice
+/// The first GPU gate uses the eager unified lane: rank 0 and workers share
+/// the same collective-bearing token body, while rank 0 alone runs the
+/// replicated final norm/head.
 pub struct MiniCpmTpRank {
     pub spec: MiniCpmTpSpec,
     exec: Arc<GpuExecutor>,
@@ -214,7 +213,6 @@ impl MiniCpmTpRank {
     /// `blk.{i}.{attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down}.weight`,
     /// `blk.{i}.{attn_norm,ffn_norm}.weight`, `token_embd.weight`,
     /// `output.weight`, `model.norm.weight`.
-    #[allow(dead_code)] // spine builder; consumed by the ServeModel impl slice
     fn load_layers(
         exec: &GpuExecutor,
         map: &MappedGguf,
