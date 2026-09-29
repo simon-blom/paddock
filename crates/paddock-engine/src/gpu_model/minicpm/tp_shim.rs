@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaEvent;
 
+use paddock_dist::config::Resolved;
 use paddock_models::mapped::MappedGguf;
 
 use crate::gpu::{GpuExecutor, KvDtype, QuantW};
@@ -676,6 +677,18 @@ impl MiniCpmTpRank {
 /// The runner-facing MiniCPM5-2B TP generator: the generic serve's
 /// `TpGenerator` bound to `MiniCpmTpRank`.
 pub type TpGenerator = crate::tp::serve::TpGenerator<MiniCpmTpRank>;
+
+/// MiniCPM5-2B TP worker entry: forwards to the generic worker loop with the
+/// model binding applied (same shape as the Qwen adapter's re-export).
+pub fn run_worker(
+    stream: std::net::TcpStream,
+    resolved: &Resolved,
+    model: &Path,
+    pack: &Path,
+    gpu: usize,
+) -> Result<(), String> {
+    crate::tp::serve::run_worker::<MiniCpmTpRank>(stream, resolved, model, pack, gpu)
+}
 
 /// Host check entry: read the spec from a checkpoint without a device.
 pub fn load_spec_for_host_check(map_path: &Path) -> Result<MiniCpmTpSpec, String> {

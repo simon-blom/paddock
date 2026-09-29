@@ -885,13 +885,7 @@ fn tp_worker_runtime(
     pack: &std::path::Path,
     gpu: usize,
 ) -> std::process::ExitCode {
-    match paddock_dist::worker::connect_worker(resolved)
-        .map_err(|e| e.to_string())
-        .and_then(|(stream, _)| {
-            paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
-                stream, resolved, model, pack, gpu,
-            )
-        }) {
+    match crate::serving::run_tp_worker(resolved, model, pack, gpu) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "tensor-parallel worker failed");

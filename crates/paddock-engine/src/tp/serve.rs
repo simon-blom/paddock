@@ -53,6 +53,26 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 /// - decode/span forwards enter the rank's collectives; the generic serve
 ///   sequences them identically on both ranks.
 /// - checkpoint snapshot/restore is rank-local state the model owns.
+///
+/// Capability gating (the MiniCPM5-2B proof, model #2): every optional
+/// capability is runtime-gated BEFORE a model method is reached, so a model
+/// that declines a capability still serves correctly:
+/// - device sampling: `supports_device_sampling() == false` makes the
+///   scheduler send all-`Host` plans and host-logit finishers (service.rs
+///   gates `samp_supported`), which exercise `forward_token_slot` only;
+/// - prefill lane + mapped feedback pipe: `supports_overlap()` (= the
+///   generator's `overlap`, set from `supports_device_sampling` at load)
+///   gates every span/pipe/lane command in service.rs, so a model without a
+///   lane serves through the unified mixed lane and its lane methods are
+///   never called;
+/// - graph mode: `enable_graphs` runs only when `TpInit` carries the rank-0
+///   resolution of `resolve_graph_mode_for_serve()`, so a model that
+///   resolves false never sees the call;
+/// - checkpoint state: a dense model without recurrent state implements
+///   snapshot/restore as policy no-ops (paged-KV resume works from block
+///   identity alone).
+/// A capability method that IS reached without support fails with a named
+/// error — never silently serves a different model.
 pub trait ServeModel: Send {
     /// The pinned checkpoint identity this serving lane accepts (SHA-256 of
     /// the GGUF). The generic serve never hardcodes a checkpoint.

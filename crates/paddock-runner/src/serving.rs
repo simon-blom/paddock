@@ -1651,10 +1651,13 @@ pub(crate) fn load_with_residency(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
-    if tp.is_some() && arch != "qwen35" {
+    // TP arch admission resolves the checkpoint's own architecture (the
+    // same resolver normal serving applies) so the lane list and the
+    // dispatcher cannot disagree about what a checkpoint is.
+    if tp.is_some() && !matches!(arch.as_str(), "qwen35" | "llama") {
         return Err(ServeError::Open(
             path.to_path_buf(),
-            format!("TP serving requires the Qwen3.8 qwen35 architecture, got {arch}"),
+            format!("TP serving supports qwen35 and llama (MiniCPM5-2B) on CUDA, got {arch}"),
         ));
     }
 
@@ -1905,6 +1908,86 @@ pub(crate) fn load_with_residency(
 /// The tokenizer, complete terminal-token set and chat template all
 /// come from the checkpoint's own files via `GgufTokenizer::from_hf_dir`.
 #[allow(clippy::too_many_arguments)]
+/// Resolve a checkpoint's Paddock architecture string from its own files:
+/// a GGUF file answers `general.architecture`; a checkpoint DIRECTORY
+/// answers `config.json`'s `model_type` through the same family table the
+/// safetensors-primary lane applies in [`load_hf_dir`] (this resolver does
+/// NOT read the per-family configs — the loaders own that validation; the
+/// table here only maps the name, so TP arch dispatch and normal serving
+/// cannot disagree about what a checkpoint is).
+///
+/// Shared by normal serving (via the callers' inlined GGUF read) and the TP
+/// lane's worker dispatcher; do not fork a second mapping.
+fn resolve_model_arch(path: &Path) -> Result<String, ServeError> {
+    if path.is_dir() {
+        let model_type = std::fs::read(path.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                ServeError::Open(path.to_path_buf(), "config.json has no model_type".into())
+            })?;
+        Ok(match model_type.as_str() {
+            "diffusion_gemma" => "diffusion-gemma".to_owned(),
+            "llama" => "llama".to_owned(),
+            "gemma4" | "muse_glimmer" => "gemma4".to_owned(),
+            "qwen3_5" | "prism_hadamard_qwen35" => "qwen35".to_owned(),
+            "nemotron_h" => "nemotron".to_owned(),
+            "granite" => "granite".to_owned(),
+            "qwen4_exp" | "qwen3_8_flash_next" => "qwen4exp".to_owned(),
+            other => {
+                return Err(ServeError::Open(
+                    path.to_path_buf(),
+                    format!(
+                        "no safetensors-primary lane for model_type {other:?}; \
+                         checkpoint directories require an implemented backend-specific loader"
+                    ),
+                ));
+            }
+        })
+    } else {
+        let map =
+            MappedGguf::open(path).map_err(|e| ServeError::Open(path.to_path_buf(), e.to_string()))?;
+        map.gguf()
+            .architecture()
+            .map(str::to_owned)
+            .ok_or(ServeError::NoArch)
+    }
+}
+
+
+/// The TP worker dispatcher: resolve the checkpoint's architecture through
+/// the shared normal-Paddock resolver, select the adapter, and run the
+/// generic worker loop for it. The worker derives its model binding from its
+/// own checkpoint (rank identity was already validated via `TpInit` hashes)
+/// — no shell variable decides what a checkpoint is. Unsupported
+/// architectures fail here, before any GPU execution.
+pub fn run_tp_worker(
+    resolved: &paddock_dist::config::Resolved,
+    model: &Path,
+    pack: &Path,
+    gpu: usize,
+) -> Result<(), String> {
+    let (stream, _generation) =
+        paddock_dist::worker::connect_worker(resolved).map_err(|e| e.to_string())?;
+    let arch = resolve_model_arch(model).map_err(|e| e.to_string())?;
+    match arch.as_str() {
+        "qwen35" => paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
+            stream, resolved, model, pack, gpu,
+        ),
+        "llama" => paddock_engine::gpu_model::minicpm::tp_shim::run_worker(
+            stream, resolved, model, pack, gpu,
+        ),
+        other => Err(format!(
+            "no TP adapter for architecture {other:?} (supported: qwen35, llama/MiniCPM5-2B)"
+        )),
+    }
+}
+
 fn load_hf_dir(
     id: String,
     dir: &Path,
