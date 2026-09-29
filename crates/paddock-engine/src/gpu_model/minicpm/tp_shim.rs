@@ -469,56 +469,9 @@ impl ServeModel for MiniCpmTpRank {
         position: usize,
         slot: usize,
     ) -> Result<Vec<f32>, Self::Error> {
-        self.embed_row(token, position)?;
-        for layer in &mut self.layers {
-            // attn_norm -> paged GQA decode (stages row, appends KV, reduces)
-            crate::tp::traversal::span_normalize(
-                &self.exec,
-                &self.d_x,
-                &mut self.d_xn,
-                &layer.attn_norm,
-                self.spec.width,
-                self.spec.eps,
-                1,
-            )
-            .map_err(|e| e.to_string())?;
-            let mixed = layer
-                .gqa
-                .decode(&self.exec, group, &self.d_xn, logical, slot, position)
-                .map_err(|e| e.to_string())?;
-            crate::tp::traversal::span_accumulate(&self.exec, &mut self.d_x, mixed, self.spec.width, 1)
-                .map_err(|e| e.to_string())?;
-            // ffn_norm -> SwiGLU TP -> accumulate
-            crate::tp::traversal::span_normalize(
-                &self.exec,
-                &self.d_x,
-                &mut self.d_xn,
-                &layer.post_norm,
-                self.spec.width,
-                self.spec.eps,
-                1,
-            )
-            .map_err(|e| e.to_string())?;
-            let ffn = layer
-                .ffn
-                .forward(&self.exec, group, &self.d_xn)
-                .map_err(|e| e.to_string())?;
-            crate::tp::traversal::span_accumulate(&self.exec, &mut self.d_x, ffn, self.spec.width, 1)
-                .map_err(|e| e.to_string())?;
-        }
-        crate::tp::traversal::span_normalize(
-            &self.exec,
-            &self.d_x,
-            &mut self.d_xn,
-            &self.out_norm,
-            self.spec.width,
-            self.spec.eps,
-            1,
-        )
-        .map_err(|e| e.to_string())?;
-        crate::gpu_model::projection::gemv_quant(&self.exec, &self.lm_head, &self.d_xn, &mut self.logits)
-            .map_err(|e| e.to_string())?;
-        Ok(self.exec.to_host(&self.logits).map_err(|e| e.to_string())?)
+        self.forward_token_body(group, logical, token, position, slot)?;
+        self.enqueue_head()?;
+        self.read_logits()
     }
 
     fn forward_token_sampled_slot(
@@ -534,13 +487,17 @@ impl ServeModel for MiniCpmTpRank {
     }
     fn forward_token_worker_slot(
         &mut self,
-        _group: &NcclCommunicator,
-        _logical: &MirroredKv,
-        _token: u32,
-        _position: usize,
-        _slot: usize,
+        group: &NcclCommunicator,
+        logical: &MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
     ) -> Result<(), Self::Error> {
-        Err("minicpm-tp: worker forwards land with the model-#2 two-node bring-up".into())
+        // Execute exactly the same collective-bearing model body as rank 0,
+        // but stop before the replicated LM head/readback. No collective
+        // occurs in the head, so this preserves rank ordering while avoiding
+        // pointless worker logits.
+        self.forward_token_body(group, logical, token, position, slot)
     }
     fn sample_logits_slot(
         &mut self,
@@ -550,19 +507,38 @@ impl ServeModel for MiniCpmTpRank {
     }
     fn forward_span_advance(
         &mut self,
-        _group: &NcclCommunicator,
-        _logical: &MirroredKv,
-        _slot: usize,
-        _tokens: &[u32],
-        _position: usize,
+        group: &NcclCommunicator,
+        logical: &MirroredKv,
+        slot: usize,
+        tokens: &[u32],
+        position: usize,
     ) -> Result<(), Self::Error> {
-        Err("minicpm-tp: span prefill lands with the model-#2 GPU spine turn".into())
+        if tokens.is_empty() {
+            return Err("minicpm-tp: empty span".into());
+        }
+        // Correctness-first unified prefill: traverse the proven one-row
+        // collective body for each contiguous prompt row. This deliberately
+        // avoids introducing model-specific batched-prefill machinery; once
+        // parity is locked, the generic ConventionalPrefillScratch path can
+        // replace this loop as a performance optimization only.
+        for (offset, &token) in tokens.iter().enumerate() {
+            let row_position = position
+                .checked_add(offset)
+                .ok_or_else(|| "minicpm-tp: span position overflow".to_string())?;
+            self.forward_token_body(group, logical, token, row_position, slot)?;
+        }
+        Ok(())
     }
-    fn forward_span_head_enqueue(&mut self, _rows: usize) -> Result<(), Self::Error> {
-        Err("minicpm-tp: span prefill lands with the model-#2 GPU spine turn".into())
+    fn forward_span_head_enqueue(&mut self, rows: usize) -> Result<(), Self::Error> {
+        if rows == 0 {
+            return Err("minicpm-tp: empty span head".into());
+        }
+        // forward_span_advance leaves d_x holding the final row residual.
+        self.enqueue_head()
     }
-    fn forward_span_head(&mut self, _rows: usize) -> Result<Vec<f32>, Self::Error> {
-        Err("minicpm-tp: span prefill lands with the model-#2 GPU spine turn".into())
+    fn forward_span_head(&mut self, rows: usize) -> Result<Vec<f32>, Self::Error> {
+        self.forward_span_head_enqueue(rows)?;
+        self.read_logits()
     }
     fn forward_host_to_feedback(
         &mut self,
@@ -652,6 +628,104 @@ impl ServeModel for MiniCpmTpRank {
 }
 
 impl MiniCpmTpRank {
+    /// Run one token through the collective-bearing transformer body only.
+    ///
+    /// Rank 0 and every worker call this exact method, which keeps attention
+    /// and FFN collective ordering identical. The replicated final norm/head
+    /// is intentionally outside this helper so workers never need to produce
+    /// or read logits.
+    fn forward_token_body(
+        &mut self,
+        group: &NcclCommunicator,
+        logical: &MirroredKv,
+        token: u32,
+        position: usize,
+        slot: usize,
+    ) -> Result<(), String> {
+        if slot >= self.positions.len() {
+            return Err("minicpm-tp: slot out of range".into());
+        }
+        self.embed_row(token, position)?;
+        for layer in &mut self.layers {
+            crate::tp::traversal::span_normalize(
+                &self.exec,
+                &self.d_x,
+                &mut self.d_xn,
+                &layer.attn_norm,
+                self.spec.width,
+                self.spec.eps,
+                1,
+            )
+            .map_err(|e| e.to_string())?;
+            let mixed = layer
+                .gqa
+                .decode(&self.exec, group, &self.d_xn, logical, slot, position)
+                .map_err(|e| e.to_string())?;
+            crate::tp::traversal::span_accumulate(
+                &self.exec,
+                &mut self.d_x,
+                mixed,
+                self.spec.width,
+                1,
+            )
+            .map_err(|e| e.to_string())?;
+
+            crate::tp::traversal::span_normalize(
+                &self.exec,
+                &self.d_x,
+                &mut self.d_xn,
+                &layer.post_norm,
+                self.spec.width,
+                self.spec.eps,
+                1,
+            )
+            .map_err(|e| e.to_string())?;
+            let ffn = layer
+                .ffn
+                .forward(&self.exec, group, &self.d_xn)
+                .map_err(|e| e.to_string())?;
+            crate::tp::traversal::span_accumulate(
+                &self.exec,
+                &mut self.d_x,
+                ffn,
+                self.spec.width,
+                1,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        self.positions[slot] = position
+            .checked_add(1)
+            .ok_or_else(|| "minicpm-tp: position overflow".to_string())?;
+        Ok(())
+    }
+
+    /// Enqueue the replicated final norm + LM head for the residual row
+    /// currently resident in d_x. No collective and no host synchronization.
+    fn enqueue_head(&mut self) -> Result<(), String> {
+        crate::tp::traversal::span_normalize(
+            &self.exec,
+            &self.d_x,
+            &mut self.d_xn,
+            &self.out_norm,
+            self.spec.width,
+            self.spec.eps,
+            1,
+        )
+        .map_err(|e| e.to_string())?;
+        crate::gpu_model::projection::gemv_quant(
+            &self.exec,
+            &self.lm_head,
+            &self.d_xn,
+            &mut self.logits,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn read_logits(&self) -> Result<Vec<f32>, String> {
+        self.exec.to_host(&self.logits).map_err(|e| e.to_string())
+    }
+
     /// Stage one decode row's token and position, gather the embedding, and
     /// scale it (llama-identity embedding_scale — a no-op scale kept
     /// explicit so the multiplier contract is visible).
