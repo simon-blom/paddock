@@ -156,7 +156,7 @@ pub struct Qwen35TpRank {
     prefill: Option<Box<PreFillLane>>,
     /// Batched prefill-span planes (prototype, `forward_prefill_span`):
     /// allocated lazily on the first span forward, never on decode paths.
-    /// The whole-model traversal processes up to `tp_span_cap::span_cap()` rows per pass
+    /// The whole-model traversal processes up to `span_cap()` rows per pass
     /// through one shared plane set.
     span_planes: Option<super::tp_span::TpSpanPlanes>,
 }
@@ -1135,7 +1135,7 @@ impl Qwen35TpRank {
     /// DeltaNet state advance once per row. This skips final norm, LM head
     /// and logits readback. A finishing caller may then invoke
     /// [`Self::forward_span_head`] for the final row. Runs must be bounded
-    /// by `tp_span_cap::span_cap()`.
+    /// by `span_cap()`.
     pub fn forward_span_advance<C: Communicator>(
         &mut self,
         group: &C,
@@ -1151,10 +1151,10 @@ impl Qwen35TpRank {
             return Err(Qwen35TpError::Shape("rank, slot or position changed".into()));
         }
         let rows = tokens.len();
-        if rows == 0 || rows > super::tp_span_cap::span_cap() {
+        if rows == 0 || rows > crate::tp::span_cap::span_cap() {
             return Err(Qwen35TpError::Shape(format!(
                 "span rows {rows} outside the 1..={} prototype cap",
-                super::tp_span_cap::span_cap()
+                crate::tp::span_cap::span_cap()
             )));
         }
         if position.checked_add(rows).is_none_or(|end| end > self.max_ctx) {
@@ -1215,10 +1215,10 @@ impl Qwen35TpRank {
     /// halves pair across ranks. `rows` must match the advance that just
     /// ran (the head normalizes the residual plane the advance left behind).
     pub fn forward_span_head_enqueue(&mut self, rows: usize) -> Result<(), Qwen35TpError> {
-        if rows == 0 || rows > super::tp_span_cap::span_cap() {
+        if rows == 0 || rows > crate::tp::span_cap::span_cap() {
             return Err(Qwen35TpError::Shape(format!(
                 "span head rows {rows} outside the 1..={} cap",
-                super::tp_span_cap::span_cap()
+                crate::tp::span_cap::span_cap()
             )));
         }
         let Some(planes) = self.span_planes.as_mut() else {
@@ -1573,7 +1573,7 @@ impl Qwen35TpRank {
             .forward_token_body(group, logical_kv, position, slot, false)
     }
 
-    /// Enqueue ONE batched span advance (up to `tp_span_cap::span_cap()` contiguous
+    /// Enqueue ONE batched span advance (up to `span_cap()` contiguous
     /// rows of `slot` at `position..position+rows`) on the prefill lane:
     /// the lane's whole-model traversal, no head, no readback, no host sync.
     /// The caller must have validated the positions and mirrored the KV

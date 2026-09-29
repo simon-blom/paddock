@@ -1,9 +1,11 @@
-//! The TP=2 prefill span row cap: one authoritative, rank-symmetric value.
+//! The TP prefill span row cap: one authoritative, rank-symmetric value.
 //!
 //! The cap decides how many contiguous prompt rows one whole-model span
-//! advance processes. Every consumer (span planes, DeltaNet scratch, the
-//! serve-side chunkers) derives its geometry from [`resolved()`] so no magic
-//! constant drifts between TP and DeltaNet.
+//! advance processes. Every consumer (model span planes, the serve-side
+//! chunkers) derives its geometry from [`span_cap()`] so no magic constant
+//! drifts between models. Runtime policy, not model policy: the chunking
+//! mechanics are identical for any paged-KV model, so the mechanism lives in
+//! generic TP (nothing here names a model or a layer kind).
 //!
 //! Resolution is rank-0-authoritative: the coordinator resolves
 //! `PADDOCK_TP_SPAN_CAP` once and ships the value in `TpInit`; the worker

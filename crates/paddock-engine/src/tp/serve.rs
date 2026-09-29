@@ -417,8 +417,8 @@ fn validate_mixed_worker_rows(
 
 /// Row cap of the production batched prefill span. Resolved once per process
 /// from the rank-0-authoritative `TpInit` value so neither rank can drift.
-fn tp_span_cap() -> usize {
-    crate::gpu_model::qwen35::tp_span_cap::span_cap()
+fn span_cap_value() -> usize {
+    crate::tp::span_cap::span_cap()
 }
 
 /// Boundaries for one slot's contiguous prompt-row run at an explicit cap.
@@ -459,11 +459,11 @@ fn span_checkpoint_points_at(start: usize, len: usize, cuts: &[(usize, u32)], ca
 /// Production chunkers read the resolved rank-symmetric cap. All ranks
 /// derive identical geometry from the identical resolution.
 fn span_chunk_points(len: usize) -> Vec<usize> {
-    span_chunk_points_at(len, tp_span_cap())
+    span_chunk_points_at(len, span_cap_value())
 }
 
 fn span_checkpoint_points(start: usize, len: usize, cuts: &[(usize, u32)]) -> Result<Vec<usize>, String> {
-    span_checkpoint_points_at(start, len, cuts, tp_span_cap())
+    span_checkpoint_points_at(start, len, cuts, span_cap_value())
 }
 
 fn tp_suffix_rows(slot: usize, tokens: Vec<u32>, resume: usize) -> Vec<(usize, u32, usize)> {
@@ -835,7 +835,7 @@ impl<M: ServeModel> TpCoordinator<M> {
         // The span cap is rank-0-authoritative too: resolve once here, ship
         // it in TpInit, and install it before the worker can execute any
         // span. An unsupported value fails this rank (and the pair) closed.
-        let span_cap = crate::gpu_model::qwen35::tp_span_cap::resolve_from_env(
+        let span_cap = crate::tp::span_cap::resolve_from_env(
             std::env::var("PADDOCK_TP_SPAN_CAP").ok().as_deref(),
         )
         .map_err(|e| e.to_string())?;
@@ -1088,7 +1088,7 @@ impl<M: ServeModel> TpCoordinator<M> {
     }
 
     /// Execute ONE slot's contiguous chunk run on the DECODE lane as batched
-    /// spans of at most tp_span_cap() rows. Interior spans advance state only
+    /// spans of at most span_cap_value() rows. Interior spans advance state only
     /// (no head, no readback); when `finisher` is Some the FINAL span adds
     /// the head exactly once - device-sampled or read back per the kind.
     /// The caller has already authorized KV, sent `TpMixed` and consumed
@@ -1670,7 +1670,7 @@ impl<M: ServeModel> TpCoordinator<M> {
             }
         }
         // Chunk run: contiguous same-slot prompt rows executed as batched
-        // spans of at most tp_span_cap() rows. Interior spans advance state
+        // spans of at most span_cap_value() rows. Interior spans advance state
         // only; the FINAL span (the finishing chunk's last span) adds the
         // head once - final norm + LM head on the run's last row - and
         // either samples it on device or reads the logits back. The head
@@ -2960,7 +2960,7 @@ pub fn run_worker<M: ServeModel>(
                     // fails closed on an unsupported wire value: worker rank
                     // never reads the coordinator's env (same contract as
                     // graphs/dtype/ckpt_slots).
-                    crate::gpu_model::qwen35::tp_span_cap::wire_span_cap(span_cap).map_err(|e| e.to_string())?;
+                    crate::tp::span_cap::wire_span_cap(span_cap).map_err(|e| e.to_string())?;
                     if own_checkpoint != checkpoint_sha256
                         || own_pack != pack_blake3
                         || max_ctx == 0
@@ -3889,7 +3889,7 @@ mod tests {
             let points = span_checkpoint_points(0, len, &cuts).unwrap();
             assert_eq!(points.first(), Some(&0));
             assert_eq!(points.last(), Some(&len));
-            assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= tp_span_cap()));
+            assert!(points.windows(2).all(|w| w[1] > w[0] && w[1] - w[0] <= span_cap_value()));
             assert!(cuts.iter().all(|(cut, _)| points.contains(cut)), "len={len}");
         }
         let shifted = span_checkpoint_points(64, 36, &[(80, 0), (96, 1)]).unwrap();
@@ -4145,7 +4145,7 @@ mod tests {
             for w in points.windows(2) {
                 let rows = w[1] - w[0];
                 assert!(
-                    (1..=tp_span_cap()).contains(&rows),
+                    (1..=span_cap_value()).contains(&rows),
                     "len {len}: window {w:?} has {rows} rows"
                 );
             }
@@ -4173,7 +4173,7 @@ mod tests {
         // boundary lengths 63/64/65, 127/128/129 and 191/192/193 relative to
         // that cap. The `_at` variants are pure, so no process-global state
         // is touched and parallel tests stay deterministic.
-        for &cap in crate::gpu_model::qwen35::tp_span_cap::SWEEP_CAPS.iter() {
+        for &cap in crate::tp::span_cap::SWEEP_CAPS.iter() {
             for len in [cap - 1, cap, cap + 1, 2 * cap - 1, 2 * cap, 2 * cap + 1] {
                 let points = span_chunk_points_at(len, cap);
                 assert_eq!(points.first(), Some(&0), "cap {cap} len {len}");
@@ -4235,19 +4235,19 @@ mod tests {
         // half-installing: a refused value leaves the prior resolution in
         // force, so a mismatched pair can never serve. The final install
         // restores the production default for any later reader.
-        use crate::gpu_model::qwen35::tp_span_cap;
-        tp_span_cap::wire_span_cap(64).unwrap();
-        assert_eq!(tp_span_cap(), 64);
+        use crate::tp::span_cap;
+        span_cap::wire_span_cap(64).unwrap();
+        assert_eq!(span_cap_value(), 64);
         for bad in [0usize, 63, 65, 1000] {
-            assert!(tp_span_cap::wire_span_cap(bad).is_err(), "{bad}");
-            assert_eq!(tp_span_cap(), 64);
+            assert!(span_cap::wire_span_cap(bad).is_err(), "{bad}");
+            assert_eq!(span_cap_value(), 64);
         }
-        tp_span_cap::wire_span_cap(192).unwrap();
-        assert_eq!(tp_span_cap(), 192);
-        assert!(tp_span_cap::wire_span_cap(65).is_err());
-        assert_eq!(tp_span_cap(), 192);
-        tp_span_cap::wire_span_cap(64).unwrap();
-        assert_eq!(tp_span_cap(), 64);
+        span_cap::wire_span_cap(192).unwrap();
+        assert_eq!(span_cap_value(), 192);
+        assert!(span_cap::wire_span_cap(65).is_err());
+        assert_eq!(span_cap_value(), 192);
+        span_cap::wire_span_cap(64).unwrap();
+        assert_eq!(span_cap_value(), 64);
     }
 
     #[test]

@@ -47,7 +47,7 @@ mod tp_model;
 mod tp_prefill_backend;
 pub mod tp_serve;
 mod tp_span;
-pub mod tp_span_cap;
+
 pub use tp_model::{Qwen35TpError, Qwen35TpRank};
 pub mod vision;
 

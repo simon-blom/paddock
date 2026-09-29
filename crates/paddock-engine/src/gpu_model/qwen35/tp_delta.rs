@@ -12,7 +12,7 @@ use paddock_models::mapped::MappedGguf;
 use paddock_models::tensor_slice::{ShardKind, TensorSliceRequest, gguf_shard};
 
 use super::ops::{gemv_any, prefill_mm_any, prefill_mm_pre_any, prefill_quant};
-use super::tp_span_cap::span_cap;
+use crate::tp::span_cap::span_cap;
 use crate::gpu::distributed::{CollectiveError, Communicator};
 use crate::gpu::{GpuError, GpuExecutor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
@@ -26,7 +26,7 @@ const CONV_K: usize = 4;
 // Span row cap of the DeltaNet batched prefill primitive: the resolved
 // rank-0-authoritative value (the whole-model traversal reuses
 // `DeltaTpRank::prefill(rows)` with the SAME resolved cap; both consumers
-// call `tp_span_cap::span_cap()`, so no magic value can drift). DeltaNet's
+// call `tp::span_cap::span_cap()`, so no magic value can drift). DeltaNet's
 // own kernels carry no 64-row limit: the recurrence loops per-token inside
 // one block for any `n_tokens` and the conv/gate/norm kernels are
 // n_tokens-parameterized.

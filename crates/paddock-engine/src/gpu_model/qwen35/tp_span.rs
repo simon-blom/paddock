@@ -4,7 +4,7 @@
 //! advance/head path and the `forward_prefill_span` probe wrapper:
 //! whole-model activation planes, the row-batched GQA/FFN mixer planes,
 //! and one shared quantized-GEMM staging set. Capacity is fixed at
-//! [`tp_span_cap::span_cap()`] rows so memory use is bounded and explicit
+//! [`tp::span_cap::span_cap()`] rows so memory use is bounded and explicit
 //! (~16 MB at cap 64, ~25 MB at cap 192 at the Qwen3.8 geometry). Nothing
 //! here exists until the first span forward, so the one-token decode paths
 //! never pay for it.
@@ -18,7 +18,7 @@
 use cudarc::driver::CudaSlice;
 
 use super::tp_gqa::GqaGeometry;
-use super::tp_span_cap::span_cap;
+use crate::tp::span_cap::span_cap;
 use crate::gpu::{GpuError, GpuExecutor};
 use crate::tp::prefill::ProjectionStaging;
 pub(crate) use crate::tp::ffn::SwiGluPrefillScratch as SpanFfn;

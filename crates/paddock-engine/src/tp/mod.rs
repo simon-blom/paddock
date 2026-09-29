@@ -9,6 +9,7 @@ pub(crate) mod conventional;
 pub(crate) mod control;
 pub mod cache;
 pub mod serve;
+pub mod span_cap;
 pub(crate) mod ffn;
 pub(crate) mod prefill;
 pub(crate) mod state;
