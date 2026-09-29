@@ -79,6 +79,12 @@ Earlier measured six-run benchmark for `472c9c283253b11cfc85a3cd0c4b85e9c539dadf
 
 ## Progress log
 
+- 2026-09-29 (post-review seam fixes, on `review/tp-model2-proof`):
+  1. **tp::serve is model-neutral again**: `tp_span_cap` moved to `tp/span_cap.rs` (runtime policy, mechanism verbatim; consumers re-pointed) — `grep gpu_model::qwen35 src/tp/` is now empty.
+  2. **Shared arch resolution**: `resolve_model_arch` extracted in serving.rs (GGUF `general.architecture`; HF dir `model_type` through load_hf_dir's family table) — TP arch admission and the worker dispatcher use it; NO env hint, NO TpInit field, paddock-dist untouched.
+  3. **TP worker dispatcher**: `run_tp_worker` at the serving model-routing boundary — resolves the checkpoint's own arch, selects qwen35/llama adapters, forwards to generic `run_worker<M>`; workers derive their binding from their own checkpoint; unsupported archs fail before GPU execution. `startup.rs::tp_worker_runtime` routes through it.
+  4. **ServeModel capability audit (no redesign)**: device sampling, overlap/lane/pipe, graph mode and checkpoint state are all runtime-gated before a model method is reached (samp_supported / supports_overlap / TpInit use_graphs / dense-model policy no-ops) — MiniCPM serves through the unified lane with host plans; a reached-without-support method fails named. Documented on the trait.
+  Remaining for MiniCPM GPU bring-up: span prefill + worker forwards + device sampling impls (stubs), graph lane, then the user's GPU bring-up + parity.
 - 2026-09-29 (OVERNIGHT RUN HANDOFF — read this first):
   - **Branches**: `review/tp-generic-core` at `8473aea` (pushed; Part 1 done), `review/tp-model2-proof` at `d8ade3e` (pushed; branched from the generic-core tip; Parts 2–5 done to the last host-verifiable boundary).
   - **Part 1 (generic serving/runtime)**: `tp/serve.rs` extracted (see the Part 1 entry below) — `ServeModel` trait, `TpCoordinator<M>`, `TpGenerator<M>`, `run_worker<M>`, all flight/validation/protocol machinery and 29 host tests. Qwen `qwen35/tp_serve.rs` is now a ~280-line `ServeModel` binding + re-exports. GPU validation PENDING (see the pending-GPU section).
