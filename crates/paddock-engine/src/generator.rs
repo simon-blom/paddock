@@ -29,6 +29,12 @@ pub trait Generator: Send {
         Ok(1)
     }
 
+    /// An explicitly elected serial-only implementation, not a failed
+    /// attempt to enable production batch kernels. The TP lane may use one slot.
+    fn serial_only(&self) -> bool {
+        false
+    }
+
     /// True if this backend has a working speculative-decode drafter (a loaded MTP
     /// head with spec enabled). The service routes even single-user (max_batch 1)
     /// serving through the batched loop when this holds - spec decode, the big
@@ -102,6 +108,13 @@ pub trait Generator: Send {
     /// overlaps the GPU instead of gapping it between steps.
     fn supports_decode_pipe(&self) -> bool {
         false
+    }
+
+    /// A backend with fixed per-slot KV capacity must drain before a pipe's
+    /// device-driven lookahead would execute at this position. None preserves
+    /// existing backends' own rolling-window/eviction behavior.
+    fn decode_pipe_context_limit(&self) -> Option<usize> {
+        None
     }
 
     /// Post-miss draft-depth floor for the spec round that just ran, when the
@@ -210,6 +223,12 @@ pub trait Generator: Send {
     /// more work. Must be called before any other forward call.
     fn decode_pipe_drain(&mut self) -> Result<Vec<u32>, GenError> {
         Err(GenError::Backend("pipelined decode not supported".into()))
+    }
+
+    /// Owner of the next queued prompt after its first prefill rows have run.
+    /// None means unowned (or a backend without separate prefill lanes).
+    fn prefill_front_owner(&mut self) -> Option<PrefillLane> {
+        None
     }
 
     /// True when the backend can OVERLAP a prefill span with decode ticks on
@@ -1316,6 +1335,14 @@ pub struct SpecRsDraw {
     pub inv_t: f32,
     /// per-chain-step draft-draw uniforms (length >= the round's k_use)
     pub u: Vec<f32>,
+}
+
+/// Stateful prompt prefill execution lane. The owner is fixed at the first
+/// executed prompt row and is cleared when the prompt finishes or is aborted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillLane {
+    Mixed,
+    Async,
 }
 
 /// Per-row instruction for a device-sampled decode step.

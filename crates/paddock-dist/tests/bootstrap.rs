@@ -1,0 +1,535 @@
+//! Bootstrap tests: config validation, framing, and the two-role handshake.
+//! Host-only - no CUDA, no engine. The two-process path is exercised by the
+//! coordinator/worker handshake tests here over localhost.
+
+use paddock_dist::config::{DEFAULT_MASTER_PORT, ParallelConfig, ParallelConfigError, RankRole};
+use paddock_dist::protocol::{
+    ControlMessage, PROTOCOL_VERSION, ProtocolError, handshake_rank, receive_nccl_id, send_nccl_id,
+};
+use paddock_dist::worker::{coordinate, coordinate_workers, shutdown_worker};
+use std::io::Write as _;
+use std::time::Duration;
+
+fn resolved_world(tp_size: usize, rank: usize, port: u16) -> paddock_dist::config::Resolved {
+    let cfg = ParallelConfig {
+        tp_size: Some(tp_size),
+        rank: Some(rank),
+        master_addr: Some("127.0.0.1".into()),
+        master_port: Some(port),
+    };
+    cfg.resolved(false).expect("valid").expect("tensor parallel")
+}
+
+fn resolved(rank: usize, port: u16) -> paddock_dist::config::Resolved {
+    resolved_world(2, rank, port)
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind probe")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+// --- config validation ------------------------------------------------
+
+#[test]
+fn unset_parallel_is_the_historical_path() {
+    let cfg = ParallelConfig::default();
+    assert!(cfg.resolved(true).unwrap().is_none());
+}
+
+#[test]
+fn tp1_collapses_to_the_historical_path() {
+    let cfg = ParallelConfig {
+        tp_size: Some(1),
+        rank: None,
+        master_addr: None,
+        master_port: None,
+    };
+    assert!(cfg.resolved(true).unwrap().is_none());
+    let cfg = ParallelConfig {
+        tp_size: Some(1),
+        rank: Some(0),
+        master_addr: None,
+        master_port: None,
+    };
+    assert!(cfg.resolved(true).unwrap().is_none());
+}
+
+#[test]
+fn rank_without_tp_size_is_an_error() {
+    let cfg = ParallelConfig {
+        tp_size: None,
+        rank: Some(1),
+        master_addr: None,
+        master_port: None,
+    };
+    assert!(matches!(
+        cfg.resolved(true),
+        Err(ParallelConfigError::RankOutOfRange { tp: 1, rank: 1 })
+    ));
+}
+
+#[test]
+fn larger_world_sizes_are_valid_and_keep_rank_roles_generic() {
+    for tp_size in [3usize, 6, 8] {
+        let coordinator = ParallelConfig {
+            tp_size: Some(tp_size),
+            rank: Some(0),
+            master_addr: None,
+            master_port: None,
+        }
+        .resolved(true)
+        .unwrap()
+        .unwrap();
+        assert_eq!(coordinator.tp_size, tp_size);
+        assert_eq!(coordinator.role, RankRole::Coordinator);
+
+        let worker_rank = tp_size - 1;
+        let worker = ParallelConfig {
+            tp_size: Some(tp_size),
+            rank: Some(worker_rank),
+            master_addr: Some("10.0.0.5".into()),
+            master_port: None,
+        }
+        .resolved(false)
+        .unwrap()
+        .unwrap();
+        assert_eq!(worker.role, RankRole::Worker);
+        assert_eq!(worker.rank, worker_rank);
+    }
+}
+
+#[test]
+fn rank_out_of_range_is_rejected() {
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(2),
+        master_addr: None,
+        master_port: None,
+    };
+    assert!(matches!(
+        cfg.resolved(true),
+        Err(ParallelConfigError::RankOutOfRange { tp: 2, rank: 2 })
+    ));
+}
+
+#[test]
+fn rank1_may_not_serve_but_a_child_may_exist() {
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(1),
+        master_addr: Some("10.0.0.5".into()),
+        master_port: None,
+    };
+    // A user-facing serving start is refused.
+    assert!(matches!(
+        cfg.resolved(true),
+        Err(ParallelConfigError::WorkerMustNotServe)
+    ));
+    // The coordinator-spawned child (not a serving start) is accepted.
+    let r = cfg.resolved(false).unwrap().unwrap();
+    assert_eq!(r.role, RankRole::Worker);
+    assert_eq!(r.master_port, DEFAULT_MASTER_PORT);
+}
+
+#[test]
+fn rank1_without_master_addr_is_rejected() {
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(1),
+        master_addr: None,
+        master_port: None,
+    };
+    assert!(matches!(
+        cfg.resolved(false),
+        Err(ParallelConfigError::EmptyMasterAddr)
+    ));
+}
+
+#[test]
+fn rank0_defaults_bind_wildcard_and_default_port() {
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(0),
+        master_addr: None,
+        master_port: None,
+    };
+    let r = cfg.resolved(true).unwrap().unwrap();
+    assert_eq!(r.master_addr, "0.0.0.0");
+    assert_eq!(r.master_port, DEFAULT_MASTER_PORT);
+    assert!(r.is_coordinator());
+}
+
+#[test]
+fn worker_env_marks_the_child_and_sets_requested_rank() {
+    let cfg = ParallelConfig {
+        tp_size: Some(4),
+        rank: Some(0),
+        master_addr: Some("192.168.100.10".into()),
+        master_port: Some(12345),
+    };
+    let resolved = cfg.resolved(true).unwrap().unwrap();
+    let env: Vec<(String, String)> = resolved
+        .worker_env_for(3)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let get = |k: &str| {
+        env.iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    };
+    assert_eq!(get("PADDOCK_TP_SIZE"), "4");
+    assert_eq!(get("PADDOCK_TP_RANK"), "3");
+    assert_eq!(get("PADDOCK_TP_MASTER_ADDR"), "192.168.100.10");
+    assert_eq!(get("PADDOCK_TP_MASTER_PORT"), "12345");
+    assert_eq!(get("PADDOCK_TP_WORKER_CHILD"), "1");
+}
+
+#[test]
+fn toml_table_parses_and_rejects_unknown_keys() {
+    let v: toml::Value = toml::from_str("tp_size = 2\nrank = 0\nmaster_port = 11561").unwrap();
+    let cfg = ParallelConfig::from_toml_value(&v).unwrap().unwrap();
+    assert_eq!(cfg.tp_size, Some(2));
+    assert_eq!(cfg.master_port, Some(11561));
+
+    let bad: toml::Value = toml::from_str("frobnicate = 1").unwrap();
+    assert!(ParallelConfig::from_toml_value(&bad).is_err());
+}
+
+// --- protocol framing ---------------------------------------------------
+
+#[test]
+fn frame_roundtrip_over_tcp() {
+    let msg = ControlMessage::Hello {
+        version: 1,
+        tp_size: 2,
+        rank: 1,
+        who: "test".into(),
+    };
+    let frame = msg.to_frame().unwrap();
+    assert_eq!(
+        u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize + 4,
+        frame.len()
+    );
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        ControlMessage::from_stream(&mut s).unwrap()
+    });
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    msg.to_stream(&mut client).unwrap();
+    let got = t.join().unwrap();
+    assert!(matches!(got, ControlMessage::Hello { tp_size: 2, .. }));
+}
+
+#[test]
+fn oversized_frame_is_refused_not_read() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        ControlMessage::from_stream(&mut s).is_err()
+    });
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    // Announce a frame larger than the cap without sending the payload.
+    client.write_all(&(2u32 << 30).to_le_bytes()).unwrap();
+    assert!(t.join().unwrap());
+}
+
+#[test]
+fn nccl_id_roundtrip_and_malformed_length_rejected() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let t = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let id = receive_nccl_id(&mut stream).unwrap();
+        assert_eq!(id, [0x9a; 128]);
+        assert!(matches!(
+            receive_nccl_id(&mut stream),
+            Err(ProtocolError::BadNcclId(3))
+        ));
+    });
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    send_nccl_id(&mut client, &[0x9a; 128]).unwrap();
+    ControlMessage::NcclId { id: vec![1, 2, 3] }
+        .to_stream(&mut client)
+        .unwrap();
+    t.join().unwrap();
+}
+
+// --- two-role handshake end to end ---------------------------------------
+
+#[test]
+fn mismatched_world_size_is_rejected_and_coordinator_keeps_waiting() {
+    let port = free_port();
+    let coord = resolved(0, port);
+
+    let t = std::thread::spawn(move || coordinate(&coord, false));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Dial with the wrong world size; expect a Reject frame.
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ControlMessage::Hello {
+        version: 1,
+        tp_size: 8,
+        rank: 1,
+        who: "impostor".into(),
+    }
+    .to_stream(&mut c)
+    .unwrap();
+    let reply = ControlMessage::from_stream(&mut c).unwrap();
+    assert!(matches!(reply, ControlMessage::Reject { .. }));
+    drop(c);
+
+    // The coordinator did not accept the impostor: it is still waiting, so a
+    // correct worker can now join and complete the bootstrap.
+    let w = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        paddock_dist::protocol::handshake(&mut c, 2, "real-worker").unwrap()
+    });
+    let session = w.join().unwrap();
+    let Ok((mut stream, s2)) = t.join().unwrap() else {
+        panic!("coordinate failed")
+    };
+    assert_eq!(s2, session);
+    assert!(session >= 1);
+    shutdown_worker(&mut stream, true).unwrap();
+}
+
+#[test]
+fn protocol_version_mismatch_is_rejected() {
+    let port = free_port();
+    let coord = resolved(0, port);
+
+    let t = std::thread::spawn(move || coordinate(&coord, false));
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // The previous wire version must ALSO be refused (mixed-fleet case),
+    // not just a nonsense future version.
+    ControlMessage::Hello {
+        version: PROTOCOL_VERSION - 1,
+        tp_size: 2,
+        rank: 1,
+        who: "v1-worker".into(),
+    }
+    .to_stream(&mut c)
+    .unwrap();
+    let reply = ControlMessage::from_stream(&mut c).unwrap();
+    assert!(matches!(reply, ControlMessage::Reject { .. }));
+    drop(c);
+
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ControlMessage::Hello {
+        version: 999,
+        tp_size: 2,
+        rank: 1,
+        who: "time-traveler".into(),
+    }
+    .to_stream(&mut c)
+    .unwrap();
+    let reply = ControlMessage::from_stream(&mut c).unwrap();
+    assert!(matches!(reply, ControlMessage::Reject { .. }));
+    drop(c);
+
+    // A correct worker still completes bootstrap afterwards.
+    let w = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        paddock_dist::protocol::handshake(&mut c, 2, "real-worker").unwrap()
+    });
+    let session = w.join().unwrap();
+    let Ok((mut stream, s2)) = t.join().unwrap() else {
+        panic!("coordinate failed")
+    };
+    assert_eq!(s2, session);
+    shutdown_worker(&mut stream, true).unwrap();
+}
+
+#[test]
+fn unexpected_message_shape_is_rejected() {
+    let port = free_port();
+    let coord = resolved(0, port);
+
+    let t = std::thread::spawn(move || coordinate(&coord, false));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // First frame is not a Hello.
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ControlMessage::Shutdown { graceful: true }
+        .to_stream(&mut c)
+        .unwrap();
+    let reply = ControlMessage::from_stream(&mut c).unwrap();
+    assert!(matches!(reply, ControlMessage::Reject { .. }));
+    drop(c);
+
+    let w = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        paddock_dist::protocol::handshake(&mut c, 2, "real-worker").unwrap()
+    });
+    let session = w.join().unwrap();
+    let Ok((mut stream, s2)) = t.join().unwrap() else {
+        panic!("coordinate failed")
+    };
+    assert_eq!(s2, session);
+    shutdown_worker(&mut stream, true).unwrap();
+}
+
+#[test]
+fn tp4_joins_all_worker_ranks_out_of_order_and_rejects_duplicate_rank() {
+    let port = free_port();
+    let coord = resolved_world(4, 0, port);
+    let t = std::thread::spawn(move || coordinate_workers(&coord, false));
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Rank 2 joins first.
+    let w2 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 2, "rank2").unwrap()
+    });
+    let session = w2.join().unwrap();
+
+    // A second rank 2 is refused while the world remains incomplete.
+    let mut duplicate = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ControlMessage::Hello {
+        version: PROTOCOL_VERSION,
+        tp_size: 4,
+        rank: 2,
+        who: "duplicate-rank2".into(),
+    }
+    .to_stream(&mut duplicate)
+    .unwrap();
+    assert!(matches!(
+        ControlMessage::from_stream(&mut duplicate).unwrap(),
+        ControlMessage::Reject { .. }
+    ));
+    drop(duplicate);
+
+    let w3 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 3, "rank3").unwrap()
+    });
+    let w1 = std::thread::spawn(move || {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        handshake_rank(&mut c, 4, 1, "rank1").unwrap()
+    });
+
+    assert_eq!(w3.join().unwrap(), session);
+    assert_eq!(w1.join().unwrap(), session);
+    let (workers, coordinator_session) = t.join().unwrap().unwrap();
+    assert_eq!(coordinator_session, session);
+    assert_eq!(
+        workers.iter().map(|worker| worker.rank).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+// --- explicit --tp-worker dial-target precedence (CLI > env) ------------
+
+use paddock_dist::config::resolve_worker_dial;
+
+#[test]
+fn worker_dial_cli_address_and_port_win() {
+    let (addr, port) = resolve_worker_dial(
+        Some("10.0.0.9".into()),
+        Some(12345),
+        Some("192.168.100.10".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.0.0.9"));
+    assert_eq!(port, Some(12345));
+}
+
+#[test]
+fn worker_dial_env_fills_missing_cli_fields() {
+    let (addr, port) = resolve_worker_dial(
+        None,
+        None,
+        Some("192.168.100.10".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("192.168.100.10"));
+    assert_eq!(port, Some(11982));
+}
+
+#[test]
+fn worker_dial_cli_overrides_env_per_field() {
+    // CLI port + env address (each field resolves independently).
+    let (addr, port) = resolve_worker_dial(
+        None,
+        Some(7777),
+        Some("10.1.1.1".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.1.1.1"));
+    assert_eq!(port, Some(7777));
+    // CLI address + env port.
+    let (addr, port) = resolve_worker_dial(
+        Some("10.0.0.9".into()),
+        None,
+        Some("10.1.1.1".into()),
+        Some("11982".into()),
+    )
+    .expect("valid");
+    assert_eq!(addr.as_deref(), Some("10.0.0.9"));
+    assert_eq!(port, Some(11982));
+}
+
+#[test]
+fn worker_dial_invalid_env_port_fails_actionably() {
+    let err = resolve_worker_dial(
+        None,
+        None,
+        Some("10.1.1.1".into()),
+        Some("not-a-port".into()),
+    )
+    .expect_err("bad port must fail");
+    assert!(
+        err.to_string().contains("PADDOCK_TP_MASTER_PORT"),
+        "error must name the offending variable: {err}"
+    );
+    // An out-of-range numeric port fails the same way.
+    assert!(resolve_worker_dial(None, None, None, Some("70000".into())).is_err());
+}
+
+#[test]
+fn worker_dial_missing_address_still_fails_at_resolution() {
+    // Nothing configured: the resolver returns empty fields; the existing
+    // EmptyMasterAddr refusal (rank 1 requires the coordinator's address)
+    // is where the actionable failure must come from.
+    let (addr, port) = resolve_worker_dial(None, None, None, None).expect("no env error");
+    assert_eq!(addr, None);
+    assert_eq!(port, None);
+    let cfg = ParallelConfig {
+        tp_size: Some(2),
+        rank: Some(1),
+        master_addr: addr,
+        master_port: port,
+    };
+    assert!(
+        matches!(
+            cfg.resolved(false),
+            Err(ParallelConfigError::EmptyMasterAddr)
+        ),
+        "missing dial address must refuse with EmptyMasterAddr"
+    );
+}
+
+#[test]
+fn worker_dial_empty_env_strings_are_treated_as_unset() {
+    // An empty env value behaves like an absent one (same rule merge_env
+    // applies), not as a bogus address.
+    let (addr, port) =
+        resolve_worker_dial(None, None, Some(String::new()), Some(String::new())).expect("valid");
+    assert_eq!(addr, None);
+    assert_eq!(port, None);
+}

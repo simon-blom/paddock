@@ -97,29 +97,29 @@ impl GpuGranite {
         // granite keys is not a geometry we know, and refuses rather than
         // having the value dropped on the floor.
         let arch = map.gguf().architecture().unwrap_or("granite");
-        let (embedding_scale, residual_scale, logit_scale, attention_scale) = if arch == "llama" {
-            for k in [
-                "embedding_scale",
-                "residual_scale",
-                "logit_scale",
-                "attention.scale",
-            ] {
-                if map.gguf().arch_field(k).is_some() {
-                    return Err(GpuModelError::Unsupported(format!(
-                        "llama: file stamps llama.{k}, which no llama graph applies - refusing \
-                         rather than ignoring a scalar the author thought mattered"
-                    )));
-                }
-            }
-            (1.0, 1.0, 1.0, 1.0 / (head_dim as f32).sqrt())
+        let llama_policy = if arch == "llama" {
+            Some(super::plain_llama::validate(
+                map, max_ctx, head_dim, ctx_train,
+            )?)
         } else {
-            (
-                f_req("embedding_scale")?,
-                f_req("residual_scale")?,
-                f_req("logit_scale")?,
-                f_req("attention.scale")?,
-            )
+            None
         };
+        let (embedding_scale, residual_scale, logit_scale, attention_scale) =
+            if let Some(policy) = llama_policy {
+                (
+                    policy.embedding_scale,
+                    policy.residual_scale,
+                    policy.logit_scale,
+                    policy.attention_scale,
+                )
+            } else {
+                (
+                    f_req("embedding_scale")?,
+                    f_req("residual_scale")?,
+                    f_req("logit_scale")?,
+                    f_req("attention.scale")?,
+                )
+            };
         if logit_scale == 0.0 {
             return Err(GpuModelError::Unsupported(
                 "granite: logit_scale 0 would divide the logits by zero".into(),
@@ -129,9 +129,10 @@ impl GpuGranite {
         // attn_q/k/v.bias under this arch string) that the granite graph has no
         // seat for. Refuse on presence: loading the weights and skipping the
         // bias is fluent, wrong text.
-        if map.tensor_info("blk.0.attn_q.bias").is_some()
-            || map.tensor_info("blk.0.attn_k.bias").is_some()
-            || map.tensor_info("blk.0.attn_v.bias").is_some()
+        if arch != "llama"
+            && (map.tensor_info("blk.0.attn_q.bias").is_some()
+                || map.tensor_info("blk.0.attn_k.bias").is_some()
+                || map.tensor_info("blk.0.attn_v.bias").is_some())
         {
             return Err(GpuModelError::Unsupported(format!(
                 "{arch}: attention biases present - this graph serves the bias-free llama stack \
@@ -216,9 +217,10 @@ impl GpuGranite {
         // converter stamps no scaling key for them), and a graph that rotates
         // without them is right for short prompts and silently wrong past the
         // original window.
-        if map.gguf().arch_field("rope.scaling.type").is_some()
-            || f_opt("rope.scaling.factor").is_some_and(|v| v != 1.0)
-            || map.tensor_info("rope_freqs.weight").is_some()
+        if arch != "llama"
+            && (map.gguf().arch_field("rope.scaling.type").is_some()
+                || f_opt("rope.scaling.factor").is_some_and(|v| v != 1.0)
+                || map.tensor_info("rope_freqs.weight").is_some())
         {
             return Err(GpuModelError::Unsupported(format!(
                 "{arch}: rope scaling is stamped but unhandled - refusing to ignore it"
@@ -232,7 +234,7 @@ impl GpuGranite {
         // trained window: positions beyond it are raw extrapolation, which
         // degrades output without erroring. Refuse rather than serve quietly
         // wrong long-context results (no-silent-failures).
-        if max_ctx > ctx_train {
+        if arch != "llama" && max_ctx > ctx_train {
             return Err(GpuModelError::Unsupported(format!(
                 "granite: requested context {max_ctx} exceeds the trained {ctx_train} and the \
                  file stamps no rope scaling - serving past it would extrapolate silently"
@@ -249,11 +251,11 @@ impl GpuGranite {
             .map(|t| t.ggml_type)
             .ok_or_else(|| GpuModelError::MissingMeta("token_embd.weight".into()))?;
         let (tok_embd, n_vocab) = if crate::gpu::kq_params(te_ty).is_some() {
-            let t = exec.repack_kquant(map, "token_embd.weight")?;
+            let t = exec.repack_kquant(map, super::plain_llama::TOKEN_EMBD_WEIGHT)?;
             let vocab = t.dims[1];
             (TokEmbd::Kq(t), vocab)
         } else {
-            let t = exec.upload_raw(map, "token_embd.weight")?;
+            let t = exec.upload_raw(map, super::plain_llama::TOKEN_EMBD_WEIGHT)?;
             if t.ty != paddock_models::ggml_type::GgmlType::Q8_0 {
                 return Err(GpuModelError::Unsupported(format!(
                     "token_embd.weight quant {:?} has no resident gather path",
@@ -272,8 +274,8 @@ impl GpuGranite {
         let mut attn_bytes = 0u64;
         let mut ffn_bytes = 0u64;
         for i in 0..n_layer {
-            let dt = |name: &str| exec.upload(map, &format!("blk.{i}.{name}"));
-            let qt = |name: &str| exec.load_quantw(map, &format!("blk.{i}.{name}"));
+            let dt = |name: &str| exec.upload(map, &super::plain_llama::layer_weight(i, name));
+            let qt = |name: &str| exec.load_quantw(map, &super::plain_llama::layer_weight(i, name));
 
             // Per-group bytes are summed from the RESIDENT BUFFERS, not from
             // free-VRAM deltas: allocations come from a stream-ordered pool,
@@ -356,18 +358,18 @@ impl GpuGranite {
             gb(ffn_bytes)
         );
 
-        let output_norm = exec.upload(map, "output_norm.weight")?;
+        let output_norm = exec.upload(map, super::plain_llama::OUTPUT_NORM_WEIGHT)?;
         // Granite 4.1 ships a real `output.weight` despite tie_word_embeddings
         // in the HF config; tied exports omit it and llama.cpp duplicates
         // token_embd instead. Branch on PRESENCE, never on "the load failed" -
         // catching the error would turn an unsupported-quant head into a
         // silent fall back to the embedding plane, i.e. a different model that
         // still generates text.
-        let lm_head = if map.tensor_info("output.weight").is_some() {
-            GraniteW::Quant(exec.load_quantw(map, "output.weight")?)
+        let lm_head = if map.tensor_info(super::plain_llama::OUTPUT_WEIGHT).is_some() {
+            GraniteW::Quant(exec.load_quantw(map, super::plain_llama::OUTPUT_WEIGHT)?)
         } else {
             tracing::info!("granite: no output.weight - tied head, using token_embd");
-            GraniteW::Quant(exec.load_quantw(map, "token_embd.weight")?)
+            GraniteW::Quant(exec.load_quantw(map, super::plain_llama::TOKEN_EMBD_WEIGHT)?)
         };
         let head_bytes = output_norm.buf.len() as u64 * 4 + lm_head.bytes();
         tracing::info!(

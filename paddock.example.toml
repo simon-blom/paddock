@@ -199,3 +199,37 @@
 # prefill/graph scratch does not fit).
 # Env: PADDOCK_GRAPH_SCRATCH_MIB   CLI: --graph-scratch-mib
 # graph_scratch_mib = 512
+
+# --- Tensor-parallel serving
+#
+# TP splits one supported model across rank processes over NCCL. Rank 0 is the
+# only serving/API process; ranks 1..N-1 mirror it. All ranks need the same model
+# and kernel pack. The generic runtime accepts TP=2/3/4/6/8; each model shim
+# validates its own shard geometry. Unsupported combinations fail at startup.
+#
+# Rank 0 (coordinator - starts the worker child automatically, or waits for
+# a manual one when PADDOCK_TP_NO_SPAWN=1):
+#   [parallel]
+#   tp_size = 2
+#   master_addr = "0.0.0.0"     # rank-0 listens here
+#   master_port = 11982
+#
+# Rank 1 (worker on the second machine - explicit operator mode; this
+# process serves no API and exits when the coordinator shuts down):
+#   paddock-runner --tp-worker \
+#     --model /path/to/model.gguf --kernel-pack /path/to/pd-cuda-sm120.so \
+#     --tp-master-addr 192.168.100.10 --tp-master-port 11982
+#   (equivalently: --tp-size 2 --tp-rank 1 with --tp-master-addr; the
+#   --tp-worker flag is the supported form and refuses to serve)
+#
+# A worker defaults to GPU ordinal 0 on its own machine; pass --gpu <ordinal>
+# to select another local device. The coordinator's --gpu selects rank 0. CUDA
+# graphs for the TP lane are opt-in via PADDOCK_TP_GRAPH=1 (set it on the
+# coordinator; the resolved mode rides the handshake, so the worker follows).
+# Env: PADDOCK_TP_SIZE / PADDOCK_TP_RANK / PADDOCK_TP_MASTER_ADDR /
+#      PADDOCK_TP_MASTER_PORT   CLI: --tp-size / --tp-rank / --tp-worker /
+#      --tp-master-addr / --tp-master-port
+# [parallel]
+# tp_size = 2
+# master_addr = "0.0.0.0"
+# master_port = 11982

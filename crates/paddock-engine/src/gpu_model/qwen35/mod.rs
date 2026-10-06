@@ -30,8 +30,11 @@ use cudarc::driver::CudaSlice;
 use std::sync::Arc;
 
 mod batch;
+pub mod tp_delta;
 mod dflash;
+pub mod tp_ffn;
 mod forward;
+pub mod tp_gqa;
 mod load;
 mod mm_steps;
 mod multimodal;
@@ -40,6 +43,14 @@ pub mod pictures;
 mod prefix;
 mod rotation;
 mod spec;
+mod tp_graph;
+pub mod tp_kv;
+mod tp_model;
+mod tp_prefill_backend;
+pub mod tp_serve;
+mod tp_span;
+
+pub use tp_model::{Qwen35TpError, Qwen35TpRank};
 pub mod vision;
 
 pub(crate) use ops::*;
@@ -146,6 +157,14 @@ fn ckpt_cuts(t_len: usize, step: usize) -> [usize; 2] {
     let step = step.max(BLOCK_TOKENS);
     let b1 = ckpt_pos(t_len) / step * step;
     [b1.saturating_sub(step), b1]
+}
+
+/// The TP prefill's checkpoint boundaries: the same last-two-full-page rule
+/// at the BLOCK_TOKENS granularity, exposed for the TP serve (which builds
+/// its mirrored radix cuts with the identical contract). [0, 0] when the
+/// prompt is too short to be worth a checkpoint.
+pub fn tp_checkpoint_cuts(t_len: usize) -> [usize; 2] {
+    ckpt_cuts(t_len, BLOCK_TOKENS)
 }
 
 // max chunked prefills in flight: crate::service::max_chunks_inflight()

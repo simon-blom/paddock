@@ -1836,6 +1836,7 @@ pub fn load(
         fp8_native,
         vram_budget,
         None,
+        None,
     )
 }
 
@@ -1856,6 +1857,7 @@ pub fn load_with(
     fp8_native: Option<&Path>,
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
     load_with_residency(
         id,
@@ -1871,6 +1873,7 @@ pub fn load_with(
         vram_budget,
         max_image_tokens,
         None,
+        tp,
     )
 }
 
@@ -1889,7 +1892,21 @@ pub(crate) fn load_with_residency(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<ServingModel, ServeError> {
+    if tp.is_some()
+        && (!(1..=2).contains(&max_batch)
+            || device != "cuda"
+            || mmproj.is_some()
+            || mtp.is_some()
+            || fp8_native.is_some()
+            || path.is_dir())
+    {
+        return Err(ServeError::Open(
+            path.to_path_buf(),
+            "TP requires up to two CUDA text slots of Qwen3.8 GGUF without companions".into(),
+        ));
+    }
     // The safetensors-primary fork: a checkpoint DIRECTORY is the
     // HF-native lane - no GGUF exists in it, so everything (arch, tokenizer,
     // template, weights) comes from the checkpoint's own files. First family:
@@ -1930,6 +1947,15 @@ pub(crate) fn load_with_residency(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
+    // TP arch admission resolves the checkpoint's own architecture (the
+    // same resolver normal serving applies) so the lane list and the
+    // dispatcher cannot disagree about what a checkpoint is.
+    if tp.is_some() && arch != "qwen35" {
+        return Err(ServeError::Open(
+            path.to_path_buf(),
+            format!("TP serving supports qwen35 on CUDA, got {arch}"),
+        ));
+    }
 
     // sidecar-aware: SPM-class GGUFs (paddleocr) carry no merges, so the
     // checkpoint's tokenizer.json next to the weights is the source of truth
@@ -2091,6 +2117,7 @@ pub(crate) fn load_with_residency(
         .token_to_id("<|audio_pad|>")
         .or_else(|| tokenizer.token_to_id("<|audio|>"));
     let tokenizer = Arc::new(tokenizer);
+    let tp_enabled = tp.is_some();
     let engine = build_engine(
         &arch,
         path.to_path_buf(),
@@ -2105,13 +2132,15 @@ pub(crate) fn load_with_residency(
         vram_budget,
         max_image_tokens,
         residency,
+        tp,
     )?;
 
     Ok(ServingModel {
         vision_off: false,
         id,
         spec: SpecReport {
-            heads: arch_has_infile_heads(&arch)
+            heads: !tp_enabled
+                && arch_has_infile_heads(&arch)
                 && (device != "metal"
                     || (matches!(arch.as_str(), "qwen35" | "qwen35moe") && mtp.is_none())),
             drafter: mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned())),
@@ -2176,6 +2205,83 @@ pub(crate) fn load_with_residency(
 /// The tokenizer, complete terminal-token set and chat template all
 /// come from the checkpoint's own files via `GgufTokenizer::from_hf_dir`.
 #[allow(clippy::too_many_arguments)]
+/// Resolve a checkpoint's Paddock architecture string from its own files:
+/// a GGUF file answers `general.architecture`; a checkpoint DIRECTORY
+/// answers `config.json`'s `model_type` through the same family table the
+/// safetensors-primary lane applies in [`load_hf_dir`] (this resolver does
+/// NOT read the per-family configs — the loaders own that validation; the
+/// table here only maps the name, so TP arch dispatch and normal serving
+/// cannot disagree about what a checkpoint is).
+///
+/// Shared by normal serving (via the callers' inlined GGUF read) and the TP
+/// lane's worker dispatcher; do not fork a second mapping.
+fn resolve_model_arch(path: &Path) -> Result<String, ServeError> {
+    if path.is_dir() {
+        let model_type = std::fs::read(path.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("model_type")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                ServeError::Open(path.to_path_buf(), "config.json has no model_type".into())
+            })?;
+        Ok(match model_type.as_str() {
+            "diffusion_gemma" => "diffusion-gemma".to_owned(),
+            "llama" => "llama".to_owned(),
+            "gemma4" | "muse_glimmer" => "gemma4".to_owned(),
+            "qwen3_5" | "prism_hadamard_qwen35" => "qwen35".to_owned(),
+            "nemotron_h" => "nemotron".to_owned(),
+            "granite" => "granite".to_owned(),
+            "qwen4_exp" | "qwen3_8_flash_next" => "qwen4exp".to_owned(),
+            other => {
+                return Err(ServeError::Open(
+                    path.to_path_buf(),
+                    format!(
+                        "no safetensors-primary lane for model_type {other:?}; \
+                         checkpoint directories require an implemented backend-specific loader"
+                    ),
+                ));
+            }
+        })
+    } else {
+        let map =
+            MappedGguf::open(path).map_err(|e| ServeError::Open(path.to_path_buf(), e.to_string()))?;
+        map.gguf()
+            .architecture()
+            .map(str::to_owned)
+            .ok_or(ServeError::NoArch)
+    }
+}
+
+
+/// The TP worker dispatcher: resolve the checkpoint's architecture through
+/// the shared normal-Paddock resolver, select the adapter, and run the
+/// generic worker loop for it. The worker derives its model binding from its
+/// own checkpoint (rank identity was already validated via `TpInit` hashes)
+/// — no shell variable decides what a checkpoint is. Unsupported
+/// architectures fail here, before any GPU execution.
+pub fn run_tp_worker(
+    resolved: &paddock_dist::config::Resolved,
+    model: &Path,
+    pack: &Path,
+    gpu: usize,
+) -> Result<(), String> {
+    let (stream, _generation) =
+        paddock_dist::worker::connect_worker(resolved).map_err(|e| e.to_string())?;
+    let arch = resolve_model_arch(model).map_err(|e| e.to_string())?;
+    match arch.as_str() {
+        "qwen35" => paddock_engine::gpu_model::qwen35::tp_serve::run_worker(
+            stream, resolved, model, pack, gpu,
+        ),
+        other => Err(format!(
+            "no TP adapter for architecture {other:?} (supported: qwen35)"
+        )),
+    }
+}
+
 fn load_hf_dir(
     id: String,
     dir: &Path,
@@ -2357,6 +2463,7 @@ fn load_hf_dir(
         // Embedded MLX towers use their validated checkpoint processor budget.
         None,
         residency,
+        None,
     )?;
 
     Ok(ServingModel {
@@ -2412,6 +2519,7 @@ fn build_engine(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
+    tp: Option<paddock_dist::config::Resolved>,
 ) -> Result<crate::generation_residency::Handle, ServeError> {
     let (residency, reservation) = if let Some(options) = residency {
         if arch != "diffusion-gemma"
@@ -2474,7 +2582,32 @@ fn build_engine(
             mtp.clone(),
             fp8_native.clone(),
         );
+        let tp = tp.clone();
         Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
+            if let Some(resolved) = tp {
+                if device != "cuda"
+                    || !(1..=2).contains(&max_batch)
+                    || mmproj.is_some()
+                    || mtp.is_some()
+                    || fp8_native.is_some()
+                    || vram_budget.is_some()
+                {
+                    return Err("TP requires CUDA with at most two text slots and no companions/offload".into());
+                }
+                let pack = pack
+                    .as_deref()
+                    .ok_or("TP serving requires an explicit CUDA pack (--kernel-pack)")?;
+                let workers = paddock_dist::worker::take_controls().map_err(|e| e.to_string())?;
+                if arch != "qwen35" {
+                    return Err(format!("TP serving supports qwen35 on CUDA, got {arch}"));
+                }
+                let generator: Box<dyn Generator> = Box::new(
+                    paddock_engine::gpu_model::qwen35::tp_serve::TpGenerator::load(
+                        workers, resolved, &path, pack, gpu, max_ctx, max_batch,
+                    )?,
+                );
+                return Ok(generator);
+            }
             build_generator(
                 &arch,
                 &path,

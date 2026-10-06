@@ -18,6 +18,7 @@ pub mod paddleocr_vl;
 pub mod picture_store;
 pub mod pillow;
 pub mod prefix_cache;
+pub(crate) mod projection;
 pub mod qwen3;
 pub mod qwen35;
 pub mod qwen3_asr;

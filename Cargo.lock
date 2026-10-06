@@ -2933,6 +2933,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "paddock-dist"
+version = "0.1.11"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "paddock-engine"
 version = "0.1.13"
 dependencies = [
@@ -2942,12 +2954,15 @@ dependencies = [
  "image",
  "libc",
  "paddock-admin",
+ "paddock-dist",
  "paddock-kernels",
  "paddock-models",
  "paddock-tokenizer",
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "symphonia",
  "symphonia-adapter-libopus",
  "thiserror 2.0.20",
@@ -3153,6 +3168,7 @@ dependencies = [
  "minijinja-contrib",
  "paddock-admin",
  "paddock-api",
+ "paddock-dist",
  "paddock-engine",
  "paddock-filemeta",
  "paddock-forensics",

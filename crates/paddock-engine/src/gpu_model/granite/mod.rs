@@ -72,6 +72,7 @@ mod load_hf;
 mod multimodal;
 pub(crate) mod ops;
 mod prefix;
+pub(crate) mod plain_llama;
 pub mod preprocess;
 pub mod vision;
 

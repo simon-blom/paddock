@@ -6074,6 +6074,7 @@ impl GpuQwen35 {
         }
         let sc = self.scratch.as_mut().expect("scratch");
         let bs = self.batch.as_mut().expect("batch");
+        // TP1 uses the unified span lane rather than the serial prefill path.
 
         // device inputs (eager buffers; the fused shape is variable -> no graph)
         let mut d_tokens = exec.alloc_u32(r)?;
@@ -7334,7 +7335,6 @@ impl GpuQwen35 {
                         )?;
                     }
                     if let Some(l8) = lw8 {
-                        // d_pxq still holds the e4m3 xn quant from in_qkv
                         // (alpha/beta read f32 xn directly, nothing clobbers it)
                         if !dn_fused {
                             exec.f8_gemm_w8(
@@ -7963,6 +7963,8 @@ impl GpuQwen35 {
             Some(false) => exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?,
             None => {}
         }
+        // Match TP2's whole-advance boundary: exclude final norm, lm-head,
+        // and sampling from the profiled whole-prefill measurement.
         exec.rmsnorm_batch(&sc.d_x, &out_norm.buf, &mut sc.d_h, embd, eps, r)?;
         // rotated-basis model: the head is a rotated weight like the rest. On
         // such a model d_h feeds nothing else (no nextn block, no drafter -

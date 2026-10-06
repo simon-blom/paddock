@@ -1,0 +1,17 @@
+[package]
+name = "paddock-dist"
+description = "Distributed control plane for tensor-parallel serving: rank/world config, worker process bootstrap, and the rank0<->rank1 control protocol. Deliberately no engine dependency - the engine grows its Communicator in a later phase; this crate only coordinates processes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
